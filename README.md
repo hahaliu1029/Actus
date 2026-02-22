@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">Actus</h1>
   <p align="center">
-    开源 AI Agent 平台 — 基于 MCP 工具协议与 A2A 智能体间通信协议
+    自托管的通用 AI Agent 平台 — 规划、推理、执行，一站完成
   </p>
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
@@ -22,12 +22,13 @@
 - **A2A 协议** — 支持 [Agent-to-Agent](https://google.github.io/A2A/) 智能体间通信与协作
 - **Planner + ReAct 流程** — 先规划再执行的两阶段 Agent 流程编排
 - **沙箱执行** — Docker 隔离的代码执行环境，安全运行用户代码
+- **远程桌面** — 基于 noVNC 的沙箱桌面实时预览，浏览器内直接查看 Agent 操作画面
 - **浏览器自动化** — 基于 Playwright + browser-use 的网页操作能力
 - **多模型支持** — 兼容 OpenAI API 格式（DeepSeek、Kimi 等）
 - **流式输出** — 实时流式响应，支持思考过程展示
 - **文件管理** — MinIO/S3 兼容的对象存储，支持文件上传下载
 - **用户系统** — JWT 认证、角色权限管理
-- **现代前端** — Next.js 16 + React 19 + Tailwind CSS + Zustand
+- **现代前端** — Next.js 16 + React 19 + shadcn/ui 组件库，Geist 字体，深色 / 浅色双主题
 
 ## 架构概览
 
@@ -133,6 +134,8 @@ Actus/
 |------|------|
 | 后端框架 | FastAPI + Uvicorn |
 | 前端框架 | Next.js 16 + React 19 |
+| UI / 样式 | Tailwind CSS v4 + shadcn/ui + Geist 字体 |
+| 状态管理 | Zustand |
 | 数据库 | PostgreSQL 17 + SQLAlchemy 2.0 (async) |
 | 缓存/队列 | Redis (Redis Streams) |
 | 对象存储 | MinIO / S3 兼容 |

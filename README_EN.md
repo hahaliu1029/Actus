@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">Actus</h1>
   <p align="center">
-    Open-source AI Agent Platform — Built on MCP Tool Protocol & A2A Agent-to-Agent Communication
+    Self-hosted general-purpose AI Agent platform — Plan, reason, execute, all in one
   </p>
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
@@ -22,12 +22,13 @@
 - **A2A Protocol** — [Agent-to-Agent](https://google.github.io/A2A/) communication and collaboration
 - **Planner + ReAct Flow** — Two-phase agent orchestration: plan first, then execute
 - **Sandboxed Execution** — Docker-isolated code execution environment
+- **Remote Desktop** — Real-time sandbox desktop preview via noVNC, watch Agent actions directly in your browser
 - **Browser Automation** — Web interaction powered by Playwright + browser-use
 - **Multi-model Support** — Compatible with OpenAI API format (DeepSeek, Kimi, etc.)
 - **Streaming Output** — Real-time streaming responses with chain-of-thought display
 - **File Management** — MinIO/S3-compatible object storage for file upload/download
 - **User System** — JWT authentication with role-based access control
-- **Modern Frontend** — Next.js 16 + React 19 + Tailwind CSS + Zustand
+- **Modern Frontend** — Next.js 16 + React 19 + shadcn/ui, Geist font, light / dark themes
 
 ## Architecture
 
@@ -132,6 +133,8 @@ Actus/
 |-----------|-----------|
 | Backend | FastAPI + Uvicorn |
 | Frontend | Next.js 16 + React 19 |
+| UI / Styling | Tailwind CSS v4 + shadcn/ui + Geist font |
+| State Management | Zustand |
 | Database | PostgreSQL 17 + SQLAlchemy 2.0 (async) |
 | Cache/Queue | Redis (Redis Streams) |
 | Object Storage | MinIO / S3-compatible |
