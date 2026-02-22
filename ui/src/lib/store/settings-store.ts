@@ -9,9 +9,12 @@ import type {
   A2AServersData,
   AgentConfig,
   CreateA2AServerParams,
+  InstallSkillParams,
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  SkillDiscoveryData,
+  SkillListData,
   ToolWithPreference,
 } from "@/lib/api/types";
 import { registerStoreResetter } from "@/lib/store/reset";
@@ -24,6 +27,10 @@ type SettingsState = {
   a2aServers: A2AServersData["a2a_servers"];
   mcpTools: ToolWithPreference[];
   a2aTools: ToolWithPreference[];
+  skills: SkillListData["skills"];
+  skillTools: ToolWithPreference[];
+  mcpSkillDiscovery: SkillDiscoveryData["skills"];
+  githubSkillDiscovery: SkillDiscoveryData["skills"];
   isLoading: boolean;
 };
 
@@ -40,6 +47,10 @@ type SettingsActions = {
   deleteA2AServer: (a2aId: string) => Promise<void>;
   setA2AServerEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
   setA2AToolEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
+  installSkill: (params: InstallSkillParams) => Promise<void>;
+  deleteSkill: (skillId: string) => Promise<void>;
+  setSkillEnabled: (skillId: string, enabled: boolean) => Promise<void>;
+  setSkillToolEnabled: (skillId: string, enabled: boolean) => Promise<void>;
 };
 
 type SettingsStore = SettingsState & SettingsActions;
@@ -51,6 +62,10 @@ const initialState: SettingsState = {
   a2aServers: [],
   mcpTools: [],
   a2aTools: [],
+  skills: [],
+  skillTools: [],
+  mcpSkillDiscovery: [],
+  githubSkillDiscovery: [],
   isLoading: false,
 };
 
@@ -107,6 +122,10 @@ export const useSettingsStore = create<SettingsStore>()(
           a2aServersResult,
           mcpToolsResult,
           a2aToolsResult,
+          skillsResult,
+          skillToolsResult,
+          mcpSkillDiscoveryResult,
+          githubSkillDiscoveryResult,
         ] = await Promise.allSettled([
           configApi.getLLMConfig(),
           configApi.getAgentConfig(),
@@ -114,6 +133,10 @@ export const useSettingsStore = create<SettingsStore>()(
           configApi.getA2AServers(),
           userToolsApi.getMCPTools(),
           userToolsApi.getA2ATools(),
+          configApi.getSkills(),
+          userToolsApi.getSkillTools(),
+          configApi.discoverMCPSkills(),
+          configApi.discoverGitHubSkills(),
         ]);
 
         const partialState: Partial<SettingsState> = {};
@@ -153,6 +176,30 @@ export const useSettingsStore = create<SettingsStore>()(
           partialState.a2aTools = a2aToolsResult.value.tools;
         } else {
           failedItems.push("A2A 个人开关");
+        }
+
+        if (skillsResult.status === "fulfilled") {
+          partialState.skills = skillsResult.value.skills;
+        } else {
+          failedItems.push("Skill 列表");
+        }
+
+        if (skillToolsResult.status === "fulfilled") {
+          partialState.skillTools = skillToolsResult.value.tools;
+        } else {
+          failedItems.push("Skill 个人开关");
+        }
+
+        if (mcpSkillDiscoveryResult.status === "fulfilled") {
+          partialState.mcpSkillDiscovery = mcpSkillDiscoveryResult.value.skills;
+        } else {
+          failedItems.push("MCP Skill 发现");
+        }
+
+        if (githubSkillDiscoveryResult.status === "fulfilled") {
+          partialState.githubSkillDiscovery = githubSkillDiscoveryResult.value.skills;
+        } else {
+          failedItems.push("GitHub Skill 发现");
         }
 
         set(partialState);
@@ -272,6 +319,46 @@ export const useSettingsStore = create<SettingsStore>()(
         reportSuccess(enabled ? "A2A 个人开关已开启" : "A2A 个人开关已关闭");
       } catch (error) {
         reportError(error, "更新 A2A 个人开关失败");
+      }
+    },
+
+    installSkill: async (params) => {
+      try {
+        await configApi.installSkill(params);
+        await get().loadAll();
+        reportSuccess("Skill 安装成功");
+      } catch (error) {
+        reportError(error, "安装 Skill 失败");
+      }
+    },
+
+    deleteSkill: async (skillId) => {
+      try {
+        await configApi.deleteSkill(skillId);
+        await get().loadAll();
+        reportSuccess("Skill 已删除");
+      } catch (error) {
+        reportError(error, "删除 Skill 失败");
+      }
+    },
+
+    setSkillEnabled: async (skillId, enabled) => {
+      try {
+        await configApi.updateSkillEnabled(skillId, enabled);
+        await get().loadAll();
+        reportSuccess(enabled ? "Skill 已启用" : "Skill 已禁用");
+      } catch (error) {
+        reportError(error, "更新 Skill 全局开关失败");
+      }
+    },
+
+    setSkillToolEnabled: async (skillId, enabled) => {
+      try {
+        await userToolsApi.setSkillToolEnabled(skillId, enabled);
+        await get().loadAll();
+        reportSuccess(enabled ? "Skill 个人开关已开启" : "Skill 个人开关已关闭");
+      } catch (error) {
+        reportError(error, "更新 Skill 个人开关失败");
       }
     },
   }))

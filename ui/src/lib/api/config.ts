@@ -3,9 +3,12 @@ import type {
   AgentConfig,
   A2AServersData,
   CreateA2AServerParams,
+  InstallSkillParams,
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  SkillDiscoveryData,
+  SkillListData,
 } from "./types";
 
 const SETTINGS_LIST_TIMEOUT = 30000;
@@ -61,5 +64,35 @@ export const configApi = {
 
   updateA2AServerEnabled: (a2aId: string, enabled: boolean): Promise<void> => {
     return post<void>(`/app-config/a2a-servers/${a2aId}/enabled`, { enabled });
+  },
+
+  getSkills: (): Promise<SkillListData> => {
+    return get<SkillListData>("/app-config/skills", undefined, {
+      timeout: SETTINGS_LIST_TIMEOUT,
+    });
+  },
+
+  installSkill: (params: InstallSkillParams): Promise<void> => {
+    return post<void>("/app-config/skills/install", params);
+  },
+
+  updateSkillEnabled: (skillId: string, enabled: boolean): Promise<void> => {
+    return post<void>(`/app-config/skills/${skillId}/enabled`, { enabled });
+  },
+
+  deleteSkill: (skillId: string): Promise<void> => {
+    return post<void>(`/app-config/skills/${skillId}/delete`, {});
+  },
+
+  discoverMCPSkills: (): Promise<SkillDiscoveryData> => {
+    return get<SkillDiscoveryData>("/app-config/skills/discovery/mcp", undefined, {
+      timeout: SETTINGS_LIST_TIMEOUT,
+    });
+  },
+
+  discoverGitHubSkills: (): Promise<SkillDiscoveryData> => {
+    return get<SkillDiscoveryData>("/app-config/skills/discovery/github", undefined, {
+      timeout: SETTINGS_LIST_TIMEOUT,
+    });
   },
 };

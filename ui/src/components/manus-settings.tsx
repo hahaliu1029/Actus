@@ -8,6 +8,7 @@ import {
   LayoutGrid,
   LoaderCircle,
   Plus,
+  Puzzle,
   Server,
   Settings,
   Trash2,
@@ -28,7 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
-import type { AgentConfig, LLMConfig, MCPConfig } from "@/lib/api/types";
+import type { AgentConfig, LLMConfig, MCPConfig, SkillSourceType } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
 import { useSettingsStore } from "@/lib/store/settings-store";
 import { useUIStore } from "@/lib/store/ui-store";
@@ -38,6 +39,7 @@ const TABS = [
   { key: "llm", title: "模型提供商", icon: Languages },
   { key: "a2a", title: "A2A Agent 配置", icon: LayoutGrid },
   { key: "mcp", title: "MCP 服务器", icon: Server },
+  { key: "skill", title: "Skill 生态", icon: Puzzle },
   { key: "admin", title: "用户管理", icon: Bot },
 ] as const;
 
@@ -71,6 +73,7 @@ export function ManusSettings() {
   const [activeTab, setActiveTab] = useState<TabKey>("agent");
   const [isMCPDialogOpen, setIsMCPDialogOpen] = useState(false);
   const [isA2ADialogOpen, setIsA2ADialogOpen] = useState(false);
+  const [isSkillDialogOpen, setIsSkillDialogOpen] = useState(false);
 
   const llmConfig = useSettingsStore((state) => state.llmConfig);
   const agentConfig = useSettingsStore((state) => state.agentConfig);
@@ -78,6 +81,10 @@ export function ManusSettings() {
   const a2aServers = useSettingsStore((state) => state.a2aServers);
   const mcpTools = useSettingsStore((state) => state.mcpTools);
   const a2aTools = useSettingsStore((state) => state.a2aTools);
+  const skills = useSettingsStore((state) => state.skills);
+  const skillTools = useSettingsStore((state) => state.skillTools);
+  const mcpSkillDiscovery = useSettingsStore((state) => state.mcpSkillDiscovery);
+  const githubSkillDiscovery = useSettingsStore((state) => state.githubSkillDiscovery);
   const isLoading = useSettingsStore((state) => state.isLoading);
 
   const loadAll = useSettingsStore((state) => state.loadAll);
@@ -91,6 +98,10 @@ export function ManusSettings() {
   const deleteA2AServer = useSettingsStore((state) => state.deleteA2AServer);
   const setA2AServerEnabled = useSettingsStore((state) => state.setA2AServerEnabled);
   const setA2AToolEnabled = useSettingsStore((state) => state.setA2AToolEnabled);
+  const installSkill = useSettingsStore((state) => state.installSkill);
+  const deleteSkill = useSettingsStore((state) => state.deleteSkill);
+  const setSkillEnabled = useSettingsStore((state) => state.setSkillEnabled);
+  const setSkillToolEnabled = useSettingsStore((state) => state.setSkillToolEnabled);
 
   const [agentForm, setAgentForm] = useState<AgentConfig>({
     max_iterations: 100,
@@ -109,6 +120,11 @@ export function ManusSettings() {
   const [mcpPayload, setMcpPayload] = useState(MCP_EXAMPLE);
   const [mcpDialogError, setMcpDialogError] = useState<string | null>(null);
   const [a2aBaseUrl, setA2ABaseUrl] = useState("");
+  const [skillSourceType, setSkillSourceType] = useState<SkillSourceType>("mcp_registry");
+  const [skillSourceRef, setSkillSourceRef] = useState("");
+  const [skillManifest, setSkillManifest] = useState(`{\n  \"name\": \"demo-skill\",\n  \"runtime_type\": \"native\",\n  \"tools\": [\n    {\n      \"name\": \"run_demo\",\n      \"description\": \"Run demo action\",\n      \"parameters\": {\n        \"query\": {\n          \"type\": \"string\"\n        }\n      },\n      \"required\": [\"query\"],\n      \"entry\": {\n        \"exec_dir\": \"/home/ubuntu/workspace\",\n        \"command\": \"echo skill\"\n      }\n    }\n  ]\n}`);
+  const [skillMarkdown, setSkillMarkdown] = useState("# Demo Skill\\n\\nDescribe usage here.");
+  const [skillDialogError, setSkillDialogError] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -138,12 +154,18 @@ export function ManusSettings() {
     return new Map(a2aTools.map((item) => [item.tool_id, item]));
   }, [a2aTools]);
 
+  const skillToolMap = useMemo(() => {
+    return new Map(skillTools.map((item) => [item.tool_id, item]));
+  }, [skillTools]);
+
   function handleMainDialogOpen(nextOpen: boolean): void {
     setOpen(nextOpen);
     if (!nextOpen) {
       setIsMCPDialogOpen(false);
       setIsA2ADialogOpen(false);
+      setIsSkillDialogOpen(false);
       setMcpDialogError(null);
+      setSkillDialogError(null);
       setActiveTab("agent");
     }
   }
@@ -212,6 +234,32 @@ export function ManusSettings() {
     });
     setA2ABaseUrl("");
     setIsA2ADialogOpen(false);
+  }
+
+  async function handleInstallSkill(): Promise<void> {
+    if (!skillSourceRef.trim()) {
+      setSkillDialogError("请输入来源标识（市场ID或仓库ID）");
+      return;
+    }
+
+    if (!skillManifest.trim()) {
+      setSkillDialogError("请输入 Manifest JSON");
+      return;
+    }
+
+    try {
+      setSkillDialogError(null);
+      const manifest = JSON.parse(skillManifest) as Record<string, unknown>;
+      await installSkill({
+        source_type: skillSourceType,
+        source_ref: skillSourceRef.trim(),
+        manifest,
+        skill_md: skillMarkdown,
+      });
+      setIsSkillDialogOpen(false);
+    } catch {
+      setSkillDialogError("Manifest JSON 格式不合法");
+    }
   }
 
   return (
@@ -711,6 +759,232 @@ export function ManusSettings() {
                               checked={tool?.enabled_user ?? userEnabled}
                               onCheckedChange={(checked) => {
                                 void setMCPToolEnabled(server.server_name, checked);
+                              }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+
+              {activeTab === "skill" ? (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                        Skill 生态
+                      </h3>
+                      <p className="text-sm text-muted-foreground">
+                        统一管理 native / MCP / A2A 三类 Skill。
+                      </p>
+                    </div>
+
+                    <Dialog
+                      open={isSkillDialogOpen}
+                      onOpenChange={(nextOpen) => {
+                        setIsSkillDialogOpen(nextOpen);
+                        if (!nextOpen) {
+                          setSkillDialogError(null);
+                        }
+                      }}
+                    >
+                      <DialogTrigger asChild>
+                        <Button
+                          className="h-10 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
+                          disabled={!isAdmin}
+                        >
+                          <Plus className="size-4" />
+                          安装 Skill
+                        </Button>
+                      </DialogTrigger>
+                      <DialogContent className="max-w-[760px] rounded-2xl border border-border shadow-[var(--shadow-float)]">
+                        <DialogHeader>
+                          <DialogTitle>安装 Skill</DialogTitle>
+                          <DialogDescription>
+                            输入来源标识，并提供 Manifest + SKILL.md。
+                          </DialogDescription>
+                        </DialogHeader>
+
+                        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                          <label className="text-sm text-foreground/85">
+                            来源类型
+                            <select
+                              value={skillSourceType}
+                              onChange={(event) =>
+                                setSkillSourceType(event.target.value as SkillSourceType)
+                              }
+                              className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                            >
+                              <option value="mcp_registry">MCP Registry</option>
+                              <option value="github">GitHub</option>
+                            </select>
+                          </label>
+                          <label className="text-sm text-foreground/85">
+                            来源标识
+                            <Input
+                              value={skillSourceRef}
+                              onChange={(event) => setSkillSourceRef(event.target.value)}
+                              placeholder={
+                                skillSourceType === "mcp_registry"
+                                  ? "mcp:filesystem-basic"
+                                  : "github:owner/repo"
+                              }
+                              className="mt-1"
+                            />
+                          </label>
+                        </div>
+
+                        <label className="text-sm text-foreground/85">
+                          Manifest JSON
+                          <Textarea
+                            className="mt-1 min-h-[180px] text-xs"
+                            value={skillManifest}
+                            onChange={(event) => setSkillManifest(event.target.value)}
+                          />
+                        </label>
+
+                        <label className="text-sm text-foreground/85">
+                          SKILL.md
+                          <Textarea
+                            className="mt-1 min-h-[120px] text-xs"
+                            value={skillMarkdown}
+                            onChange={(event) => setSkillMarkdown(event.target.value)}
+                          />
+                        </label>
+
+                        {skillDialogError ? (
+                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+                            {skillDialogError}
+                          </p>
+                        ) : null}
+
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            variant="outline"
+                            className="h-10 rounded-xl border-border px-5"
+                            onClick={() => setIsSkillDialogOpen(false)}
+                          >
+                            取消
+                          </Button>
+                          <Button
+                            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
+                            onClick={() => {
+                              void handleInstallSkill();
+                            }}
+                          >
+                            安装
+                          </Button>
+                        </div>
+                      </DialogContent>
+                    </Dialog>
+                  </div>
+
+                  <div className="rounded-2xl border border-border/70 bg-muted/30 p-3">
+                    <p className="mb-2 text-sm font-medium text-foreground/85">可发现 Skill</p>
+                    <div className="flex flex-wrap gap-2">
+                      {[...mcpSkillDiscovery, ...githubSkillDiscovery].map((item) => (
+                        <button
+                          key={`${item.source_ref}-${item.runtime_type}`}
+                          type="button"
+                          className="rounded-md border border-border bg-card px-2 py-1 text-xs text-foreground/85 hover:bg-accent"
+                          onClick={() => {
+                            setSkillSourceType(item.source_type);
+                            setSkillSourceRef(item.source_ref);
+                            setSkillManifest(
+                              JSON.stringify(
+                                {
+                                  name: item.name,
+                                  description: item.description,
+                                  runtime_type: item.runtime_type,
+                                  tools: [],
+                                },
+                                null,
+                                2
+                              )
+                            );
+                            setIsSkillDialogOpen(true);
+                          }}
+                        >
+                          {item.name} · {item.runtime_type}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/30 p-3">
+                    {skills.length === 0 ? (
+                      <div className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
+                        暂无 Skill，可通过右上角按钮安装。
+                      </div>
+                    ) : null}
+
+                    {skills.map((skill) => {
+                      const tool = skillToolMap.get(skill.id);
+                      const userEnabled = mergeToolEnabled(skill.id, skill.enabled, skillTools);
+
+                      return (
+                        <div key={skill.id} className="rounded-2xl border bg-card px-4 py-3 shadow-[var(--shadow-subtle)]">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="min-w-0 space-y-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="text-lg font-semibold text-foreground">{skill.name}</p>
+                                <Badge variant="secondary" className="rounded-md bg-muted text-foreground/85">
+                                  {skill.runtime_type}
+                                </Badge>
+                                <Badge
+                                  variant="secondary"
+                                  className={
+                                    skill.enabled
+                                      ? "rounded-md bg-muted text-foreground/85"
+                                      : "rounded-md bg-primary text-primary-foreground"
+                                  }
+                                >
+                                  {skill.enabled ? "启用" : "禁用"}
+                                </Badge>
+                              </div>
+                              <p className="text-sm text-muted-foreground">
+                                {skill.description || "暂无描述"}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                来源：{skill.source_type} · {skill.source_ref}
+                              </p>
+                            </div>
+
+                            <div className="flex items-center gap-3">
+                              <button
+                                type="button"
+                                className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                                disabled={!isAdmin}
+                                onClick={() => {
+                                  void deleteSkill(skill.id);
+                                }}
+                              >
+                                <Trash2 className="size-4" />
+                              </button>
+
+                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                全局
+                                <Switch
+                                  className="data-[state=checked]:bg-primary"
+                                  checked={skill.enabled}
+                                  disabled={!isAdmin}
+                                  onCheckedChange={(checked) => {
+                                    void setSkillEnabled(skill.id, checked);
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-muted-foreground">
+                            个人
+                            <Switch
+                              className="data-[state=checked]:bg-primary"
+                              checked={tool?.enabled_user ?? userEnabled}
+                              onCheckedChange={(checked) => {
+                                void setSkillToolEnabled(skill.id, checked);
                               }}
                             />
                           </div>

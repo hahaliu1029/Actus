@@ -29,6 +29,7 @@ from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.message import MessageTool
 from app.domain.services.tools.search import SearchTool
 from app.domain.services.tools.shell import ShellTool
+from app.domain.services.tools.skill import SkillTool
 
 from ...repositories.uow import IUnitOfWork
 from .base import BaseFlow, FlowStatus
@@ -51,6 +52,7 @@ class PlannerReActFlow(BaseFlow):
         search_engine: SearchEngine,  # 搜索引擎
         mcp_tool: MCPTool,  # mcp工具
         a2a_tool: A2ATool,  # a2a远程agent
+        skill_tool: SkillTool,  # 统一skill工具
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
         # 1.流初始化数据配置
@@ -70,6 +72,7 @@ class PlannerReActFlow(BaseFlow):
             MessageTool(),
             mcp_tool,
             a2a_tool,
+            skill_tool,
         ]
 
         # 3.创建规划Agent

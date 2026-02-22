@@ -14,6 +14,12 @@ vi.mock("@/lib/api/config", () => ({
     addA2AServer: vi.fn(),
     deleteA2AServer: vi.fn(),
     updateA2AServerEnabled: vi.fn(),
+    getSkills: vi.fn(),
+    installSkill: vi.fn(),
+    deleteSkill: vi.fn(),
+    updateSkillEnabled: vi.fn(),
+    discoverMCPSkills: vi.fn(),
+    discoverGitHubSkills: vi.fn(),
   },
 }));
 
@@ -23,6 +29,8 @@ vi.mock("@/lib/api/user-tools", () => ({
     setMCPToolEnabled: vi.fn(),
     getA2ATools: vi.fn(),
     setA2AToolEnabled: vi.fn(),
+    getSkillTools: vi.fn(),
+    setSkillToolEnabled: vi.fn(),
   },
 }));
 
@@ -69,6 +77,18 @@ describe("settings-store", () => {
     });
     mockedUserToolsApi.getA2ATools.mockResolvedValue({
       tools: [],
+    });
+    mockedConfigApi.getSkills.mockResolvedValue({
+      skills: [],
+    });
+    mockedUserToolsApi.getSkillTools.mockResolvedValue({
+      tools: [],
+    });
+    mockedConfigApi.discoverMCPSkills.mockResolvedValue({
+      skills: [],
+    });
+    mockedConfigApi.discoverGitHubSkills.mockResolvedValue({
+      skills: [],
     });
   });
 
@@ -130,5 +150,64 @@ describe("settings-store", () => {
     });
 
     expect(result).toBe(false);
+  });
+
+  it("loadAll 会加载 Skill 列表和发现结果", async () => {
+    mockedConfigApi.getSkills.mockResolvedValue({
+      skills: [
+        {
+          id: "skill-1",
+          slug: "demo-skill",
+          name: "Demo Skill",
+          description: "desc",
+          version: "1.0.0",
+          source_type: "github",
+          source_ref: "github:owner/repo",
+          runtime_type: "native",
+          enabled: true,
+        },
+      ],
+    });
+    mockedUserToolsApi.getSkillTools.mockResolvedValue({
+      tools: [
+        {
+          tool_id: "skill-1",
+          tool_name: "Demo Skill",
+          description: "desc",
+          enabled_global: true,
+          enabled_user: true,
+        },
+      ],
+    });
+    mockedConfigApi.discoverMCPSkills.mockResolvedValue({
+      skills: [
+        {
+          source_type: "mcp_registry",
+          source_ref: "mcp:filesystem-basic",
+          name: "Filesystem Basic",
+          description: "fs",
+          runtime_type: "mcp",
+        },
+      ],
+    });
+    mockedConfigApi.discoverGitHubSkills.mockResolvedValue({
+      skills: [
+        {
+          source_type: "github",
+          source_ref: "github:openai/repo",
+          name: "Native Shell",
+          description: "shell",
+          runtime_type: "native",
+        },
+      ],
+    });
+
+    await useSettingsStore.getState().loadAll();
+
+    const state = useSettingsStore.getState();
+    expect(state.skills).toHaveLength(1);
+    expect(state.skillTools).toHaveLength(1);
+    expect(state.mcpSkillDiscovery).toHaveLength(1);
+    expect(state.githubSkillDiscovery).toHaveLength(1);
   });
 });

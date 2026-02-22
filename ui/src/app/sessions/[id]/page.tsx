@@ -172,10 +172,12 @@ function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent 
 
   // MCP/A2A 工具调用结果
   let mcpResult: string | null = null;
-  if ((toolName === "mcp" || toolName === "a2a") && content) {
+  if ((toolName === "mcp" || toolName === "a2a" || toolName === "skill") && content) {
     const rawResult = (toolName === "a2a")
       ? (content as Record<string, unknown>).a2a_result
-      : (content as Record<string, unknown>).result;
+      : (toolName === "skill")
+        ? (content as Record<string, unknown>).skill_result
+        : (content as Record<string, unknown>).result;
     if (rawResult !== undefined && rawResult !== null) {
       mcpResult = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
     }

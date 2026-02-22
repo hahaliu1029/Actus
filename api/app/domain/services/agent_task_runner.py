@@ -25,6 +25,7 @@ from app.domain.models.event import (
     MessageEvent,
     SearchToolContent,
     ShellToolContent,
+    SkillToolContent,
     TitleEvent,
     ToolEvent,
     ToolEventStatus,
@@ -34,6 +35,7 @@ from app.domain.models.file import File
 from app.domain.models.message import Message
 from app.domain.models.search import SearchResults
 from app.domain.models.session import SessionStatus
+from app.domain.models.skill import Skill
 from app.domain.models.tool_result import ToolResult
 
 # from app.domain.repositories.file_repository import FileRepository
@@ -42,6 +44,9 @@ from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.mcp import MCPTool
+from app.domain.services.tools.skill import SkillTool
+from app.infrastructure.repositories.db_skill_repository import DBSkillRepository
+from app.infrastructure.storage.postgres import get_postgres
 from fastapi import UploadFile
 from pydantic import TypeAdapter
 
@@ -80,6 +85,11 @@ class AgentTaskRunner(TaskRunner):
         self._mcp_tool = MCPTool()
         self._a2a_config = a2a_config
         self._a2a_tool = A2ATool()
+        self._skill_tool = SkillTool(
+            sandbox=sandbox,
+            mcp_tool=self._mcp_tool,
+            a2a_tool=self._a2a_tool,
+        )
         self._file_storage = file_storage
         # self._file_repository = file_repository
         self._browser = browser
@@ -95,6 +105,7 @@ class AgentTaskRunner(TaskRunner):
             search_engine=search_engine,
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
+            skill_tool=self._skill_tool,
         )
 
     async def _put_and_add_event(
@@ -311,6 +322,17 @@ class AgentTaskRunner(TaskRunner):
         # 4.预签名失败则回退为文件原始路径
         return file.filepath
 
+    async def _load_enabled_skills(self) -> list[Skill]:
+        """加载启用中的 Skill 列表。"""
+        try:
+            postgres = get_postgres()
+            async with postgres.session_factory() as session:
+                repository = DBSkillRepository(session)
+                return await repository.list_enabled()
+        except Exception as e:
+            logger.warning(f"加载Skill列表失败，降级为空列表: {str(e)}")
+            return []
+
     async def _handle_tool_event(self, event: ToolEvent) -> None:
         """额外处理工具消息，使其前端交互更友好"""
         try:
@@ -408,6 +430,19 @@ class AgentTaskRunner(TaskRunner):
                             if event.tool_name == "mcp"
                             else A2AToolContent(a2a_result="(A2A智能体无可用结果)")
                         )
+                elif event.tool_name == "skill":
+                    if event.function_result and event.function_result.data is not None:
+                        event.tool_content = SkillToolContent(
+                            skill_result=event.function_result.data
+                        )
+                    elif event.function_result and event.function_result.message:
+                        event.tool_content = SkillToolContent(
+                            skill_result=event.function_result.message
+                        )
+                    else:
+                        event.tool_content = SkillToolContent(
+                            skill_result="(Skill工具无可用结果)"
+                        )
         except Exception as e:
             logger.exception(f"AgentTaskRunner生成工具内容失败: {str(e)}")
 
@@ -443,10 +478,15 @@ class AgentTaskRunner(TaskRunner):
         except Exception as e:
             logger.warning(f"清理MCP工具资源时出错: {e}")
         try:
-            if self._a2a_tool:
+            if self._a2a_tool and self._a2a_tool.manager:
                 await self._a2a_tool.manager.cleanup()
         except Exception as e:
             logger.warning(f"清理A2A工具资源时出错: {e}")
+        try:
+            if self._skill_tool:
+                await self._skill_tool.cleanup()
+        except Exception as e:
+            logger.warning(f"清理Skill工具资源时出错: {e}")
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
@@ -462,6 +502,8 @@ class AgentTaskRunner(TaskRunner):
             await self._sandbox.ensure_sandbox()
             await self._mcp_tool.initialize(self._mcp_config)
             await self._a2a_tool.initialize(self._a2a_config)
+            enabled_skills = await self._load_enabled_skills()
+            await self._skill_tool.initialize(enabled_skills)
 
             # 3.循环读取任务中的输入消息队列
             while not await task.input_stream.is_empty():

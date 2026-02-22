@@ -17,4 +17,12 @@ export const userToolsApi = {
   setA2AToolEnabled(a2aId: string, enabled: boolean): Promise<void> {
     return post<void>(`/user/tools/a2a/${a2aId}/enabled`, { enabled });
   },
+
+  getSkillTools(): Promise<ToolPreferenceListResponse> {
+    return get<ToolPreferenceListResponse>("/user/tools/skills");
+  },
+
+  setSkillToolEnabled(skillId: string, enabled: boolean): Promise<void> {
+    return post<void>(`/user/tools/skills/${skillId}/enabled`, { enabled });
+  },
 };

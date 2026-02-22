@@ -5,6 +5,7 @@ from . import (
     app_config_routes,
     auth_routes,
     file_routes,
+    skill_routes,
     session_routes,
     status_routes,
     user_routes,
@@ -22,6 +23,7 @@ def create_api_routes() -> APIRouter:
     # 业务路由 (需要认证)
     api_router.include_router(status_routes.router)
     api_router.include_router(app_config_routes.router)
+    api_router.include_router(skill_routes.router)
     api_router.include_router(file_routes.router)
 
     # 用户路由

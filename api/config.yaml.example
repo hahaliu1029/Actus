@@ -42,3 +42,7 @@ mcp_config:
 
 a2a_config:
   a2a_servers: []
+
+# Skill 生态说明：
+# - Skill 清单与启用状态存储在数据库（skills + user_tool_preferences）
+# - 请在前端「设置 -> Skill 生态」中安装和管理 Skill

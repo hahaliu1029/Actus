@@ -419,7 +419,7 @@ function pickToolDetail(
     asString(args.filepath);
 
   // MCP工具：显示完整的工具函数名和参数摘要
-  if (toolName === "mcp" || toolName === "a2a") {
+  if (toolName === "mcp" || toolName === "a2a" || toolName === "skill") {
     return functionName || genericText || "正在处理中";
   }
 
@@ -473,11 +473,12 @@ function getToolActionTitle(
     file: "文件工具",
     mcp: "MCP 工具",
     a2a: "远程 Agent",
+    skill: "Skill 工具",
     message: "消息工具",
   };
 
   // MCP/A2A工具：从函数名中提取可读的工具名
-  if (toolName === "mcp" || toolName === "a2a") {
+  if (toolName === "mcp" || toolName === "a2a" || toolName === "skill") {
     const label = toolLabelByName[toolName] || "工具";
     // 函数名格式: mcp_servername_toolname，提取最后的工具名部分
     const readableName = extractMCPToolShortName(functionName);

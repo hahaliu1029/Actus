@@ -20,6 +20,7 @@
 - **ReAct Agent** — Reasoning + Acting pattern with multi-turn reasoning and tool calling
 - **MCP Tool Protocol** — Dynamically connect external tool servers via [Model Context Protocol](https://modelcontextprotocol.io/)
 - **A2A Protocol** — [Agent-to-Agent](https://google.github.io/A2A/) communication and collaboration
+- **Skill Ecosystem Layer** — Unified native / MCP / A2A Skill management with Manifest + SKILL.md installation
 - **Planner + ReAct Flow** — Two-phase agent orchestration: plan first, then execute
 - **Sandboxed Execution** — Docker-isolated code execution environment
 - **Remote Desktop** — Real-time sandbox desktop preview via noVNC, watch Agent actions directly in your browser
@@ -43,6 +44,7 @@
                      │       │      │────▶│  MinIO / S3   │
                      │   ┌───▼────┐ │     └──────────────┘
                      │   │MCP/A2A │ │     ┌──────────────┐
+                     │   │/Skill  │ │
                      │   │Tools   │ │────▶│  Sandbox      │
                      │   └────────┘ │     │  (Docker)     │
                      └──────────────┘     └──────────────┘
@@ -71,7 +73,8 @@ cp .env.example .env
 
 # 3. Configure Agent runtime parameters
 cp api/config.yaml.example api/config.yaml
-# Edit api/config.yaml with your LLM API key and MCP server configurations
+# Edit api/config.yaml with your LLM API key and MCP/A2A configurations
+# Skill ecosystem configuration is managed in Settings -> Skill Ecosystem (DB-backed)
 
 # 4. Start all services
 docker compose --env-file .env up -d --build
@@ -139,7 +142,7 @@ Actus/
 | Cache/Queue | Redis (Redis Streams) |
 | Object Storage | MinIO / S3-compatible |
 | LLM Integration | OpenAI SDK (DeepSeek, Kimi, etc.) |
-| Agent Protocols | MCP SDK + A2A |
+| Agent Protocols | MCP SDK + A2A + Skill Layer |
 | Browser Automation | Playwright + browser-use |
 | Sandbox | Docker container isolation |
 | Auth | JWT + bcrypt |
