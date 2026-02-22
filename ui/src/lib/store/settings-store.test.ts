@@ -152,6 +152,26 @@ describe("settings-store", () => {
     expect(result).toBe(false);
   });
 
+  it("addA2AServer 在成功时返回 true", async () => {
+    mockedConfigApi.addA2AServer.mockResolvedValue();
+
+    const result = await useSettingsStore.getState().addA2AServer({
+      base_url: "https://agent.example.com",
+    });
+
+    expect(result).toBe(true);
+  });
+
+  it("addA2AServer 在接口失败时返回 false", async () => {
+    mockedConfigApi.addA2AServer.mockRejectedValue(new Error("create failed"));
+
+    const result = await useSettingsStore.getState().addA2AServer({
+      base_url: "https://agent.example.com",
+    });
+
+    expect(result).toBe(false);
+  });
+
   it("loadAll 会加载 Skill 列表和发现结果", async () => {
     mockedConfigApi.getSkills.mockResolvedValue({
       skills: [

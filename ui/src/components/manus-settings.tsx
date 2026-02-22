@@ -120,6 +120,7 @@ export function ManusSettings() {
   const [mcpPayload, setMcpPayload] = useState(MCP_EXAMPLE);
   const [mcpDialogError, setMcpDialogError] = useState<string | null>(null);
   const [a2aBaseUrl, setA2ABaseUrl] = useState("");
+  const [a2aDialogError, setA2ADialogError] = useState<string | null>(null);
   const [skillSourceType, setSkillSourceType] = useState<SkillSourceType>("mcp_registry");
   const [skillSourceRef, setSkillSourceRef] = useState("");
   const [skillManifest, setSkillManifest] = useState(`{\n  \"name\": \"demo-skill\",\n  \"runtime_type\": \"native\",\n  \"tools\": [\n    {\n      \"name\": \"run_demo\",\n      \"description\": \"Run demo action\",\n      \"parameters\": {\n        \"query\": {\n          \"type\": \"string\"\n        }\n      },\n      \"required\": [\"query\"],\n      \"entry\": {\n        \"exec_dir\": \"/home/ubuntu/workspace\",\n        \"command\": \"echo skill\"\n      }\n    }\n  ]\n}`);
@@ -165,6 +166,7 @@ export function ManusSettings() {
       setIsA2ADialogOpen(false);
       setIsSkillDialogOpen(false);
       setMcpDialogError(null);
+      setA2ADialogError(null);
       setSkillDialogError(null);
       setActiveTab("agent");
     }
@@ -224,15 +226,20 @@ export function ManusSettings() {
 
   async function handleAddA2AServer(): Promise<void> {
     if (!a2aBaseUrl.trim()) {
+      setA2ADialogError("请输入 A2A Agent 基础 URL");
       return;
     }
 
-    await addA2AServer({ base_url: a2aBaseUrl.trim() });
-    setMessage({
-      type: "success",
-      text: "A2A Agent 添加成功",
-    });
+    setA2ADialogError(null);
+    const added = await addA2AServer({ base_url: a2aBaseUrl.trim() });
+    if (!added) {
+      setA2ADialogError(
+        useUIStore.getState().message?.text || "新增 A2A 服务失败，请检查配置后重试"
+      );
+      return;
+    }
     setA2ABaseUrl("");
+    setA2ADialogError(null);
     setIsA2ADialogOpen(false);
   }
 
@@ -459,7 +466,15 @@ export function ManusSettings() {
                       </p>
                     </div>
 
-                    <Dialog open={isA2ADialogOpen} onOpenChange={setIsA2ADialogOpen}>
+                    <Dialog
+                      open={isA2ADialogOpen}
+                      onOpenChange={(nextOpen) => {
+                        setIsA2ADialogOpen(nextOpen);
+                        if (!nextOpen) {
+                          setA2ADialogError(null);
+                        }
+                      }}
+                    >
                       <DialogTrigger asChild>
                         <Button
                           className="h-10 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
@@ -478,9 +493,19 @@ export function ManusSettings() {
                         </DialogHeader>
                         <Input
                           value={a2aBaseUrl}
-                          onChange={(event) => setA2ABaseUrl(event.target.value)}
+                          onChange={(event) => {
+                            setA2ABaseUrl(event.target.value);
+                            if (a2aDialogError) {
+                              setA2ADialogError(null);
+                            }
+                          }}
                           placeholder="https://example.com/agent"
                         />
+                        {a2aDialogError ? (
+                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
+                            {a2aDialogError}
+                          </p>
+                        ) : null}
                         <div className="flex justify-end gap-2">
                           <Button
                             variant="outline"
@@ -645,7 +670,7 @@ export function ManusSettings() {
                           }}
                         />
                         {mcpDialogError ? (
-                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
                             {mcpDialogError}
                           </p>
                         ) : null}
@@ -855,7 +880,7 @@ export function ManusSettings() {
                         </label>
 
                         {skillDialogError ? (
-                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
                             {skillDialogError}
                           </p>
                         ) : null}

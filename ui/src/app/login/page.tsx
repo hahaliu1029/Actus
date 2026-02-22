@@ -38,6 +38,10 @@ export default function LoginPage() {
   };
 
   return (
+    <div
+      className="min-h-screen w-full bg-cover bg-center bg-no-repeat"
+      style={{backgroundImage: "url('/login-bg.png')"}}
+    >
     <main className="relative mx-auto flex min-h-screen w-full max-w-md items-center px-6 py-8">
       <div className="w-full rounded-2xl border border-border bg-card/80 p-6 shadow-[var(--shadow-elevated)] backdrop-blur-xl animate-scale-in">
         <h1 className="mb-2 text-2xl font-semibold text-foreground">登录 Actus</h1>
@@ -84,5 +88,6 @@ export default function LoginPage() {
         </p>
       </div>
     </main>
+    </div>
   );
 }

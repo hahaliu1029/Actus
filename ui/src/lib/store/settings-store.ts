@@ -43,7 +43,7 @@ type SettingsActions = {
   deleteMCPServer: (serverName: string) => Promise<void>;
   setMCPServerEnabled: (serverName: string, enabled: boolean) => Promise<void>;
   setMCPToolEnabled: (serverName: string, enabled: boolean) => Promise<void>;
-  addA2AServer: (params: CreateA2AServerParams) => Promise<void>;
+  addA2AServer: (params: CreateA2AServerParams) => Promise<boolean>;
   deleteA2AServer: (a2aId: string) => Promise<void>;
   setA2AServerEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
   setA2AToolEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
@@ -287,8 +287,10 @@ export const useSettingsStore = create<SettingsStore>()(
         await configApi.addA2AServer(params);
         await get().loadAll();
         reportSuccess("A2A Agent 已新增");
+        return true;
       } catch (error) {
         reportError(error, "新增 A2A 服务失败");
+        return false;
       }
     },
 

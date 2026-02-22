@@ -104,6 +104,7 @@ class AgentService:
             mcp_config=self._mcp_config,
             a2a_config=self._a2a_config,
             session_id=session.id,
+            user_id=session.user_id,
             # session_repository=self._session_repository,
             file_storage=self._file_storage,
             # file_repository=self._file_repository,

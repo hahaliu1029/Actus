@@ -24,6 +24,7 @@ type SessionState = {
   isLoadingSessions: boolean;
   isLoadingCurrentSession: boolean;
   isChatting: boolean;
+  chatSessionId: string | null;
   chatAbort: (() => void) | null;
   sessionsAbort: (() => void) | null;
 };
@@ -67,6 +68,7 @@ const initialState: SessionState = {
   isLoadingSessions: false,
   isLoadingCurrentSession: false,
   isChatting: false,
+  chatSessionId: null,
   chatAbort: null,
   sessionsAbort: null,
 };
@@ -592,7 +594,7 @@ export const useSessionStore = create<SessionStore>()(
     sendChat: async (sessionId, params) => {
       get().stopChat();
 
-      set({ isChatting: true });
+      set({ isChatting: true, chatSessionId: sessionId });
 
       const current = get().currentSession;
       const fallbackEventId =
@@ -613,14 +615,14 @@ export const useSessionStore = create<SessionStore>()(
       const clearChatState = () => {
         if (!abortRef) {
           shouldClearAbortAfterBind = true;
-          set({ isChatting: false });
+          set({ isChatting: false, chatSessionId: null });
           return;
         }
         set((state) => {
           if (!abortRef || state.chatAbort !== abortRef) {
             return {};
           }
-          return { isChatting: false, chatAbort: null };
+          return { isChatting: false, chatSessionId: null, chatAbort: null };
         });
       };
 
@@ -660,6 +662,7 @@ export const useSessionStore = create<SessionStore>()(
                   status: "completed",
                 },
                 isChatting: false,
+                chatSessionId: null,
               };
             }
 
@@ -671,6 +674,7 @@ export const useSessionStore = create<SessionStore>()(
                   status: "waiting",
                 },
                 isChatting: false,
+                chatSessionId: null,
               };
             }
 
@@ -682,6 +686,7 @@ export const useSessionStore = create<SessionStore>()(
                   status: "completed",
                 },
                 isChatting: false,
+                chatSessionId: null,
               };
             }
 
@@ -714,7 +719,7 @@ export const useSessionStore = create<SessionStore>()(
       if (chatAbort) {
         chatAbort();
       }
-      set({ chatAbort: null, isChatting: false });
+      set({ chatAbort: null, isChatting: false, chatSessionId: null });
     },
 
     stopSession: async (sessionId: string) => {

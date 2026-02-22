@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowUp, Loader2, Paperclip, X } from "lucide-react";
+import { ArrowUp, Loader2, Paperclip, Square, X } from "lucide-react";
 
 import type { FileInfo } from "@/lib/api/types";
 import { formatFileSize } from "@/lib/session-ui";
@@ -34,7 +34,11 @@ export function ChatInput({
   const fetchSessionFiles = useSessionStore((state) => state.fetchSessionFiles);
   const sendChat = useSessionStore((state) => state.sendChat);
   const uploadFile = useSessionStore((state) => state.uploadFile);
+  const stopSession = useSessionStore((state) => state.stopSession);
   const isChatting = useSessionStore((state) => state.isChatting);
+  const chatSessionId = useSessionStore((state) => state.chatSessionId);
+  const currentSession = useSessionStore((state) => state.currentSession);
+  const sessions = useSessionStore((state) => state.sessions);
   const setMessage = useUIStore((state) => state.setMessage);
 
   const [text, setText] = useState("");
@@ -131,8 +135,43 @@ export function ChatInput({
     }
   };
 
-  const isBusy = uploading || isChatting;
+  const sessionStatus = useMemo(() => {
+    if (!sessionId) {
+      return null;
+    }
+    if (currentSession?.session_id === sessionId) {
+      return currentSession.status;
+    }
+    return sessions.find((item) => item.session_id === sessionId)?.status ?? null;
+  }, [currentSession, sessionId, sessions]);
+  const isCurrentSessionStreaming =
+    Boolean(sessionId) && isChatting && chatSessionId === sessionId;
+  const isCurrentSessionRunning = sessionStatus === "running";
+  const showStopAction = Boolean(sessionId) && (isCurrentSessionStreaming || isCurrentSessionRunning);
+  const disableInput = uploading || showStopAction;
   const canSubmit = Boolean(text.trim()) || pendingFiles.length > 0;
+
+  const handleStopTask = async () => {
+    if (!sessionId) {
+      return;
+    }
+    try {
+      await stopSession(sessionId);
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "停止任务失败",
+      });
+    }
+  };
+
+  const handlePrimaryAction = () => {
+    if (showStopAction) {
+      void handleStopTask();
+      return;
+    }
+    void handleSubmit();
+  };
 
   return (
     <div
@@ -175,13 +214,14 @@ export function ChatInput({
         ref={textareaRef}
         rows={1}
         value={text}
+        disabled={disableInput}
         onChange={(event) => setText(event.target.value)}
         onKeyDown={(event) => {
           if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
             return;
           }
           event.preventDefault();
-          if (isBusy) {
+          if (disableInput) {
             return;
           }
           void handleSubmit();
@@ -194,7 +234,7 @@ export function ChatInput({
         <button
           onClick={handleUploadClick}
           className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={isBusy}
+          disabled={disableInput}
           aria-label="上传文件"
         >
           <Paperclip size={16} />
@@ -203,14 +243,18 @@ export function ChatInput({
         <div className="flex items-center gap-2">
           <span className="hidden text-xs text-muted-foreground sm:inline">Enter 发送，Shift+Enter 换行</span>
           <button
-            onClick={() => {
-              void handleSubmit();
-            }}
-            disabled={isBusy || !canSubmit}
+            onClick={handlePrimaryAction}
+            disabled={showStopAction ? false : disableInput || !canSubmit}
             className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground transition-all active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
-            aria-label="发送"
+            aria-label={showStopAction ? "停止任务" : "发送"}
           >
-            {isBusy ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={16} />}
+            {showStopAction ? (
+              <Square size={14} />
+            ) : uploading ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : (
+              <ArrowUp size={16} />
+            )}
           </button>
         </div>
       </div>

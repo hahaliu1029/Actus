@@ -93,7 +93,7 @@ export const WorkbenchTerminalPreview = memo(function WorkbenchTerminalPreview({
           ) : null}
 
           {realtimeError && !isHistoryMode ? (
-            <div className="mb-2 rounded-md border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-600">
+            <div className="mb-2 rounded-md border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
               {realtimeError}
             </div>
           ) : null}

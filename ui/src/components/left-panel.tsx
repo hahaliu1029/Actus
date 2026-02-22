@@ -29,7 +29,7 @@ export function LeftPanel() {
   const createSession = useSessionStore((state) => state.createSession);
   const deleteSession = useSessionStore((state) => state.deleteSession);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
-  const { theme, setTheme } = useTheme();
+  const { resolvedTheme, setTheme } = useTheme();
 
   useEffect(() => {
     void fetchSessions();
@@ -43,6 +43,9 @@ export function LeftPanel() {
     pathname?.startsWith("/sessions/") === true
       ? pathname.replace("/sessions/", "").split("/")[0]
       : null;
+  const isDarkMode = resolvedTheme === "dark";
+  const themeLabel =
+    resolvedTheme == null ? "切换主题" : isDarkMode ? "浅色模式" : "深色模式";
 
   const handleCreate = async () => {
     const createdId = await createSession();
@@ -128,12 +131,20 @@ export function LeftPanel() {
 
       <div className="mt-2 border-t border-border pt-2">
         <button
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          onClick={() => setTheme(isDarkMode ? "light" : "dark")}
+          className="relative flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
-          <Sun size={16} className="rotate-0 scale-100 transition-transform dark:-rotate-90 dark:scale-0" />
-          <Moon size={16} className="absolute rotate-90 scale-0 transition-transform dark:rotate-0 dark:scale-100" />
-          <span className="ml-4">{theme === "dark" ? "浅色模式" : "深色模式"}</span>
+          <span className="relative size-4">
+            <Sun
+              size={16}
+              className="absolute inset-0 rotate-0 scale-100 transition-transform dark:-rotate-90 dark:scale-0"
+            />
+            <Moon
+              size={16}
+              className="absolute inset-0 rotate-90 scale-0 transition-transform dark:rotate-0 dark:scale-100"
+            />
+          </span>
+          <span>{themeLabel}</span>
         </button>
       </div>
 

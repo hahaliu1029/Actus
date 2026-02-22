@@ -37,6 +37,7 @@ from app.domain.models.search import SearchResults
 from app.domain.models.session import SessionStatus
 from app.domain.models.skill import Skill
 from app.domain.models.tool_result import ToolResult
+from app.domain.models.user_tool_preference import ToolType
 
 # from app.domain.repositories.file_repository import FileRepository
 # from app.domain.repositories.session_repository import SessionRepository
@@ -45,6 +46,9 @@ from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
+from app.infrastructure.repositories.db_user_tool_preference_repository import (
+    DBUserToolPreferenceRepository,
+)
 from app.infrastructure.repositories.db_skill_repository import DBSkillRepository
 from app.infrastructure.storage.postgres import get_postgres
 from fastapi import UploadFile
@@ -67,6 +71,7 @@ class AgentTaskRunner(TaskRunner):
         mcp_config: MCPConfig,  # mcp配置
         a2a_config: A2AConfig,  # a2a配置
         session_id: str,  # 会话id
+        user_id: str | None,  # 用户id
         # session_repository: SessionRepository,  # 会话仓库
         file_storage: FileStorage,  # 文件存储桶
         # file_repository: FileRepository,  # 文件数据仓库
@@ -79,6 +84,7 @@ class AgentTaskRunner(TaskRunner):
         self._uow_factory = uow_factory
         self._uow = uow_factory()
         self._session_id = session_id
+        self._user_id = user_id
         # self._session_repository = session_repository
         self._sandbox = sandbox
         self._mcp_config = mcp_config
@@ -333,6 +339,70 @@ class AgentTaskRunner(TaskRunner):
             logger.warning(f"加载Skill列表失败，降级为空列表: {str(e)}")
             return []
 
+    async def _load_user_preferences_map(self, tool_type: ToolType) -> dict[str, bool]:
+        """加载用户在指定工具类型下的偏好映射。"""
+        if not self._user_id:
+            return {}
+
+        try:
+            postgres = get_postgres()
+            async with postgres.session_factory() as session:
+                pref_repository = DBUserToolPreferenceRepository(session)
+                preferences = await pref_repository.get_by_user_id(self._user_id, tool_type)
+                return {preference.tool_id: preference.enabled for preference in preferences}
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "加载用户工具偏好失败，降级为默认启用(user_id=%s, tool_type=%s): %s",
+                self._user_id,
+                tool_type.value,
+                str(e),
+            )
+            return {}
+
+    @staticmethod
+    def _apply_user_preferences_to_mcp_config(
+        mcp_config: MCPConfig, preference_map: dict[str, bool]
+    ) -> MCPConfig:
+        """将用户偏好应用到 MCP 配置并返回副本。"""
+        return MCPConfig(
+            mcpServers={
+                server_name: server_config.model_copy(
+                    deep=True,
+                    update={
+                        "enabled": bool(
+                            server_config.enabled
+                            and preference_map.get(server_name, True)
+                        )
+                    },
+                )
+                for server_name, server_config in mcp_config.mcpServers.items()
+            }
+        )
+
+    @staticmethod
+    def _apply_user_preferences_to_a2a_config(
+        a2a_config: A2AConfig, preference_map: dict[str, bool]
+    ) -> A2AConfig:
+        """将用户偏好应用到 A2A 配置并返回副本。"""
+        return A2AConfig(
+            a2a_servers=[
+                server.model_copy(
+                    deep=True,
+                    update={"enabled": bool(server.enabled and preference_map.get(server.id, True))},
+                )
+                for server in a2a_config.a2a_servers
+            ]
+        )
+
+    @staticmethod
+    def _filter_skills_by_user_preferences(
+        skills: list[Skill], preference_map: dict[str, bool]
+    ) -> list[Skill]:
+        """基于用户偏好过滤 Skill 列表。"""
+        return [skill for skill in skills if preference_map.get(skill.id, True)]
+
     async def _handle_tool_event(self, event: ToolEvent) -> None:
         """额外处理工具消息，使其前端交互更友好"""
         try:
@@ -500,9 +570,24 @@ class AgentTaskRunner(TaskRunner):
             # 2.确保沙箱、mcp、a2a均初始化完成
             logger.info(f"AgentTaskRunner任务处理开始")
             await self._sandbox.ensure_sandbox()
-            await self._mcp_tool.initialize(self._mcp_config)
-            await self._a2a_tool.initialize(self._a2a_config)
+            mcp_preference_map = await self._load_user_preferences_map(ToolType.MCP)
+            a2a_preference_map = await self._load_user_preferences_map(ToolType.A2A)
+            skill_preference_map = await self._load_user_preferences_map(ToolType.SKILL)
+            filtered_mcp_config = self._apply_user_preferences_to_mcp_config(
+                self._mcp_config,
+                mcp_preference_map,
+            )
+            filtered_a2a_config = self._apply_user_preferences_to_a2a_config(
+                self._a2a_config,
+                a2a_preference_map,
+            )
+            await self._mcp_tool.initialize(filtered_mcp_config)
+            await self._a2a_tool.initialize(filtered_a2a_config)
             enabled_skills = await self._load_enabled_skills()
+            enabled_skills = self._filter_skills_by_user_preferences(
+                enabled_skills,
+                skill_preference_map,
+            )
             await self._skill_tool.initialize(enabled_skills)
 
             # 3.循环读取任务中的输入消息队列
