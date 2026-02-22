@@ -180,21 +180,21 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
     activeTimestamp <= (snapshots[0]?.timestamp ?? 0);
 
   return (
-    <section className="flex h-full min-h-[560px] flex-col rounded-3xl border border-gray-200 bg-[#f5f5f4] p-3 shadow-sm">
+    <section className="flex h-full min-h-[560px] flex-col rounded-3xl border border-border bg-surface-2 p-3 shadow-[var(--shadow-card)]">
       <div className="mb-3 flex items-center justify-between">
-        <h2 className="text-[32px] font-semibold tracking-tight text-[#1f2937]">Actus 的电脑</h2>
+        <h2 className="text-[32px] font-semibold tracking-tight text-foreground">Actus 的电脑</h2>
         <Link
           href={`/sessions/${sessionId}/novnc`}
           target="_blank"
           rel="noreferrer"
-          className="inline-flex items-center rounded-xl border border-gray-200 bg-white p-2 text-gray-600 hover:bg-gray-50"
+          className="inline-flex items-center rounded-xl border border-border bg-card p-2 text-muted-foreground transition-colors hover:bg-accent"
           title="打开实时窗口（VNC）"
         >
           <Expand size={16} />
         </Link>
       </div>
 
-      <div className="mb-2 flex items-center gap-2 text-sm text-gray-600">
+      <div className="mb-2 flex items-center gap-2 text-sm text-muted-foreground">
         {selectedMode === "shell" ? <TerminalSquare size={14} /> : <Globe size={14} />}
         <span>
           {selectedMode === "shell"
@@ -214,10 +214,10 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
             }
           }}
           className={cn(
-            "rounded-full border px-2.5 py-1 text-xs",
+            "rounded-full border px-2.5 py-1 text-xs transition-colors",
             selectedMode === "shell"
-              ? "border-[#2f3b52] bg-[#2f3b52] text-white"
-              : "border-gray-200 bg-white text-gray-600 hover:bg-gray-50"
+              ? "border-accent-brand bg-accent-brand text-accent-brand-foreground"
+              : "border-border bg-card text-muted-foreground hover:bg-accent"
           )}
         >
           终端
@@ -232,16 +232,16 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
             }
           }}
           className={cn(
-            "rounded-full border px-2.5 py-1 text-xs",
+            "rounded-full border px-2.5 py-1 text-xs transition-colors",
             selectedMode === "browser"
-              ? "border-[#2f3b52] bg-[#2f3b52] text-white"
-              : "border-gray-200 bg-white text-gray-600 hover:bg-gray-50"
+              ? "border-accent-brand bg-accent-brand text-accent-brand-foreground"
+              : "border-border bg-card text-muted-foreground hover:bg-accent"
           )}
         >
           浏览器
         </button>
         {latestModeSnapshot == null ? (
-          <span className="text-xs text-gray-400">当前模式暂无可展示快照</span>
+          <span className="text-xs text-muted-foreground">当前模式暂无可展示快照</span>
         ) : null}
       </div>
 
@@ -293,19 +293,19 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
       </div>
 
       {atEarliestRecord ? (
-        <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-700">
+        <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-400">
           已到最早记录
         </div>
       ) : null}
 
       {snapshots.length === 0 ? (
-        <div className="mt-3 rounded-xl border border-dashed border-gray-300 bg-white px-3 py-3 text-sm text-gray-500">
+        <div className="mt-3 rounded-xl border border-dashed border-border-strong bg-card px-3 py-3 text-sm text-muted-foreground">
           暂无可回看状态
         </div>
       ) : null}
 
       {currentModeSnapshot == null && timelineSnapshot != null ? (
-        <p className="mt-2 text-xs text-gray-500">
+        <p className="mt-2 text-xs text-muted-foreground">
           该时间点没有 {selectedMode === "shell" ? "终端" : "浏览器"} 快照，已保留当前模式。
         </p>
       ) : null}

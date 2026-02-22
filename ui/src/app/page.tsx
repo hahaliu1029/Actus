@@ -31,14 +31,14 @@ export default function Page() {
   }, [fetchSessions]);
 
   return (
-    <div className="flex h-full min-h-screen flex-col bg-[#f8f8f7]">
+    <div className="flex h-full min-h-screen flex-col bg-surface-1">
       <ChatHeader />
 
       <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col justify-center px-4 pb-16 pt-10">
-        <h1 className="mb-2 text-5xl font-semibold leading-tight text-gray-800">
+        <h1 className="mb-2 text-5xl font-semibold leading-tight tracking-tight text-foreground animate-fade-in">
           你好，{user?.nickname || user?.username || "朋友"}
         </h1>
-        <p className="mb-6 text-sm text-gray-500">
+        <p className="mb-6 text-sm text-muted-foreground animate-fade-in" style={{ animationDelay: '80ms' }}>
           当前共有 {sessions.length} 个会话。开始一个任务，我会分步执行并持续反馈进度。
         </p>
 

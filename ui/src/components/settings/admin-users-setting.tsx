@@ -22,23 +22,23 @@ export function AdminUsersSetting() {
   return (
     <section className="space-y-3">
       <header className="flex items-center justify-between">
-        <h3 className="text-base font-semibold text-gray-800">用户管理</h3>
-        <span className="text-xs text-gray-500">总计 {total} 人</span>
+        <h3 className="text-base font-semibold text-foreground">用户管理</h3>
+        <span className="text-xs text-muted-foreground">总计 {total} 人</span>
       </header>
 
       {isLoading ? (
-        <div className="rounded-lg border bg-white px-3 py-2 text-sm text-gray-500">加载中...</div>
+        <div className="rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">加载中...</div>
       ) : null}
 
       <div className="space-y-2">
         {users.map((user) => (
-          <div key={user.id} className="rounded-lg border bg-white p-3">
+          <div key={user.id} className="rounded-lg border bg-card p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <p className="text-sm font-medium text-gray-800">
+                <p className="text-sm font-medium text-foreground">
                   {user.nickname || user.username || user.email || user.id}
                 </p>
-                <p className="text-xs text-gray-500">
+                <p className="text-xs text-muted-foreground">
                   {user.email || "无邮箱"} · {user.role}
                 </p>
               </div>
@@ -60,7 +60,7 @@ export function AdminUsersSetting() {
                 </select>
 
                 <button
-                  className="rounded border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50"
+                  className="rounded border border-destructive/30 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
                   onClick={() => {
                     void deleteUser(user.id);
                   }}

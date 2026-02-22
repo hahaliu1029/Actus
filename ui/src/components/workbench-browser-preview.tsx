@@ -25,23 +25,23 @@ export const WorkbenchBrowserPreview = memo(function WorkbenchBrowserPreview({
 
   if (!snapshot) {
     return (
-      <div className="flex h-full items-center justify-center rounded-xl border border-gray-200 bg-white text-sm text-gray-500">
+      <div className="flex h-full items-center justify-center rounded-xl border border-border bg-card text-sm text-muted-foreground">
         暂无可回看的浏览器状态
       </div>
     );
   }
 
   return (
-    <div className="flex h-full flex-col rounded-xl border border-gray-200 bg-white">
-      <div className="flex items-center gap-2 border-b border-gray-200 px-3 py-2">
-        <Globe size={14} className="text-gray-500" />
-        <p className="truncate text-sm text-gray-700">{pageUrl || "网页截图"}</p>
+    <div className="flex h-full flex-col rounded-xl border border-border bg-card">
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        <Globe size={14} className="text-muted-foreground" />
+        <p className="truncate text-sm text-foreground/85">{pageUrl || "网页截图"}</p>
         {pageUrl ? (
           <a
             href={pageUrl}
             target="_blank"
             rel="noreferrer"
-            className="ml-auto text-gray-500 hover:text-gray-700"
+            className="ml-auto text-muted-foreground hover:text-foreground"
           >
             <ExternalLink size={14} />
           </a>
@@ -50,7 +50,7 @@ export const WorkbenchBrowserPreview = memo(function WorkbenchBrowserPreview({
 
       <div className="relative flex-1 overflow-hidden p-2">
         {!screenshotSrc || imageBroken ? (
-          <div className="flex h-full min-h-[280px] items-center justify-center rounded-lg border border-dashed border-gray-300 bg-gray-50 text-sm text-gray-500">
+          <div className="flex h-full min-h-[280px] items-center justify-center rounded-lg border border-dashed border-border-strong bg-muted text-sm text-muted-foreground">
             <span className="inline-flex items-center gap-1">
               <ImageOff size={14} />
               截图不可用，请打开实时窗口查看
@@ -60,8 +60,8 @@ export const WorkbenchBrowserPreview = memo(function WorkbenchBrowserPreview({
           <button
             type="button"
             className={cn(
-              "h-full w-full overflow-hidden rounded-lg border border-gray-200 bg-gray-50",
-              "focus-visible:ring-2 focus-visible:ring-[#2f3b52]/30 focus-visible:outline-none"
+              "h-full w-full overflow-hidden rounded-lg border border-border bg-muted",
+              "focus-visible:ring-2 focus-visible:ring-accent-brand/30 focus-visible:outline-none"
             )}
             onClick={() => onPreviewImage(screenshotSrc, pageUrl || "网页截图")}
           >

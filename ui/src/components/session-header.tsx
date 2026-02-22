@@ -44,19 +44,19 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   };
 
   return (
-    <header className="sticky top-0 z-10 flex items-center justify-between border-b border-gray-200 bg-[#f8f8f7]/95 px-4 py-3 backdrop-blur-sm">
+    <header className="sticky top-0 z-10 flex items-center justify-between border-b border-border bg-surface-1/95 px-4 py-3 backdrop-blur-sm">
       <div className="min-w-0">
         <Link
           href="/"
-          className="mb-1 inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700"
+          className="mb-1 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
         >
           <House size={13} />
           返回主页
         </Link>
-        <h1 className="text-base font-semibold text-gray-800">
+        <h1 className="text-base font-semibold text-foreground">
           {session?.title || "未命名任务"}
         </h1>
-        <p className="text-xs text-gray-500">会话 ID：{sessionId}</p>
+        <p className="text-xs text-muted-foreground">会话 ID：{sessionId}</p>
       </div>
       {isMobile ? (
         <div className="flex items-center gap-2">
@@ -66,8 +66,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
               <Button
                 variant="outline"
                 size="icon"
-                className="rounded-xl border-gray-200 text-gray-700"
-                aria-label="更多操作"
+                className="rounded-xl border-border text-foreground/80"
               >
                 <EllipsisVertical size={16} />
               </Button>
@@ -103,7 +102,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
           <ManusSettings />
           <Button
             variant="outline"
-            className="rounded-xl border-gray-200 text-gray-700"
+            className="rounded-xl border-border text-foreground/80"
             onClick={() => {
               logout();
             }}
@@ -112,7 +111,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
           </Button>
           <Button
             variant="outline"
-            className="rounded-xl border-gray-200 text-gray-700"
+            className="rounded-xl border-border text-foreground/80"
             onClick={() => {
               void handleStop();
             }}
@@ -121,7 +120,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
           </Button>
           <Button
             variant="outline"
-            className="rounded-xl border-red-200 text-red-600 hover:bg-red-50 hover:text-red-600"
+            className="rounded-xl border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
             onClick={() => {
               setDeleteDialogOpen(true);
             }}
@@ -132,7 +131,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
       )}
 
       <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-        <DialogContent className="max-w-md rounded-2xl border-gray-200">
+        <DialogContent className="max-w-md rounded-2xl border-border">
           <DialogHeader>
             <DialogTitle className="text-xl">要删除任务信息吗？</DialogTitle>
             <DialogDescription className="leading-6">

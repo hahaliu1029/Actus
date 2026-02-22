@@ -9,19 +9,19 @@ export function ChatHeader() {
   const { user, logout } = useAuth();
 
   return (
-    <header className="flex items-center justify-between border-b bg-white px-4 py-3">
+    <header className="flex items-center justify-between border-b border-border bg-card px-4 py-3">
       <div className="flex items-center gap-3">
-        <Link href="/" className="text-lg font-semibold text-gray-800">
+        <Link href="/" className="text-lg font-semibold text-foreground">
           Actus
         </Link>
-        <span className="text-sm text-gray-500">
+        <span className="text-sm text-muted-foreground">
           你好，{user?.nickname || user?.username || "用户"}
         </span>
       </div>
       <div className="flex items-center gap-2">
         <ManusSettings />
         <button
-          className="rounded-md border px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50"
+          className="rounded-md border border-border px-3 py-1.5 text-sm text-foreground/80 transition-colors hover:bg-accent"
           onClick={() => logout()}
         >
           退出登录

@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Loader2, Plus, Trash } from "lucide-react";
+import { Loader2, Moon, Plus, Sun, Trash } from "lucide-react";
+import { useTheme } from "next-themes";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -28,6 +29,7 @@ export function LeftPanel() {
   const createSession = useSessionStore((state) => state.createSession);
   const deleteSession = useSessionStore((state) => state.deleteSession);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const { theme, setTheme } = useTheme();
 
   useEffect(() => {
     void fetchSessions();
@@ -56,19 +58,19 @@ export function LeftPanel() {
   };
 
   return (
-    <aside className="hidden h-screen w-[280px] border-r border-gray-200 bg-white p-3 md:flex md:flex-col">
+    <aside className="hidden h-screen w-[280px] border-r border-border bg-card p-3 md:flex md:flex-col">
       <button
         onClick={() => {
           void handleCreate();
         }}
-        className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-gray-200 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+        className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-border px-3 py-2 text-sm text-foreground/80 transition-colors hover:bg-accent"
       >
         <Plus size={16} /> 新建任务
       </button>
 
       <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
         {isLoadingSessions ? (
-          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500">
+          <div className="rounded-xl border border-border bg-muted px-3 py-2 text-sm text-muted-foreground">
             正在加载会话...
           </div>
         ) : null}
@@ -76,37 +78,37 @@ export function LeftPanel() {
         {sessions.map((session) => (
           <div
             key={session.session_id}
-            className={`group rounded-xl border px-3 py-2 ${
+            className={`group rounded-xl border px-3 py-2 transition-colors duration-150 ${
               currentSessionId === session.session_id
-                ? "border-gray-300 bg-gray-50"
-                : "border-transparent hover:border-gray-200 hover:bg-gray-50/60"
+                ? "border-border-strong bg-accent"
+                : "border-transparent hover:border-border hover:bg-accent/60"
             }`}
           >
             <button
               onClick={() => router.push(`/sessions/${session.session_id}`)}
               className="w-full text-left"
             >
-              <p className="truncate text-sm font-medium text-gray-800">
+              <p className="truncate text-sm font-medium text-foreground">
                 {session.title || "未命名会话"}
               </p>
-              <p className="truncate text-xs text-gray-500">
+              <p className="truncate text-xs text-muted-foreground">
                 {session.latest_message || "暂无消息"}
               </p>
             </button>
             <div className="mt-1 flex items-center justify-between">
               <div className="flex items-center gap-1.5">
-                <span className="inline-flex items-center gap-1 text-[11px] text-gray-400">
+                <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
                   {session.status === "running" ? (
                     <Loader2 size={11} className="animate-spin text-amber-500" />
                   ) : null}
                   {session.status}
                 </span>
                 {session.unread_message_count > 0 ? (
-                  <span className="rounded-full bg-gray-900 px-1.5 py-0.5 text-[10px] text-white">
+                  <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">
                     {session.unread_message_count}
                   </span>
                 ) : null}
-                <span className="text-[11px] text-gray-300">
+                <span className="text-[11px] text-muted-foreground/60">
                   {formatRelativeTime(session.latest_message_at)}
                 </span>
               </div>
@@ -114,7 +116,7 @@ export function LeftPanel() {
                 onClick={() => {
                   setDeletingSessionId(session.session_id);
                 }}
-                className="invisible rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-red-600 group-hover:visible"
+                className="invisible rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive group-hover:visible"
                 aria-label="删除会话"
               >
                 <Trash size={14} />
@@ -124,8 +126,19 @@ export function LeftPanel() {
         ))}
       </div>
 
+      <div className="mt-2 border-t border-border pt-2">
+        <button
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Sun size={16} className="rotate-0 scale-100 transition-transform dark:-rotate-90 dark:scale-0" />
+          <Moon size={16} className="absolute rotate-90 scale-0 transition-transform dark:rotate-0 dark:scale-100" />
+          <span className="ml-4">{theme === "dark" ? "浅色模式" : "深色模式"}</span>
+        </button>
+      </div>
+
       <Dialog open={Boolean(deletingSessionId)} onOpenChange={(open) => !open && setDeletingSessionId(null)}>
-        <DialogContent className="max-w-md rounded-2xl border-gray-200">
+        <DialogContent className="max-w-md rounded-2xl border-border">
           <DialogHeader>
             <DialogTitle className="text-xl">要删除任务信息吗？</DialogTitle>
             <DialogDescription className="leading-6">

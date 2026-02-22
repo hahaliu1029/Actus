@@ -217,23 +217,23 @@ export function ManusSettings() {
   return (
     <Dialog open={open} onOpenChange={handleMainDialogOpen}>
       <DialogTrigger asChild>
-        <button className="inline-flex h-9 w-9 items-center justify-center rounded-md border text-gray-700 transition-colors hover:bg-gray-50">
+        <button className="inline-flex h-9 w-9 items-center justify-center rounded-md border text-foreground/85 transition-colors hover:bg-accent">
           <Settings size={16} />
         </button>
       </DialogTrigger>
 
-      <DialogContent className="!max-w-[980px] max-h-[88vh] gap-0 overflow-hidden rounded-[24px] border border-slate-200 p-0 shadow-[0_30px_80px_rgba(15,23,42,0.28)]">
-        <DialogHeader className="border-b border-slate-200 px-7 py-6">
-          <DialogTitle className="text-[40px] font-semibold tracking-tight text-slate-800">
+      <DialogContent className="!max-w-[980px] max-h-[88vh] gap-0 overflow-hidden rounded-[24px] border border-border p-0 shadow-[var(--shadow-float)]">
+        <DialogHeader className="border-b border-border px-7 py-6">
+          <DialogTitle className="text-3xl font-semibold tracking-tight text-foreground">
             Actus 设置
           </DialogTitle>
-          <DialogDescription className="text-sm text-slate-500">
+          <DialogDescription className="text-sm text-muted-foreground">
             在此管理您的 Actus 设置。
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid h-[640px] grid-cols-[232px_minmax(0,1fr)]">
-          <aside className="border-r border-slate-200 bg-slate-100/70 px-4 py-5">
+          <aside className="border-r border-border bg-muted/70 px-4 py-5">
             <div className="space-y-1">
               {TABS.map((tab) => {
                 const Icon = tab.icon;
@@ -244,8 +244,8 @@ export function ManusSettings() {
                     onClick={() => setActiveTab(tab.key)}
                     className={`flex h-10 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors ${
                       isActive
-                        ? "bg-slate-700 text-white shadow-sm"
-                        : "text-slate-700 hover:bg-white hover:shadow-sm"
+                        ? "bg-primary text-primary-foreground shadow-sm"
+                        : "text-foreground/85 hover:bg-card hover:shadow-sm"
                     }`}
                   >
                     <Icon size={15} />
@@ -256,10 +256,10 @@ export function ManusSettings() {
             </div>
           </aside>
 
-          <section className="flex min-h-0 flex-col bg-white">
+          <section className="flex min-h-0 flex-col bg-card">
             <div className="min-h-0 flex-1 overflow-y-auto px-7 py-6">
               {isLoading ? (
-                <div className="mb-5 inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-sm text-slate-600">
+                <div className="mb-5 inline-flex items-center gap-2 rounded-lg border border-border bg-muted/80 px-3 py-2 text-sm text-muted-foreground">
                   <LoaderCircle className="size-4 animate-spin" />
                   正在加载设置...
                 </div>
@@ -267,11 +267,11 @@ export function ManusSettings() {
 
               {activeTab === "agent" ? (
                 <div className="space-y-4">
-                  <h3 className="text-[34px] font-semibold tracking-tight text-slate-800">
+                  <h3 className="text-2xl font-semibold tracking-tight text-foreground">
                     通用配置
                   </h3>
                   <div className="grid max-w-[420px] grid-cols-1 gap-5">
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       最大计划迭代次数
                       <Input
                         type="number"
@@ -284,12 +284,12 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
-                      <p className="mt-1 text-xs text-slate-500">
+                      <p className="mt-1 text-xs text-muted-foreground">
                         执行 Agent 最大能迭代循环调用工具的次数。
                       </p>
                     </label>
 
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       最大重试次数
                       <Input
                         type="number"
@@ -302,10 +302,10 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
-                      <p className="mt-1 text-xs text-slate-500">默认情况下最大重试次数。</p>
+                      <p className="mt-1 text-xs text-muted-foreground">默认情况下最大重试次数。</p>
                     </label>
 
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       最大搜索结果
                       <Input
                         type="number"
@@ -318,8 +318,7 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
-                      <p className="mt-1 text-xs text-slate-500">
-                        每个搜索步骤包含的最大结果数量。
+                      <p className="mt-1 text-xs text-muted-foreground">
                       </p>
                     </label>
                   </div>
@@ -328,11 +327,11 @@ export function ManusSettings() {
 
               {activeTab === "llm" ? (
                 <div className="space-y-4">
-                  <h3 className="text-[34px] font-semibold tracking-tight text-slate-800">
+                  <h3 className="text-2xl font-semibold tracking-tight text-foreground">
                     模型提供商
                   </h3>
                   <div className="grid max-w-[420px] grid-cols-1 gap-5">
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       提供商基础地址（base_url）
                       <Input
                         value={llmForm.base_url}
@@ -343,7 +342,7 @@ export function ManusSettings() {
                       />
                     </label>
 
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       提供商密钥
                       <Input
                         type="password"
@@ -355,7 +354,7 @@ export function ManusSettings() {
                       />
                     </label>
 
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       模型名
                       <Input
                         value={llmForm.model_name}
@@ -366,7 +365,7 @@ export function ManusSettings() {
                       />
                     </label>
 
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       temperature
                       <Input
                         type="number"
@@ -382,7 +381,7 @@ export function ManusSettings() {
                       />
                     </label>
 
-                    <label className="text-sm text-slate-700">
+                    <label className="text-sm text-foreground/85">
                       max_tokens
                       <Input
                         type="number"
@@ -404,10 +403,10 @@ export function ManusSettings() {
                 <div className="space-y-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
-                      <h3 className="text-[34px] font-semibold tracking-tight text-slate-800">
+                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
                         A2A Agent 配置
                       </h3>
-                      <p className="text-sm text-slate-500">
+                      <p className="text-sm text-muted-foreground">
                         通过 A2A 协议连接远程 Agent，增强系统能力。
                       </p>
                     </div>
@@ -415,14 +414,14 @@ export function ManusSettings() {
                     <Dialog open={isA2ADialogOpen} onOpenChange={setIsA2ADialogOpen}>
                       <DialogTrigger asChild>
                         <Button
-                          className="h-10 rounded-xl bg-slate-700 text-white hover:bg-slate-800"
+                          className="h-10 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
                           disabled={!isAdmin}
                         >
                           <Plus className="size-4" />
                           添加远程Agent
                         </Button>
                       </DialogTrigger>
-                        <DialogContent className="max-w-[560px] rounded-2xl border border-slate-200 shadow-2xl">
+                        <DialogContent className="max-w-[560px] rounded-2xl border border-border shadow-[var(--shadow-float)]">
                         <DialogHeader>
                           <DialogTitle>添加远程 Agent</DialogTitle>
                           <DialogDescription>
@@ -437,13 +436,13 @@ export function ManusSettings() {
                         <div className="flex justify-end gap-2">
                           <Button
                             variant="outline"
-                            className="h-10 rounded-xl border-slate-200 px-5"
+                            className="h-10 rounded-xl border-border px-5"
                             onClick={() => setIsA2ADialogOpen(false)}
                           >
                             取消
                           </Button>
                           <Button
-                            className="h-10 rounded-xl bg-slate-700 px-5 text-white hover:bg-slate-800"
+                            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
                             onClick={() => {
                               void handleAddA2AServer();
                             }}
@@ -455,9 +454,9 @@ export function ManusSettings() {
                     </Dialog>
                   </div>
 
-                  <div className="space-y-3 rounded-2xl border border-slate-200/70 bg-slate-50/30 p-3">
+                  <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/30 p-3">
                     {a2aServers.length === 0 ? (
-                      <div className="rounded-xl border border-dashed bg-white p-6 text-center text-sm text-slate-500">
+                      <div className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
                         暂无 A2A Agent，可通过右上角按钮新增。
                       </div>
                     ) : null}
@@ -479,23 +478,23 @@ export function ManusSettings() {
                       }
 
                       return (
-                        <div key={server.id} className="rounded-2xl border bg-white px-4 py-3 shadow-sm">
+                        <div key={server.id} className="rounded-2xl border bg-card px-4 py-3 shadow-[var(--shadow-subtle)]">
                           <div className="flex flex-wrap items-start justify-between gap-3">
                             <div className="min-w-0 space-y-2">
                               <div className="flex flex-wrap items-center gap-2">
-                                <p className="text-lg font-semibold text-slate-800">{server.name}</p>
+                                <p className="text-lg font-semibold text-foreground">{server.name}</p>
                                 <Badge
                                   variant="secondary"
                                   className={
                                     server.enabled
-                                      ? "rounded-md bg-slate-100 text-slate-700"
-                                      : "rounded-md bg-slate-700 text-white"
+                                      ? "rounded-md bg-muted text-foreground/85"
+                                      : "rounded-md bg-primary text-primary-foreground"
                                   }
                                 >
                                   {server.enabled ? "启用" : "禁用"}
                                 </Badge>
                               </div>
-                              <p className="text-sm text-slate-500">
+                              <p className="text-sm text-muted-foreground">
                                 {server.description || "未获取到远程 Agent 描述"}
                               </p>
                               <div className="flex flex-wrap gap-2">
@@ -510,7 +509,7 @@ export function ManusSettings() {
                             <div className="flex items-center gap-3">
                               <button
                                 type="button"
-                                className="inline-flex size-8 items-center justify-center rounded-md border border-slate-200 text-slate-500 transition-colors hover:border-red-200 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+                                className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                                 disabled={!isAdmin}
                                 onClick={() => {
                                   void deleteA2AServer(server.id);
@@ -519,10 +518,10 @@ export function ManusSettings() {
                                 <Trash2 className="size-4" />
                               </button>
 
-                              <div className="flex items-center gap-2 text-xs text-slate-500">
+                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
                                 全局
                                 <Switch
-                                  className="data-[state=checked]:bg-slate-700"
+                                  className="data-[state=checked]:bg-primary"
                                   checked={server.enabled}
                                   disabled={!isAdmin}
                                   onCheckedChange={(checked) => {
@@ -533,10 +532,10 @@ export function ManusSettings() {
                             </div>
                           </div>
 
-                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-slate-500">
+                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-muted-foreground">
                             个人
                             <Switch
-                              className="data-[state=checked]:bg-slate-700"
+                              className="data-[state=checked]:bg-primary"
                               checked={tool?.enabled_user ?? userEnabled}
                               onCheckedChange={(checked) => {
                                 void setA2AToolEnabled(server.id, checked);
@@ -554,10 +553,10 @@ export function ManusSettings() {
                 <div className="space-y-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
-                      <h3 className="text-[34px] font-semibold tracking-tight text-slate-800">
+                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
                         MCP 服务器
                       </h3>
-                      <p className="text-sm text-slate-500">
+                      <p className="text-sm text-muted-foreground">
                         通过标准 JSON MCP 配置接入外部工具能力。
                       </p>
                     </div>
@@ -573,14 +572,14 @@ export function ManusSettings() {
                     >
                       <DialogTrigger asChild>
                         <Button
-                          className="h-10 rounded-xl bg-slate-700 text-white hover:bg-slate-800"
+                          className="h-10 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
                           disabled={!isAdmin}
                         >
                           <Plus className="size-4" />
                           添加服务器
                         </Button>
                       </DialogTrigger>
-                      <DialogContent className="max-w-[680px] rounded-2xl border border-slate-200 shadow-2xl">
+                      <DialogContent className="max-w-[680px] rounded-2xl border border-border shadow-[var(--shadow-float)]">
                         <DialogHeader>
                           <DialogTitle>添加新的 MCP 服务器</DialogTitle>
                           <DialogDescription>
@@ -605,13 +604,13 @@ export function ManusSettings() {
                         <div className="flex justify-end gap-2">
                           <Button
                             variant="outline"
-                            className="h-10 rounded-xl border-slate-200 px-5"
+                            className="h-10 rounded-xl border-border px-5"
                             onClick={() => setIsMCPDialogOpen(false)}
                           >
                             取消
                           </Button>
                           <Button
-                            className="h-10 rounded-xl bg-slate-700 px-5 text-white hover:bg-slate-800"
+                            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
                             onClick={() => {
                               void handleAddMCPServer();
                             }}
@@ -623,9 +622,9 @@ export function ManusSettings() {
                     </Dialog>
                   </div>
 
-                  <div className="space-y-3 rounded-2xl border border-slate-200/70 bg-slate-50/30 p-3">
+                  <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/30 p-3">
                     {mcpServers.length === 0 ? (
-                      <div className="rounded-xl border border-dashed bg-white p-6 text-center text-sm text-slate-500">
+                      <div className="rounded-xl border border-dashed bg-card p-6 text-center text-sm text-muted-foreground">
                         暂无 MCP 服务器，可通过右上角按钮新增。
                       </div>
                     ) : null}
@@ -639,16 +638,16 @@ export function ManusSettings() {
                       );
 
                       return (
-                        <div key={server.server_name} className="rounded-2xl border bg-white px-4 py-3 shadow-sm">
+                        <div key={server.server_name} className="rounded-2xl border bg-card px-4 py-3 shadow-[var(--shadow-subtle)]">
                           <div className="flex flex-wrap items-start justify-between gap-3">
                             <div className="min-w-0 space-y-2">
                               <div className="flex flex-wrap items-center gap-2">
-                                <p className="text-lg font-semibold text-slate-800">
+                                <p className="text-lg font-semibold text-foreground">
                                   {server.server_name}
                                 </p>
                                 <Badge
                                   variant="secondary"
-                                  className="rounded-md bg-slate-100 text-slate-700"
+                                  className="rounded-md bg-muted text-foreground/85"
                                 >
                                   {server.transport}
                                 </Badge>
@@ -656,8 +655,8 @@ export function ManusSettings() {
                                   variant="secondary"
                                   className={
                                     server.enabled
-                                      ? "rounded-md bg-slate-100 text-slate-700"
-                                      : "rounded-md bg-slate-700 text-white"
+                                      ? "rounded-md bg-muted text-foreground/85"
+                                      : "rounded-md bg-primary text-primary-foreground"
                                   }
                                 >
                                   {server.enabled ? "启用" : "禁用"}
@@ -682,7 +681,7 @@ export function ManusSettings() {
                             <div className="flex items-center gap-3">
                               <button
                                 type="button"
-                                className="inline-flex size-8 items-center justify-center rounded-md border border-slate-200 text-slate-500 transition-colors hover:border-red-200 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+                                className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                                 disabled={!isAdmin}
                                 onClick={() => {
                                   void deleteMCPServer(server.server_name);
@@ -691,10 +690,10 @@ export function ManusSettings() {
                                 <Trash2 className="size-4" />
                               </button>
 
-                              <div className="flex items-center gap-2 text-xs text-slate-500">
+                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
                                 全局
                                 <Switch
-                                  className="data-[state=checked]:bg-slate-700"
+                                  className="data-[state=checked]:bg-primary"
                                   checked={server.enabled}
                                   disabled={!isAdmin}
                                   onCheckedChange={(checked) => {
@@ -705,10 +704,10 @@ export function ManusSettings() {
                             </div>
                           </div>
 
-                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-slate-500">
+                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-muted-foreground">
                             个人
                             <Switch
-                              className="data-[state=checked]:bg-slate-700"
+                              className="data-[state=checked]:bg-primary"
                               checked={tool?.enabled_user ?? userEnabled}
                               onCheckedChange={(checked) => {
                                 void setMCPToolEnabled(server.server_name, checked);
@@ -726,17 +725,17 @@ export function ManusSettings() {
                 isAdmin ? (
                   <AdminUsersSetting />
                 ) : (
-                  <p className="rounded-lg border border-dashed p-5 text-sm text-slate-500">
+                  <p className="rounded-lg border border-dashed p-5 text-sm text-muted-foreground">
                     需要管理员权限才可管理用户。
                   </p>
                 )
               ) : null}
             </div>
 
-            <div className="flex items-center justify-end gap-3 border-t border-slate-200 px-7 py-4">
+            <div className="flex items-center justify-end gap-3 border-t border-border px-7 py-4">
               <Button
                 variant="outline"
-                className="h-10 rounded-xl border-slate-200 px-6 text-slate-700"
+                className="h-10 rounded-xl border-border px-6 text-foreground/85"
                 onClick={() => {
                   setOpen(false);
                 }}
@@ -744,7 +743,7 @@ export function ManusSettings() {
                 取消
               </Button>
               <Button
-                className="h-10 rounded-xl bg-slate-700 px-6 text-white hover:bg-slate-800"
+                className="h-10 rounded-xl bg-primary px-6 text-primary-foreground hover:bg-primary/90"
                 disabled={isLoading || (!isAdmin && (activeTab === "agent" || activeTab === "llm"))}
                 onClick={() => {
                   void handleSave();

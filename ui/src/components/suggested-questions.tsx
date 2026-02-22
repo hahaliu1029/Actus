@@ -27,7 +27,7 @@ export function SuggestedQuestions({
         <Button
           key={question}
           variant="outline"
-          className="cursor-pointer rounded-xl border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:bg-gray-50"
+          className="cursor-pointer rounded-xl border-border bg-card text-muted-foreground transition-all hover:border-border-strong hover:-translate-y-0.5 hover:shadow-[var(--shadow-card)]"
           onClick={() => onSelect?.(question)}
         >
           {question}

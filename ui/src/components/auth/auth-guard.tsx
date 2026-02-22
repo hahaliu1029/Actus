@@ -37,7 +37,7 @@ export function AuthGuard({ children }: Readonly<{ children: React.ReactNode }>)
   }, [accessToken, isHydrated, isPublicRoute, pathname, router]);
 
   if (!isHydrated) {
-    return <div className="p-6 text-sm text-gray-500">正在初始化登录状态...</div>;
+    return <div className="p-6 text-sm text-muted-foreground">正在初始化登录状态...</div>;
   }
 
   if (!accessToken && !isPublicRoute) {

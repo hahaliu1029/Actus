@@ -17,7 +17,7 @@ export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) 
     <AuthGuard>
       <GlobalNotice />
       {isPublicRoute ? (
-        <div className="min-h-screen bg-[#f8f8f7]">{children}</div>
+        <div className="min-h-screen bg-surface-1">{children}</div>
       ) : (
         <SidebarProvider
           className="h-screen overflow-hidden"
@@ -29,7 +29,7 @@ export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) 
           }}
         >
           <LeftPanel />
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-[#f8f8f7]">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-surface-1">
             {children}
           </div>
         </SidebarProvider>

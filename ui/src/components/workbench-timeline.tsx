@@ -92,20 +92,20 @@ export function WorkbenchTimeline({
   };
 
   return (
-    <div className="space-y-2 rounded-xl border border-gray-200 bg-white/95 p-3">
+    <div className="space-y-2 rounded-xl border border-border bg-card/95 p-3 backdrop-blur-sm">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={onToggleLock}
-            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+            className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
             title={isLocked ? "取消锁定视图" : "锁定当前视图"}
           >
             {isLocked ? <Lock size={12} /> : <Unlock size={12} />}
             {isLocked ? "已锁定" : "自动跟随"}
           </button>
           {hasNewRealtime && isHistory ? (
-            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700">
+            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
               有新实时状态
             </span>
           ) : null}
@@ -114,7 +114,7 @@ export function WorkbenchTimeline({
           <button
             type="button"
             onClick={onBackToLive}
-            className="rounded-lg bg-[#2f3b52] px-2.5 py-1 text-xs font-medium text-white hover:bg-[#253248]"
+            className="rounded-lg bg-accent-brand px-2.5 py-1 text-xs font-medium text-accent-brand-foreground transition-colors hover:opacity-90"
           >
             回到实时
           </button>
@@ -123,9 +123,9 @@ export function WorkbenchTimeline({
 
       <div className="space-y-2">
         <div className="relative h-5">
-          <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-gray-200" />
+          <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-border" />
           <div
-            className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[#2f3b52]"
+            className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-accent-brand"
             style={{ width: `${currentPercent}%` }}
           />
           {snapshots.map((snapshot, index) => {
@@ -146,7 +146,7 @@ export function WorkbenchTimeline({
             );
           })}
           <span
-            className="pointer-events-none absolute top-1/2 block h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#2f3b52] bg-white shadow"
+            className="pointer-events-none absolute top-1/2 block h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-accent-brand bg-card shadow"
             style={{ left: `${currentPercent}%` }}
           />
           <input
@@ -167,7 +167,7 @@ export function WorkbenchTimeline({
             )}
           />
         </div>
-        <div className="flex items-center gap-3 text-[11px] text-gray-500">
+        <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
           <span className="inline-flex items-center gap-1">
             <span className="h-2 w-2 rounded-full bg-emerald-500" />
             Shell
@@ -177,12 +177,12 @@ export function WorkbenchTimeline({
             Browser
           </span>
         </div>
-        <div className="flex items-center justify-between text-xs text-gray-500">
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
           <span>{selectedSnapshot ? formatWorkbenchClock(selectedSnapshot.timestamp * 1000) : "--:--:--"}</span>
           <span
             className={cn(
               "rounded-full px-2 py-0.5",
-              isHistory ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"
+              isHistory ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400" : "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
             )}
           >
             {isHistory ? "历史" : "实时"}

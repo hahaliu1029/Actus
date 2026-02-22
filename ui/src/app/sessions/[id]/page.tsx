@@ -73,11 +73,11 @@ function renderMessageAttachments(
       {attachments.map((file) => (
         <button
           key={file.id}
-          className="flex min-w-0 items-center justify-between rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-left text-xs hover:border-gray-300 hover:bg-white"
+          className="flex min-w-0 items-center justify-between rounded-xl border border-border bg-muted px-3 py-2 text-left text-xs hover:border-border-strong hover:bg-card"
           onClick={() => onPreviewFile(file)}
         >
-          <span className="truncate font-medium text-gray-700">{file.filename}</span>
-          <span className="ml-2 shrink-0 text-gray-400">{formatFileSize(file.size)}</span>
+          <span className="truncate font-medium text-foreground/85">{file.filename}</span>
+          <span className="ml-2 shrink-0 text-muted-foreground">{formatFileSize(file.size)}</span>
         </button>
       ))}
     </div>
@@ -94,7 +94,7 @@ function renderStepStatusIcon(status: string) {
   if (status === "running" || status === "started") {
     return <Loader2 size={16} className="animate-spin text-amber-500" />;
   }
-  return <CircleDashed size={16} className="animate-pulse text-gray-400" />;
+  return <CircleDashed size={16} className="animate-pulse text-muted-foreground" />;
 }
 
 function getEventTime(eventData: Record<string, unknown>) {
@@ -205,8 +205,8 @@ function renderEventItem(
     if (role === "user") {
       return (
         <div key={eventKey} className="mt-4 flex flex-col items-end">
-          <div className="mb-1 text-xs text-gray-400">{timeText}</div>
-          <div className="max-w-[90%] rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-700 shadow-sm">
+          <div className="mb-1 text-xs text-muted-foreground">{timeText}</div>
+          <div className="max-w-[90%] rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
             <p className="whitespace-pre-wrap leading-7">{message || "（空消息）"}</p>
             {renderMessageAttachments(attachments, onPreviewFile)}
           </div>
@@ -217,13 +217,13 @@ function renderEventItem(
     return (
       <div key={eventKey} className="mt-4">
         <div className="mb-1 flex items-center justify-between">
-          <div className="flex items-center gap-1.5 text-sm font-semibold text-gray-700">
+          <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground/85">
             <Bot size={16} />
             Actus
           </div>
-          <span className="text-xs text-gray-400">{timeText}</span>
+          <span className="text-xs text-muted-foreground">{timeText}</span>
         </div>
-        <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-700 shadow-sm">
+        <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
           <MarkdownRenderer content={message || "（空消息）"} />
           {renderMessageAttachments(attachments, onPreviewFile)}
           {isStreamingAssistant ? (
@@ -242,26 +242,26 @@ function renderEventItem(
     const done = steps.filter((step) => String(step.status || "") === "completed").length;
 
     return (
-      <div key={eventKey} className="mt-3 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700">
+      <div key={eventKey} className="mt-3 rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground/85">
         <div className="flex items-center justify-between gap-2">
           <p className="font-medium">进度已更新</p>
-          <span className="text-xs text-gray-500">
+          <span className="text-xs text-muted-foreground">
             {done}/{steps.length}
           </span>
         </div>
-        <p className="mt-1 text-xs text-gray-500">完整步骤请查看底部任务摘要。</p>
+        <p className="mt-1 text-xs text-muted-foreground">完整步骤请查看底部任务摘要。</p>
       </div>
     );
   }
 
   if (event.event === "step") {
     return (
-      <div key={eventKey} className="mt-3 flex items-start gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2">
+      <div key={eventKey} className="mt-3 flex items-start gap-2 rounded-xl border border-border bg-card px-3 py-2">
         <div className="mt-[3px]">{renderStepStatusIcon(String(event.data.status || "pending"))}</div>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm text-gray-700">{String(event.data.description || "执行步骤")}</p>
+          <p className="truncate text-sm text-foreground/85">{String(event.data.description || "执行步骤")}</p>
         </div>
-        <span className="shrink-0 text-xs text-gray-400">{getEventTime(event.data)}</span>
+        <span className="shrink-0 text-xs text-muted-foreground">{getEventTime(event.data)}</span>
       </div>
     );
   }
@@ -272,13 +272,13 @@ function renderEventItem(
       return (
         <div key={eventKey} className="mt-4">
           <div className="mb-1 flex items-center justify-between">
-            <div className="flex items-center gap-1.5 text-sm font-semibold text-gray-700">
+            <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground/85">
               <Bot size={16} />
               Actus
             </div>
-            <span className="text-xs text-gray-400">{getEventTime(event.data)}</span>
+            <span className="text-xs text-muted-foreground">{getEventTime(event.data)}</span>
           </div>
-          <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-700 shadow-sm">
+          <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
             <p className="whitespace-pre-wrap leading-7">{display.detail}</p>
           </div>
         </div>
@@ -290,29 +290,29 @@ function renderEventItem(
     const visual = parseToolVisual(event.data);
 
     return (
-      <div key={eventKey} className="mt-3 rounded-xl border border-gray-200 bg-white px-3 py-2">
+      <div key={eventKey} className="mt-3 rounded-xl border border-border bg-card px-3 py-2">
         <div className="flex items-center justify-between gap-2">
-          <p className="truncate text-sm font-medium text-gray-700">{display.title}</p>
+          <p className="truncate text-sm font-medium text-foreground/85">{display.title}</p>
           <span
             className={cn(
               "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-xs",
               isRunning
-                ? "bg-amber-50 text-amber-700"
-                : "bg-emerald-50 text-emerald-700"
+                ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
+                : "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
             )}
           >
             {isRunning ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
             {statusText}
           </span>
         </div>
-        {display.detail ? <p className="mt-1 truncate text-xs text-gray-500">{display.detail}</p> : null}
+        {display.detail ? <p className="mt-1 truncate text-xs text-muted-foreground">{display.detail}</p> : null}
 
         {visual.screenshots.length > 0 ? (
           <div className="mt-2 flex flex-wrap gap-2">
             {visual.screenshots.map((shot) => (
               <button
                 key={shot.src}
-                className="overflow-hidden rounded-lg border border-gray-200"
+                className="overflow-hidden rounded-lg border border-border"
                 onClick={() => onPreviewImage(shot.src, shot.title)}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -327,7 +327,7 @@ function renderEventItem(
             {visual.searchResults.slice(0, 4).map((item) => (
               <button
                 key={item.url}
-                className="flex min-w-0 gap-2 rounded-lg border border-gray-200 bg-gray-50 p-2 text-left hover:bg-white"
+                className="flex min-w-0 gap-2 rounded-lg border border-border bg-muted p-2 text-left hover:bg-card"
                 onClick={() =>
                   onPreviewImage(
                     toDisplayImageUrl(toSearchThumbnail(item.url, 1200)),
@@ -339,11 +339,11 @@ function renderEventItem(
                 <img
                   src={toDisplayImageUrl(toSearchThumbnail(item.url, 360))}
                   alt={item.title}
-                  className="h-16 w-24 shrink-0 rounded-md border border-gray-200 object-cover"
+                  className="h-16 w-24 shrink-0 rounded-md border border-border object-cover"
                 />
                 <div className="min-w-0">
-                  <p className="truncate text-xs font-medium text-gray-700">{item.title}</p>
-                  <p className="line-clamp-2 text-[11px] text-gray-500">{item.snippet || item.url}</p>
+                  <p className="truncate text-xs font-medium text-foreground/85">{item.title}</p>
+                  <p className="line-clamp-2 text-[11px] text-muted-foreground">{item.snippet || item.url}</p>
                 </div>
               </button>
             ))}
@@ -352,7 +352,7 @@ function renderEventItem(
 
         {!isRunning && visual.filepath ? (
           <button
-            className="mt-2 inline-flex items-center rounded-lg border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100"
+            className="mt-2 inline-flex items-center rounded-lg border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-400 dark:hover:bg-blue-500/20"
             onClick={() => onPreviewFilePath(visual.filepath!)}
           >
             查看文件：{getPathTail(visual.filepath)}
@@ -361,10 +361,10 @@ function renderEventItem(
 
         {!isRunning && visual.mcpResult ? (
           <details className="mt-2">
-            <summary className="cursor-pointer text-xs text-gray-500 hover:text-gray-700">
+            <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
               查看调用结果
             </summary>
-            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-2 text-xs text-gray-600">
+            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 text-xs text-muted-foreground">
               {visual.mcpResult}
             </pre>
           </details>
@@ -377,7 +377,7 @@ function renderEventItem(
     return (
       <div
         key={eventKey}
-        className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600"
+        className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400"
       >
         错误：{String(event.data.error || "未知错误")}
       </div>
@@ -389,7 +389,7 @@ function renderEventItem(
     (typeof event.data.message === "string" && event.data.message);
   if (fallbackText) {
     return (
-      <div key={eventKey} className="mt-3 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700">
+      <div key={eventKey} className="mt-3 rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground/85">
         {fallbackText}
       </div>
     );
@@ -675,10 +675,10 @@ export default function SessionPage() {
       <div className="mx-auto flex w-full max-w-[1700px] flex-1 gap-4 px-4 py-4">
         <main className="flex min-w-0 flex-1 flex-col">
           <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-2 text-xs text-gray-500">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <span>当前状态：{visibleSession?.status || "pending"}</span>
               {sessionRunning ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-amber-700">
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
                   <Loader2 size={12} className="animate-spin" />
                   正在执行中
                 </span>
@@ -688,8 +688,7 @@ export default function SessionPage() {
               {isMobile ? (
                 <Button
                   variant="outline"
-                  className="rounded-xl border-gray-200"
-                  onClick={() => setMobileWorkbenchOpen(true)}
+                  className="rounded-xl border-border"
                 >
                   <PanelRightOpen size={16} />
                   打开工作区
@@ -697,8 +696,7 @@ export default function SessionPage() {
               ) : (
                 <Button
                   variant="outline"
-                  className="rounded-xl border-gray-200"
-                  onClick={() => setDesktopWorkbenchVisible((prev) => !prev)}
+                  className="rounded-xl border-border"
                 >
                   {desktopWorkbenchVisible ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
                   {desktopWorkbenchVisible ? "隐藏工作区" : "显示工作区"}
@@ -708,14 +706,14 @@ export default function SessionPage() {
           </div>
 
           {isLoadingCurrentSession ? (
-            <div className="mb-4 rounded-2xl border border-gray-200 bg-white p-3 text-sm text-gray-500">
+            <div className="mb-4 rounded-2xl border border-border bg-card p-3 text-sm text-muted-foreground">
               正在加载会话内容...
             </div>
           ) : null}
 
           <div ref={eventScrollRef} className="flex-1 space-y-0 overflow-y-auto pb-4">
             {eventList.length === 0 ? (
-              <div className="rounded-2xl border border-gray-200 bg-white p-3 text-sm text-gray-500">
+              <div className="rounded-2xl border border-border bg-card p-3 text-sm text-muted-foreground">
                 暂无会话事件，输入消息后开始。
               </div>
             ) : (
@@ -741,14 +739,14 @@ export default function SessionPage() {
               )
             )}
             {isChatting ? (
-              <div className="mt-3 inline-flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+              <div className="mt-3 inline-flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
                 <Loader2 size={14} className="animate-spin" />
                 正在持续生成执行结果...
               </div>
             ) : null}
           </div>
 
-          <div className="mt-3 border-t border-gray-200 bg-[#f8f8f7] pt-3">
+          <div className="mt-3 border-t border-border bg-surface-1 pt-3">
             <SessionTaskDock
               className="mb-3"
               summary={progressSummary}
@@ -775,7 +773,7 @@ export default function SessionPage() {
       </div>
 
       <Sheet open={mobileWorkbenchOpen} onOpenChange={setMobileWorkbenchOpen}>
-        <SheetContent side="right" className="w-full max-w-none border-l-gray-200 p-3 sm:max-w-[620px]">
+        <SheetContent side="right" className="w-full max-w-none border-l-border p-3 sm:max-w-[620px]">
           <WorkbenchPanel
             sessionId={sessionId}
             snapshots={workbenchSnapshots}
@@ -797,46 +795,44 @@ export default function SessionPage() {
         }}
       >
         <SheetContent side="right" className="w-full max-w-none p-0 sm:max-w-xl">
-          <SheetHeader className="border-b border-gray-200 px-5 py-4">
+          <SheetHeader className="border-b border-border px-5 py-4">
             <SheetTitle className="truncate">{previewTitle}</SheetTitle>
             <SheetDescription>文件内容预览</SheetDescription>
           </SheetHeader>
 
           <div className="min-h-0 flex-1 overflow-auto p-5">
             {previewLoading ? (
-              <div className="flex items-center gap-2 text-sm text-gray-500">
-                <Loader2 size={16} className="animate-spin" />
-                正在加载预览...
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
               </div>
             ) : null}
 
             {!previewLoading && previewError ? (
-              <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-600">
+              <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
                 {previewError}
               </div>
             ) : null}
 
             {!previewLoading && !previewError && previewKind === "text" ? (
-              <pre className="overflow-auto rounded-xl border border-gray-200 bg-gray-50 p-4 text-xs leading-6 text-gray-700">
+              <pre className="overflow-auto rounded-xl border border-border bg-muted p-4 text-xs leading-6 text-foreground/85">
                 {previewTextContent}
               </pre>
             ) : null}
 
             {!previewLoading && !previewError && previewKind === "image" && previewBlobUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={previewBlobUrl} alt={previewTitle} className="h-auto max-w-full rounded-xl border border-gray-200" />
+              <img src={previewBlobUrl} alt={previewTitle} className="h-auto max-w-full rounded-xl border border-border" />
             ) : null}
 
             {!previewLoading && !previewError && previewKind === "pdf" && previewBlobUrl ? (
               <iframe
                 title={previewTitle}
                 src={previewBlobUrl}
-                className="h-[72vh] w-full rounded-xl border border-gray-200"
+                className="h-[72vh] w-full rounded-xl border border-border"
               />
             ) : null}
 
             {!previewLoading && !previewError && previewKind === "unsupported" ? (
-              <div className="rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm text-gray-600">
+              <div className="rounded-xl border border-border bg-muted p-4 text-sm text-muted-foreground">
                 此文件暂不支持在线预览，可下载后查看。
                 {previewFile ? (
                   <Button
@@ -863,12 +859,12 @@ export default function SessionPage() {
           }
         }}
       >
-        <DialogContent className="max-w-5xl border-gray-200 p-3">
-          <DialogTitle className="px-2 text-sm text-gray-700">{imagePreview?.title || "图片预览"}</DialogTitle>
+        <DialogContent className="max-w-5xl border-border p-3">
+          <DialogTitle className="px-2 text-sm text-foreground/85">{imagePreview?.title || "图片预览"}</DialogTitle>
           <div className="max-h-[80vh] overflow-auto">
             {imagePreview ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={imagePreview.src} alt={imagePreview.title} className="h-auto w-full rounded-lg border border-gray-200" />
+              <img src={imagePreview.src} alt={imagePreview.title} className="h-auto w-full rounded-lg border border-border" />
             ) : null}
           </div>
         </DialogContent>

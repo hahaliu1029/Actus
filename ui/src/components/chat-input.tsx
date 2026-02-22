@@ -137,8 +137,8 @@ export function ChatInput({
   return (
     <div
       className={cn(
-        "rounded-3xl border border-gray-200 bg-white p-3 shadow-sm transition",
-        "focus-within:border-gray-300 focus-within:shadow-md",
+        "rounded-3xl border border-border bg-card p-3 shadow-[var(--shadow-card)] transition-all",
+        "focus-within:border-border-strong focus-within:shadow-[var(--shadow-elevated)] focus-within:ring-1 focus-within:ring-ring/20",
         className
       )}
     >
@@ -155,12 +155,12 @@ export function ChatInput({
           {pendingFiles.map((file) => (
             <div
               key={file.id}
-              className="flex max-w-[280px] items-center gap-2 rounded-xl border border-gray-200 bg-gray-50/80 px-2 py-1.5 text-xs"
+              className="flex max-w-[280px] items-center gap-2 rounded-xl border border-border bg-muted/80 px-2 py-1.5 text-xs"
             >
-              <span className="truncate font-medium text-gray-700">{file.filename}</span>
-              <span className="shrink-0 text-gray-400">{formatFileSize(file.size)}</span>
+              <span className="truncate font-medium text-foreground/85">{file.filename}</span>
+              <span className="shrink-0 text-muted-foreground">{formatFileSize(file.size)}</span>
               <button
-                className="shrink-0 text-gray-500 hover:text-gray-700"
+                className="shrink-0 text-muted-foreground hover:text-foreground"
                 onClick={() => removePendingFile(file.id)}
                 aria-label={`移除文件 ${file.filename}`}
               >
@@ -187,13 +187,13 @@ export function ChatInput({
           void handleSubmit();
         }}
         placeholder="分配一个任务或提问任何问题..."
-        className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-gray-700 outline-none placeholder:text-gray-400"
+        className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
       />
 
       <div className="mt-2 flex items-center justify-between px-1">
         <button
           onClick={handleUploadClick}
-          className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           disabled={isBusy}
           aria-label="上传文件"
         >
@@ -201,13 +201,13 @@ export function ChatInput({
         </button>
 
         <div className="flex items-center gap-2">
-          <span className="hidden text-xs text-gray-400 sm:inline">Enter 发送，Shift+Enter 换行</span>
+          <span className="hidden text-xs text-muted-foreground sm:inline">Enter 发送，Shift+Enter 换行</span>
           <button
             onClick={() => {
               void handleSubmit();
             }}
             disabled={isBusy || !canSubmit}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-gray-900 text-white disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground transition-all active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="发送"
           >
             {isBusy ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={16} />}

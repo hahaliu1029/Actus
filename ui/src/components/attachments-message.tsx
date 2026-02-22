@@ -30,7 +30,7 @@ export function AttachmentsMessage({className, role}: AttachmentsMessageProps) {
             <Item
               key={file.id}
               variant="outline"
-              className="w-[280px] bg-white p-2 flex-shrink-0 gap-2"
+              className="w-[280px] bg-card p-2 flex-shrink-0 gap-2"
             >
               {/* 左侧文件图标 */}
               <ItemMedia>
@@ -42,7 +42,7 @@ export function AttachmentsMessage({className, role}: AttachmentsMessageProps) {
               </ItemMedia>
               {/* 文件信息 */}
               <ItemContent className="gap-0">
-                <ItemTitle className="text-sm text-gray-700">{file.filename}</ItemTitle>
+                <ItemTitle className="text-sm text-foreground/85">{file.filename}</ItemTitle>
                 <ItemDescription className="text-xs">{file.extension} · {file.size}</ItemDescription>
               </ItemContent>
               <ItemActions>
@@ -64,7 +64,7 @@ export function AttachmentsMessage({className, role}: AttachmentsMessageProps) {
             <Item
               key={file.id}
               variant="outline"
-              className="w-[280px] bg-white p-2 flex-shrink-0 gap-2"
+              className="w-[280px] bg-card p-2 flex-shrink-0 gap-2"
             >
               {/* 左侧文件图标 */}
               <ItemMedia>
@@ -76,7 +76,7 @@ export function AttachmentsMessage({className, role}: AttachmentsMessageProps) {
               </ItemMedia>
               {/* 文件信息 */}
               <ItemContent className="gap-0">
-                <ItemTitle className="text-sm text-gray-700">{file.filename}</ItemTitle>
+                <ItemTitle className="text-sm text-foreground/85">{file.filename}</ItemTitle>
                 <ItemDescription className="text-xs">{file.extension} · {file.size}</ItemDescription>
               </ItemContent>
               <ItemActions>
@@ -88,7 +88,7 @@ export function AttachmentsMessage({className, role}: AttachmentsMessageProps) {
           ))}
           <Button variant="outline" className="cursor-pointer">
             <FileSearch size={16}/>
-            <span className="text-sm text-gray-700">查看此任务中所有的文件</span>
+            <span className="text-sm text-foreground/85">查看此任务中所有的文件</span>
           </Button>
         </div>
       </div>

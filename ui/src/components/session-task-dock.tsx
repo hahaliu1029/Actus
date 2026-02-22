@@ -38,7 +38,7 @@ export const SessionTaskDock = memo(function SessionTaskDock({
   return (
     <div className={cn("w-full", className)}>
       <div className="mx-auto w-full max-w-4xl">
-        <div className="rounded-2xl border border-gray-200 bg-white shadow-lg">
+        <div className="rounded-2xl border border-border bg-card shadow-[var(--shadow-elevated)]">
           <button
             type="button"
             aria-label={expanded ? "收起任务摘要" : "展开任务摘要"}
@@ -46,12 +46,12 @@ export const SessionTaskDock = memo(function SessionTaskDock({
             onClick={() => setExpanded((prev) => !prev)}
           >
             <div className="min-w-0">
-              <p className="text-xs text-gray-500">任务摘要</p>
-              <p className="truncate text-sm font-medium text-gray-800">{summary.currentStep}</p>
+              <p className="text-xs text-muted-foreground">任务摘要</p>
+              <p className="truncate text-sm font-medium text-foreground">{summary.currentStep}</p>
             </div>
-            <div className="flex shrink-0 items-center gap-2 text-xs text-gray-600">
+            <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
               {running ? (
-                <span className="rounded-full bg-amber-50 px-2 py-0.5 text-amber-700">运行中</span>
+                <span className="rounded-full bg-amber-50 px-2 py-0.5 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">运行中</span>
               ) : null}
               <span>{progressText}</span>
               <span>{`文件 ${files.length}`}</span>
@@ -60,17 +60,17 @@ export const SessionTaskDock = memo(function SessionTaskDock({
           </button>
 
           {expanded ? (
-            <div className="border-t border-gray-200 px-4 pb-4 pt-3">
+            <div className="border-t border-border px-4 pb-4 pt-3">
               <div role="tablist" className="mb-3 flex items-center gap-2">
                 <button
                   type="button"
                   role="tab"
                   aria-selected={activeTab === "progress"}
                   className={cn(
-                    "rounded-full border px-3 py-1 text-xs",
+                    "rounded-full border px-3 py-1 text-xs transition-colors",
                     activeTab === "progress"
-                      ? "border-gray-900 bg-gray-900 text-white"
-                      : "border-gray-200 bg-white text-gray-600"
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-border bg-card text-muted-foreground hover:bg-accent"
                   )}
                   onClick={() => setActiveTab("progress")}
                 >
@@ -81,10 +81,10 @@ export const SessionTaskDock = memo(function SessionTaskDock({
                   role="tab"
                   aria-selected={activeTab === "files"}
                   className={cn(
-                    "rounded-full border px-3 py-1 text-xs",
+                    "rounded-full border px-3 py-1 text-xs transition-colors",
                     activeTab === "files"
-                      ? "border-gray-900 bg-gray-900 text-white"
-                      : "border-gray-200 bg-white text-gray-600"
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-border bg-card text-muted-foreground hover:bg-accent"
                   )}
                   onClick={() => setActiveTab("files")}
                 >
@@ -93,21 +93,21 @@ export const SessionTaskDock = memo(function SessionTaskDock({
               </div>
 
               {activeTab === "progress" ? (
-                <div className="space-y-2 rounded-xl border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700">
+                <div className="space-y-2 rounded-xl border border-border bg-muted p-3 text-sm text-foreground/85">
                   <p>{`完成度：${summary.completed}/${summary.total}`}</p>
                   <p>{`当前步骤：${summary.currentStep}`}</p>
                 </div>
               ) : (
                 <div className="space-y-2">
                   {sortedFiles.length === 0 ? (
-                    <p className="rounded-xl border border-gray-200 bg-gray-50 p-3 text-sm text-gray-500">
+                    <p className="rounded-xl border border-border bg-muted p-3 text-sm text-muted-foreground">
                       暂无文件
                     </p>
                   ) : (
                     sortedFiles.map((file) => (
                       <div
                         key={file.id}
-                        className="flex items-center justify-between gap-2 rounded-xl border border-gray-200 bg-gray-50 p-2"
+                        className="flex items-center justify-between gap-2 rounded-xl border border-border bg-muted p-2"
                       >
                         <button
                           type="button"
@@ -115,13 +115,13 @@ export const SessionTaskDock = memo(function SessionTaskDock({
                           className="min-w-0 flex-1 text-left"
                           onClick={() => onPreviewFile(file)}
                         >
-                          <p className="truncate text-sm font-medium text-gray-700">{file.filename}</p>
-                          <p className="text-xs text-gray-500">{formatFileSize(file.size)}</p>
+                          <p className="truncate text-sm font-medium text-foreground/85">{file.filename}</p>
+                          <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
                         </button>
                         <button
                           type="button"
                           aria-label={`下载文件 ${file.filename}`}
-                          className="shrink-0 rounded-lg border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 hover:bg-gray-100"
+                          className="shrink-0 rounded-lg border border-border bg-card px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-accent"
                           onClick={(event) => {
                             event.stopPropagation();
                             onDownloadFile(file);
