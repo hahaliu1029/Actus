@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockReplace = vi.fn();
@@ -44,6 +45,7 @@ describe("SessionHeader", () => {
     mockUseIsMobile.mockReturnValue(false);
     mockStopSession.mockResolvedValue(undefined);
     mockDeleteSession.mockResolvedValue(undefined);
+    vi.clearAllMocks();
   });
 
   it("桌面端显示返回主页、设置、退出登录、停止、删除", () => {
@@ -56,14 +58,23 @@ describe("SessionHeader", () => {
     expect(screen.getByRole("button", { name: "删除" })).toBeInTheDocument();
   });
 
-  it("移动端通过更多菜单触发退出登录和停止操作", () => {
+  it("移动端通过更多菜单触发退出登录和停止操作", async () => {
+    const user = userEvent.setup();
     mockUseIsMobile.mockReturnValue(true);
     render(<SessionHeader sessionId="sid-2" />);
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "更多操作" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "退出登录" }));
-    fireEvent.pointerDown(screen.getByRole("button", { name: "更多操作" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "停止" }));
+    // 点击更多操作按钮打开菜单
+    const moreButton = screen.getByRole("button", { name: "更多操作" });
+    await user.click(moreButton);
+
+    // 等待菜单打开并点击退出登录
+    const logoutMenuItem = await screen.findByRole("menuitem", { name: "退出登录" });
+    await user.click(logoutMenuItem);
+
+    // 再次打开菜单点击停止
+    await user.click(moreButton);
+    const stopMenuItem = await screen.findByRole("menuitem", { name: "停止" });
+    await user.click(stopMenuItem);
 
     expect(mockLogout).toHaveBeenCalledTimes(1);
     expect(mockStopSession).toHaveBeenCalledWith("sid-2");

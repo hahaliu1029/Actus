@@ -697,6 +697,7 @@ export default function SessionPage() {
                 <Button
                   variant="outline"
                   className="rounded-xl border-border"
+                  onClick={() => setDesktopWorkbenchVisible(!desktopWorkbenchVisible)}
                 >
                   {desktopWorkbenchVisible ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
                   {desktopWorkbenchVisible ? "隐藏工作区" : "显示工作区"}

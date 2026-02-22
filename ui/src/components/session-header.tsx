@@ -67,6 +67,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
                 variant="outline"
                 size="icon"
                 className="rounded-xl border-border text-foreground/80"
+                aria-label="更多操作"
               >
                 <EllipsisVertical size={16} />
               </Button>
