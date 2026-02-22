@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     sandbox_https_proxy: Optional[str] = None
     sandbox_http_proxy: Optional[str] = None
     sandbox_no_proxy: Optional[str] = None
+    container_timezone: str = "UTC"
 
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"
