@@ -1,0 +1,88 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useState } from "react";
+
+import { useAuth } from "@/hooks/use-auth";
+
+export default function LoginPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const { login } = useAuth();
+
+  const [identity, setIdentity] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const redirectTo = searchParams.get("redirect") || "/";
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    setIsSubmitting(true);
+
+    try {
+      const isEmail = identity.includes("@");
+      await login({
+        ...(isEmail ? { email: identity } : { username: identity }),
+        password,
+      });
+      router.replace(redirectTo);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "登录失败，请重试");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <main className="mx-auto flex min-h-screen w-full max-w-md items-center px-6 py-8">
+      <div className="w-full rounded-2xl border bg-white p-6 shadow-sm">
+        <h1 className="mb-2 text-2xl font-semibold text-gray-800">登录 Actus</h1>
+        <p className="mb-6 text-sm text-gray-500">使用用户名或邮箱登录</p>
+
+        <form className="space-y-4" onSubmit={handleSubmit}>
+          <label className="block text-sm text-gray-700">
+            用户名或邮箱
+            <input
+              className="mt-1 w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-gray-400"
+              value={identity}
+              onChange={(e) => setIdentity(e.target.value)}
+              required
+            />
+          </label>
+
+          <label className="block text-sm text-gray-700">
+            密码
+            <input
+              type="password"
+              className="mt-1 w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-gray-400"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+          </label>
+
+          {error ? <p className="text-sm text-red-600">{error}</p> : null}
+
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="w-full rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+          >
+            {isSubmitting ? "登录中..." : "登录"}
+          </button>
+        </form>
+
+        <p className="mt-4 text-center text-sm text-gray-500">
+          还没有账号？
+          <Link href="/register" className="ml-1 text-gray-800 underline">
+            立即注册
+          </Link>
+        </p>
+      </div>
+    </main>
+  );
+}

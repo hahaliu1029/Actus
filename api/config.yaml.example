@@ -1,0 +1,44 @@
+# Actus 运行时配置模板
+# 复制此文件为 config.yaml 并填入你的实际配置
+# cp config.yaml.example config.yaml
+
+llm_config:
+  base_url: https://api.deepseek.com/    # LLM API 地址
+  api_key: ''                             # 你的 LLM API Key
+  model_name: deepseek-reasoner           # 模型名称
+  temperature: 0.7
+  max_tokens: 8192
+
+agent_config:
+  max_iterations: 100                     # Agent 最大迭代次数
+  max_retries: 3                          # 工具调用最大重试次数
+  max_search_results: 10                  # 搜索结果数量
+
+mcp_config:
+  mcpServers:
+    # 示例：高德地图 MCP 服务器
+    # amap-maps-streamableHTTP:
+    #   transport: streamable_http
+    #   enabled: true
+    #   description: null
+    #   env: null
+    #   command: null
+    #   args: null
+    #   url: https://mcp.amap.com/mcp?key=YOUR_AMAP_KEY
+    #   headers: null
+    #
+    # 示例：Jina MCP 服务器
+    # jina-mcp-server:
+    #   transport: streamable_http
+    #   enabled: true
+    #   description: null
+    #   env: null
+    #   command: null
+    #   args: null
+    #   url: https://mcp.jina.ai/v1
+    #   headers:
+    #     Authorization: Bearer YOUR_JINA_API_KEY
+    #   server_name: jina-mcp-server
+
+a2a_config:
+  a2a_servers: []
