@@ -24,7 +24,7 @@
 - **Planner + ReAct Flow** — Two-phase agent orchestration: plan first, then execute
 - **Sandboxed Execution** — Docker-isolated code execution environment
 - **Remote Desktop** — Real-time sandbox desktop preview via noVNC, watch Agent actions directly in your browser
-- **Browser Automation** — Web interaction powered by Playwright + browser-use
+- **Browser Automation** — Web interaction powered by Playwright with a custom DOM index extraction approach, connecting to sandbox Chromium via CDP for precise element-level interaction
 - **Multi-model Support** — Compatible with OpenAI API format (DeepSeek, Kimi, etc.)
 - **Streaming Output** — Real-time streaming responses with chain-of-thought display
 - **File Management** — MinIO/S3-compatible object storage for file upload/download
@@ -143,7 +143,7 @@ Actus/
 | Object Storage | MinIO / S3-compatible |
 | LLM Integration | OpenAI SDK (DeepSeek, Kimi, etc.) |
 | Agent Protocols | MCP SDK + A2A + Skill Layer |
-| Browser Automation | Playwright + browser-use |
+| Browser Automation | Playwright + Custom DOM Index Extraction |
 | Sandbox | Docker container isolation |
 | Auth | JWT + bcrypt |
 | Testing | pytest + Vitest |

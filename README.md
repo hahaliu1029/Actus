@@ -24,7 +24,7 @@
 - **Planner + ReAct 流程** — 先规划再执行的两阶段 Agent 流程编排
 - **沙箱执行** — Docker 隔离的代码执行环境，安全运行用户代码
 - **远程桌面** — 基于 noVNC 的沙箱桌面实时预览，浏览器内直接查看 Agent 操作画面
-- **浏览器自动化** — 基于 Playwright + browser-use 的网页操作能力
+- **浏览器自动化** — 基于 Playwright + DOM 索引方案的网页操作能力，通过 CDP 连接沙箱 Chromium，实时提取可交互元素并精确操作
 - **多模型支持** — 兼容 OpenAI API 格式（DeepSeek、Kimi 等）
 - **流式输出** — 实时流式响应，支持思考过程展示
 - **文件管理** — MinIO/S3 兼容的对象存储，支持文件上传下载
@@ -144,7 +144,7 @@ Actus/
 | 对象存储 | MinIO / S3 兼容 |
 | LLM 接入 | OpenAI SDK（DeepSeek、Kimi 等） |
 | Agent 协议 | MCP SDK + A2A + Skill Layer |
-| 浏览器自动化 | Playwright + browser-use |
+| 浏览器自动化 | Playwright + 自研 DOM 索引提取 |
 | 沙箱 | Docker 容器隔离 |
 | 认证 | JWT + bcrypt |
 | 测试 | pytest + Vitest |

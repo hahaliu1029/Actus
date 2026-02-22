@@ -11,7 +11,7 @@
 - A2A (Agent-to-Agent) 智能体间通信协议支持
 - Planner + ReAct 两阶段 Agent 流程编排
 - Docker 沙箱隔离代码执行环境
-- Playwright + browser-use 浏览器自动化
+- Playwright + DOM 索引提取方案浏览器自动化，通过 CDP 连接沙箱 Chromium，实时提取可交互元素并通过选择器精确操作
 - 多模型支持（兼容 OpenAI API 格式：DeepSeek、Kimi 等）
 - 流式输出与思考过程展示
 - MinIO/S3 兼容的文件上传下载
