@@ -1,11 +1,20 @@
 from typing import Any
 
+import pytest
+
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import ErrorEvent, MessageEvent, ToolEvent
 from app.domain.models.memory import Memory
 from app.domain.models.tool_result import ToolResult
 from app.domain.services.agents.base import BaseAgent
 from app.domain.services.tools.base import BaseTool, tool
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture()
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 class _DummySessionRepo:

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from alembic import command
@@ -65,7 +66,8 @@ async def lifespan(app: FastAPI):
     logger.info("Manus应用正在初始化")
 
     # 2.运行数据库迁移(将数据同步到生产环境)
-    alembic_cfg = Config("alembic.ini")
+    _api_root = Path(__file__).resolve().parent.parent
+    alembic_cfg = Config(str(_api_root / "alembic.ini"))
     alembic_db_url = _build_alembic_database_url()
     alembic_cfg.set_main_option("sqlalchemy.url", alembic_db_url)
     logger.info(f"数据库迁移开始，连接地址: {_mask_database_url(alembic_db_url)}")

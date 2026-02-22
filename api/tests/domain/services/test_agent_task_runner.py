@@ -1,6 +1,15 @@
+import pytest
+
 from app.domain.models.event import MessageEvent
 from app.domain.models.file import File
 from app.domain.services.agent_task_runner import AgentTaskRunner
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture()
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 class _DummyInputStream:
