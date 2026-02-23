@@ -55,6 +55,7 @@ class Settings(BaseSettings):
 
     # Skill v2 配置
     skills_root_dir: str = "/app/data/skills"
+    skill_sandbox_bundle_root: str = "/home/ubuntu/workspace/.skills"
     skill_backend: str = "filesystem"
     skill_blocked_command_patterns: str = "rm -rf,:(){,mkfs.,shutdown,reboot"
 

@@ -27,6 +27,13 @@ Rate limit:
 
 Note: Most errors are returned via the response envelope (`code`/`msg`) while HTTP status may remain 200.
 
+## Skill Runtime Sync (Directory Skills)
+
+- HTTP APIs are unchanged for this behavior; sync is an internal runtime mechanism.
+- At session startup, the runner syncs a selected initial skill subset to sandbox first, then backfills remaining enabled skills in background.
+- During one session, skill bundle version is static (no mid-session refresh).
+- For native skills, when `entry.exec_dir` is missing, runtime defaults to `/home/ubuntu/workspace/.skills/<skill_id>`.
+
 ## OpenAPI
 
 - Swagger UI: `/docs`

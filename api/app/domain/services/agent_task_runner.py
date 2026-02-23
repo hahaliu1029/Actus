@@ -49,6 +49,7 @@ from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
+from app.domain.services.tools.skill_bundle_sync import SkillBundleSyncManager
 from app.infrastructure.repositories.db_user_tool_preference_repository import (
     DBUserToolPreferenceRepository,
 )
@@ -99,19 +100,27 @@ class AgentTaskRunner(TaskRunner):
         self._mcp_tool = MCPTool()
         self._a2a_config = a2a_config
         self._a2a_tool = A2ATool()
+        settings = get_settings()
+        self._skill_repository = FileSkillRepository(settings.skills_root_dir)
+        self._skill_bundle_sync = SkillBundleSyncManager(
+            sandbox=sandbox,
+            skills_root_dir=settings.skills_root_dir,
+            sandbox_skill_root=settings.skill_sandbox_bundle_root,
+        )
         self._skill_tool = SkillTool(
             sandbox=sandbox,
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
             risk_mode=(skill_risk_policy or SkillRiskPolicy()).mode.value,
+            bundle_sync_manager=self._skill_bundle_sync,
+            skill_sandbox_bundle_root=settings.skill_sandbox_bundle_root,
         )
-        settings = get_settings()
-        self._skill_repository = FileSkillRepository(settings.skills_root_dir)
         self._skill_index_service = SkillIndexService(
             skill_repository=self._skill_repository,
             skills_root=settings.skills_root_dir,
         )
         self._skill_selector = SkillSelector(default_top_k=12)
+        self._session_skill_pool: list[Skill] = []
         self._file_storage = file_storage
         # self._file_repository = file_repository
         self._browser = browser
@@ -359,7 +368,13 @@ class AgentTaskRunner(TaskRunner):
     ) -> list[Skill]:
         skills = await self._load_enabled_skills()
         filtered = self._filter_skills_by_user_preferences(skills, preference_map)
-        return self._skill_selector.select(filtered, user_message)
+        return self._select_skills_from_pool(filtered, user_message)
+
+    def _select_skills_from_pool(self, skill_pool: list[Skill], user_message: str) -> list[Skill]:
+        """从给定技能池中选择本轮激活的技能子集。"""
+        if not skill_pool:
+            return []
+        return self._skill_selector.select(skill_pool, user_message)
 
     @staticmethod
     def _strip_skill_frontmatter(skill_md: str) -> str:
@@ -631,10 +646,16 @@ class AgentTaskRunner(TaskRunner):
         except Exception as e:
             logger.warning(f"清理A2A工具资源时出错: {e}")
         try:
+            if self._skill_bundle_sync:
+                await self._skill_bundle_sync.cleanup()
+        except Exception as e:
+            logger.warning(f"清理Skill bundle同步任务时出错: {e}")
+        try:
             if self._skill_tool:
                 await self._skill_tool.cleanup()
         except Exception as e:
             logger.warning(f"清理Skill工具资源时出错: {e}")
+        self._session_skill_pool = []
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
@@ -661,14 +682,25 @@ class AgentTaskRunner(TaskRunner):
             )
             await self._mcp_tool.initialize(filtered_mcp_config)
             await self._a2a_tool.initialize(filtered_a2a_config)
-            initial_skills = await self._load_selected_skills(
-                user_message="",
-                preference_map=skill_preference_map,
+            enabled_skills = await self._load_enabled_skills()
+            self._session_skill_pool = self._filter_skills_by_user_preferences(
+                enabled_skills,
+                skill_preference_map,
             )
+            initial_skills = self._select_skills_from_pool(
+                self._session_skill_pool,
+                "",
+            )
+            await self._skill_bundle_sync.prepare_startup_sync(
+                skill_pool=self._session_skill_pool,
+                initial_selected=initial_skills,
+            )
+            await self._skill_bundle_sync.await_initial_sync()
             await self._skill_tool.initialize(initial_skills)
             initial_skill_context = self._build_skill_context_prompt(initial_skills)
             if hasattr(self._flow, "set_skill_context"):
                 self._flow.set_skill_context(initial_skill_context)
+            self._skill_bundle_sync.start_background_sync()
 
             # 3.循环读取任务中的输入消息队列
             while not await task.input_stream.is_empty():
@@ -694,9 +726,9 @@ class AgentTaskRunner(TaskRunner):
                     ),
                 )
 
-                selected_skills = await self._load_selected_skills(
-                    user_message=message_obj.message,
-                    preference_map=skill_preference_map,
+                selected_skills = self._select_skills_from_pool(
+                    self._session_skill_pool,
+                    message_obj.message,
                 )
                 await self._skill_tool.initialize(selected_skills)
                 skill_context = self._build_skill_context_prompt(selected_skills)

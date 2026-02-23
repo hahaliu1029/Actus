@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
@@ -17,6 +19,11 @@ def anyio_backend() -> str:
 class _FakeSandbox:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
+        self.available_dirs = {
+            "/home/ubuntu/workspace",
+            "/home/ubuntu/workspace/.skills/pptx--1234abcd",
+            "/tmp/custom-skill-dir",
+        }
 
     async def exec_command(self, session_id: str, exec_dir: str, command: str) -> ToolResult:
         self.calls.append((session_id, exec_dir, command))
@@ -24,6 +31,9 @@ class _FakeSandbox:
 
     async def read_shell_output(self, session_id: str, console: bool = False) -> ToolResult:
         return ToolResult(success=True, data={"session_id": session_id, "output": "native-ok"})
+
+    async def check_file_exists(self, filepath: str) -> ToolResult:
+        return ToolResult(success=True, data={"exists": filepath in self.available_dirs})
 
 
 class _FakeMCPTool:
@@ -44,12 +54,41 @@ class _FakeA2ATool:
         return ToolResult(success=True, data="a2a-ok")
 
 
-async def test_native_skill_executes_entry_command() -> None:
-    sandbox = _FakeSandbox()
-    skill_tool = SkillTool(sandbox=sandbox, mcp_tool=_FakeMCPTool(), a2a_tool=_FakeA2ATool())
+class _FakeBundleSyncManager:
+    def __init__(
+        self,
+        *,
+        ready_dir: str | None = None,
+        error: str | None = None,
+        gate: asyncio.Event | None = None,
+    ) -> None:
+        self.ready_dir = ready_dir
+        self.error = error
+        self.gate = gate
+        self.calls: list[str] = []
 
-    skill = Skill(
-        slug="demo-native",
+    async def ensure_ready_for_invoke(
+        self,
+        skill_id: str,
+        *,
+        skill: Skill | None = None,
+    ) -> tuple[str | None, str | None]:
+        self.calls.append(skill_id)
+        if self.gate is not None:
+            await self.gate.wait()
+        return self.ready_dir, self.error
+
+
+
+def _build_native_skill(
+    *,
+    skill_id: str = "demo-native--1234abcd",
+    slug: str = "demo-native",
+    entry: dict | None = None,
+) -> Skill:
+    return Skill(
+        id=skill_id,
+        slug=slug,
         name="Demo Native",
         source_type=SkillSourceType.GITHUB,
         source_ref="github:owner/repo",
@@ -58,13 +97,17 @@ async def test_native_skill_executes_entry_command() -> None:
             "name": "Demo Native",
             "runtime_type": "native",
             "skill_md": "# Demo Native\nUse this skill when user asks for demo shell action.",
+            "bundle_file_count": 1,
+            "last_sync_at": "v1",
             "tools": [
                 {
                     "name": "run_demo",
                     "description": "run",
                     "parameters": {"target": {"type": "string"}},
                     "required": ["target"],
-                    "entry": {
+                    "entry": entry
+                    if entry is not None
+                    else {
                         "exec_dir": "/home/ubuntu/workspace",
                         "command": "echo demo",
                     },
@@ -73,6 +116,13 @@ async def test_native_skill_executes_entry_command() -> None:
         },
         installed_by="admin-1",
     )
+
+
+async def test_native_skill_executes_entry_command() -> None:
+    sandbox = _FakeSandbox()
+    skill_tool = SkillTool(sandbox=sandbox, mcp_tool=_FakeMCPTool(), a2a_tool=_FakeA2ATool())
+
+    skill = _build_native_skill()
 
     await skill_tool.initialize([skill])
     tools = skill_tool.get_tools()
@@ -85,6 +135,119 @@ async def test_native_skill_executes_entry_command() -> None:
     assert sandbox.calls
     _, _, command = sandbox.calls[0]
     assert "echo demo" in command
+
+
+async def test_native_defaults_exec_dir_to_skill_directory_when_missing() -> None:
+    sandbox = _FakeSandbox()
+    skill = _build_native_skill(
+        skill_id="pptx--1234abcd",
+        slug="pptx",
+        entry={"command": "python scripts/run.py"},
+    )
+    skill.manifest["bundle_file_count"] = 0
+
+    skill_tool = SkillTool(
+        sandbox=sandbox,
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+    )
+
+    await skill_tool.initialize([skill])
+    function_name = skill_tool.get_tools()[0]["function"]["name"]
+    result = await skill_tool.invoke(function_name, topic="deck")
+
+    assert result.success is True
+    assert sandbox.calls
+    _, exec_dir, _ = sandbox.calls[0]
+    assert exec_dir == "/home/ubuntu/workspace/.skills/pptx--1234abcd"
+
+
+async def test_native_waits_for_sync_before_execute() -> None:
+    sandbox = _FakeSandbox()
+    gate = asyncio.Event()
+    sync_manager = _FakeBundleSyncManager(
+        ready_dir="/home/ubuntu/workspace/.skills/pptx--1234abcd",
+        gate=gate,
+    )
+    skill = _build_native_skill(
+        skill_id="pptx--1234abcd",
+        slug="pptx",
+        entry={"command": "python scripts/run.py"},
+    )
+
+    skill_tool = SkillTool(
+        sandbox=sandbox,
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        bundle_sync_manager=sync_manager,
+    )
+
+    await skill_tool.initialize([skill])
+    function_name = skill_tool.get_tools()[0]["function"]["name"]
+
+    invoke_task = asyncio.create_task(skill_tool.invoke(function_name, topic="deck"))
+    await asyncio.sleep(0.01)
+    assert not sandbox.calls
+
+    gate.set()
+    result = await invoke_task
+
+    assert result.success is True
+    assert sync_manager.calls == ["pptx--1234abcd"]
+    assert sandbox.calls
+
+
+async def test_native_returns_error_when_sync_failed() -> None:
+    sandbox = _FakeSandbox()
+    sync_manager = _FakeBundleSyncManager(error="Skill[pptx--1234abcd] bundle同步失败")
+    skill = _build_native_skill(
+        skill_id="pptx--1234abcd",
+        slug="pptx",
+        entry={"command": "python scripts/run.py"},
+    )
+
+    skill_tool = SkillTool(
+        sandbox=sandbox,
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        bundle_sync_manager=sync_manager,
+    )
+
+    await skill_tool.initialize([skill])
+    function_name = skill_tool.get_tools()[0]["function"]["name"]
+    result = await skill_tool.invoke(function_name, topic="deck")
+
+    assert result.success is False
+    assert "同步失败" in (result.message or "")
+    assert not sandbox.calls
+
+
+async def test_native_explicit_exec_dir_not_overridden() -> None:
+    sandbox = _FakeSandbox()
+    sync_manager = _FakeBundleSyncManager(
+        ready_dir="/home/ubuntu/workspace/.skills/pptx--1234abcd",
+    )
+    skill = _build_native_skill(
+        skill_id="pptx--1234abcd",
+        slug="pptx",
+        entry={"command": "python scripts/run.py", "exec_dir": "/tmp/custom-skill-dir"},
+    )
+
+    skill_tool = SkillTool(
+        sandbox=sandbox,
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        bundle_sync_manager=sync_manager,
+    )
+
+    await skill_tool.initialize([skill])
+    function_name = skill_tool.get_tools()[0]["function"]["name"]
+    result = await skill_tool.invoke(function_name, topic="deck")
+
+    assert result.success is True
+    assert sandbox.calls
+    _, exec_dir, _ = sandbox.calls[0]
+    assert exec_dir == "/tmp/custom-skill-dir"
 
 
 async def test_mcp_skill_delegates_to_mcp_tool() -> None:

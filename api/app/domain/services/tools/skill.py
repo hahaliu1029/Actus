@@ -18,6 +18,7 @@ from core.config import get_settings
 from .a2a import A2ATool
 from .base import BaseTool
 from .mcp import MCPTool
+from .skill_bundle_sync import SkillBundleSyncManager
 
 logger = logging.getLogger(__name__)
 TOOL_NAME_MAX_LENGTH = 64
@@ -35,25 +36,33 @@ class SkillTool(BaseTool):
         a2a_tool: A2ATool,
         risk_mode: str = "off",
         blocked_command_patterns: list[str] | None = None,
+        bundle_sync_manager: SkillBundleSyncManager | None = None,
+        skill_sandbox_bundle_root: str | None = None,
     ) -> None:
         super().__init__()
         self._sandbox = sandbox
         self._mcp_tool = mcp_tool
         self._a2a_tool = a2a_tool
         self._risk_mode = risk_mode
+        self._bundle_sync_manager = bundle_sync_manager
         self._skills: list[Skill] = []
         self._tools: list[dict[str, Any]] = []
         self._tool_bindings: dict[str, dict[str, Any]] = {}
         self._tool_name_index: dict[str, int] = {}
+        settings = get_settings()
         if blocked_command_patterns is not None:
             self._blocked_command_patterns = blocked_command_patterns
         else:
-            settings = get_settings()
             self._blocked_command_patterns = [
                 item.strip()
                 for item in str(settings.skill_blocked_command_patterns).split(",")
                 if item.strip()
             ]
+        root_dir = str(skill_sandbox_bundle_root or settings.skill_sandbox_bundle_root or "").strip()
+        if root_dir:
+            self._skill_sandbox_bundle_root = root_dir.rstrip("/")
+        else:
+            self._skill_sandbox_bundle_root = "/home/ubuntu/workspace/.skills"
 
     async def initialize(self, skills: list[Skill]) -> None:
         """初始化可用 Skill 列表并生成工具声明"""
@@ -145,7 +154,7 @@ class SkillTool(BaseTool):
             )
 
         if runtime_type == SkillRuntimeType.NATIVE:
-            return await self._invoke_native(manifest_tool, kwargs)
+            return await self._invoke_native(skill, manifest_tool, kwargs)
         if runtime_type == SkillRuntimeType.MCP:
             return await self._invoke_mcp(manifest_tool, kwargs)
         if runtime_type == SkillRuntimeType.A2A:
@@ -161,6 +170,7 @@ class SkillTool(BaseTool):
 
     async def _invoke_native(
         self,
+        skill: Skill,
         manifest_tool: dict[str, Any],
         kwargs: dict[str, Any],
     ) -> ToolResult:
@@ -168,7 +178,33 @@ class SkillTool(BaseTool):
         if not isinstance(entry, dict):
             return ToolResult(success=False, message="native skill 缺少 entry 配置")
 
-        exec_dir = str(entry.get("exec_dir") or "/home/ubuntu/workspace")
+        synced_skill_dir = ""
+        if self._bundle_sync_manager:
+            synced_skill_dir, sync_error = await self._bundle_sync_manager.ensure_ready_for_invoke(
+                skill.id,
+                skill=skill,
+            )
+            if sync_error:
+                return ToolResult(
+                    success=False,
+                    message=f"Skill[{skill.id}]同步失败: {sync_error}",
+                )
+
+        default_exec_dir = synced_skill_dir or f"{self._skill_sandbox_bundle_root}/{skill.id}"
+        exec_dir = str(entry.get("exec_dir") or "").strip() or default_exec_dir
+        if not exec_dir:
+            return ToolResult(success=False, message="native skill 缺少可用执行目录")
+
+        exists_result = await self._sandbox.check_file_exists(exec_dir)
+        if not exists_result.success:
+            return ToolResult(
+                success=False,
+                message=f"native skill 执行目录检查失败: {exists_result.message or ''}",
+            )
+        exists_data = exists_result.data if isinstance(exists_result.data, dict) else {}
+        if not exists_data.get("exists"):
+            return ToolResult(success=False, message=f"native skill 执行目录不存在: {exec_dir}")
+
         command = str(entry.get("command") or "").strip()
         if not command:
             return ToolResult(success=False, message="native skill 缺少 entry.command")

@@ -27,6 +27,13 @@
 
 说明：大部分错误通过响应体 `code`/`msg` 返回，HTTP 状态码可能仍为 200。
 
+## Skill 运行时同步（目录型 Skill）
+
+- 该能力不变更 HTTP API，仅调整服务端运行时内部链路。
+- 会话启动时先同步初始选中 Skill 子集，再后台补齐其余已启用 Skill。
+- 单会话内采用静态版本：不做中途刷新，Skill 更新在下一会话生效。
+- native Skill 在缺少 `entry.exec_dir` 时，默认执行目录为 `/home/ubuntu/workspace/.skills/<skill_id>`。
+
 ## OpenAPI
 
 - Swagger UI：`/docs`
