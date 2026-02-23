@@ -76,6 +76,8 @@ docker compose down -v
 
 - API startup runs Alembic migrations automatically.
 - App config is persisted in `api-data` volume (`/app/data/config.yaml`).
+- **Skill data is stored on the filesystem** at `/app/data/skills` within the `api-data` volume (configurable via `SKILLS_ROOT_DIR` environment variable). Each Skill occupies a separate directory containing `meta.json`, `manifest.json`, `SKILL.md`, and an optional `bundle/` directory.
 - Sandbox containers are created by API through Docker socket mount.
 - MinIO is not started by compose. API connects to your remote MinIO using `.env` values.
 - If your deployment domain changes, rebuild UI so new `NEXT_PUBLIC_API_BASE_URL` is baked in.
+- Skills can be installed and managed through the frontend under **Settings → Skill Ecosystem**, supporting both GitHub and local directory sources.

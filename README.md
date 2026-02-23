@@ -20,7 +20,7 @@
 - **ReAct Agent** — 基于 Reasoning + Acting 模式的智能体，支持多轮推理与工具调用
 - **MCP 工具协议** — 通过 [Model Context Protocol](https://modelcontextprotocol.io/) 动态接入外部工具服务器
 - **A2A 协议** — 支持 [Agent-to-Agent](https://google.github.io/A2A/) 智能体间通信与协作
-- **Skill 生态层** — 统一管理 native / MCP / A2A Skill，支持 Manifest + SKILL.md 安装
+- **Skill 生态** — 独立的 Skill 扩展生态，通过 SKILL.md 定义与安装，基于文件系统存储，支持 GitHub / 本地目录双来源
 - **Planner + ReAct 流程** — 先规划再执行的两阶段 Agent 流程编排
 - **沙箱执行** — Docker 隔离的代码执行环境，安全运行用户代码
 - **远程桌面** — 基于 noVNC 的沙箱桌面实时预览，浏览器内直接查看 Agent 操作画面
@@ -74,7 +74,8 @@ cp .env.example .env
 # 3. 配置 Agent 运行时参数
 cp api/config.yaml.example api/config.yaml
 # 编辑 api/config.yaml，填入你的 LLM API Key 和 MCP/A2A 配置
-# Skill 生态配置通过「设置 -> Skill 生态」写入数据库管理
+# Skill 存储在文件系统 /app/data/skills（可通过 SKILLS_ROOT_DIR 环境变量调整）
+# 通过前端「设置 -> Skill 生态」安装和管理 Skill
 
 # 4. 启动所有服务
 docker compose --env-file .env up -d --build
@@ -108,13 +109,13 @@ npm run dev
 Actus/
 ├── api/                 # 后端服务 (FastAPI)
 │   ├── app/             # 应用代码（整洁架构分层）
-│   │   ├── domain/      #   领域层（模型、Agent、工具、Prompt）
-│   │   ├── application/ #   应用层（用例编排）
-│   │   ├── infrastructure/ # 基础设施层（数据库、存储、外部服务）
+│   │   ├── domain/      #   领域层（模型、Agent、工具、Prompt、Skill 领域模型）
+│   │   ├── application/ #   应用层（用例编排、Skill 安装/选择/索引服务）
+│   │   ├── infrastructure/ # 基础设施层（数据库、文件系统 Skill 仓储、外部服务）
 │   │   └── interfaces/  #   接口层（路由、Schema、依赖注入）
 │   ├── core/            # 核心配置与安全
 │   ├── alembic/         # 数据库迁移
-│   ├── scripts/         # 运维脚本
+│   ├── scripts/         # 运维脚本（含 Skill 迁移脚本）
 │   └── tests/           # 测试
 ├── ui/                  # 前端 (Next.js)
 ├── sandbox/             # 沙箱服务 (代码执行环境)

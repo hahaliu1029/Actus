@@ -879,6 +879,124 @@ Notes:
 
 Response: `Response` (no data payload)
 
+## Skill Ecosystem Module (v2)
+
+### Data Models
+
+#### SkillInstallRequest
+
+```json
+{
+  "source_type": "local | github",
+  "source_ref": "string",
+  "manifest": {},
+  "skill_md": ""
+}
+```
+
+Notes:
+- `source_type`: Source type. `local` for absolute local path, `github` for GitHub tree URL.
+- `source_ref`: Source reference (local path e.g. `/path/to/skill`, GitHub URL e.g. `https://github.com/owner/repo/tree/main/skills/my-skill`).
+- `manifest`: Optional compatibility field. Auto-generated from SKILL.md frontmatter by default.
+- `skill_md`: Optional SKILL.md content override, takes priority over bundled SKILL.md.
+
+#### SkillItem
+
+```json
+{
+  "id": "string",
+  "slug": "string",
+  "name": "string",
+  "description": "",
+  "version": "0.1.0",
+  "source_type": "local | github",
+  "source_ref": "string",
+  "runtime_type": "native | mcp | a2a",
+  "enabled": true,
+  "installed_by": "string | null",
+  "created_at": "datetime",
+  "updated_at": "datetime",
+  "bundle_file_count": 0,
+  "context_ref_count": 0,
+  "last_sync_at": "string | null"
+}
+```
+
+#### SkillRiskPolicyItem
+
+```json
+{
+  "mode": "off | enforce_confirmation"
+}
+```
+
+### GET `/api/v2/skills`
+
+List all installed Skills.
+
+Auth: Bearer token (admin required).
+
+Response: `Response[SkillListResponse]`
+
+### POST `/api/v2/skills/install`
+
+Install a Skill from GitHub or local directory.
+
+Auth: Bearer token (admin required).
+
+Body: `SkillInstallRequest`
+
+Response: `Response[SkillItem]`
+
+Notes:
+- Installation flow: load bundle → parse SKILL.md frontmatter → validate security policy → build context_blob → write to filesystem.
+- Skills with the same slug are updated (preserving enabled state and ID).
+- Storage path: `SKILLS_ROOT_DIR` (default `/app/data/skills`).
+
+### POST `/api/v2/skills/{skill_key}/enabled`
+
+Toggle Skill enabled state.
+
+Auth: Bearer token (admin required).
+
+Body:
+
+```json
+{
+  "enabled": true
+}
+```
+
+Response: `Response` (no data payload)
+
+### DELETE `/api/v2/skills/{skill_key}`
+
+Delete a Skill (also cleans up user tool preferences).
+
+Auth: Bearer token (admin required).
+
+Response: `Response` (no data payload)
+
+### GET `/api/v2/skills/policy`
+
+Get Skill risk policy configuration.
+
+Auth: Bearer token (admin required).
+
+Response: `Response[SkillRiskPolicyItem]`
+
+### POST `/api/v2/skills/policy`
+
+Update Skill risk policy configuration.
+
+Auth: Bearer token (admin required).
+
+Body: `SkillRiskPolicyItem`
+
+Response: `Response` (no data payload)
+
+> **Note**: Legacy v1 Skill API (`/api/app-config/skills/*`) returns HTTP 410. Use the v2 API above.
+
 ## cURL Examples
 
 Base URL: `http://localhost:8000`
@@ -938,5 +1056,53 @@ curl -X POST http://localhost:8000/api/sessions/<session_id>/clear-unread-messag
 
 ```bash
 curl -X POST http://localhost:8000/api/sessions/<session_id>/delete \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### List Skills
+
+```bash
+curl -X GET http://localhost:8000/api/v2/skills \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Install Skill (Local Directory)
+
+```bash
+curl -X POST http://localhost:8000/api/v2/skills/install \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"source_type": "local", "source_ref": "/path/to/skill"}'
+```
+
+### Install Skill (GitHub)
+
+```bash
+curl -X POST http://localhost:8000/api/v2/skills/install \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"source_type": "github", "source_ref": "https://github.com/owner/repo/tree/main/skills/my-skill"}'
+```
+
+### Enable/Disable Skill
+
+```bash
+curl -X POST http://localhost:8000/api/v2/skills/<skill_key>/enabled \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+```
+
+### Delete Skill
+
+```bash
+curl -X DELETE http://localhost:8000/api/v2/skills/<skill_key> \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Get Skill Risk Policy
+
+```bash
+curl -X GET http://localhost:8000/api/v2/skills/policy \
   -H "Authorization: Bearer <access_token>"
 ```

@@ -19,3 +19,9 @@
 - Next.js 16 + React 19 现代前端
 - Docker Compose 一键部署
 - PostgreSQL + Redis 数据存储
+- Skill 生态系统：独立的 Skill 扩展层，基于文件系统存储（`/app/data/skills`），支持 GitHub / 本地目录双来源安装
+- SKILL.md 驱动的安装规范，支持 frontmatter 自动解析，manifest 为可选兼容字段
+- Skill 安全机制：命令黑名单、风险策略（off / enforce_confirmation）、路径穿越防护、bundle 大小限制
+- Skill 选择器：基于关键词评分的渐进式候选 Skill 推荐
+- Skill 索引服务：基于目录 mtime 的缓存失效机制
+- Skill v2 API（`/api/v2/skills/*`），v1 API 返回 410 引导迁移

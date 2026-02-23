@@ -879,6 +879,124 @@ MinIO 上传文件测试（multipart/form-data）。
 
 响应：`Response`（无 data）
 
+## Skill 生态模块（v2）
+
+### 数据模型
+
+#### SkillInstallRequest
+
+```json
+{
+  "source_type": "local | github",
+  "source_ref": "string",
+  "manifest": {},
+  "skill_md": ""
+}
+```
+
+说明：
+- `source_type`：来源类型，`local` 为本地绝对路径，`github` 为 GitHub tree URL。
+- `source_ref`：来源引用（本地路径如 `/path/to/skill`，GitHub URL 如 `https://github.com/owner/repo/tree/main/skills/my-skill`）。
+- `manifest`：可选兼容字段，默认由 SKILL.md frontmatter 自动生成。
+- `skill_md`：可选 SKILL.md 内容覆盖，优先级高于 bundle 中的 SKILL.md。
+
+#### SkillItem
+
+```json
+{
+  "id": "string",
+  "slug": "string",
+  "name": "string",
+  "description": "",
+  "version": "0.1.0",
+  "source_type": "local | github",
+  "source_ref": "string",
+  "runtime_type": "native | mcp | a2a",
+  "enabled": true,
+  "installed_by": "string | null",
+  "created_at": "datetime",
+  "updated_at": "datetime",
+  "bundle_file_count": 0,
+  "context_ref_count": 0,
+  "last_sync_at": "string | null"
+}
+```
+
+#### SkillRiskPolicyItem
+
+```json
+{
+  "mode": "off | enforce_confirmation"
+}
+```
+
+### GET `/api/v2/skills`
+
+获取 Skill 列表。
+
+认证：需要 Bearer token（管理员）。
+
+响应：`Response[SkillListResponse]`
+
+### POST `/api/v2/skills/install`
+
+安装 Skill（支持 GitHub / 本地目录来源）。
+
+认证：需要 Bearer token（管理员）。
+
+请求体：`SkillInstallRequest`
+
+响应：`Response[SkillItem]`
+
+说明：
+- 安装流程：加载 bundle → 解析 SKILL.md frontmatter → 校验安全策略 → 构建 context_blob → 写入文件系统。
+- 同 slug 的 Skill 会被更新（保留 enabled 状态和 ID）。
+- Skill 存储路径：`SKILLS_ROOT_DIR`（默认 `/app/data/skills`）。
+
+### POST `/api/v2/skills/{skill_key}/enabled`
+
+更新 Skill 启用状态。
+
+认证：需要 Bearer token（管理员）。
+
+请求体：
+
+```json
+{
+  "enabled": true
+}
+```
+
+响应：`Response`（无 data）
+
+### DELETE `/api/v2/skills/{skill_key}`
+
+删除 Skill（同时清理用户工具偏好）。
+
+认证：需要 Bearer token（管理员）。
+
+响应：`Response`（无 data）
+
+### GET `/api/v2/skills/policy`
+
+获取 Skill 风险策略配置。
+
+认证：需要 Bearer token（管理员）。
+
+响应：`Response[SkillRiskPolicyItem]`
+
+### POST `/api/v2/skills/policy`
+
+更新 Skill 风险策略配置。
+
+认证：需要 Bearer token（管理员）。
+
+请求体：`SkillRiskPolicyItem`
+
+响应：`Response`（无 data）
+
+> **注意**：旧版 v1 Skill API（`/api/app-config/skills/*`）已返回 HTTP 410，请使用 v2 API。
+
 ## cURL 示例
 
 基础地址：`http://localhost:8000`
@@ -938,5 +1056,53 @@ curl -X POST http://localhost:8000/api/sessions/<session_id>/clear-unread-messag
 
 ```bash
 curl -X POST http://localhost:8000/api/sessions/<session_id>/delete \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### 获取 Skill 列表
+
+```bash
+curl -X GET http://localhost:8000/api/v2/skills \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### 安装 Skill（本地目录）
+
+```bash
+curl -X POST http://localhost:8000/api/v2/skills/install \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"source_type": "local", "source_ref": "/path/to/skill"}'
+```
+
+### 安装 Skill（GitHub）
+
+```bash
+curl -X POST http://localhost:8000/api/v2/skills/install \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"source_type": "github", "source_ref": "https://github.com/owner/repo/tree/main/skills/my-skill"}'
+```
+
+### 启用/禁用 Skill
+
+```bash
+curl -X POST http://localhost:8000/api/v2/skills/<skill_key>/enabled \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+```
+
+### 删除 Skill
+
+```bash
+curl -X DELETE http://localhost:8000/api/v2/skills/<skill_key> \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### 获取 Skill 风险策略
+
+```bash
+curl -X GET http://localhost:8000/api/v2/skills/policy \
   -H "Authorization: Bearer <access_token>"
 ```

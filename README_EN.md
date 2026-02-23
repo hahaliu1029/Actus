@@ -20,7 +20,7 @@
 - **ReAct Agent** — Reasoning + Acting pattern with multi-turn reasoning and tool calling
 - **MCP Tool Protocol** — Dynamically connect external tool servers via [Model Context Protocol](https://modelcontextprotocol.io/)
 - **A2A Protocol** — [Agent-to-Agent](https://google.github.io/A2A/) communication and collaboration
-- **Skill Ecosystem Layer** — Unified native / MCP / A2A Skill management with Manifest + SKILL.md installation
+- **Skill Ecosystem** — Independent Skill extension ecosystem, defined and installed via SKILL.md, filesystem-based storage, supporting GitHub / local directory dual sources
 - **Planner + ReAct Flow** — Two-phase agent orchestration: plan first, then execute
 - **Sandboxed Execution** — Docker-isolated code execution environment
 - **Remote Desktop** — Real-time sandbox desktop preview via noVNC, watch Agent actions directly in your browser
@@ -74,7 +74,8 @@ cp .env.example .env
 # 3. Configure Agent runtime parameters
 cp api/config.yaml.example api/config.yaml
 # Edit api/config.yaml with your LLM API key and MCP/A2A configurations
-# Skill ecosystem configuration is managed in Settings -> Skill Ecosystem (DB-backed)
+# Skills are stored on the filesystem at /app/data/skills (configurable via SKILLS_ROOT_DIR)
+# Install and manage Skills in the frontend under Settings -> Skill Ecosystem
 
 # 4. Start all services
 docker compose --env-file .env up -d --build
@@ -108,13 +109,13 @@ npm run dev
 Actus/
 ├── api/                 # Backend service (FastAPI)
 │   ├── app/             # Application code (Clean Architecture layers)
-│   │   ├── domain/      #   Domain layer (models, agents, tools, prompts)
-│   │   ├── application/ #   Application layer (use case orchestration)
-│   │   ├── infrastructure/ # Infrastructure layer (DB, storage, external services)
+│   │   ├── domain/      #   Domain layer (models, agents, tools, prompts, Skill domain models)
+│   │   ├── application/ #   Application layer (use case orchestration, Skill install/select/index services)
+│   │   ├── infrastructure/ # Infrastructure layer (DB, filesystem Skill repository, external services)
 │   │   └── interfaces/  #   Interface layer (routes, schemas, DI)
 │   ├── core/            # Core config & security
 │   ├── alembic/         # Database migrations
-│   ├── scripts/         # Admin scripts
+│   ├── scripts/         # Admin scripts (including Skill migration scripts)
 │   └── tests/           # Tests
 ├── ui/                  # Frontend (Next.js)
 ├── sandbox/             # Sandbox service (code execution)

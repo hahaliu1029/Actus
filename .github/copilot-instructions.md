@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-这是一个 **开源 AI Agent 平台**，基于 MCP (Model Context Protocol) 工具协议与 A2A (Agent-to-Agent) 智能体间通信协议，构建具有工具调用能力的 ReAct Agent。
+这是一个 **开源 AI Agent 平台**，基于 MCP (Model Context Protocol) 工具协议与 A2A (Agent-to-Agent) 智能体间通信协议，构建具有工具调用能力的 ReAct Agent。支持 **Skill 生态系统**，通过 SKILL.md 定义与安装扩展能力，基于文件系统存储和管理。
 
 ## 架构模式
 
@@ -15,6 +15,30 @@
 ### ReAct Agent 实现模式
 项目采用 **ReAct (Reasoning + Acting)** 模式，核心循环：
 1. 用户输入 → 2. LLM 推理 → 3. 工具调用（可选）→ 4. 结果整合 → 5. 递归/输出
+
+### Skill 生态系统
+Skill 是独立的扩展生态层，通过 SKILL.md 定义，支持三类运行时：
+- **native** — 通过 Sandbox 执行命令
+- **mcp** — 委托 MCP 服务器工具
+- **a2a** — 委托远程 Agent
+
+Skill 存储在 **文件系统**（默认 `/app/data/skills`），每个 Skill 为独立目录：
+```
+/app/data/skills/{skill_id}/
+├── meta.json          # 元信息
+├── manifest.json      # 工具定义、策略配置
+├── SKILL.md           # 说明文档（含 frontmatter）
+├── bundle_index.json  # 文件索引
+└── bundle/            # 源文件
+```
+
+Skill 相关核心代码路径：
+- 领域模型：`app/domain/models/skill.py`
+- 仓库接口：`app/domain/repositories/skill_repository.py`
+- 仓库实现：`app/infrastructure/repositories/file_skill_repository.py`（当前使用）
+- 应用服务：`app/application/services/skill_service.py`、`skill_source_loader.py`、`skill_selector.py`、`skill_index_service.py`
+- 统一工具层：`app/domain/services/tools/skill.py`（SkillTool）
+- API 路由：`app/interfaces/endpoints/skill_v2_routes.py`（v2，当前活跃）
 
 ### 工具定义约定
 使用 **Pydantic BaseModel** 定义工具输入参数 schema：
@@ -40,6 +64,7 @@ tools = [{
 
 - 使用 `.env` 文件管理环境变量（参考 `.env.example`）
 - 运行时配置使用 `api/config.yaml`（参考 `api/config.yaml.example`）
+- Skill 存储路径通过 `SKILLS_ROOT_DIR` 环境变量配置（默认 `/app/data/skills`）
 - 敏感信息（密钥、密码）通过环境变量注入，**不硬编码**
 
 ## 常用模型标识
