@@ -6,7 +6,13 @@ from app.domain.external.browser import Browser as BrowserProtocol
 from app.domain.external.llm import LLM
 from app.domain.models.tool_result import ToolResult
 from markdownify import markdownify
-from playwright.async_api import Browser, Page, Playwright, async_playwright
+from playwright.async_api import (
+    Browser,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from .playwright_browser_fun import (
     GET_INTERACTIVE_ELEMENTS_FUNC,
@@ -300,7 +306,7 @@ class PlaywrightBrowser(BrowserProtocol):
 
         # 2.使用异步任务事件循环中的时间来作为开始时间(只和异步任务相关)
         start_time = asyncio.get_event_loop().time()
-        check_interval = 5
+        check_interval = 0.5
 
         # 3.循环检测网页是否加载成功
         while asyncio.get_event_loop().time() - start_time < timeout:
@@ -325,10 +331,25 @@ class PlaywrightBrowser(BrowserProtocol):
             # 2.在跳转之前先将可交互元素的缓存清空
             self.page.interactive_elements_cache = []
 
-            # 3.使用goto进行跳转
-            await self.page.goto(url)
+            # 3.使用强等待策略进行跳转，提升SPA页面可见内容提取稳定性
+            await self.page.goto(url, wait_until="load", timeout=30000)
+
+            warnings: list[str] = []
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                warnings.append("页面等待networkidle超时，已继续提取当前可见内容。")
+            except Exception as e:
+                logger.warning(f"等待networkidle状态异常: {str(e)}")
+                warnings.append("页面等待networkidle异常，已继续提取当前可见内容。")
+
+            page_loaded = await self.wait_for_page_load(timeout=15)
+            if not page_loaded:
+                warnings.append("页面未完全加载，返回当前可见内容。")
+
             return ToolResult(
                 success=True,
+                message=" ".join(warnings),
                 data={
                     "interactive_elements": await self._extract_interactive_elements()
                 },
@@ -494,7 +515,13 @@ class PlaywrightBrowser(BrowserProtocol):
         # 1.确保页面存在
         await self._ensure_page()
 
-        # 2.可以指定另外一段js代码查看控制台的内容
+        # 2.在查看日志之前确保日志注入已启用
+        try:
+            await self.page.evaluate(INJECT_CONSOLE_LOGS_FUNC)
+        except Exception as e:
+            logger.warning(f"注入window.console.logs失败: {str(e)}")
+
+        # 3.可以指定另外一段js代码查看控制台的内容
         logs = await self.page.evaluate(
             """() => {
             return window.console.logs || [];

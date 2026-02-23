@@ -1,31 +1,46 @@
 /*getVisibleContent*/
 const getVisibleContent = () => {
-    // 1.定义变量存储所有可视元素+视口宽高
+    // 1.定义变量存储所有可视元素+去重key+视口宽高
     const visibleElements = [];
+    const seenContentKeys = new Set();
     const viewportHeight = window.innerHeight;
-    const viewportWeight = window.innerWidth;
+    const viewportWidth = window.innerWidth;
+    const MAX_TEXT_LENGTH = 300;
 
-    // 2.获取页面上所有元素
+    // 2.定义文本处理函数
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const escapeHtml = (value) => String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    const truncateText = (value) =>
+        value.length > MAX_TEXT_LENGTH
+            ? value.substring(0, MAX_TEXT_LENGTH - 3) + '...'
+            : value;
+
+    // 3.获取页面上所有元素
     const elements = document.querySelectorAll("body *");
 
-    // 3.循环遍历所有元素逐个处理
+    // 4.循环遍历所有元素逐个处理
     for (let i = 0; i < elements.length; i++) {
-        // 4.获取元素的尺寸与位置
+        // 5.获取元素的尺寸与位置
         const element = elements[i];
         const rect = element.getBoundingClientRect();
 
-        // 5.判断元素的宽高，如果没有大小则跳过
+        // 6.判断元素的宽高，如果没有大小则跳过
         if (rect.height === 0 || rect.width === 0) continue;
 
-        // 6.排除完全在当前屏幕可视区域之外的元素(上方、下方、左侧、右侧)的元素
+        // 7.排除完全在当前屏幕可视区域之外的元素(上方、下方、左侧、右侧)的元素
         if (
             rect.bottom < 0 ||
             rect.top > viewportHeight ||
             rect.right < 0 ||
-            rect.left > viewportWeight
+            rect.left > viewportWidth
         ) continue;
 
-        // 7.通用样式判断当前元素是否隐藏
+        // 8.通用样式判断当前元素是否隐藏
         const style = window.getComputedStyle(element);
         if (
             style.display === 'none' || // 块隐藏
@@ -33,16 +48,53 @@ const getVisibleContent = () => {
             style.opacity === '0' // 透明度为0
         ) continue;
 
-        // 8.如果element是文本节点或有意义的元素，请将其添加到结果中
-        if (
-            element.innerText ||
-            element.tagName === "IMG" ||
-            element.tagName === "INPUT" ||
-            element.tagName === "BUTTON"
-        ) visibleElements.push(element.outerHTML)
+        // 9.提取文本并构建去重key
+        const tagName = element.tagName.toLowerCase();
+        const innerText = normalizeText(element.innerText);
+        const ariaLabel = normalizeText(element.getAttribute('aria-label'));
+        const title = normalizeText(element.getAttribute('title'));
+        const alt = normalizeText(element.getAttribute('alt'));
+        const placeholder = normalizeText(element.getAttribute('placeholder'));
+        const value = normalizeText(element.value);
+        const href = normalizeText(element.getAttribute('href'));
+        const src = normalizeText(element.getAttribute('src'));
+        const inputType = normalizeText(element.getAttribute('type'));
+
+        const isInteractiveOrMedia =
+            tagName === "img" ||
+            tagName === "input" ||
+            tagName === "button" ||
+            tagName === "textarea" ||
+            tagName === "select" ||
+            tagName === "a";
+
+        let contentText = innerText;
+        if (!contentText && isInteractiveOrMedia) {
+            contentText =
+                ariaLabel ||
+                alt ||
+                title ||
+                placeholder ||
+                value ||
+                "[No text]";
+        }
+
+        if (!contentText) continue;
+
+        const truncatedText = truncateText(contentText);
+        let contentKey = `text:${truncatedText}`;
+        if (isInteractiveOrMedia) {
+            contentKey = `node:${tagName}|${inputType}|${href}|${src}|${truncatedText}`;
+        }
+
+        // 10.按首见顺序去重，减少重复信息和token
+        if (seenContentKeys.has(contentKey)) continue;
+        seenContentKeys.add(contentKey);
+
+        visibleElements.push(`<${tagName}>${escapeHtml(truncatedText)}</${tagName}>`)
     }
 
-    // 9.将所有内容使用空格拼接后包裹在div内返回
+    // 11.将所有内容使用空格拼接后包裹在div内返回
     return '<div>' + visibleElements.join(' ') + '</div>'
 }
 /*getVisibleContent*/
@@ -54,8 +106,31 @@ const getInteractiveElements = () => {
     const viewportHeight = window.innerHeight;
     const viewportWidth = window.innerWidth;
 
-    // 2.获取页面上所有可交互的元素，包含按钮、a标签、输入框、文本域、下拉菜单、按钮、tab等
-    const elements = document.querySelectorAll('button, a, input, textarea, select, [role="button"], [tabindex]:not([tabindex="-1"])');
+    // 2.获取页面上所有可交互的元素，包含原生可交互标签 + 常见ARIA交互角色
+    const selectorParts = [
+        'button',
+        'a',
+        'input',
+        'textarea',
+        'select',
+        '[role="button"]',
+        '[role="link"]',
+        '[role="menuitem"]',
+        '[role="menuitemcheckbox"]',
+        '[role="menuitemradio"]',
+        '[role="tab"]',
+        '[role="option"]',
+        '[role="checkbox"]',
+        '[role="radio"]',
+        '[role="switch"]',
+        '[role="textbox"]',
+        '[role="searchbox"]',
+        '[role="combobox"]',
+        '[role="slider"]',
+        '[role="spinbutton"]',
+        '[tabindex]:not([tabindex="-1"])'
+    ];
+    const elements = document.querySelectorAll(selectorParts.join(', '));
 
     // 3.定义变量用于生成连续的唯一索引
     let validElementIndex = 0;
@@ -126,6 +201,8 @@ const getInteractiveElements = () => {
         } else if (element.innerText) {
             // 16.普通元素则提取内部文本并剔除多余空格 (如 <button>提交</button>)
             text = element.innerText.trim().replace(/\\s+/g, ' ');
+        } else if (element.getAttribute('aria-label')) {
+            text = element.getAttribute('aria-label').trim();
         } else if (element.alt) {
             // 17.图片按钮，取 alt 属性
             text = element.alt;
@@ -199,14 +276,60 @@ const getInteractiveElements = () => {
 
 /*injectConsoleLogs***/
 const injectConsoleLogs = () => {
-    // 1.定义变量存储控制台输出日志
-    window.console.logs = [];
+    const MAX_LOGS = 1000;
+    const levels = ['log', 'info', 'warn', 'error', 'debug'];
 
-    // 2.重写window.console.log函数
-    const originalLog = console.log;
-    console.log = (...args) => {
-        window.console.logs.push(args.join(" "));
-        originalLog.apply(console, args);
+    const ensureLogContainer = () => {
+        if (!Array.isArray(window.console.logs)) {
+            window.console.logs = [];
+        }
     };
+
+    const stringifyArg = (arg) => {
+        if (typeof arg === 'string') {
+            return arg;
+        }
+        if (arg instanceof Error) {
+            return arg.stack || arg.message;
+        }
+        try {
+            return JSON.stringify(arg);
+        } catch (_error) {
+            return String(arg);
+        }
+    };
+
+    const pushLog = (level, args) => {
+        ensureLogContainer();
+        const line = `[${level.toUpperCase()}] ` + args.map(stringifyArg).join(' ');
+        window.console.logs.push(line);
+        if (window.console.logs.length > MAX_LOGS) {
+            window.console.logs.splice(0, window.console.logs.length - MAX_LOGS);
+        }
+    };
+
+    ensureLogContainer();
+
+    if (window.__manusConsoleHooked) {
+        return true;
+    }
+
+    window.__manusConsoleHooked = true;
+    window.__manusConsoleOriginal = window.__manusConsoleOriginal || {};
+
+    levels.forEach((level) => {
+        const original = console[level];
+        window.__manusConsoleOriginal[level] = original;
+        if (typeof original !== 'function') {
+            return;
+        }
+
+        console[level] = (...args) => {
+            pushLog(level, args);
+            original.apply(console, args);
+        };
+    });
+
+    return true;
 }
 /*injectConsoleLogs***/
