@@ -11,6 +11,17 @@ const md = new MarkdownIt({
   breaks: true,
 });
 
+/**
+ * 预处理：将 <tool_code> 等 XML 标签转换为 Markdown 代码块
+ * 这样 Agent 返回的工具调用格式可以正确显示为代码块
+ */
+function preprocessXmlTags(content: string): string {
+  return content.replace(
+    /<tool_code>([\s\S]*?)<\/tool_code>/g,
+    '\n```xml\n$1\n```\n'
+  );
+}
+
 const defaultLinkOpen = md.renderer.rules.link_open;
 md.renderer.rules.link_open = (tokens, index, options, env, self) => {
   tokens[index]?.attrSet("target", "_blank");
@@ -27,7 +38,7 @@ type MarkdownRendererProps = {
 };
 
 export function MarkdownRenderer({ content, className }: Readonly<MarkdownRendererProps>) {
-  const html = useMemo(() => md.render(content || "（空消息）"), [content]);
+  const html = useMemo(() => md.render(preprocessXmlTags(content || "（空消息）")), [content]);
 
   return (
     <div
