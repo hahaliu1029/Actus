@@ -12,14 +12,58 @@ const md = new MarkdownIt({
 });
 
 /**
- * 预处理：将 <tool_code> 等 XML 标签转换为 Markdown 代码块
- * 这样 Agent 返回的工具调用格式可以正确显示为代码块
+ * 预处理 XML 标签：
+ * 1. <think>/<thinking> → Markdown 引用块（保留展示思考过程）
+ * 2. <tool_code> → Markdown 代码块
+ * 3. <tool ...> → 紧凑提示文本（避免大段 XML 和空白）
  */
 function preprocessXmlTags(content: string): string {
-  return content.replace(
-    /<tool_code>([\s\S]*?)<\/tool_code>/g,
-    '\n```xml\n$1\n```\n'
+  let result = content;
+
+  // 将完整的 <think>...</think> 转为引用块
+  result = result.replace(
+    /<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi,
+    (_match, inner: string) => {
+      const quoted = inner
+        .trim()
+        .split("\n")
+        .map((line: string) => `> ${line}`)
+        .join("\n");
+      return `\n> **💭 思考过程**\n>\n${quoted}\n`;
+    }
   );
+
+  // 处理未闭合的 <think>（流式截断场景）
+  result = result.replace(
+    /<think(?:ing)?>(?![\s\S]*<\/think)([\s\S]*)$/gi,
+    (_match, inner: string) => {
+      const quoted = inner
+        .trim()
+        .split("\n")
+        .map((line: string) => `> ${line}`)
+        .join("\n");
+      return `\n> **💭 思考中…**\n>\n${quoted}\n`;
+    }
+  );
+
+  // <tool_code>...</tool_code> → 代码块
+  result = result.replace(
+    /<tool_code>([\s\S]*?)<\/tool_code>/g,
+    "\n```xml\n$1\n```\n"
+  );
+
+  // <tool ...>...</tool> → 紧凑提示（工具调用已通过独立事件卡片展示）
+  result = result.replace(/<tool\b([^>]*)>[\s\S]*?<\/tool>/gi, (_match, attrs: string) => {
+    const nameMatch = attrs.match(/name\s*=\s*["']([^"']+)["']/i);
+    const toolName = nameMatch?.[1]?.trim();
+    const displayName = toolName || "未知工具";
+    return `\n> 🔧 工具调用：${displayName}\n`;
+  });
+
+  // 折叠连续空白行，避免出现大面积留白
+  result = result.replace(/\n{3,}/g, "\n\n");
+
+  return result.trim();
 }
 
 const defaultLinkOpen = md.renderer.rules.link_open;
@@ -38,7 +82,10 @@ type MarkdownRendererProps = {
 };
 
 export function MarkdownRenderer({ content, className }: Readonly<MarkdownRendererProps>) {
-  const html = useMemo(() => md.render(preprocessXmlTags(content || "（空消息）")), [content]);
+  const html = useMemo(() => {
+    const preprocessed = preprocessXmlTags(content || "（空消息）");
+    return md.render(preprocessed || "（空消息）");
+  }, [content]);
 
   return (
     <div

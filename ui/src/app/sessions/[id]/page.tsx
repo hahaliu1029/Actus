@@ -183,6 +183,16 @@ function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent 
   return { screenshots, searchResults, filepath, mcpResult };
 }
 
+/** 流式纯文本渲染时，清理 XML 标签为可读文本 */
+function stripXmlTags(text: string): string {
+  let result = text;
+  result = result.replace(/<\/?think(?:ing)?>/gi, "");
+  result = result.replace(/<\/?tool_code>/g, "");
+  result = result.replace(/<tool\b[^>]*>/g, "");
+  result = result.replace(/<\/tool>/g, "");
+  return result;
+}
+
 function renderEventItem(
   event: SessionEvent,
   index: number,
@@ -225,7 +235,7 @@ function renderEventItem(
         </div>
         <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
           {isPartial ? (
-            <p className="whitespace-pre-wrap leading-7">{message || "（空消息）"}</p>
+            <p className="whitespace-pre-wrap leading-7">{stripXmlTags(message) || "（空消息）"}</p>
           ) : (
             <MarkdownRenderer content={message || "（空消息）"} />
           )}
