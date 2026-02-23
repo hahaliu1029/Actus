@@ -201,6 +201,11 @@ export const useSettingsStore = create<SettingsStore>()(
     updateLLMConfig: async (config) => {
       try {
         const llmConfig = await configApi.updateLLMConfig(config);
+        // 后端出于安全考虑不返回 api_key，如果前端提交的 api_key 为空则保留原值
+        const currentConfig = get().llmConfig;
+        if (!config.api_key && currentConfig?.api_key) {
+          llmConfig.api_key = currentConfig.api_key;
+        }
         set({ llmConfig });
         reportSuccess("模型配置已保存");
       } catch (error) {

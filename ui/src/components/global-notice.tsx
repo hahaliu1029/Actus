@@ -33,7 +33,7 @@ export function GlobalNotice() {
   }
 
   return (
-    <div className="fixed left-1/2 top-4 z-50 w-[90vw] max-w-xl -translate-x-1/2">
+    <div className="fixed left-1/2 top-4 z-[100] w-[90vw] max-w-xl -translate-x-1/2">
       <div
         className={`rounded-lg border px-4 py-3 text-sm shadow-[var(--shadow-card)] ${COLOR_BY_TYPE[message.type]}`}
       >
