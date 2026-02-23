@@ -136,7 +136,7 @@ export type CreateA2AServerParams = {
   base_url: string;
 };
 
-export type SkillSourceType = "mcp_registry" | "github";
+export type SkillSourceType = "local" | "github";
 export type SkillRuntimeType = "native" | "mcp" | "a2a";
 
 export type SkillItem = {
@@ -149,29 +149,27 @@ export type SkillItem = {
   source_ref: string;
   runtime_type: SkillRuntimeType;
   enabled: boolean;
+  installed_by?: string | null;
+  created_at: string;
+  updated_at: string;
+  bundle_file_count?: number;
+  context_ref_count?: number;
+  last_sync_at?: string | null;
 };
 
 export type SkillListData = {
   skills: SkillItem[];
 };
 
-export type SkillDiscoveryItem = {
-  source_type: SkillSourceType;
-  source_ref: string;
-  name: string;
-  description: string;
-  runtime_type: SkillRuntimeType;
-};
-
-export type SkillDiscoveryData = {
-  skills: SkillDiscoveryItem[];
-};
-
 export type InstallSkillParams = {
   source_type: SkillSourceType;
   source_ref: string;
-  manifest: Record<string, unknown>;
-  skill_md: string;
+  skill_md?: string;
+  manifest?: Record<string, unknown>;
+};
+
+export type SkillRiskPolicy = {
+  mode: "off" | "enforce_confirmation";
 };
 
 export type ToolWithPreference = {

@@ -13,6 +13,7 @@ from app.domain.models.app_config import (
     AppConfig,
     LLMConfig,
     MCPConfig,
+    SkillRiskPolicy,
 )
 from app.domain.repositories.app_config_repository import AppConfigRepository
 from app.domain.services.tools.a2a import A2AClientManager
@@ -71,6 +72,20 @@ class AppConfigService:
         """获取Agent通用配置"""
         app_config = await self._load_app_config()
         return app_config.agent_config
+
+    async def get_skill_risk_policy(self) -> SkillRiskPolicy:
+        """获取 Skill 风险策略配置。"""
+        app_config = await self._load_app_config()
+        return app_config.skill_risk_policy
+
+    async def update_skill_risk_policy(
+        self, policy: SkillRiskPolicy
+    ) -> SkillRiskPolicy:
+        """更新 Skill 风险策略配置。"""
+        app_config = await self._load_app_config()
+        app_config.skill_risk_policy = policy
+        self.app_config_repository.save(app_config)
+        return app_config.skill_risk_policy
 
     async def update_agent_config(self, agent_config: AgentConfig) -> AgentConfig:
         """根据传递的agent_config更新Agent通用配置"""

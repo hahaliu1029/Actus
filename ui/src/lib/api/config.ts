@@ -1,4 +1,4 @@
-import { get, post } from "./fetch";
+import { del, get, post } from "./fetch";
 import type {
   AgentConfig,
   A2AServersData,
@@ -7,8 +7,8 @@ import type {
   LLMConfig,
   MCPConfig,
   MCPServersData,
-  SkillDiscoveryData,
   SkillListData,
+  SkillRiskPolicy,
 } from "./types";
 
 const SETTINGS_LIST_TIMEOUT = 30000;
@@ -67,32 +67,28 @@ export const configApi = {
   },
 
   getSkills: (): Promise<SkillListData> => {
-    return get<SkillListData>("/app-config/skills", undefined, {
+    return get<SkillListData>("/v2/skills", undefined, {
       timeout: SETTINGS_LIST_TIMEOUT,
     });
   },
 
   installSkill: (params: InstallSkillParams): Promise<void> => {
-    return post<void>("/app-config/skills/install", params);
+    return post<void>("/v2/skills/install", params);
   },
 
   updateSkillEnabled: (skillId: string, enabled: boolean): Promise<void> => {
-    return post<void>(`/app-config/skills/${skillId}/enabled`, { enabled });
+    return post<void>(`/v2/skills/${skillId}/enabled`, { enabled });
   },
 
   deleteSkill: (skillId: string): Promise<void> => {
-    return post<void>(`/app-config/skills/${skillId}/delete`, {});
+    return del<void>(`/v2/skills/${skillId}`);
   },
 
-  discoverMCPSkills: (): Promise<SkillDiscoveryData> => {
-    return get<SkillDiscoveryData>("/app-config/skills/discovery/mcp", undefined, {
-      timeout: SETTINGS_LIST_TIMEOUT,
-    });
+  getSkillRiskPolicy: (): Promise<SkillRiskPolicy> => {
+    return get<SkillRiskPolicy>("/v2/skills/policy");
   },
 
-  discoverGitHubSkills: (): Promise<SkillDiscoveryData> => {
-    return get<SkillDiscoveryData>("/app-config/skills/discovery/github", undefined, {
-      timeout: SETTINGS_LIST_TIMEOUT,
-    });
+  updateSkillRiskPolicy: (policy: SkillRiskPolicy): Promise<SkillRiskPolicy> => {
+    return post<SkillRiskPolicy>("/v2/skills/policy", policy);
   },
 };

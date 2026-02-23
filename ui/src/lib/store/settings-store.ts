@@ -13,7 +13,6 @@ import type {
   LLMConfig,
   MCPConfig,
   MCPServersData,
-  SkillDiscoveryData,
   SkillListData,
   ToolWithPreference,
 } from "@/lib/api/types";
@@ -29,9 +28,8 @@ type SettingsState = {
   a2aTools: ToolWithPreference[];
   skills: SkillListData["skills"];
   skillTools: ToolWithPreference[];
-  mcpSkillDiscovery: SkillDiscoveryData["skills"];
-  githubSkillDiscovery: SkillDiscoveryData["skills"];
   isLoading: boolean;
+  isInstallingSkill: boolean;
 };
 
 type SettingsActions = {
@@ -47,7 +45,7 @@ type SettingsActions = {
   deleteA2AServer: (a2aId: string) => Promise<void>;
   setA2AServerEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
   setA2AToolEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
-  installSkill: (params: InstallSkillParams) => Promise<void>;
+  installSkill: (params: InstallSkillParams) => Promise<boolean>;
   deleteSkill: (skillId: string) => Promise<void>;
   setSkillEnabled: (skillId: string, enabled: boolean) => Promise<void>;
   setSkillToolEnabled: (skillId: string, enabled: boolean) => Promise<void>;
@@ -64,9 +62,8 @@ const initialState: SettingsState = {
   a2aTools: [],
   skills: [],
   skillTools: [],
-  mcpSkillDiscovery: [],
-  githubSkillDiscovery: [],
   isLoading: false,
+  isInstallingSkill: false,
 };
 
 function mergeOptimisticMCPServers(
@@ -124,8 +121,6 @@ export const useSettingsStore = create<SettingsStore>()(
           a2aToolsResult,
           skillsResult,
           skillToolsResult,
-          mcpSkillDiscoveryResult,
-          githubSkillDiscoveryResult,
         ] = await Promise.allSettled([
           configApi.getLLMConfig(),
           configApi.getAgentConfig(),
@@ -135,8 +130,6 @@ export const useSettingsStore = create<SettingsStore>()(
           userToolsApi.getA2ATools(),
           configApi.getSkills(),
           userToolsApi.getSkillTools(),
-          configApi.discoverMCPSkills(),
-          configApi.discoverGitHubSkills(),
         ]);
 
         const partialState: Partial<SettingsState> = {};
@@ -188,18 +181,6 @@ export const useSettingsStore = create<SettingsStore>()(
           partialState.skillTools = skillToolsResult.value.tools;
         } else {
           failedItems.push("Skill 个人开关");
-        }
-
-        if (mcpSkillDiscoveryResult.status === "fulfilled") {
-          partialState.mcpSkillDiscovery = mcpSkillDiscoveryResult.value.skills;
-        } else {
-          failedItems.push("MCP Skill 发现");
-        }
-
-        if (githubSkillDiscoveryResult.status === "fulfilled") {
-          partialState.githubSkillDiscovery = githubSkillDiscoveryResult.value.skills;
-        } else {
-          failedItems.push("GitHub Skill 发现");
         }
 
         set(partialState);
@@ -325,12 +306,17 @@ export const useSettingsStore = create<SettingsStore>()(
     },
 
     installSkill: async (params) => {
+      set({ isInstallingSkill: true });
       try {
         await configApi.installSkill(params);
         await get().loadAll();
         reportSuccess("Skill 安装成功");
+        return true;
       } catch (error) {
         reportError(error, "安装 Skill 失败");
+        return false;
+      } finally {
+        set({ isInstallingSkill: false });
       }
     },
 

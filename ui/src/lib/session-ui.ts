@@ -202,6 +202,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+export function getSessionEventStableKey(
+  event: SessionEventLike,
+  index: number
+): string {
+  if (event.event === "message") {
+    const streamId = asString(event.data.stream_id).trim();
+    if (streamId) {
+      return `message:${streamId}`;
+    }
+  }
+
+  if (event.event === "tool") {
+    const toolCallId = asString(event.data.tool_call_id).trim();
+    if (toolCallId) {
+      return `tool:${toolCallId}`;
+    }
+  }
+
+  if (event.event === "step") {
+    const stepId = asString(event.data.id).trim();
+    if (stepId) {
+      return `step:${stepId}`;
+    }
+  }
+
+  const eventId = asString(event.data.event_id).trim();
+  if (eventId) {
+    return eventId;
+  }
+
+  return `${event.event}-${index}`;
+}
+
 function formatPathTail(path: string): string {
   const clean = path.split("?")[0]?.split("#")[0] || path;
   const parts = clean.split("/");

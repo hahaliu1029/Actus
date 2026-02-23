@@ -10,7 +10,12 @@ from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task
-from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
+from app.domain.models.app_config import (
+    A2AConfig,
+    AgentConfig,
+    MCPConfig,
+    SkillRiskPolicy,
+)
 from app.domain.models.event import (
     BaseEvent,
     DoneEvent,
@@ -47,6 +52,7 @@ class AgentService:
         json_parser: JSONParser,
         search_engine: SearchEngine,
         file_storage: FileStorage,
+        skill_risk_policy: SkillRiskPolicy | None = None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
@@ -56,6 +62,7 @@ class AgentService:
         self._agent_config = agent_config
         self._mcp_config = mcp_config
         self._a2a_config = a2a_config
+        self._skill_risk_policy = skill_risk_policy or SkillRiskPolicy()
         self._sandbox_cls = sandbox_cls
         self._task_cls = task_cls
         self._json_parser = json_parser
@@ -103,6 +110,7 @@ class AgentService:
             agent_config=self._agent_config,
             mcp_config=self._mcp_config,
             a2a_config=self._a2a_config,
+            skill_risk_policy=self._skill_risk_policy,
             session_id=session.id,
             user_id=session.user_id,
             # session_repository=self._session_repository,

@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     sandbox_no_proxy: Optional[str] = None
     container_timezone: str = "UTC"
 
+    # Skill v2 配置
+    skills_root_dir: str = "/app/data/skills"
+    skill_backend: str = "filesystem"
+    skill_blocked_command_patterns: str = "rm -rf,:(){,mkfs.,shutdown,reboot"
+
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"
     jwt_algorithm: str = "HS256"

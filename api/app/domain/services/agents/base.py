@@ -54,6 +54,44 @@ class BaseAgent(ABC):
         self._memory: Optional[Memory] = None
         self._json_parser = json_parser
         self._tools = tools
+        self._runtime_system_context: str = ""
+
+    def set_runtime_system_context(self, context: str) -> None:
+        """设置运行时系统上下文（如动态激活的 Skill 指南）"""
+        self._runtime_system_context = (context or "").strip()
+
+    def _build_effective_system_prompt(self) -> str:
+        """构建当前生效的系统提示词（静态 + 运行时上下文）"""
+        if not self._runtime_system_context:
+            return self._system_prompt
+        return f"{self._system_prompt}\n\n{self._runtime_system_context}"
+
+    def _ensure_system_message(self) -> None:
+        """确保记忆中的首条 system 消息与当前系统提示词一致"""
+        expected_system_prompt = self._build_effective_system_prompt()
+
+        if self._memory.empty:
+            self._memory.add_message(
+                {
+                    "role": "system",
+                    "content": expected_system_prompt,
+                }
+            )
+            return
+
+        first_message = self._memory.messages[0]
+        if first_message.get("role") != "system":
+            self._memory.messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": expected_system_prompt,
+                },
+            )
+            return
+
+        if first_message.get("content") != expected_system_prompt:
+            first_message["content"] = expected_system_prompt
 
     async def _ensure_memory(self) -> None:
         """确保智能体记忆是存在的"""
@@ -171,14 +209,8 @@ class BaseAgent(ABC):
         # 1.先检查确保记忆是存在的
         await self._ensure_memory()
 
-        # 2.检查记忆的消息列表是否为空，如果是空则需要添加预设prompt作为初始记忆
-        if self._memory.empty:
-            self._memory.add_message(
-                {
-                    "role": "system",
-                    "content": self._system_prompt,
-                }
-            )
+        # 2.确保首条系统消息和当前上下文一致
+        self._ensure_system_message()
 
         # 3.将正常消息添加到记忆中
         self._memory.add_messages(messages)

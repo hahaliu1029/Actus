@@ -6,12 +6,14 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import uuid
 from typing import Any, Dict, List, Optional
 
 from app.domain.external.sandbox import Sandbox
 from app.domain.models.skill import Skill, SkillRuntimeType
 from app.domain.models.tool_result import ToolResult
+from core.config import get_settings
 
 from .a2a import A2ATool
 from .base import BaseTool
@@ -31,15 +33,27 @@ class SkillTool(BaseTool):
         sandbox: Sandbox,
         mcp_tool: MCPTool,
         a2a_tool: A2ATool,
+        risk_mode: str = "off",
+        blocked_command_patterns: list[str] | None = None,
     ) -> None:
         super().__init__()
         self._sandbox = sandbox
         self._mcp_tool = mcp_tool
         self._a2a_tool = a2a_tool
+        self._risk_mode = risk_mode
         self._skills: list[Skill] = []
         self._tools: list[dict[str, Any]] = []
         self._tool_bindings: dict[str, dict[str, Any]] = {}
         self._tool_name_index: dict[str, int] = {}
+        if blocked_command_patterns is not None:
+            self._blocked_command_patterns = blocked_command_patterns
+        else:
+            settings = get_settings()
+            self._blocked_command_patterns = [
+                item.strip()
+                for item in str(settings.skill_blocked_command_patterns).split(",")
+                if item.strip()
+            ]
 
     async def initialize(self, skills: list[Skill]) -> None:
         """初始化可用 Skill 列表并生成工具声明"""
@@ -60,6 +74,9 @@ class SkillTool(BaseTool):
 
                 raw_tool_name = str(manifest_tool.get("name") or "").strip()
                 if not raw_tool_name:
+                    continue
+
+                if not self._is_model_invocable(skill, manifest_tool):
                     continue
 
                 function_name = self._build_function_name(skill.slug, raw_tool_name)
@@ -109,8 +126,23 @@ class SkillTool(BaseTool):
         if not binding:
             return ToolResult(success=False, message=f"Skill工具[{tool_name}]不存在")
 
+        skill: Skill = binding["skill"]
         runtime_type: SkillRuntimeType = binding["runtime_type"]
         manifest_tool: dict[str, Any] = binding["manifest_tool"]
+        policy = self._get_tool_policy(skill, manifest_tool)
+        risk_level = str(policy.get("risk_level") or "low").strip().lower()
+
+        if self._risk_mode == "enforce_confirmation" and risk_level == "high":
+            return ToolResult(
+                success=False,
+                message="APPROVAL_REQUIRED",
+                data={
+                    "approval_required": True,
+                    "skill_id": skill.id,
+                    "tool_name": tool_name,
+                    "risk_level": risk_level,
+                },
+            )
 
         if runtime_type == SkillRuntimeType.NATIVE:
             return await self._invoke_native(manifest_tool, kwargs)
@@ -140,9 +172,11 @@ class SkillTool(BaseTool):
         command = str(entry.get("command") or "").strip()
         if not command:
             return ToolResult(success=False, message="native skill 缺少 entry.command")
+        if self._contains_blocked_command(command):
+            return ToolResult(success=False, message="native skill 命令命中禁止规则")
 
         payload = json.dumps(kwargs, ensure_ascii=False) if kwargs else "{}"
-        full_command = f"{command} '{payload}'"
+        full_command = f"{command} {shlex.quote(payload)}"
         session_id = f"skill-{uuid.uuid4()}"
 
         result = await self._sandbox.exec_command(session_id, exec_dir, full_command)
@@ -244,3 +278,24 @@ class SkillTool(BaseTool):
             parts.append(f"Skill guide: {skill_md_summary}")
 
         return " ".join(parts)[:512]
+
+    @staticmethod
+    def _get_tool_policy(skill: Skill, manifest_tool: dict[str, Any]) -> dict[str, Any]:
+        policy: dict[str, Any] = {}
+        manifest_policy = (skill.manifest or {}).get("policy")
+        if isinstance(manifest_policy, dict):
+            policy.update(manifest_policy)
+        tool_policy = manifest_tool.get("policy")
+        if isinstance(tool_policy, dict):
+            policy.update(tool_policy)
+        return policy
+
+    def _is_model_invocable(self, skill: Skill, manifest_tool: dict[str, Any]) -> bool:
+        policy = self._get_tool_policy(skill, manifest_tool)
+        return bool(policy.get("model_invocable", True))
+
+    def _contains_blocked_command(self, command: str) -> bool:
+        for pattern in self._blocked_command_patterns:
+            if re.search(pattern, command, flags=re.IGNORECASE):
+                return True
+        return False

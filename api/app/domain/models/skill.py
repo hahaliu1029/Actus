@@ -1,5 +1,6 @@
 """Skill 生态领域模型"""
 
+import hashlib
 import re
 from datetime import datetime
 from enum import Enum
@@ -12,8 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class SkillSourceType(str, Enum):
     """Skill 安装来源"""
 
-    MCP_REGISTRY = "mcp_registry"
+    LOCAL = "local"
     GITHUB = "github"
+    MCP_REGISTRY = "mcp_registry"  # deprecated, reserved for historical migration
 
 
 class SkillRuntimeType(str, Enum):
@@ -45,6 +47,9 @@ class SkillManifest(BaseModel):
     description: str = ""
     runtime_type: SkillRuntimeType
     tools: List[SkillManifestTool] = Field(default_factory=list)
+    activation: Dict[str, Any] = Field(default_factory=dict)
+    policy: Dict[str, Any] = Field(default_factory=dict)
+    security: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="allow")
 
@@ -83,3 +88,15 @@ def normalize_skill_slug(raw: str) -> str:
     """规范化 skill slug。"""
     normalized = re.sub(r"[^a-zA-Z0-9]+", "-", raw or "").strip("-").lower()
     return normalized or "skill"
+
+
+def build_skill_key(
+    slug: str,
+    source_type: SkillSourceType,
+    source_ref: str,
+) -> str:
+    """根据 slug + source 生成稳定 skill key。"""
+    slug_part = normalize_skill_slug(slug)
+    seed = f"{source_type.value}:{source_ref}".encode("utf-8")
+    digest = hashlib.sha1(seed).hexdigest()[:8]
+    return f"{slug_part}--{digest}"

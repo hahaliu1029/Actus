@@ -94,7 +94,7 @@ async def test_mcp_skill_delegates_to_mcp_tool() -> None:
     skill = Skill(
         slug="demo-mcp",
         name="Demo MCP",
-        source_type=SkillSourceType.MCP_REGISTRY,
+        source_type=SkillSourceType.LOCAL,
         source_ref="mcp:demo",
         runtime_type=SkillRuntimeType.MCP,
         manifest={

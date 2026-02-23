@@ -60,3 +60,6 @@ api/config.yaml
 
 # Runtime config with potential secrets
 api/config.yaml
+
+
+docs/

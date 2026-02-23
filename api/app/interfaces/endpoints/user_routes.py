@@ -4,12 +4,10 @@ import asyncio
 import logging
 
 from app.application.services.app_config_service import AppConfigService
-from app.application.services.skill_service import SkillService
 from app.application.services.user_tool_preference_service import (
     UserToolPreferenceService,
 )
 from app.domain.models.user_tool_preference import ToolType
-from app.infrastructure.repositories.db_skill_repository import DBSkillRepository
 from app.infrastructure.repositories.db_user_tool_preference_repository import (
     DBUserToolPreferenceRepository,
 )
@@ -19,6 +17,7 @@ from app.interfaces.schemas import Response
 from app.interfaces.schemas.user import ToolPreferenceRequest, ToolWithPreference
 from app.interfaces.service_dependencies import get_app_config_service
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/user/tools", tags=["用户工具偏好"])
@@ -185,75 +184,41 @@ async def set_a2a_tool_enabled(
 @router.get(
     "/skills",
     response_model=Response,
-    summary="获取 Skill 工具列表（带用户偏好）",
-    description="获取所有 Skill 列表，包含用户的个人启用状态",
+    summary="获取 Skill 工具列表（已迁移）",
+    description="Skill 用户偏好接口已迁移到 /v2/user/tools/skills",
 )
 async def get_skill_tools(
     current_user: CurrentUser,
 ) -> Response:
-    """获取 Skill 工具列表"""
-    pref_map: dict[str, bool] = {}
-    tools: list[ToolWithPreference] = []
-    postgres = get_postgres()
-
-    try:
-        async with postgres.session_factory() as session:
-            pref_service = UserToolPreferenceService(
-                DBUserToolPreferenceRepository(session)
-            )
-            skill_service = SkillService(DBSkillRepository(session))
-
-            user_prefs = await pref_service.get_user_preferences(
-                current_user.id, ToolType.SKILL
-            )
-            pref_map = {pref.tool_id: pref.enabled for pref in user_prefs}
-
-            skills = await skill_service.list_skills()
-            for skill in skills:
-                tools.append(
-                    ToolWithPreference(
-                        tool_id=skill.id,
-                        tool_name=skill.name,
-                        description=skill.description,
-                        enabled_global=skill.enabled,
-                        enabled_user=pref_map.get(skill.id, True),
-                    )
-                )
-    except asyncio.CancelledError:
-        logger.warning("get_skill_tools 请求被取消，返回上游取消")
-        raise
-    except Exception as e:
-        logger.exception(
-            f"查询用户Skill工具偏好失败，降级为空列表(user_id={current_user.id}): {e}"
-        )
-
-    return Response.success(data={"tools": tools})
+    return JSONResponse(
+        status_code=410,
+        content=Response.fail(
+            code=410,
+            msg="SKILL_API_MOVED",
+            data={"code": "SKILL_API_MOVED", "migrate_to": "/v2/user/tools/skills"},
+        ).model_dump(),
+    )
 
 
 @router.post(
     "/skills/{skill_id}/enabled",
     response_model=Response,
-    summary="设置 Skill 工具个人启用状态",
-    description="设置用户对某个 Skill 工具的个人启用/禁用状态",
+    summary="设置 Skill 工具个人启用状态（已迁移）",
+    description="Skill 用户偏好接口已迁移到 /v2/user/tools/skills/{skill_key}/enabled",
 )
 async def set_skill_tool_enabled(
     skill_id: str,
     request: ToolPreferenceRequest,
     current_user: CurrentUser,
 ) -> Response:
-    """设置 Skill 工具个人启用状态"""
-    postgres = get_postgres()
-
-    async with postgres.session_factory() as session:
-        pref_repo = DBUserToolPreferenceRepository(session)
-        pref_service = UserToolPreferenceService(pref_repo)
-
-        await pref_service.set_tool_enabled(
-            current_user.id,
-            ToolType.SKILL,
-            skill_id,
-            request.enabled,
-        )
-        await session.commit()
-
-        return Response.success(msg="设置成功")
+    return JSONResponse(
+        status_code=410,
+        content=Response.fail(
+            code=410,
+            msg="SKILL_API_MOVED",
+            data={
+                "code": "SKILL_API_MOVED",
+                "migrate_to": f"/v2/user/tools/skills/{skill_id}/enabled",
+            },
+        ).model_dump(),
+    )

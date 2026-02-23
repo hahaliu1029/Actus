@@ -35,6 +35,7 @@ import {
   formatFileSize,
   formatRelativeTime,
   getFilePreviewKind,
+  getSessionEventStableKey,
   getToolDisplayCopy,
   normalizeMessageAttachments,
 } from "@/lib/session-ui";
@@ -99,10 +100,6 @@ function renderStepStatusIcon(status: string) {
 
 function getEventTime(eventData: Record<string, unknown>) {
   return formatRelativeTime(eventData.created_at);
-}
-
-function getEventKey(event: SessionEvent, index: number): string {
-  return String(event.data.event_id || `${event.event}-${index}`);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -195,11 +192,12 @@ function renderEventItem(
   onPreviewImage: (src: string, title?: string) => void,
   streamingAssistantEventId?: string | null
 ) {
-  const eventKey = getEventKey(event, index);
+  const eventKey = getSessionEventStableKey(event, index);
 
   if (event.event === "message") {
     const role = String(event.data.role || "assistant");
     const message = String(event.data.message || "");
+    const isPartial = Boolean(event.data.partial);
     const attachments = normalizeMessageAttachments(event.data.attachments, sessionFiles);
     const timeText = getEventTime(event.data);
     const isStreamingAssistant = role === "assistant" && streamingAssistantEventId === eventKey;
@@ -226,9 +224,13 @@ function renderEventItem(
           <span className="text-xs text-muted-foreground">{timeText}</span>
         </div>
         <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
-          <MarkdownRenderer content={message || "（空消息）"} />
+          {isPartial ? (
+            <p className="whitespace-pre-wrap leading-7">{message || "（空消息）"}</p>
+          ) : (
+            <MarkdownRenderer content={message || "（空消息）"} />
+          )}
           {renderMessageAttachments(attachments, onPreviewFile)}
-          {isStreamingAssistant ? (
+          {isStreamingAssistant || isPartial ? (
             <div className="mt-2 inline-flex items-center gap-1 text-xs text-amber-600">
               <Loader2 size={12} className="animate-spin" />
               流式输出中
@@ -523,7 +525,7 @@ export default function SessionPage() {
       if (String(event.data.role || "assistant") !== "assistant") {
         continue;
       }
-      return getEventKey(event, index);
+      return getSessionEventStableKey(event, index);
     }
     return null;
   }, [eventList, isChatting]);
@@ -535,7 +537,11 @@ export default function SessionPage() {
     }
     node.scrollTo({
       top: node.scrollHeight,
-      behavior: "smooth",
+      behavior:
+        eventList.at(-1)?.event === "message" &&
+        Boolean(eventList.at(-1)?.data?.partial)
+          ? "auto"
+          : "smooth",
     });
   }, [eventList]);
 

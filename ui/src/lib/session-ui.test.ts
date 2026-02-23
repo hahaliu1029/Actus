@@ -9,6 +9,7 @@ import {
   formatFileSize,
   formatRelativeTime,
   getFilePreviewKind,
+  getSessionEventStableKey,
   getLatestSnapshotByMode,
   getShellSessionIds,
   getToolDisplayCopy,
@@ -157,6 +158,51 @@ describe("session-ui", () => {
       expect(copy.kind).toBe("tool");
       expect(copy.title).toBe("正在搜索资料");
       expect(copy.detail).toContain("关键词");
+    });
+  });
+
+  describe("getSessionEventStableKey", () => {
+    it("message 事件优先使用 stream_id 作为稳定 key", () => {
+      const first = getSessionEventStableKey(
+        {
+          event: "message",
+          data: {
+            event_id: "evt-1",
+            stream_id: "stream-1",
+            message: "part 1",
+          },
+        },
+        0
+      );
+      const second = getSessionEventStableKey(
+        {
+          event: "message",
+          data: {
+            event_id: "evt-2",
+            stream_id: "stream-1",
+            message: "part 2",
+          },
+        },
+        0
+      );
+
+      expect(first).toBe("message:stream-1");
+      expect(second).toBe("message:stream-1");
+    });
+
+    it("无 stream_id 时回退到 event_id", () => {
+      const key = getSessionEventStableKey(
+        {
+          event: "message",
+          data: {
+            event_id: "evt-100",
+            message: "hello",
+          },
+        },
+        3
+      );
+
+      expect(key).toBe("evt-100");
     });
   });
 

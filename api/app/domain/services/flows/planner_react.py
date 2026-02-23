@@ -99,6 +99,11 @@ class PlannerReActFlow(BaseFlow):
         )
         logger.debug(f"创建执行Agent成功, 会话id: {self._session_id}")
 
+    def set_skill_context(self, skill_context: str) -> None:
+        """设置当前轮次激活 Skill 的系统上下文提示。"""
+        self.planner.set_runtime_system_context(skill_context)
+        self.react.set_runtime_system_context(skill_context)
+
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """传递消息，运行流，在六中调用planner&react智能体组合完成任务并返回对应事件"""
         # 1.调用会话仓库查询会话是否存在

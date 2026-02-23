@@ -18,8 +18,8 @@ vi.mock("@/lib/api/config", () => ({
     installSkill: vi.fn(),
     deleteSkill: vi.fn(),
     updateSkillEnabled: vi.fn(),
-    discoverMCPSkills: vi.fn(),
-    discoverGitHubSkills: vi.fn(),
+    getSkillRiskPolicy: vi.fn(),
+    updateSkillRiskPolicy: vi.fn(),
   },
 }));
 
@@ -83,12 +83,6 @@ describe("settings-store", () => {
     });
     mockedUserToolsApi.getSkillTools.mockResolvedValue({
       tools: [],
-    });
-    mockedConfigApi.discoverMCPSkills.mockResolvedValue({
-      skills: [],
-    });
-    mockedConfigApi.discoverGitHubSkills.mockResolvedValue({
-      skills: [],
     });
   });
 
@@ -172,6 +166,26 @@ describe("settings-store", () => {
     expect(result).toBe(false);
   });
 
+  it("installSkill 在请求期间设置 isInstallingSkill，并在结束后恢复", async () => {
+    let resolveInstall: (() => void) | null = null;
+    mockedConfigApi.installSkill.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveInstall = resolve;
+        })
+    );
+
+    const installPromise = useSettingsStore.getState().installSkill({
+      source_type: "github",
+      source_ref: "https://github.com/anthropics/skills/tree/main/skills/pptx",
+    });
+
+    expect(useSettingsStore.getState().isInstallingSkill).toBe(true);
+    resolveInstall?.();
+    await installPromise;
+    expect(useSettingsStore.getState().isInstallingSkill).toBe(false);
+  });
+
   it("loadAll 会加载 Skill 列表和发现结果", async () => {
     mockedConfigApi.getSkills.mockResolvedValue({
       skills: [
@@ -199,35 +213,10 @@ describe("settings-store", () => {
         },
       ],
     });
-    mockedConfigApi.discoverMCPSkills.mockResolvedValue({
-      skills: [
-        {
-          source_type: "mcp_registry",
-          source_ref: "mcp:filesystem-basic",
-          name: "Filesystem Basic",
-          description: "fs",
-          runtime_type: "mcp",
-        },
-      ],
-    });
-    mockedConfigApi.discoverGitHubSkills.mockResolvedValue({
-      skills: [
-        {
-          source_type: "github",
-          source_ref: "github:openai/repo",
-          name: "Native Shell",
-          description: "shell",
-          runtime_type: "native",
-        },
-      ],
-    });
-
     await useSettingsStore.getState().loadAll();
 
     const state = useSettingsStore.getState();
     expect(state.skills).toHaveLength(1);
     expect(state.skillTools).toHaveLength(1);
-    expect(state.mcpSkillDiscovery).toHaveLength(1);
-    expect(state.githubSkillDiscovery).toHaveLength(1);
   });
 });

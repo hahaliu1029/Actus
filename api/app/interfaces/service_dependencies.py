@@ -125,6 +125,7 @@ def get_agent_service(
         agent_config=app_config.agent_config,
         mcp_config=app_config.mcp_config,
         a2a_config=app_config.a2a_config,
+        skill_risk_policy=app_config.skill_risk_policy,
         sandbox_cls=DockerSandbox,
         task_cls=RedisStreamTask,
         json_parser=RepairJSONParser(),

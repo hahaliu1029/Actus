@@ -94,6 +94,19 @@ class A2AConfig(BaseModel):
     a2a_servers: List[A2AServerConfig] = Field(default_factory=list)
 
 
+class SkillRiskMode(str, Enum):
+    """Skill 风险控制模式"""
+
+    OFF = "off"
+    ENFORCE_CONFIRMATION = "enforce_confirmation"
+
+
+class SkillRiskPolicy(BaseModel):
+    """Skill 风险控制配置"""
+
+    mode: SkillRiskMode = SkillRiskMode.OFF
+
+
 class AppConfig(BaseModel):
     """应用配置信息，包含Agent配置、LLM提供商配置、MCP配置、A2A配置"""
 
@@ -101,6 +114,7 @@ class AppConfig(BaseModel):
     agent_config: AgentConfig  # Agent通用配置
     mcp_config: MCPConfig  # MCP服务配置
     a2a_config: A2AConfig  # A2A服务配置
+    skill_risk_policy: SkillRiskPolicy = SkillRiskPolicy()
 
     # Pydantic配置，允许传递额外的字段初始化
     model_config = ConfigDict(extra="allow")

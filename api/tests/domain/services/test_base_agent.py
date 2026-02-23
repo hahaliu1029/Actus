@@ -128,3 +128,27 @@ async def test_invoke_handles_non_dict_tool_args_without_crashing() -> None:
     assert any(isinstance(event, ToolEvent) for event in events)
     assert isinstance(events[-1], MessageEvent)
     assert events[-1].message == "done"
+
+
+async def test_runtime_system_context_is_injected_into_system_prompt() -> None:
+    agent = _build_agent(_SequenceLLM())
+
+    agent.set_runtime_system_context("Active skill: repo-search")
+    _ = [event async for event in agent.invoke("hello")]
+
+    memory = agent._uow.session._memory
+    assert memory.messages[0]["role"] == "system"
+    assert "Active skill: repo-search" in memory.messages[0]["content"]
+
+
+async def test_runtime_system_context_updates_between_turns() -> None:
+    agent = _build_agent(_SequenceLLM())
+
+    agent.set_runtime_system_context("Active skill: first")
+    _ = [event async for event in agent.invoke("hello")]
+    agent.set_runtime_system_context("Active skill: second")
+    _ = [event async for event in agent.invoke("hello again")]
+
+    memory = agent._uow.session._memory
+    assert memory.messages[0]["role"] == "system"
+    assert "Active skill: second" in memory.messages[0]["content"]

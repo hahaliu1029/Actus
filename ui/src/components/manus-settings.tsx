@@ -83,9 +83,8 @@ export function ManusSettings() {
   const a2aTools = useSettingsStore((state) => state.a2aTools);
   const skills = useSettingsStore((state) => state.skills);
   const skillTools = useSettingsStore((state) => state.skillTools);
-  const mcpSkillDiscovery = useSettingsStore((state) => state.mcpSkillDiscovery);
-  const githubSkillDiscovery = useSettingsStore((state) => state.githubSkillDiscovery);
   const isLoading = useSettingsStore((state) => state.isLoading);
+  const isInstallingSkill = useSettingsStore((state) => state.isInstallingSkill);
 
   const loadAll = useSettingsStore((state) => state.loadAll);
   const updateLLMConfig = useSettingsStore((state) => state.updateLLMConfig);
@@ -121,10 +120,9 @@ export function ManusSettings() {
   const [mcpDialogError, setMcpDialogError] = useState<string | null>(null);
   const [a2aBaseUrl, setA2ABaseUrl] = useState("");
   const [a2aDialogError, setA2ADialogError] = useState<string | null>(null);
-  const [skillSourceType, setSkillSourceType] = useState<SkillSourceType>("mcp_registry");
+  const [skillSourceType, setSkillSourceType] = useState<SkillSourceType>("local");
   const [skillSourceRef, setSkillSourceRef] = useState("");
-  const [skillManifest, setSkillManifest] = useState(`{\n  \"name\": \"demo-skill\",\n  \"runtime_type\": \"native\",\n  \"tools\": [\n    {\n      \"name\": \"run_demo\",\n      \"description\": \"Run demo action\",\n      \"parameters\": {\n        \"query\": {\n          \"type\": \"string\"\n        }\n      },\n      \"required\": [\"query\"],\n      \"entry\": {\n        \"exec_dir\": \"/home/ubuntu/workspace\",\n        \"command\": \"echo skill\"\n      }\n    }\n  ]\n}`);
-  const [skillMarkdown, setSkillMarkdown] = useState("# Demo Skill\\n\\nDescribe usage here.");
+  const [skillMarkdown, setSkillMarkdown] = useState("");
   const [skillDialogError, setSkillDialogError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -244,29 +242,50 @@ export function ManusSettings() {
   }
 
   async function handleInstallSkill(): Promise<void> {
-    if (!skillSourceRef.trim()) {
-      setSkillDialogError("请输入来源标识（市场ID或仓库ID）");
+    if (isInstallingSkill) {
       return;
     }
 
-    if (!skillManifest.trim()) {
-      setSkillDialogError("请输入 Manifest JSON");
+    const trimmedSourceRef = skillSourceRef.trim();
+    if (!trimmedSourceRef) {
+      setSkillDialogError("请输入来源标识（本地目录或 GitHub 仓库）");
       return;
     }
 
-    try {
-      setSkillDialogError(null);
-      const manifest = JSON.parse(skillManifest) as Record<string, unknown>;
-      await installSkill({
-        source_type: skillSourceType,
-        source_ref: skillSourceRef.trim(),
-        manifest,
-        skill_md: skillMarkdown,
-      });
-      setIsSkillDialogOpen(false);
-    } catch {
-      setSkillDialogError("Manifest JSON 格式不合法");
+    if (
+      skillSourceType === "github" &&
+      !/^https:\/\/github\.com\/[^/]+\/[^/]+\/tree\/[^/]+\/.+/.test(trimmedSourceRef)
+    ) {
+      setSkillDialogError(
+        "GitHub 来源请使用目录 URL，例如 https://github.com/owner/repo/tree/main/skills/pptx"
+      );
+      return;
     }
+
+    if (
+      skillSourceType === "local" &&
+      !(trimmedSourceRef.startsWith("/") || trimmedSourceRef.startsWith("local:/"))
+    ) {
+      setSkillDialogError("Local 来源请填写绝对路径，或使用 local:/abs/path 形式");
+      return;
+    }
+
+    setSkillDialogError(null);
+    const payload: { source_type: SkillSourceType; source_ref: string; skill_md?: string } = {
+      source_type: skillSourceType,
+      source_ref: trimmedSourceRef,
+    };
+    if (skillMarkdown.trim()) {
+      payload.skill_md = skillMarkdown.trim();
+    }
+    const installed = await installSkill(payload);
+    if (!installed) {
+      setSkillDialogError(useUIStore.getState().message?.text || "安装 Skill 失败");
+      return;
+    }
+    setSkillSourceRef("");
+    setSkillDialogError(null);
+    setIsSkillDialogOpen(false);
   }
 
   return (
@@ -484,29 +503,31 @@ export function ManusSettings() {
                           添加远程Agent
                         </Button>
                       </DialogTrigger>
-                        <DialogContent className="max-w-[560px] rounded-2xl border border-border shadow-[var(--shadow-float)]">
-                        <DialogHeader>
+                      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] max-h-[85vh] max-w-[560px] gap-0 overflow-hidden rounded-2xl border border-border p-0 shadow-[var(--shadow-float)]">
+                        <DialogHeader className="px-6 pt-6 pb-3">
                           <DialogTitle>添加远程 Agent</DialogTitle>
                           <DialogDescription>
                             请输入 A2A Agent 的基础 URL，系统将自动探测其能力信息。
                           </DialogDescription>
                         </DialogHeader>
-                        <Input
-                          value={a2aBaseUrl}
-                          onChange={(event) => {
-                            setA2ABaseUrl(event.target.value);
-                            if (a2aDialogError) {
-                              setA2ADialogError(null);
-                            }
-                          }}
-                          placeholder="https://example.com/agent"
-                        />
-                        {a2aDialogError ? (
-                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
-                            {a2aDialogError}
-                          </p>
-                        ) : null}
-                        <div className="flex justify-end gap-2">
+                        <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-4">
+                          <Input
+                            value={a2aBaseUrl}
+                            onChange={(event) => {
+                              setA2ABaseUrl(event.target.value);
+                              if (a2aDialogError) {
+                                setA2ADialogError(null);
+                              }
+                            }}
+                            placeholder="https://example.com/agent"
+                          />
+                          {a2aDialogError ? (
+                            <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
+                              {a2aDialogError}
+                            </p>
+                          ) : null}
+                        </div>
+                        <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
                           <Button
                             variant="outline"
                             className="h-10 rounded-xl border-border px-5"
@@ -652,29 +673,31 @@ export function ManusSettings() {
                           添加服务器
                         </Button>
                       </DialogTrigger>
-                      <DialogContent className="max-w-[680px] rounded-2xl border border-border shadow-[var(--shadow-float)]">
-                        <DialogHeader>
+                      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] max-h-[85vh] max-w-[680px] gap-0 overflow-hidden rounded-2xl border border-border p-0 shadow-[var(--shadow-float)]">
+                        <DialogHeader className="px-6 pt-6 pb-3">
                           <DialogTitle>添加新的 MCP 服务器</DialogTitle>
                           <DialogDescription>
                             粘贴完整 JSON 配置后点击添加，支持一次新增多个服务器。
                           </DialogDescription>
                         </DialogHeader>
-                        <Textarea
-                          className="min-h-[320px] text-xs"
-                          value={mcpPayload}
-                          onChange={(event) => {
-                            setMcpPayload(event.target.value);
-                            if (mcpDialogError) {
-                              setMcpDialogError(null);
-                            }
-                          }}
-                        />
-                        {mcpDialogError ? (
-                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
-                            {mcpDialogError}
-                          </p>
-                        ) : null}
-                        <div className="flex justify-end gap-2">
+                        <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-4">
+                          <Textarea
+                            className="min-h-[280px] max-h-[45vh] text-xs"
+                            value={mcpPayload}
+                            onChange={(event) => {
+                              setMcpPayload(event.target.value);
+                              if (mcpDialogError) {
+                                setMcpDialogError(null);
+                              }
+                            }}
+                          />
+                          {mcpDialogError ? (
+                            <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
+                              {mcpDialogError}
+                            </p>
+                          ) : null}
+                        </div>
+                        <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
                           <Button
                             variant="outline"
                             className="h-10 rounded-xl border-border px-5"
@@ -802,13 +825,16 @@ export function ManusSettings() {
                         Skill 生态
                       </h3>
                       <p className="text-sm text-muted-foreground">
-                        统一管理 native / MCP / A2A 三类 Skill。
+                        通过 SKILL.md 管理技能说明与触发策略。
                       </p>
                     </div>
 
                     <Dialog
                       open={isSkillDialogOpen}
                       onOpenChange={(nextOpen) => {
+                        if (!nextOpen && isInstallingSkill) {
+                          return;
+                        }
                         setIsSkillDialogOpen(nextOpen);
                         if (!nextOpen) {
                           setSkillDialogError(null);
@@ -824,118 +850,100 @@ export function ManusSettings() {
                           安装 Skill
                         </Button>
                       </DialogTrigger>
-                      <DialogContent className="max-w-[760px] rounded-2xl border border-border shadow-[var(--shadow-float)]">
-                        <DialogHeader>
+                      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] max-h-[85vh] max-w-[760px] gap-0 overflow-hidden rounded-2xl border border-border p-0 shadow-[var(--shadow-float)]">
+                        <DialogHeader className="px-6 pt-6 pb-3">
                           <DialogTitle>安装 Skill</DialogTitle>
                           <DialogDescription>
-                            输入来源标识，并提供 Manifest + SKILL.md。
+                            输入来源标识即可安装。可选地手动覆盖 SKILL.md，Manifest 由系统自动生成。
                           </DialogDescription>
                         </DialogHeader>
+                        <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-4">
+                          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                            <label className="text-sm text-foreground/85">
+                              来源类型
+                              <select
+                                value={skillSourceType}
+                                onChange={(event) =>
+                                  setSkillSourceType(event.target.value as SkillSourceType)
+                                }
+                                disabled={isInstallingSkill}
+                                className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                              >
+                                <option value="local">Local</option>
+                                <option value="github">GitHub</option>
+                              </select>
+                            </label>
+                            <label className="text-sm text-foreground/85">
+                              来源标识
+                              <Input
+                                value={skillSourceRef}
+                                onChange={(event) => {
+                                  setSkillSourceRef(event.target.value);
+                                  if (skillDialogError) {
+                                    setSkillDialogError(null);
+                                  }
+                                }}
+                                placeholder={
+                                  skillSourceType === "local"
+                                    ? "/abs/path/to/skill or local:/abs/path/to/skill"
+                                    : "https://github.com/owner/repo/tree/main/skills/pptx"
+                                }
+                                disabled={isInstallingSkill}
+                                className="mt-1"
+                              />
+                            </label>
+                          </div>
 
-                        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                          <label className="text-sm text-foreground/85">
-                            来源类型
-                            <select
-                              value={skillSourceType}
-                              onChange={(event) =>
-                                setSkillSourceType(event.target.value as SkillSourceType)
-                              }
-                              className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                            >
-                              <option value="mcp_registry">MCP Registry</option>
-                              <option value="github">GitHub</option>
-                            </select>
-                          </label>
-                          <label className="text-sm text-foreground/85">
-                            来源标识
-                            <Input
-                              value={skillSourceRef}
-                              onChange={(event) => setSkillSourceRef(event.target.value)}
-                              placeholder={
-                                skillSourceType === "mcp_registry"
-                                  ? "mcp:filesystem-basic"
-                                  : "github:owner/repo"
-                              }
-                              className="mt-1"
-                            />
-                          </label>
+                          <details className="rounded-lg border border-border/70 bg-muted/20">
+                            <summary className="cursor-pointer list-none px-3 py-2 text-sm text-foreground/85">
+                              可选：手动覆盖 SKILL.md（默认从来源目录读取）
+                            </summary>
+                            <div className="space-y-2 border-t border-border/70 p-3">
+                              <Textarea
+                                className="min-h-[200px] max-h-[45vh] text-xs"
+                                value={skillMarkdown}
+                                onChange={(event) => setSkillMarkdown(event.target.value)}
+                                placeholder="留空将使用来源目录中的 SKILL.md"
+                                disabled={isInstallingSkill}
+                              />
+                            </div>
+                          </details>
+
+                          {skillDialogError ? (
+                            <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
+                              {skillDialogError}
+                            </p>
+                          ) : null}
                         </div>
 
-                        <label className="text-sm text-foreground/85">
-                          Manifest JSON
-                          <Textarea
-                            className="mt-1 min-h-[180px] text-xs"
-                            value={skillManifest}
-                            onChange={(event) => setSkillManifest(event.target.value)}
-                          />
-                        </label>
-
-                        <label className="text-sm text-foreground/85">
-                          SKILL.md
-                          <Textarea
-                            className="mt-1 min-h-[120px] text-xs"
-                            value={skillMarkdown}
-                            onChange={(event) => setSkillMarkdown(event.target.value)}
-                          />
-                        </label>
-
-                        {skillDialogError ? (
-                          <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
-                            {skillDialogError}
-                          </p>
-                        ) : null}
-
-                        <div className="flex justify-end gap-2">
+                        <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
                           <Button
                             variant="outline"
                             className="h-10 rounded-xl border-border px-5"
+                            disabled={isInstallingSkill}
                             onClick={() => setIsSkillDialogOpen(false)}
                           >
                             取消
                           </Button>
                           <Button
                             className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
+                            disabled={isInstallingSkill}
                             onClick={() => {
                               void handleInstallSkill();
                             }}
                           >
-                            安装
+                            {isInstallingSkill ? (
+                              <>
+                                <LoaderCircle className="size-4 animate-spin" />
+                                安装中...
+                              </>
+                            ) : (
+                              "安装"
+                            )}
                           </Button>
                         </div>
                       </DialogContent>
                     </Dialog>
-                  </div>
-
-                  <div className="rounded-2xl border border-border/70 bg-muted/30 p-3">
-                    <p className="mb-2 text-sm font-medium text-foreground/85">可发现 Skill</p>
-                    <div className="flex flex-wrap gap-2">
-                      {[...mcpSkillDiscovery, ...githubSkillDiscovery].map((item) => (
-                        <button
-                          key={`${item.source_ref}-${item.runtime_type}`}
-                          type="button"
-                          className="rounded-md border border-border bg-card px-2 py-1 text-xs text-foreground/85 hover:bg-accent"
-                          onClick={() => {
-                            setSkillSourceType(item.source_type);
-                            setSkillSourceRef(item.source_ref);
-                            setSkillManifest(
-                              JSON.stringify(
-                                {
-                                  name: item.name,
-                                  description: item.description,
-                                  runtime_type: item.runtime_type,
-                                  tools: [],
-                                },
-                                null,
-                                2
-                              )
-                            );
-                            setIsSkillDialogOpen(true);
-                          }}
-                        >
-                          {item.name} · {item.runtime_type}
-                        </button>
-                      ))}
-                    </div>
                   </div>
 
                   <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/30 p-3">
@@ -974,6 +982,10 @@ export function ManusSettings() {
                               </p>
                               <p className="text-xs text-muted-foreground">
                                 来源：{skill.source_type} · {skill.source_ref}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                Bundle：{skill.bundle_file_count ?? 0} 文件 · 引用
+                                {skill.context_ref_count ?? 0} 项
                               </p>
                             </div>
 

@@ -19,10 +19,10 @@ export const userToolsApi = {
   },
 
   getSkillTools(): Promise<ToolPreferenceListResponse> {
-    return get<ToolPreferenceListResponse>("/user/tools/skills");
+    return get<ToolPreferenceListResponse>("/v2/user/tools/skills");
   },
 
   setSkillToolEnabled(skillId: string, enabled: boolean): Promise<void> {
-    return post<void>(`/user/tools/skills/${skillId}/enabled`, { enabled });
+    return post<void>(`/v2/user/tools/skills/${skillId}/enabled`, { enabled });
   },
 };

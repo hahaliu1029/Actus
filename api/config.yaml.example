@@ -43,6 +43,10 @@ mcp_config:
 a2a_config:
   a2a_servers: []
 
-# Skill 生态说明：
-# - Skill 清单与启用状态存储在数据库（skills + user_tool_preferences）
+skill_risk_policy:
+  mode: off
+
+# Skill 生态说明（v2）：
+# - Skill 权威源位于 API 容器中的 /app/data/skills（可通过 SKILLS_ROOT_DIR 调整）
+# - 用户偏好仍存储在 user_tool_preferences（tool_type=skill）
 # - 请在前端「设置 -> Skill 生态」中安装和管理 Skill

@@ -64,7 +64,10 @@ def _uow_factory() -> _NoopUoW:
 
 class _DummyFlow:
     def __init__(self, **kwargs) -> None:
-        return None
+        self.skill_contexts: list[str] = []
+
+    def set_skill_context(self, skill_context: str) -> None:
+        self.skill_contexts.append(skill_context)
 
     async def invoke(self, message):
         if False:
@@ -225,3 +228,5 @@ async def test_invoke_applies_user_preferences_before_tool_initialization(
 
     assert fake_skill_tool.initialized_with is not None
     assert [skill.id for skill in fake_skill_tool.initialized_with] == ["skill-enabled"]
+    assert runner._flow.skill_contexts
+    assert "Skill Enabled" in runner._flow.skill_contexts[-1]

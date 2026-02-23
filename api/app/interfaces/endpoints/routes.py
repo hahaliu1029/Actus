@@ -6,9 +6,11 @@ from . import (
     auth_routes,
     file_routes,
     skill_routes,
+    skill_v2_routes,
     session_routes,
     status_routes,
     user_routes,
+    user_tools_v2_routes,
 )
 
 
@@ -24,10 +26,12 @@ def create_api_routes() -> APIRouter:
     api_router.include_router(status_routes.router)
     api_router.include_router(app_config_routes.router)
     api_router.include_router(skill_routes.router)
+    api_router.include_router(skill_v2_routes.router)
     api_router.include_router(file_routes.router)
 
     # 用户路由
     api_router.include_router(user_routes.router)
+    api_router.include_router(user_tools_v2_routes.router)
 
     # 管理员路由
     api_router.include_router(admin_routes.router)

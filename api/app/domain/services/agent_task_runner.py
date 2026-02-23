@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import mimetypes
+import re
 import uuid
 from typing import AsyncGenerator, BinaryIO, Callable, List
 
@@ -12,7 +13,7 @@ from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
-from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
+from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig, SkillRiskPolicy
 from app.domain.models.event import (
     A2AToolContent,
     BaseEvent,
@@ -42,6 +43,8 @@ from app.domain.models.user_tool_preference import ToolType
 # from app.domain.repositories.file_repository import FileRepository
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
+from app.application.services.skill_index_service import SkillIndexService
+from app.application.services.skill_selector import SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.mcp import MCPTool
@@ -49,8 +52,9 @@ from app.domain.services.tools.skill import SkillTool
 from app.infrastructure.repositories.db_user_tool_preference_repository import (
     DBUserToolPreferenceRepository,
 )
-from app.infrastructure.repositories.db_skill_repository import DBSkillRepository
+from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.postgres import get_postgres
+from core.config import get_settings
 from fastapi import UploadFile
 from pydantic import TypeAdapter
 
@@ -58,6 +62,9 @@ logger = logging.getLogger(__name__)
 
 MESSAGE_STREAM_CHUNK_SIZE = 24
 MESSAGE_STREAM_CHUNK_DELAY_SEC = 0.03
+SKILL_CONTEXT_MAX_SKILLS = 6
+SKILL_CONTEXT_MAX_TOTAL_CHARS = 8000
+SKILL_CONTEXT_MAX_SNIPPET_CHARS = 1200
 
 
 class AgentTaskRunner(TaskRunner):
@@ -79,6 +86,7 @@ class AgentTaskRunner(TaskRunner):
         browser: Browser,  # 浏览器
         search_engine: SearchEngine,  # 搜索引擎
         sandbox: Sandbox,  # 沙箱
+        skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._uow_factory = uow_factory
@@ -95,7 +103,15 @@ class AgentTaskRunner(TaskRunner):
             sandbox=sandbox,
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
+            risk_mode=(skill_risk_policy or SkillRiskPolicy()).mode.value,
         )
+        settings = get_settings()
+        self._skill_repository = FileSkillRepository(settings.skills_root_dir)
+        self._skill_index_service = SkillIndexService(
+            skill_repository=self._skill_repository,
+            skills_root=settings.skills_root_dir,
+        )
+        self._skill_selector = SkillSelector(default_top_k=12)
         self._file_storage = file_storage
         # self._file_repository = file_repository
         self._browser = browser
@@ -331,13 +347,75 @@ class AgentTaskRunner(TaskRunner):
     async def _load_enabled_skills(self) -> list[Skill]:
         """加载启用中的 Skill 列表。"""
         try:
-            postgres = get_postgres()
-            async with postgres.session_factory() as session:
-                repository = DBSkillRepository(session)
-                return await repository.list_enabled()
+            return await self._skill_index_service.list_enabled_skills()
         except Exception as e:
             logger.warning(f"加载Skill列表失败，降级为空列表: {str(e)}")
             return []
+
+    async def _load_selected_skills(
+        self,
+        user_message: str,
+        preference_map: dict[str, bool],
+    ) -> list[Skill]:
+        skills = await self._load_enabled_skills()
+        filtered = self._filter_skills_by_user_preferences(skills, preference_map)
+        return self._skill_selector.select(filtered, user_message)
+
+    @staticmethod
+    def _strip_skill_frontmatter(skill_md: str) -> str:
+        """移除 SKILL.md 的 YAML frontmatter，仅保留正文。"""
+        raw = (skill_md or "").strip()
+        if not raw.startswith("---"):
+            return raw
+
+        lines = raw.splitlines()
+        if len(lines) < 3:
+            return raw
+
+        if lines[0].strip() != "---":
+            return raw
+
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                return "\n".join(lines[idx + 1 :]).strip()
+        return raw
+
+    def _build_skill_context_prompt(self, skills: list[Skill]) -> str:
+        """将已选中的 Skill 构建为运行时系统上下文。"""
+        if not skills:
+            return ""
+
+        sections: list[str] = [
+            "## Active Skills",
+            "Follow these selected SKILL.md guides when they are relevant to the current task.",
+        ]
+
+        total_chars = sum(len(item) for item in sections)
+        for skill in skills[:SKILL_CONTEXT_MAX_SKILLS]:
+            manifest = skill.manifest if isinstance(skill.manifest, dict) else {}
+            context_blob = str(manifest.get("context_blob") or "").strip()
+            if context_blob:
+                body = context_blob
+            else:
+                skill_md = str(manifest.get("skill_md") or "").strip()
+                body = self._strip_skill_frontmatter(skill_md)
+            body = re.sub(r"\n{3,}", "\n\n", body).strip()
+            if len(body) > SKILL_CONTEXT_MAX_SNIPPET_CHARS:
+                body = body[:SKILL_CONTEXT_MAX_SNIPPET_CHARS].rstrip() + "\n...(truncated)"
+
+            if not body:
+                body = (skill.description or "").strip()
+            if not body:
+                body = "No additional guide content."
+
+            block = f"### {skill.name} ({skill.slug})\n{body}"
+            if total_chars + len(block) > SKILL_CONTEXT_MAX_TOTAL_CHARS:
+                break
+
+            sections.append(block)
+            total_chars += len(block)
+
+        return "\n\n".join(sections)
 
     async def _load_user_preferences_map(self, tool_type: ToolType) -> dict[str, bool]:
         """加载用户在指定工具类型下的偏好映射。"""
@@ -583,12 +661,14 @@ class AgentTaskRunner(TaskRunner):
             )
             await self._mcp_tool.initialize(filtered_mcp_config)
             await self._a2a_tool.initialize(filtered_a2a_config)
-            enabled_skills = await self._load_enabled_skills()
-            enabled_skills = self._filter_skills_by_user_preferences(
-                enabled_skills,
-                skill_preference_map,
+            initial_skills = await self._load_selected_skills(
+                user_message="",
+                preference_map=skill_preference_map,
             )
-            await self._skill_tool.initialize(enabled_skills)
+            await self._skill_tool.initialize(initial_skills)
+            initial_skill_context = self._build_skill_context_prompt(initial_skills)
+            if hasattr(self._flow, "set_skill_context"):
+                self._flow.set_skill_context(initial_skill_context)
 
             # 3.循环读取任务中的输入消息队列
             while not await task.input_stream.is_empty():
@@ -613,6 +693,15 @@ class AgentTaskRunner(TaskRunner):
                         else []
                     ),
                 )
+
+                selected_skills = await self._load_selected_skills(
+                    user_message=message_obj.message,
+                    preference_map=skill_preference_map,
+                )
+                await self._skill_tool.initialize(selected_skills)
+                skill_context = self._build_skill_context_prompt(selected_skills)
+                if hasattr(self._flow, "set_skill_context"):
+                    self._flow.set_skill_context(skill_context)
 
                 # 7.传递消息对象并运行PlannerReActFlow
                 async for event in self._run_flow(message_obj):
