@@ -13,6 +13,7 @@ import type {
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  SkillRiskPolicy,
   SkillListData,
   ToolWithPreference,
 } from "@/lib/api/types";
@@ -28,8 +29,11 @@ type SettingsState = {
   a2aTools: ToolWithPreference[];
   skills: SkillListData["skills"];
   skillTools: ToolWithPreference[];
+  skillRiskPolicy: SkillRiskPolicy | null;
   isLoading: boolean;
   isInstallingSkill: boolean;
+  isSkillRiskPolicyLoading: boolean;
+  isSkillRiskPolicyUpdating: boolean;
 };
 
 type SettingsActions = {
@@ -45,6 +49,8 @@ type SettingsActions = {
   deleteA2AServer: (a2aId: string) => Promise<void>;
   setA2AServerEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
   setA2AToolEnabled: (a2aId: string, enabled: boolean) => Promise<void>;
+  loadSkillRiskPolicy: () => Promise<void>;
+  updateSkillRiskPolicy: (policy: SkillRiskPolicy) => Promise<boolean>;
   installSkill: (params: InstallSkillParams) => Promise<boolean>;
   deleteSkill: (skillId: string) => Promise<void>;
   setSkillEnabled: (skillId: string, enabled: boolean) => Promise<void>;
@@ -62,8 +68,11 @@ const initialState: SettingsState = {
   a2aTools: [],
   skills: [],
   skillTools: [],
+  skillRiskPolicy: null,
   isLoading: false,
   isInstallingSkill: false,
+  isSkillRiskPolicyLoading: false,
+  isSkillRiskPolicyUpdating: false,
 };
 
 function mergeOptimisticMCPServers(
@@ -121,6 +130,7 @@ export const useSettingsStore = create<SettingsStore>()(
           a2aToolsResult,
           skillsResult,
           skillToolsResult,
+          skillRiskPolicyResult,
         ] = await Promise.allSettled([
           configApi.getLLMConfig(),
           configApi.getAgentConfig(),
@@ -130,6 +140,7 @@ export const useSettingsStore = create<SettingsStore>()(
           userToolsApi.getA2ATools(),
           configApi.getSkills(),
           userToolsApi.getSkillTools(),
+          configApi.getSkillRiskPolicy(),
         ]);
 
         const partialState: Partial<SettingsState> = {};
@@ -181,6 +192,12 @@ export const useSettingsStore = create<SettingsStore>()(
           partialState.skillTools = skillToolsResult.value.tools;
         } else {
           failedItems.push("Skill 个人开关");
+        }
+
+        if (skillRiskPolicyResult.status === "fulfilled") {
+          partialState.skillRiskPolicy = skillRiskPolicyResult.value;
+        } else {
+          failedItems.push("Skill 风险策略");
         }
 
         set(partialState);
@@ -307,6 +324,33 @@ export const useSettingsStore = create<SettingsStore>()(
         reportSuccess(enabled ? "A2A 个人开关已开启" : "A2A 个人开关已关闭");
       } catch (error) {
         reportError(error, "更新 A2A 个人开关失败");
+      }
+    },
+
+    loadSkillRiskPolicy: async () => {
+      set({ isSkillRiskPolicyLoading: true });
+      try {
+        const policy = await configApi.getSkillRiskPolicy();
+        set({ skillRiskPolicy: policy });
+      } catch (error) {
+        reportError(error, "加载 Skill 风险策略失败");
+      } finally {
+        set({ isSkillRiskPolicyLoading: false });
+      }
+    },
+
+    updateSkillRiskPolicy: async (policy) => {
+      set({ isSkillRiskPolicyUpdating: true });
+      try {
+        const updated = await configApi.updateSkillRiskPolicy(policy);
+        set({ skillRiskPolicy: updated });
+        reportSuccess("Skill 风险策略已更新");
+        return true;
+      } catch (error) {
+        reportError(error, "更新 Skill 风险策略失败");
+        return false;
+      } finally {
+        set({ isSkillRiskPolicyUpdating: false });
       }
     },
 

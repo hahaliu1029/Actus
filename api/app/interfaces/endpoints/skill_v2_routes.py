@@ -12,7 +12,7 @@ from app.infrastructure.repositories.db_user_tool_preference_repository import (
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.postgres import get_db_session
-from app.interfaces.dependencies import AdminUser
+from app.interfaces.dependencies import AdminUser, CurrentUser
 from app.interfaces.schemas import Response
 from app.interfaces.schemas.skill import (
     SkillInstallRequest,
@@ -131,7 +131,7 @@ async def delete_skill(
     summary="获取 Skill 风险策略（v2）",
 )
 async def get_skill_policy(
-    admin_user: AdminUser,
+    current_user: CurrentUser,
     app_config_service: AppConfigService = Depends(get_app_config_service),
 ) -> Response[SkillRiskPolicyItem]:
     policy = await app_config_service.get_skill_risk_policy()

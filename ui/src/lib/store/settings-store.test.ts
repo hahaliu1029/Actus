@@ -84,6 +84,9 @@ describe("settings-store", () => {
     mockedUserToolsApi.getSkillTools.mockResolvedValue({
       tools: [],
     });
+    mockedConfigApi.getSkillRiskPolicy.mockResolvedValue({
+      mode: "off",
+    });
   });
 
   it("loadAll 在部分接口失败时仍保留已成功模块数据", async () => {
@@ -186,7 +189,7 @@ describe("settings-store", () => {
     expect(useSettingsStore.getState().isInstallingSkill).toBe(false);
   });
 
-  it("loadAll 会加载 Skill 列表和发现结果", async () => {
+  it("loadAll 会加载 Skill 列表、个人开关和风险策略", async () => {
     mockedConfigApi.getSkills.mockResolvedValue({
       skills: [
         {
@@ -218,5 +221,41 @@ describe("settings-store", () => {
     const state = useSettingsStore.getState();
     expect(state.skills).toHaveLength(1);
     expect(state.skillTools).toHaveLength(1);
+    expect(state.skillRiskPolicy?.mode).toBe("off");
+  });
+
+  it("updateSkillRiskPolicy 在请求期间设置 isSkillRiskPolicyUpdating，并在结束后恢复", async () => {
+    let resolveUpdate: (() => void) | null = null;
+    mockedConfigApi.updateSkillRiskPolicy.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveUpdate = () => resolve({ mode: "enforce_confirmation" });
+        })
+    );
+
+    const updatePromise = useSettingsStore
+      .getState()
+      .updateSkillRiskPolicy({ mode: "enforce_confirmation" });
+
+    expect(useSettingsStore.getState().isSkillRiskPolicyUpdating).toBe(true);
+    resolveUpdate?.();
+    const ok = await updatePromise;
+
+    expect(ok).toBe(true);
+    expect(useSettingsStore.getState().isSkillRiskPolicyUpdating).toBe(false);
+    expect(useSettingsStore.getState().skillRiskPolicy?.mode).toBe("enforce_confirmation");
+  });
+
+  it("updateSkillRiskPolicy 失败时返回 false 且保留原状态", async () => {
+    useSettingsStore.setState({ skillRiskPolicy: { mode: "off" } });
+    mockedConfigApi.updateSkillRiskPolicy.mockRejectedValue(new Error("policy update failed"));
+
+    const ok = await useSettingsStore
+      .getState()
+      .updateSkillRiskPolicy({ mode: "enforce_confirmation" });
+
+    expect(ok).toBe(false);
+    expect(useSettingsStore.getState().skillRiskPolicy?.mode).toBe("off");
+    expect(useSettingsStore.getState().isSkillRiskPolicyUpdating).toBe(false);
   });
 });

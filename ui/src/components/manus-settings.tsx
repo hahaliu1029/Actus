@@ -83,8 +83,11 @@ export function ManusSettings() {
   const a2aTools = useSettingsStore((state) => state.a2aTools);
   const skills = useSettingsStore((state) => state.skills);
   const skillTools = useSettingsStore((state) => state.skillTools);
+  const skillRiskPolicy = useSettingsStore((state) => state.skillRiskPolicy);
   const isLoading = useSettingsStore((state) => state.isLoading);
   const isInstallingSkill = useSettingsStore((state) => state.isInstallingSkill);
+  const isSkillRiskPolicyLoading = useSettingsStore((state) => state.isSkillRiskPolicyLoading);
+  const isSkillRiskPolicyUpdating = useSettingsStore((state) => state.isSkillRiskPolicyUpdating);
 
   const loadAll = useSettingsStore((state) => state.loadAll);
   const updateLLMConfig = useSettingsStore((state) => state.updateLLMConfig);
@@ -98,6 +101,7 @@ export function ManusSettings() {
   const setA2AServerEnabled = useSettingsStore((state) => state.setA2AServerEnabled);
   const setA2AToolEnabled = useSettingsStore((state) => state.setA2AToolEnabled);
   const installSkill = useSettingsStore((state) => state.installSkill);
+  const updateSkillRiskPolicy = useSettingsStore((state) => state.updateSkillRiskPolicy);
   const deleteSkill = useSettingsStore((state) => state.deleteSkill);
   const setSkillEnabled = useSettingsStore((state) => state.setSkillEnabled);
   const setSkillToolEnabled = useSettingsStore((state) => state.setSkillToolEnabled);
@@ -286,6 +290,16 @@ export function ManusSettings() {
     setSkillSourceRef("");
     setSkillDialogError(null);
     setIsSkillDialogOpen(false);
+  }
+
+  async function handleSkillRiskPolicyChange(nextChecked: boolean): Promise<void> {
+    if (!isAdmin || isSkillRiskPolicyLoading || isSkillRiskPolicyUpdating) {
+      return;
+    }
+
+    await updateSkillRiskPolicy({
+      mode: nextChecked ? "enforce_confirmation" : "off",
+    });
   }
 
   return (
@@ -819,6 +833,50 @@ export function ManusSettings() {
 
               {activeTab === "skill" ? (
                 <div className="space-y-4">
+                  <div className="rounded-2xl border border-border/70 bg-muted/30 p-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="space-y-1">
+                        <h4 className="text-sm font-semibold text-foreground">风险调用策略</h4>
+                        <p className="text-sm text-muted-foreground">
+                          当前模式：
+                          {skillRiskPolicy?.mode === "enforce_confirmation"
+                            ? "enforce_confirmation（高风险调用需审批）"
+                            : "off（默认关闭确认流）"}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          开启后，Skill 高风险工具调用会返回 APPROVAL_REQUIRED。
+                        </p>
+                        {isSkillRiskPolicyLoading ? (
+                          <p className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                            <LoaderCircle className="size-3 animate-spin" />
+                            正在加载策略...
+                          </p>
+                        ) : null}
+                        {!isAdmin ? (
+                          <p className="text-xs text-muted-foreground">仅管理员可修改该策略。</p>
+                        ) : null}
+                        {isSkillRiskPolicyUpdating ? (
+                          <p className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                            <LoaderCircle className="size-3 animate-spin" />
+                            正在更新策略...
+                          </p>
+                        ) : null}
+                      </div>
+                      <Switch
+                        className="data-[state=checked]:bg-primary"
+                        checked={skillRiskPolicy?.mode === "enforce_confirmation"}
+                        disabled={
+                          !isAdmin ||
+                          isSkillRiskPolicyLoading ||
+                          isSkillRiskPolicyUpdating
+                        }
+                        onCheckedChange={(checked) => {
+                          void handleSkillRiskPolicyChange(checked);
+                        }}
+                      />
+                    </div>
+                  </div>
+
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <h3 className="text-2xl font-semibold tracking-tight text-foreground">
