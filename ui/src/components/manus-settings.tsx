@@ -310,7 +310,7 @@ export function ManusSettings() {
         </button>
       </DialogTrigger>
 
-      <DialogContent className="!max-w-[980px] max-h-[88vh] gap-0 overflow-hidden rounded-[24px] border border-border p-0 shadow-[var(--shadow-float)]">
+      <DialogContent className="!max-w-[980px] max-h-[88vh] flex flex-col gap-0 overflow-hidden rounded-[24px] border border-border p-0 shadow-[var(--shadow-float)]">
         <DialogHeader className="border-b border-border px-7 py-6">
           <DialogTitle className="text-3xl font-semibold tracking-tight text-foreground">
             Actus 设置
@@ -320,7 +320,7 @@ export function ManusSettings() {
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid h-[640px] grid-cols-[232px_minmax(0,1fr)]">
+        <div className="grid flex-1 min-h-0 grid-cols-[232px_minmax(0,1fr)]">
           <aside className="border-r border-border bg-muted/70 px-4 py-5">
             <div className="space-y-1">
               {TABS.map((tab) => {

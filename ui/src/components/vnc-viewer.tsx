@@ -27,6 +27,7 @@ export function VNCViewer({ url, viewOnly, onStatus }: VNCViewerProps) {
 
     rfb.viewOnly = viewOnly || false;
     rfb.scaleViewport = true;
+    rfb.resizeSession = true;
     rfb.background = "#000";
 
     rfb.addEventListener("connect", () => {
@@ -47,5 +48,7 @@ export function VNCViewer({ url, viewOnly, onStatus }: VNCViewerProps) {
     };
   }, [url, viewOnly, onStatus]);
 
-  return <div ref={displayRef} style={{ width: "100%", height: "100vh", background: "#000" }} />;
+  return (
+    <div ref={displayRef} className="h-full w-full overflow-hidden bg-black [&_canvas]:!max-h-full [&_canvas]:!max-w-full" />
+  );
 }

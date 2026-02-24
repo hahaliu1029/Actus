@@ -45,7 +45,7 @@ export function PlanPanel({className}: PlanPanelProps) {
               <Clock size={16}/>
               <div className="flex flex-col w-full gap-0.5 truncate">
                 <div className="text-sm truncate">
-                  使用搜索工具查找第四季度（假设为当前或最近一年的10月至12月）国内人工智能的最新新闻和发展动态，例如 xxx 等
+                  {steps[0]?.description || '暂无任务'}
                 </div>
               </div>
             </div>
@@ -84,7 +84,7 @@ export function PlanPanel({className}: PlanPanelProps) {
               </div>
             </div>
             {/* 任务列表 */}
-            <div className="max-h[min(cacl(100vh-360px), 400px)] overflow-y-auto">
+            <div className="max-h-80 overflow-y-auto">
               {steps.map(step => (
                 <div
                   key={step.id}

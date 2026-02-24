@@ -22,17 +22,37 @@ export default function NoVNCPage() {
   }, [sessionId, accessToken]);
 
   if (!accessToken) {
-    return <div className="p-4 text-sm text-red-600">缺少登录凭证，请先登录后再访问 VNC。</div>;
+    return (
+      <div className="flex h-screen items-center justify-center bg-black">
+        <div className="text-sm text-red-500">缺少登录凭证，请先登录后再访问 VNC。</div>
+      </div>
+    );
   }
 
   if (!vncUrl) {
-    return <div className="p-4 text-sm text-red-600">会话 ID 不存在，无法建立 VNC 连接。</div>;
+    return (
+      <div className="flex h-screen items-center justify-center bg-black">
+        <div className="text-sm text-red-500">会话 ID 不存在，无法建立 VNC 连接。</div>
+      </div>
+    );
   }
 
+  const isConnected = status === "VNC 连接成功";
+
   return (
-    <div className="relative h-screen w-screen">
-      <div className="absolute left-4 top-4 z-10 rounded-md bg-black/70 px-3 py-1 text-xs text-white">
-        {status}
+    <div className="relative h-screen w-full overflow-hidden bg-black">
+      {/* 连接状态指示器 */}
+      <div className="absolute left-4 top-4 z-10 flex items-center gap-2 rounded-md bg-black/50 px-3 py-1.5 backdrop-blur-sm">
+        <span
+          className={`size-2 rounded-full ${
+            isConnected
+              ? "bg-green-500"
+              : "animate-pulse bg-yellow-500"
+          }`}
+        />
+        <span className="text-xs text-white/80">
+          {isConnected ? "已连接" : "连接中..."}
+        </span>
       </div>
       <VNCViewer url={vncUrl} viewOnly={false} onStatus={setStatus} />
     </div>
