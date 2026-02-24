@@ -82,6 +82,16 @@ export type LLMConfig = {
   model_name: string;
   temperature: number;
   max_tokens: number;
+  context_window: number | null;
+  context_overflow_guard_enabled: boolean;
+  overflow_retry_cap: number;
+  soft_trigger_ratio: number;
+  hard_trigger_ratio: number;
+  reserved_output_tokens: number;
+  reserved_output_tokens_cap_ratio: number;
+  token_estimator: "hybrid" | "char" | "provider_api";
+  token_safety_factor: number;
+  unknown_model_context_window: number;
 };
 
 export type AgentConfig = {

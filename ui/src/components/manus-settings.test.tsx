@@ -9,6 +9,16 @@ type SettingsState = {
     temperature: number;
     max_tokens: number;
     api_key?: string;
+    context_window: number | null;
+    context_overflow_guard_enabled: boolean;
+    overflow_retry_cap: number;
+    soft_trigger_ratio: number;
+    hard_trigger_ratio: number;
+    reserved_output_tokens: number;
+    reserved_output_tokens_cap_ratio: number;
+    token_estimator: "hybrid" | "char" | "provider_api";
+    token_safety_factor: number;
+    unknown_model_context_window: number;
   } | null;
   agentConfig: {
     max_iterations: number;
@@ -51,6 +61,16 @@ const settingsState: SettingsState = {
     model_name: "gpt-4o",
     temperature: 0.7,
     max_tokens: 4096,
+    context_window: null,
+    context_overflow_guard_enabled: false,
+    overflow_retry_cap: 2,
+    soft_trigger_ratio: 0.85,
+    hard_trigger_ratio: 0.95,
+    reserved_output_tokens: 4096,
+    reserved_output_tokens_cap_ratio: 0.25,
+    token_estimator: "hybrid",
+    token_safety_factor: 1.15,
+    unknown_model_context_window: 32768,
   },
   agentConfig: {
     max_iterations: 100,
@@ -119,6 +139,13 @@ async function openSkillTab() {
   await user.click(screen.getByRole("button", { name: "Skill 生态" }));
 }
 
+async function openLLMTab() {
+  const user = userEvent.setup();
+  const trigger = screen.getAllByRole("button")[0];
+  await user.click(trigger);
+  await user.click(screen.getByRole("button", { name: "模型提供商" }));
+}
+
 describe("ManusSettings - Skill risk policy", () => {
   beforeEach(() => {
     mockIsAdmin.mockReturnValue(true);
@@ -165,5 +192,22 @@ describe("ManusSettings - Skill risk policy", () => {
     const policySwitch = screen.getByRole("switch");
     expect(policySwitch).toBeDisabled();
     expect(screen.getByText("正在更新策略...")).toBeInTheDocument();
+  });
+
+  it("模型配置页支持编辑 context_window 并随保存提交", async () => {
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+
+    await openLLMTab();
+    const contextWindowInput = screen.getByLabelText("context_window");
+    await user.clear(contextWindowInput);
+    await user.type(contextWindowInput, "131072");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(settingsState.updateLLMConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context_window: 131072,
+      })
+    );
   });
 });

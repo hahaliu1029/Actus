@@ -9,6 +9,7 @@ from app.domain.models.app_config import (
     MCPServerConfig,
     MCPTransport,
 )
+from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import MessageEvent
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.user_tool_preference import ToolType
@@ -65,6 +66,20 @@ def _uow_factory() -> _NoopUoW:
 
 class _DummyFlow:
     def __init__(self, **kwargs) -> None:
+        self.skill_contexts: list[str] = []
+        self.kwargs = kwargs
+
+    def set_skill_context(self, skill_context: str) -> None:
+        self.skill_contexts.append(skill_context)
+
+    async def invoke(self, message):
+        if False:
+            yield message
+
+
+class _CapturingFlow:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
         self.skill_contexts: list[str] = []
 
     def set_skill_context(self, skill_context: str) -> None:
@@ -390,3 +405,33 @@ async def test_invoke_uses_frozen_skill_pool_for_each_message(monkeypatch) -> No
     assert len(fake_skill_tool.initialize_history) >= 2
     assert [skill.id for skill in fake_skill_tool.initialize_history[0]] == ["skill-enabled"]
     assert [skill.id for skill in fake_skill_tool.initialize_history[1]] == ["skill-enabled"]
+
+
+async def test_runner_passes_overflow_config_to_flow(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _CapturingFlow,
+    )
+
+    overflow_config = ContextOverflowConfig(
+        context_window=131072,
+        context_overflow_guard_enabled=True,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-4",
+        user_id="user-4",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+        overflow_config=overflow_config,
+    )
+
+    assert runner._flow.kwargs["overflow_config"] is overflow_config

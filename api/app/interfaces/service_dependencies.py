@@ -24,6 +24,7 @@ from app.infrastructure.external.search.bing_search import BingSearchEngine
 from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
 
 # from app.infrastructure.repositories.db_file_repository import DBFileRepository
+from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.infrastructure.repositories.file_app_config_repository import (
     FileAppConfigRepository,
 )
@@ -109,6 +110,7 @@ def get_agent_service(
     )
     app_config = app_config_repository.load()
     # file_repository = DBFileRepository(db_session=db_session)
+    overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
 
     # 2.构建依赖实例
     llm = OpenAILLM(app_config.llm_config)
@@ -125,6 +127,7 @@ def get_agent_service(
         agent_config=app_config.agent_config,
         mcp_config=app_config.mcp_config,
         a2a_config=app_config.a2a_config,
+        overflow_config=overflow_config,
         skill_risk_policy=app_config.skill_risk_policy,
         sandbox_cls=DockerSandbox,
         task_cls=RedisStreamTask,

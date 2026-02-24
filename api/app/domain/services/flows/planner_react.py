@@ -7,6 +7,7 @@ from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.models.app_config import AgentConfig
+from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
     BaseEvent,
     DoneEvent,
@@ -53,6 +54,7 @@ class PlannerReActFlow(BaseFlow):
         mcp_tool: MCPTool,  # mcp工具
         a2a_tool: A2ATool,  # a2a远程agent
         skill_tool: SkillTool,  # 统一skill工具
+        overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
         # 1.流初始化数据配置
@@ -62,6 +64,7 @@ class PlannerReActFlow(BaseFlow):
         # self._session_repository = session_repository
         self.status = FlowStatus.IDLE
         self.plan: Optional[Plan] = None
+        overflow_config = overflow_config or ContextOverflowConfig()
 
         # 2.初始化Agent预设工具列表
         tools = [
@@ -84,6 +87,7 @@ class PlannerReActFlow(BaseFlow):
             llm=llm,
             json_parser=json_parser,
             tools=tools,
+            overflow_config=overflow_config,
         )
         logger.debug(f"创建规划Agent成功, 会话id: {self._session_id}")
 
@@ -96,6 +100,7 @@ class PlannerReActFlow(BaseFlow):
             llm=llm,
             json_parser=json_parser,
             tools=tools,
+            overflow_config=overflow_config,
         )
         logger.debug(f"创建执行Agent成功, 会话id: {self._session_id}")
 

@@ -118,6 +118,16 @@ export function ManusSettings() {
     model_name: "deepseek-reasoner",
     temperature: 0.7,
     max_tokens: 8192,
+    context_window: null,
+    context_overflow_guard_enabled: false,
+    overflow_retry_cap: 2,
+    soft_trigger_ratio: 0.85,
+    hard_trigger_ratio: 0.95,
+    reserved_output_tokens: 4096,
+    reserved_output_tokens_cap_ratio: 0.25,
+    token_estimator: "hybrid",
+    token_safety_factor: 1.15,
+    unknown_model_context_window: 32768,
   });
 
   const [mcpPayload, setMcpPayload] = useState(MCP_EXAMPLE);
@@ -428,6 +438,9 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        LLM API 的基础 URL 地址，需兼容 OpenAI 接口格式。例如 DeepSeek 为 https://api.deepseek.com，OpenAI 为 https://api.openai.com/v1。
+                      </p>
                     </label>
 
                     <label className="text-sm text-foreground/85">
@@ -440,6 +453,9 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        模型提供商的 API Key，用于鉴权访问 LLM 服务。
+                      </p>
                     </label>
 
                     <label className="text-sm text-foreground/85">
@@ -451,6 +467,9 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        要使用的模型标识，如 deepseek-chat、deepseek-reasoner、gpt-4o 等。使用带推理的模型时，传递 tools 会自动降级到对话模型。
+                      </p>
                     </label>
 
                     <label className="text-sm text-foreground/85">
@@ -467,11 +486,15 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        采样温度，控制输出的随机性。值越低越确定，值越高越多样。范围 0~2，默认 0.7。
+                      </p>
                     </label>
 
                     <label className="text-sm text-foreground/85">
                       max_tokens
                       <Input
+                        aria-label="max_tokens"
                         type="number"
                         value={llmForm.max_tokens}
                         onChange={(event) =>
@@ -482,6 +505,208 @@ export function ManusSettings() {
                         }
                         className="mt-1"
                       />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        单次请求的最大输出 token 数。不同模型有不同的上限，默认 8192。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      context_window
+                      <Input
+                        aria-label="context_window"
+                        type="number"
+                        value={llmForm.context_window ?? ""}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            context_window: event.target.value
+                              ? Number(event.target.value)
+                              : null,
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        为空时按模型映射与默认值推断上下文窗口。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      context_overflow_guard_enabled
+                      <div className="mt-2 flex items-center gap-3">
+                        <Switch
+                          className="data-[state=checked]:bg-primary"
+                          checked={llmForm.context_overflow_guard_enabled}
+                          onCheckedChange={(checked) =>
+                            setLLMForm((prev) => ({
+                              ...prev,
+                              context_overflow_guard_enabled: checked,
+                            }))
+                          }
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          启用预算预判与分级压缩治理
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      overflow_retry_cap
+                      <Input
+                        aria-label="overflow_retry_cap"
+                        type="number"
+                        value={llmForm.overflow_retry_cap}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            overflow_retry_cap: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        上下文超限治理的自动重试次数上限，范围 0~10，默认 2。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      soft_trigger_ratio
+                      <Input
+                        aria-label="soft_trigger_ratio"
+                        type="number"
+                        step="0.01"
+                        value={llmForm.soft_trigger_ratio}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            soft_trigger_ratio: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        软阈值比例，上下文 token 占比超过此值时优先进入预处理压缩。范围 0~1，默认 0.85。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      hard_trigger_ratio
+                      <Input
+                        aria-label="hard_trigger_ratio"
+                        type="number"
+                        step="0.01"
+                        value={llmForm.hard_trigger_ratio}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            hard_trigger_ratio: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        硬阈值比例，上下文 token 占比超过此值时强制进入压缩治理。必须大于 soft_trigger_ratio，默认 0.95。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      reserved_output_tokens
+                      <Input
+                        aria-label="reserved_output_tokens"
+                        type="number"
+                        value={llmForm.reserved_output_tokens}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            reserved_output_tokens: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        预留给模型输出的 token 预算，从上下文窗口中扣除以避免溢出。默认 4096。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      reserved_output_tokens_cap_ratio
+                      <Input
+                        aria-label="reserved_output_tokens_cap_ratio"
+                        type="number"
+                        step="0.01"
+                        value={llmForm.reserved_output_tokens_cap_ratio}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            reserved_output_tokens_cap_ratio: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        预留输出 token 占上下文窗口的最大比例，防止预留过多影响输入空间。范围 0~1，默认 0.25。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      token_estimator
+                      <select
+                        aria-label="token_estimator"
+                        value={llmForm.token_estimator}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            token_estimator: event.target.value as LLMConfig["token_estimator"],
+                          }))
+                        }
+                        className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                      >
+                        <option value="hybrid">hybrid</option>
+                        <option value="char">char</option>
+                        <option value="provider_api">provider_api</option>
+                      </select>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        token 估算策略。hybrid：混合估算（推荐）；char：按字符数估算；provider_api：调用提供商 API 精确计数。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      token_safety_factor
+                      <Input
+                        aria-label="token_safety_factor"
+                        type="number"
+                        step="0.01"
+                        value={llmForm.token_safety_factor}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            token_safety_factor: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        token 估算安全系数，乘以估算值以避免低估导致溢出。≥1.0，默认 1.15。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      unknown_model_context_window
+                      <Input
+                        aria-label="unknown_model_context_window"
+                        type="number"
+                        value={llmForm.unknown_model_context_window}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            unknown_model_context_window: Number(event.target.value),
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        当模型名称无法匹配已知映射时，使用此兜底值作为上下文窗口大小。默认 32768。
+                      </p>
                     </label>
                   </div>
                 </div>

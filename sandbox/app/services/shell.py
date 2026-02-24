@@ -6,6 +6,7 @@ import os.path
 import re
 import socket
 import uuid
+from contextlib import suppress
 from typing import Dict, List, Optional
 
 from app.interfaces.errors.exceptions import (
@@ -29,10 +30,144 @@ logger = logging.getLogger(__name__)
 class ShellService:
     """Shell命令服务"""
 
+    MAX_OUTPUT_CHARS = 200_000
+
     active_shells: Dict[str, Shell]
+    reader_tasks: Dict[str, asyncio.Task[None]]
 
     def __init__(self) -> None:
         self.active_shells = {}
+        self.reader_tasks = {}
+
+    def _append_output(self, shell: Shell, output: str) -> None:
+        """向会话输出追加内容并限制最大长度"""
+        shell.output = (shell.output + output)[-self.MAX_OUTPUT_CHARS :]
+        if shell.console_records:
+            current_record = shell.console_records[-1]
+            current_record.output = (current_record.output + output)[
+                -self.MAX_OUTPUT_CHARS :
+            ]
+
+    @classmethod
+    def _normalize_install_segment(cls, segment: str) -> str:
+        """为安装类命令注入非交互参数，减少命令挂起风险"""
+        raw = segment.strip()
+        if not raw:
+            return segment
+
+        result = raw
+
+        def has_flag(flag_pattern: str) -> bool:
+            return re.search(flag_pattern, result) is not None
+
+        def append_flag(flag: str, pattern: str) -> None:
+            nonlocal result
+            if not has_flag(pattern):
+                result = f"{result} {flag}"
+
+        def prepend_env(name: str, value: str) -> None:
+            nonlocal result
+            if f"{name}=" not in result:
+                result = f"{name}={value} {result}"
+
+        # apt/apt-get install：补齐 -y 并注入 DEBIAN_FRONTEND=noninteractive
+        if re.search(r"(^|\s)(apt-get|apt)\s+install\b", result):
+            append_flag("-y", r"(^|\s)(-y|--yes)(\s|$)")
+            prepend_env("DEBIAN_FRONTEND", "noninteractive")
+
+        # yum/dnf install：补齐 -y
+        if re.search(r"(^|\s)(yum|dnf)\s+install\b", result):
+            append_flag("-y", r"(^|\s)(-y|--assumeyes)(\s|$)")
+
+        # apk add：补齐 --no-cache（减少交互噪音与缓存体积）
+        if re.search(r"(^|\s)apk\s+add\b", result):
+            append_flag("--no-cache", r"(^|\s)--no-cache(\s|$)")
+
+        # pip install：补齐 --no-input，避免等待输入
+        if re.search(r"(^|\s)(python\s+-m\s+pip|pip3?|uv\s+pip)\s+install\b", result):
+            append_flag("--no-input", r"(^|\s)--no-input(\s|$)")
+
+        # conda install：补齐 -y
+        if re.search(r"(^|\s)conda\s+install\b", result):
+            append_flag("-y", r"(^|\s)(-y|--yes)(\s|$)")
+
+        # poetry add/install：补齐 --no-interaction
+        if re.search(r"(^|\s)poetry\s+(add|install)\b", result):
+            append_flag("--no-interaction", r"(^|\s)--no-interaction(\s|$)")
+
+        # npm install/ci：补齐 --no-audit --no-fund，减少额外交互与噪音
+        if re.search(r"(^|\s)npm\s+(install|i|ci)\b", result):
+            append_flag("--no-audit", r"(^|\s)--no-audit(\s|$)")
+            append_flag("--no-fund", r"(^|\s)--no-fund(\s|$)")
+            prepend_env("CI", "true")
+
+        # yarn add/install：补齐 --non-interactive
+        if re.search(r"(^|\s)yarn\s+(add|install)\b", result):
+            append_flag("--non-interactive", r"(^|\s)--non-interactive(\s|$)")
+            prepend_env("CI", "true")
+
+        # pnpm add/install：补齐 --no-frozen-lockfile（CI 场景更稳）
+        if re.search(r"(^|\s)pnpm\s+(add|install)\b", result):
+            append_flag("--no-frozen-lockfile", r"(^|\s)--no-frozen-lockfile(\s|$)")
+            prepend_env("CI", "true")
+
+        # npx：补齐 -y，避免首次拉包确认
+        if re.search(r"(^|\s)npx\b", result):
+            append_flag("-y", r"(^|\s)-y(\s|$)")
+            prepend_env("CI", "true")
+
+        left_padding_len = len(segment) - len(segment.lstrip())
+        right_padding_len = len(segment) - len(segment.rstrip())
+        return (
+            segment[:left_padding_len]
+            + result
+            + (segment[len(segment) - right_padding_len :] if right_padding_len else "")
+        )
+
+    @classmethod
+    def _normalize_non_interactive_command(cls, command: str) -> str:
+        """按片段处理复合命令（&& / || / ;），为安装场景注入非交互参数"""
+        parts = re.split(r"(\&\&|\|\||;)", command)
+        if len(parts) == 1:
+            return cls._normalize_install_segment(command)
+
+        normalized_parts = []
+        for index, part in enumerate(parts):
+            if index % 2 == 0:
+                normalized_parts.append(cls._normalize_install_segment(part))
+            else:
+                normalized_parts.append(part)
+        return "".join(normalized_parts)
+
+    async def _stop_reader_task(self, session_id: str) -> None:
+        """停止并回收指定会话的输出读取任务"""
+        task = self.reader_tasks.pop(session_id, None)
+        if not task or task.done():
+            return
+
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _start_reader_task(
+        self, session_id: str, process: asyncio.subprocess.Process
+    ) -> None:
+        """启动输出读取任务并注册到会话"""
+        await self._stop_reader_task(session_id)
+        task = asyncio.create_task(self._start_output_reader(session_id, process))
+        self.reader_tasks[session_id] = task
+
+        def _on_done(done_task: asyncio.Task[None]) -> None:
+            self.reader_tasks.pop(session_id, None)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc:
+                logger.warning(
+                    f"会话输出读取器异常退出: {session_id}, error: {str(exc)}"
+                )
+
+        task.add_done_callback(_on_done)
 
     @classmethod
     def _get_display_path(cls, path: str) -> str:
@@ -100,9 +235,7 @@ class ShellService:
                     # 6.判断会话是否存在
                     if shell:
                         # 7.更新会话输出和控制台记录
-                        shell.output += output
-                        if shell.console_records:
-                            shell.console_records[-1].output += output
+                        self._append_output(shell, output)
                 except Exception as e:
                     logger.error(f"读取进程输出时错误: {str(e)}")
                     break
@@ -216,7 +349,8 @@ class ShellService:
     ) -> ShellExecuteResult:
         """传递会话id+执行目录+命令在沙箱中执行后返回"""
         # 1.记录日志并判断执行目录是否存在
-        logger.info(f"正在会话 {session_id} 中执行命令: {command}")
+        normalized_command = self._normalize_non_interactive_command(command)
+        logger.info(f"正在会话 {session_id} 中执行命令: {normalized_command}")
         if not exec_dir or exec_dir == "":
             exec_dir = os.path.expanduser("~")
         if not os.path.exists(exec_dir):
@@ -231,20 +365,18 @@ class ShellService:
             if session_id not in self.active_shells:
                 # 4.创建一个新的进程
                 logger.debug(f"创建一个新的Shell会话: {session_id}")
-                process = await self._create_process(exec_dir, command)
+                process = await self._create_process(exec_dir, normalized_command)
                 self.active_shells[session_id] = Shell(
                     process=process,
                     exec_dir=exec_dir,
                     output="",
                     console_records=[
-                        ConsoleRecord(ps1=ps1, command=command, output="")
+                        ConsoleRecord(ps1=ps1, command=normalized_command, output="")
                     ],
                 )
 
-                # 5.创建后台任务来运行输出读取器
-                await asyncio.create_task(
-                    self._start_output_reader(session_id, process)
-                )
+                # 5.创建后台任务来运行输出读取器（带会话级任务管理）
+                await self._start_reader_task(session_id, process)
             else:
                 # 6.该会话已存在则读取数据
                 logger.debug(f"使用现有的Shell会话: {session_id}")
@@ -266,20 +398,21 @@ class ShellService:
                         old_process.kill()
 
                 # 10.关闭之后创建一个新的进程
-                process = await self._create_process(exec_dir, command)
+                process = await self._create_process(exec_dir, normalized_command)
 
                 # 11.更新会话信息
                 shell.process = process
                 shell.exec_dir = exec_dir
                 shell.output = ""
                 shell.console_records.append(
-                    ConsoleRecord(ps1=ps1, command=command, output="")
+                    ConsoleRecord(ps1=ps1, command=normalized_command, output="")
                 )
 
-                # 12.创建后台任务来运行输出读取器
-                await asyncio.create_task(
-                    self._start_output_reader(session_id, process)
-                )
+                # 12.创建后台任务来运行输出读取器（带会话级任务管理）
+                await self._start_reader_task(session_id, process)
+
+            # 等待一小段时间让输出读取器开始收集数据
+            await asyncio.sleep(0.1)
 
             try:
 
@@ -295,7 +428,7 @@ class ShellService:
 
                     return ShellExecuteResult(
                         session_id=session_id,
-                        command=command,
+                        command=normalized_command,
                         status="completed",
                         returncode=wait_result.returncode,
                         output=view_result.output,
@@ -312,7 +445,7 @@ class ShellService:
             # 18.返回正在等待Shell执行结果
             return ShellExecuteResult(
                 session_id=session_id,
-                command=command,
+                command=normalized_command,
                 status="running",
             )
         except Exception as e:
@@ -320,7 +453,7 @@ class ShellService:
             logger.error(f"命令执行失败: {str(e)}", exc_info=True)
             raise AppException(
                 msg=f"命令执行失败: {str(e)}",
-                data={"session_id": session_id, "command": command},
+                data={"session_id": session_id, "command": normalized_command},
             )
 
     async def write_shell_input(
@@ -359,9 +492,7 @@ class ShellService:
 
             # 7.记录日志/输出(直接使用原始字符串，不从input_data编码，避免编码不统一的情况)
             log_text = input_text + ("\n" if press_enter else "")
-            shell.output += log_text
-            if shell.console_records:
-                shell.console_records[-1].output += log_text
+            self._append_output(shell, log_text)
 
             # 8.向子进程写入数据
             process.stdin.write(input_data)
@@ -408,12 +539,14 @@ class ShellService:
 
                 # 7.记录日志并返回关闭结果
                 logger.info(f"进程已终止, 返回代码为: {process.returncode}")
+                await self._stop_reader_task(session_id)
                 return ShellKillResult(
                     status="terminated", returncode=process.returncode
                 )
             else:
                 # 8.进程已结束无需重复关闭
                 logger.info(f"进程已终止, 返回代码为: {process.returncode}")
+                await self._stop_reader_task(session_id)
                 return ShellKillResult(
                     status="already_terminated", returncode=process.returncode
                 )
