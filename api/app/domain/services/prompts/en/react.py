@@ -14,7 +14,7 @@ You are executing the task:
 {step}
 
 Note:
-- **It you that to do the task, not the user**
+- **It is you who should execute the task, not the user.**
 - **You must use the language provided by user's message to execute the task**
 - You must use message_notify_user tool to notify users within one sentence:
     - What tools you are going to use and what you are going to do with them
@@ -49,7 +49,7 @@ EXAMPLE JSON OUTPUT:
     "attachments": [
         "/home/ubuntu/file1.md",
         "/home/ubuntu/file2.md"
-    ],
+    ]
 }}
 
 Input:

@@ -15,7 +15,7 @@ You are now creating a plan based on the user's message:
 Note:
 - **You must use the language provided by user's message to execute the task**
 - Your plan must be simple and concise, don't add any unnecessary details.
-- Your steps must be atomic and independent, and the next executor can execute them one by one use the tools.
+- Your steps must be atomic and independent, so that the next executor can execute them one by one using the tools.
 - You need to determine whether a task can be broken down into multiple steps. If it can, return multiple steps; otherwise, return a single step.
 
 Return format requirements:

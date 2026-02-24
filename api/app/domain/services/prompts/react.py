@@ -98,7 +98,7 @@ interface Response {{
 
 JSON 输出示例：
 {{
-    "message": "任务已完成。我已经为您处理了所有数据，主要发现如下：\n1. 增长率...\n2. 异常值...\n详细报告请查看附件。",
+    "message": "任务已完成。我已经为您处理了所有数据，并整理了增长趋势与异常值分析结果。详细报告请查看附件。",
     "attachments": [
         "/home/ubuntu/report.md",
         "/home/ubuntu/data.csv"
