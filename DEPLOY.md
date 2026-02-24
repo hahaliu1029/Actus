@@ -72,6 +72,25 @@ To remove all persistent data volumes as well:
 docker compose down -v
 ```
 
+## 7. Rebuild sandbox runtime after sandbox code changes
+
+If you changed files under `sandbox/` (for example shell runtime behavior), use the following steps to apply updates correctly:
+
+```bash
+# Rebuild sandbox image and API image
+docker compose --env-file .env build sandbox-image api
+
+# Force recreate API container
+docker compose --env-file .env up -d --force-recreate api
+
+# Optional: remove existing temporary sandbox containers
+docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
+```
+
+Notes:
+- Compose service name is `sandbox-image` (not `sandbox`).
+- New sessions will use the updated sandbox image. Existing sessions may still bind to old temporary sandbox containers.
+
 ## Notes
 
 - API startup runs Alembic migrations automatically.

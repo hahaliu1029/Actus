@@ -23,6 +23,7 @@
 - **Skill Ecosystem** — Independent Skill extension ecosystem, defined and installed via SKILL.md, filesystem-based storage, supporting GitHub / local directory dual sources
 - **Planner + ReAct Flow** — Two-phase agent orchestration: plan first, then execute
 - **Sandboxed Execution** — Docker-isolated code execution environment
+- **Long-running Command Friendly** — Shell long-running jobs (e.g. `npm start` / `pip install`) return `running` after a short wait, then continue via output polling / stop controls
 - **Remote Desktop** — Real-time sandbox desktop preview via noVNC, watch Agent actions directly in your browser
 - **Browser Automation** — Web interaction powered by Playwright with a custom DOM index extraction approach, connecting to sandbox Chromium via CDP for precise element-level interaction
 - **Multi-model Support** — Compatible with OpenAI API format (DeepSeek, Kimi, etc.)
@@ -101,6 +102,21 @@ bash dev.sh
 cd ui
 npm install
 npm run dev
+```
+
+### Rebuild Sandbox Runtime After Sandbox Code Changes
+
+When you modify code under `sandbox/` (for example `sandbox/app/services/shell.py`), do **not** run `docker compose up ... sandbox` (there is no `sandbox` service in compose). Use:
+
+```bash
+# 1) Rebuild sandbox image and API image
+docker compose --env-file .env build sandbox-image api
+
+# 2) Force recreate API container so new sessions use the latest sandbox image
+docker compose --env-file .env up -d --force-recreate api
+
+# 3) Optional: remove old temporary sandbox containers to avoid stale reuse
+docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
 ```
 
 ## Project Structure

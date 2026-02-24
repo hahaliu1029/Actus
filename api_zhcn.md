@@ -79,11 +79,25 @@ curl -o openapi.json http://localhost:8000/openapi.json
   "api_key": "string",
   "model_name": "deepseek-reasoner",
   "temperature": 0.7,
-  "max_tokens": 8192
+  "max_tokens": 8192,
+  "context_window": 32768,
+  "context_overflow_guard_enabled": false,
+  "overflow_retry_cap": 2,
+  "soft_trigger_ratio": 0.85,
+  "hard_trigger_ratio": 0.95,
+  "reserved_output_tokens": 4096,
+  "reserved_output_tokens_cap_ratio": 0.25,
+  "token_estimator": "hybrid",
+  "token_safety_factor": 1.15,
+  "unknown_model_context_window": 32768
 }
 ```
 
 说明：LLMConfig 响应不包含 `api_key`。
+补充说明：
+- `context_window` 为空时按模型映射自动推断。
+- `context_overflow_guard_enabled` 用于开启上下文超限治理。
+- `hard_trigger_ratio` 必须大于 `soft_trigger_ratio`。
 
 ### AgentConfig
 
@@ -775,6 +789,8 @@ MinIO 上传文件测试（multipart/form-data）。
 说明：
 - 普通用户仅可访问自己的会话。
 - 管理员可跨用户访问。
+- 长时间命令（如 `npm start` / `pip install`）通常会在执行端先返回 `running`，随后通过本接口持续读取输出。
+- 安装类命令会自动补齐常见非交互参数以降低卡在确认提示符的概率。
 
 ### WS `/api/sessions/{session_id}/vnc?token=<access_token>`
 

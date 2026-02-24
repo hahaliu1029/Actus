@@ -79,11 +79,25 @@ curl -o openapi.json http://localhost:8000/openapi.json
   "api_key": "string",
   "model_name": "deepseek-reasoner",
   "temperature": 0.7,
-  "max_tokens": 8192
+  "max_tokens": 8192,
+  "context_window": 32768,
+  "context_overflow_guard_enabled": false,
+  "overflow_retry_cap": 2,
+  "soft_trigger_ratio": 0.85,
+  "hard_trigger_ratio": 0.95,
+  "reserved_output_tokens": 4096,
+  "reserved_output_tokens_cap_ratio": 0.25,
+  "token_estimator": "hybrid",
+  "token_safety_factor": 1.15,
+  "unknown_model_context_window": 32768
 }
 ```
 
 Note: Responses for LLMConfig exclude `api_key`.
+Additional notes:
+- `context_window` is auto-inferred from model mapping when omitted.
+- `context_overflow_guard_enabled` enables context overflow governance.
+- `hard_trigger_ratio` must be greater than `soft_trigger_ratio`.
 
 ### AgentConfig
 
@@ -775,6 +789,8 @@ Auth: Bearer token required.
 Notes:
 - Normal users can only access their own sessions.
 - Admin users can access across users.
+- Long-running commands (for example `npm start` / `pip install`) typically return `running` first on execution side, then stream/poll output through this endpoint.
+- Install-like commands may be normalized with common non-interactive flags to reduce hangs on confirmation prompts.
 
 ### WS `/api/sessions/{session_id}/vnc?token=<access_token>`
 

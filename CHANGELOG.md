@@ -2,6 +2,21 @@
 
 本文件记录项目的版本变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] - 2026-02-24
+
+### 变更
+
+- 沙箱 Shell 执行链路优化：长时间命令（如 `npm start`、`pip install`、`apt-get install`）不再阻塞主流程，`shell_execute` 会在短等待后返回 `running`，可通过读取输出/等待进程继续跟踪。
+- Shell 输出读取任务增加会话级生命周期管理（启动前回收旧 reader，结束后清理 task），降低并发读输出与后台任务泄漏风险。
+- Shell 输出统一增加最大长度截断策略，降低长命令持续输出导致的内存增长风险。
+- 安装类命令自动非交互化增强：对 `apt/apt-get`、`yum/dnf`、`apk`、`pip`、`npm/yarn/pnpm/npx`、`conda`、`poetry` 注入常见非交互参数，减少卡在确认提示的概率。
+- 设置页「模型提供商」补全全部 LLM 配置项的中文说明文案，便于理解参数语义。
+
+### 文档
+
+- 更新中英文 API 文档中的 `LLMConfig` 字段定义，补充上下文溢出治理相关配置项。
+- 补充部署文档与 README：说明 `sandbox-image` 为 Compose 服务名，并提供沙箱代码变更后的正确重建命令。
+
 ## [0.1.0] - 2025-XX-XX
 
 ### 新增

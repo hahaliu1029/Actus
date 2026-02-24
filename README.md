@@ -23,6 +23,7 @@
 - **Skill 生态** — 独立的 Skill 扩展生态，通过 SKILL.md 定义与安装，基于文件系统存储，支持 GitHub / 本地目录双来源
 - **Planner + ReAct 流程** — 先规划再执行的两阶段 Agent 流程编排
 - **沙箱执行** — Docker 隔离的代码执行环境，安全运行用户代码
+- **长命令友好** — Shell 长时间任务（如 `npm start` / `pip install`）短等待后返回 `running`，可持续读取输出与主动停止
 - **远程桌面** — 基于 noVNC 的沙箱桌面实时预览，浏览器内直接查看 Agent 操作画面
 - **浏览器自动化** — 基于 Playwright + DOM 索引方案的网页操作能力，通过 CDP 连接沙箱 Chromium，实时提取可交互元素并精确操作
 - **多模型支持** — 兼容 OpenAI API 格式（DeepSeek、Kimi 等）
@@ -101,6 +102,21 @@ bash dev.sh
 cd ui
 npm install
 npm run dev
+```
+
+### 沙箱代码更新后的正确重建
+
+当你修改了 `sandbox/` 代码（如 `sandbox/app/services/shell.py`）时，请不要执行 `docker compose up ... sandbox`（Compose 中没有该服务名），应使用：
+
+```bash
+# 1) 重建沙箱镜像与 API 镜像
+docker compose --env-file .env build sandbox-image api
+
+# 2) 强制重建 API 容器（确保后续新建会话使用新镜像）
+docker compose --env-file .env up -d --force-recreate api
+
+# 3) 可选：清理旧的临时沙箱容器，避免复用旧版本
+docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
 ```
 
 ## 项目结构
