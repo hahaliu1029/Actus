@@ -14,6 +14,7 @@ from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
 from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig, SkillRiskPolicy
+from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
     A2AToolContent,
     BaseEvent,
@@ -88,6 +89,7 @@ class AgentTaskRunner(TaskRunner):
         search_engine: SearchEngine,  # 搜索引擎
         sandbox: Sandbox,  # 沙箱
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
+        overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._uow_factory = uow_factory
@@ -122,6 +124,7 @@ class AgentTaskRunner(TaskRunner):
         self._skill_selector = SkillSelector(default_top_k=12)
         self._session_skill_pool: list[Skill] = []
         self._file_storage = file_storage
+        self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
         self._browser = browser
         self._flow = PlannerReActFlow(
@@ -137,6 +140,7 @@ class AgentTaskRunner(TaskRunner):
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
             skill_tool=self._skill_tool,
+            overflow_config=self._overflow_config,
         )
 
     async def _put_and_add_event(

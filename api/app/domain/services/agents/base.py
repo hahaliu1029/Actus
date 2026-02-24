@@ -7,6 +7,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 from app.domain.external.json_parser import JSONParser
 from app.domain.external.llm import LLM
 from app.domain.models.app_config import AgentConfig
+from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
     BaseEvent,
     ErrorEvent,
@@ -43,6 +44,7 @@ class BaseAgent(ABC):
         llm: LLM,  # 语言模型协议
         json_parser: JSONParser,  # JSON输出解析器
         tools: List[BaseTool],  # 工具列表
+        overflow_config: ContextOverflowConfig | None = None,  # 上下文超限治理配置
     ) -> None:
         """构造函数，完成Agent的初始化"""
         self._uow_factory = uow_factory
@@ -54,6 +56,7 @@ class BaseAgent(ABC):
         self._memory: Optional[Memory] = None
         self._json_parser = json_parser
         self._tools = tools
+        self._overflow_config = overflow_config or ContextOverflowConfig()
         self._runtime_system_context: str = ""
 
     def set_runtime_system_context(self, context: str) -> None:

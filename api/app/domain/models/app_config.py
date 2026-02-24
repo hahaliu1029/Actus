@@ -1,6 +1,6 @@
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
@@ -17,6 +17,37 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(
         8192, ge=0
     )  # 最大输出token数，默认设置为deepseek-chat模型的最大输出限制
+    context_window: int | None = Field(
+        default=None, ge=1024
+    )  # 上下文窗口大小，空表示根据模型映射自动推断
+    context_overflow_guard_enabled: bool = False  # 是否开启上下文超限治理
+    overflow_retry_cap: int = Field(2, ge=0, le=10)  # 超限治理自动重试次数上限
+    soft_trigger_ratio: float = Field(
+        0.85, gt=0, le=1
+    )  # 软阈值比例，超过后优先进入预处理
+    hard_trigger_ratio: float = Field(
+        0.95, gt=0, le=1
+    )  # 硬阈值比例，超过后强制进入压缩治理
+    reserved_output_tokens: int = Field(4096, ge=0)  # 预留输出token预算
+    reserved_output_tokens_cap_ratio: float = Field(
+        0.25, gt=0, le=1
+    )  # 预留输出token占上下文窗口最大比例
+    token_estimator: Literal["hybrid", "char", "provider_api"] = (
+        "hybrid"  # token估算策略
+    )
+    token_safety_factor: float = Field(
+        1.15, ge=1.0
+    )  # token估算安全系数，避免低估预算
+    unknown_model_context_window: int = Field(
+        32768, ge=1024
+    )  # 未知模型的上下文窗口兜底值
+
+    @model_validator(mode="after")
+    def validate_context_budget_ratio(self):
+        """校验上下文预算比例配置"""
+        if self.hard_trigger_ratio <= self.soft_trigger_ratio:
+            raise ValueError("hard_trigger_ratio 必须大于 soft_trigger_ratio")
+        return self
 
 
 class AgentConfig(BaseModel):

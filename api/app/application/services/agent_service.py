@@ -16,6 +16,7 @@ from app.domain.models.app_config import (
     MCPConfig,
     SkillRiskPolicy,
 )
+from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
     BaseEvent,
     DoneEvent,
@@ -53,6 +54,7 @@ class AgentService:
         search_engine: SearchEngine,
         file_storage: FileStorage,
         skill_risk_policy: SkillRiskPolicy | None = None,
+        overflow_config: ContextOverflowConfig | None = None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
@@ -63,6 +65,7 @@ class AgentService:
         self._mcp_config = mcp_config
         self._a2a_config = a2a_config
         self._skill_risk_policy = skill_risk_policy or SkillRiskPolicy()
+        self._overflow_config = overflow_config or ContextOverflowConfig()
         self._sandbox_cls = sandbox_cls
         self._task_cls = task_cls
         self._json_parser = json_parser
@@ -111,6 +114,7 @@ class AgentService:
             mcp_config=self._mcp_config,
             a2a_config=self._a2a_config,
             skill_risk_policy=self._skill_risk_policy,
+            overflow_config=self._overflow_config,
             session_id=session.id,
             user_id=session.user_id,
             # session_repository=self._session_repository,

@@ -53,6 +53,16 @@ describe("settings-store", () => {
       model_name: "gpt-4o",
       temperature: 0.7,
       max_tokens: 4096,
+      context_window: null,
+      context_overflow_guard_enabled: false,
+      overflow_retry_cap: 2,
+      soft_trigger_ratio: 0.85,
+      hard_trigger_ratio: 0.95,
+      reserved_output_tokens: 4096,
+      reserved_output_tokens_cap_ratio: 0.25,
+      token_estimator: "hybrid",
+      token_safety_factor: 1.15,
+      unknown_model_context_window: 32768,
     });
     mockedConfigApi.getAgentConfig.mockResolvedValue({
       max_iterations: 100,
