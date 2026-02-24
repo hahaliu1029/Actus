@@ -614,8 +614,7 @@ export function ManusSettings() {
                               </div>
                             </div>
 
-                            <div className="flex items-center gap-3">
-                              <button
+                            <button
                                 type="button"
                                 className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                                 disabled={!isAdmin}
@@ -625,30 +624,30 @@ export function ManusSettings() {
                               >
                                 <Trash2 className="size-4" />
                               </button>
-
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                全局
-                                <Switch
-                                  className="data-[state=checked]:bg-primary"
-                                  checked={server.enabled}
-                                  disabled={!isAdmin}
-                                  onCheckedChange={(checked) => {
-                                    void setA2AServerEnabled(server.id, checked);
-                                  }}
-                                />
-                              </div>
-                            </div>
                           </div>
 
-                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-muted-foreground">
-                            个人
-                            <Switch
-                              className="data-[state=checked]:bg-primary"
-                              checked={tool?.enabled_user ?? userEnabled}
-                              onCheckedChange={(checked) => {
-                                void setA2AToolEnabled(server.id, checked);
-                              }}
-                            />
+                          <div className="mt-3 flex items-center justify-end gap-6 text-xs text-muted-foreground">
+                            <div className="flex items-center gap-2">
+                              全局
+                              <Switch
+                                className="data-[state=checked]:bg-primary"
+                                checked={server.enabled}
+                                disabled={!isAdmin}
+                                onCheckedChange={(checked) => {
+                                  void setA2AServerEnabled(server.id, checked);
+                                }}
+                              />
+                            </div>
+                            <div className="flex items-center gap-2">
+                              个人
+                              <Switch
+                                className="data-[state=checked]:bg-primary"
+                                checked={tool?.enabled_user ?? userEnabled}
+                                onCheckedChange={(checked) => {
+                                  void setA2AToolEnabled(server.id, checked);
+                                }}
+                              />
+                            </div>
                           </div>
                         </div>
                       );
@@ -788,8 +787,7 @@ export function ManusSettings() {
                               </div>
                             </div>
 
-                            <div className="flex items-center gap-3">
-                              <button
+                            <button
                                 type="button"
                                 className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                                 disabled={!isAdmin}
@@ -799,30 +797,30 @@ export function ManusSettings() {
                               >
                                 <Trash2 className="size-4" />
                               </button>
-
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                全局
-                                <Switch
-                                  className="data-[state=checked]:bg-primary"
-                                  checked={server.enabled}
-                                  disabled={!isAdmin}
-                                  onCheckedChange={(checked) => {
-                                    void setMCPServerEnabled(server.server_name, checked);
-                                  }}
-                                />
-                              </div>
-                            </div>
                           </div>
 
-                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-muted-foreground">
-                            个人
-                            <Switch
-                              className="data-[state=checked]:bg-primary"
-                              checked={tool?.enabled_user ?? userEnabled}
-                              onCheckedChange={(checked) => {
-                                void setMCPToolEnabled(server.server_name, checked);
-                              }}
-                            />
+                          <div className="mt-3 flex items-center justify-end gap-6 text-xs text-muted-foreground">
+                            <div className="flex items-center gap-2">
+                              全局
+                              <Switch
+                                className="data-[state=checked]:bg-primary"
+                                checked={server.enabled}
+                                disabled={!isAdmin}
+                                onCheckedChange={(checked) => {
+                                  void setMCPServerEnabled(server.server_name, checked);
+                                }}
+                              />
+                            </div>
+                            <div className="flex items-center gap-2">
+                              个人
+                              <Switch
+                                className="data-[state=checked]:bg-primary"
+                                checked={tool?.enabled_user ?? userEnabled}
+                                onCheckedChange={(checked) => {
+                                  void setMCPToolEnabled(server.server_name, checked);
+                                }}
+                              />
+                            </div>
                           </div>
                         </div>
                       );
@@ -1047,8 +1045,7 @@ export function ManusSettings() {
                               </p>
                             </div>
 
-                            <div className="flex items-center gap-3">
-                              <button
+                            <button
                                 type="button"
                                 className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                                 disabled={!isAdmin}
@@ -1058,30 +1055,30 @@ export function ManusSettings() {
                               >
                                 <Trash2 className="size-4" />
                               </button>
-
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                全局
-                                <Switch
-                                  className="data-[state=checked]:bg-primary"
-                                  checked={skill.enabled}
-                                  disabled={!isAdmin}
-                                  onCheckedChange={(checked) => {
-                                    void setSkillEnabled(skill.id, checked);
-                                  }}
-                                />
-                              </div>
-                            </div>
                           </div>
 
-                          <div className="mt-3 flex items-center justify-end gap-2 text-xs text-muted-foreground">
-                            个人
-                            <Switch
-                              className="data-[state=checked]:bg-primary"
-                              checked={tool?.enabled_user ?? userEnabled}
-                              onCheckedChange={(checked) => {
-                                void setSkillToolEnabled(skill.id, checked);
-                              }}
-                            />
+                          <div className="mt-3 flex items-center justify-end gap-6 text-xs text-muted-foreground">
+                            <div className="flex items-center gap-2">
+                              全局
+                              <Switch
+                                className="data-[state=checked]:bg-primary"
+                                checked={skill.enabled}
+                                disabled={!isAdmin}
+                                onCheckedChange={(checked) => {
+                                  void setSkillEnabled(skill.id, checked);
+                                }}
+                              />
+                            </div>
+                            <div className="flex items-center gap-2">
+                              个人
+                              <Switch
+                                className="data-[state=checked]:bg-primary"
+                                checked={tool?.enabled_user ?? userEnabled}
+                                onCheckedChange={(checked) => {
+                                  void setSkillToolEnabled(skill.id, checked);
+                                }}
+                              />
+                            </div>
                           </div>
                         </div>
                       );
