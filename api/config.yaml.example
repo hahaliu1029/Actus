@@ -13,6 +13,37 @@ agent_config:
   max_iterations: 100                     # Agent 最大迭代次数
   max_retries: 3                          # 工具调用最大重试次数
   max_search_results: 10                  # 搜索结果数量
+  skill_selection:
+    base_threshold: 3
+    short_message_max_chars: 24
+    llm_trigger_token_count: 4
+    continuation_llm_enabled: true
+    continuation_llm_timeout_seconds: 3.0
+    continuation_llm_cache_size: 128
+    continuation_phrases:
+      - "继续"
+      - "请继续"
+      - "继续一下"
+      - "继续吧"
+      - "接着"
+      - "下一步"
+      - "好的"
+      - "好"
+      - "行"
+      - "嗯"
+      - "收到"
+      - "ok"
+      - "okay"
+      - "go on"
+      - "next"
+      - "please continue"
+      - "proceed"
+    # continuation_patterns 使用 Python re 语法
+    # 注意 YAML 中反斜杠需要转义，例如 "\\s"
+    continuation_patterns:
+      - "^(请)?继续(一下|吧|下去)?$"
+      - "^(好的?[,，\\s]*)?(继续|接着)$"
+      - "^(ok|okay)([,\\s]+(go on|continue))?$"
 
 mcp_config:
   mcpServers:

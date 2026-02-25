@@ -1,5 +1,6 @@
 import uuid
 from enum import Enum
+import re
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
@@ -50,12 +51,65 @@ class LLMConfig(BaseModel):
         return self
 
 
+class SkillSelectionPolicy(BaseModel):
+    """Skill选择稳定性策略配置。"""
+
+    base_threshold: int = Field(3, ge=1, le=20)
+    short_message_max_chars: int = Field(24, ge=1, le=200)
+    llm_trigger_token_count: int = Field(4, ge=1, le=50)
+    continuation_llm_enabled: bool = True
+    continuation_llm_timeout_seconds: float = Field(3.0, gt=0, le=10)
+    continuation_llm_cache_size: int = Field(128, ge=0, le=2048)
+    continuation_phrases: List[str] = Field(
+        default_factory=lambda: [
+            "继续",
+            "请继续",
+            "继续一下",
+            "继续吧",
+            "接着",
+            "下一步",
+            "好的",
+            "好",
+            "行",
+            "嗯",
+            "收到",
+            "ok",
+            "okay",
+            "go on",
+            "next",
+            "please continue",
+            "proceed",
+        ]
+    )
+    continuation_patterns: List[str] = Field(
+        default_factory=lambda: [
+            r"^(请)?继续(一下|吧|下去)?$",
+            r"^(好的?[,，\s]*)?(继续|接着)$",
+            r"^(ok|okay)([,\s]+(go on|continue))?$",
+            r"^(好的?[,，\s]*)?继续([,，\s]+(一下|下|吧))?$",
+        ]
+    )
+
+    @model_validator(mode="after")
+    def validate_continuation_patterns(self):
+        """校验续写判定正则表达式可编译。"""
+        for index, pattern in enumerate(self.continuation_patterns):
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"continuation_patterns[{index}] 无法编译: {pattern} ({exc})"
+                ) from exc
+        return self
+
+
 class AgentConfig(BaseModel):
     """Agent通用配置"""
 
     max_iterations: int = Field(default=100, gt=0, lt=1000)  # Agent最大迭代次数
     max_retries: int = Field(default=3, gt=1, lt=10)  # 最大重试次数
     max_search_results: int = Field(default=10, gt=1, lt=30)  # 最大搜索结果条数
+    skill_selection: SkillSelectionPolicy = Field(default_factory=SkillSelectionPolicy)
 
 
 class MCPTransport(str, Enum):

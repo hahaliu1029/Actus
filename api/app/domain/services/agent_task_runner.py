@@ -1,11 +1,19 @@
 import asyncio
+import hashlib
 import io
 import logging
 import mimetypes
 import re
+import time
+import unicodedata
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import AsyncGenerator, BinaryIO, Callable, List
 
+from app.application.services.continuation_intent_classifier import (
+    ContinuationIntentClassifier,
+)
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
 from app.domain.external.json_parser import JSONParser
@@ -13,7 +21,12 @@ from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
-from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig, SkillRiskPolicy
+from app.domain.models.app_config import (
+    A2AConfig,
+    AgentConfig,
+    MCPConfig,
+    SkillRiskPolicy,
+)
 from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
     A2AToolContent,
@@ -45,7 +58,7 @@ from app.domain.models.user_tool_preference import ToolType
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.application.services.skill_index_service import SkillIndexService
-from app.application.services.skill_selector import SkillSelector
+from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.mcp import MCPTool
@@ -67,6 +80,23 @@ MESSAGE_STREAM_CHUNK_DELAY_SEC = 0.03
 SKILL_CONTEXT_MAX_SKILLS = 6
 SKILL_CONTEXT_MAX_TOTAL_CHARS = 8000
 SKILL_CONTEXT_MAX_SNIPPET_CHARS = 1200
+
+
+@dataclass(slots=True)
+class SelectionDebugMeta:
+    selection_source: str
+    continuation_decision: bool
+    continuation_decision_source: str
+    llm_invoked: bool
+    llm_cache_hit: bool
+    llm_latency_ms: int | None
+    message_len: int
+    message_digest: str
+    max_score: int
+    second_score: int
+    effective_threshold: int
+    token_count: int
+    has_positive_match: bool
 
 
 class AgentTaskRunner(TaskRunner):
@@ -92,6 +122,9 @@ class AgentTaskRunner(TaskRunner):
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        self._agent_config = agent_config
+        self._llm = llm
+        self._json_parser = json_parser
         self._uow_factory = uow_factory
         self._uow = uow_factory()
         self._session_id = session_id
@@ -121,7 +154,29 @@ class AgentTaskRunner(TaskRunner):
             skill_repository=self._skill_repository,
             skills_root=settings.skills_root_dir,
         )
-        self._skill_selector = SkillSelector(default_top_k=12)
+        self._skill_selection_policy = agent_config.skill_selection
+        self._skill_selector = SkillSelector(
+            default_top_k=12,
+            base_threshold=self._skill_selection_policy.base_threshold,
+        )
+        self._continuation_classifier = ContinuationIntentClassifier(
+            llm=llm,
+            json_parser=json_parser,
+            timeout_seconds=self._skill_selection_policy.continuation_llm_timeout_seconds,
+        )
+        self._continuation_phrases = {
+            self._normalize_continuation_text(item)
+            for item in self._skill_selection_policy.continuation_phrases
+            if self._normalize_continuation_text(item)
+        }
+        self._continuation_patterns = [
+            re.compile(item)
+            for item in self._skill_selection_policy.continuation_patterns
+            if item
+        ]
+        self._continuation_decision_cache: OrderedDict[str, bool] = OrderedDict()
+        self._last_effective_selected_skills: list[Skill] = []
+        self._last_substantive_user_message: str = ""
         self._session_skill_pool: list[Skill] = []
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
@@ -372,13 +427,168 @@ class AgentTaskRunner(TaskRunner):
     ) -> list[Skill]:
         skills = await self._load_enabled_skills()
         filtered = self._filter_skills_by_user_preferences(skills, preference_map)
-        return self._select_skills_from_pool(filtered, user_message)
+        selected_skills, _ = await self._select_skills_for_message(filtered, user_message)
+        return selected_skills
 
     def _select_skills_from_pool(self, skill_pool: list[Skill], user_message: str) -> list[Skill]:
         """从给定技能池中选择本轮激活的技能子集。"""
         if not skill_pool:
             return []
         return self._skill_selector.select(skill_pool, user_message)
+
+    @staticmethod
+    def _normalize_continuation_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", text or "").lower()
+        normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def _is_low_info_continuation_by_rule(self, message: str) -> bool:
+        normalized = self._normalize_continuation_text(message)
+        if not normalized:
+            return False
+        if normalized in self._continuation_phrases:
+            return True
+        return any(pattern.fullmatch(normalized) for pattern in self._continuation_patterns)
+
+    def _should_invoke_continuation_llm(
+        self,
+        meta: SkillSelectionMeta,
+        message: str,
+    ) -> bool:
+        if not self._skill_selection_policy.continuation_llm_enabled:
+            return False
+        if not self._last_substantive_user_message.strip():
+            return False
+        normalized = self._normalize_continuation_text(message)
+        if not normalized:
+            return False
+        if len(normalized) > self._skill_selection_policy.short_message_max_chars:
+            return False
+        if meta.token_count > self._skill_selection_policy.llm_trigger_token_count:
+            return False
+        if meta.max_score > meta.effective_threshold:
+            return False
+        return True
+
+    def _build_continuation_cache_key(self, current_message: str) -> str:
+        current = self._normalize_continuation_text(current_message)
+        previous = self._normalize_continuation_text(self._last_substantive_user_message)
+        payload = f"{current}|{previous}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _get_cached_continuation_decision(self, key: str) -> bool | None:
+        if key not in self._continuation_decision_cache:
+            return None
+        value = self._continuation_decision_cache.pop(key)
+        self._continuation_decision_cache[key] = value
+        return value
+
+    def _set_cached_continuation_decision(self, key: str, value: bool) -> None:
+        self._continuation_decision_cache[key] = value
+        if len(self._continuation_decision_cache) <= self._skill_selection_policy.continuation_llm_cache_size:
+            return
+        self._continuation_decision_cache.popitem(last=False)
+
+    async def _decide_continuation(
+        self,
+        message: str,
+        meta: SkillSelectionMeta,
+    ) -> tuple[bool, str, bool, bool, int | None]:
+        if self._is_low_info_continuation_by_rule(message):
+            return True, "rule", False, False, None
+        if not self._should_invoke_continuation_llm(meta, message):
+            return False, "fallback", False, False, None
+
+        cache_key = self._build_continuation_cache_key(message)
+        cached = self._get_cached_continuation_decision(cache_key)
+        if cached is not None:
+            return cached, "llm", False, True, 0
+
+        started = time.perf_counter()
+        decision = await self._continuation_classifier.classify(
+            current_message=message,
+            previous_substantive_message=self._last_substantive_user_message,
+        )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        self._set_cached_continuation_decision(cache_key, decision)
+        return decision, "llm", True, False, latency_ms
+
+    async def _select_skills_for_message(
+        self,
+        skill_pool: list[Skill],
+        user_message: str,
+    ) -> tuple[list[Skill], SelectionDebugMeta]:
+        if not skill_pool:
+            debug = SelectionDebugMeta(
+                selection_source="fallback",
+                continuation_decision=False,
+                continuation_decision_source="fallback",
+                llm_invoked=False,
+                llm_cache_hit=False,
+                llm_latency_ms=None,
+                message_len=len(user_message or ""),
+                message_digest=hashlib.sha256((user_message or "").encode("utf-8")).hexdigest(),
+                max_score=0,
+                second_score=0,
+                effective_threshold=1,
+                token_count=0,
+                has_positive_match=False,
+            )
+            return [], debug
+
+        meta = self._skill_selector.select_with_meta(skill_pool, user_message)
+        (
+            is_continuation,
+            continuation_source,
+            llm_invoked,
+            llm_cache_hit,
+            llm_latency_ms,
+        ) = await self._decide_continuation(user_message, meta)
+
+        if is_continuation and self._last_effective_selected_skills:
+            selected_skills = list(self._last_effective_selected_skills)
+            selection_source = "carry_over"
+        else:
+            selected_skills = list(meta.selected_skills)
+            selection_source = "current" if meta.has_positive_match else "fallback"
+            if not is_continuation and user_message.strip():
+                self._last_effective_selected_skills = list(selected_skills)
+                self._last_substantive_user_message = user_message
+
+        debug = SelectionDebugMeta(
+            selection_source=selection_source,
+            continuation_decision=is_continuation,
+            continuation_decision_source=continuation_source,
+            llm_invoked=llm_invoked,
+            llm_cache_hit=llm_cache_hit,
+            llm_latency_ms=llm_latency_ms,
+            message_len=len(user_message or ""),
+            message_digest=hashlib.sha256((user_message or "").encode("utf-8")).hexdigest(),
+            max_score=meta.max_score,
+            second_score=meta.second_score,
+            effective_threshold=meta.effective_threshold,
+            token_count=meta.token_count,
+            has_positive_match=meta.has_positive_match,
+        )
+        logger.info(
+            "Skill选择 source=%s continuation=%s continuation_source=%s max=%s second=%s threshold=%s "
+            "token_count=%s selected=%s llm_invoked=%s llm_cache_hit=%s llm_latency_ms=%s message_len=%s message_digest=%s",
+            debug.selection_source,
+            debug.continuation_decision,
+            debug.continuation_decision_source,
+            debug.max_score,
+            debug.second_score,
+            debug.effective_threshold,
+            debug.token_count,
+            [skill.id for skill in selected_skills],
+            debug.llm_invoked,
+            debug.llm_cache_hit,
+            debug.llm_latency_ms,
+            debug.message_len,
+            debug.message_digest,
+        )
+        return selected_skills, debug
 
     @staticmethod
     def _strip_skill_frontmatter(skill_md: str) -> str:
@@ -660,6 +870,9 @@ class AgentTaskRunner(TaskRunner):
         except Exception as e:
             logger.warning(f"清理Skill工具资源时出错: {e}")
         self._session_skill_pool = []
+        self._last_effective_selected_skills = []
+        self._last_substantive_user_message = ""
+        self._continuation_decision_cache.clear()
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
@@ -718,7 +931,11 @@ class AgentTaskRunner(TaskRunner):
                 if isinstance(event, MessageEvent):
                     message = event.message or ""
                     await self._sync_message_attachments_to_sandbox(event)
-                    logger.info(f"AgentTaskRunner接收到新消息: {message[:50]}...")
+                    logger.info(
+                        "AgentTaskRunner接收到新消息(len=%s, digest=%s)",
+                        len(message),
+                        hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    )
 
                 # 6.将消息事件转换称消息对象
                 message_obj = Message(
@@ -730,7 +947,7 @@ class AgentTaskRunner(TaskRunner):
                     ),
                 )
 
-                selected_skills = self._select_skills_from_pool(
+                selected_skills, _ = await self._select_skills_for_message(
                     self._session_skill_pool,
                     message_obj.message,
                 )

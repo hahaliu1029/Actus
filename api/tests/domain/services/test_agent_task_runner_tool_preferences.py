@@ -202,6 +202,16 @@ class _FakeSkillBundleSync:
         self.sequence.append("cleanup")
 
 
+class _FakeContinuationClassifier:
+    def __init__(self, *, decision: bool = False) -> None:
+        self.decision = decision
+        self.calls: list[tuple[str, str]] = []
+
+    async def classify(self, current_message: str, previous_substantive_message: str) -> bool:
+        self.calls.append((current_message, previous_substantive_message))
+        return self.decision
+
+
 def _build_skill(skill_id: str, *, name: str) -> Skill:
     return Skill(
         id=skill_id,
@@ -435,3 +445,120 @@ async def test_runner_passes_overflow_config_to_flow(monkeypatch) -> None:
     )
 
     assert runner._flow.kwargs["overflow_config"] is overflow_config
+
+
+async def test_initial_skills_do_not_seed_anchor(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _DummyFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-initial-anchor",
+        user_id="user-initial-anchor",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+    runner._mcp_tool = _FakeMCPTool()
+    runner._a2a_tool = _FakeA2ATool()
+    runner._skill_tool = _FakeSkillTool()
+    runner._skill_bundle_sync = _FakeSkillBundleSync()
+
+    async def fake_load_user_preferences_map(tool_type: ToolType) -> dict[str, bool]:
+        return {}
+
+    async def fake_load_enabled_skills() -> list[Skill]:
+        return [
+            _build_skill("skill-a", name="Skill A"),
+            _build_skill("skill-b", name="Skill B"),
+        ]
+
+    monkeypatch.setattr(runner, "_load_user_preferences_map", fake_load_user_preferences_map)
+    monkeypatch.setattr(runner, "_load_enabled_skills", fake_load_enabled_skills)
+
+    await runner.invoke(_DummyTask())
+
+    assert runner._last_effective_selected_skills == []
+    assert runner._last_substantive_user_message == ""
+
+
+async def test_skill_anchor_switches_a_continue_b_continue(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _DummyFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-anchor-switch",
+        user_id="user-anchor-switch",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+
+    sql_skill = _build_skill("sql", name="SQL")
+    sql_skill.description = "sql optimize query index SQL优化"
+    log_skill = _build_skill("log", name="Log")
+    log_skill.description = "analyze log trace diagnose 查日志 日志"
+    pool = [sql_skill, log_skill]
+
+    selected_a, _ = await runner._select_skills_for_message(pool, "请做 sql 优化")
+    selected_continue_a, _ = await runner._select_skills_for_message(pool, "继续")
+    selected_b, _ = await runner._select_skills_for_message(pool, "查日志")
+    selected_continue_b, _ = await runner._select_skills_for_message(pool, "继续")
+
+    assert selected_a[0].id == "sql"
+    assert selected_continue_a[0].id == "sql"
+    assert selected_b[0].id == "log"
+    assert selected_continue_b[0].id == "log"
+
+
+async def test_ambiguous_message_triggers_llm_but_explicit_message_does_not(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _DummyFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-llm-trigger",
+        user_id="user-llm-trigger",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+
+    sql_skill = _build_skill("sql", name="SQL")
+    sql_skill.description = "sql optimize query index"
+    pool = [sql_skill]
+
+    fake_classifier = _FakeContinuationClassifier(decision=True)
+    runner._continuation_classifier = fake_classifier
+
+    await runner._select_skills_for_message(pool, "请帮我做 sql 优化")
+    await runner._select_skills_for_message(pool, "咋办")
+    assert len(fake_classifier.calls) == 1
+
+    await runner._select_skills_for_message(pool, "请继续处理 SQL 优化并补充执行计划")
+    assert len(fake_classifier.calls) == 1

@@ -68,3 +68,47 @@ def test_skill_selector_prefers_context_blob_when_available() -> None:
 
     assert selected
     assert selected[0].id == "pptx"
+
+
+def test_tokenize_cjk_bigram_examples_snapshot() -> None:
+    selector = SkillSelector()
+
+    assert selector._tokenize("流程图") == {"流程图", "流程", "程图"}
+    assert selector._tokenize("画流程图") == {"画流程图", "画流", "流程", "程图"}
+    assert selector._tokenize("sql优化") == {"sql", "优化"}
+    assert selector._tokenize("查日志") == {"查日志", "查日", "日志"}
+    assert selector._tokenize("图") == {"图"}
+
+
+def test_tokenize_mixed_sql_cjk() -> None:
+    selector = SkillSelector()
+    tokens = selector._tokenize("请做 SQL 优化并查日志")
+    assert "sql" in tokens
+    assert "优化" in tokens
+    assert "查日" in tokens
+    assert "日志" in tokens
+
+
+def test_no_unigram_for_multi_char_cjk_span() -> None:
+    selector = SkillSelector()
+    tokens = selector._tokenize("好的继续")
+    assert "好的继续" in tokens
+    assert "好的" in tokens
+    assert "继续" in tokens
+    assert "好" not in tokens
+    assert "的" not in tokens
+
+
+def test_select_with_meta_uses_dynamic_threshold_for_short_intent() -> None:
+    selector = SkillSelector(default_top_k=12, base_threshold=3)
+    skills = [
+        _build_skill("sql", "SQL", "sql optimize", "query and index"),
+        _build_skill("draw", "Draw", "diagram", "draw flow chart"),
+    ]
+
+    meta = selector.select_with_meta(skills=skills, user_message="sql优化")
+
+    assert meta.token_count == 2
+    assert meta.effective_threshold == 1
+    assert meta.has_positive_match is True
+    assert meta.selected_skills[0].id == "sql"
