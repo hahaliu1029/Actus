@@ -391,6 +391,74 @@ describe("session-store", () => {
     expect(state.currentSession?.status).toBe("waiting");
   });
 
+  it("sendChat 终态事件应同步更新 sessions 列表状态", async () => {
+    useSessionStore.setState({
+      sessions: [
+        {
+          session_id: "s-done",
+          title: "会话",
+          latest_message: "",
+          latest_message_at: null,
+          status: "running",
+          unread_message_count: 0,
+        },
+      ],
+    });
+
+    mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent, _onError, onClose) => {
+      onEvent({
+        type: "done",
+        data: { event_id: "evt-done", created_at: Math.floor(Date.now() / 1000) },
+      });
+      onClose?.();
+      return () => {};
+    });
+
+    await useSessionStore.getState().sendChat("s-done", { message: "完成" });
+
+    expect(useSessionStore.getState().sessions[0]?.status).toBe("completed");
+  });
+
+  it("stopSession 后应乐观更新会话状态并停止当前流", async () => {
+    const abortMock = vi.fn();
+    useSessionStore.setState({
+      sessions: [
+        {
+          session_id: "s-stop",
+          title: "会话",
+          latest_message: "",
+          latest_message_at: null,
+          status: "running",
+          unread_message_count: 0,
+        },
+      ],
+      currentSession: buildSession({ session_id: "s-stop", status: "running" }),
+      isChatting: true,
+      chatSessionId: "s-stop",
+      chatAbort: abortMock,
+    });
+
+    await useSessionStore.getState().stopSession("s-stop");
+
+    const state = useSessionStore.getState();
+    expect(mockedSessionApi.stopSession).toHaveBeenCalledWith("s-stop");
+    expect(abortMock).toHaveBeenCalledTimes(1);
+    expect(state.isChatting).toBe(false);
+    expect(state.chatSessionId).toBeNull();
+    expect(state.currentSession?.status).toBe("completed");
+    expect(state.sessions[0]?.status).toBe("completed");
+  });
+
+  it("isSessionStreaming 仅对当前流会话返回 true", () => {
+    useSessionStore.setState({
+      isChatting: true,
+      chatSessionId: "s-active",
+    });
+
+    expect(useSessionStore.getState().isSessionStreaming("s-active")).toBe(true);
+    expect(useSessionStore.getState().isSessionStreaming("s-other")).toBe(false);
+  });
+
   it("fetchSessionById 在 silent 模式下不应切换加载态", async () => {
     let resolveSession: ((session: Session) => void) | null = null;
     mockedSessionApi.getSession.mockImplementation(

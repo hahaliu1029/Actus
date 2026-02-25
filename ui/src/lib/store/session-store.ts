@@ -32,6 +32,8 @@ type SessionState = {
 type SessionActions = {
   reset: () => void;
   setActiveSession: (sessionId: string | null) => void;
+  isSessionStreaming: (sessionId: string) => boolean;
+  getSessionStatus: (sessionId: string) => Session["status"] | null;
   fetchSessions: () => Promise<void>;
   streamSessions: () => void;
   stopStreamSessions: () => void;
@@ -373,6 +375,22 @@ function isSameFileList(left: FileInfo[], right: FileInfo[]): boolean {
   return true;
 }
 
+function updateSessionListStatus(
+  sessions: ListSessionItem[],
+  sessionId: string,
+  status: Session["status"]
+): ListSessionItem[] {
+  let changed = false;
+  const next = sessions.map((item) => {
+    if (item.session_id !== sessionId || item.status === status) {
+      return item;
+    }
+    changed = true;
+    return { ...item, status };
+  });
+  return changed ? next : sessions;
+}
+
 function isRecoverableLLMErrorEvent(event: SessionEventRecord): boolean {
   if (event.event !== "error") {
     return false;
@@ -438,6 +456,19 @@ export const useSessionStore = create<SessionStore>()(
         }
         return { activeSessionId: sessionId };
       });
+    },
+
+    isSessionStreaming: (sessionId: string) => {
+      const state = get();
+      return state.isChatting && state.chatSessionId === sessionId;
+    },
+
+    getSessionStatus: (sessionId: string) => {
+      const state = get();
+      if (state.currentSession?.session_id === sessionId) {
+        return state.currentSession.status;
+      }
+      return state.sessions.find((item) => item.session_id === sessionId)?.status ?? null;
     },
 
     fetchSessions: async () => {
@@ -639,8 +670,29 @@ export const useSessionStore = create<SessionStore>()(
           }
 
           set((state) => {
+            if (process.env.NODE_ENV === "development") {
+              console.debug("[session-store] chat-event", {
+                session_id: sessionId,
+                event_type: event.type,
+                chat_session_id: state.chatSessionId,
+                is_chatting: state.isChatting,
+              });
+            }
+
+            const nextStatus: Session["status"] =
+              event.type === "wait"
+                ? "waiting"
+                : event.type === "done" || event.type === "error"
+                  ? "completed"
+                  : "running";
+            const nextSessions = updateSessionListStatus(
+              state.sessions,
+              sessionId,
+              nextStatus
+            );
+
             if (state.activeSessionId && state.activeSessionId !== sessionId) {
-              return {};
+              return nextSessions === state.sessions ? {} : { sessions: nextSessions };
             }
 
             const current =
@@ -654,6 +706,8 @@ export const useSessionStore = create<SessionStore>()(
                   } as Session);
 
             const next = applySSEToSession(current, event);
+            const shouldResetStreaming = state.chatSessionId === sessionId;
+
             if (event.type === "done") {
               shouldClearAbortAfterBind = true;
               return {
@@ -661,8 +715,10 @@ export const useSessionStore = create<SessionStore>()(
                   ...next,
                   status: "completed",
                 },
-                isChatting: false,
-                chatSessionId: null,
+                sessions: nextSessions,
+                ...(shouldResetStreaming
+                  ? { isChatting: false, chatSessionId: null }
+                  : {}),
               };
             }
 
@@ -673,8 +729,10 @@ export const useSessionStore = create<SessionStore>()(
                   ...next,
                   status: "waiting",
                 },
-                isChatting: false,
-                chatSessionId: null,
+                sessions: nextSessions,
+                ...(shouldResetStreaming
+                  ? { isChatting: false, chatSessionId: null }
+                  : {}),
               };
             }
 
@@ -685,8 +743,10 @@ export const useSessionStore = create<SessionStore>()(
                   ...next,
                   status: "completed",
                 },
-                isChatting: false,
-                chatSessionId: null,
+                sessions: nextSessions,
+                ...(shouldResetStreaming
+                  ? { isChatting: false, chatSessionId: null }
+                  : {}),
               };
             }
 
@@ -695,6 +755,7 @@ export const useSessionStore = create<SessionStore>()(
                 ...next,
                 status: "running",
               },
+              sessions: nextSessions,
             };
           });
         },
@@ -724,6 +785,16 @@ export const useSessionStore = create<SessionStore>()(
 
     stopSession: async (sessionId: string) => {
       await sessionApi.stopSession(sessionId);
+      if (get().chatSessionId === sessionId) {
+        get().stopChat();
+      }
+      set((state) => ({
+        sessions: updateSessionListStatus(state.sessions, sessionId, "completed"),
+        currentSession:
+          state.currentSession?.session_id === sessionId
+            ? { ...state.currentSession, status: "completed" }
+            : state.currentSession,
+      }));
       showMessage("success", "任务已停止");
     },
 

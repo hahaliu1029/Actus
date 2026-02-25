@@ -424,6 +424,7 @@ export default function SessionPage() {
   const downloadFile = useSessionStore((state) => state.downloadFile);
   const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
   const isChatting = useSessionStore((state) => state.isChatting);
+  const chatSessionId = useSessionStore((state) => state.chatSessionId);
   const setMessage = useUIStore((state) => state.setMessage);
   const isMobile = useIsMobile();
 
@@ -493,8 +494,11 @@ export default function SessionPage() {
     [eventList]
   );
   const workbenchVisible = (!isMobile && desktopWorkbenchVisible) || (isMobile && mobileWorkbenchOpen);
+  const isCurrentSessionStreaming = Boolean(sessionId) && isChatting && chatSessionId === sessionId;
   const sessionRunning =
-    isChatting || visibleSession?.status === "running" || visibleSession?.status === "waiting";
+    isCurrentSessionStreaming ||
+    visibleSession?.status === "running" ||
+    visibleSession?.status === "waiting";
 
   useEffect(() => {
     if (!sessionId || !sessionRunning) {
@@ -507,8 +511,8 @@ export default function SessionPage() {
         return;
       }
       // SSE 流已经实时推送事件，轮询 session 会导致状态交替抖动（闪烁），
-      // 因此 isChatting（SSE 活跃）期间只轮询文件列表
-      if (!isChatting) {
+      // 因此当前会话处于流式活跃期间只轮询文件列表
+      if (!isCurrentSessionStreaming) {
         void fetchSessionById(sessionId, { silent: true });
       }
       void fetchSessionFiles(sessionId, { silent: true });
@@ -521,10 +525,16 @@ export default function SessionPage() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [fetchSessionById, fetchSessionFiles, sessionId, sessionRunning, isChatting]);
+  }, [
+    fetchSessionById,
+    fetchSessionFiles,
+    sessionId,
+    sessionRunning,
+    isCurrentSessionStreaming,
+  ]);
 
   const streamingAssistantEventId = useMemo(() => {
-    if (!isChatting) {
+    if (!isCurrentSessionStreaming) {
       return null;
     }
     for (let index = eventList.length - 1; index >= 0; index -= 1) {
@@ -538,7 +548,7 @@ export default function SessionPage() {
       return getSessionEventStableKey(event, index);
     }
     return null;
-  }, [eventList, isChatting]);
+  }, [eventList, isCurrentSessionStreaming]);
 
   useEffect(() => {
     const node = eventScrollRef.current;
@@ -757,7 +767,7 @@ export default function SessionPage() {
                 )
               )
             )}
-            {isChatting ? (
+            {isCurrentSessionStreaming ? (
               <div className="mt-3 inline-flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
                 <Loader2 size={14} className="animate-spin" />
                 正在持续生成执行结果...

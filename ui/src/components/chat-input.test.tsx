@@ -8,6 +8,7 @@ type SessionStoreState = {
   sendChat: ReturnType<typeof vi.fn>;
   uploadFile: ReturnType<typeof vi.fn>;
   stopSession: ReturnType<typeof vi.fn>;
+  isSessionStreaming: ReturnType<typeof vi.fn>;
   isChatting: boolean;
   chatSessionId: string | null;
   currentSession: { session_id: string; status: string } | null;
@@ -21,6 +22,11 @@ const sessionStoreState: SessionStoreState = {
   sendChat: vi.fn(async () => {}),
   uploadFile: vi.fn(async () => ({ id: "f1", filename: "a.txt", size: 10 })),
   stopSession: vi.fn(async () => {}),
+  isSessionStreaming: vi.fn((sessionId: string) => {
+    return (
+      sessionStoreState.isChatting && sessionStoreState.chatSessionId === sessionId
+    );
+  }),
   isChatting: false,
   chatSessionId: null,
   currentSession: null,
@@ -55,6 +61,7 @@ describe("ChatInput", () => {
     sessionStoreState.sendChat.mockClear();
     sessionStoreState.uploadFile.mockClear();
     sessionStoreState.stopSession.mockClear();
+    sessionStoreState.isSessionStreaming.mockClear();
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;
     sessionStoreState.currentSession = null;
@@ -99,5 +106,21 @@ describe("ChatInput", () => {
     fireEvent.click(stopButton);
 
     expect(sessionStoreState.stopSession).toHaveBeenCalledWith("s-current");
+  });
+
+  it("currentSession 未对齐时，列表 running 不应禁用输入", () => {
+    sessionStoreState.sessions = [{ session_id: "s-current", status: "running" }];
+    sessionStoreState.currentSession = {
+      session_id: "s-other",
+      status: "completed",
+    };
+
+    render(<ChatInput sessionId="s-current" />);
+
+    const textarea = screen.getByPlaceholderText("分配一个任务或提问任何问题...");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+
+    const sendButton = screen.getByRole("button", { name: "发送" });
+    expect(sendButton).not.toBeDisabled();
   });
 });

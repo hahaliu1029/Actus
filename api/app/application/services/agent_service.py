@@ -196,6 +196,14 @@ class AgentService:
             # 2.获取对应会话任务
             task = await self._get_task(session)
 
+            logger.info(
+                "会话[%s] chat请求: message_present=%s task_exists=%s session_status=%s",
+                session_id,
+                bool(message),
+                task is not None,
+                session.status.value,
+            )
+
             # 3.判断是否传递了message
             if message:
                 # 4.判断会话的状态是什么,如果不是运行中则表示已完成或者空闲中
@@ -239,6 +247,16 @@ class AgentService:
                 logger.info(
                     f"往会话[{session_id}]输入消息队列写入消息: {message[:50]}..."
                 )
+            elif session.status == SessionStatus.RUNNING and task is None:
+                logger.warning(
+                    "会话[%s]状态自愈: status_reconciled=true from=running to=completed message_present=false task_exists=false",
+                    session_id,
+                )
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        session_id, SessionStatus.COMPLETED
+                    )
+                session = session.model_copy(update={"status": SessionStatus.COMPLETED})
 
             # 11.记录日志展示会话已启动
             logger.info(f"会话[{session_id}]已启动")

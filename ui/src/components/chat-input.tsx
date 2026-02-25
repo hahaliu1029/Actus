@@ -35,10 +35,8 @@ export function ChatInput({
   const sendChat = useSessionStore((state) => state.sendChat);
   const uploadFile = useSessionStore((state) => state.uploadFile);
   const stopSession = useSessionStore((state) => state.stopSession);
-  const isChatting = useSessionStore((state) => state.isChatting);
-  const chatSessionId = useSessionStore((state) => state.chatSessionId);
+  const isSessionStreaming = useSessionStore((state) => state.isSessionStreaming);
   const currentSession = useSessionStore((state) => state.currentSession);
-  const sessions = useSessionStore((state) => state.sessions);
   const setMessage = useUIStore((state) => state.setMessage);
 
   const [text, setText] = useState("");
@@ -142,10 +140,11 @@ export function ChatInput({
     if (currentSession?.session_id === sessionId) {
       return currentSession.status;
     }
-    return sessions.find((item) => item.session_id === sessionId)?.status ?? null;
-  }, [currentSession, sessionId, sessions]);
-  const isCurrentSessionStreaming =
-    Boolean(sessionId) && isChatting && chatSessionId === sessionId;
+    return null;
+  }, [currentSession, sessionId]);
+  const isCurrentSessionStreaming = sessionId
+    ? isSessionStreaming(sessionId)
+    : false;
   const isCurrentSessionRunning = sessionStatus === "running";
   const showStopAction = Boolean(sessionId) && (isCurrentSessionStreaming || isCurrentSessionRunning);
   const disableInput = uploading || showStopAction;
