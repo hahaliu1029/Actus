@@ -240,6 +240,11 @@ describe("session-ui", () => {
         total: 3,
         currentStep: "步骤2",
         hasPlan: true,
+        steps: [
+          { id: "s1", description: "步骤1", status: "completed" },
+          { id: "s2", description: "步骤2", status: "running" },
+          { id: "s3", description: "步骤3", status: "pending" },
+        ],
       });
     });
 
@@ -261,6 +266,10 @@ describe("session-ui", () => {
         total: 2,
         currentStep: "生成结果",
         hasPlan: true,
+        steps: [
+          { id: "s1", description: "准备数据", status: "completed" },
+          { id: "s2", description: "生成结果", status: "completed" },
+        ],
       });
     });
 
@@ -279,6 +288,45 @@ describe("session-ui", () => {
       ]);
 
       expect(summary?.currentStep).toBe("步骤2");
+      expect(summary?.steps[1]).toEqual({
+        id: "s2",
+        description: "步骤2",
+        status: "started",
+      });
+    });
+
+    it("步骤缺失 id/description 时使用兜底值", () => {
+      const summary = deriveSessionProgressSummary([
+        {
+          event: "plan",
+          data: {
+            steps: [{ status: "running" }],
+          },
+        },
+      ]);
+
+      expect(summary?.currentStep).toBe("未命名步骤");
+      expect(summary?.steps).toEqual([
+        {
+          id: "step-1",
+          description: "未命名步骤",
+          status: "running",
+        },
+      ]);
+    });
+
+    it("未知状态降级为 pending", () => {
+      const summary = deriveSessionProgressSummary([
+        {
+          event: "plan",
+          data: {
+            steps: [{ id: "s1", description: "步骤X", status: "UNKNOWN" }],
+          },
+        },
+      ]);
+
+      expect(summary?.steps[0]?.status).toBe("pending");
+      expect(summary?.currentStep).toBe("步骤X");
     });
   });
 

@@ -43,11 +43,25 @@ export type WorkbenchSnapshot = {
   consoleRecords: WorkbenchConsoleRecord[] | null;
 };
 
+export type SessionProgressStepStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "started";
+
+export type SessionProgressStep = {
+  id: string;
+  description: string;
+  status: SessionProgressStepStatus;
+};
+
 export type SessionProgressSummary = {
   completed: number;
   total: number;
   currentStep: string;
   hasPlan: boolean;
+  steps: SessionProgressStep[];
 };
 
 const TEXT_EXTENSIONS = new Set([
@@ -245,6 +259,22 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+const SESSION_PROGRESS_STEP_STATUS_SET = new Set<SessionProgressStepStatus>([
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "started",
+]);
+
+function normalizeSessionProgressStepStatus(value: unknown): SessionProgressStepStatus {
+  const status = asString(value).trim().toLowerCase();
+  if (SESSION_PROGRESS_STEP_STATUS_SET.has(status as SessionProgressStepStatus)) {
+    return status as SessionProgressStepStatus;
+  }
+  return "pending";
+}
+
 function normalizeFileInfoFromRecord(value: Record<string, unknown>): FileInfo | null {
   const id = asString(value.id).trim();
   if (!id) {
@@ -314,7 +344,7 @@ export function normalizeMessageAttachments(
 
 function getStepListFromPlanEvent(
   events: SessionEventLike[]
-): Array<{ status: string; description: string }> | null {
+): SessionProgressStep[] | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (!event || event.event !== "plan") {
@@ -324,11 +354,13 @@ function getStepListFromPlanEvent(
     if (!Array.isArray(rawSteps)) {
       return [];
     }
-    return rawSteps.map((item) => {
+    return rawSteps.map((item, itemIndex) => {
       const step = isRecord(item) ? item : {};
+      const description = asString(step.description).trim() || "未命名步骤";
       return {
-        status: asString(step.status).toLowerCase(),
-        description: asString(step.description),
+        id: asString(step.id).trim() || `step-${itemIndex + 1}`,
+        status: normalizeSessionProgressStepStatus(step.status),
+        description,
       };
     });
   }
@@ -336,7 +368,7 @@ function getStepListFromPlanEvent(
 }
 
 function pickCurrentStepDescription(
-  steps: Array<{ status: string; description: string }>
+  steps: SessionProgressStep[]
 ): string {
   const running =
     steps.find((step) => step.status === "running" || step.status === "started") ||
@@ -368,6 +400,7 @@ export function deriveSessionProgressSummary(
     total,
     currentStep: pickCurrentStepDescription(steps),
     hasPlan: true,
+    steps,
   };
 }
 

@@ -11,6 +11,11 @@ const summary: SessionProgressSummary = {
   total: 3,
   currentStep: "执行步骤2",
   hasPlan: true,
+  steps: [
+    { id: "s1", description: "执行步骤1", status: "completed" },
+    { id: "s2", description: "执行步骤2", status: "running" },
+    { id: "s3", description: "执行步骤3", status: "pending" },
+  ],
 };
 
 const files: FileInfo[] = [
@@ -84,6 +89,52 @@ describe("SessionTaskDock", () => {
     expect(fileButtons).toHaveLength(2);
     expect(fileButtons[0]).toHaveTextContent("new.txt");
     expect(fileButtons[1]).toHaveTextContent("old.txt");
+  });
+
+  it("进度页默认只显示当前步骤，并可展开全部步骤", () => {
+    render(
+      <SessionTaskDock
+        summary={summary}
+        files={files}
+        onPreviewFile={() => {}}
+        onDownloadFile={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+    expect(screen.getByText("当前步骤：执行步骤2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "展开全部步骤" })).toBeInTheDocument();
+    expect(screen.queryByText("执行步骤1")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "展开全部步骤" }));
+    expect(screen.getByText("执行步骤1")).toBeInTheDocument();
+    expect(screen.getAllByText("执行步骤2").length).toBeGreaterThan(1);
+    expect(screen.getByText("执行步骤3")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "收起全部步骤" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起全部步骤" }));
+    expect(screen.queryByText("执行步骤1")).not.toBeInTheDocument();
+  });
+
+  it("仅一个步骤时不显示展开全部入口", () => {
+    render(
+      <SessionTaskDock
+        summary={{
+          completed: 0,
+          total: 1,
+          currentStep: "单步骤",
+          hasPlan: true,
+          steps: [{ id: "s1", description: "单步骤", status: "pending" }],
+        }}
+        files={files}
+        onPreviewFile={() => {}}
+        onDownloadFile={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+    expect(screen.queryByRole("button", { name: "展开全部步骤" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "收起全部步骤" })).not.toBeInTheDocument();
   });
 
   it("文件项点击触发预览，下载按钮仅触发下载", () => {
