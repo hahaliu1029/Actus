@@ -63,3 +63,6 @@ api/config.yaml
 
 
 docs/
+
+# Git worktrees
+.worktrees/
