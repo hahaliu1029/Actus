@@ -266,12 +266,14 @@ export function ManusSettings() {
       return;
     }
 
+    const githubSourceRefPattern =
+      /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+(?:\/tree\/[^/\s]+(?:\/.+)?)?\/?$/;
     if (
       skillSourceType === "github" &&
-      !/^https:\/\/github\.com\/[^/]+\/[^/]+\/tree\/[^/]+\/.+/.test(trimmedSourceRef)
+      !githubSourceRefPattern.test(trimmedSourceRef)
     ) {
       setSkillDialogError(
-        "GitHub 来源请使用目录 URL，例如 https://github.com/owner/repo/tree/main/skills/pptx"
+        "GitHub 来源请填写仓库 URL 或目录 URL，例如 https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
       );
       return;
     }
@@ -1167,7 +1169,7 @@ export function ManusSettings() {
                                 placeholder={
                                   skillSourceType === "local"
                                     ? "/abs/path/to/skill or local:/abs/path/to/skill"
-                                    : "https://github.com/owner/repo/tree/main/skills/pptx"
+                                    : "https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
                                 }
                                 disabled={isInstallingSkill}
                                 className="mt-1"

@@ -12,7 +12,7 @@ class SkillInstallRequest(BaseModel):
     source_type: SkillSourceType = Field(..., description="来源类型")
     source_ref: str = Field(
         ...,
-        description="来源标识：github 使用 tree URL；local 使用绝对路径或 local:/abs/path",
+        description="来源标识：github 支持仓库根 URL 或 tree URL；local 使用绝对路径或 local:/abs/path",
     )
     manifest: Dict[str, Any] = Field(
         default_factory=dict,

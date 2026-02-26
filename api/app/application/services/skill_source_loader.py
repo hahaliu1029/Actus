@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Load Skill bundles from GitHub directory URLs or local directories."""
+"""Load Skill bundles from GitHub URLs or local directories."""
 
 import hashlib
 from dataclasses import dataclass
@@ -94,7 +94,7 @@ class SkillSourceLoader:
         )
 
     async def _load_from_github(self, source_ref: str) -> SkillBundle:
-        owner, repo, ref, base_path, normalized_ref = self._parse_github_tree_url(source_ref)
+        owner, repo, parsed_ref, base_path = self._parse_github_source_ref(source_ref)
         files: dict[str, SkillBundleFile] = {}
         total_size = 0
 
@@ -106,6 +106,11 @@ class SkillSourceLoader:
                 "User-Agent": "Actus-SkillSourceLoader/1.0",
             },
         ) as client:
+            ref = parsed_ref or await self._fetch_github_default_branch(
+                client=client,
+                owner=owner,
+                repo=repo,
+            )
             total_size = await self._fetch_github_dir(
                 client=client,
                 owner=owner,
@@ -118,11 +123,18 @@ class SkillSourceLoader:
             )
 
         if "SKILL.md" not in files:
+            if not base_path:
+                raise ValidationError(
+                    msg=(
+                        "GitHub 仓库根目录缺少 SKILL.md，请改用目录 tree URL，"
+                        "例如 https://github.com/owner/repo/tree/main/skills/pptx"
+                    )
+                )
             raise ValidationError(msg="GitHub Skill 目录中缺少 SKILL.md")
 
         skill_md = self._decode_utf8(files["SKILL.md"].content, "SKILL.md")
         return SkillBundle(
-            normalized_source_ref=normalized_ref,
+            normalized_source_ref=self._build_github_source_ref(owner, repo, ref, base_path),
             skill_md=skill_md,
             files=files,
         )
@@ -138,7 +150,10 @@ class SkillSourceLoader:
         files: dict[str, SkillBundleFile],
         total_size: int,
     ) -> int:
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{current_path}"
+        if current_path:
+            url = f"https://api.github.com/repos/{owner}/{repo}/contents/{current_path}"
+        else:
+            url = f"https://api.github.com/repos/{owner}/{repo}/contents"
         response = await client.get(url, params={"ref": ref})
 
         if response.status_code == 404:
@@ -177,7 +192,10 @@ class SkillSourceLoader:
             if item_type != "file":
                 continue
 
-            relative_path = item_path[len(base_path) :].lstrip("/")
+            if base_path and item_path.startswith(base_path):
+                relative_path = item_path[len(base_path) :].lstrip("/")
+            else:
+                relative_path = item_path
             normalized_path = self._normalize_relative_path(relative_path)
             if not normalized_path:
                 raise ValidationError(msg=f"检测到非法文件路径: {relative_path}")
@@ -208,34 +226,84 @@ class SkillSourceLoader:
         return total_size
 
     @staticmethod
-    def _parse_github_tree_url(source_ref: str) -> tuple[str, str, str, str, str]:
+    def _parse_github_source_ref(source_ref: str) -> tuple[str, str, str | None, str]:
         raw = (source_ref or "").strip()
         parsed = urlparse(raw)
 
         if parsed.scheme != "https" or parsed.netloc not in {"github.com", "www.github.com"}:
             raise ValidationError(
-                msg="github source_ref 必须是 GitHub tree URL，例如 https://github.com/owner/repo/tree/main/skills/pptx"
+                msg=(
+                    "github source_ref 必须是 GitHub URL，例如 "
+                    "https://github.com/owner/repo 或 "
+                    "https://github.com/owner/repo/tree/main/skills/pptx"
+                )
             )
 
         segments = [item for item in parsed.path.split("/") if item]
-        if len(segments) < 5 or segments[2] != "tree":
-            raise ValidationError(msg="github source_ref 必须为 /owner/repo/tree/{ref}/{path} 形式")
+        if len(segments) < 2:
+            raise ValidationError(
+                msg="github source_ref 必须为 /owner/repo 或 /owner/repo/tree/{ref}/{path?} 形式"
+            )
 
         owner = segments[0]
         repo = segments[1]
-        ref = segments[3]
+        if not owner or not repo:
+            raise ValidationError(msg="github source_ref 缺少 owner/repo 信息")
+
+        if len(segments) == 2:
+            return owner, repo, None, ""
+
+        if segments[2] != "tree":
+            raise ValidationError(
+                msg="github source_ref 必须为 /owner/repo 或 /owner/repo/tree/{ref}/{path?} 形式"
+            )
+
+        if len(segments) < 4:
+            raise ValidationError(msg="github source_ref 缺少 ref 信息")
+
+        ref = segments[3].strip()
+        if not ref:
+            raise ValidationError(msg="github source_ref 缺少 ref 信息")
+
         directory_path = "/".join(segments[4:])
-        if not owner or not repo or not ref or not directory_path:
-            raise ValidationError(msg="github source_ref 缺少 owner/repo/ref/path 信息")
+        if not directory_path:
+            return owner, repo, ref, ""
 
         normalized_path = SkillSourceLoader._normalize_relative_path(directory_path)
         if not normalized_path:
             raise ValidationError(msg="github source_ref 中 path 非法")
 
-        normalized_source_ref = (
-            f"https://github.com/{owner}/{repo}/tree/{ref}/{normalized_path}"
-        )
-        return owner, repo, ref, normalized_path, normalized_source_ref
+        return owner, repo, ref, normalized_path
+
+    @staticmethod
+    def _build_github_source_ref(owner: str, repo: str, ref: str, path: str) -> str:
+        normalized_source_ref = f"https://github.com/{owner}/{repo}/tree/{ref}"
+        if path:
+            normalized_source_ref = (
+                f"https://github.com/{owner}/{repo}/tree/{ref}/{path}"
+            )
+        return normalized_source_ref
+
+    @staticmethod
+    async def _fetch_github_default_branch(
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+    ) -> str:
+        response = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
+        if response.status_code == 404:
+            raise ValidationError(msg=f"GitHub 仓库不存在或无权限: {owner}/{repo}")
+        if response.status_code >= 400:
+            raise ValidationError(msg=f"GitHub 仓库读取失败[{response.status_code}]")
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValidationError(msg="GitHub 仓库信息响应格式非法")
+
+        default_branch = str(payload.get("default_branch") or "").strip()
+        if not default_branch:
+            raise ValidationError(msg=f"GitHub 仓库默认分支缺失: {owner}/{repo}")
+        return default_branch
 
     @staticmethod
     def _normalize_relative_path(path: str) -> str:

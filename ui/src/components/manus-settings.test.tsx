@@ -146,13 +146,21 @@ async function openLLMTab() {
   await user.click(screen.getByRole("button", { name: "模型提供商" }));
 }
 
+async function openSkillInstallDialog() {
+  const user = userEvent.setup();
+  await openSkillTab();
+  await user.click(screen.getByRole("button", { name: "安装 Skill" }));
+}
+
 describe("ManusSettings - Skill risk policy", () => {
   beforeEach(() => {
     mockIsAdmin.mockReturnValue(true);
     settingsState.skillRiskPolicy = { mode: "off" };
     settingsState.isSkillRiskPolicyLoading = false;
     settingsState.isSkillRiskPolicyUpdating = false;
+    settingsState.isInstallingSkill = false;
     settingsState.updateSkillRiskPolicy.mockClear();
+    settingsState.installSkill.mockClear();
     settingsState.loadAll.mockClear();
   });
 
@@ -209,5 +217,52 @@ describe("ManusSettings - Skill risk policy", () => {
         context_window: 131072,
       })
     );
+  });
+
+  it("Skill 安装允许 GitHub 仓库根 URL", async () => {
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+
+    await openSkillInstallDialog();
+    await user.selectOptions(screen.getByLabelText("来源类型"), "github");
+
+    const sourceInput = screen.getByLabelText("来源标识");
+    await user.clear(sourceInput);
+    await user.type(sourceInput, "https://github.com/owner/repo");
+
+    await user.click(screen.getByRole("button", { name: "安装" }));
+
+    expect(settingsState.installSkill).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source_type: "github",
+        source_ref: "https://github.com/owner/repo",
+      })
+    );
+    expect(
+      screen.queryByText(
+        "GitHub 来源请填写仓库 URL 或目录 URL，例如 https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
+      )
+    ).not.toBeInTheDocument();
+  });
+
+  it("Skill 安装在 GitHub URL 非法时前端拦截", async () => {
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+
+    await openSkillInstallDialog();
+    await user.selectOptions(screen.getByLabelText("来源类型"), "github");
+
+    const sourceInput = screen.getByLabelText("来源标识");
+    await user.clear(sourceInput);
+    await user.type(sourceInput, "https://example.com/owner/repo");
+
+    await user.click(screen.getByRole("button", { name: "安装" }));
+
+    expect(settingsState.installSkill).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(
+        "GitHub 来源请填写仓库 URL 或目录 URL，例如 https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
+      )
+    ).toBeInTheDocument();
   });
 });
