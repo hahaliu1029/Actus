@@ -3,6 +3,10 @@ from typing import AsyncGenerator
 
 from app.domain.models.event import (
     BaseEvent,
+    ControlAction,
+    ControlEvent,
+    ControlScope,
+    ControlSource,
     ErrorEvent,
     MessageEvent,
     StepEvent,
@@ -64,8 +68,26 @@ class ReActAgent(BaseAgent):
                             message=event.function_args.get("text", ""),
                         )
                     elif event.status == ToolEventStatus.CALLED:
-                        # 7.如果工具事件为已调用，则需要返回等待事件并中断程序
-                        yield WaitEvent()
+                        # 7.根据接管建议分流：none 走等待，shell/browser 走控制请求
+                        suggest_takeover = str(
+                            event.function_args.get("suggest_user_takeover", "none")
+                        ).strip().lower()
+                        if suggest_takeover in {
+                            ControlScope.SHELL.value,
+                            ControlScope.BROWSER.value,
+                        }:
+                            yield ControlEvent(
+                                action=ControlAction.REQUESTED,
+                                scope=ControlScope(suggest_takeover),
+                                source=ControlSource.AGENT,
+                            )
+                        else:
+                            if suggest_takeover not in {"", "none"}:
+                                logger.warning(
+                                    "ReActAgent检测到非法suggest_user_takeover值，降级为WaitEvent: %r",
+                                    suggest_takeover,
+                                )
+                            yield WaitEvent()
                         return
                     continue
             elif isinstance(event, MessageEvent):

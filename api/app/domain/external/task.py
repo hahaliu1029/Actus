@@ -30,8 +30,13 @@ class Task(Protocol):
         """运行当前任务"""
         ...
 
-    def cancel(self) -> bool:
+    def cancel(self, reason: str = "stop") -> bool:
         """取消当前任务"""
+        ...
+
+    @property
+    def cancel_reason(self) -> str:
+        """返回任务最近一次取消原因"""
         ...
 
     @property

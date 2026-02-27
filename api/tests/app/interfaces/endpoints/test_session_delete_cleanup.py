@@ -62,9 +62,11 @@ class _FakeSandbox:
 class _FakeTask:
     def __init__(self) -> None:
         self.cancel_called = False
+        self.cancel_reason: str | None = None
 
-    def cancel(self) -> bool:
+    def cancel(self, reason: str = "stop") -> bool:
         self.cancel_called = True
+        self.cancel_reason = reason
         return True
 
 
@@ -109,6 +111,7 @@ def test_delete_session_cleans_related_task_and_sandbox() -> None:
     asyncio.run(service.delete_session("s-delete-1", user_id="owner", is_admin=False))
 
     assert task.cancel_called is True
+    assert task.cancel_reason == "session_delete"
     assert sandbox.destroy_called is True
     assert repo.deleted_ids == ["s-delete-1"]
 

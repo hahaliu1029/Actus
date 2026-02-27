@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     skill_backend: str = "filesystem"
     skill_blocked_command_patterns: str = "rm -rf,:(){,mkfs.,shutdown,reboot"
 
+    # Session 接管配置
+    feature_takeover_enabled: bool = True
+    feature_takeover_browser_enabled: bool = True
+    feature_takeover_allowed_roles: str = "super_admin,user"
+    feature_takeover_user_whitelist: str = ""
+    feature_takeover_single_worker_only: bool = True
+    feature_takeover_pending_ttl_seconds: int = 300
+    feature_takeover_lease_ttl_seconds: int = 900
+
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"
     jwt_algorithm: str = "HS256"

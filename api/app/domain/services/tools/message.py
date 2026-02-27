@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from app.domain.models.tool_result import ToolResult
 
@@ -46,8 +46,8 @@ class MessageTool(BaseTool):
             },
             "suggest_user_takeover": {
                 "type": "string",
-                "enum": ["none", "browser"],
-                "description": "(可选)建议用户接管的操作（例如由用户在浏览器中手动完成某些事）。",
+                "enum": ["none", "shell", "browser"],
+                "description": "(可选)建议用户接管的操作，可选择终端或浏览器。",
             },
         },
         required=["text"],
@@ -56,7 +56,7 @@ class MessageTool(BaseTool):
         self,
         text: str,
         attachments: Optional[Union[str, List[str]]] = None,
-        suggest_user_takeover: Optional[str] = None,
+        suggest_user_takeover: Optional[Literal["none", "shell", "browser"]] = None,
     ) -> ToolResult:
         """提问用户并等待响应"""
         return ToolResult(success=True)

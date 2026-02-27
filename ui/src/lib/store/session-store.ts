@@ -81,6 +81,71 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function asString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function resolveControlStatus(
+  currentStatus: Session["status"],
+  data: Record<string, unknown>
+): Session["status"] {
+  const action = asString(data.action).trim().toLowerCase();
+  const reason = asString(data.reason).trim().toLowerCase();
+  const handoffMode = asString(data.handoff_mode).trim().toLowerCase();
+
+  if (action === "requested") {
+    return "takeover_pending";
+  }
+  if (action === "started" || action === "renewed") {
+    return "takeover";
+  }
+  if (action === "rejected") {
+    if (reason === "terminate") {
+      return "completed";
+    }
+    if (reason === "continue" || reason === "cancel_timeout") {
+      return "running";
+    }
+    return currentStatus;
+  }
+  if (action === "ended") {
+    return handoffMode === "continue" ? "running" : "completed";
+  }
+  if (action === "expired") {
+    if (reason === "takeover_timeout") {
+      return "takeover_pending";
+    }
+    if (reason === "pending_timeout") {
+      return "completed";
+    }
+    return currentStatus;
+  }
+  if (action && process.env.NODE_ENV !== "production") {
+    console.warn("[session-store] 未识别的 control action，保持当前状态", {
+      action,
+      data,
+      currentStatus,
+    });
+  }
+  return currentStatus;
+}
+
+function resolveStatusFromEvent(
+  currentStatus: Session["status"],
+  event: SSEEventData
+): Session["status"] {
+  if (event.type === "wait") {
+    return "waiting";
+  }
+  if (event.type === "done" || event.type === "error") {
+    return "completed";
+  }
+  if (event.type === "control") {
+    return resolveControlStatus(currentStatus, asRecord(event.data));
+  }
+  return "running";
+}
+
 function applySSEToSession(session: Session, event: SSEEventData): Session {
   if (event.type === "done") {
     return session;
@@ -679,12 +744,17 @@ export const useSessionStore = create<SessionStore>()(
               });
             }
 
-            const nextStatus: Session["status"] =
-              event.type === "wait"
-                ? "waiting"
-                : event.type === "done" || event.type === "error"
-                  ? "completed"
-                  : "running";
+            const current =
+              state.currentSession && state.currentSession.session_id === sessionId
+                ? state.currentSession
+                : ({
+                    session_id: sessionId,
+                    title: null,
+                    status: "running",
+                    events: [],
+                  } as Session);
+            const currentStatus = current.status || "running";
+            const nextStatus = resolveStatusFromEvent(currentStatus, event);
             const nextSessions = updateSessionListStatus(
               state.sessions,
               sessionId,
@@ -695,53 +765,20 @@ export const useSessionStore = create<SessionStore>()(
               return nextSessions === state.sessions ? {} : { sessions: nextSessions };
             }
 
-            const current =
-              state.currentSession && state.currentSession.session_id === sessionId
-                ? state.currentSession
-                : ({
-                    session_id: sessionId,
-                    title: null,
-                    status: "running",
-                    events: [],
-                  } as Session);
-
             const next = applySSEToSession(current, event);
             const shouldResetStreaming = state.chatSessionId === sessionId;
 
-            if (event.type === "done") {
+            if (
+              event.type === "done" ||
+              event.type === "wait" ||
+              event.type === "error" ||
+              event.type === "control"
+            ) {
               shouldClearAbortAfterBind = true;
               return {
                 currentSession: {
                   ...next,
-                  status: "completed",
-                },
-                sessions: nextSessions,
-                ...(shouldResetStreaming
-                  ? { isChatting: false, chatSessionId: null }
-                  : {}),
-              };
-            }
-
-            if (event.type === "wait") {
-              shouldClearAbortAfterBind = true;
-              return {
-                currentSession: {
-                  ...next,
-                  status: "waiting",
-                },
-                sessions: nextSessions,
-                ...(shouldResetStreaming
-                  ? { isChatting: false, chatSessionId: null }
-                  : {}),
-              };
-            }
-
-            if (event.type === "error") {
-              shouldClearAbortAfterBind = true;
-              return {
-                currentSession: {
-                  ...next,
-                  status: "completed",
+                  status: nextStatus,
                 },
                 sessions: nextSessions,
                 ...(shouldResetStreaming

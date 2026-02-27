@@ -91,7 +91,7 @@ class SessionService:
             if not task:
                 logger.info(f"会话任务[{task_id}]不存在或已结束，无需清理")
                 return
-            task.cancel()
+            task.cancel(reason="session_delete")
             logger.info(f"会话任务[{task_id}]已取消")
         except Exception as e:
             logger.warning(f"清理会话任务[{task_id}]失败: {e}")

@@ -40,6 +40,13 @@ class ForbiddenError(AppException):
         super().__init__(code=403, status_code=403, msg=msg)
 
 
+class ConflictError(AppException):
+    """资源冲突异常"""
+
+    def __init__(self, msg: str = "资源状态冲突"):
+        super().__init__(code=409, status_code=409, msg=msg)
+
+
 class ValidationError(AppException):
     """数据验证错误异常"""
 

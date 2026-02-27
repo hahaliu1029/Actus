@@ -24,18 +24,27 @@ from app.interfaces.schemas.event import EventMapper
 from app.interfaces.schemas.session import (
     ChatRequest,
     CreateSessionResponse,
+    EndTakeoverRequest,
+    EndTakeoverResponse,
     FileReadRequest,
     FileReadResponse,
+    GetTakeoverResponse,
     GetSessionFilesResponse,
     GetSessionResponse,
     ListSessionItem,
     ListSessionResponse,
+    RejectTakeoverRequest,
+    RejectTakeoverResponse,
+    RenewTakeoverRequest,
+    RenewTakeoverResponse,
     ShellReadRequest,
     ShellReadResponse,
+    StartTakeoverRequest,
+    StartTakeoverResponse,
 )
 from app.interfaces.service_dependencies import get_agent_service, get_session_service
 from app.infrastructure.storage.redis import RedisClient, get_redis
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response as FastAPIResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets import ConnectionClosed
@@ -277,6 +286,142 @@ async def get_session(
             status=session.status,
             events=EventMapper.events_to_sse_events(session.events),
         ),
+    )
+
+
+@router.get(
+    path="/{session_id}/takeover",
+    response_model=Response[GetTakeoverResponse],
+    summary="获取指定会话接管状态",
+    description="根据会话ID获取当前会话接管状态",
+    dependencies=[Depends(rate_limit_read)],
+)
+async def get_takeover(
+    session_id: str,
+    current_user: CurrentUser,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[GetTakeoverResponse]:
+    """获取指定会话接管状态"""
+    result = await agent_service.get_takeover(
+        session_id=session_id,
+        user_id=current_user.id,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    return Response.success(
+        msg="获取会话接管状态成功",
+        data=GetTakeoverResponse.model_validate(result),
+    )
+
+
+@router.post(
+    path="/{session_id}/takeover/start",
+    response_model=Response[StartTakeoverResponse],
+    summary="启动指定会话接管",
+    description="用户主动接管指定会话控制权",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def start_takeover(
+    session_id: str,
+    request: StartTakeoverRequest,
+    current_user: CurrentUser,
+    http_response: FastAPIResponse,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[StartTakeoverResponse]:
+    """启动指定会话接管"""
+    result = await agent_service.start_takeover(
+        session_id=session_id,
+        user_id=current_user.id,
+        scope=request.scope,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    if result.get("request_status") == "starting":
+        http_response.status_code = 202
+    return Response.success(
+        msg="启动会话接管成功",
+        data=StartTakeoverResponse.model_validate(result),
+    )
+
+
+@router.post(
+    path="/{session_id}/takeover/renew",
+    response_model=Response[RenewTakeoverResponse],
+    summary="续期指定会话接管",
+    description="续期当前会话的接管租约",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def renew_takeover(
+    session_id: str,
+    request: RenewTakeoverRequest,
+    current_user: CurrentUser,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[RenewTakeoverResponse]:
+    """续期指定会话接管"""
+    result = await agent_service.renew_takeover(
+        session_id=session_id,
+        user_id=current_user.id,
+        takeover_id=request.takeover_id,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    return Response.success(
+        msg="续期会话接管成功",
+        data=RenewTakeoverResponse.model_validate(result),
+    )
+
+
+@router.post(
+    path="/{session_id}/takeover/reject",
+    response_model=Response[RejectTakeoverResponse],
+    summary="处理指定会话接管请求",
+    description="处理AI发起的接管请求，可继续或终止",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def reject_takeover(
+    session_id: str,
+    request: RejectTakeoverRequest,
+    current_user: CurrentUser,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[RejectTakeoverResponse]:
+    """处理指定会话接管请求"""
+    result = await agent_service.reject_takeover(
+        session_id=session_id,
+        user_id=current_user.id,
+        decision=request.decision,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    return Response.success(
+        msg="处理接管请求成功",
+        data=RejectTakeoverResponse.model_validate(result),
+    )
+
+
+@router.post(
+    path="/{session_id}/takeover/end",
+    response_model=Response[EndTakeoverResponse],
+    summary="结束指定会话接管",
+    description="结束用户接管并选择继续执行或直接完成",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def end_takeover(
+    session_id: str,
+    request: EndTakeoverRequest,
+    current_user: CurrentUser,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[EndTakeoverResponse]:
+    """结束指定会话接管"""
+    result = await agent_service.end_takeover(
+        session_id=session_id,
+        user_id=current_user.id,
+        handoff_mode=request.handoff_mode,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    return Response.success(
+        msg="结束会话接管成功",
+        data=EndTakeoverResponse.model_validate(result),
     )
 
 

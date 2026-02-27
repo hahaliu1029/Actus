@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .file import File
 from .plan import Plan, Step
@@ -32,6 +32,32 @@ class ToolEventStatus(str, Enum):
 
     CALLING = "calling"  # 调用中
     CALLED = "called"  # 调用完毕
+
+
+class ControlAction(str, Enum):
+    """接管控制事件动作"""
+
+    REQUESTED = "requested"
+    STARTED = "started"
+    REJECTED = "rejected"
+    RENEWED = "renewed"
+    EXPIRED = "expired"
+    ENDED = "ended"
+
+
+class ControlScope(str, Enum):
+    """接管范围"""
+
+    SHELL = "shell"
+    BROWSER = "browser"
+
+
+class ControlSource(str, Enum):
+    """接管事件来源"""
+
+    AGENT = "agent"
+    USER = "user"
+    SYSTEM = "system"
 
 
 class BaseEvent(BaseModel):
@@ -69,7 +95,7 @@ class MessageEvent(BaseEvent):
     """消息事件，包含人类消息和AI消息"""
 
     type: Literal["message"] = "message"
-    role: Literal["user", "assistant"] = "assistant"  # 消息角色
+    role: Literal["user", "assistant", "system"] = "assistant"  # 消息角色
     message: str = ""  # 消息本身
     stream_id: Optional[str] = None  # 同一条消息流式更新id
     partial: bool = False  # 是否为流式中间片段
@@ -148,6 +174,26 @@ class WaitEvent(BaseEvent):
     type: Literal["wait"] = "wait"
 
 
+class ControlEvent(BaseEvent):
+    """接管控制事件"""
+
+    type: Literal["control"] = "control"
+    action: ControlAction
+    scope: Optional[ControlScope] = None
+    source: ControlSource = ControlSource.SYSTEM
+    reason: Optional[str] = None
+    handoff_mode: Optional[str] = None
+    request_status: Optional[str] = None
+    takeover_id: Optional[str] = None
+    expires_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def _validate_requested_scope(self) -> "ControlEvent":
+        if self.action == ControlAction.REQUESTED and self.scope is None:
+            raise ValueError("control.requested 事件必须提供 scope")
+        return self
+
+
 class ErrorEvent(BaseEvent):
     """错误事件"""
 
@@ -170,6 +216,7 @@ Event = Annotated[
         MessageEvent,
         ToolEvent,
         WaitEvent,
+        ControlEvent,
         ErrorEvent,
         DoneEvent,
     ],

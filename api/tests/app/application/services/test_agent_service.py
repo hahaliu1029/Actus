@@ -2,6 +2,7 @@ import asyncio
 from typing import Optional
 
 import pytest
+from app.application.errors.exceptions import BadRequestError
 from app.application.services.agent_service import AgentService
 from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.session import Session, SessionStatus
@@ -212,3 +213,54 @@ async def test_chat_with_message_yields_user_message_event_immediately(monkeypat
     assert first_event.type == "message"
     assert first_event.role == "user"
     assert first_event.message == "hello"
+
+
+@pytest.mark.parametrize(
+    "session_status",
+    [SessionStatus.TAKEOVER_PENDING, SessionStatus.TAKEOVER],
+)
+async def test_chat_with_message_forbidden_in_takeover_states(
+    monkeypatch,
+    session_status: SessionStatus,
+) -> None:
+    service = AgentService(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(),
+        a2a_config=A2AConfig(),
+        sandbox_cls=object,
+        task_cls=_DummyTaskClass,
+        json_parser=object(),
+        search_engine=object(),
+        file_storage=object(),
+    )
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return Session(id="session-1", user_id="user-1", status=session_status)
+
+    async def fake_check_attachments_access(*args, **kwargs) -> None:
+        return None
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    async def fake_safe_update_unread_count(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_check_attachments_access", fake_check_attachments_access)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+    monkeypatch.setattr(service, "_safe_update_unread_count", fake_safe_update_unread_count)
+
+    chat_gen = service.chat(
+        session_id="session-1",
+        user_id="user-1",
+        message="hello",
+        attachments=None,
+        latest_event_id=None,
+        timestamp=None,
+    )
+
+    with pytest.raises(BadRequestError):
+        await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)

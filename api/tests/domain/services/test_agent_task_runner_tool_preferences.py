@@ -10,7 +10,15 @@ from app.domain.models.app_config import (
     MCPTransport,
 )
 from app.domain.models.context_overflow_config import ContextOverflowConfig
-from app.domain.models.event import MessageEvent
+from app.domain.models.event import (
+    ControlAction,
+    ControlEvent,
+    ControlScope,
+    ControlSource,
+    MessageEvent,
+    WaitEvent,
+)
+from app.domain.models.session import SessionStatus
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.user_tool_preference import ToolType
 from app.domain.services.agent_task_runner import AgentTaskRunner
@@ -88,6 +96,34 @@ class _CapturingFlow:
     async def invoke(self, message):
         if False:
             yield message
+
+
+class _ControlRequestedFlow:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.skill_contexts: list[str] = []
+
+    def set_skill_context(self, skill_context: str) -> None:
+        self.skill_contexts.append(skill_context)
+
+    async def invoke(self, message):
+        yield ControlEvent(
+            action=ControlAction.REQUESTED,
+            scope=ControlScope.SHELL,
+            source=ControlSource.AGENT,
+        )
+
+
+class _WaitFlow:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.skill_contexts: list[str] = []
+
+    def set_skill_context(self, skill_context: str) -> None:
+        self.skill_contexts.append(skill_context)
+
+    async def invoke(self, message):
+        yield WaitEvent()
 
 
 class _EmptyInputStream:
@@ -224,6 +260,90 @@ def _build_skill(skill_id: str, *, name: str) -> Skill:
         manifest={"runtime_type": "native", "tools": []},
         enabled=True,
     )
+
+
+async def test_invoke_wait_event_sets_waiting_status(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _WaitFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-wait",
+        user_id="user-wait",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+    runner._mcp_tool = _FakeMCPTool()
+    runner._a2a_tool = _FakeA2ATool()
+    runner._skill_tool = _FakeSkillTool()
+    runner._skill_bundle_sync = _FakeSkillBundleSync()
+
+    async def fake_load_user_preferences_map(tool_type: ToolType) -> dict[str, bool]:
+        return {}
+
+    async def fake_load_enabled_skills() -> list[Skill]:
+        return []
+
+    monkeypatch.setattr(runner, "_load_user_preferences_map", fake_load_user_preferences_map)
+    monkeypatch.setattr(runner, "_load_enabled_skills", fake_load_enabled_skills)
+
+    await runner.invoke(_DummyMessageTask("please wait"))
+
+    assert runner._uow.session.status_updates == [
+        ("session-wait", SessionStatus.RUNNING),
+        ("session-wait", SessionStatus.WAITING),
+    ]
+
+
+async def test_invoke_control_requested_sets_takeover_pending_status(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _ControlRequestedFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-control",
+        user_id="user-control",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+    runner._mcp_tool = _FakeMCPTool()
+    runner._a2a_tool = _FakeA2ATool()
+    runner._skill_tool = _FakeSkillTool()
+    runner._skill_bundle_sync = _FakeSkillBundleSync()
+
+    async def fake_load_user_preferences_map(tool_type: ToolType) -> dict[str, bool]:
+        return {}
+
+    async def fake_load_enabled_skills() -> list[Skill]:
+        return []
+
+    monkeypatch.setattr(runner, "_load_user_preferences_map", fake_load_user_preferences_map)
+    monkeypatch.setattr(runner, "_load_enabled_skills", fake_load_enabled_skills)
+
+    await runner.invoke(_DummyMessageTask("please takeover"))
+
+    assert runner._uow.session.status_updates == [
+        ("session-control", SessionStatus.RUNNING),
+        ("session-control", SessionStatus.TAKEOVER_PENDING),
+    ]
 
 
 async def test_invoke_applies_user_preferences_before_tool_initialization(

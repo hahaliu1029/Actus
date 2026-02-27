@@ -23,6 +23,7 @@ class RedisStreamTask(Task):
         self._task_runner = task_runner
         self._id = str(uuid.uuid4())
         self._execution_task: Optional[asyncio.Task] = None  # 定义在后台执行的任务
+        self._cancel_reason: str = "stop"
 
         input_stream_name = f"task:input:{self._id}"
         output_stream_name = f"task:output:{self._id}"
@@ -66,12 +67,17 @@ class RedisStreamTask(Task):
             self._execution_task = asyncio.create_task(self._execute_task())
             logger.info(f"任务[{self._id}]开始执行")
 
-    def cancel(self) -> bool:
+    def cancel(self, reason: str = "stop") -> bool:
         """取消当前执行的任务"""
+        self._cancel_reason = reason or "stop"
         if not self.done:
             # 1.取消任务
             self._execution_task.cancel()
-            logger.info(f"任务[{self._id}]已取消")
+            logger.info(
+                "任务[%s]已取消，reason=%s",
+                self._id,
+                self._cancel_reason,
+            )
 
             # 2.清除注册的当前任务
             self._cleanup_registry()
@@ -80,6 +86,10 @@ class RedisStreamTask(Task):
         # 3.否则代表任务已结束，无需重复取消
         self._cleanup_registry()
         return True
+
+    @property
+    def cancel_reason(self) -> str:
+        return self._cancel_reason
 
     @property
     def input_stream(self) -> MessageQueue:

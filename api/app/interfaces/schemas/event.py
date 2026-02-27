@@ -3,6 +3,10 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Self, Type, Union, get_args
 
 from app.domain.models.event import (
+    ControlAction,
+    ControlEvent,
+    ControlScope,
+    ControlSource,
     Event,
     PlanEvent,
     StepEvent,
@@ -80,7 +84,7 @@ class CommonSSEEvent(BaseSSEEvent):
 class MessageEventData(BaseEventData):
     """消息事件数据"""
 
-    role: Literal["user", "assistant"] = "assistant"
+    role: Literal["user", "assistant", "system"] = "assistant"
     message: str = ""
     stream_id: Optional[str] = None
     partial: bool = False
@@ -220,6 +224,45 @@ class WaitSSEEvent(BaseSSEEvent):
     event: Literal["wait"] = "wait"
 
 
+class ControlEventData(BaseEventData):
+    """接管控制事件数据"""
+
+    action: ControlAction
+    scope: Optional[ControlScope] = None
+    source: ControlSource
+    reason: Optional[str] = None
+    handoff_mode: Optional[str] = None
+    request_status: Optional[str] = None
+    takeover_id: Optional[str] = None
+    expires_at: Optional[int] = None
+
+
+class ControlSSEEvent(BaseSSEEvent):
+    """接管控制流式事件"""
+
+    event: Literal["control"] = "control"
+    data: ControlEventData
+
+    @classmethod
+    def from_event(cls, event: ControlEvent) -> Self:
+        expires_at = (
+            int(event.expires_at.timestamp()) if event.expires_at is not None else None
+        )
+        return cls(
+            data=ControlEventData(
+                **BaseEventData.base_event_data(event),
+                action=event.action,
+                scope=event.scope,
+                source=event.source,
+                reason=event.reason,
+                handoff_mode=event.handoff_mode,
+                request_status=event.request_status,
+                takeover_id=event.takeover_id,
+                expires_at=expires_at,
+            )
+        )
+
+
 class ErrorEventData(BaseEventData):
     """错误事件数据"""
 
@@ -244,6 +287,7 @@ AgentSSEEvent = Union[
     DoneSSEEvent,
     ErrorSSEEvent,
     WaitSSEEvent,
+    ControlSSEEvent,
 ]
 
 

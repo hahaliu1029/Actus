@@ -370,6 +370,28 @@ describe("session-store", () => {
     });
   });
 
+  it("fetchSessionById 对 takeover 会话不应自动续流", async () => {
+    mockedSessionApi.getSession.mockResolvedValue(
+      buildSession({
+        session_id: "s-takeover",
+        status: "takeover",
+        events: [
+          {
+            event: "control",
+            data: {
+              event_id: "evt-control",
+              action: "started",
+            },
+          },
+        ],
+      })
+    );
+
+    await useSessionStore.getState().fetchSessionById("s-takeover");
+
+    expect(mockedSessionApi.chat).not.toHaveBeenCalled();
+  });
+
   it("sendChat 收到 wait 事件后应结束流并将状态置为 waiting", async () => {
     mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent, _onError, onClose) => {
       onEvent({
@@ -389,6 +411,79 @@ describe("session-store", () => {
     expect(state.isChatting).toBe(false);
     expect(state.chatAbort).toBeNull();
     expect(state.currentSession?.status).toBe("waiting");
+  });
+
+  it("sendChat 收到 control.started 事件后应进入 takeover 状态并结束流", async () => {
+    mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent, _onError, onClose) => {
+      onEvent({
+        type: "control",
+        data: {
+          event_id: "evt-control-start",
+          created_at: Math.floor(Date.now() / 1000),
+          action: "started",
+          source: "system",
+          request_status: "started",
+          takeover_id: "tk_001",
+        },
+      });
+      onClose?.();
+      return () => {};
+    });
+
+    await useSessionStore.getState().sendChat("s-control-start", { message: "接管" });
+
+    const state = useSessionStore.getState();
+    expect(state.isChatting).toBe(false);
+    expect(state.chatAbort).toBeNull();
+    expect(state.currentSession?.status).toBe("takeover");
+  });
+
+  it("sendChat 收到 control.rejected(cancel_timeout) 事件后应回到 running 状态", async () => {
+    mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent, _onError, onClose) => {
+      onEvent({
+        type: "control",
+        data: {
+          event_id: "evt-control-rejected",
+          created_at: Math.floor(Date.now() / 1000),
+          action: "rejected",
+          source: "system",
+          reason: "cancel_timeout",
+          request_status: "rejected",
+          takeover_id: "tk_002",
+        },
+      });
+      onClose?.();
+      return () => {};
+    });
+
+    await useSessionStore.getState().sendChat("s-control-rejected", { message: "接管" });
+
+    const state = useSessionStore.getState();
+    expect(state.currentSession?.status).toBe("running");
+  });
+
+  it("sendChat 收到未知 control.action 时应保持状态并输出告警", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent, _onError, onClose) => {
+      onEvent({
+        type: "control",
+        data: {
+          event_id: "evt-control-unknown",
+          created_at: Math.floor(Date.now() / 1000),
+          action: "unknown_action",
+          source: "system",
+        },
+      });
+      onClose?.();
+      return () => {};
+    });
+
+    await useSessionStore.getState().sendChat("s-control-unknown", { message: "接管" });
+
+    const state = useSessionStore.getState();
+    expect(state.currentSession?.status).toBe("running");
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it("sendChat 终态事件应同步更新 sessions 列表状态", async () => {

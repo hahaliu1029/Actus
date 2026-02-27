@@ -32,6 +32,8 @@ from app.domain.models.event import (
     A2AToolContent,
     BaseEvent,
     BrowserToolContent,
+    ControlAction,
+    ControlEvent,
     DoneEvent,
     ErrorEvent,
     Event,
@@ -1001,19 +1003,38 @@ class AgentTaskRunner(TaskRunner):
                                     self._session_id, SessionStatus.WAITING
                                 )
                             return
+                        elif (
+                            isinstance(emitted_event, ControlEvent)
+                            and emitted_event.action == ControlAction.REQUESTED
+                        ):
+                            # 12.control.requested 进入接管待决状态并立即停机
+                            async with self._uow:
+                                await self._uow.session.update_status(
+                                    self._session_id, SessionStatus.TAKEOVER_PENDING
+                                )
+                            return
 
-                # 12.判断如果输入消息队列为空则跳出循环
+                # 13.判断如果输入消息队列为空则跳出循环
                 if not await task.input_stream.is_empty():
                     break
 
-            # 13.更新会话状态为已完成
+            # 14.更新会话状态为已完成
             async with self._uow:
                 await self._uow.session.update_status(
                     self._session_id, SessionStatus.COMPLETED
                 )
         except asyncio.CancelledError:
-            # 14.异步任务被取消，推送结束事件并更新状态
-            logger.info(f"AgentTaskRunner任务运行取消")
+            # 15.异步任务被取消，根据取消原因分流处理
+            cancel_reason = getattr(task, "cancel_reason", "stop")
+            logger.info(
+                "AgentTaskRunner任务运行取消，reason=%s",
+                cancel_reason,
+            )
+
+            if cancel_reason in {"takeover_start", "takeover_timeout"}:
+                # takeover_* 由上层控制事件驱动状态流转，这里只做资源清理
+                raise
+
             await self._put_and_add_event(task, DoneEvent())
             async with self._uow:
                 await self._uow.session.update_status(
@@ -1021,7 +1042,7 @@ class AgentTaskRunner(TaskRunner):
                 )
             raise
         except Exception as e:
-            # 15.记录日志并往任务队列/消息队列中写入异常事件并更新会话状态
+            # 16.记录日志并往任务队列/消息队列中写入异常事件并更新会话状态
             logger.exception(f"AgentTaskRunner运行出错: {str(e)}")
             await self._put_and_add_event(
                 task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
@@ -1031,7 +1052,7 @@ class AgentTaskRunner(TaskRunner):
                     self._session_id, SessionStatus.COMPLETED
                 )
         finally:
-            # 16.在同一个asyncio Task上下文中清理MCP/A2A工具资源
+            # 17.在同一个asyncio Task上下文中清理MCP/A2A工具资源
             # 这是关键：streamablehttp_client内部使用anyio.create_task_group()，
             # 要求在同一个Task中进入和退出cancel scope，
             # 所以必须在invoke()的finally块（即初始化MCP的同一个Task）中清理

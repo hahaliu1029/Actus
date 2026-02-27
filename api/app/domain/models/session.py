@@ -16,6 +16,8 @@ class SessionStatus(str, Enum):
 
     PENDING = "pending"  # 等待任务
     RUNNING = "running"  # 运行中
+    TAKEOVER_PENDING = "takeover_pending"  # 请求接管待用户决策
+    TAKEOVER = "takeover"  # 用户接管中
     WAITING = "waiting"  # 等待人类响应
     COMPLETED = "completed"  # 已完成
 

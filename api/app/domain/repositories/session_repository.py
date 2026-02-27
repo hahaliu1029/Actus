@@ -26,6 +26,10 @@ class SessionRepository(Protocol):
         """根据传递的会话id查询会话"""
         ...
 
+    async def get_by_id_for_update(self, session_id: str) -> Optional[Session]:
+        """根据传递的会话id查询会话并加行锁"""
+        ...
+
     async def delete_by_id(self, session_id: str) -> None:
         """根据传递的会话id删除会话"""
         ...

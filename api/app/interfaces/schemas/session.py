@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from app.domain.models.file import File
 from app.domain.models.session import SessionStatus
@@ -89,3 +89,70 @@ class ShellReadResponse(BaseModel):
     session_id: str
     output: str
     console_records: List[ConsoleRecord] = Field(default_factory=list)
+
+
+class GetTakeoverResponse(BaseModel):
+    """获取会话接管状态响应结构"""
+
+    status: SessionStatus
+    takeover_id: Optional[str] = None
+    request_status: Optional[str] = None
+    reason: Optional[str] = None
+    scope: Optional[str] = None
+    handoff_mode: Optional[str] = None
+
+
+class StartTakeoverRequest(BaseModel):
+    """启动接管请求结构"""
+
+    scope: Literal["shell", "browser"] = "shell"
+
+
+class StartTakeoverResponse(BaseModel):
+    """启动接管响应结构"""
+
+    status: SessionStatus
+    request_status: str
+    scope: str
+    takeover_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class RejectTakeoverRequest(BaseModel):
+    """拒绝接管请求结构"""
+
+    decision: Literal["continue", "terminate"]
+
+
+class RejectTakeoverResponse(BaseModel):
+    """拒绝接管响应结构"""
+
+    status: SessionStatus
+    reason: str
+
+
+class EndTakeoverRequest(BaseModel):
+    """结束接管请求结构"""
+
+    handoff_mode: Literal["continue", "complete"] = "complete"
+
+
+class EndTakeoverResponse(BaseModel):
+    """结束接管响应结构"""
+
+    status: SessionStatus
+    handoff_mode: str
+
+
+class RenewTakeoverRequest(BaseModel):
+    """续期接管请求结构"""
+
+    takeover_id: str
+
+
+class RenewTakeoverResponse(BaseModel):
+    """续期接管响应结构"""
+
+    status: SessionStatus
+    request_status: str
+    takeover_id: str

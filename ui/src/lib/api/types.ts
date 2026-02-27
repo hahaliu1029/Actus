@@ -57,7 +57,13 @@ export type UpdateMeParams = {
 /**
  * 会话状态
  */
-export type SessionStatus = "pending" | "running" | "waiting" | "completed";
+export type SessionStatus =
+  | "pending"
+  | "running"
+  | "takeover_pending"
+  | "takeover"
+  | "waiting"
+  | "completed";
 
 /**
  * 执行状态
@@ -245,7 +251,7 @@ export type CreateSessionResponse = {
 export type ChatMessageData = {
   event_id?: string;
   created_at?: number;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   message: string;
   stream_id?: string;
   partial?: boolean;
@@ -302,6 +308,29 @@ export type ErrorEvent = {
   error: string;
 };
 
+export type ControlAction =
+  | "requested"
+  | "started"
+  | "rejected"
+  | "renewed"
+  | "expired"
+  | "ended";
+
+export type ControlSource = "agent" | "user" | "system";
+
+export type ControlEvent = {
+  event_id?: string;
+  created_at?: number;
+  action: ControlAction;
+  scope?: "shell" | "browser";
+  source: ControlSource;
+  reason?: string;
+  handoff_mode?: "continue" | "complete";
+  request_status?: string;
+  takeover_id?: string;
+  expires_at?: number;
+};
+
 export type WaitEvent = {
   event_id?: string;
   created_at?: number;
@@ -320,6 +349,7 @@ export type SSEEventType =
   | "plan"
   | "step"
   | "tool"
+  | "control"
   | "wait"
   | "done"
   | "error"
@@ -331,6 +361,7 @@ export type SSEEventData =
   | { type: "plan"; data: PlanEvent }
   | { type: "step"; data: StepEvent }
   | { type: "tool"; data: ToolEvent }
+  | { type: "control"; data: ControlEvent }
   | { type: "wait"; data: WaitEvent }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }

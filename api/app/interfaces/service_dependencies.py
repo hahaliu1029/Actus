@@ -103,6 +103,7 @@ def get_session_service() -> SessionService:
 # @lru_cache()
 def get_agent_service(
     minio_store: MinioStore = Depends(get_minio),
+    redis_client: RedisClient = Depends(get_redis),
 ) -> AgentService:
     # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
     app_config_repository = FileAppConfigRepository(
@@ -134,5 +135,6 @@ def get_agent_service(
         json_parser=RepairJSONParser(),
         search_engine=BingSearchEngine(),
         file_storage=file_storage,
+        redis_client=redis_client,
         # file_repository=file_repository,
     )

@@ -2,7 +2,15 @@ import pytest
 from typing import Any
 
 from app.domain.models.app_config import AgentConfig
-from app.domain.models.event import MessageEvent, StepEvent
+from app.domain.models.event import (
+    ControlEvent,
+    ControlScope,
+    MessageEvent,
+    StepEvent,
+    ToolEvent,
+    ToolEventStatus,
+    WaitEvent,
+)
 from app.domain.models.memory import Memory
 from app.domain.models.message import Message
 from app.domain.models.plan import Plan, Step
@@ -82,3 +90,157 @@ async def test_execute_step_degrades_when_parser_returns_non_dict() -> None:
     assert step_events[-1].step.result == "这是一段普通文本结果"
     assert len(message_events) == 1
     assert message_events[0].message == "这是一段普通文本结果"
+
+
+async def test_execute_step_message_ask_user_without_takeover_emits_wait_event() -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-wait",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+
+    async def fake_invoke(_query: str):
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请确认是否继续", "suggest_user_takeover": "none"},
+            status=ToolEventStatus.CALLING,
+        )
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请确认是否继续", "suggest_user_takeover": "none"},
+            status=ToolEventStatus.CALLED,
+        )
+
+    agent.invoke = fake_invoke  # type: ignore[method-assign]
+
+    plan = Plan(language="zh", steps=[Step(description="测试步骤")])
+    step = plan.steps[0]
+    message = Message(message="请继续")
+    events = [event async for event in agent.execute_step(plan, step, message)]
+
+    assert any(isinstance(event, WaitEvent) for event in events)
+    assert not any(isinstance(event, ControlEvent) for event in events)
+
+
+async def test_execute_step_message_ask_user_without_takeover_field_emits_wait_event() -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-wait-default",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+
+    async def fake_invoke(_query: str):
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请确认是否继续"},
+            status=ToolEventStatus.CALLING,
+        )
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请确认是否继续"},
+            status=ToolEventStatus.CALLED,
+        )
+
+    agent.invoke = fake_invoke  # type: ignore[method-assign]
+
+    plan = Plan(language="zh", steps=[Step(description="测试步骤")])
+    step = plan.steps[0]
+    message = Message(message="请继续")
+    events = [event async for event in agent.execute_step(plan, step, message)]
+
+    assert any(isinstance(event, WaitEvent) for event in events)
+    assert not any(isinstance(event, ControlEvent) for event in events)
+
+
+@pytest.mark.parametrize("scope", ["shell", "browser"])
+async def test_execute_step_message_ask_user_takeover_emits_control_requested(scope: str) -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-control",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+
+    async def fake_invoke(_query: str):
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请接管", "suggest_user_takeover": scope},
+            status=ToolEventStatus.CALLING,
+        )
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请接管", "suggest_user_takeover": scope},
+            status=ToolEventStatus.CALLED,
+        )
+
+    agent.invoke = fake_invoke  # type: ignore[method-assign]
+
+    plan = Plan(language="zh", steps=[Step(description="测试步骤")])
+    step = plan.steps[0]
+    message = Message(message="请继续")
+    events = [event async for event in agent.execute_step(plan, step, message)]
+
+    control_events = [event for event in events if isinstance(event, ControlEvent)]
+    assert len(control_events) == 1
+    assert control_events[0].action.value == "requested"
+    assert control_events[0].scope == ControlScope(scope)
+    assert control_events[0].source.value == "agent"
+    assert not any(isinstance(event, WaitEvent) for event in events)
+
+
+async def test_execute_step_message_ask_user_takeover_scope_with_spaces_emits_control_requested() -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-control-strip",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+
+    async def fake_invoke(_query: str):
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请接管", "suggest_user_takeover": " Shell "},
+            status=ToolEventStatus.CALLING,
+        )
+        yield ToolEvent(
+            tool_call_id="tool-1",
+            tool_name="message",
+            function_name="message_ask_user",
+            function_args={"text": "请接管", "suggest_user_takeover": " Shell "},
+            status=ToolEventStatus.CALLED,
+        )
+
+    agent.invoke = fake_invoke  # type: ignore[method-assign]
+
+    plan = Plan(language="zh", steps=[Step(description="测试步骤")])
+    step = plan.steps[0]
+    message = Message(message="请继续")
+    events = [event async for event in agent.execute_step(plan, step, message)]
+
+    control_events = [event for event in events if isinstance(event, ControlEvent)]
+    assert len(control_events) == 1
+    assert control_events[0].scope == ControlScope.SHELL

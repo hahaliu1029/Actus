@@ -206,6 +206,9 @@ function renderEventItem(
 
   if (event.event === "message") {
     const role = String(event.data.role || "assistant");
+    if (role === "system") {
+      return null;
+    }
     const message = String(event.data.message || "");
     const isPartial = Boolean(event.data.partial);
     const attachments = normalizeMessageAttachments(event.data.attachments, sessionFiles);
