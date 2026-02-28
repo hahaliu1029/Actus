@@ -244,3 +244,37 @@ async def test_execute_step_message_ask_user_takeover_scope_with_spaces_emits_co
     control_events = [event for event in events if isinstance(event, ControlEvent)]
     assert len(control_events) == 1
     assert control_events[0].scope == ControlScope.SHELL
+
+
+def test_ask_user_blocked_before_attempt_threshold() -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-gating-blocked",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+    agent._step_tool_attempt_rounds = 0
+    agent._step_failed_tool_calls = 0
+
+    result = agent._intercept_tool_call("message_ask_user", {"text": "需要确认"})
+    assert result is not None
+    assert result.success is False
+    assert result.data["code"] == "ASK_USER_BLOCKED_BY_POLICY"
+    assert result.data["required_attempts"] == 3
+
+
+def test_ask_user_allowed_after_attempt_threshold() -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-gating-allowed",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+    agent._step_tool_attempt_rounds = 3
+    agent._step_failed_tool_calls = 0
+
+    assert agent._intercept_tool_call("message_ask_user", {"text": "需要确认"}) is None

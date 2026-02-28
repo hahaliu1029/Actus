@@ -45,6 +45,7 @@ class _FakeAgentService:
             "reason": "agent_request",
             "scope": "shell",
             "handoff_mode": None,
+            "expires_at": 1_772_222_222,
         }
 
     async def start_takeover(self, **kwargs):
@@ -56,6 +57,7 @@ class _FakeAgentService:
                 "scope": kwargs["scope"],
                 "takeover_id": "tk_starting",
                 "reason": None,
+                "expires_at": 1_772_222_222,
             }
         return {
             "status": "takeover",
@@ -63,6 +65,7 @@ class _FakeAgentService:
             "scope": kwargs["scope"],
             "takeover_id": "tk_002",
             "reason": None,
+            "expires_at": 1_772_222_222,
         }
 
     async def renew_takeover(self, **kwargs):
@@ -71,6 +74,7 @@ class _FakeAgentService:
             "status": "takeover",
             "request_status": "renewed",
             "takeover_id": kwargs["takeover_id"],
+            "expires_at": 1_772_333_333,
         }
 
     async def reject_takeover(self, **kwargs):
@@ -126,6 +130,7 @@ async def test_get_takeover_route() -> None:
     assert body["code"] == 200
     assert body["data"]["status"] == "takeover_pending"
     assert body["data"]["takeover_id"] == "tk_001"
+    assert body["data"]["expires_at"] == 1_772_222_222
     assert fake_service.calls == [
         (
             "get_takeover",
@@ -154,6 +159,7 @@ async def test_start_takeover_route() -> None:
     assert body["data"]["status"] == "takeover"
     assert body["data"]["request_status"] == "started"
     assert body["data"]["scope"] == "browser"
+    assert body["data"]["expires_at"] == 1_772_222_222
     assert fake_service.calls == [
         (
             "start_takeover",
@@ -183,6 +189,7 @@ async def test_start_takeover_route_returns_202_when_starting() -> None:
     assert body["data"]["status"] == "running"
     assert body["data"]["request_status"] == "starting"
     assert body["data"]["takeover_id"] == "tk_starting"
+    assert body["data"]["expires_at"] == 1_772_222_222
 
 
 async def test_renew_takeover_route() -> None:
@@ -200,6 +207,7 @@ async def test_renew_takeover_route() -> None:
     assert body["data"]["status"] == "takeover"
     assert body["data"]["request_status"] == "renewed"
     assert body["data"]["takeover_id"] == "tk_renew_001"
+    assert body["data"]["expires_at"] == 1_772_333_333
     assert fake_service.calls == [
         (
             "renew_takeover",
@@ -261,6 +269,32 @@ async def test_end_takeover_route() -> None:
                 "session_id": "s1",
                 "user_id": "test-user",
                 "handoff_mode": "complete",
+                "is_admin": False,
+                "user_role": "user",
+            },
+        )
+    ]
+
+
+async def test_end_takeover_route_uses_continue_as_default() -> None:
+    fake_service = _FakeAgentService()
+    response = await _request(
+        "POST",
+        "/api/sessions/s1/takeover/end",
+        fake_agent_service=fake_service,
+        payload={},
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["data"]["status"] == "completed"
+    assert fake_service.calls == [
+        (
+            "end_takeover",
+            {
+                "session_id": "s1",
+                "user_id": "test-user",
+                "handoff_mode": "continue",
                 "is_admin": False,
                 "user_role": "user",
             },

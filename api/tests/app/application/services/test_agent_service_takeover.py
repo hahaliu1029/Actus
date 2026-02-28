@@ -1,9 +1,10 @@
 import asyncio
 import json
+from datetime import datetime
 
 import pytest
 from app.application.services.agent_service import AgentService
-from app.application.errors.exceptions import ConflictError, ForbiddenError
+from app.application.errors.exceptions import BadRequestError, ConflictError, ForbiddenError
 from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.event import ControlAction, ControlEvent, ControlScope, ControlSource
 from app.domain.models.session import Session, SessionStatus
@@ -112,6 +113,7 @@ async def test_start_takeover_from_pending_updates_status_and_appends_event(
     service = _make_service(uow)
     session = Session(id="s1", user_id="u1", status=SessionStatus.TAKEOVER_PENDING)
     append_calls: list[dict] = []
+    timeout_calls: list[dict] = []
 
     async def fake_get_accessible_session(*args, **kwargs) -> Session:
         return session
@@ -120,18 +122,40 @@ async def test_start_takeover_from_pending_updates_status_and_appends_event(
         append_calls.append(kwargs)
         return None
 
+    def fake_schedule_takeover_timeout(
+        *,
+        session_id: str,
+        takeover_id: str,
+        operator_user_id: str,
+        ttl_seconds: int,
+    ) -> None:
+        timeout_calls.append(
+            {
+                "session_id": session_id,
+                "takeover_id": takeover_id,
+                "operator_user_id": operator_user_id,
+                "ttl_seconds": ttl_seconds,
+            }
+        )
+
     monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
     monkeypatch.setattr(service, "_append_control_event", fake_append_control_event)
+    monkeypatch.setattr(service, "_schedule_takeover_timeout", fake_schedule_takeover_timeout)
 
     result = await service.start_takeover("s1", "u1", scope="shell")
 
     assert result["status"] == SessionStatus.TAKEOVER
     assert result["request_status"] == "started"
     assert result["scope"] == "shell"
+    assert isinstance(result["expires_at"], int)
     assert uow.session.update_status_calls == [("s1", SessionStatus.TAKEOVER)]
     assert append_calls[0]["action"] == ControlAction.STARTED
     assert append_calls[0]["source"] == ControlSource.USER
     assert append_calls[0]["scope"] == ControlScope.SHELL
+    assert isinstance(append_calls[0]["expires_at"], datetime)
+    assert timeout_calls
+    assert timeout_calls[0]["session_id"] == "s1"
+    assert timeout_calls[0]["operator_user_id"] == "u1"
 
 
 async def test_start_takeover_running_returns_starting_and_schedules_completion(
@@ -181,6 +205,7 @@ async def test_start_takeover_running_returns_starting_and_schedules_completion(
     assert result["status"] == SessionStatus.RUNNING
     assert result["scope"] == "browser"
     assert result["takeover_id"] is not None
+    assert isinstance(result["expires_at"], int)
     assert uow.session.update_status_calls == []
     assert schedule_calls
     assert schedule_calls[0]["session_id"] == "s1"
@@ -521,6 +546,7 @@ async def test_renew_takeover_success_emits_control_renewed(
     service = _make_service(uow)
     session = Session(id="s1", user_id="u1", status=SessionStatus.TAKEOVER)
     append_calls: list[dict] = []
+    timeout_calls: list[dict] = []
 
     async def fake_get_accessible_session(*args, **kwargs) -> Session:
         return session
@@ -532,9 +558,26 @@ async def test_renew_takeover_success_emits_control_renewed(
         append_calls.append(kwargs)
         return None
 
+    def fake_schedule_takeover_timeout(
+        *,
+        session_id: str,
+        takeover_id: str,
+        operator_user_id: str,
+        ttl_seconds: int,
+    ) -> None:
+        timeout_calls.append(
+            {
+                "session_id": session_id,
+                "takeover_id": takeover_id,
+                "operator_user_id": operator_user_id,
+                "ttl_seconds": ttl_seconds,
+            }
+        )
+
     monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
     monkeypatch.setattr(service, "_renew_takeover_lease", fake_renew_takeover_lease)
     monkeypatch.setattr(service, "_append_control_event", fake_append_control_event)
+    monkeypatch.setattr(service, "_schedule_takeover_timeout", fake_schedule_takeover_timeout)
 
     result = await service.renew_takeover("s1", "u1", takeover_id="tk_renew_1")
 
@@ -542,11 +585,17 @@ async def test_renew_takeover_success_emits_control_renewed(
         "status": SessionStatus.TAKEOVER,
         "request_status": "renewed",
         "takeover_id": "tk_renew_1",
+        "expires_at": result["expires_at"],
     }
+    assert isinstance(result["expires_at"], int)
     assert append_calls
     assert append_calls[0]["action"] == ControlAction.RENEWED
     assert append_calls[0]["request_status"] == "renewed"
     assert append_calls[0]["takeover_id"] == "tk_renew_1"
+    assert isinstance(append_calls[0]["expires_at"], datetime)
+    assert timeout_calls
+    assert timeout_calls[0]["session_id"] == "s1"
+    assert timeout_calls[0]["takeover_id"] == "tk_renew_1"
 
 
 async def test_renew_takeover_uses_settings_ttl_by_default(
@@ -741,6 +790,64 @@ async def test_pending_timeout_expires_takeover_pending_session(
     assert release_calls == ["s1"]
 
 
+async def test_takeover_timeout_moves_takeover_to_pending_and_schedules_pending_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.TAKEOVER,
+        events=[
+            ControlEvent(
+                action=ControlAction.STARTED,
+                source=ControlSource.USER,
+                scope=ControlScope.SHELL,
+                takeover_id="tk_takeover_1",
+            )
+        ],
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    force_release_calls: list[str] = []
+    pending_timeout_calls: list[str] = []
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    async def fake_force_release_takeover_lease(session_id: str):
+        force_release_calls.append(session_id)
+        return None
+
+    async def fake_verify_takeover_lease_owner(**_kwargs) -> bool:
+        return False
+
+    def fake_schedule_pending_timeout(session_id: str) -> None:
+        pending_timeout_calls.append(session_id)
+
+    monkeypatch.setattr("app.application.services.agent_service.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(service, "_force_release_takeover_lease", fake_force_release_takeover_lease)
+    monkeypatch.setattr(service, "_verify_takeover_lease_owner", fake_verify_takeover_lease_owner)
+    monkeypatch.setattr(service, "_schedule_pending_timeout", fake_schedule_pending_timeout)
+
+    await service._handle_takeover_lease_timeout(
+        session_id="s1",
+        takeover_id="tk_takeover_1",
+        operator_user_id="u1",
+        ttl_seconds=1,
+    )
+
+    assert uow.session.add_event_calls
+    timeout_event = uow.session.add_event_calls[0][1]
+    assert timeout_event.action == ControlAction.EXPIRED
+    assert timeout_event.reason == "takeover_timeout"
+    assert timeout_event.request_status == "expired"
+    assert timeout_event.takeover_id == "tk_takeover_1"
+    assert uow.session.update_status_calls == [("s1", SessionStatus.TAKEOVER_PENDING)]
+    assert pending_timeout_calls == ["s1"]
+    assert force_release_calls == ["s1"]
+    assert uow.session.get_by_id_for_update_calls == ["s1"]
+
+
 async def test_start_takeover_lease_conflict_raises_conflict_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -777,6 +884,115 @@ async def test_renew_takeover_lease_conflict_raises_conflict_error(
 
     with pytest.raises(ConflictError):
         await service.renew_takeover("s1", "u1", takeover_id="tk_conflict")
+
+
+async def test_assert_takeover_shell_access_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uow = _Uow()
+    service = _make_service(uow)
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.TAKEOVER,
+        events=[
+            ControlEvent(
+                action=ControlAction.STARTED,
+                source=ControlSource.USER,
+                scope=ControlScope.SHELL,
+                takeover_id="tk_shell_1",
+            )
+        ],
+    )
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_verify_takeover_lease_owner(**kwargs) -> bool:
+        return kwargs["takeover_id"] == "tk_shell_1"
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_verify_takeover_lease_owner", fake_verify_takeover_lease_owner)
+
+    await service.assert_takeover_shell_access(
+        session_id="s1",
+        user_id="u1",
+        takeover_id="tk_shell_1",
+        is_admin=False,
+        user_role="user",
+    )
+
+
+async def test_assert_takeover_shell_access_raises_conflict_when_takeover_id_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uow = _Uow()
+    service = _make_service(uow)
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.TAKEOVER,
+        events=[
+            ControlEvent(
+                action=ControlAction.STARTED,
+                source=ControlSource.USER,
+                scope=ControlScope.SHELL,
+                takeover_id="tk_shell_1",
+            )
+        ],
+    )
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_verify_takeover_lease_owner(**kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_verify_takeover_lease_owner", fake_verify_takeover_lease_owner)
+
+    with pytest.raises(ConflictError):
+        await service.assert_takeover_shell_access(
+            session_id="s1",
+            user_id="u1",
+            takeover_id="tk_shell_2",
+            is_admin=False,
+            user_role="user",
+        )
+
+
+async def test_assert_takeover_shell_access_raises_bad_request_when_scope_not_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uow = _Uow()
+    service = _make_service(uow)
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.TAKEOVER,
+        events=[
+            ControlEvent(
+                action=ControlAction.STARTED,
+                source=ControlSource.USER,
+                scope=ControlScope.BROWSER,
+                takeover_id="tk_browser_1",
+            )
+        ],
+    )
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+
+    with pytest.raises(BadRequestError):
+        await service.assert_takeover_shell_access(
+            session_id="s1",
+            user_id="u1",
+            takeover_id="tk_browser_1",
+            is_admin=False,
+            user_role="user",
+        )
 
 
 async def test_start_takeover_forbidden_when_single_worker_only_and_multi_worker_env(

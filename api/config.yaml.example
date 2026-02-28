@@ -20,6 +20,12 @@ agent_config:
     continuation_llm_enabled: true
     continuation_llm_timeout_seconds: 3.0
     continuation_llm_cache_size: 128
+    ask_user_min_attempt_rounds_per_step: 3
+    step_skill_lock_enabled: true
+    step_skill_reselect_unknown_tool_threshold: 3
+    step_skill_reselect_max_per_step: 1
+    available_tool_summary_token_budget: 500
+    unknown_tool_candidate_limit: 10
     continuation_phrases:
       - "继续"
       - "请继续"

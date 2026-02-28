@@ -74,6 +74,26 @@ class _SequenceLLM:
         }
 
 
+class _UnknownThenDoneLLM:
+    def __init__(self) -> None:
+        self._index = 0
+
+    async def invoke(self, **kwargs: Any) -> dict[str, Any]:
+        self._index += 1
+        if self._index == 1:
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tool-unknown",
+                        "function": {"name": "not_exists_tool", "arguments": "{}"},
+                    }
+                ],
+            }
+        return {"role": "assistant", "content": "recovered", "tool_calls": []}
+
+
 class _DummyJsonParser:
     async def invoke(self, payload: Any) -> Any:
         if payload == "null":
@@ -152,3 +172,13 @@ async def test_runtime_system_context_updates_between_turns() -> None:
     memory = agent._uow.session._memory
     assert memory.messages[0]["role"] == "system"
     assert "Active skill: second" in memory.messages[0]["content"]
+
+
+async def test_invoke_unknown_tool_recovers_without_error_event() -> None:
+    agent = _build_agent(_UnknownThenDoneLLM())
+
+    events = [event async for event in agent.invoke("hello")]
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, ToolEvent) for event in events)
+    assert isinstance(events[-1], MessageEvent)
+    assert events[-1].message == "recovered"

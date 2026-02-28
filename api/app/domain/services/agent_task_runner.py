@@ -8,7 +8,7 @@ import time
 import unicodedata
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import AsyncGenerator, BinaryIO, Callable, List
 
 from app.application.services.continuation_intent_classifier import (
@@ -43,6 +43,8 @@ from app.domain.models.event import (
     SearchToolContent,
     ShellToolContent,
     SkillToolContent,
+    StepEvent,
+    StepEventStatus,
     TitleEvent,
     ToolEvent,
     ToolEventStatus,
@@ -82,6 +84,7 @@ MESSAGE_STREAM_CHUNK_DELAY_SEC = 0.03
 SKILL_CONTEXT_MAX_SKILLS = 6
 SKILL_CONTEXT_MAX_TOTAL_CHARS = 8000
 SKILL_CONTEXT_MAX_SNIPPET_CHARS = 1200
+TOOL_SUMMARY_MAX_ITEMS_PER_GROUP = 6
 
 
 @dataclass(slots=True)
@@ -99,6 +102,17 @@ class SelectionDebugMeta:
     effective_threshold: int
     token_count: int
     has_positive_match: bool
+
+
+@dataclass(slots=True)
+class StepSkillActivationState:
+    """当前 step 的 skill 锁定状态（仅内存态）。"""
+
+    step_id: str
+    user_message: str
+    locked_skills: list[Skill] = field(default_factory=list)
+    consecutive_unknown_tool_calls: int = 0
+    reselect_count: int = 0
 
 
 class AgentTaskRunner(TaskRunner):
@@ -180,6 +194,11 @@ class AgentTaskRunner(TaskRunner):
         self._last_effective_selected_skills: list[Skill] = []
         self._last_substantive_user_message: str = ""
         self._session_skill_pool: list[Skill] = []
+        self._step_skill_state: StepSkillActivationState | None = None
+        self._current_message_selected_skills: list[Skill] = []
+        self._current_message_text: str = ""
+        self._last_initialized_skill_ids: tuple[str, ...] = ()
+        self._last_virtual_step_id: str = ""
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
@@ -648,6 +667,188 @@ class AgentTaskRunner(TaskRunner):
 
         return "\n\n".join(sections)
 
+    def _build_available_tool_summary(self) -> str:
+        """构建可用工具摘要，减少模型对工具可用性的错觉。"""
+        budget_tokens = self._skill_selection_policy.available_tool_summary_token_budget
+        char_budget = max(400, budget_tokens * 4)
+
+        shell_tools = [
+            "shell_exec",
+            "shell_write_to_process",
+            "shell_kill_process",
+            "shell_list_processes",
+        ]
+        browser_tools = [
+            "browser_navigate",
+            "browser_click",
+            "browser_input",
+            "browser_snapshot",
+        ]
+        message_tools = ["message_notify_user", "message_ask_user"]
+
+        skill_tools: list[str] = []
+        try:
+            for schema in self._skill_tool.get_tools():
+                if not isinstance(schema, dict):
+                    continue
+                function_info = schema.get("function")
+                if not isinstance(function_info, dict):
+                    continue
+                tool_name = function_info.get("name")
+                if isinstance(tool_name, str) and tool_name:
+                    skill_tools.append(tool_name)
+        except Exception as exc:
+            logger.debug("读取Skill工具摘要失败，降级为空: %s", exc)
+            skill_tools = []
+
+        lines = [
+            "## Available Tool Summary",
+            f"- shell: {', '.join(shell_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
+            f"- browser: {', '.join(browser_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
+            f"- message: {', '.join(message_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
+        ]
+        if skill_tools:
+            lines.append(
+                "- active skill tools: "
+                + ", ".join(skill_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+            )
+        else:
+            lines.append("- active skill tools: (none)")
+
+        summary = "\n".join(lines).strip()
+        if len(summary) > char_budget:
+            summary = summary[:char_budget].rstrip() + "\n...(truncated)"
+        return summary
+
+    def _build_runtime_system_context(self, skills: list[Skill]) -> str:
+        """组装运行时上下文（Skill指南 + 可用工具摘要）。"""
+        sections: list[str] = []
+        skill_context = self._build_skill_context_prompt(skills)
+        if skill_context:
+            sections.append(skill_context)
+        sections.append(self._build_available_tool_summary())
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _set_runtime_system_context(self, skills: list[Skill]) -> None:
+        context = self._build_runtime_system_context(skills)
+        if hasattr(self._flow, "set_skill_context"):
+            self._flow.set_skill_context(context)
+
+    async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
+        """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。"""
+        skill_ids = tuple(skill.id for skill in skills)
+        if skill_ids == self._last_initialized_skill_ids:
+            return
+        await self._skill_tool.initialize(skills)
+        self._last_initialized_skill_ids = skill_ids
+
+    @staticmethod
+    def _is_unknown_tool_event(event: ToolEvent) -> bool:
+        """判断 ToolEvent 是否为 unknown-tool 降级结果。"""
+        if event.status != ToolEventStatus.CALLED:
+            return False
+        result = event.function_result
+        if not result or result.success:
+            return False
+        data = result.data if result.data is not None else {}
+        return isinstance(data, dict) and data.get("code") == "UNKNOWN_TOOL"
+
+    def _build_virtual_step_id(self, event: BaseEvent) -> str:
+        event_id = getattr(event, "id", "") or str(uuid.uuid4())
+        return f"react-cycle-{event_id}"
+
+    async def _activate_step_skills(
+        self,
+        *,
+        step_id: str,
+        user_message: str,
+        selected_skills: list[Skill] | None = None,
+        is_virtual: bool = False,
+    ) -> None:
+        """按 step 锁定技能集并更新运行时上下文。"""
+        if (
+            self._step_skill_state
+            and self._step_skill_state.step_id == step_id
+            and self._step_skill_state.locked_skills
+        ):
+            return
+
+        target_skills = list(selected_skills or [])
+        if not target_skills:
+            target_skills, _ = await self._select_skills_for_message(
+                self._session_skill_pool,
+                user_message,
+            )
+
+        await self._initialize_skill_tool_if_needed(target_skills)
+        self._set_runtime_system_context(target_skills)
+        self._step_skill_state = StepSkillActivationState(
+            step_id=step_id,
+            user_message=user_message,
+            locked_skills=list(target_skills),
+        )
+        if is_virtual:
+            self._last_virtual_step_id = step_id
+
+    async def _handle_step_skill_lock(self, event: BaseEvent, user_message: str) -> None:
+        """处理 step 级 skill 锁定、unknown-tool 紧急重选与无 Planner 降级路径。"""
+        if not self._skill_selection_policy.step_skill_lock_enabled:
+            return
+
+        if isinstance(event, StepEvent):
+            step_id = event.step.id or self._build_virtual_step_id(event)
+            if event.status == StepEventStatus.STARTED:
+                await self._activate_step_skills(
+                    step_id=step_id,
+                    user_message=user_message,
+                    selected_skills=self._current_message_selected_skills,
+                )
+                return
+            if event.status in {StepEventStatus.COMPLETED, StepEventStatus.FAILED}:
+                if self._step_skill_state and self._step_skill_state.step_id == step_id:
+                    self._step_skill_state = None
+                return
+
+        if self._step_skill_state is None:
+            virtual_step_id = self._build_virtual_step_id(event)
+            await self._activate_step_skills(
+                step_id=virtual_step_id,
+                user_message=user_message,
+                selected_skills=self._current_message_selected_skills,
+                is_virtual=True,
+            )
+
+        if not isinstance(event, ToolEvent) or self._step_skill_state is None:
+            return
+
+        state = self._step_skill_state
+        if not self._is_unknown_tool_event(event):
+            state.consecutive_unknown_tool_calls = 0
+            return
+
+        state.consecutive_unknown_tool_calls += 1
+        threshold = self._skill_selection_policy.step_skill_reselect_unknown_tool_threshold
+        max_reselect = self._skill_selection_policy.step_skill_reselect_max_per_step
+        if state.consecutive_unknown_tool_calls < threshold:
+            return
+        if state.reselect_count >= max_reselect:
+            return
+
+        selected_skills, _ = await self._select_skills_for_message(
+            self._session_skill_pool,
+            user_message,
+        )
+        state.locked_skills = list(selected_skills)
+        state.reselect_count += 1
+        state.consecutive_unknown_tool_calls = 0
+        await self._initialize_skill_tool_if_needed(selected_skills)
+        self._set_runtime_system_context(selected_skills)
+        logger.warning(
+            "step内连续unknown-tool达到阈值，触发一次技能重选(step_id=%s, reselect_count=%s)",
+            state.step_id,
+            state.reselect_count,
+        )
+
     async def _load_user_preferences_map(self, tool_type: ToolType) -> dict[str, bool]:
         """加载用户在指定工具类型下的偏好映射。"""
         if not self._user_id:
@@ -875,6 +1076,10 @@ class AgentTaskRunner(TaskRunner):
         self._last_effective_selected_skills = []
         self._last_substantive_user_message = ""
         self._continuation_decision_cache.clear()
+        self._step_skill_state = None
+        self._current_message_selected_skills = []
+        self._current_message_text = ""
+        self._last_initialized_skill_ids = ()
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
@@ -915,10 +1120,8 @@ class AgentTaskRunner(TaskRunner):
                 initial_selected=initial_skills,
             )
             await self._skill_bundle_sync.await_initial_sync()
-            await self._skill_tool.initialize(initial_skills)
-            initial_skill_context = self._build_skill_context_prompt(initial_skills)
-            if hasattr(self._flow, "set_skill_context"):
-                self._flow.set_skill_context(initial_skill_context)
+            await self._initialize_skill_tool_if_needed(initial_skills)
+            self._set_runtime_system_context(initial_skills)
             self._skill_bundle_sync.start_background_sync()
 
             # 3.循环读取任务中的输入消息队列
@@ -953,13 +1156,16 @@ class AgentTaskRunner(TaskRunner):
                     self._session_skill_pool,
                     message_obj.message,
                 )
-                await self._skill_tool.initialize(selected_skills)
-                skill_context = self._build_skill_context_prompt(selected_skills)
-                if hasattr(self._flow, "set_skill_context"):
-                    self._flow.set_skill_context(skill_context)
+                self._current_message_text = message_obj.message
+                self._current_message_selected_skills = list(selected_skills)
+                self._step_skill_state = None
+                self._last_virtual_step_id = ""
+                await self._initialize_skill_tool_if_needed(selected_skills)
+                self._set_runtime_system_context(selected_skills)
 
                 # 7.传递消息对象并运行PlannerReActFlow
                 async for event in self._run_flow(message_obj):
+                    await self._handle_step_skill_lock(event, message_obj.message)
                     emitted_events: List[Event] = []
                     if isinstance(event, MessageEvent) and event.role == "assistant":
                         async for chunked_event in self._stream_assistant_message_event(
@@ -1017,6 +1223,9 @@ class AgentTaskRunner(TaskRunner):
                 # 13.判断如果输入消息队列为空则跳出循环
                 if not await task.input_stream.is_empty():
                     break
+
+                # 单条消息执行结束后重置step锁定状态
+                self._step_skill_state = None
 
             # 14.更新会话状态为已完成
             async with self._uow:

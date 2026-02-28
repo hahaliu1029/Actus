@@ -32,6 +32,7 @@ class DockerSandbox(Sandbox):
         self._ip = ip
         self._container_name = container_name
         self._base_url = f"http://{ip}:8080"
+        self._shell_ws_url = f"ws://{ip}:8080/api/shell/ws"
         self._vnc_url = f"ws://{ip}:5901"
         self._cdp_url = f"http://{ip}:9222"
 
@@ -49,6 +50,10 @@ class DockerSandbox(Sandbox):
     @property
     def cdp_url(self) -> str:
         return self._cdp_url
+
+    @property
+    def shell_ws_url(self) -> str:
+        return self._shell_ws_url
 
     @classmethod
     @alru_cache(maxsize=128, typed=True)
@@ -517,6 +522,23 @@ class DockerSandbox(Sandbox):
                 "session_id": session_id,
                 "input_text": input_text,
                 "press_enter": press_enter,
+            },
+        )
+        return ToolResult.from_sandbox(**response.json())
+
+    async def resize_shell_session(
+        self,
+        session_id: str,
+        cols: int,
+        rows: int,
+    ) -> ToolResult:
+        """调整沙箱中PTY会话窗口大小"""
+        response = await self.client.post(
+            f"{self._base_url}/api/shell/resize-shell",
+            json={
+                "session_id": session_id,
+                "cols": cols,
+                "rows": rows,
             },
         )
         return ToolResult.from_sandbox(**response.json())

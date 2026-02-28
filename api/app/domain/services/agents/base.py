@@ -121,6 +121,42 @@ class BaseAgent(ABC):
 
         raise ValueError(f"未知工具: {tool_name}")
 
+    def _build_unknown_tool_result(self, function_name: str) -> ToolResult:
+        """构建未知工具结果并回灌给 LLM，避免直接中断执行。"""
+        available_names: list[str] = []
+        for tool_schema in self._get_available_tools():
+            if not isinstance(tool_schema, dict):
+                continue
+            function_info = tool_schema.get("function")
+            if not isinstance(function_info, dict):
+                continue
+            tool_name = function_info.get("name")
+            if isinstance(tool_name, str) and tool_name:
+                available_names.append(tool_name)
+
+        candidate_limit = self._agent_config.skill_selection.unknown_tool_candidate_limit
+        candidates = list(dict.fromkeys(available_names))[:candidate_limit]
+
+        return ToolResult(
+            success=False,
+            message=f"UNKNOWN_TOOL: {function_name}",
+            data={
+                "code": "UNKNOWN_TOOL",
+                "tool_name": function_name,
+                "candidates": candidates,
+            },
+        )
+
+    def _intercept_tool_call(
+        self, function_name: str, function_args: Dict[str, Any]
+    ) -> ToolResult | None:
+        """工具调用拦截器，默认不拦截。"""
+        return None
+
+    def _on_tool_result(self, function_name: str, result: ToolResult) -> None:
+        """工具结果回调，子类可覆写统计每 step 的调用状态。"""
+        return None
+
     async def _invoke_llm(
         self, messages: List[Dict[str, Any]], format: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -314,25 +350,45 @@ class BaseAgent(ABC):
                 if not isinstance(function_args, dict):
                     function_args = {}
 
-                # 7.取出Agent中对应的工具
-                tool = self._get_tool(function_name)
+                # 7.取出Agent中对应的工具（未知工具降级为可恢复结果，避免直接中断）
+                tool: BaseTool | None = None
+                tool_name = "unknown"
+                unknown_tool_result: ToolResult | None = None
+                try:
+                    tool = self._get_tool(function_name)
+                    tool_name = tool.name
+                except ValueError:
+                    unknown_tool_result = self._build_unknown_tool_result(function_name)
+                    logger.warning("检测到未知工具调用，降级回灌给LLM: %s", function_name)
 
                 # 8.返回工具即将调用事件，其中tool_content比较特殊，需要在具体业务中进行实现，这里留空即可
                 yield ToolEvent(
                     tool_call_id=tool_call_id,
-                    tool_name=tool.name,
+                    tool_name=tool_name,
                     function_name=function_name,
                     function_args=function_args,
                     status=ToolEventStatus.CALLING,
                 )
 
                 # 9.调用工具并获取结果
-                result = await self._invoke_tool(tool, function_name, function_args)
+                if unknown_tool_result is not None:
+                    result = unknown_tool_result
+                else:
+                    intercepted_result = self._intercept_tool_call(
+                        function_name, function_args
+                    )
+                    if intercepted_result is not None:
+                        result = intercepted_result
+                    else:
+                        # mypy: unknown_tool_result is None 时 tool 必存在
+                        assert tool is not None
+                        result = await self._invoke_tool(tool, function_name, function_args)
+                self._on_tool_result(function_name, result)
 
                 # 10.返回工具调用结果，其中tool_content比较特殊，需要在业务中进行实现
                 yield ToolEvent(
                     tool_call_id=tool_call_id,
-                    tool_name=tool.name,
+                    tool_name=tool_name,
                     function_name=function_name,
                     function_args=function_args,
                     function_result=result,

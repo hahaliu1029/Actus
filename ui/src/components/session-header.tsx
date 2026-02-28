@@ -23,7 +23,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useAuth } from "@/hooks/use-auth";
 import { useIsMobile } from "@/hooks/use-mobile";
+import { sessionApi } from "@/lib/api/session";
 import { useSessionStore } from "@/lib/store/session-store";
+import { useUIStore } from "@/lib/store/ui-store";
 
 export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const router = useRouter();
@@ -32,7 +34,13 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const session = useSessionStore((state) => state.currentSession);
   const stopSession = useSessionStore((state) => state.stopSession);
   const deleteSession = useSessionStore((state) => state.deleteSession);
+  const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
+  const setMessage = useUIStore((state) => state.setMessage);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [takeoverSubmitting, setTakeoverSubmitting] = useState(false);
+
+  const status = session?.status;
+  const canEndTakeover = status === "takeover";
 
   const handleStop = async () => {
     await stopSession(sessionId);
@@ -41,6 +49,25 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const handleDelete = async () => {
     await deleteSession(sessionId);
     router.replace("/");
+  };
+
+  const handleEndTakeover = async () => {
+    setTakeoverSubmitting(true);
+    try {
+      await sessionApi.endTakeover(sessionId, { handoff_mode: "continue" });
+      await fetchSessionById(sessionId, { silent: true });
+      setMessage({
+        type: "success",
+        text: "已结束接管并交还给 AI 继续执行",
+      });
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "结束接管失败",
+      });
+    } finally {
+      setTakeoverSubmitting(false);
+    }
   };
 
   return (
@@ -73,6 +100,16 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-40">
+              {canEndTakeover ? (
+                <DropdownMenuItem
+                  disabled={takeoverSubmitting}
+                  onClick={() => {
+                    void handleEndTakeover();
+                  }}
+                >
+                  结束接管
+                </DropdownMenuItem>
+              ) : null}
               <DropdownMenuItem
                 onClick={() => {
                   logout();
@@ -101,6 +138,18 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
       ) : (
         <div className="flex items-center gap-2">
           <ManusSettings />
+          {canEndTakeover ? (
+            <Button
+              variant="outline"
+              disabled={takeoverSubmitting}
+              className="rounded-xl border-border text-foreground/80"
+              onClick={() => {
+                void handleEndTakeover();
+              }}
+            >
+              结束接管
+            </Button>
+          ) : null}
           <Button
             variant="outline"
             className="rounded-xl border-border text-foreground/80"

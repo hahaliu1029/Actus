@@ -100,6 +100,7 @@ class GetTakeoverResponse(BaseModel):
     reason: Optional[str] = None
     scope: Optional[str] = None
     handoff_mode: Optional[str] = None
+    expires_at: Optional[int] = None
 
 
 class StartTakeoverRequest(BaseModel):
@@ -116,6 +117,7 @@ class StartTakeoverResponse(BaseModel):
     scope: str
     takeover_id: Optional[str] = None
     reason: Optional[str] = None
+    expires_at: Optional[int] = None
 
 
 class RejectTakeoverRequest(BaseModel):
@@ -134,7 +136,7 @@ class RejectTakeoverResponse(BaseModel):
 class EndTakeoverRequest(BaseModel):
     """结束接管请求结构"""
 
-    handoff_mode: Literal["continue", "complete"] = "complete"
+    handoff_mode: Literal["continue", "complete"] = "continue"
 
 
 class EndTakeoverResponse(BaseModel):
@@ -156,3 +158,4 @@ class RenewTakeoverResponse(BaseModel):
     status: SessionStatus
     request_status: str
     takeover_id: str
+    expires_at: Optional[int] = None

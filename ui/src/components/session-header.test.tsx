@@ -2,11 +2,37 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mockReplace = vi.fn();
-const mockStopSession = vi.fn();
-const mockDeleteSession = vi.fn();
-const mockLogout = vi.fn();
-const mockUseIsMobile = vi.fn();
+const {
+  mockReplace,
+  mockStopSession,
+  mockDeleteSession,
+  mockFetchSessionById,
+  mockSetMessage,
+  mockEndTakeover,
+  mockLogout,
+  mockUseIsMobile,
+  mockSessionState,
+} = vi.hoisted(() => {
+  const stopSession = vi.fn();
+  const deleteSession = vi.fn();
+  const fetchSessionById = vi.fn();
+  return {
+    mockReplace: vi.fn(),
+    mockStopSession: stopSession,
+    mockDeleteSession: deleteSession,
+    mockFetchSessionById: fetchSessionById,
+    mockSetMessage: vi.fn(),
+    mockEndTakeover: vi.fn(),
+    mockLogout: vi.fn(),
+    mockUseIsMobile: vi.fn(),
+    mockSessionState: {
+      currentSession: { title: "任务标题", status: "running" },
+      stopSession,
+      deleteSession,
+      fetchSessionById,
+    },
+  };
+});
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({
@@ -16,11 +42,20 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/lib/store/session-store", () => ({
   useSessionStore: (selector: (state: Record<string, unknown>) => unknown) =>
+    selector(mockSessionState),
+}));
+
+vi.mock("@/lib/store/ui-store", () => ({
+  useUIStore: (selector: (state: Record<string, unknown>) => unknown) =>
     selector({
-      currentSession: { title: "任务标题" },
-      stopSession: mockStopSession,
-      deleteSession: mockDeleteSession,
+      setMessage: mockSetMessage,
     }),
+}));
+
+vi.mock("@/lib/api/session", () => ({
+  sessionApi: {
+    endTakeover: mockEndTakeover,
+  },
 }));
 
 vi.mock("@/hooks/use-auth", () => ({
@@ -42,10 +77,16 @@ import { SessionHeader } from "./session-header";
 
 describe("SessionHeader", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockUseIsMobile.mockReturnValue(false);
+    mockSessionState.currentSession = { title: "任务标题", status: "running" };
     mockStopSession.mockResolvedValue(undefined);
     mockDeleteSession.mockResolvedValue(undefined);
-    vi.clearAllMocks();
+    mockFetchSessionById.mockResolvedValue(undefined);
+    mockEndTakeover.mockResolvedValue({
+      status: "running",
+      handoff_mode: "continue",
+    });
   });
 
   it("桌面端显示返回主页、设置、退出登录、停止、删除", () => {
@@ -78,5 +119,10 @@ describe("SessionHeader", () => {
 
     expect(mockLogout).toHaveBeenCalledTimes(1);
     expect(mockStopSession).toHaveBeenCalledWith("sid-2");
+  });
+
+  it("顶部不再显示主动接管入口", () => {
+    render(<SessionHeader sessionId="sid-3" />);
+    expect(screen.queryByRole("button", { name: "主动接管" })).not.toBeInTheDocument();
   });
 });

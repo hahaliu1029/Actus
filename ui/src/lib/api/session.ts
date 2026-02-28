@@ -2,14 +2,23 @@ import { createSSEStream, get, parseSSEStream, post } from "./fetch";
 import type {
   ChatParams,
   CreateSessionResponse,
+  EndTakeoverParams,
+  EndTakeoverResponse,
   FileReadResponse,
+  GetTakeoverResponse,
   GetSessionFilesResponse,
   ListSessionItem,
   ListSessionResponse,
+  RejectTakeoverParams,
+  RejectTakeoverResponse,
+  RenewTakeoverParams,
+  RenewTakeoverResponse,
   Session,
   ShellReadResponse,
   SSEEventData,
   SSEEventHandler,
+  StartTakeoverParams,
+  StartTakeoverResponse,
   ViewFileParams,
   ViewShellParams,
 } from "./types";
@@ -156,5 +165,41 @@ export const sessionApi = {
     params: ViewShellParams
   ): Promise<ShellReadResponse> => {
     return post<ShellReadResponse>(`/sessions/${sessionId}/shell`, params);
+  },
+
+  getTakeover: (sessionId: string): Promise<GetTakeoverResponse> => {
+    return get<GetTakeoverResponse>(`/sessions/${sessionId}/takeover`);
+  },
+
+  startTakeover: (
+    sessionId: string,
+    params: StartTakeoverParams = {}
+  ): Promise<StartTakeoverResponse> => {
+    return post<StartTakeoverResponse>(`/sessions/${sessionId}/takeover/start`, {
+      scope: params.scope || "shell",
+    });
+  },
+
+  renewTakeover: (
+    sessionId: string,
+    params: RenewTakeoverParams
+  ): Promise<RenewTakeoverResponse> => {
+    return post<RenewTakeoverResponse>(`/sessions/${sessionId}/takeover/renew`, params);
+  },
+
+  rejectTakeover: (
+    sessionId: string,
+    params: RejectTakeoverParams
+  ): Promise<RejectTakeoverResponse> => {
+    return post<RejectTakeoverResponse>(`/sessions/${sessionId}/takeover/reject`, params);
+  },
+
+  endTakeover: (
+    sessionId: string,
+    params: EndTakeoverParams = {}
+  ): Promise<EndTakeoverResponse> => {
+    return post<EndTakeoverResponse>(`/sessions/${sessionId}/takeover/end`, {
+      handoff_mode: params.handoff_mode || "continue",
+    });
   },
 };

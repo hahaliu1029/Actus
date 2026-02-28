@@ -1,11 +1,19 @@
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import AsyncGenerator, Dict, Optional
+from urllib.parse import quote
 
 import websockets
-from app.application.errors.exceptions import ServiceUnavailableError, TooManyRequestsError
-from app.application.errors.exceptions import NotFoundError
+from app.application.errors.exceptions import (
+    BadRequestError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ServiceUnavailableError,
+    TooManyRequestsError,
+)
 from app.application.services.agent_service import AgentService
 from app.application.services.session_service import SessionService
 from app.interfaces.dependencies import (
@@ -44,6 +52,7 @@ from app.interfaces.schemas.session import (
 )
 from app.interfaces.service_dependencies import get_agent_service, get_session_service
 from app.infrastructure.storage.redis import RedisClient, get_redis
+from core.config import get_settings
 from fastapi import APIRouter, Depends, Response as FastAPIResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -519,6 +528,348 @@ async def read_shell_output(
 
 
 @router.websocket(
+    path="/{session_id}/takeover/shell/ws",
+)
+async def takeover_shell_websocket(
+    websocket: WebSocket,
+    session_id: str,
+    takeover_id: str | None = None,
+    token: str | None = None,
+    session_service: SessionService = Depends(get_session_service),
+    agent_service: AgentService = Depends(get_agent_service),
+    redis_client: RedisClient = Depends(get_redis),
+) -> None:
+    """终端接管 WebSocket 端点，提供接管态下的双向交互。"""
+    lease = None
+    current_user = None
+
+    # 先 accept 连接，再进行认证/鉴权，失败时通过 status 消息告知后关闭。
+    # Starlette 不允许对未 accept 的 WebSocket 调用 close()。
+    await websocket.accept()
+
+    if not takeover_id:
+        await websocket.send_text(
+            json.dumps({"type": "status", "state": "error", "message": "缺少takeover_id"}, ensure_ascii=False)
+        )
+        await websocket.close(code=4400, reason="缺少takeover_id")
+        return
+
+    try:
+        current_user = await get_current_user_ws_query(token)
+        await enforce_request_limit(
+            bucket=RateLimitBucket.READ,
+            current_user=current_user,
+            redis_client=redis_client,
+        )
+        lease = await acquire_connection_limit(
+            channel=RateLimitChannel.WS,
+            user_id=current_user.id,
+            redis_client=redis_client,
+        )
+        lease.start_heartbeat()
+        await agent_service.assert_takeover_shell_access(
+            session_id=session_id,
+            user_id=current_user.id,
+            takeover_id=takeover_id,
+            is_admin=current_user.is_admin(),
+            user_role=current_user.role.value,
+        )
+        sandbox, shell_session_id = await session_service.ensure_takeover_shell_session(
+            session_id=session_id,
+            takeover_id=takeover_id,
+            user_id=current_user.id,
+            is_admin=current_user.is_admin(),
+        )
+    except TooManyRequestsError as exc:
+        retry_after = (exc.data or {}).get("retry_after", 1)
+        await websocket.send_text(
+            json.dumps({"type": "status", "state": "error", "message": f"请求过多，请{retry_after}秒后重试"}, ensure_ascii=False)
+        )
+        await websocket.close(code=1013, reason=f"请求过多，请{retry_after}秒后重试")
+        return
+    except ServiceUnavailableError:
+        await websocket.send_text(
+            json.dumps({"type": "status", "state": "error", "message": "限流服务不可用"}, ensure_ascii=False)
+        )
+        await websocket.close(code=1011, reason="限流服务不可用")
+        return
+    except ForbiddenError as exc:
+        await websocket.send_text(
+            json.dumps({"type": "status", "state": "forbidden", "message": str(exc)}, ensure_ascii=False)
+        )
+        await websocket.close(code=4403, reason=str(exc))
+        return
+    except (BadRequestError, ConflictError) as exc:
+        await websocket.send_text(
+            json.dumps({"type": "status", "state": "error", "message": str(exc)}, ensure_ascii=False)
+        )
+        await websocket.close(code=4409, reason=str(exc))
+        return
+    except Exception as exc:
+        await websocket.send_text(
+            json.dumps({"type": "status", "state": "error", "message": str(exc)}, ensure_ascii=False)
+        )
+        await websocket.close(code=4401, reason=str(exc))
+        return
+    await websocket.send_text(
+        json.dumps({"type": "status", "state": "connected"}, ensure_ascii=False)
+    )
+
+    try:
+        closed = asyncio.Event()
+        last_output = ""
+        last_output_hash = 0
+
+        async def check_takeover_lease() -> bool:
+            try:
+                await agent_service.assert_takeover_shell_access(
+                    session_id=session_id,
+                    user_id=current_user.id,
+                    takeover_id=takeover_id,
+                    is_admin=current_user.is_admin(),
+                    user_role=current_user.role.value,
+                )
+                return True
+            except ConflictError:
+                await websocket.send_text(
+                    json.dumps(
+                        {"type": "status", "state": "lease_expired"},
+                        ensure_ascii=False,
+                    )
+                )
+                return False
+            except (ForbiddenError, BadRequestError):
+                await websocket.send_text(
+                    json.dumps(
+                        {"type": "status", "state": "forbidden"},
+                        ensure_ascii=False,
+                    )
+                )
+                return False
+
+        async def lease_guard() -> None:
+            guard_interval = get_settings().feature_takeover_lease_guard_interval_seconds
+            while not closed.is_set():
+                lease_ok = await check_takeover_lease()
+                if not lease_ok:
+                    break
+                await asyncio.sleep(guard_interval)
+
+        sandbox_shell_ws_url = str(getattr(sandbox, "shell_ws_url", "") or "").strip()
+        if sandbox_shell_ws_url:
+            target_url = (
+                f"{sandbox_shell_ws_url}?session_id={quote(shell_session_id, safe='')}"
+            )
+            logger.info("接管终端走沙箱WS透传: %s", target_url)
+
+            async with websockets.connect(target_url) as sandbox_ws:
+                async def forward_to_sandbox() -> None:
+                    while not closed.is_set():
+                        try:
+                            message = await websocket.receive()
+                        except WebSocketDisconnect:
+                            break
+
+                        if message.get("type") == "websocket.disconnect":
+                            break
+
+                        payload_bytes = message.get("bytes")
+                        if payload_bytes is not None:
+                            await sandbox_ws.send(payload_bytes)
+                            continue
+
+                        payload_text = message.get("text")
+                        if payload_text is not None:
+                            await sandbox_ws.send(payload_text)
+
+                async def forward_from_sandbox() -> None:
+                    while not closed.is_set():
+                        try:
+                            data = await sandbox_ws.recv()
+                        except ConnectionClosed:
+                            break
+                        if isinstance(data, bytes):
+                            await websocket.send_bytes(data)
+                        else:
+                            await websocket.send_text(str(data))
+
+                tasks = [
+                    asyncio.create_task(forward_to_sandbox()),
+                    asyncio.create_task(forward_from_sandbox()),
+                    asyncio.create_task(lease_guard()),
+                ]
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+        else:
+            logger.warning("沙箱不支持shell_ws_url，降级为HTTP轮询转发")
+
+            async def forward_to_sandbox_via_http() -> None:
+                while not closed.is_set():
+                    try:
+                        message = await websocket.receive()
+                    except WebSocketDisconnect:
+                        break
+
+                    if message.get("type") == "websocket.disconnect":
+                        break
+
+                    payload_bytes = message.get("bytes")
+                    if payload_bytes is not None:
+                        input_text = payload_bytes.decode("utf-8", errors="replace")
+                        if not input_text:
+                            continue
+                        result = await sandbox.write_shell_input(
+                            session_id=shell_session_id,
+                            input_text=input_text,
+                            press_enter=False,
+                        )
+                        if not result.success:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "code": "write_failed",
+                                        "message": result.message or "写入终端失败",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        continue
+
+                    payload_text = message.get("text")
+                    if payload_text is None:
+                        continue
+                    try:
+                        payload = json.loads(payload_text)
+                    except Exception:
+                        continue
+                    if payload.get("type") == "resize":
+                        try:
+                            cols = max(1, min(int(payload.get("cols", 0)), 500))
+                            rows = max(1, min(int(payload.get("rows", 0)), 200))
+                        except (TypeError, ValueError):
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "code": "invalid_resize",
+                                        "message": "无效的终端尺寸参数",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                            continue
+                        resize_result = await sandbox.resize_shell_session(
+                            session_id=shell_session_id,
+                            cols=cols,
+                            rows=rows,
+                        )
+                        if not resize_result.success:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "code": "resize_failed",
+                                        "message": resize_result.message or "调整终端尺寸失败",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        continue
+
+            async def forward_from_sandbox_via_http() -> None:
+                nonlocal last_output, last_output_hash
+                while not closed.is_set():
+                    read_result = await sandbox.read_shell_output(
+                        session_id=shell_session_id, console=False
+                    )
+                    if not read_result.success:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "code": "read_failed",
+                                    "message": read_result.message or "读取终端输出失败",
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                        await asyncio.sleep(0.3)
+                        continue
+
+                    latest_output = str((read_result.data or {}).get("output") or "")
+                    latest_hash = hash(latest_output)
+
+                    # 内容完全相同（含空），跳过
+                    if latest_hash == last_output_hash and latest_output == last_output:
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    # 判断新内容是否是旧内容的追加延续
+                    if (
+                        len(latest_output) >= len(last_output)
+                        and latest_output[: len(last_output)] == last_output
+                    ):
+                        delta = latest_output[len(last_output) :]
+                    else:
+                        # 缓冲区被截断/重置/内容不连续 → 全量重传
+                        delta = latest_output
+
+                    if delta:
+                        await websocket.send_bytes(delta.encode("utf-8"))
+                    last_output = latest_output
+                    last_output_hash = latest_hash
+                    await asyncio.sleep(0.2)
+
+            tasks = [
+                asyncio.create_task(forward_to_sandbox_via_http()),
+                asyncio.create_task(forward_from_sandbox_via_http()),
+                asyncio.create_task(lease_guard()),
+            ]
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+        closed.set()
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        for task in done:
+            if task.cancelled():
+                continue
+            try:
+                exc = task.exception()
+            except Exception as task_exc:  # noqa: BLE001 - 保护收尾阶段不被次生异常打断
+                logger.warning(
+                    "接管终端任务收尾异常: session_id=%s error=%s",
+                    session_id,
+                    str(task_exc),
+                )
+                continue
+            if exc:
+                logger.warning(
+                    "接管终端任务异常退出: session_id=%s error=%s",
+                    session_id,
+                    str(exc),
+                )
+    except WebSocketDisconnect:
+        logger.info("接管终端WebSocket连接已断开, session_id=%s", session_id)
+    except Exception as exc:
+        logger.error("接管终端WebSocket异常: %s", str(exc))
+        await websocket.close(code=1011, reason=f"WebSocket异常: {str(exc)}")
+    finally:
+        if lease:
+            await lease.release()
+
+
+@router.websocket(
     path="/{session_id}/vnc",
 )
 async def vnc_websocket(
@@ -617,6 +968,11 @@ async def vnc_websocket(
             # 9.如果任一任务完成则取消其他任务(关闭全部链接)
             for task in pending:
                 task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
     except ConnectionError as connection_e:
         # 连接沙箱环境失败，关闭websocket
         logger.error(f"连接沙箱环境失败: {str(connection_e)}")

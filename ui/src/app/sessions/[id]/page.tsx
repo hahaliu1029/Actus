@@ -40,6 +40,7 @@ import {
   normalizeMessageAttachments,
 } from "@/lib/session-ui";
 import { cn } from "@/lib/utils";
+import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
@@ -59,6 +60,12 @@ type ToolVisualContent = {
   searchResults: SearchResultCard[];
   filepath: string | null;
   mcpResult: string | null;
+};
+
+type TakeoverMeta = {
+  takeoverId: string | null;
+  takeoverScope: "shell" | "browser" | null;
+  takeoverExpiresAt: number | null;
 };
 
 function renderMessageAttachments(
@@ -127,6 +134,33 @@ function toDisplayImageUrl(url: string): string {
     return toImageProxyUrl(url);
   }
   return url;
+}
+
+function deriveTakeoverMeta(events: SessionEvent[]): TakeoverMeta {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.event !== "control") {
+      continue;
+    }
+    const takeoverId = String(event.data.takeover_id || "").trim() || null;
+    const rawScope = String(event.data.scope || "").trim();
+    const takeoverScope =
+      rawScope === "shell" || rawScope === "browser" ? rawScope : null;
+    const takeoverExpiresAt = normalizeUnixSeconds(event.data.expires_at);
+    if (takeoverId || takeoverScope || takeoverExpiresAt != null) {
+      return {
+        takeoverId,
+        takeoverScope,
+        takeoverExpiresAt,
+      };
+    }
+  }
+
+  return {
+    takeoverId: null,
+    takeoverScope: null,
+    takeoverExpiresAt: null,
+  };
 }
 
 function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent {
@@ -492,6 +526,10 @@ export default function SessionPage() {
     () => deriveWorkbenchSnapshots(eventList),
     [eventList]
   );
+  const takeoverMeta = useMemo(
+    () => deriveTakeoverMeta(eventList),
+    [eventList]
+  );
   const progressSummary = useMemo(
     () => deriveSessionProgressSummary(eventList),
     [eventList]
@@ -502,6 +540,19 @@ export default function SessionPage() {
     isCurrentSessionStreaming ||
     visibleSession?.status === "running" ||
     visibleSession?.status === "waiting";
+
+  useEffect(() => {
+    if (!isMobile) {
+      return;
+    }
+    if (visibleSession?.status !== "takeover") {
+      return;
+    }
+    if (takeoverMeta.takeoverScope === "browser") {
+      return;
+    }
+    setMobileWorkbenchOpen(true);
+  }, [isMobile, takeoverMeta.takeoverScope, visibleSession?.status]);
 
   useEffect(() => {
     if (!sessionId || !sessionRunning) {
@@ -795,6 +846,10 @@ export default function SessionPage() {
           <aside className="sticky top-[84px] hidden h-[calc(100vh-104px)] min-h-[620px] w-[620px] shrink-0 self-start lg:block xl:w-[660px]">
             <WorkbenchPanel
               sessionId={sessionId}
+              status={visibleSession?.status || "pending"}
+              takeoverId={takeoverMeta.takeoverId}
+              takeoverScope={takeoverMeta.takeoverScope}
+              takeoverExpiresAt={takeoverMeta.takeoverExpiresAt}
               snapshots={workbenchSnapshots}
               running={sessionRunning}
               visible={workbenchVisible}
@@ -808,6 +863,10 @@ export default function SessionPage() {
         <SheetContent side="right" className="w-full max-w-none border-l-border p-3 sm:max-w-[620px]">
           <WorkbenchPanel
             sessionId={sessionId}
+            status={visibleSession?.status || "pending"}
+            takeoverId={takeoverMeta.takeoverId}
+            takeoverScope={takeoverMeta.takeoverScope}
+            takeoverExpiresAt={takeoverMeta.takeoverExpiresAt}
             snapshots={workbenchSnapshots}
             running={sessionRunning}
             visible={mobileWorkbenchOpen}

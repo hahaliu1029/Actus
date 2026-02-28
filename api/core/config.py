@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     sandbox_https_proxy: Optional[str] = None
     sandbox_http_proxy: Optional[str] = None
     sandbox_no_proxy: Optional[str] = None
+    sandbox_default_cwd: str = "/root"
     container_timezone: str = "UTC"
 
     # Skill v2 配置
@@ -67,6 +68,7 @@ class Settings(BaseSettings):
     feature_takeover_single_worker_only: bool = True
     feature_takeover_pending_ttl_seconds: int = 300
     feature_takeover_lease_ttl_seconds: int = 900
+    feature_takeover_lease_guard_interval_seconds: int = 15
 
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"

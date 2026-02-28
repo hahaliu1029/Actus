@@ -115,4 +115,4 @@ class BaseTool:
                 return await method(**filtered_kwargs)
 
         # 5.如果循环结束还没有找到工具并调用则抛出错误
-        return ValueError(f"工具[{tool_name}]未找到")
+        raise ValueError(f"工具[{tool_name}]未找到")

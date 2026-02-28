@@ -1,12 +1,18 @@
 import asyncio
 import codecs
+import errno
+import fcntl
 import getpass
 import logging
 import os.path
+import pty
 import re
 import socket
+import struct
+import termios
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from app.interfaces.errors.exceptions import (
@@ -27,17 +33,32 @@ from app.models.shell import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class PtyShellSession:
+    """PTY 交互会话"""
+
+    process: asyncio.subprocess.Process
+    master_fd: int
+    output_queue: asyncio.Queue[bytes] = field(default_factory=asyncio.Queue)
+    reader_task: Optional[asyncio.Task[None]] = None
+
+
 class ShellService:
     """Shell命令服务"""
 
     MAX_OUTPUT_CHARS = 200_000
+    MAX_PTY_QUEUE_CHUNKS = 1024
+    DEFAULT_PTY_COLS = 120
+    DEFAULT_PTY_ROWS = 36
 
     active_shells: Dict[str, Shell]
     reader_tasks: Dict[str, asyncio.Task[None]]
+    pty_shells: Dict[str, PtyShellSession]
 
     def __init__(self) -> None:
         self.active_shells = {}
         self.reader_tasks = {}
+        self.pty_shells = {}
 
     def _append_output(self, shell: Shell, output: str) -> None:
         """向会话输出追加内容并限制最大长度"""
@@ -168,6 +189,178 @@ class ShellService:
                 )
 
         task.add_done_callback(_on_done)
+
+    @classmethod
+    def _set_pty_size(cls, fd: int, cols: int, rows: int) -> None:
+        """设置 PTY 窗口大小"""
+        cols = cols if cols > 0 else cls.DEFAULT_PTY_COLS
+        rows = rows if rows > 0 else cls.DEFAULT_PTY_ROWS
+        size = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+
+    async def _start_pty_output_reader(
+        self, session_id: str, pty_shell: PtyShellSession
+    ) -> None:
+        """持续读取 PTY 输出并写入会话队列"""
+        while True:
+            try:
+                chunk = await asyncio.to_thread(os.read, pty_shell.master_fd, 4096)
+            except OSError as exc:
+                if exc.errno in {errno.EIO, errno.EBADF}:
+                    break
+                logger.warning(
+                    "读取PTY输出失败: session_id=%s error=%s",
+                    session_id,
+                    str(exc),
+                )
+                break
+
+            if not chunk:
+                break
+            if pty_shell.output_queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    pty_shell.output_queue.get_nowait()
+            with suppress(asyncio.QueueFull):
+                pty_shell.output_queue.put_nowait(chunk)
+
+    async def ensure_pty_session(
+        self,
+        session_id: str,
+        *,
+        exec_dir: Optional[str] = None,
+        cols: int = DEFAULT_PTY_COLS,
+        rows: int = DEFAULT_PTY_ROWS,
+    ) -> None:
+        """确保 PTY 交互会话存在，不存在则创建。"""
+        existing = self.pty_shells.get(session_id)
+        if existing and existing.process.returncode is None:
+            return
+        if existing:
+            await self.close_pty_session(session_id)
+
+        exec_dir = exec_dir or os.path.expanduser("~")
+        if not os.path.exists(exec_dir):
+            raise BadRequestException(f"当前目录不存在: {exec_dir}")
+
+        master_fd, slave_fd = pty.openpty()
+        process: Optional[asyncio.subprocess.Process] = None
+        try:
+            self._set_pty_size(master_fd, cols, rows)
+            env = os.environ.copy()
+            env.setdefault("TERM", "xterm-256color")
+            process = await asyncio.create_subprocess_exec(
+                "/bin/bash",
+                "-i",
+                cwd=exec_dir,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception:
+            with suppress(OSError):
+                os.close(master_fd)
+            with suppress(OSError):
+                os.close(slave_fd)
+            if process and process.returncode is None:
+                process.kill()
+            raise
+        finally:
+            with suppress(OSError):
+                os.close(slave_fd)
+
+        pty_shell = PtyShellSession(
+            process=process,
+            master_fd=master_fd,
+            output_queue=asyncio.Queue(maxsize=self.MAX_PTY_QUEUE_CHUNKS),
+        )
+        reader_task = asyncio.create_task(
+            self._start_pty_output_reader(session_id, pty_shell)
+        )
+        pty_shell.reader_task = reader_task
+        self.pty_shells[session_id] = pty_shell
+
+    async def write_pty_input(self, session_id: str, payload: bytes) -> None:
+        """向 PTY 会话写入原始字节"""
+        if session_id not in self.pty_shells:
+            raise NotFoundException(f"Shell会话不存在: {session_id}")
+        if not payload:
+            return
+
+        pty_shell = self.pty_shells[session_id]
+        if pty_shell.process.returncode is not None:
+            raise BadRequestException("子进程已结束, 无法写入输入")
+        await asyncio.to_thread(os.write, pty_shell.master_fd, payload)
+
+    async def read_pty_output(
+        self,
+        session_id: str,
+        *,
+        timeout_seconds: float = 0.2,
+        max_bytes: int = 65536,
+    ) -> bytes:
+        """读取 PTY 输出增量，超时返回空字节。"""
+        if session_id not in self.pty_shells:
+            raise NotFoundException(f"Shell会话不存在: {session_id}")
+        pty_shell = self.pty_shells[session_id]
+
+        try:
+            first_chunk = await asyncio.wait_for(
+                pty_shell.output_queue.get(),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return b""
+
+        chunks = bytearray(first_chunk)
+        while len(chunks) < max_bytes:
+            try:
+                chunk = pty_shell.output_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            chunks.extend(chunk)
+        return bytes(chunks[:max_bytes])
+
+    def resize_pty_session(self, session_id: str, *, cols: int, rows: int) -> None:
+        """调整 PTY 窗口大小"""
+        if session_id not in self.pty_shells:
+            raise NotFoundException(f"Shell会话不存在: {session_id}")
+        if cols <= 0 or rows <= 0:
+            raise BadRequestException("cols 和 rows 必须大于 0")
+        pty_shell = self.pty_shells[session_id]
+        self._set_pty_size(pty_shell.master_fd, cols, rows)
+
+    def is_pty_session_alive(self, session_id: str) -> bool:
+        """判断 PTY 会话是否仍存活"""
+        pty_shell = self.pty_shells.get(session_id)
+        return bool(pty_shell and pty_shell.process.returncode is None)
+
+    async def close_pty_session(self, session_id: str) -> Optional[int]:
+        """关闭并清理 PTY 会话"""
+        pty_shell = self.pty_shells.pop(session_id, None)
+        if not pty_shell:
+            return None
+
+        task = pty_shell.reader_task
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        process = pty_shell.process
+        if process.returncode is None:
+            process.terminate()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=2)
+            if process.returncode is None:
+                process.kill()
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=1)
+
+        with suppress(OSError):
+            os.close(pty_shell.master_fd)
+        return process.returncode
 
     @classmethod
     def _get_display_path(cls, path: str) -> str:
@@ -512,6 +705,13 @@ class ShellService:
 
     async def kill_process(self, session_id: str) -> ShellKillResult:
         """根据传递的Shell会话id关闭对应进程"""
+        if session_id in self.pty_shells:
+            returncode = await self.close_pty_session(session_id)
+            return ShellKillResult(
+                status="terminated",
+                returncode=0 if returncode is None else returncode,
+            )
+
         # 1.判断下传递的会话是否存在
         logger.debug(f"正在终止会话中的进程: {session_id}")
         if session_id not in self.active_shells:

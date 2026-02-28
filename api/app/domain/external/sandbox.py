@@ -34,6 +34,15 @@ class Sandbox(Protocol):
         """根据传递会话id+文本内容+是否回车键写入内容到进程中"""
         ...
 
+    async def resize_shell_session(
+        self,
+        session_id: str,
+        cols: int,
+        rows: int,
+    ) -> ToolResult:
+        """根据传递会话id+终端列行参数调整PTY窗口大小"""
+        ...
+
     async def kill_process(self, session_id: str) -> ToolResult:
         """根据传递的会话id杀死对应的进程"""
         ...
@@ -126,6 +135,11 @@ class Sandbox(Protocol):
     @property
     def cdp_url(self) -> str:
         """只读属性，返回沙箱的cdp链接(操控浏览器的)"""
+        ...
+
+    @property
+    def shell_ws_url(self) -> str:
+        """只读属性，返回沙箱Shell WebSocket基础链接"""
         ...
 
     @property

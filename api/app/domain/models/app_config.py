@@ -60,6 +60,12 @@ class SkillSelectionPolicy(BaseModel):
     continuation_llm_enabled: bool = True
     continuation_llm_timeout_seconds: float = Field(3.0, gt=0, le=10)
     continuation_llm_cache_size: int = Field(128, ge=0, le=2048)
+    ask_user_min_attempt_rounds_per_step: int = Field(3, ge=1, le=10)
+    step_skill_lock_enabled: bool = True
+    step_skill_reselect_unknown_tool_threshold: int = Field(3, ge=1, le=20)
+    step_skill_reselect_max_per_step: int = Field(1, ge=0, le=5)
+    available_tool_summary_token_budget: int = Field(500, ge=100, le=2000)
+    unknown_tool_candidate_limit: int = Field(10, ge=1, le=50)
     continuation_phrases: List[str] = Field(
         default_factory=lambda: [
             "继续",

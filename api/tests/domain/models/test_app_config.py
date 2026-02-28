@@ -55,6 +55,18 @@ def test_agent_config_has_default_skill_selection_policy() -> None:
     assert config.skill_selection.continuation_patterns
 
 
+def test_agent_config_has_new_stability_defaults() -> None:
+    config = AgentConfig()
+    policy = config.skill_selection
+
+    assert policy.ask_user_min_attempt_rounds_per_step == 3
+    assert policy.step_skill_lock_enabled is True
+    assert policy.step_skill_reselect_unknown_tool_threshold == 3
+    assert policy.step_skill_reselect_max_per_step == 1
+    assert policy.available_tool_summary_token_budget == 500
+    assert policy.unknown_tool_candidate_limit == 10
+
+
 def test_agent_config_rejects_invalid_continuation_pattern() -> None:
     with pytest.raises(ValueError) as exc_info:
         AgentConfig(

@@ -229,3 +229,44 @@ class SessionService:
         await sandbox.ensure_sandbox()
 
         return sandbox.vnc_url
+
+    async def ensure_takeover_shell_session(
+        self,
+        session_id: str,
+        takeover_id: str,
+        user_id: str,
+        is_admin: bool = False,
+    ) -> tuple[Sandbox, str]:
+        """确保接管终端会话存在并返回沙箱实例与shell会话ID。"""
+        logger.info("确保会话[%s]接管终端可用，takeover_id=%s", session_id, takeover_id)
+        async with self._uow:
+            session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+        sandbox = None
+        if session.sandbox_id:
+            sandbox = await self._sandbox_cls.get(session.sandbox_id)
+        if not sandbox:
+            sandbox = await self._sandbox_cls.create()
+            session.sandbox_id = sandbox.id
+            async with self._uow:
+                await self._uow.session.save(session)
+
+        await sandbox.ensure_sandbox()
+
+        shell_session_id = f"takeover_{session_id}_{takeover_id}"
+        probe_result = await sandbox.read_shell_output(
+            session_id=shell_session_id,
+            console=False,
+        )
+        if not probe_result.success:
+            # 使用沙箱容器的默认工作目录而非 API 进程的 home。
+            sandbox_home = get_settings().sandbox_default_cwd or "/root"
+            start_result = await sandbox.exec_command(
+                session_id=shell_session_id,
+                exec_dir=sandbox_home,
+                command="bash -i",
+            )
+            if not start_result.success:
+                raise ServerRequestsError(start_result.message)
+
+        return sandbox, shell_session_id

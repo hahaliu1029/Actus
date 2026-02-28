@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Callable, Dict, List, Optional, Type
 
 from app.application.errors.exceptions import (
@@ -90,6 +90,7 @@ class AgentService:
         self._redis_client = redis_client
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
+        self._takeover_timeout_tasks: dict[str, asyncio.Task] = {}
         self._settings = get_settings()
         # self._file_repository = file_repository
         logger.info(f"AgentService初始化成功")
@@ -387,6 +388,16 @@ class AgentService:
     def _lease_value(takeover_id: str, operator_user_id: str) -> str:
         return f"{takeover_id}:{operator_user_id}"
 
+    @staticmethod
+    def _to_unix_seconds(value: Optional[datetime]) -> Optional[int]:
+        if value is None:
+            return None
+        return int(value.timestamp())
+
+    @staticmethod
+    def _build_lease_expiry(ttl_seconds: int) -> datetime:
+        return datetime.now(timezone.utc) + timedelta(seconds=max(ttl_seconds, 1))
+
     def _get_redis_connection(self):
         if not self._redis_client:
             return None
@@ -533,6 +544,24 @@ end
             return
         await redis.delete(self._lease_key(session_id))
 
+    async def _verify_takeover_lease_owner(
+        self,
+        *,
+        session_id: str,
+        takeover_id: str,
+        operator_user_id: str,
+    ) -> bool:
+        redis = self._get_redis_connection()
+        if redis is None:
+            return True
+
+        lease_value = await redis.get(self._lease_key(session_id))
+        if lease_value is None:
+            return False
+        if isinstance(lease_value, bytes):
+            lease_value = lease_value.decode("utf-8", errors="ignore")
+        return lease_value == self._lease_value(takeover_id, operator_user_id)
+
     def _track_background_task(self, task: asyncio.Task) -> None:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -542,6 +571,38 @@ end
         if timeout_task and not timeout_task.done():
             timeout_task.cancel()
 
+    def _cancel_takeover_timeout(self, session_id: str) -> None:
+        timeout_task = self._takeover_timeout_tasks.pop(session_id, None)
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
+
+    def _schedule_takeover_timeout(
+        self,
+        *,
+        session_id: str,
+        takeover_id: str,
+        operator_user_id: str,
+        ttl_seconds: int,
+    ) -> None:
+        self._cancel_takeover_timeout(session_id)
+        timeout_task = asyncio.create_task(
+            self._handle_takeover_lease_timeout(
+                session_id=session_id,
+                takeover_id=takeover_id,
+                operator_user_id=operator_user_id,
+                ttl_seconds=max(ttl_seconds, 1),
+            )
+        )
+        self._takeover_timeout_tasks[session_id] = timeout_task
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            current_task = self._takeover_timeout_tasks.get(session_id)
+            if current_task is done_task:
+                self._takeover_timeout_tasks.pop(session_id, None)
+
+        timeout_task.add_done_callback(_cleanup)
+        self._track_background_task(timeout_task)
+
     def _schedule_pending_timeout(self, session_id: str) -> None:
         ttl = max(self._settings.feature_takeover_pending_ttl_seconds, 1)
         self._cancel_pending_timeout(session_id)
@@ -549,7 +610,13 @@ end
             self._handle_takeover_pending_timeout(session_id=session_id, ttl_seconds=ttl)
         )
         self._pending_timeout_tasks[session_id] = timeout_task
-        timeout_task.add_done_callback(lambda _: self._pending_timeout_tasks.pop(session_id, None))
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            current_task = self._pending_timeout_tasks.get(session_id)
+            if current_task is done_task:
+                self._pending_timeout_tasks.pop(session_id, None)
+
+        timeout_task.add_done_callback(_cleanup)
         self._track_background_task(timeout_task)
 
     async def _handle_takeover_pending_timeout(
@@ -581,11 +648,57 @@ end
                 )
                 await uow.session.update_status(session_id, SessionStatus.COMPLETED)
             await self._force_release_takeover_lease(session_id)
-            # TODO(P2): 增加 takeover lease 到期监控，实现 takeover -> takeover_pending 自动迁移。
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.exception("会话[%s]处理接管待决超时失败: %s", session_id, exc)
+
+    async def _handle_takeover_lease_timeout(
+        self,
+        *,
+        session_id: str,
+        takeover_id: str,
+        operator_user_id: str,
+        ttl_seconds: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(max(ttl_seconds, 1))
+            uow = self._uow_factory()
+            async with uow:
+                session = await uow.session.get_by_id_for_update(session_id)
+                if not session or session.status != SessionStatus.TAKEOVER:
+                    return
+
+                latest_control = self._get_latest_control_event(session)
+                if not latest_control or latest_control.takeover_id != takeover_id:
+                    return
+
+                lease_owned = await self._verify_takeover_lease_owner(
+                    session_id=session_id,
+                    takeover_id=takeover_id,
+                    operator_user_id=operator_user_id,
+                )
+                if lease_owned:
+                    return
+
+                await uow.session.add_event(
+                    session_id,
+                    ControlEvent(
+                        action=ControlAction.EXPIRED,
+                        source=ControlSource.SYSTEM,
+                        reason="takeover_timeout",
+                        request_status="expired",
+                        takeover_id=takeover_id,
+                    ),
+                )
+                await uow.session.update_status(session_id, SessionStatus.TAKEOVER_PENDING)
+            # 先释放 lease 再调度 pending timeout，防止释放失败时已有 timeout 在跑
+            await self._force_release_takeover_lease(session_id)
+            self._schedule_pending_timeout(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("会话[%s]处理接管租约超时失败: %s", session_id, exc)
 
     def _schedule_takeover_completion(
         self,
@@ -596,6 +709,8 @@ end
         takeover_id: str,
         operator_user_id: str,
         cancel_timeout_seconds: int,
+        lease_ttl_seconds: int,
+        expires_at: datetime,
     ) -> None:
         background_task = asyncio.create_task(
             self._complete_takeover_after_cancel(
@@ -605,6 +720,8 @@ end
                 takeover_id=takeover_id,
                 operator_user_id=operator_user_id,
                 cancel_timeout_seconds=cancel_timeout_seconds,
+                lease_ttl_seconds=lease_ttl_seconds,
+                expires_at=expires_at,
             )
         )
         self._track_background_task(background_task)
@@ -620,6 +737,7 @@ end
         handoff_mode: Optional[str] = None,
         request_status: Optional[str] = None,
         takeover_id: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
         task: Optional[Task] = None,
     ) -> ControlEvent:
         control_event = ControlEvent(
@@ -630,6 +748,7 @@ end
             handoff_mode=handoff_mode,
             request_status=request_status,
             takeover_id=takeover_id,
+            expires_at=expires_at,
         )
         if task:
             try:
@@ -690,6 +809,7 @@ end
         operator_user_id: Optional[str] = None,
     ) -> None:
         logger.exception("会话[%s]恢复执行失败: %s", session_id, error)
+        self._cancel_takeover_timeout(session_id)
         if task and not task.done:
             task.cancel(reason="takeover_timeout")
         await self._append_error_event(
@@ -726,9 +846,18 @@ end
         takeover_id: str,
         operator_user_id: str,
         cancel_timeout_seconds: int,
+        lease_ttl_seconds: Optional[int] = None,
+        expires_at: Optional[datetime] = None,
     ) -> None:
         """等待running任务取消完成，异步推进接管状态。"""
         try:
+            effective_lease_ttl_seconds = max(
+                int(lease_ttl_seconds or self._settings.feature_takeover_lease_ttl_seconds),
+                1,
+            )
+            effective_expires_at = expires_at or self._build_lease_expiry(
+                effective_lease_ttl_seconds
+            )
             deadline = time.monotonic() + max(cancel_timeout_seconds, 1)
             while not task.done and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
@@ -746,7 +875,14 @@ end
                     scope=scope,
                     request_status="started",
                     takeover_id=takeover_id,
+                    expires_at=effective_expires_at,
                     task=task,
+                )
+                self._schedule_takeover_timeout(
+                    session_id=session_id,
+                    takeover_id=takeover_id,
+                    operator_user_id=operator_user_id,
+                    ttl_seconds=effective_lease_ttl_seconds,
                 )
                 return
 
@@ -803,7 +939,44 @@ end
             "reason": latest_control.reason,
             "scope": latest_control.scope.value if latest_control.scope else None,
             "handoff_mode": latest_control.handoff_mode,
+            "expires_at": self._to_unix_seconds(latest_control.expires_at),
         }
+
+    async def assert_takeover_shell_access(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        takeover_id: str,
+        is_admin: bool = False,
+        user_role: Optional[str] = None,
+    ) -> None:
+        """校验终端接管 WebSocket 访问权限与租约有效性。"""
+        self._assert_takeover_capability(
+            user_id=user_id,
+            is_admin=is_admin,
+            user_role=user_role,
+            scope=ControlScope.SHELL,
+        )
+        session = await self._get_accessible_session(session_id, user_id, is_admin)
+        if session.status != SessionStatus.TAKEOVER:
+            raise BadRequestError("当前会话不处于接管状态")
+
+        latest_control = self._get_latest_control_event(session)
+        if not latest_control or not latest_control.takeover_id:
+            raise ConflictError("接管租约已失效或不匹配")
+        if latest_control.takeover_id != takeover_id:
+            raise ConflictError("接管租约已失效或不匹配")
+        if latest_control.scope and latest_control.scope != ControlScope.SHELL:
+            raise BadRequestError("当前接管范围不是终端")
+
+        lease_owned = await self._verify_takeover_lease_owner(
+            session_id=session_id,
+            takeover_id=takeover_id,
+            operator_user_id=user_id,
+        )
+        if not lease_owned:
+            raise ConflictError("接管租约已失效或不匹配")
 
     async def start_takeover(
         self,
@@ -839,6 +1012,11 @@ end
                     else control_scope.value
                 ),
                 "takeover_id": latest_control.takeover_id if latest_control else None,
+                "expires_at": (
+                    self._to_unix_seconds(latest_control.expires_at)
+                    if latest_control
+                    else None
+                ),
             }
 
         if session.status not in {
@@ -851,11 +1029,13 @@ end
             )
 
         takeover_id = f"tk_{uuid.uuid4().hex[:12]}"
+        lease_ttl_seconds = max(self._settings.feature_takeover_lease_ttl_seconds, 1)
+        lease_expires_at = self._build_lease_expiry(lease_ttl_seconds)
         acquired = await self._acquire_takeover_lease(
             session_id,
             takeover_id=takeover_id,
             operator_user_id=user_id,
-            ttl_seconds=max(self._settings.feature_takeover_lease_ttl_seconds, 1),
+            ttl_seconds=lease_ttl_seconds,
         )
         if not acquired:
             raise ConflictError("接管租约冲突，请稍后重试")
@@ -871,12 +1051,15 @@ end
                     takeover_id=takeover_id,
                     operator_user_id=user_id,
                     cancel_timeout_seconds=cancel_timeout_seconds,
+                    lease_ttl_seconds=lease_ttl_seconds,
+                    expires_at=lease_expires_at,
                 )
                 return {
                     "takeover_id": takeover_id,
                     "request_status": "starting",
                     "status": SessionStatus.RUNNING,
                     "scope": control_scope.value,
+                    "expires_at": self._to_unix_seconds(lease_expires_at),
                 }
             logger.warning(
                 "会话[%s]处于RUNNING但无活跃task，直接按无任务路径进入接管",
@@ -895,12 +1078,20 @@ end
             scope=control_scope,
             request_status="started",
             takeover_id=takeover_id,
+            expires_at=lease_expires_at,
+        )
+        self._schedule_takeover_timeout(
+            session_id=session_id,
+            takeover_id=takeover_id,
+            operator_user_id=user_id,
+            ttl_seconds=lease_ttl_seconds,
         )
         return {
             "takeover_id": takeover_id,
             "request_status": "started",
             "status": SessionStatus.TAKEOVER,
             "scope": control_scope.value,
+            "expires_at": self._to_unix_seconds(lease_expires_at),
         }
 
     async def renew_takeover(
@@ -928,11 +1119,13 @@ end
             if lease_ttl_seconds is not None and lease_ttl_seconds > 0
             else self._settings.feature_takeover_lease_ttl_seconds
         )
+        effective_ttl_seconds = max(int(effective_ttl_seconds), 1)
+        lease_expires_at = self._build_lease_expiry(effective_ttl_seconds)
         renewed = await self._renew_takeover_lease(
             session_id,
             takeover_id=takeover_id,
             operator_user_id=user_id,
-            ttl_seconds=max(effective_ttl_seconds, 1),
+            ttl_seconds=effective_ttl_seconds,
         )
         if not renewed:
             raise ConflictError("接管租约已失效或不匹配")
@@ -943,11 +1136,19 @@ end
             source=ControlSource.USER,
             request_status="renewed",
             takeover_id=takeover_id,
+            expires_at=lease_expires_at,
+        )
+        self._schedule_takeover_timeout(
+            session_id=session_id,
+            takeover_id=takeover_id,
+            operator_user_id=user_id,
+            ttl_seconds=effective_ttl_seconds,
         )
         return {
             "status": SessionStatus.TAKEOVER,
             "request_status": "renewed",
             "takeover_id": takeover_id,
+            "expires_at": self._to_unix_seconds(lease_expires_at),
         }
 
     async def reject_takeover(
@@ -968,6 +1169,7 @@ end
         session = await self._get_accessible_session(session_id, user_id, is_admin)
         if session.status != SessionStatus.TAKEOVER_PENDING:
             raise BadRequestError("当前会话不处于待接管状态")
+        self._cancel_takeover_timeout(session_id)
         self._cancel_pending_timeout(session_id)
         latest_control = self._get_latest_control_event(session)
         takeover_id = latest_control.takeover_id if latest_control else None
@@ -998,6 +1200,7 @@ end
                 takeover_id=takeover_id,
                 task=resumed_task,
             )
+            await self._force_release_takeover_lease(session_id)
             return {"status": SessionStatus.RUNNING, "reason": "continue"}
 
         if decision_normalized == "terminate":
@@ -1020,7 +1223,7 @@ end
         session_id: str,
         user_id: str,
         *,
-        handoff_mode: str = "complete",
+        handoff_mode: str = "continue",
         is_admin: bool = False,
         user_role: Optional[str] = None,
     ) -> Dict[str, object]:
@@ -1033,6 +1236,7 @@ end
         session = await self._get_accessible_session(session_id, user_id, is_admin)
         if session.status != SessionStatus.TAKEOVER:
             raise BadRequestError("当前会话不处于接管状态")
+        self._cancel_takeover_timeout(session_id)
         latest_control = self._get_latest_control_event(session)
         takeover_id = latest_control.takeover_id if latest_control else None
 
@@ -1101,6 +1305,10 @@ end
             if not task.done():
                 task.cancel()
         self._pending_timeout_tasks.clear()
+        for task in list(self._takeover_timeout_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._takeover_timeout_tasks.clear()
         for task in list(self._background_tasks):
             if not task.done():
                 task.cancel()

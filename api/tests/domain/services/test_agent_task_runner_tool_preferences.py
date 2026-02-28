@@ -16,11 +16,17 @@ from app.domain.models.event import (
     ControlScope,
     ControlSource,
     MessageEvent,
+    StepEvent,
+    StepEventStatus,
+    ToolEvent,
+    ToolEventStatus,
     WaitEvent,
 )
 from app.domain.models.session import SessionStatus
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
+from app.domain.models.tool_result import ToolResult
 from app.domain.models.user_tool_preference import ToolType
+from app.domain.models.plan import Step
 from app.domain.services.agent_task_runner import AgentTaskRunner
 
 pytestmark = pytest.mark.anyio
@@ -124,6 +130,54 @@ class _WaitFlow:
 
     async def invoke(self, message):
         yield WaitEvent()
+
+
+class _UnknownBurstFlow:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.skill_contexts: list[str] = []
+
+    def set_skill_context(self, skill_context: str) -> None:
+        self.skill_contexts.append(skill_context)
+
+    async def invoke(self, message):
+        step = Step(id="step-1", description="执行步骤")
+        yield StepEvent(step=step, status=StepEventStatus.STARTED)
+        for index in range(3):
+            yield ToolEvent(
+                tool_call_id=f"unknown-{index}",
+                tool_name="unknown",
+                function_name="missing_tool",
+                function_args={},
+                function_result=ToolResult(
+                    success=False,
+                    message="UNKNOWN_TOOL: missing_tool",
+                    data={"code": "UNKNOWN_TOOL", "tool_name": "missing_tool"},
+                ),
+                status=ToolEventStatus.CALLED,
+            )
+        yield StepEvent(step=step, status=StepEventStatus.COMPLETED)
+        yield MessageEvent(role="assistant", message="done")
+
+
+class _ToolOnlyFlow:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.skill_contexts: list[str] = []
+
+    def set_skill_context(self, skill_context: str) -> None:
+        self.skill_contexts.append(skill_context)
+
+    async def invoke(self, message):
+        yield ToolEvent(
+            tool_call_id="tool-only",
+            tool_name="message",
+            function_name="message_notify_user",
+            function_args={"text": "processing"},
+            function_result=ToolResult(success=True, data="ok"),
+            status=ToolEventStatus.CALLED,
+        )
+        yield MessageEvent(role="assistant", message="ok")
 
 
 class _EmptyInputStream:
@@ -532,9 +586,8 @@ async def test_invoke_uses_frozen_skill_pool_for_each_message(monkeypatch) -> No
     await runner.invoke(_DummyMessageTask("please use skill"))
 
     assert load_calls["count"] == 1
-    assert len(fake_skill_tool.initialize_history) >= 2
+    assert len(fake_skill_tool.initialize_history) == 1
     assert [skill.id for skill in fake_skill_tool.initialize_history[0]] == ["skill-enabled"]
-    assert [skill.id for skill in fake_skill_tool.initialize_history[1]] == ["skill-enabled"]
 
 
 async def test_runner_passes_overflow_config_to_flow(monkeypatch) -> None:
@@ -682,3 +735,138 @@ async def test_ambiguous_message_triggers_llm_but_explicit_message_does_not(monk
 
     await runner._select_skills_for_message(pool, "请继续处理 SQL 优化并补充执行计划")
     assert len(fake_classifier.calls) == 1
+
+
+async def test_step_lock_reselects_once_when_unknown_tool_hits_threshold(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _UnknownBurstFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+            skill_selection={
+                "step_skill_lock_enabled": True,
+                "step_skill_reselect_unknown_tool_threshold": 2,
+                "step_skill_reselect_max_per_step": 1,
+            },
+        ),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-step-lock",
+        user_id="user-step-lock",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+
+    skill_a = _build_skill("skill-a", name="Skill A")
+    skill_b = _build_skill("skill-b", name="Skill B")
+    runner._mcp_tool = _FakeMCPTool()
+    runner._a2a_tool = _FakeA2ATool()
+    fake_skill_tool = _FakeSkillTool()
+    runner._skill_tool = fake_skill_tool
+    runner._skill_bundle_sync = _FakeSkillBundleSync()
+
+    async def fake_load_user_preferences_map(tool_type: ToolType) -> dict[str, bool]:
+        return {}
+
+    async def fake_load_enabled_skills() -> list[Skill]:
+        return [skill_a, skill_b]
+
+    selection_calls = {"count": 0}
+
+    async def fake_select_skills_for_message(
+        pool: list[Skill], user_message: str
+    ) -> tuple[list[Skill], object]:
+        selection_calls["count"] += 1
+        if selection_calls["count"] == 1:
+            return [skill_a], object()
+        return [skill_b], object()
+
+    monkeypatch.setattr(runner, "_load_user_preferences_map", fake_load_user_preferences_map)
+    monkeypatch.setattr(runner, "_load_enabled_skills", fake_load_enabled_skills)
+    monkeypatch.setattr(runner, "_select_skills_for_message", fake_select_skills_for_message)
+
+    await runner.invoke(_DummyMessageTask("请继续处理"))
+
+    initialized_skill_ids = [[skill.id for skill in items] for items in fake_skill_tool.initialize_history]
+    assert ["skill-b"] in initialized_skill_ids
+    assert initialized_skill_ids.count(["skill-b"]) == 1
+
+
+async def test_non_planner_flow_uses_virtual_step_id_for_skill_lock(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _ToolOnlyFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+            skill_selection={"step_skill_lock_enabled": True},
+        ),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-virtual-step",
+        user_id="user-virtual-step",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+
+    runner._mcp_tool = _FakeMCPTool()
+    runner._a2a_tool = _FakeA2ATool()
+    runner._skill_tool = _FakeSkillTool()
+    runner._skill_bundle_sync = _FakeSkillBundleSync()
+
+    async def fake_load_user_preferences_map(tool_type: ToolType) -> dict[str, bool]:
+        return {}
+
+    async def fake_load_enabled_skills() -> list[Skill]:
+        return [_build_skill("skill-a", name="Skill A")]
+
+    monkeypatch.setattr(runner, "_load_user_preferences_map", fake_load_user_preferences_map)
+    monkeypatch.setattr(runner, "_load_enabled_skills", fake_load_enabled_skills)
+
+    await runner.invoke(_DummyMessageTask("继续"))
+
+    assert runner._last_virtual_step_id.startswith("react-cycle-")
+
+
+def test_runtime_context_includes_capped_available_tool_summary() -> None:
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-tool-summary",
+        user_id="user-tool-summary",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+    runner._skill_tool = _FakeSkillTool()
+
+    summary = runner._build_available_tool_summary()
+
+    assert "shell" in summary.lower()
+    assert "browser" in summary.lower()
+    assert "message_ask_user" in summary
+    assert len(summary) < 4000

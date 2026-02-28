@@ -248,6 +248,60 @@ export type CreateSessionResponse = {
   session_id: string;
 };
 
+export type TakeoverScope = "shell" | "browser";
+
+export type GetTakeoverResponse = {
+  status: SessionStatus;
+  takeover_id?: string;
+  request_status?: string;
+  reason?: string;
+  scope?: string;
+  handoff_mode?: string;
+  expires_at?: number;
+};
+
+export type StartTakeoverParams = {
+  scope?: TakeoverScope;
+};
+
+export type StartTakeoverResponse = {
+  status: SessionStatus;
+  request_status: string;
+  scope: string;
+  takeover_id?: string;
+  reason?: string;
+  expires_at?: number;
+};
+
+export type RejectTakeoverParams = {
+  decision: "continue" | "terminate";
+};
+
+export type RejectTakeoverResponse = {
+  status: SessionStatus;
+  reason: string;
+};
+
+export type EndTakeoverParams = {
+  handoff_mode?: "continue" | "complete";
+};
+
+export type EndTakeoverResponse = {
+  status: SessionStatus;
+  handoff_mode: string;
+};
+
+export type RenewTakeoverParams = {
+  takeover_id: string;
+};
+
+export type RenewTakeoverResponse = {
+  status: SessionStatus;
+  request_status: string;
+  takeover_id: string;
+  expires_at?: number;
+};
+
 export type ChatMessageData = {
   event_id?: string;
   created_at?: number;

@@ -41,3 +41,11 @@ class ShellKillRequest(BaseModel):
     """关闭进程请求结构体"""
 
     session_id: str = Field(..., description="目标 Shell 会话的唯一标识符")
+
+
+class ShellResizeRequest(BaseModel):
+    """调整PTY窗口尺寸请求结构体"""
+
+    session_id: str = Field(..., description="目标 Shell 会话的唯一标识符")
+    cols: int = Field(..., gt=0, le=500, description="终端列数")
+    rows: int = Field(..., gt=0, le=200, description="终端行数")

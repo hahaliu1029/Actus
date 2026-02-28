@@ -1,5 +1,5 @@
 import logging
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Dict
 
 from app.domain.models.event import (
     BaseEvent,
@@ -18,6 +18,7 @@ from app.domain.models.event import (
 from app.domain.models.file import File
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan, Step
+from app.domain.models.tool_result import ToolResult
 from app.domain.services.prompts.react import (
     EXECUTION_PROMPT,
     REACT_SYSTEM_PROMPT,
@@ -38,11 +39,54 @@ class ReActAgent(BaseAgent):
     _format: str = (
         "json_object"  # format控制的是content、工具调用控制的是tool_calls两者不冲突
     )
+    _step_tool_attempt_rounds: int = 0
+    _step_failed_tool_calls: int = 0
+
+    def _intercept_tool_call(
+        self, function_name: str, function_args: Dict[str, Any]
+    ) -> ToolResult | None:
+        if function_name != "message_ask_user":
+            return None
+
+        required_attempts = (
+            self._agent_config.skill_selection.ask_user_min_attempt_rounds_per_step
+        )
+        effective_attempt_score = max(
+            self._step_tool_attempt_rounds,
+            self._step_failed_tool_calls,
+        )
+        if effective_attempt_score >= required_attempts:
+            return None
+
+        return ToolResult(
+            success=False,
+            message="ASK_USER_BLOCKED_BY_POLICY",
+            data={
+                "code": "ASK_USER_BLOCKED_BY_POLICY",
+                "tool_attempt_rounds": self._step_tool_attempt_rounds,
+                "failed_tool_calls": self._step_failed_tool_calls,
+                "effective_attempt_score": effective_attempt_score,
+                "required_attempts": required_attempts,
+                "remaining_attempts": max(
+                    0, required_attempts - effective_attempt_score
+                ),
+            },
+        )
+
+    def _on_tool_result(self, function_name: str, result: ToolResult) -> None:
+        # 计数粒度：按每个 tool_call 计数（而非每轮LLM回合）；unknown-tool 同样会走这里。
+        self._step_tool_attempt_rounds += 1
+        if not result.success:
+            self._step_failed_tool_calls += 1
 
     async def execute_step(
         self, plan: Plan, step: Step, message: Message
     ) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的消息+规划+子步骤，执行相应的子步骤"""
+        # execute_step 与 Planner step 一一对应；无 Planner 时由 Runner 构造虚拟 step 并管理锁定。
+        self._step_tool_attempt_rounds = 0
+        self._step_failed_tool_calls = 0
+
         # 1.根据传递的内容生成执行消息
         query = EXECUTION_PROMPT.format(
             message=message.message,
@@ -61,13 +105,26 @@ class ReActAgent(BaseAgent):
             if isinstance(event, ToolEvent):
                 # 5.工具事件需要判断工具的名称是否为message_ask_user
                 if event.function_name == "message_ask_user":
-                    # 6.工具如果在调用中，我们需要返回一条消息告知用户需要让用户处理什么
-                    if event.status == ToolEventStatus.CALLING:
+                    if event.status == ToolEventStatus.CALLED:
+                        result_data = (
+                            event.function_result.data
+                            if event.function_result and event.function_result.data
+                            else {}
+                        )
+                        blocked_by_policy = (
+                            isinstance(result_data, dict)
+                            and result_data.get("code") == "ASK_USER_BLOCKED_BY_POLICY"
+                        )
+                        if blocked_by_policy:
+                            logger.info(
+                                "message_ask_user 在本 step 内被门控拦截，继续自动执行。"
+                            )
+                            continue
+
                         yield MessageEvent(
                             role="assistant",
                             message=event.function_args.get("text", ""),
                         )
-                    elif event.status == ToolEventStatus.CALLED:
                         # 7.根据接管建议分流：none 走等待，shell/browser 走控制请求
                         suggest_takeover = str(
                             event.function_args.get("suggest_user_takeover", "none")
