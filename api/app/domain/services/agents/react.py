@@ -74,6 +74,9 @@ class ReActAgent(BaseAgent):
         )
 
     def _on_tool_result(self, function_name: str, result: ToolResult) -> None:
+        # message_ask_user 不计入尝试/失败计数，避免通过连续被拦截提问绕过门控。
+        if function_name == "message_ask_user":
+            return
         # 计数粒度：按每个 tool_call 计数（而非每轮LLM回合）；unknown-tool 同样会走这里。
         self._step_tool_attempt_rounds += 1
         if not result.success:

@@ -278,3 +278,25 @@ def test_ask_user_allowed_after_attempt_threshold() -> None:
     agent._step_failed_tool_calls = 0
 
     assert agent._intercept_tool_call("message_ask_user", {"text": "需要确认"}) is None
+
+
+def test_blocked_ask_user_does_not_increment_attempt_counters() -> None:
+    agent = ReActAgent(
+        uow_factory=_DummyUoW,
+        session_id="s-react-gating-no-count",
+        agent_config=AgentConfig(max_iterations=3, max_retries=2, max_search_results=5),
+        llm=_DummyLLM(),
+        json_parser=_DummyJsonParser(),
+        tools=[],
+    )
+    agent._step_tool_attempt_rounds = 0
+    agent._step_failed_tool_calls = 0
+
+    result = agent._intercept_tool_call("message_ask_user", {"text": "需要确认"})
+    assert result is not None
+    assert result.success is False
+
+    agent._on_tool_result("message_ask_user", result)
+
+    assert agent._step_tool_attempt_rounds == 0
+    assert agent._step_failed_tool_calls == 0
