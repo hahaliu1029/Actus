@@ -86,7 +86,8 @@ const {
     observe = vi.fn();
     disconnect = vi.fn();
 
-    constructor(_callback: ResizeObserverCallback) {
+    constructor(callback: ResizeObserverCallback) {
+      void callback;
       observers.push(this as unknown as (typeof observers)[number]);
     }
   }

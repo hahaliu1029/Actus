@@ -138,7 +138,6 @@ export function WorkbenchInteractiveTerminal({
         wsRef.current.close();
         wsRef.current = null;
       }
-      setConnectionState("closed");
       return;
     }
 
@@ -320,12 +319,15 @@ export function WorkbenchInteractiveTerminal({
     sendBytes(new Uint8Array([0x03]));
   };
 
+  const displayConnectionState: ConnectionState =
+    panelVisible && wsUrl ? connectionState : "closed";
+
   const connectionLabel =
-    connectionState === "connected"
+    displayConnectionState === "connected"
       ? "已连接"
-      : connectionState === "connecting"
+      : displayConnectionState === "connecting"
         ? "连接中..."
-        : connectionState === "reconnecting"
+        : displayConnectionState === "reconnecting"
           ? "重连中..."
           : "已断开";
 
@@ -339,7 +341,7 @@ export function WorkbenchInteractiveTerminal({
 
       <div className="min-h-0 flex-1 p-2">
         <div className="flex h-full flex-col rounded-lg border border-border bg-surface-1 p-2">
-          {connectionState !== "connected" ? (
+          {displayConnectionState !== "connected" ? (
             <div className="mb-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 size={12} className="animate-spin" />
               正在建立终端连接...
