@@ -26,4 +26,17 @@ describe("sessionApi takeover", () => {
       handoff_mode: "continue",
     });
   });
+
+  it("reopenTakeover 发送 POST 且无请求体参数", async () => {
+    mockPost.mockResolvedValue({
+      status: "takeover_pending",
+      request_status: "reopened",
+      reason: null,
+      remaining_seconds: 240,
+    });
+
+    await sessionApi.reopenTakeover("sid-2");
+
+    expect(mockPost).toHaveBeenCalledWith("/sessions/sid-2/takeover/reopen", {});
+  });
 });

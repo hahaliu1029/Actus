@@ -1299,6 +1299,59 @@ end
 
         raise BadRequestError("handoff_mode仅支持 continue 或 complete")
 
+    async def reopen_takeover(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        is_admin: bool = False,
+        user_role: Optional[str] = None,
+    ):
+        """已完成会话的补救接管：completed -> takeover_pending，并调度 pending timeout。"""
+        # scope 在 reopen 阶段故意不传：reopen 仅恢复到 takeover_pending，
+        # 具体 scope 在后续 start_takeover 时由用户选择确定
+        self._assert_takeover_capability(
+            user_id=user_id, is_admin=is_admin, user_role=user_role
+        )
+        await self._get_accessible_session(session_id, user_id, is_admin)
+
+        window_seconds = self._settings.feature_takeover_reopen_window_seconds
+        if window_seconds <= 0:
+            raise BadRequestError("REOPEN_DISABLED")
+
+        # 使用 _uow_factory() 创建独立 UoW，避免 self._uow 单例共享 DB session
+        uow = self._uow_factory()
+        async with uow:
+            # 事务内加锁重读，防并发
+            session = await uow.session.get_by_id_for_update(session_id)
+            if not session or session.status != SessionStatus.COMPLETED:
+                raise BadRequestError("当前状态不支持恢复接管")
+            if not session.completed_at:
+                raise BadRequestError("REOPEN_WINDOW_EXPIRED")
+            # 与领域模型 / ORM 保持一致，使用 datetime.now()（naive local time）
+            elapsed = (datetime.now() - session.completed_at).total_seconds()
+            if elapsed > window_seconds:
+                raise BadRequestError("REOPEN_WINDOW_EXPIRED")
+            # 使用 add_event 而非 _append_control_event，
+            # 因为 completed 阶段无活跃 output stream
+            await uow.session.add_event(
+                session_id,
+                ControlEvent(
+                    action=ControlAction.REOPENED,
+                    source=ControlSource.USER,
+                ),
+            )
+            await uow.session.update_status(session_id, SessionStatus.TAKEOVER_PENDING)
+
+        self._schedule_pending_timeout(session_id)
+        remaining_seconds = window_seconds - elapsed
+        return {
+            "status": SessionStatus.TAKEOVER_PENDING,
+            "request_status": "reopened",
+            "reason": None,
+            "remaining_seconds": remaining_seconds,
+        }
+
     async def shutdown(self) -> None:
         """关闭Agent服务"""
         for task in list(self._pending_timeout_tasks.values()):

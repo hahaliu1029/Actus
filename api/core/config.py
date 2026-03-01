@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     feature_takeover_single_worker_only: bool = True
     feature_takeover_pending_ttl_seconds: int = 300
     feature_takeover_lease_ttl_seconds: int = 900
+    feature_takeover_reopen_window_seconds: int = 300
     feature_takeover_lease_guard_interval_seconds: int = 15
 
     # JWT 配置

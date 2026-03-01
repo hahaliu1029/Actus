@@ -43,6 +43,7 @@ class ControlAction(str, Enum):
     RENEWED = "renewed"
     EXPIRED = "expired"
     ENDED = "ended"
+    REOPENED = "reopened"
 
 
 class ControlScope(str, Enum):

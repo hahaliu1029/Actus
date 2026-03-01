@@ -207,11 +207,20 @@ class DBSessionRepository(SessionRepository):
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
         """更新会话状态"""
-        # 1.构建更新语句并执行
+        # 1.构建更新值
+        values = {"status": status.value, "updated_at": datetime.now()}
+        if status == SessionStatus.COMPLETED:
+            values["completed_at"] = datetime.now()
+        elif status == SessionStatus.TAKEOVER_PENDING:
+            # reopen 场景：从 completed 恢复时清空 completed_at，
+            # 避免统计逻辑误判"非空即完成过"
+            values["completed_at"] = None
+
+        # 2.构建更新语句并执行
         stmt = (
             update(SessionModel)
             .where(SessionModel.id == session_id)
-            .values(status=status.value)
+            .values(**values)
         )
         result = await self.db_session.execute(stmt)
 

@@ -45,6 +45,7 @@ from app.interfaces.schemas.session import (
     RejectTakeoverResponse,
     RenewTakeoverRequest,
     RenewTakeoverResponse,
+    ReopenTakeoverResponse,
     ShellReadRequest,
     ShellReadResponse,
     StartTakeoverRequest,
@@ -431,6 +432,31 @@ async def end_takeover(
     return Response.success(
         msg="结束会话接管成功",
         data=EndTakeoverResponse.model_validate(result),
+    )
+
+
+@router.post(
+    path="/{session_id}/takeover/reopen",
+    response_model=Response[ReopenTakeoverResponse],
+    summary="补救接管已完成的会话",
+    description="在完成窗口期内恢复已完成会话到接管待决状态",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def reopen_takeover(
+    session_id: str,
+    current_user: CurrentUser,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[ReopenTakeoverResponse]:
+    """补救接管已完成的会话"""
+    result = await agent_service.reopen_takeover(
+        session_id=session_id,
+        user_id=current_user.id,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    return Response.success(
+        msg="补救接管成功",
+        data=ReopenTakeoverResponse.model_validate(result),
     )
 
 

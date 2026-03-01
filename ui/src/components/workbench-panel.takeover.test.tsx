@@ -7,6 +7,7 @@ const {
   mockEndTakeover,
   mockRejectTakeover,
   mockRenewTakeover,
+  mockReopenTakeover,
   mockFetchSessionById,
   mockSetMessage,
 } = vi.hoisted(() => ({
@@ -14,6 +15,7 @@ const {
   mockEndTakeover: vi.fn(),
   mockRejectTakeover: vi.fn(),
   mockRenewTakeover: vi.fn(),
+  mockReopenTakeover: vi.fn(),
   mockFetchSessionById: vi.fn(),
   mockSetMessage: vi.fn(),
 }));
@@ -66,6 +68,7 @@ vi.mock("@/lib/api/session", () => ({
     endTakeover: mockEndTakeover,
     rejectTakeover: mockRejectTakeover,
     renewTakeover: mockRenewTakeover,
+    reopenTakeover: mockReopenTakeover,
   },
 }));
 
@@ -108,6 +111,12 @@ describe("WorkbenchPanel takeover controls", () => {
       status: "takeover",
       request_status: "renewed",
       takeover_id: "tk_renew_1",
+    });
+    mockReopenTakeover.mockResolvedValue({
+      status: "takeover_pending",
+      request_status: "reopened",
+      reason: null,
+      remaining_seconds: 240,
     });
     mockFetchSessionById.mockResolvedValue(undefined);
 
@@ -332,5 +341,76 @@ describe("WorkbenchPanel takeover controls", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(mockRenewTakeover).toHaveBeenCalledTimes(1);
+  });
+
+  it("completed 状态下按钮可见", () => {
+    render(
+      <WorkbenchPanel
+        sessionId="sid-completed"
+        status="completed"
+        takeoverId={null}
+        takeoverScope={null}
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={false}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: "主动接管" })).toBeInTheDocument();
+  });
+
+  it("completed 状态先调用 reopen 再调用 startTakeover", async () => {
+    const user = userEvent.setup();
+    render(
+      <WorkbenchPanel
+        sessionId="sid-completed-reopen"
+        status="completed"
+        takeoverId={null}
+        takeoverScope={null}
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={false}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "主动接管" }));
+    await user.click(await screen.findByRole("menuitem", { name: "接管终端" }));
+
+    expect(mockReopenTakeover).toHaveBeenCalledWith("sid-completed-reopen");
+    expect(mockStartTakeover).toHaveBeenCalledTimes(1);
+    expect(mockStartTakeover).toHaveBeenCalledWith("sid-completed-reopen", { scope: "shell" });
+  });
+
+  it("reopen 成功但 start 失败时会刷新会话并给出正确提示", async () => {
+    const user = userEvent.setup();
+    mockStartTakeover.mockRejectedValueOnce(new Error("当前状态不支持启动接管"));
+
+    render(
+      <WorkbenchPanel
+        sessionId="sid-reopen-start-fail"
+        status="completed"
+        takeoverId={null}
+        takeoverScope={null}
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={false}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "主动接管" }));
+    await user.click(await screen.findByRole("menuitem", { name: "接管终端" }));
+
+    expect(mockReopenTakeover).toHaveBeenCalledWith("sid-reopen-start-fail");
+    expect(mockFetchSessionById).toHaveBeenCalledWith("sid-reopen-start-fail", { silent: true });
+    expect(mockSetMessage).toHaveBeenCalledWith({
+      type: "error",
+      text: "当前状态不支持启动接管",
+    });
   });
 });

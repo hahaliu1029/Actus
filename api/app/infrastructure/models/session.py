@@ -77,6 +77,10 @@ class SessionModel(Base):
         nullable=True,
         index=True,
     )  # 会话所属用户ID
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )  # 完成时间
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,

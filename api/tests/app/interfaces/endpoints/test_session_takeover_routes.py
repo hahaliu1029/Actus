@@ -91,6 +91,15 @@ class _FakeAgentService:
             "handoff_mode": kwargs["handoff_mode"],
         }
 
+    async def reopen_takeover(self, **kwargs):
+        self.calls.append(("reopen_takeover", kwargs))
+        return {
+            "status": "takeover_pending",
+            "request_status": "reopened",
+            "reason": None,
+            "remaining_seconds": 240.5,
+        }
+
 
 async def _request(
     method: str,
@@ -295,6 +304,35 @@ async def test_end_takeover_route_uses_continue_as_default() -> None:
                 "session_id": "s1",
                 "user_id": "test-user",
                 "handoff_mode": "continue",
+                "is_admin": False,
+                "user_role": "user",
+            },
+        )
+    ]
+
+
+async def test_reopen_takeover_route() -> None:
+    fake_service = _FakeAgentService()
+    response = await _request(
+        "POST",
+        "/api/sessions/s1/takeover/reopen",
+        fake_agent_service=fake_service,
+        payload={},
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["code"] == 200
+    assert body["data"]["status"] == "takeover_pending"
+    assert body["data"]["request_status"] == "reopened"
+    assert body["data"]["reason"] is None
+    assert body["data"]["remaining_seconds"] == 240.5
+    assert fake_service.calls == [
+        (
+            "reopen_takeover",
+            {
+                "session_id": "s1",
+                "user_id": "test-user",
                 "is_admin": False,
                 "user_role": "user",
             },

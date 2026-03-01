@@ -93,7 +93,7 @@ function resolveControlStatus(
   const reason = asString(data.reason).trim().toLowerCase();
   const handoffMode = asString(data.handoff_mode).trim().toLowerCase();
 
-  if (action === "requested") {
+  if (action === "requested" || action === "reopened") {
     return "takeover_pending";
   }
   if (action === "started" || action === "renewed") {

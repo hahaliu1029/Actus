@@ -26,6 +26,12 @@ class _SessionRepo:
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
         self.update_status_calls.append((session_id, status))
+        # 模拟 completed_at 行为：COMPLETED 时设置，TAKEOVER_PENDING 时清空
+        if self._session and self._session.id == session_id:
+            if status == SessionStatus.COMPLETED:
+                self._session.completed_at = datetime.now()
+            elif status == SessionStatus.TAKEOVER_PENDING:
+                self._session.completed_at = None
 
     async def add_event(self, session_id: str, event) -> None:
         self.add_event_calls.append((session_id, event))
@@ -1049,3 +1055,252 @@ async def test_shutdown_cancels_background_tasks() -> None:
     assert pending_task.cancelled() is True
     assert background_task.cancelled() is True
     assert _DummyTaskCls.destroyed is True
+
+
+async def test_update_status_completed_sets_completed_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """当 reject_takeover(terminate) 触发 update_status(COMPLETED) 时，
+    mock 的 _SessionRepo 应模拟设置 completed_at。"""
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.TAKEOVER_PENDING,
+        events=[
+            ControlEvent(
+                action=ControlAction.REQUESTED,
+                source=ControlSource.AGENT,
+                scope=ControlScope.SHELL,
+                takeover_id="tk_completed_at_test",
+            )
+        ],
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_append_control_event(_session_id: str, **kwargs):
+        return None
+
+    async def fake_force_release_takeover_lease(session_id: str):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_append_control_event", fake_append_control_event)
+    monkeypatch.setattr(service, "_force_release_takeover_lease", fake_force_release_takeover_lease)
+
+    assert session.completed_at is None
+    await service.reject_takeover("s1", "u1", decision="terminate")
+    assert session.completed_at is not None
+
+
+async def test_reopen_takeover_success_schedules_pending_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reopen_takeover 成功时应更新状态到 takeover_pending 并调度 pending timeout。"""
+    from datetime import timedelta
+
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.COMPLETED,
+        completed_at=datetime.now() - timedelta(seconds=60),
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    schedule_calls: list[str] = []
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    def fake_schedule_pending_timeout(session_id: str) -> None:
+        schedule_calls.append(session_id)
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_schedule_pending_timeout", fake_schedule_pending_timeout)
+    monkeypatch.setattr(
+        service._settings, "feature_takeover_reopen_window_seconds", 300, raising=False
+    )
+
+    result = await service.reopen_takeover("s1", "u1", is_admin=False, user_role="user")
+
+    assert result["status"] == SessionStatus.TAKEOVER_PENDING
+    assert result["request_status"] == "reopened"
+    assert result["remaining_seconds"] > 0
+    assert schedule_calls == ["s1"]
+    assert uow.session.update_status_calls == [("s1", SessionStatus.TAKEOVER_PENDING)]
+    # reopen 后 completed_at 应被清空，避免统计误判
+    assert session.completed_at is None
+    assert uow.session.add_event_calls
+    event = uow.session.add_event_calls[0][1]
+    assert event.action == ControlAction.REOPENED
+    assert event.source == ControlSource.USER
+
+
+async def test_reopen_takeover_expired_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """超过 reopen 窗口应抛出 REOPEN_WINDOW_EXPIRED。"""
+    from datetime import timedelta
+
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.COMPLETED,
+        completed_at=datetime.now() - timedelta(seconds=600),
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(
+        service._settings, "feature_takeover_reopen_window_seconds", 300, raising=False
+    )
+
+    with pytest.raises(BadRequestError, match="REOPEN_WINDOW_EXPIRED"):
+        await service.reopen_takeover("s1", "u1", is_admin=False, user_role="user")
+
+
+async def test_reopen_takeover_disabled_when_window_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """window_seconds <= 0 时应抛出 REOPEN_DISABLED。"""
+    uow = _Uow()
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return Session(id="s1", user_id="u1", status=SessionStatus.COMPLETED)
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(
+        service._settings, "feature_takeover_reopen_window_seconds", 0, raising=False
+    )
+
+    with pytest.raises(BadRequestError, match="REOPEN_DISABLED"):
+        await service.reopen_takeover("s1", "u1", is_admin=False, user_role="user")
+
+
+async def test_reopen_takeover_boundary_elapsed_equals_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """elapsed == window_seconds 时恰好在边界内，应成功。"""
+    from datetime import timedelta
+
+    window = 300
+    # 使用略小于 window 的值避免测试中微小的时间漂移
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.COMPLETED,
+        completed_at=datetime.now() - timedelta(seconds=window - 1),
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    def fake_schedule_pending_timeout(session_id: str) -> None:
+        pass
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_schedule_pending_timeout", fake_schedule_pending_timeout)
+    monkeypatch.setattr(
+        service._settings, "feature_takeover_reopen_window_seconds", window, raising=False
+    )
+
+    result = await service.reopen_takeover("s1", "u1", is_admin=False, user_role="user")
+    assert result["status"] == SessionStatus.TAKEOVER_PENDING
+
+
+async def test_reopen_takeover_admin_can_reopen_others_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """admin 用户可以 reopen 他人会话。"""
+    from datetime import timedelta
+
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.COMPLETED,
+        completed_at=datetime.now() - timedelta(seconds=60),
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    def fake_schedule_pending_timeout(session_id: str) -> None:
+        pass
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_schedule_pending_timeout", fake_schedule_pending_timeout)
+    monkeypatch.setattr(
+        service._settings, "feature_takeover_reopen_window_seconds", 300, raising=False
+    )
+
+    result = await service.reopen_takeover(
+        "s1", "admin_user", is_admin=True, user_role="super_admin"
+    )
+    assert result["status"] == SessionStatus.TAKEOVER_PENDING
+
+
+async def test_reopen_takeover_concurrent_requests_only_one_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """并发两次 reopen，仅一次成功，另一次因状态非 completed 而失败，且不重复写入事件。"""
+    from datetime import timedelta
+
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.COMPLETED,
+        completed_at=datetime.now() - timedelta(seconds=60),
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    call_count = {"reopen": 0}
+
+    original_get_for_update = uow.session.get_by_id_for_update
+
+    async def mock_get_for_update(session_id):
+        call_count["reopen"] += 1
+        s = await original_get_for_update(session_id)
+        if call_count["reopen"] > 1:
+            # 模拟第二次读到的状态已被第一次修改为 takeover_pending
+            s.status = SessionStatus.TAKEOVER_PENDING
+        return s
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    def fake_schedule_pending_timeout(session_id: str) -> None:
+        pass
+
+    monkeypatch.setattr(uow.session, "get_by_id_for_update", mock_get_for_update)
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_schedule_pending_timeout", fake_schedule_pending_timeout)
+    monkeypatch.setattr(
+        service._settings, "feature_takeover_reopen_window_seconds", 300, raising=False
+    )
+
+    # 第一次调用成功
+    result = await service.reopen_takeover("s1", "u1", is_admin=False, user_role="user")
+    assert result["status"] == SessionStatus.TAKEOVER_PENDING
+
+    # 第二次调用失败（状态已非 completed）
+    with pytest.raises(BadRequestError, match="当前状态不支持恢复接管"):
+        await service.reopen_takeover("s1", "u1", is_admin=False, user_role="user")
+
+    # 验证事件只写入了一次
+    reopened_events = [
+        e for _, e in uow.session.add_event_calls
+        if getattr(e, "action", None) == ControlAction.REOPENED
+    ]
+    assert len(reopened_events) == 1

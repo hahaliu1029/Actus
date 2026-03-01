@@ -37,6 +37,7 @@ class Session(BaseModel):
     memories: Dict[str, Memory] = Field(default_factory=dict)  # 记忆
     status: SessionStatus = SessionStatus.PENDING  # 状态
     user_id: Optional[str] = None  # 会话所属用户ID
+    completed_at: Optional[datetime] = None  # 完成时间
     updated_at: datetime = Field(default_factory=datetime.now)  # 更新时间
     created_at: datetime = Field(default_factory=datetime.now)  # 创建时间
 

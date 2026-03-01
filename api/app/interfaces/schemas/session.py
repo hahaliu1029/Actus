@@ -146,6 +146,15 @@ class EndTakeoverResponse(BaseModel):
     handoff_mode: str
 
 
+class ReopenTakeoverResponse(BaseModel):
+    """补救接管响应结构"""
+
+    status: SessionStatus
+    request_status: str
+    reason: Optional[str] = None
+    remaining_seconds: Optional[float] = None
+
+
 class RenewTakeoverRequest(BaseModel):
     """续期接管请求结构"""
 

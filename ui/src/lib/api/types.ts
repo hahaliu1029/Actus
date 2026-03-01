@@ -362,13 +362,21 @@ export type ErrorEvent = {
   error: string;
 };
 
+export type ReopenTakeoverResponse = {
+  status: SessionStatus;
+  request_status: string;
+  reason: string | null;
+  remaining_seconds: number | null;
+};
+
 export type ControlAction =
   | "requested"
   | "started"
   | "rejected"
   | "renewed"
   | "expired"
-  | "ended";
+  | "ended"
+  | "reopened";
 
 export type ControlSource = "agent" | "user" | "system";
 

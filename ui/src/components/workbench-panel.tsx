@@ -112,7 +112,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
   const setMessage = useUIStore((state) => state.setMessage);
 
   const canStartTakeover =
-    status === "running" || status === "waiting" || status === "takeover_pending";
+    status === "running" || status === "waiting" || status === "takeover_pending" || status === "completed";
   const canEndTakeover = status === "takeover";
   const canRejectTakeover = status === "takeover_pending";
   const effectiveTakeoverScope: TakeoverScope =
@@ -414,6 +414,9 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
   const handleStartTakeover = async (scope: TakeoverScope) => {
     setTakeoverSubmitting(true);
     try {
+      if (status === "completed") {
+        await sessionApi.reopenTakeover(sessionId);
+      }
       const result = await sessionApi.startTakeover(sessionId, { scope });
       lockAndSwitchMode(scope === "browser" ? "browser" : "shell");
       await fetchSessionById(sessionId, { silent: true });
@@ -425,6 +428,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
             : "已进入接管模式",
       });
     } catch (error) {
+      await fetchSessionById(sessionId, { silent: true });
       setMessage({
         type: "error",
         text: error instanceof Error ? error.message : "主动接管失败",

@@ -13,6 +13,7 @@ import type {
   RejectTakeoverResponse,
   RenewTakeoverParams,
   RenewTakeoverResponse,
+  ReopenTakeoverResponse,
   Session,
   ShellReadResponse,
   SSEEventData,
@@ -201,5 +202,9 @@ export const sessionApi = {
     return post<EndTakeoverResponse>(`/sessions/${sessionId}/takeover/end`, {
       handoff_mode: params.handoff_mode || "continue",
     });
+  },
+
+  reopenTakeover: (sessionId: string): Promise<ReopenTakeoverResponse> => {
+    return post<ReopenTakeoverResponse>(`/sessions/${sessionId}/takeover/reopen`, {});
   },
 };
