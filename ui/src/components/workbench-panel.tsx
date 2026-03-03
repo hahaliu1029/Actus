@@ -26,9 +26,12 @@ import {
 } from "@/lib/session-ui";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
+import { useAuthStore } from "@/lib/store/auth-store";
 import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
 import { cn } from "@/lib/utils";
+import { buildVNCProxyUrl } from "@/lib/vnc/url";
 
+import { VNCViewer } from "./vnc-viewer";
 import { WorkbenchBrowserPreview } from "./workbench-browser-preview";
 import { WorkbenchInteractiveTerminal } from "./workbench-interactive-terminal";
 import { WorkbenchTerminalPreview } from "./workbench-terminal-preview";
@@ -110,6 +113,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
   const prevPageVisibleRef = useRef(isPageVisible);
   const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
   const setMessage = useUIStore((state) => state.setMessage);
+  const accessToken = useAuthStore((state) => state.accessToken);
 
   const canStartTakeover =
     status === "running" || status === "waiting" || status === "takeover_pending" || status === "completed";
@@ -119,6 +123,8 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
     takeoverScope === "browser" ? "browser" : "shell";
   const interactiveShellTakeover =
     status === "takeover" && effectiveTakeoverScope === "shell" && Boolean(takeoverId);
+  const interactiveBrowserTakeover =
+    status === "takeover" && effectiveTakeoverScope === "browser" && Boolean(takeoverId);
 
   const latestSnapshot = snapshots[snapshots.length - 1] || null;
   const latestTimestamp = latestSnapshot?.timestamp ?? null;
@@ -262,6 +268,13 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
     () => computeRenewIntervalMs(takeoverTtlMs),
     [takeoverTtlMs]
   );
+
+  const vncUrl = useMemo(() => {
+    if (!interactiveBrowserTakeover || !accessToken) {
+      return null;
+    }
+    return buildVNCProxyUrl(sessionId, accessToken);
+  }, [interactiveBrowserTakeover, sessionId, accessToken]);
 
   const clearRenewTimer = useCallback(() => {
     if (renewTimerRef.current != null) {
@@ -652,6 +665,32 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
               <WorkbenchBrowserPreview
                 snapshot={browserSnapshot}
                 onPreviewImage={onPreviewImage}
+              />
+            </div>
+          </>
+        ) : interactiveBrowserTakeover ? (
+          <>
+            <div className={cn("h-full", selectedMode === "browser" ? "block" : "hidden")}>
+              {vncUrl ? (
+                <VNCViewer url={vncUrl} viewOnly={false} />
+              ) : (
+                <WorkbenchBrowserPreview
+                  snapshot={browserSnapshot}
+                  onPreviewImage={onPreviewImage}
+                />
+              )}
+            </div>
+            <div className={cn("h-full", selectedMode === "shell" ? "block" : "hidden")}>
+              <WorkbenchTerminalPreview
+                snapshot={shellSnapshot}
+                shellSessionIds={shellSessionIds}
+                selectedShellSessionId={effectiveShellSessionId}
+                onSelectShellSessionId={setSelectedShellSessionId}
+                isHistoryMode={isHistoryMode}
+                realtimeRecords={shellPreview.consoleRecords}
+                realtimeOutput={shellPreview.output}
+                realtimeLoading={shellPreview.loading}
+                realtimeError={shellPreview.error}
               />
             </div>
           </>

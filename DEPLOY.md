@@ -2,7 +2,8 @@
 
 This guide deploys the full stack on one host:
 
-- `ui` (Next.js)
+- `ui` (nginx gateway)
+- `ui-app` (Next.js runtime)
 - `api` (FastAPI)
 - `postgres`
 - `redis`
@@ -49,7 +50,7 @@ docker compose logs -f api
 
 Open:
 
-- UI: `http://localhost:3000`
+- UI: `http://localhost:80` (or `http://localhost:${UI_PORT}`)
 - API docs: `http://localhost:8000/docs`
 
 ## 5. Create super admin (optional but recommended)
@@ -90,6 +91,7 @@ docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
 Notes:
 - Compose service name is `sandbox-image` (not `sandbox`).
 - New sessions will use the updated sandbox image. Existing sessions may still bind to old temporary sandbox containers.
+- Frontend traffic path is `ui(nginx)` -> `ui-app(Next.js)` in container mode.
 
 ## Notes
 

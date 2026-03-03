@@ -1239,14 +1239,22 @@ end
         self._cancel_takeover_timeout(session_id)
         latest_control = self._get_latest_control_event(session)
         takeover_id = latest_control.takeover_id if latest_control else None
+        takeover_scope = latest_control.scope if latest_control else None
 
         mode = (handoff_mode or "").strip().lower()
         if mode == "continue":
+            if takeover_scope == ControlScope.BROWSER:
+                handoff_text = (
+                    "用户已结束浏览器接管，浏览器页面已被用户操作，"
+                    "请先获取最新页面状态再继续执行任务。"
+                )
+            else:
+                handoff_text = "用户已结束接管并交还控制，请继续执行未完成任务。"
             resumed_task: Optional[Task] = None
             try:
                 resumed_task = await self._resume_task_with_handoff(
                     session,
-                    "用户已结束接管并交还控制，请继续执行未完成任务。",
+                    handoff_text,
                 )
             except Exception as exc:
                 await self._rollback_resume_failed(

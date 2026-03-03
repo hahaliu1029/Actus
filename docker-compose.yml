@@ -98,23 +98,42 @@ services:
     networks:
       - actus-net
 
-  ui:
+  ui-app:
     build:
       context: ./ui
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api}
-    image: actus-ui:latest
+    image: actus-ui-app:latest
     restart: unless-stopped
     environment:
       TZ: ${TZ:-Asia/Shanghai}
     depends_on:
       api:
         condition: service_healthy
-    ports:
-      - "${UI_PORT:-3000}:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    networks:
+      - actus-net
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile.nginx
+    image: actus-ui:latest
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      ui-app:
+        condition: service_healthy
+    ports:
+      - "${UI_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/healthz || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 20

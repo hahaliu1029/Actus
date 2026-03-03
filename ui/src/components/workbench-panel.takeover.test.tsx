@@ -88,6 +88,20 @@ vi.mock("./workbench-timeline", () => ({
   WorkbenchTimeline: () => <div data-testid="workbench-timeline" />,
 }));
 
+vi.mock("./vnc-viewer", () => ({
+  VNCViewer: ({ url }: { url: string }) => <div data-testid="vnc-viewer" data-url={url} />,
+}));
+
+vi.mock("@/lib/store/auth-store", () => ({
+  useAuthStore: (selector: (state: Record<string, unknown>) => unknown) =>
+    selector({ accessToken: "test-token" }),
+}));
+
+vi.mock("@/lib/vnc/url", () => ({
+  buildVNCProxyUrl: (sessionId: string, token: string) =>
+    `wss://test/api/sessions/${sessionId}/vnc?token=${token}`,
+}));
+
 import { WorkbenchPanel } from "./workbench-panel";
 
 describe("WorkbenchPanel takeover controls", () => {
@@ -204,7 +218,7 @@ describe("WorkbenchPanel takeover controls", () => {
     expect(screen.queryByTestId("terminal-preview")).not.toBeInTheDocument();
   });
 
-  it("takeover(browser) 时仍展示浏览器预览，不展示交互终端", async () => {
+  it("takeover(browser) 时展示内嵌 VNC 查看器", async () => {
     const user = userEvent.setup();
     render(
       <WorkbenchPanel
@@ -221,8 +235,33 @@ describe("WorkbenchPanel takeover controls", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "浏览器" }));
-    expect(screen.getByTestId("browser-preview")).toBeInTheDocument();
+    expect(screen.getByTestId("vnc-viewer")).toBeInTheDocument();
     expect(screen.queryByTestId("interactive-terminal")).not.toBeInTheDocument();
+  });
+
+  it("takeover(browser) 时切换到终端标签显示静态终端预览", async () => {
+    const user = userEvent.setup();
+    render(
+      <WorkbenchPanel
+        sessionId="sid-browser-shell-switch"
+        status="takeover"
+        takeoverId="tk_browser_2"
+        takeoverScope="browser"
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={false}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "终端" }));
+    expect(screen.getByTestId("terminal-preview")).toBeInTheDocument();
+    // VNC viewer is still in the DOM but hidden via CSS (display:none)
+    const vncViewer = screen.queryByTestId("vnc-viewer");
+    if (vncViewer) {
+      expect(vncViewer.closest(".hidden")).toBeTruthy();
+    }
   });
 
   it("takeover 状态应按策略续期，并在页面隐藏时暂停、恢复时立即续期", async () => {

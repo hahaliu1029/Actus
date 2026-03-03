@@ -87,8 +87,10 @@ docker compose exec api python scripts/create_super_admin.py
 
 After startup, visit:
 
-- Frontend: http://localhost:3000
+- Frontend: http://localhost:80 (or `http://localhost:${UI_PORT}`)
 - API Docs: http://localhost:8000/docs
+
+In container deployment, the frontend uses a two-layer setup: `ui` (nginx gateway) -> `ui-app` (Next.js runtime).
 
 ### Local Development
 

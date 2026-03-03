@@ -146,8 +146,9 @@ export function ChatInput({
     ? isSessionStreaming(sessionId)
     : false;
   const isCurrentSessionRunning = sessionStatus === "running";
+  const isTakeoverActive = sessionStatus === "takeover" || sessionStatus === "takeover_pending";
   const showStopAction = Boolean(sessionId) && (isCurrentSessionStreaming || isCurrentSessionRunning);
-  const disableInput = uploading || showStopAction;
+  const disableInput = uploading || showStopAction || isTakeoverActive;
   const canSubmit = Boolean(text.trim()) || pendingFiles.length > 0;
 
   const handleStopTask = async () => {
@@ -225,7 +226,7 @@ export function ChatInput({
           }
           void handleSubmit();
         }}
-        placeholder="分配一个任务或提问任何问题..."
+        placeholder={isTakeoverActive ? "接管中，暂不支持发送消息" : "分配一个任务或提问任何问题..."}
         className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
       />
 

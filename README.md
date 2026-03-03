@@ -87,8 +87,10 @@ docker compose exec api python scripts/create_super_admin.py
 
 启动后访问：
 
-- 前端界面：http://localhost:3000
+- 前端界面：http://localhost:80（或 `http://localhost:${UI_PORT}`）
 - API 文档：http://localhost:8000/docs
+
+容器部署下，前端采用两层结构：`ui`（nginx 网关）-> `ui-app`（Next.js 运行时）。
 
 ### 本地开发
 
