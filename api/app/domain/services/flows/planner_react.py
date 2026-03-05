@@ -31,6 +31,7 @@ from app.domain.services.tools.message import MessageTool
 from app.domain.services.tools.search import SearchTool
 from app.domain.services.tools.shell import ShellTool
 from app.domain.services.tools.skill import SkillTool
+from app.domain.services.tools.base import BaseTool
 
 from ...repositories.uow import IUnitOfWork
 from .base import BaseFlow, FlowStatus
@@ -54,6 +55,7 @@ class PlannerReActFlow(BaseFlow):
         mcp_tool: MCPTool,  # mcp工具
         a2a_tool: A2ATool,  # a2a远程agent
         skill_tool: SkillTool,  # 统一skill工具
+        create_skill_tool: BaseTool | None = None,  # skill创建工具
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
@@ -77,6 +79,8 @@ class PlannerReActFlow(BaseFlow):
             a2a_tool,
             skill_tool,
         ]
+        if create_skill_tool is not None:
+            tools.append(create_skill_tool)
 
         # 3.创建规划Agent
         self.planner = PlannerAgent(

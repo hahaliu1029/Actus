@@ -1,0 +1,62 @@
+llm_config:
+  base_url: https://api.deepseek.com
+  api_key: ''
+  model_name: deepseek-reasoner
+  temperature: 0.7
+  max_tokens: 8192
+  context_window: null
+  context_overflow_guard_enabled: false
+  overflow_retry_cap: 2
+  soft_trigger_ratio: 0.85
+  hard_trigger_ratio: 0.95
+  reserved_output_tokens: 4096
+  reserved_output_tokens_cap_ratio: 0.25
+  token_estimator: hybrid
+  token_safety_factor: 1.15
+  unknown_model_context_window: 32768
+agent_config:
+  max_iterations: 100
+  max_retries: 3
+  max_search_results: 10
+  skill_selection:
+    base_threshold: 3
+    short_message_max_chars: 24
+    llm_trigger_token_count: 4
+    continuation_llm_enabled: true
+    continuation_llm_timeout_seconds: 3.0
+    continuation_llm_cache_size: 128
+    ask_user_min_attempt_rounds_per_step: 3
+    step_skill_lock_enabled: true
+    step_skill_reselect_unknown_tool_threshold: 3
+    step_skill_reselect_max_per_step: 1
+    available_tool_summary_token_budget: 500
+    unknown_tool_candidate_limit: 10
+    continuation_phrases:
+    - 继续
+    - 请继续
+    - 继续一下
+    - 继续吧
+    - 接着
+    - 下一步
+    - 好的
+    - 好
+    - 行
+    - 嗯
+    - 收到
+    - ok
+    - okay
+    - go on
+    - next
+    - please continue
+    - proceed
+    continuation_patterns:
+    - ^(请)?继续(一下|吧|下去)?$
+    - ^(好的?[,，\s]*)?(继续|接着)$
+    - ^(ok|okay)([,\s]+(go on|continue))?$
+    - ^(好的?[,，\s]*)?继续([,，\s]+(一下|下|吧))?$
+mcp_config:
+  mcpServers: {}
+a2a_config:
+  a2a_servers: []
+skill_risk_policy:
+  mode: 'off'

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Bot,
   Cog,
@@ -11,6 +12,7 @@ import {
   Puzzle,
   Server,
   Settings,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 
@@ -31,6 +33,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
 import type { AgentConfig, LLMConfig, MCPConfig, SkillSourceType } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
+import { useSessionStore } from "@/lib/store/session-store";
 import { useSettingsStore } from "@/lib/store/settings-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
@@ -138,6 +141,9 @@ export function ManusSettings() {
   const [skillSourceRef, setSkillSourceRef] = useState("");
   const [skillMarkdown, setSkillMarkdown] = useState("");
   const [skillDialogError, setSkillDialogError] = useState<string | null>(null);
+
+  const router = useRouter();
+  const createSession = useSessionStore((state) => state.createSession);
 
   useEffect(() => {
     if (open) {
@@ -253,6 +259,12 @@ export function ManusSettings() {
     setA2ABaseUrl("");
     setA2ADialogError(null);
     setIsA2ADialogOpen(false);
+  }
+
+  async function handleAICreateSkill(): Promise<void> {
+    const createdId = await createSession();
+    setOpen(false);
+    router.push(`/sessions/${createdId}`);
   }
 
   async function handleInstallSkill(): Promise<void> {
@@ -1112,121 +1124,136 @@ export function ManusSettings() {
                       </p>
                     </div>
 
-                    <Dialog
-                      open={isSkillDialogOpen}
-                      onOpenChange={(nextOpen) => {
-                        if (!nextOpen && isInstallingSkill) {
-                          return;
-                        }
-                        setIsSkillDialogOpen(nextOpen);
-                        if (!nextOpen) {
-                          setSkillDialogError(null);
-                        }
-                      }}
-                    >
-                      <DialogTrigger asChild>
-                        <Button
-                          className="h-10 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
-                          disabled={!isAdmin}
-                        >
-                          <Plus className="size-4" />
-                          安装 Skill
-                        </Button>
-                      </DialogTrigger>
-                      <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] max-h-[85vh] max-w-[760px] gap-0 overflow-hidden rounded-2xl border border-border p-0 shadow-[var(--shadow-float)]">
-                        <DialogHeader className="px-6 pt-6 pb-3">
-                          <DialogTitle>安装 Skill</DialogTitle>
-                          <DialogDescription>
-                            输入来源标识即可安装。可选地手动覆盖 SKILL.md，Manifest 由系统自动生成。
-                          </DialogDescription>
-                        </DialogHeader>
-                        <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-4">
-                          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                            <label className="text-sm text-foreground/85">
-                              来源类型
-                              <select
-                                value={skillSourceType}
-                                onChange={(event) =>
-                                  setSkillSourceType(event.target.value as SkillSourceType)
-                                }
-                                disabled={isInstallingSkill}
-                                className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                              >
-                                <option value="local">Local</option>
-                                <option value="github">GitHub</option>
-                              </select>
-                            </label>
-                            <label className="text-sm text-foreground/85">
-                              来源标识
-                              <Input
-                                value={skillSourceRef}
-                                onChange={(event) => {
-                                  setSkillSourceRef(event.target.value);
-                                  if (skillDialogError) {
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        className="h-10 rounded-xl border-border"
+                        disabled={!isAdmin}
+                        onClick={() => {
+                          void handleAICreateSkill();
+                        }}
+                      >
+                        <Sparkles className="size-4" />
+                        AI 创建
+                      </Button>
+
+                      <Dialog
+                        open={isSkillDialogOpen}
+                        onOpenChange={(nextOpen) => {
+                          if (!nextOpen && isInstallingSkill) {
+                            return;
+                          }
+                          setIsSkillDialogOpen(nextOpen);
+                          if (!nextOpen) {
+                            setSkillDialogError(null);
+                          }
+                        }}
+                      >
+                        <DialogTrigger asChild>
+                          <Button
+                            className="h-10 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
+                            disabled={!isAdmin}
+                          >
+                            <Plus className="size-4" />
+                            安装 Skill
+                          </Button>
+                        </DialogTrigger>
+                        <DialogContent className="grid-rows-[auto_minmax(0,1fr)_auto] max-h-[85vh] max-w-[760px] gap-0 overflow-hidden rounded-2xl border border-border p-0 shadow-[var(--shadow-float)]">
+                          <DialogHeader className="px-6 pt-6 pb-3">
+                            <DialogTitle>安装 Skill</DialogTitle>
+                            <DialogDescription>
+                              从本地目录或 GitHub 仓库安装 Skill。
+                            </DialogDescription>
+                          </DialogHeader>
+                          <div className="min-h-0 space-y-4 overflow-y-auto px-6 pb-4">
+                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                              <label className="text-sm text-foreground/85">
+                                来源类型
+                                <select
+                                  value={skillSourceType}
+                                  onChange={(event) => {
+                                    setSkillSourceType(event.target.value as SkillSourceType)
                                     setSkillDialogError(null);
+                                  }}
+                                  disabled={isInstallingSkill}
+                                  className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                                >
+                                  <option value="local">Local</option>
+                                  <option value="github">GitHub</option>
+                                </select>
+                              </label>
+                              <label className="text-sm text-foreground/85">
+                                来源标识
+                                <Input
+                                  value={skillSourceRef}
+                                  onChange={(event) => {
+                                    setSkillSourceRef(event.target.value);
+                                    if (skillDialogError) {
+                                      setSkillDialogError(null);
+                                    }
+                                  }}
+                                  placeholder={
+                                    skillSourceType === "local"
+                                      ? "/abs/path/to/skill or local:/abs/path/to/skill"
+                                      : "https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
                                   }
-                                }}
-                                placeholder={
-                                  skillSourceType === "local"
-                                    ? "/abs/path/to/skill or local:/abs/path/to/skill"
-                                    : "https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
-                                }
-                                disabled={isInstallingSkill}
-                                className="mt-1"
-                              />
-                            </label>
+                                  disabled={isInstallingSkill}
+                                  className="mt-1"
+                                />
+                              </label>
+                            </div>
+
+                            <details className="rounded-lg border border-border/70 bg-muted/20">
+                              <summary className="cursor-pointer list-none px-3 py-2 text-sm text-foreground/85">
+                                可选：手动覆盖 SKILL.md（默认从来源目录读取）
+                              </summary>
+                              <div className="space-y-2 border-t border-border/70 p-3">
+                                <Textarea
+                                  className="min-h-[200px] max-h-[45vh] text-xs"
+                                  value={skillMarkdown}
+                                  onChange={(event) => setSkillMarkdown(event.target.value)}
+                                  placeholder="留空将使用来源目录中的 SKILL.md"
+                                  disabled={isInstallingSkill}
+                                />
+                              </div>
+                            </details>
+
+                            {skillDialogError ? (
+                              <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
+                                {skillDialogError}
+                              </p>
+                            ) : null}
                           </div>
 
-                          <details className="rounded-lg border border-border/70 bg-muted/20">
-                            <summary className="cursor-pointer list-none px-3 py-2 text-sm text-foreground/85">
-                              可选：手动覆盖 SKILL.md（默认从来源目录读取）
-                            </summary>
-                            <div className="space-y-2 border-t border-border/70 p-3">
-                              <Textarea
-                                className="min-h-[200px] max-h-[45vh] text-xs"
-                                value={skillMarkdown}
-                                onChange={(event) => setSkillMarkdown(event.target.value)}
-                                placeholder="留空将使用来源目录中的 SKILL.md"
-                                disabled={isInstallingSkill}
-                              />
-                            </div>
-                          </details>
-
-                          {skillDialogError ? (
-                            <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400">
-                              {skillDialogError}
-                            </p>
-                          ) : null}
-                        </div>
-
-                        <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
-                          <Button
-                            variant="outline"
-                            className="h-10 rounded-xl border-border px-5"
-                            disabled={isInstallingSkill}
-                            onClick={() => setIsSkillDialogOpen(false)}
-                          >
-                            取消
-                          </Button>
-                          <Button
-                            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
-                            disabled={isInstallingSkill}
-                            onClick={() => {
-                              void handleInstallSkill();
-                            }}
-                          >
-                            {isInstallingSkill ? (
-                              <>
-                                <LoaderCircle className="size-4 animate-spin" />
-                                安装中...
-                              </>
-                            ) : (
-                              "安装"
-                            )}
-                          </Button>
-                        </div>
-                      </DialogContent>
-                    </Dialog>
+                          <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
+                            <Button
+                              variant="outline"
+                              className="h-10 rounded-xl border-border px-5"
+                              disabled={isInstallingSkill}
+                              onClick={() => setIsSkillDialogOpen(false)}
+                            >
+                              取消
+                            </Button>
+                            <Button
+                              className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
+                              disabled={isInstallingSkill}
+                              onClick={() => {
+                                void handleInstallSkill();
+                              }}
+                            >
+                              {isInstallingSkill ? (
+                                <>
+                                  <LoaderCircle className="size-4 animate-spin" />
+                                  安装中...
+                                </>
+                              ) : (
+                                "安装"
+                              )}
+                            </Button>
+                          </div>
+                        </DialogContent>
+                      </Dialog>
+                    </div>
                   </div>
 
                   <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/30 p-3">

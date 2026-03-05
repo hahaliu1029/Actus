@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     skill_sandbox_bundle_root: str = "/home/ubuntu/workspace/.skills"
     skill_backend: str = "filesystem"
     skill_blocked_command_patterns: str = "rm -rf,:(){,mkfs.,shutdown,reboot"
+    github_token: str = ""
 
     # Session 接管配置
     feature_takeover_enabled: bool = True

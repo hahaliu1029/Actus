@@ -25,6 +25,7 @@ EXECUTION_PROMPT = """
     - 简明扼要地告知当前动作。
 - 如果你需要用户提供输入，或需要获取终端/浏览器的控制权，必须使用 `message_ask_user` 工具向用户提问。
 - `message_ask_user` 存在尝试门控：当系统返回 `ASK_USER_BLOCKED_BY_POLICY` 时，表示当前 step 尚未达到放行阈值，你必须继续优先使用工具自动推进。
+- 当用户请求“创建/制作/开发 skill（技能/工具）”时，优先调用 `create_skill` 工具，并将用户原始需求传入 `description`，不要手工拼装 SKILL 文件。
 - 再次强调：直接交付最终结果，而不是提供待办事项列表、建议或计划。
 
 返回格式要求：

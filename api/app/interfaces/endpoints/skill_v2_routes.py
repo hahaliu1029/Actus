@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from typing import AsyncGenerator
+
 from app.application.services.app_config_service import AppConfigService
 from app.application.services.skill_service import SkillService
 from app.application.services.user_tool_preference_service import UserToolPreferenceService
 from app.domain.models.app_config import SkillRiskPolicy
+from app.domain.models.skill_creator import SkillCreationResult
 from app.domain.models.user_tool_preference import ToolType
 from app.infrastructure.repositories.db_user_tool_preference_repository import (
     DBUserToolPreferenceRepository,
@@ -20,17 +24,27 @@ from app.interfaces.schemas.skill import (
     SkillListResponse,
     SkillRiskPolicyItem,
 )
-from app.interfaces.service_dependencies import get_app_config_service
+from app.interfaces.service_dependencies import (
+    get_app_config_service,
+    get_skill_creator_service,
+)
 from core.config import get_settings
 from fastapi import APIRouter, Body, Depends
+from pydantic import BaseModel
+from sse_starlette import EventSourceResponse, ServerSentEvent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 settings = get_settings()
 router = APIRouter(prefix="/v2/skills", tags=["Skill生态v2"])
+SSE_HEADERS = {"X-Accel-Buffering": "no"}
 
 
 def _build_skill_service() -> SkillService:
     return SkillService(FileSkillRepository(settings.skills_root_dir))
+
+
+class SkillCreateRequest(BaseModel):
+    description: str
 
 
 @router.get(
@@ -89,6 +103,41 @@ async def install_skill(
         installed_by=admin_user.id,
     )
     return Response.success(msg="Skill 安装成功")
+
+
+@router.post(
+    path="/create",
+    summary="AI 创建 Skill（SSE）",
+)
+async def create_skill_ai(
+    request: SkillCreateRequest,
+    admin_user: AdminUser,
+    creator_service=Depends(get_skill_creator_service),
+) -> EventSourceResponse:
+    async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
+        try:
+            async for event in creator_service.create(
+                description=request.description,
+                sandbox=None,
+                installed_by=admin_user.id,
+            ):
+                if isinstance(event, SkillCreationResult):
+                    yield ServerSentEvent(
+                        event="complete",
+                        data=event.model_dump_json(),
+                    )
+                else:
+                    yield ServerSentEvent(
+                        event="progress",
+                        data=event.model_dump_json(),
+                    )
+        except Exception as exc:
+            yield ServerSentEvent(
+                event="error",
+                data=json.dumps({"error": str(exc)}, ensure_ascii=False),
+            )
+
+    return EventSourceResponse(event_generator(), headers=SSE_HEADERS)
 
 
 @router.post(

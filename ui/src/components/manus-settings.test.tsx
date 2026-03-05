@@ -130,6 +130,17 @@ vi.mock("@/components/settings/admin-users-setting", () => ({
   AdminUsersSetting: () => <div>admin-users-setting</div>,
 }));
 
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}));
+
+vi.mock("@/lib/store/session-store", () => ({
+  useSessionStore: (selector: (state: { createSession: ReturnType<typeof vi.fn> }) => unknown) =>
+    selector({
+      createSession: vi.fn(async () => "new-session-id"),
+    }),
+}));
+
 import { ManusSettings } from "./manus-settings";
 
 async function openSkillTab() {
@@ -264,5 +275,12 @@ describe("ManusSettings - Skill risk policy", () => {
         "GitHub 来源请填写仓库 URL 或目录 URL，例如 https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/skills/pptx"
       )
     ).toBeInTheDocument();
+  });
+
+  it("Skill 页面有 AI 创建按钮", async () => {
+    render(<ManusSettings />);
+
+    await openSkillTab();
+    expect(screen.getByRole("button", { name: "AI 创建" })).toBeInTheDocument();
   });
 });

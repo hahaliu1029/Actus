@@ -65,6 +65,7 @@ from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
+from app.domain.services.tools.create_skill import CreateSkillTool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
 from app.domain.services.tools.skill_bundle_sync import SkillBundleSyncManager
@@ -134,6 +135,7 @@ class AgentTaskRunner(TaskRunner):
         browser: Browser,  # 浏览器
         search_engine: SearchEngine,  # 搜索引擎
         sandbox: Sandbox,  # 沙箱
+        skill_creator_service=None,  # skill创建服务
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
     ) -> None:
@@ -165,6 +167,15 @@ class AgentTaskRunner(TaskRunner):
             risk_mode=(skill_risk_policy or SkillRiskPolicy()).mode.value,
             bundle_sync_manager=self._skill_bundle_sync,
             skill_sandbox_bundle_root=settings.skill_sandbox_bundle_root,
+        )
+        self._create_skill_tool = (
+            CreateSkillTool(
+                skill_creator_service=skill_creator_service,
+                sandbox=sandbox,
+                user_id=user_id or "",
+            )
+            if skill_creator_service is not None
+            else None
         )
         self._skill_index_service = SkillIndexService(
             skill_repository=self._skill_repository,
@@ -216,6 +227,7 @@ class AgentTaskRunner(TaskRunner):
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
             skill_tool=self._skill_tool,
+            create_skill_tool=self._create_skill_tool,
             overflow_config=self._overflow_config,
         )
 
@@ -700,6 +712,21 @@ class AgentTaskRunner(TaskRunner):
         except Exception as exc:
             logger.debug("读取Skill工具摘要失败，降级为空: %s", exc)
             skill_tools = []
+        creator_tools: list[str] = []
+        if self._create_skill_tool is not None:
+            try:
+                for schema in self._create_skill_tool.get_tools():
+                    if not isinstance(schema, dict):
+                        continue
+                    function_info = schema.get("function")
+                    if not isinstance(function_info, dict):
+                        continue
+                    tool_name = function_info.get("name")
+                    if isinstance(tool_name, str) and tool_name:
+                        creator_tools.append(tool_name)
+            except Exception as exc:
+                logger.debug("读取Skill Creator工具摘要失败，降级为空: %s", exc)
+                creator_tools = []
 
         lines = [
             "## Available Tool Summary",
@@ -714,6 +741,11 @@ class AgentTaskRunner(TaskRunner):
             )
         else:
             lines.append("- active skill tools: (none)")
+        if creator_tools:
+            lines.append(
+                "- skill creator tools: "
+                + ", ".join(creator_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+            )
 
         summary = "\n".join(lines).strip()
         if len(summary) > char_budget:
@@ -1022,6 +1054,19 @@ class AgentTaskRunner(TaskRunner):
                     else:
                         event.tool_content = SkillToolContent(
                             skill_result="(Skill工具无可用结果)"
+                        )
+                elif event.tool_name == "create_skill":
+                    if event.function_result and event.function_result.data is not None:
+                        event.tool_content = SkillToolContent(
+                            skill_result=event.function_result.data
+                        )
+                    elif event.function_result and event.function_result.message:
+                        event.tool_content = SkillToolContent(
+                            skill_result=event.function_result.message
+                        )
+                    else:
+                        event.tool_content = SkillToolContent(
+                            skill_result="(Skill Creator 工具无可用结果)"
                         )
         except Exception as e:
             logger.exception(f"AgentTaskRunner生成工具内容失败: {str(e)}")

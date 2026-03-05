@@ -4,6 +4,8 @@ from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
 from app.application.services.file_service import FileService
 from app.application.services.session_service import SessionService
+from app.application.services.skill_creator_service import SkillCreatorService
+from app.application.services.skill_service import SkillService
 from app.application.services.status_service import StatusService
 
 # from app.domain.repositories.session_repository import SessionRepository
@@ -20,6 +22,7 @@ from app.infrastructure.external.health_checker.redis_health_checker import (
 from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser
 from app.infrastructure.external.llm.openai_llm import OpenAILLM
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
+from app.infrastructure.external.github_search_client import GitHubSearchClient
 from app.infrastructure.external.search.bing_search import BingSearchEngine
 from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
 
@@ -28,6 +31,7 @@ from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.infrastructure.repositories.file_app_config_repository import (
     FileAppConfigRepository,
 )
+from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.minio import MinioStore, get_minio
 from app.infrastructure.storage.postgres import get_db_session, get_uow
 from app.infrastructure.storage.redis import RedisClient, get_redis
@@ -100,16 +104,36 @@ def get_session_service() -> SessionService:
     )
 
 
+def _load_app_config():
+    app_config_repository = FileAppConfigRepository(
+        config_path=settings.app_config_filepath
+    )
+    return app_config_repository.load()
+
+
+def _build_skill_service() -> SkillService:
+    return SkillService(FileSkillRepository(settings.skills_root_dir))
+
+
+def get_skill_creator_service() -> SkillCreatorService:
+    app_config = _load_app_config()
+    llm = OpenAILLM(app_config.llm_config)
+    github_client = GitHubSearchClient(token=settings.github_token or None)
+    skill_service = _build_skill_service()
+    return SkillCreatorService(
+        llm=llm,
+        github_client=github_client,
+        skill_service=skill_service,
+    )
+
+
 # @lru_cache()
 def get_agent_service(
     minio_store: MinioStore = Depends(get_minio),
     redis_client: RedisClient = Depends(get_redis),
 ) -> AgentService:
     # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
-    app_config_repository = FileAppConfigRepository(
-        config_path=settings.app_config_filepath
-    )
-    app_config = app_config_repository.load()
+    app_config = _load_app_config()
     # file_repository = DBFileRepository(db_session=db_session)
     overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
 
@@ -119,6 +143,11 @@ def get_agent_service(
         bucket=settings.minio_bucket_name,
         minio_store=minio_store,
         uow_factory=get_uow,
+    )
+    skill_creator_service = SkillCreatorService(
+        llm=llm,
+        github_client=GitHubSearchClient(token=settings.github_token or None),
+        skill_service=_build_skill_service(),
     )
 
     # 3.实例Agent服务并返回
@@ -136,5 +165,6 @@ def get_agent_service(
         search_engine=BingSearchEngine(),
         file_storage=file_storage,
         redis_client=redis_client,
+        skill_creator_service=skill_creator_service,
         # file_repository=file_repository,
     )

@@ -71,6 +71,7 @@ class AgentService:
         skill_risk_policy: SkillRiskPolicy | None = None,
         overflow_config: ContextOverflowConfig | None = None,
         redis_client: object | None = None,
+        skill_creator_service=None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
@@ -88,6 +89,7 @@ class AgentService:
         self._search_engine = search_engine
         self._file_storage = file_storage
         self._redis_client = redis_client
+        self._skill_creator_service = skill_creator_service
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
         self._takeover_timeout_tasks: dict[str, asyncio.Task] = {}
@@ -145,6 +147,7 @@ class AgentService:
             browser=browser,
             search_engine=self._search_engine,
             sandbox=sandbox,
+            skill_creator_service=self._skill_creator_service,
         )
 
         # 6.创建任务Task并更新会话中的信息
