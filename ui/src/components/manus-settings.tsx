@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { AdminUsersSetting } from "@/components/settings/admin-users-setting";
+import { SkillDetailDrawer } from "@/components/settings/skill-detail-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -77,6 +78,8 @@ export function ManusSettings() {
   const [isMCPDialogOpen, setIsMCPDialogOpen] = useState(false);
   const [isA2ADialogOpen, setIsA2ADialogOpen] = useState(false);
   const [isSkillDialogOpen, setIsSkillDialogOpen] = useState(false);
+  const [skillDetailId, setSkillDetailId] = useState<string | null>(null);
+  const [isSkillDetailOpen, setIsSkillDetailOpen] = useState(false);
 
   const llmConfig = useSettingsStore((state) => state.llmConfig);
   const agentConfig = useSettingsStore((state) => state.agentConfig);
@@ -1268,7 +1271,14 @@ export function ManusSettings() {
                       const userEnabled = mergeToolEnabled(skill.id, skill.enabled, skillTools);
 
                       return (
-                        <div key={skill.id} className="rounded-2xl border bg-card px-4 py-3 shadow-[var(--shadow-subtle)]">
+                        <div
+                          key={skill.id}
+                          className="cursor-pointer rounded-2xl border bg-card px-4 py-3 shadow-[var(--shadow-subtle)] transition-colors hover:bg-accent/50"
+                          onClick={() => {
+                            setSkillDetailId(skill.id);
+                            setIsSkillDetailOpen(true);
+                          }}
+                        >
                           <div className="flex flex-wrap items-start justify-between gap-3">
                             <div className="min-w-0 space-y-2">
                               <div className="flex flex-wrap items-center gap-2">
@@ -1303,7 +1313,8 @@ export function ManusSettings() {
                                 type="button"
                                 className="inline-flex size-8 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-destructive/30 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                                 disabled={!isAdmin}
-                                onClick={() => {
+                                onClick={(e) => {
+                                  e.stopPropagation();
                                   void deleteSkill(skill.id);
                                 }}
                               >
@@ -1311,7 +1322,10 @@ export function ManusSettings() {
                               </button>
                           </div>
 
-                          <div className="mt-3 flex items-center justify-end gap-6 text-xs text-muted-foreground">
+                          <div
+                            className="mt-3 flex items-center justify-end gap-6 text-xs text-muted-foreground"
+                            onClick={(e) => e.stopPropagation()}
+                          >
                             <div className="flex items-center gap-2">
                               全局
                               <Switch
@@ -1337,6 +1351,12 @@ export function ManusSettings() {
                         </div>
                       );
                     })}
+
+                    <SkillDetailDrawer
+                      skillId={skillDetailId}
+                      open={isSkillDetailOpen}
+                      onOpenChange={setIsSkillDetailOpen}
+                    />
                   </div>
                 </div>
               ) : null}

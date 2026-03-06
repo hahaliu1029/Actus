@@ -177,6 +177,30 @@ export type SkillListData = {
   skills: SkillItem[];
 };
 
+export type SkillToolItem = {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  required: string[];
+  entry?: Record<string, unknown> | null;
+};
+
+export type BundleFileItem = {
+  path: string;
+  size: number;
+  sha256: string;
+  is_text: boolean;
+};
+
+export type SkillDetailData = SkillItem & {
+  tools: SkillToolItem[];
+  skill_md: string;
+  bundle_files: BundleFileItem[];
+  activation: Record<string, unknown>;
+  policy: Record<string, unknown>;
+  security: Record<string, unknown>;
+};
+
 export type InstallSkillParams = {
   source_type: SkillSourceType;
   source_ref: string;

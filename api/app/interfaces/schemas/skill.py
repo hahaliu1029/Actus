@@ -51,3 +51,48 @@ class SkillRiskPolicyItem(BaseModel):
     """Skill 风险策略"""
 
     mode: str = Field(..., description="off | enforce_confirmation")
+
+
+class SkillToolItem(BaseModel):
+    """Skill Tool 声明"""
+
+    name: str
+    description: str = ""
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    required: List[str] = Field(default_factory=list)
+    entry: Dict[str, Any] | None = None
+
+
+class BundleFileItem(BaseModel):
+    """Bundle 文件条目"""
+
+    path: str
+    size: int
+    sha256: str
+    is_text: bool
+
+
+class SkillDetailResponse(BaseModel):
+    """Skill 详情响应"""
+
+    id: str
+    slug: str
+    name: str
+    description: str
+    version: str
+    source_type: SkillSourceType
+    source_ref: str
+    runtime_type: SkillRuntimeType
+    enabled: bool
+    installed_by: str | None = None
+    created_at: str
+    updated_at: str
+    bundle_file_count: int = 0
+    context_ref_count: int = 0
+    last_sync_at: str | None = None
+    tools: List[SkillToolItem] = Field(default_factory=list)
+    skill_md: str = ""
+    bundle_files: List[BundleFileItem] = Field(default_factory=list)
+    activation: Dict[str, Any] = Field(default_factory=dict)
+    policy: Dict[str, Any] = Field(default_factory=dict)
+    security: Dict[str, Any] = Field(default_factory=dict)

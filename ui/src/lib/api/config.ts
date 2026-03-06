@@ -7,6 +7,7 @@ import type {
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  SkillDetailData,
   SkillListData,
   SkillRiskPolicy,
 } from "./types";
@@ -70,6 +71,10 @@ export const configApi = {
     return get<SkillListData>("/v2/skills", undefined, {
       timeout: SETTINGS_LIST_TIMEOUT,
     });
+  },
+
+  getSkillDetail: (skillId: string): Promise<SkillDetailData> => {
+    return get<SkillDetailData>(`/v2/skills/${skillId}`);
   },
 
   installSkill: (params: InstallSkillParams): Promise<void> => {

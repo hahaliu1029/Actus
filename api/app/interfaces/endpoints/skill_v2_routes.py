@@ -19,10 +19,13 @@ from app.infrastructure.storage.postgres import get_db_session
 from app.interfaces.dependencies import AdminUser, CurrentUser
 from app.interfaces.schemas import Response
 from app.interfaces.schemas.skill import (
+    BundleFileItem,
+    SkillDetailResponse,
     SkillInstallRequest,
     SkillItem,
     SkillListResponse,
     SkillRiskPolicyItem,
+    SkillToolItem,
 )
 from app.interfaces.service_dependencies import (
     get_app_config_service,
@@ -203,4 +206,82 @@ async def update_skill_policy(
     return Response.success(
         msg="Skill 风险策略已更新",
         data=SkillRiskPolicyItem(mode=policy.mode.value),
+    )
+
+
+@router.get(
+    path="/{skill_key}",
+    response_model=Response[SkillDetailResponse],
+    summary="获取 Skill 详情（v2）",
+)
+async def get_skill_detail(
+    skill_key: str,
+    admin_user: AdminUser,
+) -> Response[SkillDetailResponse]:
+    service = _build_skill_service()
+    skill = await service.get_skill(skill_key)
+
+    manifest = skill.manifest or {}
+    raw_tools = manifest.get("tools") or []
+    tools = [
+        SkillToolItem(
+            name=t.get("name", ""),
+            description=t.get("description", ""),
+            parameters=t.get("parameters") or {},
+            required=t.get("required") or [],
+            entry=t.get("entry"),
+        )
+        for t in raw_tools
+        if isinstance(t, dict)
+    ]
+
+    raw_bundle_files: list = []
+    from pathlib import Path as _Path
+
+    bundle_index_path = (
+        _Path(settings.skills_root_dir) / skill_key / "bundle_index.json"
+    )
+    if bundle_index_path.exists():
+        try:
+            raw_bundle_files = json.loads(
+                bundle_index_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            raw_bundle_files = []
+
+    bundle_files = [
+        BundleFileItem(
+            path=bf.get("path", ""),
+            size=bf.get("size", 0),
+            sha256=bf.get("sha256", ""),
+            is_text=bf.get("is_text", False),
+        )
+        for bf in raw_bundle_files
+        if isinstance(bf, dict)
+    ]
+
+    return Response.success(
+        data=SkillDetailResponse(
+            id=skill.id,
+            slug=skill.slug,
+            name=skill.name,
+            description=skill.description,
+            version=skill.version,
+            source_type=skill.source_type,
+            source_ref=skill.source_ref,
+            runtime_type=skill.runtime_type,
+            enabled=skill.enabled,
+            installed_by=skill.installed_by,
+            created_at=skill.created_at.isoformat(),
+            updated_at=skill.updated_at.isoformat(),
+            bundle_file_count=int(manifest.get("bundle_file_count") or 0),
+            context_ref_count=int(manifest.get("context_ref_count") or 0),
+            last_sync_at=manifest.get("last_sync_at"),
+            tools=tools,
+            skill_md=str(manifest.get("skill_md") or ""),
+            bundle_files=bundle_files,
+            activation=manifest.get("activation") or {},
+            policy=manifest.get("policy") or {},
+            security=manifest.get("security") or {},
+        )
     )
