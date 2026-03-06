@@ -59,7 +59,7 @@ def test_agent_config_has_new_stability_defaults() -> None:
     config = AgentConfig()
     policy = config.skill_selection
 
-    assert policy.ask_user_min_attempt_rounds_per_step == 3
+    assert policy.ask_user_min_attempt_rounds_per_step == 1
     assert policy.step_skill_lock_enabled is True
     assert policy.step_skill_reselect_unknown_tool_threshold == 3
     assert policy.step_skill_reselect_max_per_step == 1
