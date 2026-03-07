@@ -27,7 +27,7 @@ class ToolDef(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _normalize_parameters(cls, data: Any) -> Any:
-        """兼容 parameters 为对象字典的场景。"""
+        """兼容 parameters 为对象字典或 JSON Schema 格式的场景。"""
         if not isinstance(data, dict):
             return data
 
@@ -40,6 +40,45 @@ class ToolDef(BaseModel):
         if not isinstance(raw_parameters, dict):
             return data
 
+        # 检测 JSON Schema 格式: {"type": "object", "properties": {...}, ...}
+        if "properties" in raw_parameters and isinstance(
+            raw_parameters.get("properties"), dict
+        ):
+            properties = raw_parameters["properties"]
+            schema_required = raw_parameters.get("required", [])
+            required_names = (
+                {str(item) for item in schema_required if isinstance(item, str)}
+                if isinstance(schema_required, list)
+                else set()
+            )
+            normalized_parameters: list[dict[str, Any]] = []
+            for name, spec in properties.items():
+                param_name = str(name).strip()
+                if not param_name:
+                    continue
+                if isinstance(spec, dict):
+                    normalized_parameters.append(
+                        {
+                            "name": param_name,
+                            "type": str(spec.get("type") or "string"),
+                            "description": str(spec.get("description") or ""),
+                            "required": param_name in required_names,
+                        }
+                    )
+                else:
+                    normalized_parameters.append(
+                        {
+                            "name": param_name,
+                            "type": "string",
+                            "description": "",
+                            "required": param_name in required_names,
+                        }
+                    )
+            normalized = dict(data)
+            normalized["parameters"] = normalized_parameters
+            return normalized
+
+        # 原有逻辑：parameters 为扁平对象字典 {"param_name": {type, description}, ...}
         required_raw = data.get("required")
         required_names = (
             {str(item) for item in required_raw if isinstance(item, str)}
@@ -47,7 +86,7 @@ class ToolDef(BaseModel):
             else set()
         )
 
-        normalized_parameters: list[dict[str, Any]] = []
+        normalized_parameters = []
         for name, spec in raw_parameters.items():
             param_name = str(name).strip()
             if not param_name:
@@ -86,6 +125,27 @@ class SkillBlueprint(BaseModel):
     tools: list[ToolDef] = Field(default_factory=list)
     search_keywords: list[str] = Field(default_factory=list)
     estimated_deps: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_search_keywords(cls, data: Any) -> Any:
+        """兼容 LLM 返回嵌套数组格式的 search_keywords。"""
+        if not isinstance(data, dict):
+            return data
+        raw_keywords = data.get("search_keywords")
+        if not isinstance(raw_keywords, list):
+            return data
+        flattened: list[str] = []
+        for item in raw_keywords:
+            if isinstance(item, list):
+                flattened.extend(str(kw) for kw in item if kw)
+            elif isinstance(item, str):
+                flattened.append(item)
+        if flattened != raw_keywords:
+            normalized = dict(data)
+            normalized["search_keywords"] = flattened
+            return normalized
+        return data
 
     @computed_field
     @property
