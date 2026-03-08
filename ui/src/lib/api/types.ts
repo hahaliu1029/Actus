@@ -86,6 +86,7 @@ export type LLMConfig = {
   base_url: string;
   api_key?: string;
   model_name: string;
+  api_type: "chat_completions" | "responses" | "auto";
   temperature: number;
   max_tokens: number;
   context_window: number | null;

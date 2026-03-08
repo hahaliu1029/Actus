@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import uuid
 from abc import ABC
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
@@ -17,6 +18,7 @@ from app.domain.models.event import (
 )
 from app.domain.models.memory import Memory
 from app.domain.models.message import Message
+from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.models.tool_result import ToolResult
 
 # from app.domain.repositories.session_repository import SessionRepository
@@ -24,6 +26,44 @@ from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
+
+_SKILL_CREATION_TEXT_RE = re.compile(r"[^0-9a-zA-Z\u4e00-\u9fff]+")
+_SKILL_CREATION_AFFIRMATIVE_REPLIES = frozenset(
+    {
+        "好的",
+        "安装吧",
+        "嗯",
+        "行",
+        "ok",
+        "yes",
+        "对",
+        "是的",
+        "确定",
+        "没问题",
+        "可以",
+        "继续",
+        "开始吧",
+        "安装",
+        "好的 继续生成吧",
+        "可以 安装",
+        "嗯 开始吧",
+    }
+)
+_SKILL_CREATION_NEGATIVE_REPLIES = frozenset(
+    {
+        "不安装",
+        "取消",
+        "不",
+        "no",
+        "cancel",
+        "否",
+        "拒绝",
+        "不要",
+        "不用",
+        "先别安装",
+        "不要继续",
+    }
+)
 
 
 class BaseAgent(ABC):
@@ -60,6 +100,8 @@ class BaseAgent(ABC):
         self._overflow_config = overflow_config or ContextOverflowConfig()
         self._runtime_system_context: str = ""
         self._conversation_summaries: list = []
+        self._skill_creation_state: SkillCreationState | None = None
+        self._skill_creation_approved_actions: set[str] = set()
 
     def set_runtime_system_context(self, context: str) -> None:
         """设置运行时系统上下文（如动态激活的 Skill 指南）"""
@@ -159,6 +201,54 @@ class BaseAgent(ABC):
                     self._session_id, self.name
                 )
 
+    async def _ensure_skill_creation_state(self) -> None:
+        """确保 Skill 创建等待状态已加载到运行时缓存。"""
+        if self._skill_creation_state is not None:
+            return
+
+        async with self._uow:
+            get_state = getattr(self._uow.session, "get_skill_creation_state", None)
+            if get_state is None:
+                self._skill_creation_state = None
+                return
+            self._skill_creation_state = await get_state(self._session_id)
+
+    async def _persist_skill_creation_state(self) -> None:
+        """持久化 Skill 创建等待状态。"""
+        if self._skill_creation_state is None:
+            return
+
+        async with self._uow:
+            save_state = getattr(self._uow.session, "save_skill_creation_state", None)
+            if save_state is None:
+                return
+            await save_state(self._session_id, self._skill_creation_state)
+
+    async def _clear_skill_creation_state(self) -> None:
+        """清理 Skill 创建等待状态。"""
+        self._skill_creation_state = None
+
+        async with self._uow:
+            clear_state = getattr(self._uow.session, "clear_skill_creation_state", None)
+            if clear_state is None:
+                return
+            await clear_state(self._session_id)
+
+    @staticmethod
+    def normalize_skill_creation_reply(text: str) -> str:
+        """归一化用户确认文本，便于确定性判定。"""
+        normalized = _SKILL_CREATION_TEXT_RE.sub(" ", (text or "").lower())
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    @classmethod
+    def _classify_skill_creation_reply(cls, text: str) -> str:
+        normalized = cls.normalize_skill_creation_reply(text)
+        if normalized in _SKILL_CREATION_NEGATIVE_REPLIES:
+            return "negative"
+        if normalized in _SKILL_CREATION_AFFIRMATIVE_REPLIES:
+            return "affirmative"
+        return "revise"
+
     def _get_available_tools(self) -> List[Dict[str, Any]]:
         """获取Agent所有可用的工具列表参数声明/Schema"""
         available_tools = []
@@ -209,6 +299,10 @@ class BaseAgent(ABC):
             },
         )
 
+    def _get_tool_choice(self) -> Optional[str]:
+        """返回当前轮调用LLM时应使用的 tool_choice。"""
+        return self._tool_choice
+
     def _intercept_tool_call(
         self, function_name: str, function_args: Dict[str, Any]
     ) -> ToolResult | None:
@@ -238,7 +332,7 @@ class BaseAgent(ABC):
                     messages=self._memory.get_messages(),
                     tools=self._get_available_tools(),
                     response_format=response_format,
-                    tool_choice=self._tool_choice,
+                    tool_choice=self._get_tool_choice(),
                 )
                 if not isinstance(message, dict):
                     raise ValueError("LLM返回的消息格式非法")
@@ -333,8 +427,44 @@ class BaseAgent(ABC):
 
     async def roll_back(self, message: Message) -> None:
         """Agent的状态回滚，该函数用于确保Agent的消息列表状态是正确，用于发送新消息、暂停/停止任务、通知用户"""
+        await self._ensure_skill_creation_state()
         # 1.取出记忆中的最后一条消息，检查是否是工具调用
         await self._ensure_memory()
+        if self._skill_creation_state and self._skill_creation_state.pending_action:
+            state = self._skill_creation_state
+            decision = self._classify_skill_creation_reply(message.message or "")
+            logger.info(
+                "Skill 创建确认回滚: pending=%s decision=%s reply=%r",
+                state.pending_action,
+                decision,
+                (message.message or "")[:50],
+            )
+
+            if decision in {"affirmative", "revise"}:
+                self._memory.add_message(
+                    {
+                        "role": "tool",
+                        "tool_call_id": state.last_tool_call_id,
+                        "function_name": state.last_tool_name,
+                        "content": state.saved_tool_result_json,
+                    }
+                )
+
+            if decision == "affirmative":
+                self._skill_creation_approved_actions.add(state.pending_action)
+                await self._clear_skill_creation_state()
+            elif decision == "negative":
+                await self._clear_skill_creation_state()
+                last_message = self._memory.get_last_message()
+                if last_message and last_message.get("tool_calls"):
+                    self._memory.roll_back()
+
+            async with self._uow:
+                await self._uow.session.save_memory(
+                    self._session_id, self.name, self._memory
+                )
+            return
+
         last_message = self._memory.get_last_message()
         if (
             not last_message

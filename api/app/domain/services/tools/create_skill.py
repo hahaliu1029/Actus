@@ -40,30 +40,43 @@ class CreateSkillTool(BaseTool):
                 "type": "string",
                 "description": "用户对目标 Skill 的完整需求描述",
             },
+            "blueprint": {
+                "type": "object",
+                "description": "（可选）brainstorm_skill 返回的 data.blueprint 对象，传入后跳过分析步骤",
+            },
             "blueprint_json": {
                 "type": "string",
-                "description": "（可选）brainstorm_skill 返回的蓝图 JSON，传入后跳过分析步骤",
+                "description": "（可选）brainstorm_skill 返回的蓝图 JSON 字符串，传入后跳过分析步骤。优先使用 blueprint 参数",
             },
         },
         required=["description"],
     )
-    async def generate_skill(self, description: str, blueprint_json: str = "") -> ToolResult:
+    async def generate_skill(
+        self,
+        description: str,
+        blueprint: dict | None = None,
+        blueprint_json: str = "",
+    ) -> ToolResult:
         progress_log: list[str] = []
         generated_files: SkillGeneratedFiles | None = None
         last_error: str | None = None
 
         try:
-            blueprint: SkillBlueprint | None = None
-            if blueprint_json:
+            parsed_blueprint: SkillBlueprint | None = None
+            if blueprint is not None:
+                parsed_blueprint = SkillBlueprint.model_validate(blueprint)
+            elif blueprint_json:
                 try:
-                    blueprint = SkillBlueprint.model_validate_json(blueprint_json)
+                    parsed_blueprint = SkillBlueprint.model_validate_json(blueprint_json)
                 except Exception:
-                    blueprint = SkillBlueprint.model_validate(json.loads(blueprint_json))
+                    parsed_blueprint = SkillBlueprint.model_validate(
+                        json.loads(blueprint_json)
+                    )
 
             async for event in self._creator.generate(
                 description=description,
                 sandbox=self._sandbox,
-                blueprint=blueprint,
+                blueprint=parsed_blueprint,
             ):
                 if isinstance(event, SkillGeneratedFiles):
                     generated_files = event

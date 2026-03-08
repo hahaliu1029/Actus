@@ -6,7 +6,16 @@ from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.models.session import Session, SessionStatus
-from app.domain.models.event import DoneEvent, PlanEvent, PlanEventStatus
+from app.domain.models.event import (
+    ControlAction,
+    ControlEvent,
+    ControlScope,
+    ControlSource,
+    DoneEvent,
+    PlanEvent,
+    PlanEventStatus,
+    WaitEvent,
+)
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
 pytestmark = pytest.mark.anyio
@@ -104,6 +113,7 @@ class _FlowAgent:
         self.update_plan_calls: list[dict] = []
         self.compact_calls: list[bool] = []
         self.summary_sets: list[list[ConversationSummary]] = []
+        self.create_plan_calls: list[Message] = []
 
     def set_runtime_system_context(self, _context: str) -> None:
         return None
@@ -150,6 +160,7 @@ class _FlowAgent:
             yield None
 
     async def create_plan(self, _message: Message):
+        self.create_plan_calls.append(_message)
         if False:
             yield None
 
@@ -164,6 +175,22 @@ class _FlowAgent:
             }
         )
         yield PlanEvent(plan=plan, status=PlanEventStatus.UPDATED)
+
+
+class _WaitingFlowAgent(_FlowAgent):
+    async def execute_step(self, plan: Plan, step: Step, _message: Message):
+        step.status = ExecutionStatus.RUNNING
+        yield WaitEvent()
+
+
+class _TakeoverFlowAgent(_FlowAgent):
+    async def execute_step(self, plan: Plan, step: Step, _message: Message):
+        step.status = ExecutionStatus.RUNNING
+        yield ControlEvent(
+            action=ControlAction.REQUESTED,
+            scope=ControlScope.SHELL,
+            source=ControlSource.AGENT,
+        )
 
 
 async def test_planner_react_flow_injects_anchor_and_passes_execution_summary(
@@ -312,3 +339,149 @@ async def test_planner_react_flow_loads_and_generates_summaries(monkeypatch) -> 
     assert len(session_repo.summaries) == 2
     assert session_repo.summaries[-1].round_number == 2
     assert session_repo.summaries[-1].user_intent == "继续分析数据"
+
+
+async def test_planner_react_flow_short_circuits_on_wait_event(monkeypatch) -> None:
+    plan = Plan(goal="创建 skill", steps=[Step(description="等待用户确认蓝图")])
+    session = Session(
+        id="session-wait-short-circuit",
+        status=SessionStatus.WAITING,
+        events=[PlanEvent(plan=plan, status=PlanEventStatus.CREATED)],
+    )
+    session_repo = _FlowSessionRepo(session)
+
+    planner_agent = _FlowAgent(name="planner")
+    react_agent = _WaitingFlowAgent(name="react")
+
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.PlannerAgent",
+        lambda **kwargs: planner_agent,
+    )
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.ReActAgent",
+        lambda **kwargs: react_agent,
+    )
+
+    flow = PlannerReActFlow(
+        uow_factory=lambda: _DummyUoW(session_repo),
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        session_id="session-wait-short-circuit",
+        json_parser=object(),
+        browser=object(),
+        sandbox=object(),
+        search_engine=object(),
+        mcp_tool=object(),
+        a2a_tool=object(),
+        skill_tool=object(),
+    )
+
+    events = [event async for event in flow.invoke(Message(message="可以，继续生成"))]
+
+    assert any(isinstance(event, WaitEvent) for event in events)
+    assert not planner_agent.update_plan_calls
+    assert not react_agent.compact_calls
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+async def test_planner_react_flow_short_circuits_on_control_requested(monkeypatch) -> None:
+    plan = Plan(goal="创建 skill", steps=[Step(description="等待用户接管 shell")])
+    session = Session(
+        id="session-control-short-circuit",
+        status=SessionStatus.WAITING,
+        events=[PlanEvent(plan=plan, status=PlanEventStatus.CREATED)],
+    )
+    session_repo = _FlowSessionRepo(session)
+
+    planner_agent = _FlowAgent(name="planner")
+    react_agent = _TakeoverFlowAgent(name="react")
+
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.PlannerAgent",
+        lambda **kwargs: planner_agent,
+    )
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.ReActAgent",
+        lambda **kwargs: react_agent,
+    )
+
+    flow = PlannerReActFlow(
+        uow_factory=lambda: _DummyUoW(session_repo),
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        session_id="session-control-short-circuit",
+        json_parser=object(),
+        browser=object(),
+        sandbox=object(),
+        search_engine=object(),
+        mcp_tool=object(),
+        a2a_tool=object(),
+        skill_tool=object(),
+    )
+
+    events = [event async for event in flow.invoke(Message(message="请继续"))]
+
+    assert any(
+        isinstance(event, ControlEvent) and event.action == ControlAction.REQUESTED
+        for event in events
+    )
+    assert not planner_agent.update_plan_calls
+    assert not react_agent.compact_calls
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+async def test_planner_react_flow_skips_replanning_during_skill_confirmation_resume(
+    monkeypatch,
+) -> None:
+    plan = Plan(goal="创建 skill", steps=[Step(description="继续生成 skill")])
+    session = Session(
+        id="session-skill-resume-running",
+        status=SessionStatus.RUNNING,
+        events=[PlanEvent(plan=plan, status=PlanEventStatus.CREATED)],
+    )
+    session_repo = _FlowSessionRepo(session)
+
+    planner_agent = _FlowAgent(name="planner")
+    react_agent = _WaitingFlowAgent(name="react")
+    react_agent._skill_creation_approved_actions = {"generate"}
+
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.PlannerAgent",
+        lambda **kwargs: planner_agent,
+    )
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.ReActAgent",
+        lambda **kwargs: react_agent,
+    )
+
+    flow = PlannerReActFlow(
+        uow_factory=lambda: _DummyUoW(session_repo),
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        session_id="session-skill-resume-running",
+        json_parser=object(),
+        browser=object(),
+        sandbox=object(),
+        search_engine=object(),
+        mcp_tool=object(),
+        a2a_tool=object(),
+        skill_tool=object(),
+    )
+
+    events = [event async for event in flow.invoke(Message(message="好的，根据这个蓝图开始生产"))]
+
+    assert any(isinstance(event, WaitEvent) for event in events)
+    assert not planner_agent.create_plan_calls
+    assert not planner_agent.update_plan_calls

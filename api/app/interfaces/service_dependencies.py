@@ -20,7 +20,11 @@ from app.infrastructure.external.health_checker.redis_health_checker import (
     RedisHealthChecker,
 )
 from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser
+from app.domain.external.llm import LLM
+from app.domain.models.app_config import LLMConfig
+from app.infrastructure.external.llm.fallback_llm import FallbackLLM
 from app.infrastructure.external.llm.openai_llm import OpenAILLM
+from app.infrastructure.external.llm.openai_responses_llm import OpenAIResponsesLLM
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.external.github_search_client import GitHubSearchClient
 from app.infrastructure.external.search.bing_search import BingSearchEngine
@@ -111,13 +115,30 @@ def _load_app_config():
     return app_config_repository.load()
 
 
+def _build_llm(llm_config: LLMConfig) -> LLM:
+    """根据 api_type 配置构建 LLM 实例。
+
+    - chat_completions: 仅用 Chat Completions API
+    - responses: 仅用 Responses API
+    - auto: 先走 Chat Completions，遇到兼容性错误自动回退到 Responses API
+    """
+    if llm_config.api_type == "responses":
+        return OpenAIResponsesLLM(llm_config)
+    if llm_config.api_type == "auto":
+        return FallbackLLM(
+            primary=OpenAILLM(llm_config),
+            fallback=OpenAIResponsesLLM(llm_config),
+        )
+    return OpenAILLM(llm_config)
+
+
 def _build_skill_service() -> SkillService:
     return SkillService(FileSkillRepository(settings.skills_root_dir))
 
 
 def get_skill_creator_service() -> SkillCreatorService:
     app_config = _load_app_config()
-    llm = OpenAILLM(app_config.llm_config)
+    llm = _build_llm(app_config.llm_config)
     github_client = GitHubSearchClient(token=settings.github_token or None)
     skill_service = _build_skill_service()
     return SkillCreatorService(
@@ -138,13 +159,13 @@ def get_agent_service(
     overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
 
     # 2.构建依赖实例
-    llm = OpenAILLM(app_config.llm_config)
+    llm = _build_llm(app_config.llm_config)
     summary_llm = None
     if app_config.agent_config.memory.summary_model:
         summary_llm_config = app_config.llm_config.model_copy(
             update={"model_name": app_config.agent_config.memory.summary_model}
         )
-        summary_llm = OpenAILLM(summary_llm_config)
+        summary_llm = _build_llm(summary_llm_config)
     file_storage = MinioFileStorage(
         bucket=settings.minio_bucket_name,
         minio_store=minio_store,

@@ -5,6 +5,7 @@ from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
+from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.repositories.session_repository import SessionRepository
 from app.infrastructure.models import SessionModel
 from sqlalchemy import cast, delete, func, select, update
@@ -346,6 +347,55 @@ class DBSessionRepository(SessionRepository):
             .values(
                 memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
                 + cast(patch_data, JSONB),
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def get_skill_creation_state(
+        self, session_id: str
+    ) -> SkillCreationState | None:
+        """获取会话中的 Skill 创建等待状态"""
+        stmt = select(SessionModel.memories["_skill_creator"]).where(
+            SessionModel.id == session_id
+        )
+        result = await self.db_session.execute(stmt)
+        state_data = result.scalar_one_or_none()
+
+        if not state_data:
+            return None
+
+        return SkillCreationState.model_validate(state_data)
+
+    async def save_skill_creation_state(
+        self, session_id: str, state: SkillCreationState
+    ) -> None:
+        """保存会话中的 Skill 创建等待状态"""
+        patch_data = {"_skill_creator": state.model_dump(mode="json")}
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                + cast(patch_data, JSONB),
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def clear_skill_creation_state(self, session_id: str) -> None:
+        """清理会话中的 Skill 创建等待状态"""
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB)).op("-")(
+                    "_skill_creator"
+                )
             )
         )
         result = await self.db_session.execute(stmt)

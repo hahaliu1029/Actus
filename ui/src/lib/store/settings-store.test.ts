@@ -51,6 +51,7 @@ describe("settings-store", () => {
     mockedConfigApi.getLLMConfig.mockResolvedValue({
       base_url: "https://api.openai.com/v1",
       model_name: "gpt-4o",
+      api_type: "chat_completions",
       temperature: 0.7,
       max_tokens: 4096,
       context_window: null,

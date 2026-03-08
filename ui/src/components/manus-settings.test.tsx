@@ -6,6 +6,7 @@ type SettingsState = {
   llmConfig: {
     base_url: string;
     model_name: string;
+    api_type: "chat_completions" | "responses" | "auto";
     temperature: number;
     max_tokens: number;
     api_key?: string;
@@ -59,6 +60,7 @@ const settingsState: SettingsState = {
   llmConfig: {
     base_url: "https://api.openai.com/v1",
     model_name: "gpt-4o",
+    api_type: "chat_completions",
     temperature: 0.7,
     max_tokens: 4096,
     context_window: null,
@@ -226,6 +228,21 @@ describe("ManusSettings - Skill risk policy", () => {
     expect(settingsState.updateLLMConfig).toHaveBeenCalledWith(
       expect.objectContaining({
         context_window: 131072,
+      })
+    );
+  });
+
+  it("模型配置页支持选择 api_type 并随保存提交", async () => {
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+
+    await openLLMTab();
+    await user.selectOptions(screen.getByLabelText("api_type"), "responses");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(settingsState.updateLLMConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        api_type: "responses",
       })
     );
   });

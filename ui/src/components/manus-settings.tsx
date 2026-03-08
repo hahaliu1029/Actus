@@ -122,6 +122,7 @@ export function ManusSettings() {
     base_url: "https://api.deepseek.com",
     api_key: "",
     model_name: "deepseek-reasoner",
+    api_type: "chat_completions",
     temperature: 0.7,
     max_tokens: 8192,
     context_window: null,
@@ -486,6 +487,30 @@ export function ManusSettings() {
                       />
                       <p className="mt-1 text-xs text-muted-foreground">
                         要使用的模型标识，如 deepseek-chat、deepseek-reasoner、gpt-4o 等。使用带推理的模型时，传递 tools 会自动降级到对话模型。
+                      </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      api_type
+                      <select
+                        aria-label="api_type"
+                        value={llmForm.api_type}
+                        onChange={(event) =>
+                          setLLMForm((prev) => ({
+                            ...prev,
+                            api_type: event.target.value as LLMConfig["api_type"],
+                          }))
+                        }
+                        className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                      >
+                        <option value="chat_completions">
+                          chat_completions（仅 Chat Completions）
+                        </option>
+                        <option value="responses">responses（仅 Responses API）</option>
+                        <option value="auto">auto（先 Chat，失败后回退 Responses）</option>
+                      </select>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        OpenAI gpt-5.4 推荐使用 auto，gpt-5.4-pro 必须使用 responses。
                       </p>
                     </label>
 

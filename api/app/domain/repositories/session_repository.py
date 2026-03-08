@@ -10,6 +10,7 @@ from app.domain.models.session import Session, SessionStatus
 
 if TYPE_CHECKING:
     from app.domain.models.conversation_summary import ConversationSummary
+    from app.domain.models.skill_creation_state import SkillCreationState
 
 
 class SessionRepository(Protocol):
@@ -99,4 +100,20 @@ class SessionRepository(Protocol):
         self, session_id: str, summaries: list[ConversationSummary]
     ) -> None:
         """保存会话的对话摘要列表"""
+        ...
+
+    async def get_skill_creation_state(
+        self, session_id: str
+    ) -> SkillCreationState | None:
+        """获取 Skill 创建链路的等待状态"""
+        ...
+
+    async def save_skill_creation_state(
+        self, session_id: str, state: SkillCreationState
+    ) -> None:
+        """保存 Skill 创建链路的等待状态"""
+        ...
+
+    async def clear_skill_creation_state(self, session_id: str) -> None:
+        """清理 Skill 创建链路的等待状态"""
         ...

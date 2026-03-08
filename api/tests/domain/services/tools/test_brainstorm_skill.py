@@ -66,6 +66,27 @@ async def test_brainstorm_returns_formatted_blueprint(
     assert result.data["skill_name"] == "cn-en-translator"
 
 
+async def test_brainstorm_returns_blueprint_and_json(
+    tool: BrainstormSkillTool,
+    mock_creator_service: MagicMock,
+) -> None:
+    mock_creator_service.analyze.return_value = SkillBlueprint(
+        skill_name="meeting-audio-analyzer",
+        description="会议音频分析工具",
+        tools=[],
+        search_keywords=["meeting audio analysis python"],
+        estimated_deps=["openai-whisper"],
+    )
+
+    result = await tool.invoke("brainstorm_skill", description="创建一个会议音频分析 skill")
+
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["skill_name"] == "meeting-audio-analyzer"
+    assert result.data["blueprint"]["skill_name"] == "meeting-audio-analyzer"
+    assert "blueprint_json" in result.data
+
+
 async def test_brainstorm_returns_error_on_exception(
     tool: BrainstormSkillTool,
     mock_creator_service: MagicMock,

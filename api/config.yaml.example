@@ -1,5 +1,5 @@
 # Actus 运行时配置模板
-# 复制此文件为 config.yaml 并填入你的实际配置
+# 本地开发可复制为 api/config.yaml；Docker 运行时请写入 /app/data/config.yaml
 # cp config.yaml.example config.yaml
 
 llm_config:
@@ -8,6 +8,28 @@ llm_config:
   model_name: deepseek-reasoner           # 模型名称
   temperature: 0.7
   max_tokens: 8192
+  # api_type: chat_completions            # API 类型: chat_completions / responses / auto
+  # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
+
+# OpenAI 官方 API 示例（gpt-5.4，推荐）
+# llm_config:
+#   base_url: https://api.openai.com/v1
+#   api_key: YOUR_OPENAI_API_KEY
+#   model_name: gpt-5.4
+#   temperature: 0.7
+#   max_tokens: 8192
+#   api_type: auto
+#   supports_response_format: true
+
+# OpenAI 官方 API 示例（gpt-5.4-pro，仅支持 Responses API）
+# llm_config:
+#   base_url: https://api.openai.com/v1
+#   api_key: YOUR_OPENAI_API_KEY
+#   model_name: gpt-5.4-pro
+#   temperature: 0.7
+#   max_tokens: 8192
+#   api_type: responses
+#   supports_response_format: true
 
 agent_config:
   max_iterations: 100                     # Agent 最大迭代次数

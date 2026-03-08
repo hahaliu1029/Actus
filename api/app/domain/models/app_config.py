@@ -21,6 +21,10 @@ class LLMConfig(BaseModel):
     context_window: int | None = Field(
         default=None, ge=1024
     )  # 上下文窗口大小，空表示根据模型映射自动推断
+    api_type: Literal["chat_completions", "responses", "auto"] = (
+        "chat_completions"  # API 类型: chat_completions / responses / auto（先 chat 失败回退 responses）
+    )
+    supports_response_format: bool = True  # 是否支持 response_format 参数，部分兼容 API 不支持需设为 False
     context_overflow_guard_enabled: bool = False  # 是否开启上下文超限治理
     overflow_retry_cap: int = Field(2, ge=0, le=10)  # 超限治理自动重试次数上限
     soft_trigger_ratio: float = Field(

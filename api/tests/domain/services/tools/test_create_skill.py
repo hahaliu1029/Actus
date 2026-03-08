@@ -113,6 +113,39 @@ class TestGenerateSkill:
         assert received_blueprint["bp"] is not None
         assert received_blueprint["bp"].skill_name == "my-skill"
 
+    async def test_generate_with_blueprint_object(
+        self, tool: CreateSkillTool, mock_creator: MagicMock,
+    ) -> None:
+        files = SkillGeneratedFiles(
+            skill_md="---\nname: test\n---",
+            manifest={"name": "test", "tools": []},
+            scripts=[ScriptFile(path="bundle/run.py", content="print('ok')")],
+            dependencies=[],
+        )
+
+        received_blueprint = {}
+
+        async def fake_generate(**kwargs):
+            received_blueprint["bp"] = kwargs.get("blueprint")
+            yield files
+
+        mock_creator.generate = fake_generate
+        result = await tool.invoke(
+            "generate_skill",
+            description="测试",
+            blueprint={
+                "skill_name": "my-skill",
+                "description": "测试",
+                "tools": [],
+                "search_keywords": [],
+                "estimated_deps": [],
+            },
+        )
+
+        assert result.success
+        assert received_blueprint["bp"] is not None
+        assert received_blueprint["bp"].skill_name == "my-skill"
+
 
 class TestInstallSkill:
     async def test_install_returns_success(

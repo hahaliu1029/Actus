@@ -26,6 +26,7 @@ class OpenAILLM(LLM):
         self._temperature = llm_config.temperature
         self._max_tokens = llm_config.max_tokens
         self._timeout = 3600
+        self._supports_response_format = llm_config.supports_response_format
 
     @property
     def model_name(self) -> str:
@@ -178,8 +179,8 @@ class OpenAILLM(LLM):
                 "timeout": self._timeout,
             }
 
-            # 仅在有值时传递可选参数，避免None导致兼容性问题
-            if response_format is not None:
+            # 仅在有值且模型支持时传递 response_format，部分兼容 API 不支持该参数
+            if response_format is not None and self._supports_response_format:
                 params["response_format"] = response_format
             if tools:
                 params["tools"] = tools

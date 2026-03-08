@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 from app.domain.models.skill_creator import SkillBlueprint
@@ -63,10 +64,15 @@ class BrainstormSkillTool(BaseTool):
         try:
             blueprint = await self._creator.analyze(description)
             preview = _format_blueprint(blueprint)
+            payload = blueprint.model_dump(mode="json")
             return ToolResult(
                 success=True,
                 message=preview,
-                data=blueprint.model_dump(),
+                data={
+                    **payload,
+                    "blueprint": payload,
+                    "blueprint_json": json.dumps(payload, ensure_ascii=False),
+                },
             )
         except Exception as exc:
             logger.exception("蓝图生成异常: %s", exc)

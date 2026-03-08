@@ -10,11 +10,14 @@ from app.domain.models.app_config import AgentConfig
 from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
     BaseEvent,
+    ControlAction,
+    ControlEvent,
     DoneEvent,
     MessageEvent,
     PlanEvent,
     PlanEventStatus,
     TitleEvent,
+    WaitEvent,
 )
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan
@@ -24,6 +27,7 @@ from app.domain.models.session import SessionStatus
 from app.domain.services.agents.planner import PlannerAgent
 from app.domain.services.agents.react import ReActAgent
 from app.domain.services.tools.a2a import A2ATool
+from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.browser import BrowserTool
 from app.domain.services.tools.file import FileTool
 from app.domain.services.tools.mcp import MCPTool
@@ -31,7 +35,6 @@ from app.domain.services.tools.message import MessageTool
 from app.domain.services.tools.search import SearchTool
 from app.domain.services.tools.shell import ShellTool
 from app.domain.services.tools.skill import SkillTool
-from app.domain.services.tools.base import BaseTool
 
 from ...repositories.uow import IUnitOfWork
 from .base import BaseFlow, FlowStatus
@@ -134,9 +137,7 @@ class PlannerReActFlow(BaseFlow):
             for step in plan.steps:
                 status = "成功" if step.success else ("失败" if step.done else "未执行")
                 result_text = (step.result or "无结果记录")[:200]
-                steps_lines.append(
-                    f"- {step.description} [{status}]: {result_text}"
-                )
+                steps_lines.append(f"- {step.description} [{status}]: {result_text}")
 
             prompt = GENERATE_SUMMARY_PROMPT.format(
                 round_number=round_number,
@@ -215,8 +216,12 @@ class PlannerReActFlow(BaseFlow):
             logger.debug(
                 f"会话[{self._session_id}]未处于空闲状态，回滚数据确保消息列表格式正确"
             )
-            await self.planner.roll_back(message)
+            # react 必须先于 planner 执行 roll_back：
+            # 两者共享同一份 DB 持久化的 SkillCreationState，
+            # 若 planner 先运行会把 state 清除，react 便无法读取到
+            # 已确认的 pending_action，导致工具门控失效。
             await self.react.roll_back(message)
+            await self.planner.roll_back(message)
 
             if self._memory_config.context_anchor_enabled:
                 completed_steps: list[str] = []
@@ -243,8 +248,18 @@ class PlannerReActFlow(BaseFlow):
 
         # 3.如果会话状态等于运行中，则流需要重新规划内容/plan
         if session.status == SessionStatus.RUNNING:
-            logger.debug(f"会话[{self._session_id}]处于运行状态并传递了新消息")
-            self.status = FlowStatus.PLANNING
+            # AgentTaskRunner 会在 flow 之前把 WAITING 改为 RUNNING，
+            # 因此需要通过 react 的 approved_actions 判断是否正处于
+            # Skill 创建确认恢复阶段；若是则跳转 EXECUTING，避免
+            # planner 为 "可以" 等确认短语重新生成无意义的计划。
+            if getattr(self.react, "_skill_creation_approved_actions", None):
+                logger.debug(
+                    f"会话[{self._session_id}]处于Skill创建确认恢复阶段，直接进入执行"
+                )
+                self.status = FlowStatus.EXECUTING
+            else:
+                logger.debug(f"会话[{self._session_id}]处于运行状态并传递了新消息")
+                self.status = FlowStatus.PLANNING
 
         # 4.如果会话状态等于等待人类输入，则需要修改流的状态为执行中
         if session.status == SessionStatus.WAITING:
@@ -325,6 +340,17 @@ class PlannerReActFlow(BaseFlow):
                 )
                 async for event in self.react.execute_step(self.plan, step, message):
                     yield event
+                    if isinstance(event, WaitEvent):
+                        logger.info("Planner&ReAct流检测到WaitEvent，暂停当前轮执行")
+                        return
+                    if (
+                        isinstance(event, ControlEvent)
+                        and event.action == ControlAction.REQUESTED
+                    ):
+                        logger.info(
+                            "Planner&ReAct流检测到ControlEvent(requested)，暂停当前轮执行"
+                        )
+                        return
 
                 # 21.压缩执行Agent记忆，避免上下文腐化+消耗大量token
                 logger.info(f"压缩{self.react.name} Agent记忆/上下文")
@@ -366,9 +392,7 @@ class PlannerReActFlow(BaseFlow):
 
                 uow = self._uow_factory()
                 async with uow:
-                    existing_summaries = await uow.session.get_summary(
-                        self._session_id
-                    )
+                    existing_summaries = await uow.session.get_summary(self._session_id)
                 round_number = len(existing_summaries) + 1
                 await self._generate_summary(self.plan, round_number)
 
