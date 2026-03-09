@@ -11,6 +11,7 @@ from app.domain.models.session import Session, SessionStatus
 if TYPE_CHECKING:
     from app.domain.models.conversation_summary import ConversationSummary
     from app.domain.models.skill_creation_state import SkillCreationState
+    from app.domain.models.skill_graph_state import SkillGraphState
 
 
 class SessionRepository(Protocol):
@@ -116,4 +117,20 @@ class SessionRepository(Protocol):
 
     async def clear_skill_creation_state(self, session_id: str) -> None:
         """清理 Skill 创建链路的等待状态"""
+        ...
+
+    async def get_skill_graph_state(
+        self, session_id: str
+    ) -> SkillGraphState | None:
+        """获取 Skill 创建子图的持久化状态"""
+        ...
+
+    async def save_skill_graph_state(
+        self, session_id: str, state: SkillGraphState
+    ) -> None:
+        """保存 Skill 创建子图的持久化状态"""
+        ...
+
+    async def clear_skill_graph_state(self, session_id: str) -> None:
+        """清理 Skill 创建子图的持久化状态"""
         ...

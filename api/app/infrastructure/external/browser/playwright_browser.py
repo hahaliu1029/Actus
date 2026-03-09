@@ -220,24 +220,13 @@ class PlaywrightBrowser(BrowserProtocol):
                 # 4.获取浏览器的所有上下文
                 contexts = self.browser.contexts
 
-                # 5.如果上下文存在，并且第一个上下文只有一个页面则执行如下逻辑
-                if contexts and len(contexts[0].pages) == 1:
-                    # 6.获取当前上下文的第一个页面
-                    page = contexts[0].pages[0]
-
-                    # 7.判断当前页面是不是空页面，如果是则直接使用page，否则新建一个
-                    if (
-                        page.url == "about:blank"
-                        or page.url == "chrome://newtab/"
-                        or page.url == "chrome://new-tab-page/"
-                        or not page.url
-                    ):
-                        self.page = page
-                    else:
-                        # 8.当前页面已经有数据则新建一个页面
-                        self.page = await contexts[0].new_page()
+                # 5.如果上下文存在且有页面，则复用已有页面
+                if contexts and contexts[0].pages:
+                    # 6.获取当前上下文的最新页面(最右侧标签页)
+                    pages = contexts[0].pages
+                    self.page = pages[-1]
                 else:
-                    # 9.上下文不存在或者页面不唯一则表示数据被污染，新建一个页面
+                    # 7.上下文不存在或者没有页面，新建一个页面
                     context = (
                         contexts[0] if contexts else await self.browser.new_context()
                     )

@@ -38,6 +38,8 @@ from app.domain.services.tools.skill import SkillTool
 
 from ...repositories.uow import IUnitOfWork
 from .base import BaseFlow, FlowStatus
+from .skill_creation_graph import SkillCreationGraph
+from .skill_graph_canary import is_skill_graph_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,8 @@ class PlannerReActFlow(BaseFlow):
         brainstorm_skill_tool: BaseTool | None = None,  # skill头脑风暴工具
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
         summary_llm: LLM | None = None,  # 摘要生成模型
+        user_id: str = "",  # 用户ID（用于灰度分桶）
+        skill_graph_canary_percent: int = 0,  # 子图灰度百分比
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
         # 1.流初始化数据配置
@@ -144,6 +148,12 @@ class PlannerReActFlow(BaseFlow):
         )
         self._memory_config = agent_config.memory
         logger.debug(f"创建执行Agent成功, 会话id: {self._session_id}")
+
+        # 5. Skill 创建子图（灰度控制）
+        self._user_id = user_id
+        self._skill_graph_canary_percent = skill_graph_canary_percent
+        self._brainstorm_skill_tool = brainstorm_skill_tool
+        self._create_skill_tool = create_skill_tool
 
     async def _generate_summary(self, plan: Plan, round_number: int) -> None:
         """在对话轮结束时生成并持久化对话摘要。"""
@@ -207,6 +217,136 @@ class PlannerReActFlow(BaseFlow):
         except Exception as exc:
             logger.warning(f"摘要生成失败，跳过: {exc}")
 
+    def _is_skill_graph_active(self) -> bool:
+        """判断当前用户是否命中子图灰度。"""
+        return is_skill_graph_enabled(self._user_id, self._skill_graph_canary_percent)
+
+    async def _try_drive_skill_graph(
+        self, message: Message
+    ) -> AsyncGenerator[BaseEvent, None] | None:
+        """尝试通过子图驱动 Skill 创建流程。
+
+        Returns
+        -------
+        如果子图被激活，返回事件的 async generator；否则返回 None。
+        """
+        if not self._is_skill_graph_active():
+            return None
+        if not self._brainstorm_skill_tool or not self._create_skill_tool:
+            return None
+
+        action = message.skill_confirmation_action
+
+        # 从 DB 读取子图状态
+        async with self._uow_factory() as uow:
+            graph_state = await uow.session.get_skill_graph_state(self._session_id)
+
+        # 无子图状态且无结构化动作 → 不激活子图（走正常流程，让 brainstorm 首次执行）
+        if graph_state is None and action is None:
+            return None
+
+        # 无子图状态但有结构化动作 → 尝试从旧状态迁移
+        if graph_state is None and action is not None:
+            async with self._uow_factory() as uow:
+                old_state = await uow.session.get_skill_creation_state(self._session_id)
+            if old_state is None:
+                return None
+            # 从旧状态构建子图状态
+            from app.domain.models.skill_graph_state import SkillGraphState
+            status_map = {
+                "generate": "wait_generate",
+                "install": "wait_install",
+            }
+            mapped_status = status_map.get(old_state.pending_action or "", None)
+            if mapped_status is None:
+                return None
+            graph_state = SkillGraphState(
+                status=mapped_status,
+                pending_action=old_state.pending_action,
+                approval_status=old_state.approval_status,
+                blueprint=old_state.blueprint,
+                blueprint_json=old_state.blueprint_json,
+                skill_data=old_state.skill_data,
+                last_tool_call_id=old_state.last_tool_call_id,
+                saved_tool_result_json=old_state.saved_tool_result_json,
+            )
+
+        # 子图处于终态 → 不拦截
+        if graph_state is not None and graph_state.is_terminal:
+            return None
+
+        # 驱动子图
+        async def _drive() -> AsyncGenerator[BaseEvent, None]:
+            graph = SkillCreationGraph(
+                brainstorm_tool=self._brainstorm_skill_tool,
+                create_skill_tool=self._create_skill_tool,
+            )
+            async for event in graph.run(
+                state=graph_state,
+                action=action,
+                original_request=getattr(graph_state, "original_request", ""),
+            ):
+                yield event
+
+            # 持久化更新后的状态
+            new_state = graph.state
+            if new_state is not None:
+                async with self._uow_factory() as uow:
+                    if new_state.is_terminal:
+                        await uow.session.clear_skill_graph_state(self._session_id)
+                        # 同时清理旧状态
+                        await uow.session.clear_skill_creation_state(self._session_id)
+                    else:
+                        await uow.session.save_skill_graph_state(
+                            self._session_id, new_state
+                        )
+
+        return _drive()
+
+    async def _promote_to_skill_graph(self, wait_event: WaitEvent) -> None:
+        """将 WaitEvent 触发时的旧 SkillCreationState 提升为子图状态。"""
+        try:
+            async with self._uow_factory() as uow:
+                old_state = await uow.session.get_skill_creation_state(
+                    self._session_id
+                )
+            if old_state is None:
+                return
+
+            from app.domain.models.skill_graph_state import SkillGraphState
+
+            status_map = {
+                "generate": "wait_generate",
+                "install": "wait_install",
+            }
+            mapped_status = status_map.get(old_state.pending_action or "", None)
+            if mapped_status is None:
+                return
+
+            graph_state = SkillGraphState(
+                status=mapped_status,
+                pending_action=old_state.pending_action,
+                approval_status=old_state.approval_status,
+                original_request="",
+                blueprint=old_state.blueprint,
+                blueprint_json=old_state.blueprint_json,
+                skill_data=old_state.skill_data,
+                last_tool_call_id=old_state.last_tool_call_id,
+                saved_tool_result_json=old_state.saved_tool_result_json,
+            )
+
+            async with self._uow_factory() as uow:
+                await uow.session.save_skill_graph_state(
+                    self._session_id, graph_state
+                )
+            logger.info(
+                "WaitEvent 触发子图状态提升: session=%s status=%s",
+                self._session_id,
+                mapped_status,
+            )
+        except Exception as exc:
+            logger.warning("子图状态提升失败，将回退旧流程: %s", exc)
+
     def set_skill_context(self, skill_context: str) -> None:
         """设置当前轮次激活 Skill 的系统上下文提示。"""
         self.planner.set_runtime_system_context(skill_context)
@@ -268,6 +408,16 @@ class PlannerReActFlow(BaseFlow):
                     original_request=original_request,
                     completed_steps=completed_steps,
                 )
+
+        # 2.5 尝试通过子图驱动 Skill 创建流程
+        subgraph_gen = await self._try_drive_skill_graph(message)
+        if subgraph_gen is not None:
+            logger.info(
+                f"会话[{self._session_id}]由 Skill 创建子图驱动"
+            )
+            async for event in subgraph_gen:
+                yield event
+            return
 
         self._hydrate_skill_resume_token_from_structured_confirmation(message)
 
@@ -366,6 +516,9 @@ class PlannerReActFlow(BaseFlow):
                 async for event in self.react.execute_step(self.plan, step, message):
                     yield event
                     if isinstance(event, WaitEvent):
+                        # 子图灰度命中时，将旧状态迁移为子图状态以便下轮走子图路径
+                        if self._is_skill_graph_active():
+                            await self._promote_to_skill_graph(event)
                         logger.info("Planner&ReAct流检测到WaitEvent，暂停当前轮执行")
                         return
                     if (

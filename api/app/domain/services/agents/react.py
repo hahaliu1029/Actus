@@ -295,6 +295,11 @@ class ReActAgent(BaseAgent):
         if function_name != "message_ask_user":
             return None
 
+        # 携带 suggest_user_takeover 的接管请求直接放行，不受软引导门控限制
+        suggest_takeover = str(function_args.get("suggest_user_takeover", "none")).strip().lower()
+        if suggest_takeover in {"browser", "shell"}:
+            return None
+
         # 如果已经收到过一次 SOFT_HINT，第二次直接放行
         if self._step_ask_user_soft_hint_count >= 1:
             return None

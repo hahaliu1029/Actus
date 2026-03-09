@@ -240,6 +240,8 @@ class AgentTaskRunner(TaskRunner):
             brainstorm_skill_tool=self._brainstorm_skill_tool,
             overflow_config=self._overflow_config,
             summary_llm=summary_llm,
+            user_id=self._user_id or "",
+            skill_graph_canary_percent=settings.skill_graph_canary_percent,
         )
 
     async def _put_and_add_event(

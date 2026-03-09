@@ -7,6 +7,7 @@ from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
 from app.domain.models.skill_creation_state import SkillCreationState
+from app.domain.models.skill_graph_state import SkillGraphState
 from app.domain.repositories.session_repository import SessionRepository
 from app.infrastructure.models import SessionModel
 from pydantic import ValidationError
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 _SKILL_CREATION_STATE_KEY = "__skill_creation_state_v1"
 _SKILL_CREATION_STATE_LEGACY_KEY = "_skill_creator"
+_SKILL_GRAPH_STATE_KEY = "_skill_graph"
 
 
 class DBSessionRepository(SessionRepository):
@@ -417,6 +419,63 @@ class DBSessionRepository(SessionRepository):
                 memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
                 .op("-")(_SKILL_CREATION_STATE_KEY)
                 .op("-")(_SKILL_CREATION_STATE_LEGACY_KEY)
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    # -- Skill 创建子图状态 -------------------------------------------------- #
+
+    async def get_skill_graph_state(
+        self, session_id: str
+    ) -> SkillGraphState | None:
+        """获取会话中的 Skill 创建子图状态"""
+        stmt = select(
+            SessionModel.memories[_SKILL_GRAPH_STATE_KEY],
+        ).where(SessionModel.id == session_id)
+        result = await self.db_session.execute(stmt)
+        row = result.one_or_none()
+        if not row or not row[0]:
+            return None
+
+        try:
+            return SkillGraphState.model_validate(row[0])
+        except ValidationError as exc:
+            logger.warning(
+                "Skill 子图状态结构非法，忽略: session_id=%s error=%s",
+                session_id,
+                exc,
+            )
+            return None
+
+    async def save_skill_graph_state(
+        self, session_id: str, state: SkillGraphState
+    ) -> None:
+        """保存会话中的 Skill 创建子图状态"""
+        patch_data = {_SKILL_GRAPH_STATE_KEY: state.model_dump(mode="json")}
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                + cast(patch_data, JSONB),
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def clear_skill_graph_state(self, session_id: str) -> None:
+        """清理会话中的 Skill 创建子图状态"""
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                .op("-")(_SKILL_GRAPH_STATE_KEY)
             )
         )
         result = await self.db_session.execute(stmt)

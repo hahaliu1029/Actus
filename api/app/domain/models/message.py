@@ -2,7 +2,9 @@ from typing import List, Literal
 
 from pydantic import BaseModel, Field
 
-SkillConfirmationAction = Literal["generate", "revise", "install", "cancel"]
+SkillConfirmationAction = Literal[
+    "generate", "revise", "install", "cancel", "regenerate", "retry"
+]
 
 
 class Message(BaseModel):
