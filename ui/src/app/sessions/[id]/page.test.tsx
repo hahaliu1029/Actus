@@ -31,6 +31,9 @@ const sessionStoreState: SessionStoreState = {
   isChatting: false,
   chatSessionId: null,
 };
+const markdownRendererMock = vi.fn(({ content }: { content: string }) => (
+  <div data-testid="markdown-renderer">{content}</div>
+));
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ id: "s-b" }),
@@ -41,7 +44,7 @@ vi.mock("@/components/chat-input", () => ({
 }));
 
 vi.mock("@/components/markdown-renderer", () => ({
-  MarkdownRenderer: ({ content }: { content: string }) => <div>{content}</div>,
+  MarkdownRenderer: (props: { content: string }) => markdownRendererMock(props),
 }));
 
 vi.mock("@/components/session-header", () => ({
@@ -125,6 +128,7 @@ describe("SessionPage", () => {
     sessionStoreState.isLoadingCurrentSession = false;
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;
+    markdownRendererMock.mockClear();
   });
 
   it("全局流式属于其他会话时，不应显示当前会话执行中", () => {
@@ -166,5 +170,45 @@ describe("SessionPage", () => {
         silent: true,
       });
     });
+  });
+
+  it("tool progress 事件应使用 MarkdownRenderer 渲染 detail", () => {
+    const askText = [
+      "请你只回答下面这 6 行：",
+      "",
+      "输入方式（选 A/B/C，可多选）：",
+      "输出方式（选 A/B/C）：",
+    ].join("\n");
+
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "waiting",
+      events: [
+        {
+          event: "tool",
+          data: {
+            event_id: "evt-tool-ask",
+            name: "message",
+            function: "message_ask_user",
+            status: "called",
+            created_at: 1_700_000_000,
+            args: {
+              text: askText,
+            },
+          },
+        },
+      ],
+    };
+
+    render(<SessionPage />);
+
+    expect(markdownRendererMock).toHaveBeenCalledWith(
+      expect.objectContaining({ content: askText })
+    );
+    expect(screen.getByTestId("markdown-renderer")).toHaveTextContent("请你只回答下面这 6 行：");
+    expect(screen.getByTestId("markdown-renderer")).toHaveTextContent(
+      "输入方式（选 A/B/C，可多选）："
+    );
   });
 });

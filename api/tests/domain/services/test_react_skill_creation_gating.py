@@ -201,6 +201,54 @@ def test_intercept_blocks_install_without_approval_token(agent: ReActAgent) -> N
     assert result.data["code"] == "SKILL_CONFIRMATION_REQUIRED"
 
 
+def test_intercept_install_approved_state_auto_injects_skill_data(
+    agent: ReActAgent,
+) -> None:
+    agent._skill_creation_state = SkillCreationState(
+        pending_action="install",
+        approval_status="approved",
+        skill_data='{"skill_md":"x"}',
+    )
+    agent._skill_creation_approved_actions = set()
+    args: dict[str, Any] = {}
+
+    result = agent._intercept_tool_call("install_skill", args)
+
+    assert result is None
+    assert args["skill_data"] == '{"skill_md":"x"}'
+
+
+def test_intercept_install_approved_state_returns_missing_when_unrecoverable(
+    agent: ReActAgent,
+) -> None:
+    agent._skill_creation_state = SkillCreationState(
+        pending_action="install",
+        approval_status="approved",
+    )
+    agent._skill_creation_approved_actions = set()
+
+    result = agent._intercept_tool_call("install_skill", {})
+
+    assert result is not None
+    assert result.success is False
+    assert result.data["code"] == "SKILL_DATA_MISSING"
+
+
+def test_resume_allowed_tools_can_be_restored_from_persisted_approved_state(
+    agent: ReActAgent,
+) -> None:
+    agent._skill_creation_state = SkillCreationState(
+        pending_action="install",
+        approval_status="approved",
+        skill_data='{"skill_md":"x"}',
+    )
+    agent._skill_creation_approved_actions = set()
+
+    allowed = agent._get_skill_creation_resume_allowed_tools()
+
+    assert allowed == {"install_skill"}
+
+
 def test_intercept_ignores_unrelated_tools(agent: ReActAgent) -> None:
     agent._skill_creation_state = SkillCreationState(
         pending_action="generate",
@@ -241,7 +289,9 @@ async def test_wait_after_brainstorm_when_not_skipped(agent: ReActAgent) -> None
 
     assert any(isinstance(event, StepEvent) for event in events)
     assert any(isinstance(event, MessageEvent) for event in events)
-    assert any(isinstance(event, WaitEvent) for event in events)
+    wait_events = [event for event in events if isinstance(event, WaitEvent)]
+    assert wait_events
+    assert wait_events[0].pending_action == "generate"
 
 
 async def test_wait_after_generate_before_install(agent: ReActAgent) -> None:
@@ -270,7 +320,9 @@ async def test_wait_after_generate_before_install(agent: ReActAgent) -> None:
     events = [event async for event in agent.execute_step(plan, step, message)]
 
     assert any(isinstance(event, MessageEvent) for event in events)
-    assert any(isinstance(event, WaitEvent) for event in events)
+    wait_events = [event for event in events if isinstance(event, WaitEvent)]
+    assert wait_events
+    assert wait_events[0].pending_action == "install"
 
 
 async def test_skill_confirmation_required_persists_state(agent: ReActAgent) -> None:
@@ -474,3 +526,92 @@ def test_tool_choice_is_required_during_install_resume(
     agent_with_creator_tools._skill_creation_approved_actions = {"install"}
 
     assert agent_with_creator_tools._get_tool_choice() == "required"
+
+
+def test_intercept_redirects_message_tools_during_install_resume(
+    agent: ReActAgent,
+) -> None:
+    """安装恢复阶段，LLM 调用 message 类工具时应被拦截并引导调用 install_skill。"""
+    agent._skill_creation_approved_actions = {"install"}
+
+    for tool_name in ["message_ask_user", "message_notify_user"]:
+        result = agent._intercept_tool_call(tool_name, {"text": "找不到 skill_data"})
+
+        assert result is not None
+        assert result.success is True
+        assert result.data["code"] == "SKILL_RESUME_REDIRECT"
+        assert "install_skill" in result.message
+
+
+def test_intercept_does_not_redirect_message_tools_without_install_resume(
+    agent: ReActAgent,
+) -> None:
+    """非安装恢复阶段，message 类工具不应被拦截。"""
+    agent._skill_creation_approved_actions = set()
+
+    result = agent._intercept_tool_call("message_ask_user", {"text": "hello"})
+
+    # 应进入正常的 soft hint 流程，而非 SKILL_RESUME_REDIRECT
+    assert result is None or result.data.get("code") != "SKILL_RESUME_REDIRECT"
+
+
+async def test_execute_step_skips_message_ask_user_during_install_resume(
+    agent: ReActAgent,
+) -> None:
+    """安装恢复阶段 message_ask_user 被 SKILL_RESUME_REDIRECT 拦截后，
+    execute_step 应跳过向用户转发（不产生 WaitEvent），LLM 继续重试。"""
+
+    call_count = 0
+
+    async def fake_invoke(_query: str):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # LLM 第一次尝试调用 message_ask_user
+            yield ToolEvent(
+                tool_call_id="msg-1",
+                tool_name="message",
+                function_name="message_ask_user",
+                function_args={"text": "找不到 skill_data"},
+                function_result=ToolResult(
+                    success=True,
+                    message="当前处于安装恢复阶段，无需询问用户。",
+                    data={"code": "SKILL_RESUME_REDIRECT"},
+                ),
+                status=ToolEventStatus.CALLED,
+            )
+        # 后续 LLM 返回文本结果
+        yield MessageEvent(
+            role="assistant",
+            message='{"success": true, "result": "ok", "attachments": []}',
+        )
+
+    agent.invoke = fake_invoke  # type: ignore[method-assign]
+    agent._skill_creation_approved_actions = {"install"}
+
+    plan = Plan(language="zh", steps=[Step(description="安装 skill")])
+    step = plan.steps[0]
+    message = Message(message="确认安装")
+
+    events = [event async for event in agent.execute_step(plan, step, message)]
+
+    # 不应产生 WaitEvent（说明 message_ask_user 被正确跳过）
+    assert not any(isinstance(event, WaitEvent) for event in events)
+    # 应包含步骤完成事件
+    assert any(isinstance(event, StepEvent) for event in events)
+
+
+def test_install_resume_prompt_mentions_auto_inject(agent: ReActAgent) -> None:
+    """安装恢复阶段的执行提示词应明确告知系统会自动注入 skill_data。"""
+    agent._skill_creation_approved_actions = {"install"}
+
+    plan = Plan(language="zh", steps=[Step(description="安装 skill")])
+    step = plan.steps[0]
+    message = Message(message="可以")
+
+    query = agent._build_execution_query(plan, step, message)
+
+    assert "系统会自动" in query
+    assert "skill_data 可以传空字符串" in query
+    # 不应再要求 LLM 从上下文中查找 skill_data
+    assert "优先使用上一轮" not in query

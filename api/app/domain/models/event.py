@@ -6,6 +6,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 from .file import File
+from .message import SkillConfirmationAction
 from .plan import Plan, Step
 from .search import SearchResultItem
 from .tool_result import ToolResult
@@ -101,6 +102,7 @@ class MessageEvent(BaseEvent):
     stream_id: Optional[str] = None  # 同一条消息流式更新id
     partial: bool = False  # 是否为流式中间片段
     attachments: List[File] = Field(default_factory=list)  # 附件列表信息
+    skill_confirmation_action: SkillConfirmationAction | None = None
 
 
 class BrowserToolContent(BaseModel):
@@ -173,6 +175,7 @@ class WaitEvent(BaseEvent):
     """等待事件，等待用户输入确认"""
 
     type: Literal["wait"] = "wait"
+    pending_action: Literal["generate", "install"] | None = None
 
 
 class ControlEvent(BaseEvent):

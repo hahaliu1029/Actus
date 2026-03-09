@@ -485,3 +485,59 @@ async def test_planner_react_flow_skips_replanning_during_skill_confirmation_res
     assert any(isinstance(event, WaitEvent) for event in events)
     assert not planner_agent.create_plan_calls
     assert not planner_agent.update_plan_calls
+
+
+async def test_planner_react_flow_skips_replanning_when_structured_generate_confirmation_arrives_without_runtime_token(
+    monkeypatch,
+) -> None:
+    plan = Plan(goal="创建 skill", steps=[Step(description="继续生成 skill")])
+    session = Session(
+        id="session-skill-resume-structured-action",
+        status=SessionStatus.RUNNING,
+        events=[PlanEvent(plan=plan, status=PlanEventStatus.CREATED)],
+    )
+    session_repo = _FlowSessionRepo(session)
+
+    planner_agent = _FlowAgent(name="planner")
+    react_agent = _WaitingFlowAgent(name="react")
+
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.PlannerAgent",
+        lambda **kwargs: planner_agent,
+    )
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.ReActAgent",
+        lambda **kwargs: react_agent,
+    )
+
+    flow = PlannerReActFlow(
+        uow_factory=lambda: _DummyUoW(session_repo),
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        session_id="session-skill-resume-structured-action",
+        json_parser=object(),
+        browser=object(),
+        sandbox=object(),
+        search_engine=object(),
+        mcp_tool=object(),
+        a2a_tool=object(),
+        skill_tool=object(),
+    )
+
+    events = [
+        event
+        async for event in flow.invoke(
+            Message(
+                message="确认蓝图并开始生成",
+                skill_confirmation_action="generate",
+            )
+        )
+    ]
+
+    assert any(isinstance(event, WaitEvent) for event in events)
+    assert not planner_agent.create_plan_calls
+    assert not planner_agent.update_plan_calls

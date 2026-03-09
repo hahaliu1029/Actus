@@ -9,12 +9,14 @@ import { formatFileSize } from "@/lib/session-ui";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
+import { Button } from "@/components/ui/button";
 
 interface ChatInputProps {
   className?: string;
   sessionId?: string;
   draftText?: string | null;
   onDraftApplied?: () => void;
+  skillConfirmationPendingAction?: "generate" | "install" | null;
 }
 
 const MAX_TEXTAREA_HEIGHT = 220;
@@ -24,6 +26,7 @@ export function ChatInput({
   sessionId,
   draftText,
   onDraftApplied,
+  skillConfirmationPendingAction = null,
 }: ChatInputProps) {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -92,6 +95,29 @@ export function ChatInput({
 
   const removePendingFile = (fileId: string) => {
     setPendingFiles((prev) => prev.filter((file) => file.id !== fileId));
+  };
+
+  const sendStructuredConfirmation = async (
+    message: string,
+    action: "generate" | "revise" | "install" | "cancel"
+  ) => {
+    if (!sessionId) {
+      return;
+    }
+    try {
+      await fetchSessionById(sessionId);
+      await fetchSessionFiles(sessionId);
+      await sendChat(sessionId, {
+        message,
+        skill_confirmation_action: action,
+        attachments: [],
+      });
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "发送确认失败",
+      });
+    }
   };
 
   const handleSubmit = async () => {
@@ -207,6 +233,58 @@ export function ChatInput({
               </button>
             </div>
           ))}
+        </div>
+      ) : null}
+
+      {skillConfirmationPendingAction === "generate" ? (
+        <div className="mb-3 flex flex-wrap gap-2 px-1">
+          <Button
+            type="button"
+            size="sm"
+            className="rounded-full"
+            onClick={() => {
+              void sendStructuredConfirmation("确认蓝图并开始生成", "generate");
+            }}
+          >
+            确认蓝图并开始生成
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="rounded-full"
+            onClick={() => {
+              void sendStructuredConfirmation("需要修改蓝图", "revise");
+            }}
+          >
+            需要修改蓝图
+          </Button>
+        </div>
+      ) : null}
+
+      {skillConfirmationPendingAction === "install" ? (
+        <div className="mb-3 flex flex-wrap gap-2 px-1">
+          <Button
+            type="button"
+            size="sm"
+            className="rounded-full"
+            onClick={() => {
+              void sendStructuredConfirmation("确认安装", "install");
+            }}
+          >
+            确认安装
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="rounded-full"
+            onClick={() => {
+              void sendStructuredConfirmation("取消安装", "cancel");
+            }}
+          >
+            取消安装
+          </Button>
         </div>
       ) : null}
 

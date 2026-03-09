@@ -341,6 +341,7 @@ export type ChatMessageData = {
 export type ChatParams = {
   message?: string;
   attachments?: string[];
+  skill_confirmation_action?: "generate" | "revise" | "install" | "cancel";
   event_id?: string;
   timestamp?: number;
 };
@@ -422,6 +423,7 @@ export type ControlEvent = {
 export type WaitEvent = {
   event_id?: string;
   created_at?: number;
+  pending_action?: "generate" | "install" | null;
   [key: string]: unknown;
 };
 

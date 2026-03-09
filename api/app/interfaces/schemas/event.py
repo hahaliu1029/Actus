@@ -222,6 +222,7 @@ class WaitSSEEvent(BaseSSEEvent):
     """等待人类输入流式事件"""
 
     event: Literal["wait"] = "wait"
+    data: CommonEventData
 
 
 class ControlEventData(BaseEventData):

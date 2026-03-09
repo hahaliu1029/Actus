@@ -39,11 +39,15 @@ _SKILL_CREATION_AFFIRMATIVE_REPLIES = frozenset(
         "对",
         "是的",
         "确定",
+        "确认",
         "没问题",
         "可以",
         "继续",
         "开始吧",
         "安装",
+        "同意",
+        "通过",
+        "好",
         "好的 继续生成吧",
         "可以 安装",
         "嗯 开始吧",
@@ -63,6 +67,25 @@ _SKILL_CREATION_NEGATIVE_REPLIES = frozenset(
         "先别安装",
         "不要继续",
     }
+)
+_SKILL_CREATION_AFFIRMATIVE_PATTERNS = (
+    "继续生成",
+    "开始生成",
+    "开始生产",
+    "确认安装",
+    "确认蓝图",
+    "按这个蓝图",
+    "就按这个",
+    "就这样",
+    "符合预期",
+    "没问题",
+    "可以生成",
+    "可以安装",
+    "开始安装",
+    "继续安装",
+    "确认生成",
+    "同意蓝图",
+    "蓝图没问题",
 )
 
 
@@ -212,6 +235,19 @@ class BaseAgent(ABC):
                 self._skill_creation_state = None
                 return
             self._skill_creation_state = await get_state(self._session_id)
+            if self._skill_creation_state is None:
+                logger.warning(
+                    "Skill 创建状态加载为 None: agent=%s session=%s",
+                    self.name, self._session_id,
+                )
+            else:
+                logger.info(
+                    "Skill 创建状态加载成功: agent=%s pending=%s approval=%s skill_data_len=%d",
+                    self.name,
+                    self._skill_creation_state.pending_action,
+                    self._skill_creation_state.approval_status,
+                    len(self._skill_creation_state.skill_data),
+                )
 
     async def _persist_skill_creation_state(self) -> None:
         """持久化 Skill 创建等待状态。"""
@@ -246,6 +282,24 @@ class BaseAgent(ABC):
         if normalized in _SKILL_CREATION_NEGATIVE_REPLIES:
             return "negative"
         if normalized in _SKILL_CREATION_AFFIRMATIVE_REPLIES:
+            return "affirmative"
+        if any(pattern in normalized for pattern in _SKILL_CREATION_AFFIRMATIVE_PATTERNS):
+            return "affirmative"
+        return "revise"
+
+    @staticmethod
+    def _classify_skill_creation_structured_action(
+        pending_action: str | None, action: str | None
+    ) -> str | None:
+        if not action:
+            return None
+        if action == "cancel":
+            return "negative"
+        if action == "revise":
+            return "revise"
+        if pending_action == "generate" and action == "generate":
+            return "affirmative"
+        if pending_action == "install" and action == "install":
             return "affirmative"
         return "revise"
 
@@ -432,27 +486,43 @@ class BaseAgent(ABC):
         await self._ensure_memory()
         if self._skill_creation_state and self._skill_creation_state.pending_action:
             state = self._skill_creation_state
-            decision = self._classify_skill_creation_reply(message.message or "")
+            decision = self._classify_skill_creation_structured_action(
+                state.pending_action,
+                message.skill_confirmation_action,
+            ) or self._classify_skill_creation_reply(message.message or "")
             logger.info(
-                "Skill 创建确认回滚: pending=%s decision=%s reply=%r",
+                "Skill 创建确认回滚: pending=%s decision=%s action=%s reply=%r",
                 state.pending_action,
                 decision,
+                message.skill_confirmation_action,
                 (message.message or "")[:50],
             )
 
             if decision in {"affirmative", "revise"}:
-                self._memory.add_message(
-                    {
-                        "role": "tool",
-                        "tool_call_id": state.last_tool_call_id,
-                        "function_name": state.last_tool_name,
-                        "content": state.saved_tool_result_json,
-                    }
+                # 仅当记忆中尚无该工具结果时才补充（execute_step 可能已写入）
+                last_msg = self._memory.get_last_message() if self._memory else None
+                already_has_tool_result = (
+                    last_msg
+                    and last_msg.get("role") == "tool"
+                    and last_msg.get("tool_call_id") == state.last_tool_call_id
                 )
+                if not already_has_tool_result:
+                    self._memory.add_message(
+                        {
+                            "role": "tool",
+                            "tool_call_id": state.last_tool_call_id,
+                            "function_name": state.last_tool_name,
+                            "content": state.saved_tool_result_json,
+                        }
+                    )
 
             if decision == "affirmative":
-                self._skill_creation_approved_actions.add(state.pending_action)
-                await self._clear_skill_creation_state()
+                if state.pending_action:
+                    self._skill_creation_approved_actions.add(state.pending_action)
+                # 保留状态并标记为已批准，供跨轮恢复时自动补齐关键 payload（如 skill_data）。
+                state.approval_status = "approved"
+                self._skill_creation_state = state
+                await self._persist_skill_creation_state()
             elif decision == "negative":
                 await self._clear_skill_creation_state()
                 last_message = self._memory.get_last_message()

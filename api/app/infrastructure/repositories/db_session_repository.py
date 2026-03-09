@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -8,9 +9,15 @@ from app.domain.models.session import Session, SessionStatus
 from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.repositories.session_repository import SessionRepository
 from app.infrastructure.models import SessionModel
+from pydantic import ValidationError
 from sqlalchemy import cast, delete, func, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+_SKILL_CREATION_STATE_KEY = "__skill_creation_state_v1"
+_SKILL_CREATION_STATE_LEGACY_KEY = "_skill_creator"
 
 
 class DBSessionRepository(SessionRepository):
@@ -358,22 +365,36 @@ class DBSessionRepository(SessionRepository):
         self, session_id: str
     ) -> SkillCreationState | None:
         """获取会话中的 Skill 创建等待状态"""
-        stmt = select(SessionModel.memories["_skill_creator"]).where(
-            SessionModel.id == session_id
-        )
+        stmt = select(
+            SessionModel.memories[_SKILL_CREATION_STATE_KEY],
+            SessionModel.memories[_SKILL_CREATION_STATE_LEGACY_KEY],
+        ).where(SessionModel.id == session_id)
         result = await self.db_session.execute(stmt)
-        state_data = result.scalar_one_or_none()
+        row = result.one_or_none()
+        if not row:
+            return None
+
+        state_data = row[0] or row[1]
 
         if not state_data:
             return None
 
-        return SkillCreationState.model_validate(state_data)
+        try:
+            return SkillCreationState.model_validate(state_data)
+        except ValidationError as exc:
+            logger.warning(
+                "Skill 创建状态结构非法，忽略并按空状态处理: session_id=%s key=%s error=%s",
+                session_id,
+                _SKILL_CREATION_STATE_KEY if row[0] else _SKILL_CREATION_STATE_LEGACY_KEY,
+                exc,
+            )
+            return None
 
     async def save_skill_creation_state(
         self, session_id: str, state: SkillCreationState
     ) -> None:
         """保存会话中的 Skill 创建等待状态"""
-        patch_data = {"_skill_creator": state.model_dump(mode="json")}
+        patch_data = {_SKILL_CREATION_STATE_KEY: state.model_dump(mode="json")}
         stmt = (
             update(SessionModel)
             .where(SessionModel.id == session_id)
@@ -393,9 +414,9 @@ class DBSessionRepository(SessionRepository):
             update(SessionModel)
             .where(SessionModel.id == session_id)
             .values(
-                memories=func.coalesce(SessionModel.memories, cast({}, JSONB)).op("-")(
-                    "_skill_creator"
-                )
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                .op("-")(_SKILL_CREATION_STATE_KEY)
+                .op("-")(_SKILL_CREATION_STATE_LEGACY_KEY)
             )
         )
         result = await self.db_session.execute(stmt)

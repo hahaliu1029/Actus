@@ -23,16 +23,19 @@ def db_session() -> AsyncMock:
 
 async def test_get_skill_creation_state_returns_model(db_session: AsyncMock) -> None:
     db_session.execute.return_value = SimpleNamespace(
-        scalar_one_or_none=lambda: {
-            "pending_action": "generate",
-            "approval_status": "pending",
-            "last_tool_name": "brainstorm_skill",
-            "last_tool_call_id": "call_123",
-            "saved_tool_result_json": '{"success": true}',
-            "blueprint": {"skill_name": "meeting-audio-analyzer"},
-            "blueprint_json": '{"skill_name":"meeting-audio-analyzer"}',
-            "skill_data": "",
-        }
+        one_or_none=lambda: (
+            {
+                "pending_action": "generate",
+                "approval_status": "pending",
+                "last_tool_name": "brainstorm_skill",
+                "last_tool_call_id": "call_123",
+                "saved_tool_result_json": '{"success": true}',
+                "blueprint": {"skill_name": "meeting-audio-analyzer"},
+                "blueprint_json": '{"skill_name":"meeting-audio-analyzer"}',
+                "skill_data": "",
+            },
+            None,
+        )
     )
     repo = DBSessionRepository(db_session)
 
@@ -46,12 +49,52 @@ async def test_get_skill_creation_state_returns_model(db_session: AsyncMock) -> 
 async def test_get_skill_creation_state_returns_none_when_missing(
     db_session: AsyncMock,
 ) -> None:
-    db_session.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: None)
+    db_session.execute.return_value = SimpleNamespace(one_or_none=lambda: None)
     repo = DBSessionRepository(db_session)
 
     result = await repo.get_skill_creation_state("s1")
 
     assert result is None
+
+
+async def test_get_skill_creation_state_returns_none_for_invalid_payload(
+    db_session: AsyncMock,
+) -> None:
+    db_session.execute.return_value = SimpleNamespace(
+        one_or_none=lambda: (
+            {"messages": []},  # 被 memory 覆盖后的脏结构
+            None,
+        )
+    )
+    repo = DBSessionRepository(db_session)
+
+    result = await repo.get_skill_creation_state("s1")
+
+    assert result is None
+
+
+async def test_get_skill_creation_state_supports_legacy_key_fallback(
+    db_session: AsyncMock,
+) -> None:
+    db_session.execute.return_value = SimpleNamespace(
+        one_or_none=lambda: (
+            None,
+            {
+                "pending_action": "install",
+                "approval_status": "pending",
+                "last_tool_name": "generate_skill",
+                "last_tool_call_id": "call_456",
+                "saved_tool_result_json": '{"success": true}',
+                "skill_data": '{"skill_md":"x"}',
+            },
+        )
+    )
+    repo = DBSessionRepository(db_session)
+
+    result = await repo.get_skill_creation_state("s1")
+
+    assert result is not None
+    assert result.pending_action == "install"
 
 
 async def test_save_and_clear_skill_creation_state(db_session: AsyncMock) -> None:
@@ -70,4 +113,3 @@ async def test_save_and_clear_skill_creation_state(db_session: AsyncMock) -> Non
     await repo.clear_skill_creation_state("s1")
 
     assert db_session.execute.await_count == 2
-

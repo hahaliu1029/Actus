@@ -165,6 +165,28 @@ function deriveTakeoverMeta(events: SessionEvent[]): TakeoverMeta {
   };
 }
 
+function deriveLatestSkillConfirmationPendingAction(
+  events: SessionEvent[],
+  sessionStatus: string | undefined
+): "generate" | "install" | null {
+  if (sessionStatus !== "waiting") {
+    return null;
+  }
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.event !== "wait") {
+      continue;
+    }
+    const pendingAction = String(event.data.pending_action || "").trim();
+    if (pendingAction === "generate" || pendingAction === "install") {
+      return pendingAction;
+    }
+  }
+
+  return null;
+}
+
 function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent {
   const content = asRecord(eventData.content);
   const args = asRecord(eventData.args);
@@ -332,7 +354,7 @@ function renderEventItem(
             <span className="text-xs text-muted-foreground">{getEventTime(event.data)}</span>
           </div>
           <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
-            <p className="whitespace-pre-wrap leading-7">{display.detail}</p>
+            <MarkdownRenderer content={display.detail || "请补充下一步操作信息"} />
           </div>
         </div>
       );
@@ -535,6 +557,14 @@ export default function SessionPage() {
   const progressSummary = useMemo(
     () => deriveSessionProgressSummary(eventList),
     [eventList]
+  );
+  const skillConfirmationPendingAction = useMemo(
+    () =>
+      deriveLatestSkillConfirmationPendingAction(
+        eventList,
+        visibleSession?.status
+      ),
+    [eventList, visibleSession?.status]
   );
   const currentStatusMeta = useMemo(
     () => getSessionStatusMeta(visibleSession?.status || "pending"),
@@ -847,7 +877,10 @@ export default function SessionPage() {
               onPreviewFile={handleTaskDockPreviewFile}
               onDownloadFile={handleTaskDockDownloadFile}
             />
-            <ChatInput sessionId={sessionId} />
+            <ChatInput
+              sessionId={sessionId}
+              skillConfirmationPendingAction={skillConfirmationPendingAction}
+            />
           </div>
         </main>
 

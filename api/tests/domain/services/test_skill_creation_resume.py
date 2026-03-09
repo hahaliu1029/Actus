@@ -128,12 +128,31 @@ def test_classify_skill_creation_reply_affirmative(agent: _DummyAgent) -> None:
         "对",
         "是的",
         "确定",
+        "确认",
         "没问题",
         "可以",
         "继续",
+        "同意",
+        "通过",
+        "好",
         "好的，继续生成吧",
         "可以，安装",
         "嗯 开始吧",
+        # Pattern-based matches
+        "确认蓝图并开始生成",
+        "确认蓝图",
+        "确认安装",
+        "开始生成",
+        "可以生成",
+        "可以安装",
+        "开始安装",
+        "继续安装",
+        "确认生成",
+        "同意蓝图",
+        "蓝图没问题",
+        "就这样吧",
+        "符合预期",
+        "好的，根据这个蓝图开始生产",
     ]:
         assert (
             agent._classify_skill_creation_reply(text) == "affirmative"
@@ -188,7 +207,68 @@ async def test_roll_back_injects_saved_tool_result_on_affirmative(
     assert last_message["tool_call_id"] == "call_1"
     assert last_message["function_name"] == "brainstorm_skill"
     assert "generate" in agent._skill_creation_approved_actions
-    assert agent._uow.session._skill_creation_state is None
+    state = agent._uow.session._skill_creation_state
+    assert state is not None
+    assert state.pending_action == "generate"
+    assert state.approval_status == "approved"
+
+
+async def test_roll_back_accepts_structured_generate_confirmation(
+    agent: _DummyAgent,
+) -> None:
+    agent._uow.session._memory.add_message(_waiting_tool_call())
+    agent._uow.session._skill_creation_state = SkillCreationState(
+        pending_action="generate",
+        approval_status="pending",
+        last_tool_name="brainstorm_skill",
+        last_tool_call_id="call_1",
+        saved_tool_result_json=ToolResult(
+            success=True,
+            message="Skill 蓝图预览",
+            data={"blueprint": {"skill_name": "meeting-audio-analyzer"}},
+        ).model_dump_json(),
+    )
+
+    await agent.roll_back(
+        Message(message="根据这个蓝图开始生产", skill_confirmation_action="generate")
+    )
+
+    last_message = agent._uow.session._memory.get_last_message()
+    assert last_message is not None
+    assert last_message["role"] == "tool"
+    assert last_message["function_name"] == "brainstorm_skill"
+    assert "generate" in agent._skill_creation_approved_actions
+    state = agent._uow.session._skill_creation_state
+    assert state is not None
+    assert state.pending_action == "generate"
+    assert state.approval_status == "approved"
+
+
+async def test_roll_back_keeps_install_state_with_skill_data_on_affirmative(
+    agent: _DummyAgent,
+) -> None:
+    agent._uow.session._memory.add_message(_waiting_tool_call("generate_skill"))
+    agent._uow.session._skill_creation_state = SkillCreationState(
+        pending_action="install",
+        approval_status="pending",
+        last_tool_name="generate_skill",
+        last_tool_call_id="call_1",
+        saved_tool_result_json=ToolResult(
+            success=True,
+            message="Skill 代码生成并验证通过",
+            data={"skill_data": "{\"skill_md\":\"# demo\"}"},
+        ).model_dump_json(),
+        skill_data="{\"skill_md\":\"# demo\"}",
+    )
+
+    await agent.roll_back(Message(message="确认安装"))
+
+    state = agent._uow.session._skill_creation_state
+    assert state is not None
+    assert state.pending_action == "install"
+    assert state.approval_status == "approved"
+    assert state.skill_data == "{\"skill_md\":\"# demo\"}"
+    assert "install" in agent._skill_creation_approved_actions
 
 
 async def test_roll_back_clears_state_and_rolls_back_on_negative(
@@ -211,6 +291,32 @@ async def test_roll_back_clears_state_and_rolls_back_on_negative(
 
     assert agent._uow.session._memory.get_last_message() is None
     assert agent._uow.session._skill_creation_state is None
+    assert "install" not in agent._skill_creation_approved_actions
+
+
+async def test_roll_back_keeps_gate_when_structured_action_mismatches_pending_action(
+    agent: _DummyAgent,
+) -> None:
+    agent._uow.session._memory.add_message(_waiting_tool_call("generate_skill"))
+    agent._uow.session._skill_creation_state = SkillCreationState(
+        pending_action="install",
+        approval_status="pending",
+        last_tool_name="generate_skill",
+        last_tool_call_id="call_1",
+        saved_tool_result_json=ToolResult(
+            success=True,
+            message="Skill 代码生成并验证通过",
+            data={"skill_data": "{}"},
+        ).model_dump_json(),
+    )
+
+    await agent.roll_back(
+        Message(message="开始生成", skill_confirmation_action="generate")
+    )
+
+    state = agent._uow.session._skill_creation_state
+    assert state is not None
+    assert state.pending_action == "install"
     assert "install" not in agent._skill_creation_approved_actions
 
 
@@ -239,6 +345,46 @@ async def test_roll_back_keeps_gate_for_revise(agent: _DummyAgent) -> None:
     assert last_message["role"] == "tool"
     assert last_message["function_name"] == "brainstorm_skill"
     assert "generate" not in agent._skill_creation_approved_actions
+
+
+async def test_roll_back_skips_duplicate_tool_result_when_already_in_memory(
+    agent: _DummyAgent,
+) -> None:
+    """当 execute_step 已将工具结果写入记忆时，roll_back 不应重复添加。"""
+    tool_result_json = ToolResult(
+        success=True,
+        message="Skill 代码生成并验证通过",
+        data={"skill_data": "{\"skill_md\":\"# demo\"}"},
+    ).model_dump_json()
+    # 模拟 execute_step 已写入的记忆：assistant(tool_call) + tool(result)
+    agent._uow.session._memory.add_message(_waiting_tool_call("generate_skill"))
+    agent._uow.session._memory.add_message(
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "function_name": "generate_skill",
+            "content": tool_result_json,
+        }
+    )
+    agent._uow.session._skill_creation_state = SkillCreationState(
+        pending_action="install",
+        approval_status="pending",
+        last_tool_name="generate_skill",
+        last_tool_call_id="call_1",
+        saved_tool_result_json=tool_result_json,
+        skill_data="{\"skill_md\":\"# demo\"}",
+    )
+
+    await agent.roll_back(Message(message="确认安装"))
+
+    # 验证记忆中只有 1 条 tool result（不应重复）
+    tool_results = [
+        m
+        for m in agent._uow.session._memory.messages
+        if m.get("role") == "tool" and m.get("function_name") == "generate_skill"
+    ]
+    assert len(tool_results) == 1
+    assert "install" in agent._skill_creation_approved_actions
 
 
 async def test_skill_creation_state_helpers_support_lazy_uow_session() -> None:

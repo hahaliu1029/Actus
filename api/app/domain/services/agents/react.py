@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from typing import Any, AsyncGenerator, Dict
@@ -50,10 +51,78 @@ class ReActAgent(BaseAgent):
     _step_ask_user_soft_hint_count: int = 0
     _confirmed_tool_names: set = set()  # 已被用户确认的工具，跳过后续确认拦截
 
+    def _is_skill_creation_action_approved(self, action: str) -> bool:
+        """判断 Skill 创建动作是否已获批准（运行时令牌 + 持久化状态）。"""
+        if action in self._skill_creation_approved_actions:
+            return True
+        state = self._skill_creation_state
+        return bool(
+            state is not None
+            and state.pending_action == action
+            and state.approval_status == "approved"
+        )
+
+    @staticmethod
+    def _extract_skill_data_from_tool_result_json(raw_json: str) -> str:
+        if not raw_json:
+            return ""
+        try:
+            payload = json.loads(raw_json)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return ""
+        skill_data = data.get("skill_data")
+        return skill_data if isinstance(skill_data, str) else ""
+
+    def _resolve_skill_data_for_install(self) -> str:
+        """恢复 install_skill 所需的 skill_data，避免跨轮上下文丢失。"""
+        state = self._skill_creation_state
+        if state is not None:
+            if state.skill_data.strip():
+                logger.info("install_skill skill_data 恢复路径: state.skill_data (len=%d)", len(state.skill_data))
+                return state.skill_data
+            from_saved = self._extract_skill_data_from_tool_result_json(
+                state.saved_tool_result_json
+            )
+            if from_saved.strip():
+                logger.info("install_skill skill_data 恢复路径: saved_tool_result_json (len=%d)", len(from_saved))
+                return from_saved
+            logger.warning(
+                "install_skill skill_data 恢复: state 存在但 skill_data 和 saved_json 均为空, "
+                "state.pending_action=%s state.approval_status=%s skill_data_len=%d saved_json_len=%d",
+                state.pending_action, state.approval_status,
+                len(state.skill_data), len(state.saved_tool_result_json),
+            )
+        else:
+            logger.warning("install_skill skill_data 恢复: _skill_creation_state 为 None，尝试从记忆搜索")
+
+        if self._memory is None:
+            logger.warning("install_skill skill_data 恢复: memory 为 None，放弃")
+            return ""
+
+        for message in reversed(self._memory.messages):
+            if (
+                message.get("role") == "tool"
+                and message.get("function_name") == "generate_skill"
+            ):
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                from_memory = self._extract_skill_data_from_tool_result_json(content)
+                if from_memory.strip():
+                    logger.info("install_skill skill_data 恢复路径: memory 搜索 (len=%d)", len(from_memory))
+                    return from_memory
+        logger.warning("install_skill skill_data 恢复: 全部路径均失败")
+        return ""
+
     def _get_skill_creation_resume_allowed_tools(self) -> set[str] | None:
-        if "install" in self._skill_creation_approved_actions:
+        if self._is_skill_creation_action_approved("install"):
             return {"install_skill"}
-        if "generate" in self._skill_creation_approved_actions:
+        if self._is_skill_creation_action_approved("generate"):
             return {"generate_skill"}
         return None
 
@@ -87,7 +156,7 @@ class ReActAgent(BaseAgent):
 
         stage = (
             "安装确认后的恢复阶段"
-            if "install" in self._skill_creation_approved_actions
+            if self._is_skill_creation_action_approved("install")
             else "蓝图确认后的恢复阶段"
         )
         tool_names = ", ".join(
@@ -114,14 +183,16 @@ class ReActAgent(BaseAgent):
             step=step.description,
         )
 
-        if "install" in self._skill_creation_approved_actions:
+        if self._is_skill_creation_action_approved("install"):
             query += (
                 "\n\n恢复提示：用户刚刚已经确认安装。"
                 "不要重新调用 brainstorm_skill 或 generate_skill，"
-                "请直接调用 install_skill，并优先使用上一轮 generate_skill "
-                "已返回并保存在上下文中的 skill_data。"
+                "请直接调用 install_skill。"
+                "你不需要自己查找或传入 skill_data 参数，"
+                "系统会自动从上一轮生成结果中恢复并注入 skill_data，"
+                "你只需调用 install_skill 即可（skill_data 可以传空字符串）。"
             )
-        elif "generate" in self._skill_creation_approved_actions:
+        elif self._is_skill_creation_action_approved("generate"):
             query += (
                 "\n\n恢复提示：用户刚刚已经确认蓝图。"
                 "不要再次调用 brainstorm_skill，"
@@ -153,20 +224,33 @@ class ReActAgent(BaseAgent):
         # 放行令牌仅在此处做"是否放行"判定，不主动消费；
         # 令牌会在 execute_step 中工具成功后统一 discard，
         # 从而保证工具失败重试期间 _filter_tools_for_skill_creation_resume 持续生效。
-        if (
-            function_name == "generate_skill"
-            and "generate" in self._skill_creation_approved_actions
+        if function_name == "generate_skill" and self._is_skill_creation_action_approved(
+            "generate"
         ):
             return None
-        if (
-            function_name == "install_skill"
-            and "install" in self._skill_creation_approved_actions
+        if function_name == "install_skill" and self._is_skill_creation_action_approved(
+            "install"
         ):
+            if not str(function_args.get("skill_data", "")).strip():
+                recovered_skill_data = self._resolve_skill_data_for_install()
+                if recovered_skill_data.strip():
+                    function_args["skill_data"] = recovered_skill_data
+                    logger.info("install_skill 自动恢复并注入 skill_data")
+                else:
+                    return ToolResult(
+                        success=False,
+                        message="SKILL_DATA_MISSING",
+                        data={
+                            "code": "SKILL_DATA_MISSING",
+                            "hint": "未找到可用的 skill_data，请重新执行 generate_skill。",
+                        },
+                    )
             return None
         if (
             function_name == "generate_skill"
             and self._skill_creation_state is not None
             and self._skill_creation_state.pending_action == "generate"
+            and self._skill_creation_state.approval_status != "approved"
         ):
             return ToolResult(
                 success=False,
@@ -191,6 +275,20 @@ class ReActAgent(BaseAgent):
                     "pending_action": pending_action,
                     "tool_name": function_name,
                 },
+            )
+
+        # Skill 创建恢复阶段：拦截 message 类工具，引导 LLM 调用目标工具
+        if function_name.startswith("message_") and self._is_skill_creation_action_approved(
+            "install"
+        ):
+            return ToolResult(
+                success=True,
+                message=(
+                    "当前处于安装恢复阶段，无需询问用户。"
+                    "请直接调用 install_skill，skill_data 参数可以传空字符串，"
+                    "系统会自动注入。"
+                ),
+                data={"code": "SKILL_RESUME_REDIRECT"},
             )
 
         # 第二层：message_ask_user 软引导门控
@@ -313,7 +411,7 @@ class ReActAgent(BaseAgent):
                             event.function_name,
                         )
                         yield MessageEvent(role="assistant", message=prompt)
-                        yield WaitEvent()
+                        yield WaitEvent(pending_action=pending_action)
                         return
 
                     if (
@@ -341,11 +439,22 @@ class ReActAgent(BaseAgent):
                             ),
                         )
                         await self._persist_skill_creation_state()
+                        # 将工具结果写入记忆，确保跨轮恢复时 memory 搜索路径可兜底
+                        await self._add_to_memory(
+                            [
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": event.tool_call_id,
+                                    "function_name": "brainstorm_skill",
+                                    "content": event.function_result.model_dump_json(),
+                                }
+                            ]
+                        )
                         yield MessageEvent(
                             role="assistant",
                             message=f"{preview}\n\n请确认蓝图是否符合预期。",
                         )
-                        yield WaitEvent()
+                        yield WaitEvent(pending_action="generate")
                         return
 
                     if (
@@ -364,28 +473,43 @@ class ReActAgent(BaseAgent):
                     ):
                         # generate 成功，正式消费放行令牌
                         self._skill_creation_approved_actions.discard("generate")
+                        tool_result_json = event.function_result.model_dump_json()
+                        skill_data_value = (
+                            result_data.get("skill_data", "")
+                            if isinstance(result_data, dict)
+                            else ""
+                        )
                         logger.info(
-                            "generate_skill 成功，进入安装确认等待: call_id=%s",
+                            "generate_skill 成功，进入安装确认等待: call_id=%s skill_data_len=%d saved_json_len=%d",
                             event.tool_call_id,
+                            len(skill_data_value),
+                            len(tool_result_json),
                         )
                         self._skill_creation_state = SkillCreationState(
                             pending_action="install",
                             approval_status="pending",
                             last_tool_name="generate_skill",
                             last_tool_call_id=event.tool_call_id,
-                            saved_tool_result_json=event.function_result.model_dump_json(),
-                            skill_data=(
-                                result_data.get("skill_data", "")
-                                if isinstance(result_data, dict)
-                                else ""
-                            ),
+                            saved_tool_result_json=tool_result_json,
+                            skill_data=skill_data_value,
                         )
                         await self._persist_skill_creation_state()
+                        # 将工具结果写入记忆，确保跨轮恢复时 memory 搜索路径可兜底
+                        await self._add_to_memory(
+                            [
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": event.tool_call_id,
+                                    "function_name": "generate_skill",
+                                    "content": tool_result_json,
+                                }
+                            ]
+                        )
                         yield MessageEvent(
                             role="assistant",
                             message="Skill 代码生成并验证通过，是否确认安装？",
                         )
-                        yield WaitEvent()
+                        yield WaitEvent(pending_action="install")
                         return
 
                     if (
@@ -406,7 +530,17 @@ class ReActAgent(BaseAgent):
                             if event.function_result and event.function_result.data
                             else {}
                         )
-                        # 6a.软引导提示：LLM 继续自动执行
+                        # 6a.安装恢复阶段拦截：不向用户转发，LLM 重试 install_skill
+                        if (
+                            isinstance(result_data, dict)
+                            and result_data.get("code") == "SKILL_RESUME_REDIRECT"
+                        ):
+                            logger.info(
+                                "message_ask_user 被安装恢复阶段拦截，LLM 将重试 install_skill。"
+                            )
+                            continue
+
+                        # 6b.软引导提示：LLM 继续自动执行
                         soft_hint = (
                             isinstance(result_data, dict)
                             and result_data.get("code") == "ASK_USER_SOFT_HINT"

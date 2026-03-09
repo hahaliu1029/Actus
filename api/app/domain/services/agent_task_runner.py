@@ -1220,6 +1220,11 @@ class AgentTaskRunner(TaskRunner):
                         if isinstance(event, MessageEvent)
                         else []
                     ),
+                    skill_confirmation_action=(
+                        event.skill_confirmation_action
+                        if isinstance(event, MessageEvent)
+                        else None
+                    ),
                 )
 
                 selected_skills, _ = await self._select_skills_for_message(

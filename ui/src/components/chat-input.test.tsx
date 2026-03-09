@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 type SessionStoreState = {
@@ -122,5 +122,57 @@ describe("ChatInput", () => {
 
     const sendButton = screen.getByRole("button", { name: "发送" });
     expect(sendButton).not.toBeDisabled();
+  });
+
+  it("蓝图确认等待态应显示固定按钮并发送结构化 generate 动作", async () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-current",
+      status: "waiting",
+    };
+
+    render(
+      <ChatInput
+        sessionId="s-current"
+        skillConfirmationPendingAction="generate"
+      />
+    );
+
+    const confirmButton = screen.getByRole("button", {
+      name: "确认蓝图并开始生成",
+    });
+    fireEvent.click(confirmButton);
+
+    await waitFor(() => {
+      expect(sessionStoreState.sendChat).toHaveBeenCalledWith("s-current", {
+        message: "确认蓝图并开始生成",
+        skill_confirmation_action: "generate",
+        attachments: [],
+      });
+    });
+  });
+
+  it("安装确认等待态应显示固定按钮并发送结构化 install 动作", async () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-current",
+      status: "waiting",
+    };
+
+    render(
+      <ChatInput
+        sessionId="s-current"
+        skillConfirmationPendingAction="install"
+      />
+    );
+
+    const installButton = screen.getByRole("button", { name: "确认安装" });
+    fireEvent.click(installButton);
+
+    await waitFor(() => {
+      expect(sessionStoreState.sendChat).toHaveBeenCalledWith("s-current", {
+        message: "确认安装",
+        skill_confirmation_action: "install",
+        attachments: [],
+      });
+    });
   });
 });

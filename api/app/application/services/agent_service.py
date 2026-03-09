@@ -38,6 +38,7 @@ from app.domain.models.event import (
     WaitEvent,
 )
 from app.domain.models.file import File
+from app.domain.models.message import SkillConfirmationAction
 from app.domain.models.session import Session, SessionStatus
 
 # from app.domain.repositories.file_repository import FileRepository
@@ -211,6 +212,7 @@ class AgentService:
         is_admin: bool = False,
         message: Optional[str] = None,
         attachments: Optional[List[str]] = None,
+        skill_confirmation_action: SkillConfirmationAction | None = None,
         latest_event_id: Optional[str] = None,
         timestamp: Optional[datetime] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
@@ -264,6 +266,7 @@ class AgentService:
                         if attachments
                         else []
                     ),
+                    skill_confirmation_action=skill_confirmation_action,
                 )
 
                 # 8.将事件添加到任务的输入流中，好让Agent获取到数据

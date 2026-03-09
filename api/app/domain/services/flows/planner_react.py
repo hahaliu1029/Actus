@@ -49,6 +49,29 @@ class PlannerReActFlow(BaseFlow):
         """从 ReAct Agent 提取最近一轮执行摘要。"""
         return self.react.get_latest_assistant_content(max_chars=max_chars)
 
+    def _hydrate_skill_resume_token_from_structured_confirmation(
+        self, message: Message
+    ) -> None:
+        """兜底：当结构化确认动作存在但运行时放行令牌缺失时，补齐令牌避免误入重规划。"""
+        action = (message.skill_confirmation_action or "").strip().lower()
+        if action not in {"generate", "install"}:
+            return
+
+        approved_actions = getattr(self.react, "_skill_creation_approved_actions", None)
+        if approved_actions is None:
+            approved_actions = set()
+            setattr(self.react, "_skill_creation_approved_actions", approved_actions)
+        if not isinstance(approved_actions, set):
+            return
+        if approved_actions:
+            return
+
+        approved_actions.add(action)
+        logger.info(
+            "Skill 创建确认兜底生效: action=%s, 通过结构化确认补齐运行时放行令牌",
+            action,
+        )
+
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],  # 单元工作工厂
@@ -245,6 +268,8 @@ class PlannerReActFlow(BaseFlow):
                     original_request=original_request,
                     completed_steps=completed_steps,
                 )
+
+        self._hydrate_skill_resume_token_from_structured_confirmation(message)
 
         # 3.如果会话状态等于运行中，则流需要重新规划内容/plan
         if session.status == SessionStatus.RUNNING:
