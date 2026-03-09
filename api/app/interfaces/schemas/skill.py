@@ -1,5 +1,6 @@
 """Skill 接口 Schema"""
 
+from enum import Enum
 from typing import Any, Dict, List
 
 from app.domain.models.skill import SkillRuntimeType, SkillSourceType
@@ -96,3 +97,9 @@ class SkillDetailResponse(BaseModel):
     activation: Dict[str, Any] = Field(default_factory=dict)
     policy: Dict[str, Any] = Field(default_factory=dict)
     security: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillExportFormat(str, Enum):
+    """Skill 导出格式"""
+    AGENT_SKILLS = "agent-skills"
+    ACTUS = "actus"

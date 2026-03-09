@@ -1,4 +1,4 @@
-import { del, get, post } from "./fetch";
+import { del, get, post, requestBlob } from "./fetch";
 import type {
   AgentConfig,
   A2AServersData,
@@ -95,5 +95,17 @@ export const configApi = {
 
   updateSkillRiskPolicy: (policy: SkillRiskPolicy): Promise<SkillRiskPolicy> => {
     return post<SkillRiskPolicy>("/v2/skills/policy", policy);
+  },
+
+  exportSkill: async (skillId: string, format: "agent-skills" | "actus"): Promise<void> => {
+    const blob = await requestBlob(`/v2/skills/${skillId}/export?format=${format}`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${skillId}-${format}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   },
 };

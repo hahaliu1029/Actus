@@ -12,7 +12,14 @@ import {
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { configApi } from "@/lib/api/config";
 import type { SkillDetailData } from "@/lib/api/types";
-import { LoaderCircle, ChevronDown, ChevronRight } from "lucide-react";
+import { LoaderCircle, ChevronDown, ChevronRight, Download } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 type SkillDetailDrawerProps = {
   skillId: string | null;
@@ -166,6 +173,34 @@ export function SkillDetailDrawer({
                 >
                   {detail.enabled ? "已启用" : "已禁用"}
                 </Badge>
+                <div className="ml-auto">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        <Download className="mr-1.5 size-4" />
+                        导出
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        onClick={() => configApi.exportSkill(detail.id, "agent-skills")}
+                      >
+                        <span>Agent Skills 标准</span>
+                        <span className="ml-2 text-xs text-muted-foreground">
+                          Claude Code / Claude.ai
+                        </span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => configApi.exportSkill(detail.id, "actus")}
+                      >
+                        <span>Actus 原生包</span>
+                        <span className="ml-2 text-xs text-muted-foreground">
+                          实例迁移
+                        </span>
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               </div>
               <SheetDescription>
                 {detail.description || "暂无描述"}

@@ -5,6 +5,7 @@ from app.application.services.app_config_service import AppConfigService
 from app.application.services.file_service import FileService
 from app.application.services.session_service import SessionService
 from app.application.services.skill_creator_service import SkillCreatorService
+from app.application.services.skill_export_service import SkillExportService
 from app.application.services.skill_service import SkillService
 from app.application.services.status_service import StatusService
 
@@ -196,3 +197,7 @@ def get_agent_service(
         summary_llm=summary_llm,
         # file_repository=file_repository,
     )
+
+
+def get_skill_export_service() -> SkillExportService:
+    return SkillExportService(skills_root_dir=settings.skills_root_dir)

@@ -18,9 +18,11 @@ from app.infrastructure.repositories.file_skill_repository import FileSkillRepos
 from app.infrastructure.storage.postgres import get_db_session
 from app.interfaces.dependencies import AdminUser, CurrentUser
 from app.interfaces.schemas import Response
+from app.application.services.skill_export_service import SkillExportService
 from app.interfaces.schemas.skill import (
     BundleFileItem,
     SkillDetailResponse,
+    SkillExportFormat,
     SkillInstallRequest,
     SkillItem,
     SkillListResponse,
@@ -30,9 +32,11 @@ from app.interfaces.schemas.skill import (
 from app.interfaces.service_dependencies import (
     get_app_config_service,
     get_skill_creator_service,
+    get_skill_export_service,
 )
 from core.config import get_settings
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Query
+from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -206,6 +210,24 @@ async def update_skill_policy(
     return Response.success(
         msg="Skill 风险策略已更新",
         data=SkillRiskPolicyItem(mode=policy.mode.value),
+    )
+
+
+@router.get(
+    path="/{skill_key}/export",
+    summary="导出 Skill（v2）",
+)
+async def export_skill(
+    skill_key: str,
+    admin_user: AdminUser,
+    format: SkillExportFormat = Query(..., description="导出格式"),
+    skill_export_service: SkillExportService = Depends(get_skill_export_service),
+) -> FastAPIResponse:
+    zip_bytes, filename = await skill_export_service.export_skill(skill_key, format)
+    return FastAPIResponse(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
