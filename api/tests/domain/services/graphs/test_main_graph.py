@@ -201,3 +201,201 @@ class TestMainGraphFlow:
         assert len(captured_system_content) >= 1
         assert "历史对话摘要" in captured_system_content[0]
         assert "查天气" in captured_system_content[0]
+
+
+class TestExecutorMessageBranching:
+    """Test the three-way branching in executor_node for message handling."""
+
+    @pytest.fixture
+    def mock_json_parser(self):
+        parser = AsyncMock()
+        import json
+        async def parse(content, default_value=None):
+            try:
+                return json.loads(content)
+            except Exception:
+                return default_value
+        parser.invoke = parse
+        return parser
+
+    async def test_first_step_no_history_uses_system_prompt(self, mock_json_parser):
+        """When messages=[] and is_resuming=False, executor builds fresh system+execution prompt."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        captured_react_inputs = []
+
+        class CapturingReactGraph:
+            async def astream(self, input_state, config=None):
+                captured_react_inputs.append(input_state)
+                yield {"llm_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'}
+                    ],
+                    "should_interrupt": False,
+                }}
+
+        planner_llm = AsyncMock()
+        async def mock_invoke(**kwargs):
+            return {"content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"S1"}],"message":"ok"}', "role": "assistant"}
+        planner_llm.invoke = mock_invoke
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=CapturingReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-exec",
+        )
+
+        await graph.ainvoke({
+            "message": "do something",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-exec",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        assert len(captured_react_inputs) >= 1
+        msgs = captured_react_inputs[0]["messages"]
+        assert msgs[0]["role"] == "system"
+        assert "任务执行智能体" in msgs[0]["content"]
+
+    async def test_has_history_not_resuming_updates_system_prompt(self, mock_json_parser):
+        """When messages have history and is_resuming=False, executor updates system prompt and appends execution prompt."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        captured_react_inputs = []
+
+        class CapturingReactGraph:
+            async def astream(self, input_state, config=None):
+                captured_react_inputs.append(input_state)
+                yield {"llm_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'}
+                    ],
+                    "should_interrupt": False,
+                }}
+
+        planner_llm = AsyncMock()
+        planner_llm.invoke = AsyncMock()
+
+        step = Step(description="Step 2: analyze data")
+        plan = Plan(title="T", goal="G", language="zh", steps=[
+            Step(description="Step 1: collect", status=ExecutionStatus.COMPLETED),
+            step,
+        ], message="ok", status=ExecutionStatus.RUNNING)
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=CapturingReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-exec-2",
+        )
+
+        history_messages = [
+            {"role": "system", "content": "old system prompt"},
+            {"role": "user", "content": "old execution prompt"},
+            {"role": "assistant", "content": '{"success": true, "result": "collected data", "attachments": []}'},
+        ]
+
+        await graph.ainvoke({
+            "message": "continue",
+            "language": "zh",
+            "attachments": [],
+            "plan": plan,
+            "current_step": step,
+            "messages": history_messages,
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "executing",
+            "session_id": "sess-exec-2",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "analyze data",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        assert len(captured_react_inputs) >= 1
+        msgs = captured_react_inputs[0]["messages"]
+        # System prompt should be updated (not "old system prompt")
+        assert msgs[0]["role"] == "system"
+        assert "任务执行智能体" in msgs[0]["content"]
+        # Should NOT contain "用户已完成接管" (not resuming)
+        all_content = " ".join(m.get("content", "") for m in msgs)
+        assert "用户已完成接管" not in all_content
+
+    async def test_resuming_uses_takeover_message(self, mock_json_parser):
+        """When is_resuming=True with saved messages, executor appends takeover resume message."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        captured_react_inputs = []
+
+        class CapturingReactGraph:
+            async def astream(self, input_state, config=None):
+                captured_react_inputs.append(input_state)
+                yield {"llm_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'}
+                    ],
+                    "should_interrupt": False,
+                }}
+
+        planner_llm = AsyncMock()
+        planner_llm.invoke = AsyncMock()
+
+        step = Step(description="Login to Notion")
+        plan = Plan(title="T", goal="G", language="zh", steps=[step], message="ok", status=ExecutionStatus.RUNNING)
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=CapturingReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-resume",
+        )
+
+        saved = [
+            {"role": "system", "content": "some system prompt"},
+            {"role": "user", "content": "do login"},
+        ]
+
+        await graph.ainvoke({
+            "message": "我已经登录了",
+            "language": "zh",
+            "attachments": [],
+            "plan": plan,
+            "current_step": step,
+            "messages": saved,
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "executing",
+            "session_id": "sess-resume",
+            "should_interrupt": False,
+            "is_resuming": True,
+            "original_request": "login",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        assert len(captured_react_inputs) >= 1
+        msgs = captured_react_inputs[0]["messages"]
+        all_content = " ".join(m.get("content", "") for m in msgs)
+        assert "用户已完成接管" in all_content

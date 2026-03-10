@@ -159,14 +159,28 @@ def build_main_graph(
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
-        # 如果有上次中断保存的消息历史，恢复上下文而非从零开始
+        # 三分支 messages 构建逻辑
+        is_resuming = state.get("is_resuming", False)
         saved_messages = state.get("messages") or []
-        if saved_messages:
-            # 恢复模式：在已有消息末尾追加恢复提示
+
+        if is_resuming and saved_messages:
+            # 中断恢复：保留消息 + 追加恢复提示
             initial_messages = saved_messages + [
                 {"role": "user", "content": f"用户已完成接管并交还控制。请继续执行当前步骤：{step.description}\n用户消息：{state['message']}"},
             ]
+        elif saved_messages:
+            # 非首步/有历史：更新 system prompt 为最新版本，追加新 execution prompt
+            saved_messages[0]["content"] = system_content
+            initial_messages = saved_messages + [
+                {"role": "user", "content": EXECUTION_PROMPT.format(
+                    message=state["message"],
+                    attachments=", ".join(attachments) if attachments else "无",
+                    language=language,
+                    step=step.description,
+                )},
+            ]
         else:
+            # 首步/无历史：干净的 system + execution prompt
             initial_messages = [
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": EXECUTION_PROMPT.format(
