@@ -27,6 +27,7 @@ from app.domain.models.event import (
     StepEvent,
     StepEventStatus,
     TitleEvent,
+    WaitEvent,
 )
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
@@ -92,7 +93,7 @@ def build_main_graph(
                 "goal": state["message"],
                 "language": state.get("language", "zh"),
                 "steps": [{"description": state["message"]}],
-                "message": "I'll help you with that.",
+                "message": "好的，我来帮你处理。",
             }
 
         steps = [
@@ -171,8 +172,11 @@ def build_main_graph(
             ]
         elif saved_messages:
             # 非首步/有历史：更新 system prompt 为最新版本，追加新 execution prompt
-            saved_messages[0]["content"] = system_content
-            initial_messages = saved_messages + [
+            # 注意：不能原地修改 saved_messages[0]，否则会破坏 LangGraph 状态不可变性
+            initial_messages = [
+                {**saved_messages[0], "content": system_content},
+                *saved_messages[1:],
+            ] + [
                 {"role": "user", "content": EXECUTION_PROMPT.format(
                     message=state["message"],
                     attachments=", ".join(attachments) if attachments else "无",
@@ -206,15 +210,21 @@ def build_main_graph(
         }
 
         # Stream react_graph — emit events in real-time
+        # 注意：should_interrupt 需要单独跟踪，避免后续 chunk 覆盖
         react_final: dict[str, Any] = {}
+        seen_interrupt = False
         async for chunk in react_graph.astream(react_input):
             for _node_name, node_output in chunk.items():
                 if not isinstance(node_output, dict):
                     continue
+                if node_output.get("should_interrupt"):
+                    seen_interrupt = True
                 react_final.update(node_output)
                 # Push react events to frontend immediately
                 for evt in node_output.get("events") or []:
                     await _emit(evt)
+        if seen_interrupt:
+            react_final["should_interrupt"] = True
 
         # Extract execution summary and detect step success from LLM response JSON
         react_messages = react_final.get("messages", [])
@@ -234,13 +244,14 @@ def build_main_graph(
         step.success = step_success
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
-        # Check for interrupt
+        # Check for interrupt (user takeover request)
         should_interrupt = react_final.get("should_interrupt", False)
         if should_interrupt:
+            await _emit(WaitEvent())
             return {
                 "messages": react_final.get("messages", state["messages"]),
                 "should_interrupt": True,
-                "events": [],  # already emitted via queue
+                "events": [WaitEvent()],
             }
 
         return {

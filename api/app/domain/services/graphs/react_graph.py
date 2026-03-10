@@ -46,8 +46,6 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
     # Bind tools to LLM
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
-    iteration_count: dict[str, int] = {"count": 0}  # mutable counter in closure
-
     # ---- Nodes --------------------------------------------------------- #
 
     async def llm_node(state: ReactGraphState) -> dict:
@@ -94,8 +92,6 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
                 MessageEvent(role="assistant", message=response.content)
             )
 
-        iteration_count["count"] += 1
-
         return {
             "messages": state["messages"] + [msg_dict],
             "events": new_events,
@@ -135,6 +131,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             call_id = tc.get("id", "")
 
             # ---- message_ask_user: SOFT_HINT gating ---- #
+            tool_success = True  # default; overridden in normal-tool branch on failure
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
                 if suggest in {"browser", "shell"}:
@@ -155,29 +152,36 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
                 tool_fn = tool_map.get(tool_name)
                 if tool_fn is None:
                     result_str = f"Error: Unknown tool '{tool_name}'"
+                    tool_success = False
                 else:
                     try:
                         result_str = await tool_fn.ainvoke(args)
                         if not isinstance(result_str, str):
                             result_str = str(result_str)
+                        # Detect failure indicators from upstream ToolResult
+                        tool_success = "success=False" not in result_str
                     except Exception as exc:
                         result_str = f"Error executing {tool_name}: {exc}"
+                        tool_success = False
+
+            # Prefix error messages so the LLM can clearly identify failures
+            content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
 
             new_messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": result_str,
+                "content": content,
                 "function_name": tool_name,
             })
 
-            # Emit ToolEvent(CALLED)
+            # Emit ToolEvent(CALLED) with correct success status
             new_events.append(
                 ToolEvent(
                     tool_call_id=call_id,
                     tool_name=tool_name,
                     function_name=tool_name,
                     function_args=args,
-                    function_result=ToolResult(success=True, message=result_str),
+                    function_result=ToolResult(success=tool_success, message=result_str),
                     status=ToolEventStatus.CALLED,
                 )
             )
@@ -192,23 +196,16 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         return result
 
     async def confirmation_check(state: ReactGraphState) -> dict:
-        """Check if any tool call requires user confirmation or is a takeover request."""
-        messages = state["messages"]
-        last_msg = messages[-1]
-        tool_calls = last_msg.get("tool_calls", [])
+        """Check if any tool call requires user confirmation.
 
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            tool_name = fn.get("name", "")
-            args_raw = fn.get("arguments", "{}")
-            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-
-            # Check message_ask_user with suggest_user_takeover
-            if tool_name == "message_ask_user":
-                suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
-                if suggest in {"browser", "shell"}:
-                    return {"should_interrupt": True}
-
+        Note: takeover requests (message_ask_user with suggest_user_takeover)
+        are handled by tool_node, which executes the tool first to generate
+        a proper tool response (WAITING_FOR_USER), then sets should_interrupt.
+        This ensures complete tool_call→tool_response pairs in message history,
+        which is required by LLMs on conversation resume.
+        """
+        # Currently a pass-through — all tool calls are routed to tool_node.
+        # Future: add confirmation logic for dangerous tools here.
         return {}
 
     # ---- Routing ------------------------------------------------------- #
@@ -226,10 +223,6 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
             return "confirmation_check"
 
-        # Max iteration guard
-        if iteration_count["count"] >= MAX_ITERATIONS:
-            return END
-
         return END
 
     def route_after_confirmation(state: ReactGraphState) -> str:
@@ -242,7 +235,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         """Route after tool execution: back to LLM."""
         if state.get("should_interrupt"):
             return END
-        if iteration_count["count"] >= MAX_ITERATIONS:
+        if state.get("attempt_count", 0) >= MAX_ITERATIONS:
             return END
         return "llm_node"
 

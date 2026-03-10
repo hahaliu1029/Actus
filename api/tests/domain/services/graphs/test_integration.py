@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import BaseEvent, DoneEvent, PlanEvent, MessageEvent, TitleEvent
+from app.domain.models.memory import Memory
 from app.domain.models.message import Message
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -79,6 +80,10 @@ def mock_uow():
     uow.__aexit__ = AsyncMock(return_value=False)
     uow.session = AsyncMock()
     uow.session.get_skill_graph_state = AsyncMock(return_value=None)
+    uow.session.get_memory = AsyncMock(return_value=Memory())
+    uow.session.get_summary = AsyncMock(return_value=[])
+    uow.session.save_memory = AsyncMock()
+    uow.session.save_summary = AsyncMock()
     return uow
 
 

@@ -68,3 +68,13 @@ docs/
 
 # Git worktrees
 .worktrees/
+
+# Local agent tooling
+.agent/
+.agents/
+.claude/
+.kiro/
+
+api/skills
+
+skills-lock.json
