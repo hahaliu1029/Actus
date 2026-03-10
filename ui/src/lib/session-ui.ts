@@ -619,7 +619,7 @@ function toSnapshotFromToolEvent(
   const args = isRecord(event.data.args) ? event.data.args : {};
   const content = isRecord(event.data.content) ? event.data.content : {};
 
-  if (toolName === "browser") {
+  if (toolName === "browser" || toolName.startsWith("browser_")) {
     const screenshot = asString(content.screenshot);
     if (!screenshot) {
       return null;
@@ -637,7 +637,7 @@ function toSnapshotFromToolEvent(
     };
   }
 
-  if (toolName === "shell") {
+  if (toolName === "shell" || toolName.startsWith("shell_")) {
     const shellSessionId = asString(args.session_id) || null;
     const command = asString(args.command) || null;
     const rawConsole = content.console ?? content.console_records;

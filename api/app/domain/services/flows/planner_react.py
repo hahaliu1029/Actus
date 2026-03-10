@@ -81,6 +81,11 @@ class PlannerReActFlow(BaseFlow):
         lc_tools.extend(create_mcp_langchain_tools(mcp_tool))
         # TODO: Add A2A tools, skill tools, brainstorm/create skill tools
 
+        # 中断恢复上下文：保存中断时的步骤、消息历史、原始请求
+        self._saved_current_step = None
+        self._saved_messages: list = []
+        self._saved_original_request: str = ""
+
         # Build LLM adapter
         self._llm_adapter = LLMAdapter(llm=llm)
 
@@ -158,19 +163,23 @@ class PlannerReActFlow(BaseFlow):
             return
 
         # Build input state for main_graph
+        # 如果上次因中断（接管）暂停，恢复保存的上下文
+        is_resuming = self.status == FlowStatus.EXECUTING and self.plan is not None
         input_state = {
             "message": message.message,
             "language": getattr(message, "language", "en"),
             "attachments": getattr(message, "attachments", []),
             "plan": self.plan,
-            "current_step": None,
-            "messages": [],
+            "current_step": self._saved_current_step if is_resuming else None,
+            "messages": self._saved_messages if is_resuming else [],
             "execution_summary": "",
             "events": [],
-            "flow_status": self.status.value if hasattr(self.status, "value") else "idle",
+            "flow_status": "executing" if is_resuming else (
+                self.status.value if hasattr(self.status, "value") else "idle"
+            ),
             "session_id": self._session_id,
             "should_interrupt": False,
-            "original_request": "",
+            "original_request": self._saved_original_request if is_resuming else "",
             "skill_context": self._skill_context,
         }
 
@@ -182,7 +191,19 @@ class PlannerReActFlow(BaseFlow):
         final = bridge.final_state
         self.plan = final.get("plan")
         flow_status = final.get("flow_status", "idle")
-        self.status = FlowStatus.IDLE if flow_status == "completed" else FlowStatus.IDLE
+
+        if final.get("should_interrupt"):
+            # 中断（接管）：保存上下文以便恢复
+            self.status = FlowStatus.EXECUTING
+            self._saved_current_step = final.get("current_step")
+            self._saved_messages = final.get("messages", [])
+            self._saved_original_request = final.get("original_request", "")
+        else:
+            # 正常完成：重置状态
+            self.status = FlowStatus.IDLE
+            self._saved_current_step = None
+            self._saved_messages = []
+            self._saved_original_request = ""
 
     @property
     def done(self) -> bool:

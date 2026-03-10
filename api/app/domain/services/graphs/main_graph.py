@@ -9,9 +9,11 @@ Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.1-4
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from app.domain.external.json_parser import JSONParser
@@ -112,49 +114,97 @@ def build_main_graph(
             "events": events,
         }
 
-    async def executor_node(state: MainGraphState) -> dict:
-        """Execute current step via react_graph sub-graph."""
+    async def executor_node(state: MainGraphState, config: RunnableConfig) -> dict:
+        """Execute current step via react_graph sub-graph.
+
+        Streams react events to the event_queue in real-time so the frontend
+        sees tool calls / results as they happen, rather than after the entire
+        step completes.
+        """
+        from app.domain.services.prompts.react import REACT_SYSTEM_PROMPT, EXECUTION_PROMPT
+
+        event_queue: asyncio.Queue | None = (
+            config.get("configurable", {}).get("event_queue")
+        )
+
+        async def _emit(evt: Any) -> None:
+            if event_queue is not None:
+                await event_queue.put(evt)
+
         step = state["current_step"]
         if not step:
             return {"flow_status": "summarizing", "events": []}
 
-        # Emit StepEvent(STARTED)
-        events = [StepEvent(step=step, status=StepEventStatus.STARTED)]
+        # Emit StepEvent(STARTED) immediately
+        await _emit(StepEvent(step=step, status=StepEventStatus.STARTED))
+
+        # Build initial messages with system prompt + execution prompt
+        attachments = state.get("attachments", [])
+        language = state.get("language", "en")
+        skill_context = state.get("skill_context", "")
+
+        system_content = REACT_SYSTEM_PROMPT
+        if skill_context:
+            system_content += f"\n\n{skill_context}"
+
+        # 如果有上次中断保存的消息历史，恢复上下文而非从零开始
+        saved_messages = state.get("messages") or []
+        if saved_messages:
+            # 恢复模式：在已有消息末尾追加恢复提示
+            initial_messages = saved_messages + [
+                {"role": "user", "content": f"用户已完成接管并交还控制。请继续执行当前步骤：{step.description}\n用户消息：{state['message']}"},
+            ]
+        else:
+            initial_messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": EXECUTION_PROMPT.format(
+                    message=state["message"],
+                    attachments=", ".join(attachments) if attachments else "无",
+                    language=language,
+                    step=step.description,
+                )},
+            ]
 
         # Build react_graph input
         react_input = {
-            "messages": state["messages"],
+            "messages": initial_messages,
             "step_description": step.description,
             "original_request": state.get("original_request", ""),
-            "language": state.get("language", "en"),
-            "attachments": state.get("attachments", []),
+            "language": language,
+            "attachments": attachments,
             "events": [],
             "should_interrupt": False,
             "attempt_count": 0,
             "failure_count": 0,
         }
 
-        react_result = await react_graph.ainvoke(react_input)
-
-        # Collect react events
-        react_events = react_result.get("events", [])
-        events.extend(react_events)
+        # Stream react_graph — emit events in real-time
+        react_final: dict[str, Any] = {}
+        async for chunk in react_graph.astream(react_input):
+            for _node_name, node_output in chunk.items():
+                if not isinstance(node_output, dict):
+                    continue
+                react_final.update(node_output)
+                # Push react events to frontend immediately
+                for evt in node_output.get("events") or []:
+                    await _emit(evt)
 
         # Update step status
         step.status = ExecutionStatus.COMPLETED
         step.success = True
-        events.append(StepEvent(step=step, status=StepEventStatus.COMPLETED))
+        await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
         # Check for interrupt
-        if react_result.get("should_interrupt"):
+        should_interrupt = react_final.get("should_interrupt", False)
+        if should_interrupt:
             return {
-                "messages": react_result.get("messages", state["messages"]),
+                "messages": react_final.get("messages", state["messages"]),
                 "should_interrupt": True,
-                "events": events,
+                "events": [],  # already emitted via queue
             }
 
         # Extract execution summary from last assistant message
-        react_messages = react_result.get("messages", [])
+        react_messages = react_final.get("messages", [])
         summary = ""
         for msg in reversed(react_messages):
             if msg.get("role") == "assistant" and msg.get("content"):
@@ -162,10 +212,10 @@ def build_main_graph(
                 break
 
         return {
-            "messages": react_result.get("messages", state["messages"]),
+            "messages": react_final.get("messages", state["messages"]),
             "execution_summary": summary,
             "flow_status": "updating",
-            "events": events,
+            "events": [],  # already emitted via queue
         }
 
     async def updater_node(state: MainGraphState) -> dict:

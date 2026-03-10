@@ -37,7 +37,14 @@ def _make_message_tools() -> list[StructuredTool]:
         attachments: Optional[Union[str, List[str]]] = None,
         suggest_user_takeover: Optional[Literal["none", "shell", "browser"]] = None,
     ) -> str:
-        """Ask the user a question and wait for their reply. Use for clarification, confirmation, or requesting input."""
+        """Ask the user a question and wait for their reply. Use for clarification, confirmation, or requesting input.
+
+        NOTE: The system may return SOFT_HINT if it determines the agent should
+        try to solve autonomously first. Only call again if user input is truly
+        required.
+        """
+        # Actual SOFT_HINT / interrupt logic is handled by react_graph's tool_node.
+        # This is the fallback return value.
         return "WAITING_FOR_USER"
 
     return [message_notify_user, message_ask_user]

@@ -972,49 +972,86 @@ class AgentTaskRunner(TaskRunner):
         """基于用户偏好过滤 Skill 列表。"""
         return [skill for skill in skills if preference_map.get(skill.id, True)]
 
+    def _classify_tool_name(self, tool_name: str) -> str:
+        """将工具名映射为类别（browser/shell/file/search/mcp/a2a/skill）。
+
+        兼容旧名称（browser/shell/file/search）和新 LangChain 名称（browser_view/shell_execute 等）。
+        """
+        _TOOL_CATEGORY_PREFIXES = {
+            "browser_": "browser",
+            "shell_": "shell",
+            "file_": "file",
+            "search_": "search",
+        }
+        for prefix, category in _TOOL_CATEGORY_PREFIXES.items():
+            if tool_name.startswith(prefix):
+                return category
+        # 保留旧名称兼容（非 LangChain 路径）
+        if tool_name in ("browser", "shell", "file", "search", "mcp", "a2a", "skill"):
+            return tool_name
+        # Skill creation 工具
+        if tool_name in ("generate_skill", "install_skill", "brainstorm_skill"):
+            return "skill_creation"
+        # 检查 MCP 工具
+        if self._mcp_tool:
+            mcp_names = {s.get("function", {}).get("name", "") for s in self._mcp_tool.get_tools()}
+            if tool_name in mcp_names:
+                return "mcp"
+        return "unknown"
+
     async def _handle_tool_event(self, event: ToolEvent) -> None:
         """额外处理工具消息，使其前端交互更友好"""
         try:
             # 1.如果事件状态为已调用则执行以下代码
             if event.status == ToolEventStatus.CALLED:
+                category = self._classify_tool_name(event.tool_name)
                 # 2.工具为浏览器则补全工具浏览器工具内容
-                if event.tool_name == "browser":
+                if category == "browser":
                     event.tool_content = BrowserToolContent(
                         screenshot=await self._get_browser_screenshot(),
                     )
-                elif event.tool_name == "search":
+                elif category == "search":
                     # 3.工具为搜索则添加搜索工具内容
-                    search_results: ToolResult[SearchResults] = event.function_result
-                    logger.info(f"搜索工具结果: {search_results}")
-                    event.tool_content = SearchToolContent(
-                        results=search_results.data.results
-                    )
-                elif event.tool_name == "shell":
+                    try:
+                        if (
+                            hasattr(event.function_result, "data")
+                            and event.function_result.data
+                            and hasattr(event.function_result.data, "results")
+                        ):
+                            event.tool_content = SearchToolContent(
+                                results=event.function_result.data.results
+                            )
+                        else:
+                            # LangChain 路径：结构化数据已丢失
+                            event.tool_content = SearchToolContent(results=[])
+                    except Exception:
+                        event.tool_content = SearchToolContent(results=[])
+                elif category == "shell":
                     # 4.工具为shell则生成shell工具内容
-                    if "session_id" in event.function_args:
-                        shell_result = await self._sandbox.read_shell_output(
-                            event.function_args["session_id"],
-                            console=True,
-                        )
-                        event.tool_content = ShellToolContent(
-                            console=(shell_result.data or {}).get("console_records", [])
-                        )
-                    else:
-                        event.tool_content = ShellToolContent(console="(No console)")
-                elif event.tool_name == "file":
+                    session_id = event.function_args.get("session_id", "default")
+                    shell_result = await self._sandbox.read_shell_output(
+                        session_id, console=True,
+                    )
+                    event.tool_content = ShellToolContent(
+                        console=(shell_result.data or {}).get("console_records", [])
+                    )
+                elif category == "file":
                     # 5.工具为file则将文件同步到对象存储
-                    if "filepath" in event.function_args:
-                        filepath = event.function_args["filepath"]
+                    filepath = event.function_args.get("filepath")
+                    if filepath:
                         file_read_result = await self._sandbox.read_file(filepath)
                         file_content: str = (file_read_result.data or {}).get(
                             "content", ""
                         )
                         event.tool_content = FileToolContent(content=file_content)
-                        await self._sync_file_to_storage(filepath)
+                        # 写操作同步到对象存储
+                        if event.function_name in ("file_write", "file_str_replace"):
+                            await self._sync_file_to_storage(filepath)
                     else:
                         event.tool_content = FileToolContent(content="(No Content)")
-                elif event.tool_name in ["mcp", "a2a"]:
+                elif category in ("mcp", "a2a"):
                     # 6.工具为mcp/a2a则处理调用结果
+                    is_mcp = category == "mcp"
                     logger.info(
                         f"处理MCP/A2A工具事件, function_result: {event.function_result}"
                     )
@@ -1029,7 +1066,7 @@ class AgentTaskRunner(TaskRunner):
                             )
                             event.tool_content = (
                                 MCPToolContent(result=event.function_result.data)
-                                if event.tool_name == "mcp"
+                                if is_mcp
                                 else A2AToolContent(
                                     a2a_result=event.function_result.data
                                 )
@@ -1049,27 +1086,26 @@ class AgentTaskRunner(TaskRunner):
                             )
                             event.tool_content = (
                                 MCPToolContent(result=result_data)
-                                if event.tool_name == "mcp"
+                                if is_mcp
                                 else A2AToolContent(a2a_result=result_data)
                             )
                         else:
-                            # 9.其他情况将结果转换成字符串进行传递
-                            logger.info(f"MCP/A2A工具结果: {event.function_result}")
+                            # 9.其他情况将结果转换成字符串进行传递（含 LangChain 路径）
+                            msg = getattr(event.function_result, "message", None) or str(event.function_result)
+                            logger.info(f"MCP/A2A工具结果: {msg}")
                             event.tool_content = (
-                                MCPToolContent(result=str(event.function_result))
-                                if event.tool_name == "mcp"
-                                else A2AToolContent(
-                                    a2a_result=str(event.function_result)
-                                )
+                                MCPToolContent(result=msg)
+                                if is_mcp
+                                else A2AToolContent(a2a_result=msg)
                             )
                     else:
                         logger.warning("MCP/A2A工具调用结果未发现")
                         event.tool_content = (
                             MCPToolContent(result="(MCP工具无可用结果)")
-                            if event.tool_name == "mcp"
+                            if is_mcp
                             else A2AToolContent(a2a_result="(A2A智能体无可用结果)")
                         )
-                elif event.tool_name == "skill":
+                elif category == "skill":
                     if event.function_result and event.function_result.data is not None:
                         event.tool_content = SkillToolContent(
                             skill_result=event.function_result.data
@@ -1082,7 +1118,7 @@ class AgentTaskRunner(TaskRunner):
                         event.tool_content = SkillToolContent(
                             skill_result="(Skill工具无可用结果)"
                         )
-                elif event.tool_name in ("generate_skill", "install_skill", "brainstorm_skill"):
+                elif category == "skill_creation":
                     if event.function_result and event.function_result.data is not None:
                         event.tool_content = SkillToolContent(
                             skill_result=event.function_result.data

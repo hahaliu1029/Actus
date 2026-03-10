@@ -40,12 +40,33 @@ def mock_json_parser():
     return parser
 
 
+def _make_mock_react_graph():
+    """Create a mock react_graph with async generator astream."""
+    class MockReactGraph:
+        async def astream(self, input_state, config=None):
+            yield {"llm_node": {
+                "events": [MessageEvent(role="assistant", message="Step done")],
+                "messages": [],
+            }}
+
+        async def ainvoke(self, input_state, config=None):
+            return {
+                "events": [MessageEvent(role="assistant", message="Step done")],
+                "messages": [],
+                "should_interrupt": False,
+                "attempt_count": 1,
+                "failure_count": 0,
+            }
+
+    return MockReactGraph()
+
+
 class TestBuildMainGraph:
     def test_graph_compiles(self, mock_planner_llm, mock_json_parser):
         from app.domain.services.graphs.main_graph import build_main_graph
         graph = build_main_graph(
             planner_llm=mock_planner_llm,
-            react_graph=AsyncMock(),
+            react_graph=_make_mock_react_graph(),
             json_parser=mock_json_parser,
             summary_llm=mock_planner_llm,
             uow_factory=MagicMock(),
@@ -58,16 +79,6 @@ class TestMainGraphFlow:
     async def test_full_flow_produces_plan_and_done(self, mock_planner_llm, mock_json_parser):
         from app.domain.services.graphs.main_graph import build_main_graph
 
-        # Mock react_graph that returns completed step
-        mock_react = AsyncMock()
-        mock_react.ainvoke = AsyncMock(return_value={
-            "events": [MessageEvent(role="assistant", message="Step done")],
-            "messages": [],
-            "should_interrupt": False,
-            "attempt_count": 1,
-            "failure_count": 0,
-        })
-
         mock_uow = AsyncMock()
         mock_uow.__aenter__ = AsyncMock(return_value=mock_uow)
         mock_uow.__aexit__ = AsyncMock(return_value=False)
@@ -76,7 +87,7 @@ class TestMainGraphFlow:
 
         graph = build_main_graph(
             planner_llm=mock_planner_llm,
-            react_graph=mock_react,
+            react_graph=_make_mock_react_graph(),
             json_parser=mock_json_parser,
             summary_llm=mock_planner_llm,
             uow_factory=MagicMock(return_value=mock_uow),
@@ -101,5 +112,5 @@ class TestMainGraphFlow:
 
         events = result.get("events", [])
         event_types = [type(e).__name__ for e in events]
-        # Should produce at least a PlanEvent
-        assert "PlanEvent" in event_types or "MessageEvent" in event_types
+        # planner events come through state; executor events go via queue (empty in state)
+        assert "PlanEvent" in event_types or "TitleEvent" in event_types

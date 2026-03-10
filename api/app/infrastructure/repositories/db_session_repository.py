@@ -1,6 +1,7 @@
+import json
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
@@ -16,6 +17,17 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_null_bytes(data: Any) -> Any:
+    """递归移除数据中的 \\u0000 空字节，PostgreSQL的jsonb/text类型不支持该字符"""
+    if isinstance(data, str):
+        return data.replace("\x00", "")
+    if isinstance(data, dict):
+        return {k: _strip_null_bytes(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_strip_null_bytes(item) for item in data]
+    return data
 
 _SKILL_CREATION_STATE_KEY = "__skill_creation_state_v1"
 _SKILL_CREATION_STATE_LEGACY_KEY = "_skill_creator"
@@ -133,8 +145,8 @@ class DBSessionRepository(SessionRepository):
 
     async def add_event(self, session_id: str, event: BaseEvent) -> None:
         """往会话中新增事件"""
-        # 1.将event序列化为json
-        event_data = event.model_dump(mode="json")
+        # 1.将event序列化为json，并移除PostgreSQL不支持的\u0000空字节
+        event_data = _strip_null_bytes(event.model_dump(mode="json"))
 
         # 2.构建原子更新语句并执行
         stmt = (

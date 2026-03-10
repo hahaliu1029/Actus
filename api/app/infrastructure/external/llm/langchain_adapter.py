@@ -86,8 +86,8 @@ class LLMAdapter(BaseChatModel):
 
     def _to_langchain_message(self, response: dict) -> AIMessage:
         """Convert Actus LLM response dict → LangChain AIMessage."""
-        content = response.get("content", "")
-        tool_calls_raw = response.get("tool_calls", [])
+        content = response.get("content", "") or ""
+        tool_calls_raw = response.get("tool_calls") or []
 
         tool_calls = []
         for tc in tool_calls_raw:

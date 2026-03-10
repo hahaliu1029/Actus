@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
 
 from app.domain.models.event import (
+    MessageEvent,
     ToolEvent,
     ToolEventStatus,
 )
@@ -87,6 +88,12 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
                     )
                 )
 
+        # 最终回答（无 tool_calls 且有内容）发射 MessageEvent，使前端实时收到
+        if not response.tool_calls and response.content:
+            new_events.append(
+                MessageEvent(role="assistant", message=response.content)
+            )
+
         iteration_count["count"] += 1
 
         return {
@@ -95,13 +102,30 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         }
 
     async def tool_node(state: ReactGraphState) -> dict:
-        """Execute tool calls from the last assistant message."""
+        """Execute tool calls from the last assistant message.
+
+        Special handling for ``message_ask_user``:
+        - If ``suggest_user_takeover`` is "browser"/"shell" → set should_interrupt
+          (handled by confirmation_check, but also guard here).
+        - Otherwise, first call returns SOFT_HINT (agent should try to solve
+          autonomously). If a SOFT_HINT was already returned in this step
+          and the LLM calls again, it truly needs user input → interrupt.
+        """
         messages = state["messages"]
         last_msg = messages[-1]
-        tool_calls = last_msg.get("tool_calls", [])
+        tool_calls = last_msg.get("tool_calls") or []
+
+        # Check if there was already a SOFT_HINT in this step's history
+        has_prior_soft_hint = any(
+            m.get("content") == "SOFT_HINT"
+            and m.get("function_name") == "message_ask_user"
+            for m in messages
+            if isinstance(m, dict) and m.get("role") == "tool"
+        )
 
         new_messages = []
         new_events = []
+        should_interrupt = False
 
         for tc in tool_calls:
             fn = tc.get("function", {})
@@ -110,16 +134,34 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
             call_id = tc.get("id", "")
 
-            tool_fn = tool_map.get(tool_name)
-            if tool_fn is None:
-                result_str = f"Error: Unknown tool '{tool_name}'"
+            # ---- message_ask_user: SOFT_HINT gating ---- #
+            if tool_name == "message_ask_user":
+                suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
+                if suggest in {"browser", "shell"}:
+                    # Takeover request → always interrupt
+                    result_str = "WAITING_FOR_USER"
+                    should_interrupt = True
+                elif not has_prior_soft_hint:
+                    # First non-takeover ask → return SOFT_HINT
+                    result_str = "SOFT_HINT"
+                    logger.info("message_ask_user: returning SOFT_HINT (first attempt)")
+                else:
+                    # Second call after SOFT_HINT → truly needs user input
+                    result_str = "WAITING_FOR_USER"
+                    should_interrupt = True
+                    logger.info("message_ask_user: user input required (after SOFT_HINT)")
             else:
-                try:
-                    result_str = await tool_fn.ainvoke(args)
-                    if not isinstance(result_str, str):
-                        result_str = str(result_str)
-                except Exception as exc:
-                    result_str = f"Error executing {tool_name}: {exc}"
+                # ---- Normal tool execution ---- #
+                tool_fn = tool_map.get(tool_name)
+                if tool_fn is None:
+                    result_str = f"Error: Unknown tool '{tool_name}'"
+                else:
+                    try:
+                        result_str = await tool_fn.ainvoke(args)
+                        if not isinstance(result_str, str):
+                            result_str = str(result_str)
+                    except Exception as exc:
+                        result_str = f"Error executing {tool_name}: {exc}"
 
             new_messages.append({
                 "role": "tool",
@@ -140,11 +182,14 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
                 )
             )
 
-        return {
+        result: dict = {
             "messages": state["messages"] + new_messages,
             "events": new_events,
             "attempt_count": state["attempt_count"] + 1,
         }
+        if should_interrupt:
+            result["should_interrupt"] = True
+        return result
 
     async def confirmation_check(state: ReactGraphState) -> dict:
         """Check if any tool call requires user confirmation or is a takeover request."""

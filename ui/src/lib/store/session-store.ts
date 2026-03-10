@@ -728,7 +728,7 @@ export const useSessionStore = create<SessionStore>()(
         (event) => {
           if (
             event.type === "tool" &&
-            event.data.name === "file" &&
+            (event.data.name === "file" || String(event.data.name || "").startsWith("file_")) &&
             event.data.status === "called"
           ) {
             void get().fetchSessionFiles(sessionId);

@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git worktree add .worktrees/langchain-langgraph-migration -b feature/langchain-langgraph-migration)",
+      "Bash(../.venv/bin/python --version)",
+      "Bash(../.venv/bin/python -m pytest --version)",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/test_planner_react_flow.py -v)",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/graphs/ tests/domain/services/tools/test_langchain_tools.py tests/domain/services/tools/test_langchain_mcp.py tests/app/infrastructure/external/llm/test_langchain_adapter.py -v)",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/ -v --ignore=tests/domain/services/test_agent_task_runner.py --ignore=tests/domain/services/test_agent_task_runner_cancel_reason.py --ignore=tests/domain/services/test_agent_task_runner_tool_preferences.py)",
+      "Bash(../.venv/bin/pip show langchain-core)",
+      "Bash(../.venv/bin/pip show langgraph)",
+      "Bash(../.venv/bin/python -c \"import langchain_core; print\\(langchain_core.__version__\\)\")",
+      "Bash(../.venv/bin/python -c \"import langgraph; print\\(langgraph.__version__\\)\")",
+      "Bash(../.venv/bin/python -c \"import langgraph; from langgraph.graph import StateGraph; print\\(''langgraph OK''\\)\")",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/graphs/test_integration.py -v)",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/ tests/app/infrastructure/external/llm/ tests/app/application/services/ -v --tb=short)",
+      "Bash(git checkout:*)",
+      "Bash(git rm:*)",
+      "Bash(cp /Users/liuyixuan/Desktop/code/opensource/Actus/.worktrees/langchain-langgraph-migration/api/tests/domain/services/graphs/test_integration.py /Users/liuyixuan/Desktop/code/opensource/Actus/api/tests/domain/services/graphs/test_integration.py)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git worktree:*)",
+      "Bash(git branch:*)",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/graphs/ -v --tb=short)",
+      "Bash(.venv/bin/pip show:*)",
+      "Bash(../.venv/bin/python -m pytest tests/app/infrastructure/external/llm/test_langchain_adapter.py tests/domain/services/graphs/ -v --tb=short)",
+      "Bash(docker exec:*)",
+      "Bash(docker stats:*)",
+      "Bash(../.venv/bin/python -m pytest tests/domain/services/graphs/ tests/domain/services/tools/ tests/app/infrastructure/external/llm/ -v --tb=short)"
+    ],
+    "additionalDirectories": [
+      "/Users/liuyixuan/Desktop/code/opensource/Actus/.worktrees/langchain-langgraph-migration/api/tests/app/infrastructure/external/llm"
+    ]
+  }
+}
