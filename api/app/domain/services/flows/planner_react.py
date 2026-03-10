@@ -1,3 +1,9 @@
+"""Planner+ReAct Flow — now delegates to LangGraph main_graph + react_graph.
+
+This module preserves the same public interface (constructor, invoke, done)
+so that AgentTaskRunner requires minimal changes.
+"""
+
 import logging
 from typing import AsyncGenerator, Callable, Optional
 
@@ -8,35 +14,21 @@ from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.context_overflow_config import ContextOverflowConfig
-from app.domain.models.event import (
-    BaseEvent,
-    ControlAction,
-    ControlEvent,
-    DoneEvent,
-    MessageEvent,
-    PlanEvent,
-    PlanEventStatus,
-    TitleEvent,
-    WaitEvent,
-)
+from app.domain.models.event import BaseEvent, DoneEvent, WaitEvent
 from app.domain.models.message import Message
-from app.domain.models.plan import ExecutionStatus, Plan
-from app.domain.models.session import SessionStatus
-
-# from app.domain.repositories.session_repository import SessionRepository
-from app.domain.services.agents.planner import PlannerAgent
-from app.domain.services.agents.react import ReActAgent
+from app.domain.models.plan import Plan
+from app.domain.repositories.uow import IUnitOfWork
+from app.domain.services.graphs.event_bridge import GraphEventBridge
+from app.domain.services.graphs.main_graph import build_main_graph
+from app.domain.services.graphs.react_graph import build_react_graph
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.base import BaseTool
-from app.domain.services.tools.browser import BrowserTool
-from app.domain.services.tools.file import FileTool
+from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
+from app.domain.services.tools.langchain_tools import create_native_tools
 from app.domain.services.tools.mcp import MCPTool
-from app.domain.services.tools.message import MessageTool
-from app.domain.services.tools.search import SearchTool
-from app.domain.services.tools.shell import ShellTool
 from app.domain.services.tools.skill import SkillTool
+from app.infrastructure.external.llm.langchain_adapter import LLMAdapter
 
-from ...repositories.uow import IUnitOfWork
 from .base import BaseFlow, FlowStatus
 from .skill_creation_graph import SkillCreationGraph
 from .skill_graph_canary import is_skill_graph_enabled
@@ -45,191 +37,78 @@ logger = logging.getLogger(__name__)
 
 
 class PlannerReActFlow(BaseFlow):
-    """规划与执行流"""
-
-    def _extract_react_execution_summary(self, max_chars: int = 500) -> str:
-        """从 ReAct Agent 提取最近一轮执行摘要。"""
-        return self.react.get_latest_assistant_content(max_chars=max_chars)
-
-    def _hydrate_skill_resume_token_from_structured_confirmation(
-        self, message: Message
-    ) -> None:
-        """兜底：当结构化确认动作存在但运行时放行令牌缺失时，补齐令牌避免误入重规划。"""
-        action = (message.skill_confirmation_action or "").strip().lower()
-        if action not in {"generate", "install"}:
-            return
-
-        approved_actions = getattr(self.react, "_skill_creation_approved_actions", None)
-        if approved_actions is None:
-            approved_actions = set()
-            setattr(self.react, "_skill_creation_approved_actions", approved_actions)
-        if not isinstance(approved_actions, set):
-            return
-        if approved_actions:
-            return
-
-        approved_actions.add(action)
-        logger.info(
-            "Skill 创建确认兜底生效: action=%s, 通过结构化确认补齐运行时放行令牌",
-            action,
-        )
+    """Planner+ReAct orchestration flow backed by LangGraph."""
 
     def __init__(
         self,
-        uow_factory: Callable[[], IUnitOfWork],  # 单元工作工厂
-        llm: LLM,  # 大语言模型
-        agent_config: AgentConfig,  # 智能体配置
-        session_id: str,  # 会话id
-        json_parser: JSONParser,  # JSON解析器
-        browser: Browser,  # 浏览器
-        sandbox: Sandbox,  # 沙箱
-        search_engine: SearchEngine,  # 搜索引擎
-        mcp_tool: MCPTool,  # mcp工具
-        a2a_tool: A2ATool,  # a2a远程agent
-        skill_tool: SkillTool,  # 统一skill工具
-        create_skill_tool: BaseTool | None = None,  # skill创建工具
-        brainstorm_skill_tool: BaseTool | None = None,  # skill头脑风暴工具
-        overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
-        summary_llm: LLM | None = None,  # 摘要生成模型
-        user_id: str = "",  # 用户ID（用于灰度分桶）
-        skill_graph_canary_percent: int = 0,  # 子图灰度百分比
+        uow_factory: Callable[[], IUnitOfWork],
+        llm: LLM,
+        agent_config: AgentConfig,
+        session_id: str,
+        json_parser: JSONParser,
+        browser: Browser,
+        sandbox: Sandbox,
+        search_engine: SearchEngine,
+        mcp_tool: MCPTool,
+        a2a_tool: A2ATool,
+        skill_tool: SkillTool,
+        create_skill_tool: BaseTool | None = None,
+        brainstorm_skill_tool: BaseTool | None = None,
+        overflow_config: ContextOverflowConfig | None = None,
+        summary_llm: LLM | None = None,
+        user_id: str = "",
+        skill_graph_canary_percent: int = 0,
     ) -> None:
-        """构造函数，完成规划与执行流的初始化"""
-        # 1.流初始化数据配置
         self._uow_factory = uow_factory
-        self._uow = uow_factory()
         self._session_id = session_id
-        # self._session_repository = session_repository
-        self.status = FlowStatus.IDLE
-        self.plan: Optional[Plan] = None
-        overflow_config = overflow_config or ContextOverflowConfig()
         self._json_parser = json_parser
         self._summary_llm = summary_llm or llm
-
-        # 2.初始化Agent预设工具列表
-        tools = [
-            FileTool(sandbox=sandbox),
-            ShellTool(sandbox=sandbox),
-            BrowserTool(browser=browser),
-            SearchTool(search_engine=search_engine),
-            MessageTool(),
-            mcp_tool,
-            a2a_tool,
-            skill_tool,
-        ]
-        if create_skill_tool is not None:
-            tools.append(create_skill_tool)
-        if brainstorm_skill_tool is not None:
-            tools.append(brainstorm_skill_tool)
-
-        # 3.创建规划Agent
-        self.planner = PlannerAgent(
-            uow_factory=uow_factory,
-            session_id=session_id,
-            # session_repository=session_repository,
-            agent_config=agent_config,
-            llm=llm,
-            json_parser=json_parser,
-            tools=tools,
-            overflow_config=overflow_config,
-        )
-        logger.debug(f"创建规划Agent成功, 会话id: {self._session_id}")
-
-        # 4.创建执行Agent
-        self.react = ReActAgent(
-            uow_factory=uow_factory,
-            session_id=session_id,
-            # session_repository=session_repository,
-            agent_config=agent_config,
-            llm=llm,
-            json_parser=json_parser,
-            tools=tools,
-            overflow_config=overflow_config,
-        )
+        self.status = FlowStatus.IDLE
+        self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
-        logger.debug(f"创建执行Agent成功, 会话id: {self._session_id}")
+        self._skill_context = ""
 
-        # 5. Skill 创建子图（灰度控制）
+        # Skill creation subgraph
         self._user_id = user_id
         self._skill_graph_canary_percent = skill_graph_canary_percent
         self._brainstorm_skill_tool = brainstorm_skill_tool
         self._create_skill_tool = create_skill_tool
 
-    async def _generate_summary(self, plan: Plan, round_number: int) -> None:
-        """在对话轮结束时生成并持久化对话摘要。"""
-        if not self._memory_config.summary_enabled:
-            return
-        if len(plan.steps) < self._memory_config.summary_min_steps:
-            return
+        # Build LangChain tools
+        lc_tools = create_native_tools(
+            sandbox=sandbox, browser=browser, search_engine=search_engine,
+        )
+        lc_tools.extend(create_mcp_langchain_tools(mcp_tool))
+        # TODO: Add A2A tools, skill tools, brainstorm/create skill tools
 
-        try:
-            from app.domain.models.conversation_summary import ConversationSummary
-            from app.domain.services.prompts.summary import GENERATE_SUMMARY_PROMPT
+        # Build LLM adapter
+        self._llm_adapter = LLMAdapter(llm=llm)
 
-            steps_lines = []
-            for step in plan.steps:
-                status = "成功" if step.success else ("失败" if step.done else "未执行")
-                result_text = (step.result or "无结果记录")[:200]
-                steps_lines.append(f"- {step.description} [{status}]: {result_text}")
+        # Build graphs
+        self._react_graph = build_react_graph(
+            llm=self._llm_adapter, tools=lc_tools, agent_config=agent_config,
+        )
+        self._main_graph = build_main_graph(
+            planner_llm=llm,
+            react_graph=self._react_graph,
+            json_parser=json_parser,
+            summary_llm=self._summary_llm,
+            uow_factory=uow_factory,
+            session_id=session_id,
+            agent_config=agent_config,
+        )
 
-            prompt = GENERATE_SUMMARY_PROMPT.format(
-                round_number=round_number,
-                plan_goal=plan.goal,
-                steps_summary="\n".join(steps_lines),
-            )
-
-            response = await self._summary_llm.invoke(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "你是一个对话摘要助手，请生成结构化摘要。",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
-
-            content = response.get("content", "")
-            parsed = await self._json_parser.invoke(content)
-            if not isinstance(parsed, dict):
-                logger.warning("摘要生成结果非字典，跳过")
-                return
-
-            summary = ConversationSummary(
-                round_number=round_number,
-                user_intent=parsed.get("user_intent", plan.goal),
-                plan_summary=parsed.get("plan_summary", ""),
-                execution_results=parsed.get("execution_results", []),
-                decisions=parsed.get("decisions", []),
-                unresolved=parsed.get("unresolved", []),
-            )
-
-            uow = self._uow_factory()
-            async with uow:
-                existing = await uow.session.get_summary(self._session_id)
-                existing.append(summary)
-                max_rounds = self._memory_config.summary_max_rounds
-                if len(existing) > max_rounds:
-                    existing = existing[-max_rounds:]
-                await uow.session.save_summary(self._session_id, existing)
-
-            logger.info(f"成功生成第{round_number}轮对话摘要")
-        except Exception as exc:
-            logger.warning(f"摘要生成失败，跳过: {exc}")
+    def set_skill_context(self, skill_context: str) -> None:
+        """Set activated skill context for this round."""
+        self._skill_context = skill_context
 
     def _is_skill_graph_active(self) -> bool:
-        """判断当前用户是否命中子图灰度。"""
         return is_skill_graph_enabled(self._user_id, self._skill_graph_canary_percent)
 
     async def _try_drive_skill_graph(
-        self, message: Message
+        self, message: Message,
     ) -> AsyncGenerator[BaseEvent, None] | None:
-        """尝试通过子图驱动 Skill 创建流程。
-
-        Returns
-        -------
-        如果子图被激活，返回事件的 async generator；否则返回 None。
-        """
+        """Try to drive skill creation subgraph. Returns async generator or None."""
         if not self._is_skill_graph_active():
             return None
         if not self._brainstorm_skill_tool or not self._create_skill_tool:
@@ -237,45 +116,14 @@ class PlannerReActFlow(BaseFlow):
 
         action = message.skill_confirmation_action
 
-        # 从 DB 读取子图状态
         async with self._uow_factory() as uow:
             graph_state = await uow.session.get_skill_graph_state(self._session_id)
 
-        # 无子图状态且无结构化动作 → 不激活子图（走正常流程，让 brainstorm 首次执行）
         if graph_state is None and action is None:
             return None
-
-        # 无子图状态但有结构化动作 → 尝试从旧状态迁移
-        if graph_state is None and action is not None:
-            async with self._uow_factory() as uow:
-                old_state = await uow.session.get_skill_creation_state(self._session_id)
-            if old_state is None:
-                return None
-            # 从旧状态构建子图状态
-            from app.domain.models.skill_graph_state import SkillGraphState
-            status_map = {
-                "generate": "wait_generate",
-                "install": "wait_install",
-            }
-            mapped_status = status_map.get(old_state.pending_action or "", None)
-            if mapped_status is None:
-                return None
-            graph_state = SkillGraphState(
-                status=mapped_status,
-                pending_action=old_state.pending_action,
-                approval_status=old_state.approval_status,
-                blueprint=old_state.blueprint,
-                blueprint_json=old_state.blueprint_json,
-                skill_data=old_state.skill_data,
-                last_tool_call_id=old_state.last_tool_call_id,
-                saved_tool_result_json=old_state.saved_tool_result_json,
-            )
-
-        # 子图处于终态 → 不拦截
         if graph_state is not None and graph_state.is_terminal:
             return None
 
-        # 驱动子图
         async def _drive() -> AsyncGenerator[BaseEvent, None]:
             graph = SkillCreationGraph(
                 brainstorm_tool=self._brainstorm_skill_tool,
@@ -288,299 +136,54 @@ class PlannerReActFlow(BaseFlow):
             ):
                 yield event
 
-            # 持久化更新后的状态
             new_state = graph.state
             if new_state is not None:
                 async with self._uow_factory() as uow:
                     if new_state.is_terminal:
                         await uow.session.clear_skill_graph_state(self._session_id)
-                        # 同时清理旧状态
-                        await uow.session.clear_skill_creation_state(self._session_id)
                     else:
                         await uow.session.save_skill_graph_state(
-                            self._session_id, new_state
+                            self._session_id, new_state,
                         )
 
         return _drive()
 
-    async def _promote_to_skill_graph(self, wait_event: WaitEvent) -> None:
-        """将 WaitEvent 触发时的旧 SkillCreationState 提升为子图状态。"""
-        try:
-            async with self._uow_factory() as uow:
-                old_state = await uow.session.get_skill_creation_state(
-                    self._session_id
-                )
-            if old_state is None:
-                return
-
-            from app.domain.models.skill_graph_state import SkillGraphState
-
-            status_map = {
-                "generate": "wait_generate",
-                "install": "wait_install",
-            }
-            mapped_status = status_map.get(old_state.pending_action or "", None)
-            if mapped_status is None:
-                return
-
-            graph_state = SkillGraphState(
-                status=mapped_status,
-                pending_action=old_state.pending_action,
-                approval_status=old_state.approval_status,
-                original_request="",
-                blueprint=old_state.blueprint,
-                blueprint_json=old_state.blueprint_json,
-                skill_data=old_state.skill_data,
-                last_tool_call_id=old_state.last_tool_call_id,
-                saved_tool_result_json=old_state.saved_tool_result_json,
-            )
-
-            async with self._uow_factory() as uow:
-                await uow.session.save_skill_graph_state(
-                    self._session_id, graph_state
-                )
-            logger.info(
-                "WaitEvent 触发子图状态提升: session=%s status=%s",
-                self._session_id,
-                mapped_status,
-            )
-        except Exception as exc:
-            logger.warning("子图状态提升失败，将回退旧流程: %s", exc)
-
-    def set_skill_context(self, skill_context: str) -> None:
-        """设置当前轮次激活 Skill 的系统上下文提示。"""
-        self.planner.set_runtime_system_context(skill_context)
-        self.react.set_runtime_system_context(skill_context)
-
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
-        """传递消息，运行流，在六中调用planner&react智能体组合完成任务并返回对应事件"""
-        # 1.调用会话仓库查询会话是否存在
-        # session = await self._session_repository.get_by_id(self._session_id)
-        async with self._uow:
-            session = await self._uow.session.get_by_id(self._session_id)
-            summaries = []
-            if self._memory_config.summary_enabled:
-                summaries = await self._uow.session.get_summary(self._session_id)
-        if not session:
-            raise ValueError(f"会话[{self._session_id}]不存在, 请核实后尝试")
-
-        if self._memory_config.summary_enabled:
-            self.planner.set_conversation_summaries(summaries)
-            self.react.set_conversation_summaries(summaries)
-
-        current_plan = session.get_latest_plan()
-
-        # 2.判断会话的状态是不是空闲
-        #   如果不是则有可能有两种状态
-        #    - 任务未结束，还在运行，但是用户又传递一条消息
-        #    - Agent在等待人类输入，这时候人类输入了
-        #   这时候均需要处理历史消息列表，避免AI(工具调用消息)后直接接上人类消息
-        if session.status != SessionStatus.PENDING:
-            logger.debug(
-                f"会话[{self._session_id}]未处于空闲状态，回滚数据确保消息列表格式正确"
-            )
-            # react 必须先于 planner 执行 roll_back：
-            # 两者共享同一份 DB 持久化的 SkillCreationState，
-            # 若 planner 先运行会把 state 清除，react 便无法读取到
-            # 已确认的 pending_action，导致工具门控失效。
-            await self.react.roll_back(message)
-            await self.planner.roll_back(message)
-
-            if self._memory_config.context_anchor_enabled:
-                completed_steps: list[str] = []
-                original_request = ""
-                if current_plan:
-                    completed_steps = [
-                        step.description for step in current_plan.steps if step.done
-                    ]
-                    original_request = current_plan.goal
-
-                status_str = session.status.value
-                self.planner.inject_context_anchor(
-                    session_status=status_str,
-                    user_message=message.message,
-                    original_request=original_request,
-                    completed_steps=completed_steps,
-                )
-                self.react.inject_context_anchor(
-                    session_status=status_str,
-                    user_message=message.message,
-                    original_request=original_request,
-                    completed_steps=completed_steps,
-                )
-
-        # 2.5 尝试通过子图驱动 Skill 创建流程
+        """Run the flow — delegates to LangGraph main_graph."""
+        # Try skill creation subgraph first
         subgraph_gen = await self._try_drive_skill_graph(message)
         if subgraph_gen is not None:
-            logger.info(
-                f"会话[{self._session_id}]由 Skill 创建子图驱动"
-            )
             async for event in subgraph_gen:
                 yield event
             return
 
-        self._hydrate_skill_resume_token_from_structured_confirmation(message)
+        # Build input state for main_graph
+        input_state = {
+            "message": message.message,
+            "language": getattr(message, "language", "en"),
+            "attachments": getattr(message, "attachments", []),
+            "plan": self.plan,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": self.status.value if hasattr(self.status, "value") else "idle",
+            "session_id": self._session_id,
+            "should_interrupt": False,
+            "original_request": "",
+            "skill_context": self._skill_context,
+        }
 
-        # 3.如果会话状态等于运行中，则流需要重新规划内容/plan
-        if session.status == SessionStatus.RUNNING:
-            # AgentTaskRunner 会在 flow 之前把 WAITING 改为 RUNNING，
-            # 因此需要通过 react 的 approved_actions 判断是否正处于
-            # Skill 创建确认恢复阶段；若是则跳转 EXECUTING，避免
-            # planner 为 "可以" 等确认短语重新生成无意义的计划。
-            if getattr(self.react, "_skill_creation_approved_actions", None):
-                logger.debug(
-                    f"会话[{self._session_id}]处于Skill创建确认恢复阶段，直接进入执行"
-                )
-                self.status = FlowStatus.EXECUTING
-            else:
-                logger.debug(f"会话[{self._session_id}]处于运行状态并传递了新消息")
-                self.status = FlowStatus.PLANNING
+        bridge = GraphEventBridge()
+        async for event in bridge.run(self._main_graph, input_state):
+            yield event
 
-        # 4.如果会话状态等于等待人类输入，则需要修改流的状态为执行中
-        if session.status == SessionStatus.WAITING:
-            logger.debug(f"会话[{self._session_id}]处于等待状态并传递了新消息")
-            self.status = FlowStatus.EXECUTING
-
-        # 5.更新会话状态为运行中
-        async with self._uow:
-            await self._uow.session.update_status(
-                self._session_id, SessionStatus.RUNNING
-            )
-
-        # 6.获取当前会话中最新事件
-        self.plan = current_plan
-        logger.info(f"Planner&ReAct流接收消息: {message.message[:50]}...")
-
-        # 7.定义当前正在执行的子步骤
-        step = None
-
-        # 8.创建死循环执行任务，根据流的不同状态执行不同的操作
-        while True:
-            # 9.如果流的状态为空闲，则只需要将状态修改为规划中
-            if self.status == FlowStatus.IDLE:
-                logger.info(
-                    f"Planner&ReAct流状态从{FlowStatus.IDLE}变成{FlowStatus.PLANNING}"
-                )
-                self.status = FlowStatus.PLANNING
-            elif self.status == FlowStatus.PLANNING:
-                # 10.流状态为规划中，则调用规划Agent
-                logger.info(f"Planner&ReAct流开始创建计划/Plan")
-                async for event in self.planner.create_plan(message):
-                    # 11.判断规划Agent是否返回规划事件
-                    if (
-                        isinstance(event, PlanEvent)
-                        and event.status == PlanEventStatus.CREATED
-                    ):
-                        # 12.创建计划成功时需要更新计划
-                        self.plan = event.plan
-                        logger.info(
-                            f"Planner&ReAct流成功创建计划, 共计: {len(event.plan.steps)} 步"
-                        )
-
-                        # 13.在计划中同步生成了会话标题+初始AI消息
-                        yield TitleEvent(title=event.plan.title)
-                        yield MessageEvent(role="assistant", message=event.plan.message)
-
-                    # 14.将生成的事件直接输出(一般来说是PlanEvent)
-                    yield event
-
-                # 15.计划创建完成，更新流状态为执行中
-                logger.info(
-                    f"Planner&ReAct流状态从{FlowStatus.PLANNING}变成{FlowStatus.EXECUTING}"
-                )
-                self.status = FlowStatus.EXECUTING
-
-                # 16.判断计划是否生成，步骤是否正常
-                if not self.plan or len(self.plan.steps) == 0:
-                    logger.info(f"Planner&ReAct流创建计划失败或无子步骤")
-                    self.status = FlowStatus.COMPLETED
-            elif self.status == FlowStatus.EXECUTING:
-                # 17.流的状态为执行中，先将计划状态调整为运行中，同时调用执行Agent完成每个子步骤
-                self.plan.status = ExecutionStatus.RUNNING
-
-                # 18.获取当前计划的下一个需要执行的子步骤
-                step = self.plan.get_next_step()
-
-                # 19.如果不存在下一个需要执行的子步骤，则更新流状态并执行后续步骤
-                if not step:
-                    logger.info(
-                        f"Planner&ReAct流状态从{FlowStatus.EXECUTING}变成{FlowStatus.SUMMARIZING}"
-                    )
-                    self.status = FlowStatus.SUMMARIZING
-                    continue
-
-                # 20.调用执行Agent执行对应的步骤
-                logger.info(
-                    f"Planner&ReAct流开始执行步骤 {step.id}: {step.description[:50]}..."
-                )
-                async for event in self.react.execute_step(self.plan, step, message):
-                    yield event
-                    if isinstance(event, WaitEvent):
-                        # 子图灰度命中时，将旧状态迁移为子图状态以便下轮走子图路径
-                        if self._is_skill_graph_active():
-                            await self._promote_to_skill_graph(event)
-                        logger.info("Planner&ReAct流检测到WaitEvent，暂停当前轮执行")
-                        return
-                    if (
-                        isinstance(event, ControlEvent)
-                        and event.action == ControlAction.REQUESTED
-                    ):
-                        logger.info(
-                            "Planner&ReAct流检测到ControlEvent(requested)，暂停当前轮执行"
-                        )
-                        return
-
-                # 21.压缩执行Agent记忆，避免上下文腐化+消耗大量token
-                logger.info(f"压缩{self.react.name} Agent记忆/上下文")
-                await self.react.compact_memory(
-                    keep_summary=self._memory_config.compact_keep_summary
-                )
-
-                # 22.将状态更新为updating
-                self.status = FlowStatus.UPDATING
-            elif self.status == FlowStatus.UPDATING:
-                # 23.流状态为更新表示需要更新计划
-                logger.info(f"Planner&ReAct流开始更新计划")
-                execution_summary = self._extract_react_execution_summary()
-                async for event in self.planner.update_plan(
-                    self.plan, step, execution_summary=execution_summary
-                ):
-                    yield event
-
-                # 24.计划更新完成，需要执行相应的子步骤
-                logger.info(
-                    f"Planner&ReAct流状态从{FlowStatus.UPDATING}变成{FlowStatus.EXECUTING}"
-                )
-                self.status = FlowStatus.EXECUTING
-            elif self.status == FlowStatus.SUMMARIZING:
-                # 25.流状态为总结中，则意味着所有子步骤都执行完成
-                logger.info(f"Planner&ReAct流开始总结")
-                async for event in self.react.summarize():
-                    yield event
-
-                # 26.总结完毕，意味着流即将结束
-                logger.info(
-                    f"Planner&ReAct流状态从{FlowStatus.SUMMARIZING}变成{FlowStatus.COMPLETED}"
-                )
-                self.status = FlowStatus.COMPLETED
-            elif self.status == FlowStatus.COMPLETED:
-                # 27.计划状态已完成则更新plan状态，并发送计划事件通知API已完成
-                self.plan.status = ExecutionStatus.COMPLETED
-                self.status = FlowStatus.IDLE
-
-                uow = self._uow_factory()
-                async with uow:
-                    existing_summaries = await uow.session.get_summary(self._session_id)
-                round_number = len(existing_summaries) + 1
-                await self._generate_summary(self.plan, round_number)
-
-                yield PlanEvent(status=PlanEventStatus.COMPLETED, plan=self.plan)
-                break
-        # 28.任务已经结束则返回结束事件
-        yield DoneEvent()
-        logger.info(f"Planner&ReAct流处理任务消息已完毕")
+        # Update internal state from graph result
+        final = bridge.final_state
+        self.plan = final.get("plan")
+        flow_status = final.get("flow_status", "idle")
+        self.status = FlowStatus.IDLE if flow_status == "completed" else FlowStatus.IDLE
 
     @property
     def done(self) -> bool:
-        """只读属性，返回流是否运行结束"""
         return self.status == FlowStatus.IDLE
