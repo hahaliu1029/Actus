@@ -1,0 +1,217 @@
+"""react_graph — inner ReAct loop as a LangGraph StateGraph.
+
+Replaces BaseAgent.invoke() and ReActAgent.execute_step().
+Nodes: llm_node, tool_node
+Edges: START → llm_node → route_after_llm → (tool_node → llm_node) | END
+
+Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.3-4.4
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from langchain_core.messages import AIMessage
+from langgraph.graph import END, START, StateGraph
+
+from app.domain.models.event import (
+    ToolEvent,
+    ToolEventStatus,
+)
+from app.domain.models.tool_result import ToolResult
+
+from .state import ReactGraphState
+
+logger = logging.getLogger(__name__)
+
+# Max ReAct iterations to prevent infinite loops
+MAX_ITERATIONS = 30
+
+
+def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
+    """Build and compile the inner ReAct loop graph.
+
+    Parameters
+    ----------
+    llm : LangChain BaseChatModel (or LLMAdapter) — must support bind_tools.
+    tools : List of LangChain tools.
+    agent_config : Optional AgentConfig for iteration limits etc.
+    """
+    # Build tool lookup
+    tool_map: dict[str, Any] = {t.name: t for t in tools}
+
+    # Bind tools to LLM
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    iteration_count: dict[str, int] = {"count": 0}  # mutable counter in closure
+
+    # ---- Nodes --------------------------------------------------------- #
+
+    async def llm_node(state: ReactGraphState) -> dict:
+        """Call the LLM with current messages."""
+        messages = state["messages"]
+        response: AIMessage = await llm_with_tools.ainvoke(messages)
+
+        new_events = []
+
+        # Convert response to dict message for storage
+        msg_dict: dict[str, Any] = {
+            "role": "assistant",
+            "content": response.content or "",
+        }
+        if response.tool_calls:
+            msg_dict["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["args"])
+                        if isinstance(tc["args"], dict)
+                        else tc["args"],
+                    },
+                }
+                for tc in response.tool_calls
+            ]
+            # Emit ToolEvent(CALLING) for each tool call
+            for tc in response.tool_calls:
+                new_events.append(
+                    ToolEvent(
+                        tool_call_id=tc["id"],
+                        tool_name=tc["name"],
+                        function_name=tc["name"],
+                        function_args=tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"]),
+                        status=ToolEventStatus.CALLING,
+                    )
+                )
+
+        iteration_count["count"] += 1
+
+        return {
+            "messages": state["messages"] + [msg_dict],
+            "events": new_events,
+        }
+
+    async def tool_node(state: ReactGraphState) -> dict:
+        """Execute tool calls from the last assistant message."""
+        messages = state["messages"]
+        last_msg = messages[-1]
+        tool_calls = last_msg.get("tool_calls", [])
+
+        new_messages = []
+        new_events = []
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            tool_name = fn.get("name", "")
+            args_raw = fn.get("arguments", "{}")
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            call_id = tc.get("id", "")
+
+            tool_fn = tool_map.get(tool_name)
+            if tool_fn is None:
+                result_str = f"Error: Unknown tool '{tool_name}'"
+            else:
+                try:
+                    result_str = await tool_fn.ainvoke(args)
+                    if not isinstance(result_str, str):
+                        result_str = str(result_str)
+                except Exception as exc:
+                    result_str = f"Error executing {tool_name}: {exc}"
+
+            new_messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result_str,
+                "function_name": tool_name,
+            })
+
+            # Emit ToolEvent(CALLED)
+            new_events.append(
+                ToolEvent(
+                    tool_call_id=call_id,
+                    tool_name=tool_name,
+                    function_name=tool_name,
+                    function_args=args,
+                    function_result=ToolResult(success=True, message=result_str),
+                    status=ToolEventStatus.CALLED,
+                )
+            )
+
+        return {
+            "messages": state["messages"] + new_messages,
+            "events": new_events,
+            "attempt_count": state["attempt_count"] + 1,
+        }
+
+    async def confirmation_check(state: ReactGraphState) -> dict:
+        """Check if any tool call requires user confirmation or is a takeover request."""
+        messages = state["messages"]
+        last_msg = messages[-1]
+        tool_calls = last_msg.get("tool_calls", [])
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            tool_name = fn.get("name", "")
+            args_raw = fn.get("arguments", "{}")
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+
+            # Check message_ask_user with suggest_user_takeover
+            if tool_name == "message_ask_user":
+                suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
+                if suggest in {"browser", "shell"}:
+                    return {"should_interrupt": True}
+
+        return {}
+
+    # ---- Routing ------------------------------------------------------- #
+
+    def route_after_llm(state: ReactGraphState) -> str:
+        """Route after LLM call: tool calls → confirmation_check, else END."""
+        if state.get("should_interrupt"):
+            return END
+
+        messages = state["messages"]
+        if not messages:
+            return END
+
+        last_msg = messages[-1]
+        if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+            return "confirmation_check"
+
+        # Max iteration guard
+        if iteration_count["count"] >= MAX_ITERATIONS:
+            return END
+
+        return END
+
+    def route_after_confirmation(state: ReactGraphState) -> str:
+        """Route after confirmation check."""
+        if state.get("should_interrupt"):
+            return END
+        return "tool_node"
+
+    def route_after_tool(state: ReactGraphState) -> str:
+        """Route after tool execution: back to LLM."""
+        if state.get("should_interrupt"):
+            return END
+        if iteration_count["count"] >= MAX_ITERATIONS:
+            return END
+        return "llm_node"
+
+    # ---- Build Graph --------------------------------------------------- #
+
+    g: StateGraph = StateGraph(ReactGraphState)
+
+    g.add_node("llm_node", llm_node)
+    g.add_node("tool_node", tool_node)
+    g.add_node("confirmation_check", confirmation_check)
+
+    g.add_edge(START, "llm_node")
+    g.add_conditional_edges("llm_node", route_after_llm)
+    g.add_conditional_edges("confirmation_check", route_after_confirmation)
+    g.add_conditional_edges("tool_node", route_after_tool)
+
+    return g.compile()
