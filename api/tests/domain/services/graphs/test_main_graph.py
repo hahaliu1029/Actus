@@ -202,6 +202,61 @@ class TestMainGraphFlow:
         assert "历史对话摘要" in captured_system_content[0]
         assert "查天气" in captured_system_content[0]
 
+    async def test_step_success_false_when_llm_reports_failure(self, mock_json_parser):
+        """When react LLM returns success=false, the step should be marked as failed."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        class FailingReactGraph:
+            async def astream(self, input_state, config=None):
+                yield {"llm_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        {"role": "assistant", "content": '{"success": false, "result": "CAPTCHA blocked", "attachments": []}'}
+                    ],
+                    "should_interrupt": False,
+                }}
+
+        planner_llm = AsyncMock()
+        async def mock_invoke(**kwargs):
+            return {
+                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"search news"}],"message":"ok"}',
+                "role": "assistant",
+            }
+        planner_llm.invoke = mock_invoke
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=FailingReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-fail",
+        )
+
+        result = await graph.ainvoke({
+            "message": "search AI news",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-fail",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        plan = result.get("plan")
+        assert plan is not None
+        completed_steps = [s for s in plan.steps if s.status == ExecutionStatus.COMPLETED]
+        assert len(completed_steps) >= 1
+        assert completed_steps[0].success is False
+
 
 class TestExecutorMessageBranching:
     """Test the three-way branching in executor_node for message handling."""

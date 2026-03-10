@@ -10,6 +10,7 @@ Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.1-4
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Callable
 
@@ -215,9 +216,22 @@ def build_main_graph(
                 for evt in node_output.get("events") or []:
                     await _emit(evt)
 
-        # Update step status
+        # Extract execution summary and detect step success from LLM response JSON
+        react_messages = react_final.get("messages", [])
+        step_success = True
+        summary = ""
+        for msg in reversed(react_messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                summary = msg["content"][:500]
+                try:
+                    result_json = json.loads(msg["content"])
+                    step_success = result_json.get("success", True)
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Non-JSON response treated as success
+                break
+
         step.status = ExecutionStatus.COMPLETED
-        step.success = True
+        step.success = step_success
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
         # Check for interrupt
@@ -228,14 +242,6 @@ def build_main_graph(
                 "should_interrupt": True,
                 "events": [],  # already emitted via queue
             }
-
-        # Extract execution summary from last assistant message
-        react_messages = react_final.get("messages", [])
-        summary = ""
-        for msg in reversed(react_messages):
-            if msg.get("role") == "assistant" and msg.get("content"):
-                summary = msg["content"][:500]
-                break
 
         return {
             "messages": react_final.get("messages", state["messages"]),
