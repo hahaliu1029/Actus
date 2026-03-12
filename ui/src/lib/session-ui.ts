@@ -12,7 +12,7 @@ type SessionEventLike = {
 };
 
 export type FilePreviewKind = "text" | "image" | "pdf" | "unsupported";
-export type ToolDisplayKind = "tool" | "progress";
+export type ToolDisplayKind = "tool" | "progress" | "ask";
 export type WorkbenchMode = "shell" | "browser";
 export type TimelineCursorState =
   | "live_following"
@@ -486,10 +486,25 @@ function pickToolDetail(
 
   // MCP工具：显示完整的工具函数名和参数摘要
   if (toolName === "mcp" || toolName === "a2a" || toolName === "skill") {
-    return functionName || genericText || "正在处理中";
+    if (functionName) return functionName;
+    if (genericText) return genericText;
+    // 尝试从 args 中提取摘要
+    const argKeys = Object.keys(args);
+    if (argKeys.length > 0) {
+      const summary = argKeys
+        .slice(0, 3)
+        .map((k) => {
+          const v = args[k];
+          const s = typeof v === "string" ? v : JSON.stringify(v);
+          return `${k}: ${s && s.length > 40 ? s.slice(0, 40) + "…" : s}`;
+        })
+        .join("，");
+      return summary;
+    }
+    return "";
   }
 
-  return genericText || "正在处理中";
+  return genericText || "";
 }
 
 function getToolActionTitle(
@@ -577,8 +592,8 @@ export function getToolDisplayCopy(eventData: Record<string, unknown>): ToolDisp
   if (toolName === "message" && functionName === "message_ask_user") {
     const text = asString(args.text);
     return {
-      kind: "progress",
-      title: "需要你确认",
+      kind: "ask",
+      title: "需要你的回复",
       detail: text || "请补充下一步操作信息",
     };
   }

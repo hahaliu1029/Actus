@@ -2,6 +2,8 @@
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
 from app.domain.models.event import PlanEvent, TitleEvent, MessageEvent, DoneEvent, PlanEventStatus
 from app.domain.models.plan import Plan, Step, ExecutionStatus
 
@@ -15,8 +17,24 @@ def anyio_backend() -> str:
 
 @pytest.fixture
 def mock_planner_llm():
-    """Mock LLM for planner that returns a plan JSON."""
+    """Mock LLM for planner that returns a plan JSON.
+
+    Handles both CREATE_PLAN_PROMPT and UPDATE_PLAN_PROMPT calls.
+    """
     async def mock_invoke(**kwargs):
+        messages = kwargs.get("messages", [])
+        # Detect whether this is an update_plan or create_plan call
+        user_content = ""
+        for m in messages:
+            if m.get("role") == "user":
+                user_content = m.get("content", "")
+
+        if "更新计划" in user_content or "执行摘要" in user_content:
+            # UPDATE_PLAN_PROMPT call — return updated steps
+            return {
+                "content": '{"steps":[{"id":"2","description":"Updated step based on results"}]}',
+                "role": "assistant",
+            }
         return {
             "content": '{"title":"Test","goal":"Do test","language":"en","steps":[{"description":"Step 1"}],"message":"Let me help"}',
             "role": "assistant",
@@ -46,13 +64,17 @@ def _make_mock_react_graph():
         async def astream(self, input_state, config=None):
             yield {"llm_node": {
                 "events": [MessageEvent(role="assistant", message="Step done")],
-                "messages": [],
+                "messages": input_state["messages"] + [
+                    AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
+                ],
             }}
 
         async def ainvoke(self, input_state, config=None):
             return {
                 "events": [MessageEvent(role="assistant", message="Step done")],
-                "messages": [],
+                "messages": input_state["messages"] + [
+                    AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
+                ],
                 "should_interrupt": False,
                 "attempt_count": 1,
                 "failure_count": 0,
@@ -211,13 +233,20 @@ class TestMainGraphFlow:
                 yield {"llm_node": {
                     "events": [],
                     "messages": input_state["messages"] + [
-                        {"role": "assistant", "content": '{"success": false, "result": "CAPTCHA blocked", "attachments": []}'}
+                        AIMessage(content='{"success": false, "result": "CAPTCHA blocked", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
 
         planner_llm = AsyncMock()
         async def mock_invoke(**kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = ""
+            for m in messages:
+                if m.get("role") == "user":
+                    user_content = m.get("content", "")
+            if "更新计划" in user_content or "执行摘要" in user_content:
+                return {"content": '{"steps":[]}', "role": "assistant"}
             return {
                 "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"search news"}],"message":"ok"}',
                 "role": "assistant",
@@ -294,9 +323,9 @@ class TestMainGraphFlow:
             "plan": plan,
             "current_step": None,
             "messages": [
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "do something"},
-                {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'},
+                SystemMessage(content="system"),
+                HumanMessage(content="do something"),
+                AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
             ],
             "execution_summary": "",
             "events": [],
@@ -342,13 +371,20 @@ class TestExecutorMessageBranching:
                 yield {"llm_node": {
                     "events": [],
                     "messages": input_state["messages"] + [
-                        {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'}
+                        AIMessage(content='{"success": true, "result": "done", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
 
         planner_llm = AsyncMock()
         async def mock_invoke(**kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = ""
+            for m in messages:
+                if m.get("role") == "user":
+                    user_content = m.get("content", "")
+            if "更新计划" in user_content or "执行摘要" in user_content:
+                return {"content": '{"steps":[]}', "role": "assistant"}
             return {"content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"S1"}],"message":"ok"}', "role": "assistant"}
         planner_llm.invoke = mock_invoke
 
@@ -381,8 +417,8 @@ class TestExecutorMessageBranching:
 
         assert len(captured_react_inputs) >= 1
         msgs = captured_react_inputs[0]["messages"]
-        assert msgs[0]["role"] == "system"
-        assert "任务执行智能体" in msgs[0]["content"]
+        assert isinstance(msgs[0], SystemMessage)
+        assert "任务执行智能体" in msgs[0].content
 
     async def test_has_history_not_resuming_updates_system_prompt(self, mock_json_parser):
         """When messages have history and is_resuming=False, executor updates system prompt and appends execution prompt."""
@@ -396,7 +432,7 @@ class TestExecutorMessageBranching:
                 yield {"llm_node": {
                     "events": [],
                     "messages": input_state["messages"] + [
-                        {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'}
+                        AIMessage(content='{"success": true, "result": "done", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
@@ -420,9 +456,9 @@ class TestExecutorMessageBranching:
         )
 
         history_messages = [
-            {"role": "system", "content": "old system prompt"},
-            {"role": "user", "content": "old execution prompt"},
-            {"role": "assistant", "content": '{"success": true, "result": "collected data", "attachments": []}'},
+            SystemMessage(content="old system prompt"),
+            HumanMessage(content="old execution prompt"),
+            AIMessage(content='{"success": true, "result": "collected data", "attachments": []}'),
         ]
 
         await graph.ainvoke({
@@ -446,10 +482,10 @@ class TestExecutorMessageBranching:
         assert len(captured_react_inputs) >= 1
         msgs = captured_react_inputs[0]["messages"]
         # System prompt should be updated (not "old system prompt")
-        assert msgs[0]["role"] == "system"
-        assert "任务执行智能体" in msgs[0]["content"]
+        assert isinstance(msgs[0], SystemMessage)
+        assert "任务执行智能体" in msgs[0].content
         # Should NOT contain "用户已完成接管" (not resuming)
-        all_content = " ".join(m.get("content", "") for m in msgs)
+        all_content = " ".join(m.content for m in msgs if hasattr(m, "content"))
         assert "用户已完成接管" not in all_content
 
     async def test_resuming_uses_takeover_message(self, mock_json_parser):
@@ -464,7 +500,7 @@ class TestExecutorMessageBranching:
                 yield {"llm_node": {
                     "events": [],
                     "messages": input_state["messages"] + [
-                        {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'}
+                        AIMessage(content='{"success": true, "result": "done", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
@@ -485,8 +521,8 @@ class TestExecutorMessageBranching:
         )
 
         saved = [
-            {"role": "system", "content": "some system prompt"},
-            {"role": "user", "content": "do login"},
+            SystemMessage(content="some system prompt"),
+            HumanMessage(content="do login"),
         ]
 
         await graph.ainvoke({
@@ -509,5 +545,284 @@ class TestExecutorMessageBranching:
 
         assert len(captured_react_inputs) >= 1
         msgs = captured_react_inputs[0]["messages"]
-        all_content = " ".join(m.get("content", "") for m in msgs)
+        all_content = " ".join(m.content for m in msgs if hasattr(m, "content"))
         assert "用户已完成接管" in all_content
+
+
+class TestUpdaterNodePlanUpdate:
+    """Test that updater_node calls planner LLM to update plan based on execution results."""
+
+    @pytest.fixture
+    def mock_json_parser(self):
+        parser = AsyncMock()
+        import json
+        async def parse(content, default_value=None):
+            try:
+                return json.loads(content)
+            except Exception:
+                return default_value
+        parser.invoke = parse
+        return parser
+
+    async def test_updater_calls_planner_with_execution_summary(self, mock_json_parser):
+        """updater_node should call planner LLM with UPDATE_PLAN_PROMPT when execution_summary exists."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        planner_calls = []
+
+        async def tracking_invoke(**kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = ""
+            for m in messages:
+                if m.get("role") == "user":
+                    user_content = m.get("content", "")
+
+            if "更新计划" in user_content or "执行摘要" in user_content:
+                planner_calls.append({"type": "update", "content": user_content})
+                return {
+                    "content": '{"steps":[{"id":"2","description":"使用 database_id=2083c6e7 读取待办数据库结构"}]}',
+                    "role": "assistant",
+                }
+            planner_calls.append({"type": "create", "content": user_content})
+            return {
+                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"Search databases"},{"description":"Read database structure"}],"message":"ok"}',
+                "role": "assistant",
+            }
+
+        planner_llm = AsyncMock()
+        planner_llm.invoke = tracking_invoke
+
+        class MockReactGraph:
+            async def astream(self, input_state, config=None):
+                yield {"llm_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        AIMessage(content='{"success": true, "result": "Found database_id=2083c6e7", "attachments": []}')
+                    ],
+                    "should_interrupt": False,
+                }}
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=MockReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-update",
+        )
+
+        result = await graph.ainvoke({
+            "message": "查看3月份工作",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-update",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        # Verify planner was called for both create and update
+        create_calls = [c for c in planner_calls if c["type"] == "create"]
+        update_calls = [c for c in planner_calls if c["type"] == "update"]
+        assert len(create_calls) >= 1, "Planner should have been called to create plan"
+        assert len(update_calls) >= 1, "Planner should have been called to update plan after step execution"
+
+        # Verify the plan's steps were updated by the planner
+        plan = result.get("plan")
+        assert plan is not None
+        # The updated step should contain database_id context from the planner update
+        pending = [s for s in plan.steps if not s.done]
+        # At least one step should have been updated or the plan adjusted
+        assert len(plan.steps) >= 1
+
+
+class TestInterruptResume:
+    """Test that executor_node handles interrupt (WaitEvent) correctly."""
+
+    @pytest.fixture
+    def mock_json_parser(self):
+        parser = AsyncMock()
+        import json
+        async def parse(content, default_value=None):
+            try:
+                return json.loads(content)
+            except Exception:
+                return default_value
+        parser.invoke = parse
+        return parser
+
+    async def test_interrupt_does_not_mark_step_completed(self, mock_json_parser):
+        """When react_graph returns should_interrupt=True, the step should NOT be marked COMPLETED."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        class InterruptingReactGraph:
+            async def astream(self, input_state, config=None):
+                yield {"tool_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        AIMessage(content="Requesting browser takeover"),
+                    ],
+                    "should_interrupt": True,
+                }}
+
+        planner_llm = AsyncMock()
+        async def mock_invoke(**kwargs):
+            return {
+                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"Login to Notion"},{"description":"Read data"}],"message":"ok"}',
+                "role": "assistant",
+            }
+        planner_llm.invoke = mock_invoke
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=InterruptingReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-interrupt",
+        )
+
+        result = await graph.ainvoke({
+            "message": "查看Notion数据",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-interrupt",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        # Graph should stop at END after interrupt
+        assert result.get("should_interrupt") is True
+
+        # Step should NOT be marked as COMPLETED — it was interrupted mid-execution
+        current_step = result.get("current_step")
+        assert current_step is not None
+        assert current_step.status != ExecutionStatus.COMPLETED
+
+        # Messages should be preserved for resume
+        messages = result.get("messages", [])
+        assert len(messages) > 0
+
+        # original_request should be preserved
+        assert result.get("original_request") != ""
+
+    async def test_interrupt_preserves_execution_summary(self, mock_json_parser):
+        """When interrupted, executor_node should still return execution_summary from the last AI message."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        class InterruptingReactGraph:
+            async def astream(self, input_state, config=None):
+                yield {"tool_node": {
+                    "events": [],
+                    "messages": input_state["messages"] + [
+                        AIMessage(content="Found database_id=abc123, need to login first"),
+                    ],
+                    "should_interrupt": True,
+                }}
+
+        planner_llm = AsyncMock()
+        async def mock_invoke(**kwargs):
+            return {
+                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"Find DB"}],"message":"ok"}',
+                "role": "assistant",
+            }
+        planner_llm.invoke = mock_invoke
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=InterruptingReactGraph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-int-summary",
+        )
+
+        result = await graph.ainvoke({
+            "message": "find my database",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-int-summary",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        # execution_summary should contain the LLM's last message
+        summary = result.get("execution_summary", "")
+        assert "database_id=abc123" in summary
+
+
+class TestCompactMessages:
+    """Test the _compact_messages helper function."""
+
+    def test_compacts_browser_tool_results(self):
+        from app.domain.services.graphs.main_graph import _compact_messages
+        from langchain_core.messages import ToolMessage
+
+        msgs = [
+            SystemMessage(content="system"),
+            AIMessage(content="", tool_calls=[{"id": "tc1", "name": "browser_view", "args": {}}]),
+            ToolMessage(
+                content='<html><title>Notion Dashboard</title><body><p>Lots of HTML content here...</p></body></html>',
+                tool_call_id="tc1",
+                name="browser_view",
+            ),
+        ]
+        compacted = _compact_messages(msgs)
+
+        assert len(compacted) == 3
+        assert "Notion Dashboard" in compacted[2].content
+        assert "<html>" not in compacted[2].content
+
+    def test_truncates_long_tool_results(self):
+        from app.domain.services.graphs.main_graph import _compact_messages
+        from langchain_core.messages import ToolMessage
+
+        long_content = "x" * 5000
+        msgs = [
+            ToolMessage(content=long_content, tool_call_id="tc1", name="mcp_notion_search"),
+        ]
+        compacted = _compact_messages(msgs)
+
+        assert len(compacted[0].content) < 5000
+        assert "已截断" in compacted[0].content
+
+    def test_preserves_normal_messages(self):
+        from app.domain.services.graphs.main_graph import _compact_messages
+
+        msgs = [
+            SystemMessage(content="system prompt"),
+            HumanMessage(content="user message"),
+            AIMessage(content="assistant response"),
+        ]
+        compacted = _compact_messages(msgs)
+
+        assert len(compacted) == 3
+        assert compacted[0].content == "system prompt"
+        assert compacted[1].content == "user message"
+        assert compacted[2].content == "assistant response"

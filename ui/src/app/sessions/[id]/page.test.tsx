@@ -172,7 +172,7 @@ describe("SessionPage", () => {
     });
   });
 
-  it("tool progress 事件应使用 MarkdownRenderer 渲染 detail", () => {
+  it("message_ask_user 应渲染为提问样式并显示标题", () => {
     const askText = [
       "请你只回答下面这 6 行：",
       "",

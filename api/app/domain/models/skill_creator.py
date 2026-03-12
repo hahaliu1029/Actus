@@ -128,23 +128,38 @@ class SkillBlueprint(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _flatten_search_keywords(cls, data: Any) -> Any:
-        """兼容 LLM 返回嵌套数组格式的 search_keywords。"""
+    def _normalize_llm_output(cls, data: Any) -> Any:
+        """容错处理 LLM 常见的 JSON 结构偏差。"""
         if not isinstance(data, dict):
             return data
+
+        # 1. 解包嵌套：{"skill": {...}}, {"blueprint": {...}}, {"result": {...}}
+        unwrap_keys = ("skill", "blueprint", "result", "data")
+        for key in unwrap_keys:
+            if key in data and isinstance(data[key], dict) and "skill_name" not in data:
+                inner = data[key]
+                if "skill_name" in inner or "name" in inner:
+                    data = inner
+                    break
+
+        data = dict(data)
+
+        # 2. 字段名映射：name → skill_name
+        if "skill_name" not in data and "name" in data:
+            data["skill_name"] = data.pop("name")
+
+        # 3. 兼容 LLM 返回嵌套数组格式的 search_keywords
         raw_keywords = data.get("search_keywords")
-        if not isinstance(raw_keywords, list):
-            return data
-        flattened: list[str] = []
-        for item in raw_keywords:
-            if isinstance(item, list):
-                flattened.extend(str(kw) for kw in item if kw)
-            elif isinstance(item, str):
-                flattened.append(item)
-        if flattened != raw_keywords:
-            normalized = dict(data)
-            normalized["search_keywords"] = flattened
-            return normalized
+        if isinstance(raw_keywords, list):
+            flattened: list[str] = []
+            for item in raw_keywords:
+                if isinstance(item, list):
+                    flattened.extend(str(kw) for kw in item if kw)
+                elif isinstance(item, str):
+                    flattened.append(item)
+            if flattened != raw_keywords:
+                data["search_keywords"] = flattened
+
         return data
 
     @computed_field

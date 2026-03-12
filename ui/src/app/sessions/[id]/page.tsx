@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   CircleDashed,
   Loader2,
+  MessageCircleQuestion,
   PanelRightClose,
   PanelRightOpen,
   XCircle,
@@ -241,6 +242,23 @@ function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent 
   return { screenshots, searchResults, filepath, mcpResult };
 }
 
+/** 可展开/折叠的工具详情文本 */
+function ExpandableToolDetail({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <p
+      className={cn(
+        "mt-1 text-xs text-muted-foreground cursor-pointer hover:text-foreground/70 transition-colors",
+        expanded ? "whitespace-pre-wrap break-words" : "truncate"
+      )}
+      onClick={() => setExpanded(!expanded)}
+      title={expanded ? undefined : text}
+    >
+      {text}
+    </p>
+  );
+}
+
 /** 流式纯文本渲染时，清理 XML 标签为可读文本 */
 function stripXmlTags(text: string): string {
   let result = text;
@@ -343,6 +361,28 @@ function renderEventItem(
 
   if (event.event === "tool") {
     const display = getToolDisplayCopy(event.data);
+    if (display.kind === "ask") {
+      return (
+        <div key={eventKey} className="mt-4">
+          <div className="mb-1 flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground/85">
+              <Bot size={16} />
+              Actus
+            </div>
+            <span className="text-xs text-muted-foreground">{getEventTime(event.data)}</span>
+          </div>
+          <div className="rounded-2xl border-l-[3px] border-l-primary border border-border bg-card px-4 py-3 shadow-[var(--shadow-subtle)]">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-primary">
+              <MessageCircleQuestion size={14} />
+              {display.title}
+            </div>
+            <div className="text-sm text-foreground/85">
+              <MarkdownRenderer content={display.detail || "请补充下一步操作信息"} />
+            </div>
+          </div>
+        </div>
+      );
+    }
     if (display.kind === "progress") {
       return (
         <div key={eventKey} className="mt-4">
@@ -380,7 +420,7 @@ function renderEventItem(
             {statusText}
           </span>
         </div>
-        {display.detail ? <p className="mt-1 truncate text-xs text-muted-foreground">{display.detail}</p> : null}
+        {display.detail ? <ExpandableToolDetail text={display.detail} /> : null}
 
         {visual.screenshots.length > 0 ? (
           <div className="mt-2 flex flex-wrap gap-2">

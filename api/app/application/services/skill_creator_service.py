@@ -28,13 +28,29 @@ logger = logging.getLogger(__name__)
 MAX_FIX_RETRIES = 2
 
 ANALYZE_SYSTEM_PROMPT = """\
-你是 Skill 架构师。请将用户自然语言需求解析为严格 JSON：
-- skill_name
-- description
-- tools（name/description/parameters）
-- search_keywords（2-4 组英文关键词）
-- estimated_deps（Python 依赖名）
-仅返回 JSON，不要返回其他文本。"""
+你是 Skill 架构师。请将用户自然语言需求解析为严格 JSON。
+
+必须严格遵循以下 JSON 结构（注意字段名必须完全一致）：
+{
+  "skill_name": "Skill 名称",
+  "description": "功能描述",
+  "tools": [
+    {
+      "name": "tool_function_name",
+      "description": "工具功能描述",
+      "parameters": [
+        {"name": "param1", "type": "string", "description": "参数说明", "required": true}
+      ]
+    }
+  ],
+  "search_keywords": ["keyword1", "keyword2"],
+  "estimated_deps": ["requests", "beautifulsoup4"]
+}
+
+关键约束：
+- 顶层字段必须是 skill_name（不是 name/skill/title）
+- 直接返回 JSON 对象，不要嵌套在其他键下
+- 仅返回 JSON，不要返回其他文本"""
 
 GENERATE_SYSTEM_PROMPT = """\
 你是 Skill 代码生成器。请根据需求蓝图和 GitHub 调研结果，生成可安装的 Native Skill。
@@ -284,6 +300,7 @@ class SkillCreatorService:
 
     async def _analyze_requirement(self, description: str) -> SkillBlueprint:
         import asyncio
+        from pydantic import ValidationError
         from app.application.errors.exceptions import ServerRequestsError
 
         last_exc: Exception | None = None
@@ -298,7 +315,7 @@ class SkillCreatorService:
                 )
                 payload = self._parse_llm_json(response)
                 return SkillBlueprint.model_validate(payload)
-            except (ServerRequestsError, json.JSONDecodeError) as exc:
+            except (ServerRequestsError, json.JSONDecodeError, ValidationError) as exc:
                 last_exc = exc
                 if attempt < 2:
                     delay = 2 * (2 ** attempt)
@@ -454,8 +471,59 @@ class SkillCreatorService:
         if isinstance(content, dict):
             return content
         text = str(content or "{}").strip()
-        if text.startswith("```"):
-            text = text.removeprefix("```json").removeprefix("```").strip()
-            if text.endswith("```"):
-                text = text[:-3].strip()
-        return json.loads(text or "{}")
+
+        # 剥离 markdown 代码块（支持 ```json 或 ```）
+        if "```" in text:
+            import re
+            m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+            if m:
+                text = m.group(1).strip()
+
+        # 快速尝试：直接解析
+        try:
+            return json.loads(text or "{}")
+        except json.JSONDecodeError:
+            pass
+
+        # 从混合文本中提取第一个完整的 JSON 对象
+        brace_start = text.find("{")
+        if brace_start != -1:
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i in range(brace_start, len(text)):
+                ch = text[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\":
+                    escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[brace_start:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+
+        # 最终降级：使用 json_repair 尝试修复
+        import json_repair
+        logger.warning("LLM 返回内容无法直接解析为 JSON，尝试 json_repair: %s", text[:200])
+        result = json_repair.repair_json(text, ensure_ascii=False, return_objects=True)
+        if isinstance(result, dict):
+            return result
+
+        raise json.JSONDecodeError(
+            f"无法从 LLM 响应中提取有效 JSON（内容前 200 字符: {text[:200]}）",
+            text or "",
+            0,
+        )

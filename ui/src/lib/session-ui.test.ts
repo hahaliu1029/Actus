@@ -147,6 +147,19 @@ describe("session-ui", () => {
       expect(copy.detail).toContain("正在整理");
     });
 
+    it("message_ask_user 渲染为提问样式", () => {
+      const copy = getToolDisplayCopy({
+        name: "message",
+        function: "message_ask_user",
+        args: { text: "你从哪个校区出发？" },
+        status: "called",
+      });
+
+      expect(copy.kind).toBe("ask");
+      expect(copy.title).toBe("需要你的回复");
+      expect(copy.detail).toContain("校区");
+    });
+
     it("search_web 渲染为可读工具文案", () => {
       const copy = getToolDisplayCopy({
         name: "search",

@@ -276,12 +276,20 @@ class PlannerReActFlow(BaseFlow):
                     self._saved_original_request = persisted.original_request
                     self.status = FlowStatus.EXECUTING
                     logger.info(
-                        "从数据库恢复中断状态: session=%s plan=%s",
+                        "从数据库恢复中断状态: session=%s plan=%s step=%s messages=%d",
                         self._session_id,
                         persisted.plan.title,
+                        persisted.current_step.description if persisted.current_step else "<none>",
+                        len(persisted.messages),
+                    )
+                else:
+                    logger.info(
+                        "未找到中断状态（persisted=%s），将作为新任务处理: session=%s",
+                        "None" if persisted is None else f"plan={persisted.plan}",
+                        self._session_id,
                     )
             except Exception as e:
-                logger.warning(f"加载中断状态失败，将作为新任务处理: {e}")
+                logger.warning(f"加载中断状态失败，将作为新任务处理: {e}", exc_info=True)
 
         is_resuming = self.status == FlowStatus.EXECUTING and self.plan is not None
 
@@ -343,12 +351,34 @@ class PlannerReActFlow(BaseFlow):
     async def _persist_after_graph(
         self, final: dict, summaries: list[ConversationSummary],
     ) -> None:
-        """Post-graph persistence: save memory, interrupt state, summaries."""
+        """Post-graph persistence: save memory, interrupt state, summaries.
+
+        CRITICAL: 该方法在 invoke() 的 finally 块中调用（async generator 被 aclose
+        时通过 GeneratorExit → finally 触发）。如果此方法抛出异常，异常会传播到
+        agent_task_runner 的 except Exception 处理器，导致会话状态被设为 COMPLETED
+        而非 WAITING，InterruptState 永远无法保存——恢复时上下文完全丢失。
+        因此整个方法用 try/except 包裹，确保永不向上抛出异常。
+        """
+        try:
+            await self._persist_after_graph_inner(final, summaries)
+        except Exception as exc:
+            logger.exception(
+                "持久化后处理异常（已抑制，避免破坏 generator 清理链）: %s", exc
+            )
+
+    async def _persist_after_graph_inner(
+        self, final: dict, summaries: list[ConversationSummary],
+    ) -> None:
+        """Inner implementation of post-graph persistence."""
         self.plan = final.get("plan")
 
         # 将 LangChain BaseMessage 转回 dict 用于 Memory/InterruptState 持久化
         raw_messages = final.get("messages", [])
-        dict_messages = messages_to_dicts(raw_messages) if raw_messages else []
+        try:
+            dict_messages = messages_to_dicts(raw_messages) if raw_messages else []
+        except Exception as exc:
+            logger.warning("messages_to_dicts 转换失败，使用空消息列表: %s", exc)
+            dict_messages = []
 
         if final.get("should_interrupt"):
             # 中断（接管）：保存上下文以便恢复（内存 + DB 双写）
@@ -356,6 +386,14 @@ class PlannerReActFlow(BaseFlow):
             self._saved_current_step = final.get("current_step")
             self._saved_messages = dict_messages
             self._saved_original_request = final.get("original_request", "")
+
+            logger.info(
+                "中断持久化: session=%s plan=%s step=%s messages=%d",
+                self._session_id,
+                self.plan.title if self.plan else "<none>",
+                self._saved_current_step.description if self._saved_current_step else "<none>",
+                len(dict_messages),
+            )
 
             # 持久化 Memory 到 DB，确保跨 runner 恢复时可加载
             interrupt_memory = Memory(messages=list(dict_messages))
@@ -376,6 +414,7 @@ class PlannerReActFlow(BaseFlow):
             try:
                 async with self._uow_factory() as uow:
                     await uow.session.save_interrupt_state(self._session_id, interrupt_state)
+                logger.info("InterruptState 已持久化到 DB: session=%s", self._session_id)
             except Exception as e:
                 logger.warning(f"中断时保存 InterruptState 失败: {e}")
         else:
