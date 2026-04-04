@@ -93,6 +93,9 @@ agent_config:
     flush_min_new_tokens: 3000
     flush_max_retries: 3
     flush_circuit_breaker_threshold: 3
+    # Embedding（记忆向量化，独立于 skill embedding）
+    embedding_dim: 512
+    embedding_model: "text-embedding-3-small"
 
 mcp_config:
   mcpServers:

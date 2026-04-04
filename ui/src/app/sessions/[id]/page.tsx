@@ -314,7 +314,9 @@ function extractEmbeddedJsonResult(message: string): {
           : typeof parsed.message === "string" ? parsed.message
           : null;
         if (resultText !== null) {
-          const prefix = message.slice(0, openBrace).trim();
+          // Strip trailing code fence markers (e.g. ```json) from prefix —
+          // LLMs sometimes wrap JSON output in markdown code blocks
+          const prefix = message.slice(0, openBrace).trim().replace(/```\w*\s*$/, "").trim();
           const text = prefix ? `${prefix}\n\n${resultText}` : resultText;
           const attachments: string[] = Array.isArray(parsed.attachments)
             ? parsed.attachments.filter((a: unknown): a is string => typeof a === "string")
@@ -381,11 +383,7 @@ function renderEventItem(
           <span className="text-xs text-muted-foreground">{timeText}</span>
         </div>
         <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
-          {isPartial ? (
-            <p className="whitespace-pre-wrap leading-7">{stripXmlTags(displayMessage) || "（空消息）"}</p>
-          ) : (
-            <MarkdownRenderer content={displayMessage || "（空消息）"} />
-          )}
+          <MarkdownRenderer content={isPartial ? (stripXmlTags(displayMessage) || "（空消息）") : (displayMessage || "（空消息）")} />
           {renderMessageAttachments(attachments, onPreviewFile)}
           {embeddedAttachments.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-2">

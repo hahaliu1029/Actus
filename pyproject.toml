@@ -43,6 +43,7 @@ dependencies = [
     "langgraph>=0.4.0",
     "langgraph-checkpoint-postgres>=2.0.0",
     "psycopg[binary]>=3.3.3",
+    "pgvector>=0.3.6",
 ]
 
 [project.optional-dependencies]
