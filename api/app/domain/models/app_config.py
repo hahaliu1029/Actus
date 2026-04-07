@@ -148,13 +148,14 @@ class MemoryConfig(BaseModel):
     # Flush 容错
     flush_max_retries: int = Field(3, ge=0, le=10)
     flush_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
-    # Embedding（C1 基础设施，C4 补齐连接字段）
-    # C4 需新增 embedding_api_base / embedding_api_key / embedding_enabled，
-    # 对齐 SkillEmbeddingConfig 的自包含模式。当前只有维度和模型名。
-    # 注意：embedding_dim 必须与 DB schema 中 vector 列维度一致（当前 512）。
-    # 修改此值而不同步 migration 重建列会导致插入失败。C4 将在启动时校验。
+    # Embedding（C1 基础设施 + C4 连接字段 + 容错）
+    embedding_enabled: bool = False
+    embedding_api_base: str = ""
+    embedding_api_key: str = ""
     embedding_dim: int = Field(512, ge=1, description="pgvector 列维度，须与 DB schema 一致")
     embedding_model: str = "text-embedding-3-small"
+    embedding_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
+    embedding_circuit_breaker_recovery_seconds: float = Field(300.0, ge=10, le=3600)
 
 
 class AgentConfig(BaseModel):

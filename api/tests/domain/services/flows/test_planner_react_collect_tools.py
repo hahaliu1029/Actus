@@ -1,7 +1,7 @@
 """Characterization tests for PlannerReActFlow tool collection methods."""
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -166,3 +166,32 @@ class TestCollectAllTools:
         assert a2a_last < skill_first, (
             f"A2A should come before skill creation: a2a_last={a2a_last}, skill_first={skill_first}"
         )
+
+
+class TestCollectMemoryTools:
+    """C6: _collect_memory_tools creates memory_search + memory_get."""
+
+    def test_with_memory_deps_returns_two_tools(self) -> None:
+        flow = _make_flow(
+            memory_embedding_provider=AsyncMock(),
+            memory_session_factory=MagicMock(),
+            memory_repo_factory=MagicMock(),
+        )
+        tools = flow._collect_memory_tools()
+        assert len(tools) == 2
+        names = {t.name for t in tools}
+        assert "memory_search" in names
+        assert "memory_get" in names
+
+    def test_without_deps_returns_empty(self) -> None:
+        flow = _make_flow()
+        tools = flow._collect_memory_tools()
+        assert tools == []
+
+    def test_partial_deps_returns_empty(self) -> None:
+        flow = _make_flow(
+            memory_embedding_provider=AsyncMock(),
+            # missing session_factory and repo_factory
+        )
+        tools = flow._collect_memory_tools()
+        assert tools == []

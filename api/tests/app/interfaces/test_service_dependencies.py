@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
@@ -76,6 +78,7 @@ def test_get_agent_service_builds_context_overflow_config_from_llm(monkeypatch) 
     monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
     monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
+    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: MagicMock(session_factory=MagicMock()))
 
     service = service_dependencies.get_agent_service(minio_store=object())
     overflow_config = service.kwargs["overflow_config"]
@@ -119,9 +122,54 @@ def test_get_agent_service_builds_dedicated_summary_llm(monkeypatch) -> None:
     monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
     monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
+    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: MagicMock(session_factory=MagicMock()))
 
     service = service_dependencies.get_agent_service(minio_store=object())
     summary_llm = service.kwargs["summary_llm"]
 
     assert isinstance(summary_llm, _FakeLLM)
     assert summary_llm.kwargs["model_name"] == "gpt-4o-mini"
+
+
+def test_get_agent_service_passes_memory_deps(monkeypatch) -> None:
+    """C6: get_agent_service passes memory_embedding_provider,
+    memory_session_factory, memory_repo_factory to AgentService."""
+    from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
+
+    app_config = AppConfig(
+        llm_config=LLMConfig(
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            model_name="gpt-4o",
+        ),
+        agent_config=AgentConfig(),
+        mcp_config=MCPConfig(),
+        a2a_config=A2AConfig(),
+        skill_risk_policy=SkillRiskPolicy(),
+    )
+
+    monkeypatch.setattr(
+        service_dependencies,
+        "FileAppConfigRepository",
+        lambda *args, **kwargs: _FakeAppConfigRepository(app_config),
+    )
+    monkeypatch.setattr(service_dependencies, "ActusChatModel", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
+    monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
+
+    mock_session_factory = MagicMock()
+    mock_postgres = MagicMock()
+    mock_postgres.session_factory = mock_session_factory
+    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: mock_postgres)
+
+    mock_provider = MagicMock()
+
+    service = service_dependencies.get_agent_service(
+        minio_store=object(),
+        memory_embedding_provider=mock_provider,
+    )
+
+    assert service.kwargs["memory_embedding_provider"] is mock_provider
+    assert service.kwargs["memory_session_factory"] is mock_session_factory
+    assert service.kwargs["memory_repo_factory"] is DBMemoryChunkRepository

@@ -174,7 +174,16 @@ class TestRunnerSubmitsBatchFromFlow:
 
 
 class TestFlusherNoneGuard:
-    """When memory_flusher is None, no error even if batch exists."""
+    """Runner guard: flusher=None + batch exists → short-circuit, no error.
+
+    This tests the runner's `if flush_batch and flusher:` guard in isolation.
+    The flow fixture uses default flush_enabled=True, but the test manually
+    injects a batch and sets flusher=None to verify the guard itself.
+
+    C5.1 system invariant: when flush_enabled=True, flusher is always present
+    at runtime (guaranteed by lifespan). This test verifies the guard's safety
+    net, not a normal production path.
+    """
 
     def test_no_error_when_flusher_none_and_batch_exists(self) -> None:
         """Runner guard: `if flush_batch and flusher` short-circuits on None flusher."""
@@ -305,6 +314,8 @@ class TestFullGateChunkBatchPipeline:
         batch = flow._pending_flush_batch
         assert batch is not None
         assert batch.target_cursor == 6
+        # C5.1: cursor should be advanced after batch creation
+        assert flow._flush_cursor == 6  # == target_cursor == len(msgs)
 
     def test_flusher_receives_batch_after_gate(self) -> None:
         """Full chain: gate passes → capturing flusher receives the batch."""
@@ -461,4 +472,53 @@ class TestChunkingMetadata:
 
         assert "web_search" in all_tool_names, (
             f"Expected 'web_search' in tool_names across chunks; got {all_tool_names}"
+        )
+
+
+# ─── Test 6: Persist-level cursor validation (C5.1) ────────────────────────
+
+
+class TestPersistCursorAdvancement:
+    """Verify _persist_after_graph_inner saves the advanced flush_cursor."""
+
+    @pytest.mark.anyio
+    async def test_persist_saves_advanced_cursor(self) -> None:
+        """After _evaluate_flush_gate advances cursor, Memory(flush_cursor=...)
+        in _persist_after_graph_inner must use the new value, not the old one.
+
+        Guards against someone reverting the persist path to use a stale cursor.
+        Pattern ref: test_flush_cursor_loading.py:20-80.
+        """
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock
+
+        mock_session_repo = AsyncMock()
+        mock_session_repo.save_memory = AsyncMock()
+        mock_session_repo.save_summary = AsyncMock()
+        mock_session_repo.get_summary = AsyncMock(return_value=[])
+
+        @asynccontextmanager
+        async def uow_factory():
+            uow = MagicMock()
+            uow.session = mock_session_repo
+            yield uow
+
+        flow = _make_flow(uow_factory=uow_factory)
+        flow._flush_cursor = 0
+
+        msgs = _make_rich_messages(6)
+        plan = _make_plan_with_completed_steps(2)
+        final = {
+            "messages": msgs,
+            "plan": plan,
+            "should_interrupt": False,
+        }
+
+        await flow._persist_after_graph_inner(final, summaries=[])
+
+        # Assert save_memory was called with Memory whose flush_cursor == 6
+        mock_session_repo.save_memory.assert_awaited()
+        saved_memory = mock_session_repo.save_memory.call_args[0][2]
+        assert saved_memory.flush_cursor == 6, (
+            f"Expected flush_cursor=6 (advanced), got {saved_memory.flush_cursor}"
         )

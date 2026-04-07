@@ -111,12 +111,60 @@ async def lifespan(app: FastAPI):
         app.state.checkpointer_pool = checkpointer_pool
         logger.info("Checkpointer 连接池初始化完成")
 
-        # 6. 初始化 MemoryFlushService（C5.0 记忆刷写调度器）
-        from app.application.services.memory_flush_service import MemoryFlushService
+        # 6. 初始化 Memory Embedding Provider（C4 维度串联 + 容错）
         from app.interfaces.service_dependencies import _load_app_config
         _app_config = _load_app_config()
         _memory_cfg = _app_config.agent_config.memory
+
+        from app.domain.external.embedding_provider import DisabledEmbeddingProvider
+        from app.infrastructure.external.embedding.circuit_breaker_embedding_provider import (
+            CircuitBreakerEmbeddingProvider,
+        )
+        from app.infrastructure.models.memory_chunk_orm import MEMORY_EMBEDDING_DIM
+
+        if _memory_cfg.embedding_enabled:
+            if not _memory_cfg.embedding_api_base or not _memory_cfg.embedding_api_key:
+                raise RuntimeError(
+                    "embedding_enabled=True but embedding_api_base or "
+                    "embedding_api_key is empty. "
+                    "请在 config.yaml 中配置 memory.embedding_api_base "
+                    "和 memory.embedding_api_key。"
+                )
+            if _memory_cfg.embedding_dim != MEMORY_EMBEDDING_DIM:
+                raise RuntimeError(
+                    f"MemoryConfig.embedding_dim ({_memory_cfg.embedding_dim}) != "
+                    f"MEMORY_EMBEDDING_DIM ({MEMORY_EMBEDDING_DIM}). "
+                    f"修改维度需要新 migration 重建 pgvector 列。"
+                )
+            from app.infrastructure.external.embedding.openai_embedding_provider import (
+                OpenAIEmbeddingProvider,
+            )
+            _inner_provider = OpenAIEmbeddingProvider(
+                api_base=_memory_cfg.embedding_api_base,
+                api_key=_memory_cfg.embedding_api_key,
+                model=_memory_cfg.embedding_model,
+                dimensions=_memory_cfg.embedding_dim,
+            )
+            app.state.memory_embedding_provider = CircuitBreakerEmbeddingProvider(
+                inner=_inner_provider,
+                threshold=_memory_cfg.embedding_circuit_breaker_threshold,
+                recovery_seconds=_memory_cfg.embedding_circuit_breaker_recovery_seconds,
+            )
+            logger.info("Memory Embedding Provider 初始化完成（CircuitBreaker wrapper）")
+        else:
+            app.state.memory_embedding_provider = DisabledEmbeddingProvider()
+            logger.info("Memory Embedding 未启用，使用 DisabledEmbeddingProvider")
+
+        # 7. 初始化 MemoryFlushService（C5.0 调度骨架 + C5.1 embed/write）
+        from app.application.services.memory_flush_service import MemoryFlushService
+        from app.infrastructure.repositories.db_memory_chunk_repository import (
+            DBMemoryChunkRepository,
+        )
+
         flush_service = MemoryFlushService(
+            embedding_provider=app.state.memory_embedding_provider,
+            session_factory=postgres_client.session_factory,
+            repo_factory=DBMemoryChunkRepository,
             max_retries=_memory_cfg.flush_max_retries,
             circuit_breaker_threshold=_memory_cfg.flush_circuit_breaker_threshold,
         )

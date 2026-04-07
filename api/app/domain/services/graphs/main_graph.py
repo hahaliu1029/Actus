@@ -273,6 +273,12 @@ def build_main_graph(
             from app.domain.services.prompts.react import FILE_VIEW_HINT
             system_content += FILE_VIEW_HINT
 
+        # Inject memory tools hint when available (C6)
+        has_memory_tools = (config.get("configurable") or {}).get("has_memory_tools", False)
+        if has_memory_tools:
+            from app.domain.services.prompts.react import MEMORY_TOOLS_HINT
+            system_content += MEMORY_TOOLS_HINT
+
         if skill_context:
             system_content += f"\n\n{skill_context}"
 

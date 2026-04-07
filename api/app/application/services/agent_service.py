@@ -80,10 +80,16 @@ class AgentService:
         file_understanding_config=None,
         vision_fallback_model=None,
         memory_flusher: MemoryFlusher | None = None,
+        memory_embedding_provider=None,
+        memory_session_factory=None,
+        memory_repo_factory=None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._memory_flusher = memory_flusher
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_understanding_config = file_understanding_config
@@ -191,6 +197,9 @@ class AgentService:
             supports_pdf_input=self._supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
             memory_flusher=self._memory_flusher,
+            memory_embedding_provider=self._memory_embedding_provider,
+            memory_session_factory=self._memory_session_factory,
+            memory_repo_factory=self._memory_repo_factory,
         )
 
         # 6.创建任务Task并更新会话中的信息

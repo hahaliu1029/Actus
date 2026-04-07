@@ -186,9 +186,15 @@ class AgentTaskRunner(TaskRunner):
         supports_pdf_input: bool = False,  # 是否支持原生 PDF 文件输入
         file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
         memory_flusher: MemoryFlusher | None = None,  # 记忆刷写调度器
+        memory_embedding_provider=None,  # C6: 记忆向量化 provider
+        memory_session_factory=None,  # C6: 记忆 DB session 工厂
+        memory_repo_factory=None,  # C6: 记忆仓库工厂
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._memory_flusher = memory_flusher
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
         self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
         self._llm = llm
@@ -300,6 +306,9 @@ class AgentTaskRunner(TaskRunner):
             supports_vision=supports_vision,
             supports_pdf_input=supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
+            memory_embedding_provider=self._memory_embedding_provider,
+            memory_session_factory=self._memory_session_factory,
+            memory_repo_factory=self._memory_repo_factory,
         )
 
     async def _put_and_add_event(
@@ -1159,6 +1168,11 @@ class AgentTaskRunner(TaskRunner):
                 "- a2a tools: "
                 + ", ".join(a2a_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
+
+        # Memory tools（C6: memory_search + memory_get）
+        # 直接从 runner 已知依赖判断（_build_available_tool_summary 在 flow.invoke 前执行）
+        if self._memory_session_factory and self._memory_repo_factory:
+            lines.append("- memory: memory_search, memory_get")
 
         summary = "\n".join(lines).strip()
         if len(summary) > char_budget:

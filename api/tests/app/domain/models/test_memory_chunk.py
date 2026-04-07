@@ -1,9 +1,11 @@
-"""Tests for RawChunk and FlushBatch dataclasses (Task 1)."""
+"""Tests for RawChunk, FlushBatch, and MemoryChunk dataclasses."""
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pytest
 
-from app.domain.models.memory_chunk import FlushBatch, RawChunk
+from app.domain.models.memory_chunk import FlushBatch, MemoryChunk, RawChunk
 
 
 class TestRawChunk:
@@ -133,3 +135,75 @@ class TestFlushBatch:
             chunks=chunks,
         )
         assert len(batch.chunks) == 3
+
+
+class TestMemoryChunk:
+    """MemoryChunk frozen dataclass tests — mirrors TestRawChunk/TestFlushBatch above."""
+
+    def _make_chunk(self, **overrides) -> MemoryChunk:
+        defaults = dict(
+            id="chunk-1",
+            user_id="user-1",
+            content="hello world",
+            content_hash="abc123def456",
+            source="session_flush",
+            metadata={"key": "value"},
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        defaults.update(overrides)
+        return MemoryChunk(**defaults)
+
+    def test_fields_accessible(self) -> None:
+        """MemoryChunk 字段可以正常访问。"""
+        chunk = self._make_chunk()
+        assert chunk.id == "chunk-1"
+        assert chunk.user_id == "user-1"
+        assert chunk.content == "hello world"
+        assert chunk.content_hash == "abc123def456"
+        assert chunk.source == "session_flush"
+        assert chunk.metadata == {"key": "value"}
+        assert chunk.created_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert chunk.updated_at == datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+    def test_frozen_immutability(self) -> None:
+        """MemoryChunk 是 frozen dataclass，修改字段应抛出 FrozenInstanceError。"""
+        from dataclasses import FrozenInstanceError
+
+        chunk = self._make_chunk()
+        with pytest.raises(FrozenInstanceError):
+            chunk.content = "modified"  # type: ignore[misc]
+
+    def test_equality(self) -> None:
+        """相同字段的 MemoryChunk 应相等。"""
+        chunk_a = self._make_chunk()
+        chunk_b = self._make_chunk()
+        assert chunk_a == chunk_b
+
+    def test_session_id_defaults_to_none(self) -> None:
+        """session_id 默认为 None。"""
+        chunk = self._make_chunk()
+        assert chunk.session_id is None
+
+    def test_session_id_can_be_set(self) -> None:
+        """session_id 可以显式赋值。"""
+        chunk = self._make_chunk(session_id="sess-1")
+        assert chunk.session_id == "sess-1"
+
+    def test_embedding_defaults_to_none(self) -> None:
+        """embedding 默认为 None（provider 故障降级场景）。"""
+        chunk = self._make_chunk()
+        assert chunk.embedding is None
+
+    def test_embedding_as_tuple(self) -> None:
+        """embedding 可以是 float tuple。"""
+        emb = (0.1, 0.2, 0.3)
+        chunk = self._make_chunk(embedding=emb)
+        assert chunk.embedding == (0.1, 0.2, 0.3)
+        assert isinstance(chunk.embedding, tuple)
+
+    def test_different_source_types(self) -> None:
+        """source 支持不同的字符串值。"""
+        for source in ("session_flush", "manual", "file"):
+            chunk = self._make_chunk(source=source)
+            assert chunk.source == source

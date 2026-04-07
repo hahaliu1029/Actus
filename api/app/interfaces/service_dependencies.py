@@ -34,9 +34,10 @@ from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.infrastructure.repositories.file_app_config_repository import (
     FileAppConfigRepository,
 )
+from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.minio import MinioStore, get_minio
-from app.infrastructure.storage.postgres import get_db_session, get_uow
+from app.infrastructure.storage.postgres import get_db_session, get_postgres, get_uow
 from app.infrastructure.storage.redis import RedisClient, get_redis
 
 # from app.interfaces.repository_dependencies import get_db_session_repository
@@ -182,12 +183,18 @@ def get_flush_service(request: Request):
     return getattr(request.app.state, "flush_service", None)
 
 
+def get_memory_embedding_provider(request: Request):
+    """Extract memory embedding provider from app state (C4 构建)."""
+    return getattr(request.app.state, "memory_embedding_provider", None)
+
+
 # @lru_cache()
 def get_agent_service(
     minio_store: MinioStore = Depends(get_minio),
     redis_client: RedisClient = Depends(get_redis),
     checkpointer_pool: AsyncConnectionPool = Depends(get_checkpointer_pool),
     flush_service=Depends(get_flush_service),
+    memory_embedding_provider=Depends(get_memory_embedding_provider),
 ) -> AgentService:
     # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
     app_config = _load_app_config()
@@ -253,6 +260,9 @@ def get_agent_service(
         file_understanding_config=app_config.file_understanding,
         vision_fallback_model=vision_fallback_model,
         memory_flusher=flush_service,
+        memory_embedding_provider=memory_embedding_provider,
+        memory_session_factory=get_postgres().session_factory,
+        memory_repo_factory=DBMemoryChunkRepository,
         # file_repository=file_repository,
     )
 

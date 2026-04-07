@@ -21,7 +21,7 @@ async def test_lifespan_opens_and_closes_checkpointer_pool():
     ), patch(
         "app.main.get_redis", return_value=MagicMock(init=AsyncMock(), shutdown=AsyncMock())
     ), patch(
-        "app.main.get_postgres", return_value=MagicMock(init=AsyncMock(), shutdown=AsyncMock())
+        "app.main.get_postgres", return_value=MagicMock(init=AsyncMock(), shutdown=AsyncMock(), session_factory=MagicMock())
     ), patch(
         "app.main.get_minio", return_value=MagicMock(init=AsyncMock(), shutdown=AsyncMock())
     ), patch(

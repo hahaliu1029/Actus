@@ -5,6 +5,12 @@ FILE_VIEW_HINT = (
     "\n  `file_read` 仅用于文本文件（代码、配置、日志等），对二进制文件会返回乱码。"
 )
 
+# 记忆工具提示（仅在 memory tools 可用时注入 executor prompt）
+MEMORY_TOOLS_HINT = """
+## 记忆工具
+你可以使用 memory_search 搜索之前对话中的信息。当用户提到"之前""上次""以前讨论过"等暗示历史上下文时，优先使用 memory_search 查找相关记忆。搜索结果包含 ID，可用 memory_get 获取完整内容。
+"""
+
 # ReActAgent系统提示词模板
 REACT_SYSTEM_PROMPT = """
 你是一个任务执行智能体（Agent）, 你需要按照以下步骤完成任务:

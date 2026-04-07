@@ -86,6 +86,9 @@ class PlannerReActFlow(BaseFlow):
         supports_vision: bool = True,
         supports_pdf_input: bool = False,
         file_processor_lookup: Any = None,  # FileProcessorLookup | None
+        memory_embedding_provider=None,
+        memory_session_factory=None,
+        memory_repo_factory=None,
     ) -> None:
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
@@ -157,6 +160,12 @@ class PlannerReActFlow(BaseFlow):
         # Flush scheduling: cursor + pending batch
         self._flush_cursor: int = 0
         self._pending_flush_batch: FlushBatch | None = None
+
+        # Memory tools dependencies (C6)
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
+        self._has_memory_tools = False  # set by _collect_all_tools
 
     async def _get_checkpointer(self):
         """Lazy-initialize checkpointer.
@@ -240,10 +249,22 @@ class PlannerReActFlow(BaseFlow):
             ))
         return tools
 
+    def _collect_memory_tools(self) -> list:
+        """Create memory search/get tools if dependencies are available."""
+        if not (self._memory_session_factory and self._memory_repo_factory):
+            return []
+        from app.domain.services.tools.memory_tools import create_memory_tools
+        return create_memory_tools(
+            embedding_provider=self._memory_embedding_provider,
+            session_factory=self._memory_session_factory,
+            repo_factory=self._memory_repo_factory,
+            user_id=self._user_id,
+        )
+
     async def _collect_all_tools(self) -> list:
         """Aggregate all tool categories for initial graph build.
 
-        Order: native -> MCP -> A2A -> skill creation.
+        Order: native -> MCP -> A2A -> skill creation -> memory.
         Dynamic Skill tools are NOT included here — they are injected
         per-step by react_graph_provider.
         """
@@ -252,6 +273,8 @@ class PlannerReActFlow(BaseFlow):
         tools.extend(await self._collect_mcp_tools())
         tools.extend(self._collect_a2a_tools())
         tools.extend(self._collect_skill_creation_tools())
+        tools.extend(self._collect_memory_tools())
+        self._has_memory_tools = any(t.name in ("memory_search", "memory_get") for t in tools)
         return tools
 
     # -- Graph construction ---------------------------------------------------
@@ -713,6 +736,7 @@ class PlannerReActFlow(BaseFlow):
                 "react_graph_provider": self._react_graph_provider,
                 "skill_guide_injector": self._skill_guide_injector,
                 "has_file_view": self._file_processor_lookup is not None,
+                "has_memory_tools": self._has_memory_tools,
             }
         }
 
@@ -1008,6 +1032,7 @@ class PlannerReActFlow(BaseFlow):
             target_cursor=current_len,
             chunks=tuple(chunks),
         )
+        self._flush_cursor = current_len  # C5.1: 乐观推进，在 persist 之前生效
 
     def _chunk_messages(
         self,

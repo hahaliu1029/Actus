@@ -94,8 +94,13 @@ agent_config:
     flush_max_retries: 3
     flush_circuit_breaker_threshold: 3
     # Embedding（记忆向量化，独立于 skill embedding）
-    embedding_dim: 512
+    embedding_enabled: false
+    embedding_api_base: ""          # OpenAI 兼容 API base URL
+    embedding_api_key: ""           # API key
+    embedding_dim: 512              # 必须与 DB pgvector 列维度一致
     embedding_model: "text-embedding-3-small"
+    embedding_circuit_breaker_threshold: 3    # 连续失败次数后熔断
+    embedding_circuit_breaker_recovery_seconds: 300.0  # 熔断恢复时间（秒）
 
 mcp_config:
   mcpServers:
