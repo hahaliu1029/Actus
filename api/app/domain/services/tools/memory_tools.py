@@ -40,8 +40,10 @@ def create_memory_tools(
         try:
             vectors = await embedding_provider.embed([query])
             embedding = vectors[0]
-        except EmbeddingUnavailableError:
-            return "记忆检索暂不可用（embedding 服务异常）"
+        except EmbeddingUnavailableError as e:
+            return f"记忆检索暂不可用（embedding 服务异常: {e}）"
+        except Exception as e:
+            return f"记忆检索失败（{type(e).__name__}: {e}）"
 
         async with session_factory() as session:
             repo = repo_factory(session)

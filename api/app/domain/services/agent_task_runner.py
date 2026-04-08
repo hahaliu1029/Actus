@@ -1305,6 +1305,19 @@ class AgentTaskRunner(TaskRunner):
             sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
         ))
 
+        # Memory tools (C6): 与 PlannerReActFlow._collect_memory_tools 保持一致
+        if self._memory_session_factory and self._memory_repo_factory:
+            from app.domain.services.tools.memory_tools import create_memory_tools
+            memory_config = self._flow._memory_config
+            lc_tools.extend(create_memory_tools(
+                embedding_provider=self._memory_embedding_provider,
+                session_factory=self._memory_session_factory,
+                repo_factory=self._memory_repo_factory,
+                user_id=self._user_id,
+                half_life_days=memory_config.half_life_days,
+                mmr_lambda=memory_config.mmr_lambda,
+            ))
+
         skill_tool_names = [t.name for t in dynamic_tools]
         logger.info(
             "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",

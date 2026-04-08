@@ -97,6 +97,7 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - api-data:/app/data
+      - ./api/config.yaml:/app/data/config.yaml
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/docs > /dev/null || exit 1"]
