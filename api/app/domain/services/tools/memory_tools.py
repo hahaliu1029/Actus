@@ -7,6 +7,7 @@ from langchain_core.tools import BaseTool, tool as lc_tool
 from pydantic import BaseModel, Field
 
 from app.domain.external.embedding_provider import EmbeddingUnavailableError
+from app.domain.services.memory_ranker import rank_memory_results
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,8 +28,11 @@ def create_memory_tools(
     session_factory: async_sessionmaker[AsyncSession],
     repo_factory: Callable[[AsyncSession], MemoryChunkRepository],
     user_id: str,
+    half_life_days: int = 30,
+    mmr_lambda: float = 0.7,
 ) -> list[BaseTool]:
     """Create memory search and get tools with closed-over dependencies."""
+    CANDIDATE_MULTIPLIER = 3
 
     @lc_tool(args_schema=MemorySearchInput)
     async def memory_search(query: str, max_results: int = 5) -> str:
@@ -44,8 +48,19 @@ def create_memory_tools(
             chunks = await repo.search_by_vector(
                 user_id=user_id,
                 embedding=embedding,
-                top_k=max_results,
+                top_k=max_results * CANDIDATE_MULTIPLIER,
             )
+
+        if not chunks:
+            return "未找到相关记忆。"
+
+        chunks = rank_memory_results(
+            chunks,
+            query_embedding=embedding,
+            half_life_days=half_life_days,
+            mmr_lambda=mmr_lambda,
+            top_k=max_results,
+        )
 
         if not chunks:
             return "未找到相关记忆。"

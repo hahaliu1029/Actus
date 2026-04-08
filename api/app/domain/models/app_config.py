@@ -156,6 +156,10 @@ class MemoryConfig(BaseModel):
     embedding_model: str = "text-embedding-3-small"
     embedding_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
     embedding_circuit_breaker_recovery_seconds: float = Field(300.0, ge=10, le=3600)
+    # C7: 混合检索与排序
+    half_life_days: int = Field(30, ge=1, le=365)
+    mmr_lambda: float = Field(0.7, ge=0.0, le=1.0)
+    hybrid_alpha: float = Field(0.7, ge=0.0, le=1.0)  # C7 仅占位不参与计算, C8 生效
 
 
 class AgentConfig(BaseModel):

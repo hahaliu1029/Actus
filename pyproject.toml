@@ -25,6 +25,7 @@ dependencies = [
     "keyboard>=0.13.5",
     "mcp>=1.25.0",
     "minio>=7.2.20",
+    "numpy>=1.26.0",
     "openai>=2.7.1",
     "playwright>=1.57.0",
     "psycopg2-binary>=2.9.11",

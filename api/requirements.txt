@@ -275,6 +275,7 @@ multidict==6.7.0
     #   yarl
 numpy==2.3.5
     # via
+    #   actus (../pyproject.toml)
     #   pgvector
     #   transformers
 oauthlib==3.3.1

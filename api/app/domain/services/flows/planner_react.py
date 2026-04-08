@@ -259,6 +259,8 @@ class PlannerReActFlow(BaseFlow):
             session_factory=self._memory_session_factory,
             repo_factory=self._memory_repo_factory,
             user_id=self._user_id,
+            half_life_days=self._memory_config.half_life_days,
+            mmr_lambda=self._memory_config.mmr_lambda,
         )
 
     async def _collect_all_tools(self) -> list:

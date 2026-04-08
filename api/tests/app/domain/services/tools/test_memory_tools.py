@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -22,6 +22,7 @@ def _make_chunk(**overrides) -> MemoryChunk:
         metadata={},
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        embedding=(0.1, 0.2),  # C7: ranker needs non-None embedding
     )
     defaults.update(overrides)
     return MemoryChunk(**defaults)
@@ -48,6 +49,8 @@ def _make_tools(**overrides):
         session_factory=session_factory,
         repo_factory=repo_factory,
         user_id=overrides.get("user_id", "user-1"),
+        half_life_days=overrides.get("half_life_days", 30),
+        mmr_lambda=overrides.get("mmr_lambda", 0.7),
     )
     return tools, mock_repo, provider
 
@@ -104,7 +107,41 @@ class TestMemorySearch:
         await search.ainvoke({"query": "test", "max_results": 3})
         mock_repo.search_by_vector.assert_awaited_once()
         call_kwargs = mock_repo.search_by_vector.call_args.kwargs
-        assert call_kwargs["top_k"] == 3
+        assert call_kwargs["top_k"] == 9  # 3 * CANDIDATE_MULTIPLIER
+
+    async def test_3x_overfetch_with_max_results_5(self) -> None:
+        """max_results=5 should query repo with top_k=15."""
+        mock_repo = AsyncMock()
+        mock_repo.search_by_vector.return_value = []
+        tools, _, _ = _make_tools(_mock_repo=mock_repo)
+        search = next(t for t in tools if t.name == "memory_search")
+
+        await search.ainvoke({"query": "test", "max_results": 5})
+        call_kwargs = mock_repo.search_by_vector.call_args.kwargs
+        assert call_kwargs["top_k"] == 15
+
+    async def test_search_calls_ranker(self) -> None:
+        """memory_search should call rank_memory_results with correct args."""
+        mock_repo = AsyncMock()
+        chunk = _make_chunk(embedding=(0.1, 0.2))
+        mock_repo.search_by_vector.return_value = [chunk]
+        tools, _, provider = _make_tools(
+            _mock_repo=mock_repo,
+            half_life_days=60,
+            mmr_lambda=0.5,
+        )
+        search = next(t for t in tools if t.name == "memory_search")
+
+        with patch(
+            "app.domain.services.tools.memory_tools.rank_memory_results",
+            return_value=[chunk],
+        ) as mock_ranker:
+            await search.ainvoke({"query": "test", "max_results": 2})
+            mock_ranker.assert_called_once()
+            call_kwargs = mock_ranker.call_args.kwargs
+            assert call_kwargs["half_life_days"] == 60
+            assert call_kwargs["mmr_lambda"] == 0.5
+            assert call_kwargs["top_k"] == 2
 
     async def test_long_content_truncated_with_ellipsis(self) -> None:
         long_content = "x" * 600

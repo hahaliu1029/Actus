@@ -101,6 +101,10 @@ agent_config:
     embedding_model: "text-embedding-3-small"
     embedding_circuit_breaker_threshold: 3    # 连续失败次数后熔断
     embedding_circuit_breaker_recovery_seconds: 300.0  # 熔断恢复时间（秒）
+    # C7: 混合检索与排序
+    half_life_days: 30                # 时间衰减半衰期（天）
+    mmr_lambda: 0.7                   # MMR 多样性参数 (0=纯多样性, 1=纯相关性)
+    hybrid_alpha: 0.7                 # 向量/文本混合权重 (C7 仅占位不参与计算, C8 生效)
 
 mcp_config:
   mcpServers:

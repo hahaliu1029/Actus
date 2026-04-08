@@ -74,3 +74,43 @@ class TestMemoryConfigC4Fields:
         assert cfg.embedding_api_key == "sk-test"
         assert cfg.embedding_circuit_breaker_threshold == 5
         assert cfg.embedding_circuit_breaker_recovery_seconds == 60.0
+
+
+class TestMemoryConfigC7Fields:
+    """C7 新增字段：时间衰减 + MMR + hybrid alpha。"""
+
+    def test_half_life_days_defaults_30(self) -> None:
+        cfg = MemoryConfig()
+        assert cfg.half_life_days == 30
+
+    def test_mmr_lambda_defaults_0_7(self) -> None:
+        cfg = MemoryConfig()
+        assert cfg.mmr_lambda == 0.7
+
+    def test_hybrid_alpha_defaults_0_7(self) -> None:
+        cfg = MemoryConfig()
+        assert cfg.hybrid_alpha == 0.7
+
+    def test_half_life_days_min_1(self) -> None:
+        with pytest.raises(ValidationError):
+            MemoryConfig(half_life_days=0)
+
+    def test_half_life_days_max_365(self) -> None:
+        with pytest.raises(ValidationError):
+            MemoryConfig(half_life_days=366)
+
+    def test_mmr_lambda_min_0(self) -> None:
+        cfg = MemoryConfig(mmr_lambda=0.0)
+        assert cfg.mmr_lambda == 0.0
+
+    def test_mmr_lambda_max_1(self) -> None:
+        cfg = MemoryConfig(mmr_lambda=1.0)
+        assert cfg.mmr_lambda == 1.0
+
+    def test_mmr_lambda_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            MemoryConfig(mmr_lambda=-0.1)
+
+    def test_hybrid_alpha_rejects_above_1(self) -> None:
+        with pytest.raises(ValidationError):
+            MemoryConfig(hybrid_alpha=1.1)
