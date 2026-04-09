@@ -20,17 +20,19 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import RetryPolicy
+from langgraph.types import RetryPolicy, interrupt
 
 from app.application.errors.exceptions import ServerRequestsError
 from app.domain.external.file_processor import FileProcessResult
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import (
     MessageEvent,
+    ToolConfirmationEvent,
     ToolEvent,
     ToolEventStatus,
 )
 from app.domain.models.tool_result import ToolResult
+from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
 
 from .message_utils import truncate_tool_content
 from .state import ReactGraphState
@@ -245,6 +247,9 @@ def build_react_graph(
             "events": new_events,
         }
 
+    # Shared risk assessor instance (stateless, safe to reuse)
+    _risk_assessor = RiskAssessor()
+
     async def tool_node(state: ReactGraphState, config: RunnableConfig) -> dict:
         """Execute tool calls from the last assistant message.
 
@@ -254,8 +259,18 @@ def build_react_graph(
         - Otherwise, first call returns SOFT_HINT (agent should try to solve
           autonomously). If a SOFT_HINT was already returned in this step
           and the LLM calls again, it truly needs user input → interrupt.
+
+        Risk assessment gate for tools with ``risk_level`` metadata (high/medium):
+        - Runs RiskAssessor to evaluate dynamic risk.
+        - If final_level >= MEDIUM, emits ToolConfirmationEvent and calls
+          ``interrupt()`` to pause the graph until the user responds.
+        - Approved calls proceed to normal execution; denied/timed-out calls
+          return an error string without executing.
         """
-        guide_injector = (config or {}).get("configurable", {}).get("skill_guide_injector") if config else None
+        configurable = (config or {}).get("configurable", {}) if config else {}
+        guide_injector = configurable.get("skill_guide_injector")
+        event_queue = configurable.get("event_queue")
+        confirmation_manager = configurable.get("confirmation_manager")
 
         messages = state["messages"]
         last_msg = messages[-1]
@@ -275,6 +290,38 @@ def build_react_graph(
         # pairing for group_messages() (context_assembler.py).
         deferred_human_messages: list[HumanMessage] = []
         deferred_document_messages: list[HumanMessage] = []
+
+        async def _run_tool(
+            tool_fn: BaseTool,
+            tool_name: str,
+            args: dict,
+        ) -> tuple[str, bool, list[dict]]:
+            """Execute a tool and handle result type coercion.
+
+            Returns (result_str, success, multimodal_blocks).
+            Side effect: may append to ``deferred_document_messages``.
+            """
+            mm_blocks: list[dict] = []
+            try:
+                raw_result = await tool_fn.ainvoke(args)
+                if isinstance(raw_result, FileProcessResult):
+                    r_str = raw_result.text
+                    mm_blocks = list(raw_result.image_blocks)
+                    if raw_result.document_blocks:
+                        doc_blocks: list[dict] = list(raw_result.document_blocks)
+                        doc_blocks.insert(0, {"type": "text", "text": "[file_view: PDF document attached]"})
+                        deferred_document_messages.append(HumanMessage(content=doc_blocks))
+                elif isinstance(raw_result, str):
+                    r_str = raw_result
+                else:
+                    r_str = str(raw_result)
+                # Shell image detection (M1d)
+                if tool_name in ("shell_execute", "shell_read_output"):
+                    r_str, shell_images = _extract_shell_images(r_str)
+                    mm_blocks.extend(shell_images)
+                return r_str, True, mm_blocks
+            except Exception as exc:
+                return f"Error executing {tool_name}: {exc}", False, []
 
         for tc in tool_calls:
             tool_name = tc["name"]
@@ -300,38 +347,152 @@ def build_react_graph(
                     should_interrupt = True
                     logger.info("message_ask_user: user input required (after SOFT_HINT)")
             else:
-                # ---- Normal tool execution ---- #
+                # ---- Normal tool execution (with risk assessment gate) ---- #
                 tool_fn = tool_map.get(tool_name)
                 if tool_fn is None:
                     result_str = f"Error: Unknown tool '{tool_name}'"
                     tool_success = False
-                elif getattr(tool_fn, "metadata", {}).get("require_confirmation"):
-                    # Runtime enforcement: dangerous tools must go through
-                    # user confirmation via interrupt, not just prompt hints.
-                    result_str = "WAITING_FOR_USER"
-                    should_interrupt = True
-                    logger.info(f"require_confirmation: interrupting for tool '{tool_name}'")
                 else:
-                    try:
-                        raw_result = await tool_fn.ainvoke(args)
-                        if isinstance(raw_result, FileProcessResult):
-                            result_str = raw_result.text
-                            multimodal_blocks = list(raw_result.image_blocks)
-                            if raw_result.document_blocks:
-                                doc_blocks: list[dict] = list(raw_result.document_blocks)
-                                doc_blocks.insert(0, {"type": "text", "text": "[file_view: PDF document attached]"})
-                                deferred_document_messages.append(HumanMessage(content=doc_blocks))
-                        elif isinstance(raw_result, str):
-                            result_str = raw_result
+                    # Check tool risk_level metadata for confirmation gating
+                    risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
+                    _tc_enabled = configurable.get("tool_confirmation_enabled", True)
+                    if _tc_enabled and risk_level_meta and risk_level_meta in ("high", "medium"):
+                        assessment = _risk_assessor.assess(tool_name, args)
+
+                        if assessment.final_level >= RiskLevel.MEDIUM:
+                            # Check ApprovalCache (session + always-rules)
+                            approval_cache = configurable.get("approval_cache")
+                            _user_id = configurable.get("user_id") or ""
+                            _session_id = configurable.get("session_id") or ""
+
+                            if approval_cache and _user_id and _session_id:
+                                try:
+                                    cache_decision = await approval_cache.check(
+                                        user_id=_user_id,
+                                        session_id=_session_id,
+                                        tool_name=tool_name,
+                                        arg_digest=assessment.arg_digest,
+                                        primary_arg=assessment.primary_arg,
+                                        dir_arg=assessment.dir_arg,
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "ApprovalCache.check failed for tool '%s', defaulting to no_match",
+                                        tool_name,
+                                    )
+                                    cache_decision = "no_match"
+                            else:
+                                cache_decision = "no_match"
+
+                            if cache_decision == "allow":
+                                # Cached approval — execute directly
+                                result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
+                            elif cache_decision == "deny":
+                                result_str = "此操作已被永久规则拒绝"
+                                tool_success = False
+                            else:
+                                # SmartApprove: LLM-assisted auto-approval before interrupting
+                                _sa_resolved = False
+                                _smart_approve_enabled = configurable.get("smart_approve_enabled", False)
+                                _sa_medium_only = configurable.get("smart_approve_medium_only", False)
+                                # Skip SmartApprove if medium_only is set and tool is HIGH
+                                if _smart_approve_enabled and not (_sa_medium_only and assessment.final_level > RiskLevel.MEDIUM):
+                                    from app.domain.services.smart_approve import SmartApprove
+                                    _summary_llm = configurable.get("summary_llm")
+                                    if _summary_llm:
+                                        _smart = SmartApprove(llm=_summary_llm)
+                                        _sa_decision = await _smart.evaluate(
+                                            tool_name=tool_name,
+                                            tool_args=args,
+                                            risk_level=assessment.final_level.name.lower(),
+                                            matched_patterns=assessment.matched_patterns,
+                                            task_context="",
+                                        )
+                                        if _sa_decision == "approve":
+                                            logger.info(
+                                                "SmartApprove: auto-approved tool '%s', granting session scope",
+                                                tool_name,
+                                            )
+                                            if approval_cache and _session_id:
+                                                await approval_cache.write_session(
+                                                    _session_id, tool_name, assessment.arg_digest
+                                                )
+                                            result_str, tool_success, multimodal_blocks = await _run_tool(
+                                                tool_fn, tool_name, args
+                                            )
+                                            _sa_resolved = True
+                                        elif _sa_decision == "deny":
+                                            logger.info(
+                                                "SmartApprove: auto-denied tool '%s'", tool_name
+                                            )
+                                            result_str = "此操作已被自动安全策略拒绝"
+                                            tool_success = False
+                                            _sa_resolved = True
+                                        # else: "escalate" — fall through to interrupt path below
+
+                                if not _sa_resolved:
+                                    # Emit confirmation event via event_queue
+                                    _timeout_seconds = configurable.get(
+                                        "tool_confirmation_timeout_seconds", 300
+                                    )
+                                    confirmation_event = ToolConfirmationEvent(
+                                        tool_call_id=call_id,
+                                        tool_name=tool_name,
+                                        tool_args=args,
+                                        risk_level=assessment.final_level.name.lower(),
+                                        risk_reason=assessment.risk_reason,
+                                        matched_patterns=assessment.matched_patterns,
+                                        suggested_alternative=assessment.suggested_alternative,
+                                        timeout_seconds=_timeout_seconds,
+                                    )
+                                    if event_queue:
+                                        await event_queue.put(confirmation_event)
+
+                                    # Persist confirmation detail to Redis so the
+                                    # resume path (_resume_tool_confirmation) can
+                                    # read it back after the graph is interrupted.
+                                    if confirmation_manager:
+                                        import time as _time
+                                        from app.domain.services.confirmation_manager import ConfirmationDetail
+                                        _detail = ConfirmationDetail(
+                                            session_id=_session_id,
+                                            tool_call_id=call_id,
+                                            user_id=_user_id,
+                                            tool_name=tool_name,
+                                            tool_args=args,
+                                            risk_level=assessment.final_level.name.lower(),
+                                            arg_digest=assessment.arg_digest,
+                                            primary_arg=assessment.primary_arg,
+                                            dir_arg=assessment.dir_arg,
+                                            matched_patterns=assessment.matched_patterns,
+                                            deadline_ts=_time.time() + confirmation_event.timeout_seconds,
+                                        )
+                                        await confirmation_manager.store(_detail)
+
+                                    # Interrupt — graph pauses here, resumes with user response
+                                    user_response = interrupt({
+                                        "type": "tool_confirmation",
+                                        "tool_call_id": call_id,
+                                    })
+
+                                    action = user_response.get("action", "deny") if isinstance(user_response, dict) else "deny"
+                                    if action == "approve":
+                                        logger.info("tool_confirmation: user approved tool '%s'", tool_name)
+                                        result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
+                                    elif action == "timeout_fallback":
+                                        result_str = "操作因超时被跳过。请尝试安全替代方案，或告知用户。"
+                                        tool_success = False
+                                        logger.info("tool_confirmation: timeout for tool '%s'", tool_name)
+                                    else:
+                                        result_str = "用户拒绝了此操作"
+                                        tool_success = False
+                                        logger.info("tool_confirmation: user denied tool '%s'", tool_name)
                         else:
-                            result_str = str(raw_result)
-                        # Shell image detection (M1d)
-                        if tool_name in ("shell_execute", "shell_read_output"):
-                            result_str, shell_images = _extract_shell_images(result_str)
-                            multimodal_blocks.extend(shell_images)
-                    except Exception as exc:
-                        result_str = f"Error executing {tool_name}: {exc}"
-                        tool_success = False
+                            # Assessment resolved to none/low risk — execute directly
+                            result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
+                    else:
+                        # No risk metadata — execute directly (original path)
+                        result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
 
             if not tool_success:
                 new_failures += 1

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .db_file_repository import DBFileRepository
 from .db_session_repository import DBSessionRepository
+from .db_tool_approval_log_repository import DBToolApprovalLogRepository
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class DBUnitOfWork(IUnitOfWork):
         # 2.初始化所有数据库仓库
         self.file = DBFileRepository(db_session=self.db_session)
         self.session = DBSessionRepository(db_session=self.db_session)
+        self.tool_approval_log = DBToolApprovalLogRepository(db_session=self.db_session)
 
         return self
 

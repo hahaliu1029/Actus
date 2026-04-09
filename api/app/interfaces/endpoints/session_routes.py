@@ -250,6 +250,7 @@ async def chat(
                 message=request.message,
                 attachments=request.attachments,
                 skill_confirmation_action=request.skill_confirmation_action,
+                tool_confirmation=request.tool_confirmation,
                 latest_event_id=request.event_id,
                 timestamp=(
                     datetime.fromtimestamp(request.timestamp)

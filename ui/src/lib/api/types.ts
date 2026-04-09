@@ -104,10 +104,18 @@ export type LLMConfig = {
   unknown_model_context_window: number;
 };
 
+export type ToolConfirmationConfig = {
+  enabled: boolean;
+  timeout_seconds: number;
+  smart_approve_enabled: boolean;
+  smart_approve_medium_only: boolean;
+};
+
 export type AgentConfig = {
   max_iterations: number;
   max_retries: number;
   max_search_results: number;
+  tool_confirmation?: ToolConfirmationConfig;
 };
 
 export type VisionFallbackConfig = {
@@ -373,6 +381,11 @@ export type ChatParams = {
   message?: string;
   attachments?: string[];
   skill_confirmation_action?: "generate" | "revise" | "install" | "cancel";
+  tool_confirmation?: {
+    action: "approve" | "deny";
+    scope: "once" | "session" | "always";
+    tool_call_id: string;
+  };
   event_id?: string;
   timestamp?: number;
 };
@@ -478,10 +491,25 @@ export type SSEEventType =
   | "tool"
   | "control"
   | "wait"
+  | "tool_confirmation"
   | "finishing"
   | "done"
   | "error"
   | "sessions";
+
+export type ToolConfirmationEventData = {
+  event_id?: string;
+  created_at?: number;
+  tool_call_id: string;
+  tool_name: string;
+  tool_args: Record<string, unknown>;
+  risk_level: "high" | "medium";
+  risk_reason: string;
+  matched_patterns: string[];
+  suggested_alternative: string | null;
+  approval_options: string[];
+  timeout_seconds: number;
+};
 
 export type SSEEventData =
   | { type: "message"; data: ChatMessageData }
@@ -491,6 +519,7 @@ export type SSEEventData =
   | { type: "tool"; data: ToolEvent }
   | { type: "control"; data: ControlEvent }
   | { type: "wait"; data: WaitEvent }
+  | { type: "tool_confirmation"; event_id?: string; created_at?: number; data: ToolConfirmationEventData }
   | { type: "finishing"; data: FinishingEvent }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }

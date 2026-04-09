@@ -117,11 +117,15 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
         )
         return _unwrap(result) if result else "File written successfully"
 
+    file_write.metadata = {"risk_level": "medium"}
+
     @lc_tool
     async def file_str_replace(filepath: str, old_str: str, new_str: str, sudo: bool = False) -> str:
         """Replace a string in a file."""
         result = await sandbox.replace_in_file(filepath, old_str, new_str, sudo=sudo)
         return _unwrap(result) if result else "Replacement done"
+
+    file_str_replace.metadata = {"risk_level": "medium"}
 
     @lc_tool
     async def file_find_in_content(filepath: str, regex: str, sudo: bool = False) -> str:
@@ -158,7 +162,7 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
         result = await sandbox.exec_command(session_id=session_id, exec_dir=exec_dir, command=command)
         return _unwrap(result)
 
-    shell_execute.metadata = {"require_confirmation": True}
+    shell_execute.metadata = {"risk_level": "high"}
 
     @lc_tool
     async def shell_read_output(session_id: str = "default") -> str:
@@ -265,7 +269,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         result = await browser.console_exec(javascript)
         return _unwrap(result)
 
-    browser_console_exec.metadata = {"require_confirmation": True}
+    browser_console_exec.metadata = {"risk_level": "high"}
 
     @lc_tool
     async def browser_console_view(max_lines: int = 50) -> str:

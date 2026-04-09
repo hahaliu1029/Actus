@@ -239,6 +239,21 @@ class DoneEvent(BaseEvent):
     type: Literal["done"] = "done"
 
 
+class ToolConfirmationEvent(BaseEvent):
+    """危险工具确认请求事件"""
+
+    type: Literal["tool_confirmation"] = "tool_confirmation"
+    tool_call_id: str
+    tool_name: str
+    tool_args: Dict[str, Any]
+    risk_level: str
+    risk_reason: str
+    matched_patterns: List[str]
+    suggested_alternative: Optional[str] = None
+    approval_options: List[str] = Field(default=["once", "session", "always", "deny"])
+    timeout_seconds: int
+
+
 # 定义应用事件类型声明
 Event = Annotated[
     Union[
@@ -253,6 +268,7 @@ Event = Annotated[
         ContextStatusEvent,
         CompactionEvent,
         FinishingEvent,
+        ToolConfirmationEvent,
         DoneEvent,
     ],
     Field(discriminator="type"),

@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable, Optional, Sequence
 
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -89,6 +90,8 @@ class PlannerReActFlow(BaseFlow):
         memory_embedding_provider=None,
         memory_session_factory=None,
         memory_repo_factory=None,
+        approval_cache: Any = None,  # ApprovalCache | None
+        confirmation_manager: Any = None,  # ConfirmationManager | None
     ) -> None:
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
@@ -168,6 +171,10 @@ class PlannerReActFlow(BaseFlow):
         self._memory_session_factory = memory_session_factory
         self._memory_repo_factory = memory_repo_factory
         self._has_memory_tools = False  # set by _collect_all_tools
+
+        # Dangerous tool approval cache (Task 17)
+        self._approval_cache = approval_cache
+        self._confirmation_manager = confirmation_manager
 
     @property
     def summary_llm(self):
@@ -724,6 +731,34 @@ class PlannerReActFlow(BaseFlow):
         text = " ".join(parts).lower()
         return "brainstorm_skill" in text or "generate_skill" in text
 
+    def _build_config(self) -> dict:
+        """Build the LangGraph config dict shared by invoke() and resume()."""
+        # Read tool confirmation settings from AgentConfig (config.yaml, user-editable)
+        tc = getattr(self._agent_config, "tool_confirmation", None)
+        tc_enabled = getattr(tc, "enabled", True) if tc else True
+        tc_timeout = getattr(tc, "timeout_seconds", 300) if tc else 300
+        tc_smart_approve = getattr(tc, "smart_approve_enabled", False) if tc else False
+        tc_smart_approve_medium_only = getattr(tc, "smart_approve_medium_only", False) if tc else False
+        return {
+            "configurable": {
+                "thread_id": self._session_id,
+                "skill_context_refresher": self._skill_context_refresher,
+                "react_graph_provider": self._react_graph_provider,
+                "skill_guide_injector": self._skill_guide_injector,
+                "has_file_view": self._file_processor_lookup is not None,
+                "has_memory_tools": self._has_memory_tools,
+                "approval_cache": self._approval_cache,
+                "confirmation_manager": self._confirmation_manager,
+                "user_id": self._user_id,
+                "session_id": self._session_id,
+                "tool_confirmation_enabled": tc_enabled,
+                "smart_approve_enabled": tc_smart_approve,
+                "smart_approve_medium_only": tc_smart_approve_medium_only,
+                "summary_llm": self._summary_llm if hasattr(self, "_summary_llm") else None,
+                "tool_confirmation_timeout_seconds": tc_timeout,
+            }
+        }
+
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """Run the flow — delegates to LangGraph main_graph."""
         # 1. Continuation: existing skill graph state → drive subgraph
@@ -736,17 +771,7 @@ class PlannerReActFlow(BaseFlow):
         # 延迟绑定：每次 invoke 重新构建工具和图，确保 MCP/A2A 已初始化
         await self._ensure_graphs()
 
-        # LangGraph config with thread_id for checkpointer
-        config = {
-            "configurable": {
-                "thread_id": self._session_id,
-                "skill_context_refresher": self._skill_context_refresher,
-                "react_graph_provider": self._react_graph_provider,
-                "skill_guide_injector": self._skill_guide_injector,
-                "has_file_view": self._file_processor_lookup is not None,
-                "has_memory_tools": self._has_memory_tools,
-            }
-        }
+        config = self._build_config()
 
         # === Before Graph: load summaries ===
         async with self._uow_factory() as uow:
@@ -770,7 +795,13 @@ class PlannerReActFlow(BaseFlow):
             pass
 
         if is_resume:
-            # Resume path: checkpointer has saved full state, pass user response
+            # Resume path: checkpointer has saved full state, pass user response.
+            # IMPORTANT: If the interrupt was from a tool_confirmation (react_graph
+            # tool_node), the resume value must be a structured dict like
+            # {"action": "approve", "scope": "session"}. Plain text from the user
+            # should NOT be routed here — tool confirmations use the dedicated
+            # _resume_tool_confirmation() path in agent_service.
+            # This path only handles message_ask_user interrupts (plain text is fine).
             input_for_graph = Command(resume=message.message)
             logger.info(
                 "通过 checkpointer 恢复中断: session=%s, resume=%s",
@@ -888,6 +919,31 @@ class PlannerReActFlow(BaseFlow):
                 await self._persist_after_graph(bridge.final_state, summaries)
             else:
                 # 正常完成路径：延迟到 invoke() 的 FINISHING 阶段
+                self._deferred_final_state = bridge.final_state
+                self._deferred_summaries = summaries
+
+    async def resume(self, command: Any) -> AsyncGenerator[BaseEvent, None]:
+        """Resume the graph from a pending interrupt using a LangGraph Command.
+
+        The command (e.g. Command(resume=value)) is passed directly as input
+        to the main_graph. The same checkpointer/thread_id config is used so
+        that LangGraph can restore the interrupted state and continue.
+        """
+        await self._ensure_graphs()
+
+        config = self._build_config()
+
+        async with self._uow_factory() as uow:
+            summaries = await uow.session.get_summary(self._session_id)
+
+        bridge = GraphEventBridge()
+        try:
+            async for event in bridge.run(self._main_graph, command, config=config):
+                yield event
+        finally:
+            if bridge.final_state.get("should_interrupt"):
+                await self._persist_after_graph(bridge.final_state, summaries)
+            else:
                 self._deferred_final_state = bridge.final_state
                 self._deferred_summaries = summaries
 

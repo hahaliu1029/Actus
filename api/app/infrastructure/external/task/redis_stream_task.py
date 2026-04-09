@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import uuid
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from app.domain.external.message_queue import MessageQueue
 from app.domain.external.task import Task, TaskRunner
@@ -66,6 +66,23 @@ class RedisStreamTask(Task):
         if self.done:
             self._execution_task = asyncio.create_task(self._execute_task())
             logger.info(f"任务[{self._id}]开始执行")
+
+    async def _execute_resume(self, command: Any) -> None:
+        """Execute resume in background task (mirrors _execute_task for invoke)."""
+        try:
+            await self._task_runner.resume(self, command)
+        except asyncio.CancelledError:
+            logger.info(f"任务[{self._id}] resume 被取消")
+            raise
+        except Exception as e:
+            logger.error(f"任务[{self._id}] resume 出现异常: {str(e)}")
+        finally:
+            self._on_task_done()
+
+    async def resume(self, command: Any) -> None:
+        """Resume task in a background asyncio.Task (mirrors invoke pattern)."""
+        self._execution_task = asyncio.create_task(self._execute_resume(command))
+        logger.info(f"任务[{self._id}] resume 开始执行")
 
     def cancel(self, reason: str = "stop") -> bool:
         """取消当前执行的任务"""

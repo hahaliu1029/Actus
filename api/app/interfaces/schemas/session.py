@@ -31,6 +31,14 @@ class ListSessionResponse(BaseModel):
     sessions: List[ListSessionItem]
 
 
+class ToolConfirmationAction(BaseModel):
+    """危险工具确认请求"""
+
+    action: Literal["approve", "deny"]
+    scope: Literal["once", "session", "always"]
+    tool_call_id: str
+
+
 class ChatRequest(BaseModel):
     """聊天请求结构"""
 
@@ -39,6 +47,7 @@ class ChatRequest(BaseModel):
         default_factory=list
     )  # 附件列表(传递的是文件id列表)
     skill_confirmation_action: Optional[SkillConfirmationAction] = None
+    tool_confirmation: Optional[ToolConfirmationAction] = None
     event_id: Optional[str] = None  # 最新事件id
     timestamp: Optional[int] = None  # 当前时间戳
 

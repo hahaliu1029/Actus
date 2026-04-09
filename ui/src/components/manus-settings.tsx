@@ -120,6 +120,12 @@ export function ManusSettings() {
     max_iterations: 100,
     max_retries: 3,
     max_search_results: 10,
+    tool_confirmation: {
+      enabled: true,
+      timeout_seconds: 300,
+      smart_approve_enabled: false,
+      smart_approve_medium_only: false,
+    },
   });
 
   const [llmForm, setLLMForm] = useState<LLMConfig>({
@@ -461,6 +467,107 @@ export function ManusSettings() {
                       <p className="mt-1 text-xs text-muted-foreground">
                       </p>
                     </label>
+                  </div>
+
+                  {/* 工具确认安全策略 */}
+                  <div className="mt-8 border-t border-border pt-6">
+                    <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                      安全策略
+                    </h3>
+                    <p className="mb-4 text-sm text-muted-foreground">
+                      控制 Agent 执行危险工具（如终端命令、文件写入）时的确认行为。
+                    </p>
+                    <div className="grid max-w-[420px] grid-cols-1 gap-5">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="text-sm text-foreground/85">启用危险工具确认</span>
+                          <p className="text-xs text-muted-foreground">
+                            关闭后所有工具将直接执行，不再弹出确认卡片。
+                          </p>
+                        </div>
+                        <Switch
+                          checked={agentForm.tool_confirmation?.enabled ?? true}
+                          onCheckedChange={(checked) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              tool_confirmation: {
+                                ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                enabled: checked,
+                              },
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <label className="text-sm text-foreground/85">
+                        确认超时（秒）
+                        <Input
+                          type="number"
+                          min={30}
+                          max={3600}
+                          value={agentForm.tool_confirmation?.timeout_seconds ?? 300}
+                          onChange={(event) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              tool_confirmation: {
+                                ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                timeout_seconds: Number(event.target.value),
+                              },
+                            }))
+                          }
+                          className="mt-1"
+                          disabled={!(agentForm.tool_confirmation?.enabled ?? true)}
+                        />
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          超时后 Agent 将自动尝试安全替代方案。
+                        </p>
+                      </label>
+
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="text-sm text-foreground/85">Smart Approve（LLM 辅助审批）</span>
+                          <p className="text-xs text-muted-foreground">
+                            启用后，低风险命令可由辅助 LLM 自动审批通过。
+                          </p>
+                        </div>
+                        <Switch
+                          checked={agentForm.tool_confirmation?.smart_approve_enabled ?? false}
+                          onCheckedChange={(checked) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              tool_confirmation: {
+                                ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                smart_approve_enabled: checked,
+                              },
+                            }))
+                          }
+                          disabled={!(agentForm.tool_confirmation?.enabled ?? true)}
+                        />
+                      </div>
+
+                      {(agentForm.tool_confirmation?.smart_approve_enabled) && (
+                        <div className="flex items-center justify-between pl-4">
+                          <div>
+                            <span className="text-sm text-foreground/85">仅 Medium 工具启用</span>
+                            <p className="text-xs text-muted-foreground">
+                              High 风险工具始终需人工确认。
+                            </p>
+                          </div>
+                          <Switch
+                            checked={agentForm.tool_confirmation?.smart_approve_medium_only ?? false}
+                            onCheckedChange={(checked) =>
+                              setAgentForm((prev) => ({
+                                ...prev,
+                                tool_confirmation: {
+                                  ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                  smart_approve_medium_only: checked,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               ) : null}

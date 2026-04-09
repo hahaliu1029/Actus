@@ -10,6 +10,7 @@ from app.domain.models.event import (
     Event,
     PlanEvent,
     StepEvent,
+    ToolConfirmationEvent,
     ToolEvent,
     ToolEventStatus,
 )
@@ -270,6 +271,44 @@ class ControlSSEEvent(BaseSSEEvent):
         )
 
 
+class ToolConfirmationEventData(BaseEventData):
+    """危险工具确认请求事件数据"""
+
+    tool_call_id: str
+    tool_name: str
+    tool_args: dict[str, Any]
+    risk_level: str
+    risk_reason: str
+    matched_patterns: list[str]
+    suggested_alternative: str | None = None
+    approval_options: list[str] = ["once", "session", "always", "deny"]
+    timeout_seconds: int
+
+
+class ToolConfirmationSSEEvent(BaseSSEEvent):
+    """危险工具确认请求流式事件"""
+
+    event: Literal["tool_confirmation"] = "tool_confirmation"
+    data: ToolConfirmationEventData
+
+    @classmethod
+    def from_event(cls, event: ToolConfirmationEvent) -> "ToolConfirmationSSEEvent":
+        return cls(
+            data=ToolConfirmationEventData(
+                **BaseEventData.base_event_data(event),
+                tool_call_id=event.tool_call_id,
+                tool_name=event.tool_name,
+                tool_args=event.tool_args,
+                risk_level=event.risk_level,
+                risk_reason=event.risk_reason,
+                matched_patterns=event.matched_patterns,
+                suggested_alternative=event.suggested_alternative,
+                approval_options=event.approval_options,
+                timeout_seconds=event.timeout_seconds,
+            )
+        )
+
+
 class ErrorEventData(BaseEventData):
     """错误事件数据"""
 
@@ -296,6 +335,7 @@ AgentSSEEvent = Union[
     ErrorSSEEvent,
     WaitSSEEvent,
     ControlSSEEvent,
+    ToolConfirmationSSEEvent,
 ]
 
 

@@ -182,6 +182,10 @@ async def lifespan(app: FastAPI):
         )
         logger.info("AgentService 单例初始化完成")
 
+        # 9. 启动 Confirmation Sweep 后台任务（扫描超时的危险工具确认）
+        app.state.agent_service.start_sweep_task()
+        logger.info("Confirmation sweep task 已启动")
+
         # Clean stale FINISHING sessions (best-effort: deferred_final_state lost on restart)
         try:
             from sqlalchemy import update

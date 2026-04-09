@@ -47,7 +47,9 @@ from app.domain.models.session import Session, SessionStatus
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.confirmation_manager import ConfirmationManager
 from core.config import get_settings
+from langgraph.types import Command
 from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
@@ -107,7 +109,18 @@ class AgentService:
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
         self._takeover_timeout_tasks: dict[str, asyncio.Task] = {}
+        self._confirmation_sweep_task: asyncio.Task | None = None
         self._settings = get_settings()
+        # Eagerly init ConfirmationManager so sweep and chat() guard work from startup
+        self._confirmation_manager: ConfirmationManager | None = None
+        if redis_client and hasattr(redis_client, "client"):
+            try:
+                self._confirmation_manager = ConfirmationManager(
+                    redis=redis_client.client,
+                    timeout_seconds=self._settings.tool_confirmation_timeout_seconds,
+                )
+            except Exception:
+                logger.warning("Failed to init ConfirmationManager at startup")
         logger.info("AgentService初始化成功")
 
     def _refresh_config(self, snapshot: _ConfigSnapshot) -> None:
@@ -172,6 +185,22 @@ class AgentService:
                 video_config=snap.file_understanding_config.video,
             )
 
+        # Build ApprovalCache if Redis is available
+        approval_cache = None
+        if self._redis_client and hasattr(self._redis_client, "client"):
+            try:
+                from app.domain.services.approval_cache import ApprovalCache
+                from app.infrastructure.storage.postgres import get_postgres
+                approval_cache = ApprovalCache(
+                    redis=self._redis_client.client,
+                    session_factory=get_postgres().session_factory,
+                )
+            except Exception:
+                logger.warning("Failed to build ApprovalCache, tool confirmations will always prompt")
+
+        # Reuse the service-level ConfirmationManager (initialized in __init__)
+        confirmation_manager_inst = self._confirmation_manager
+
         # 6.创建AgentTaskRunner
         task_runner = AgentTaskRunner(
             uow_factory=self._uow_factory,
@@ -197,6 +226,8 @@ class AgentService:
             memory_embedding_provider=self._memory_embedding_provider,
             memory_session_factory=self._memory_session_factory,
             memory_repo_factory=self._memory_repo_factory,
+            approval_cache=approval_cache,
+            confirmation_manager=confirmation_manager_inst,
         )
 
         # 6.创建任务Task并更新会话中的信息
@@ -220,6 +251,181 @@ class AgentService:
                 await uow.session.update_unread_message_count(session_id, 0)
         except Exception as e:
             logger.warning(f"会话[{session_id}]后台更新未读消息计数失败: {e}")
+
+    async def _resume_tool_confirmation(
+        self,
+        session_id: str,
+        user_id: str,
+        is_admin: bool,
+        tool_confirmation: object,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """处理危险工具确认的恢复路径。
+
+        1. 从 ConfirmationManager 读取确认详情
+        2. 标记为 PROCESSING
+        3. 获取/创建 task 并调用 task.resume(Command(resume=...))
+        4. 清理确认截止时间
+        5. 从 task 输出流中 yield 事件
+        """
+        action: str = getattr(tool_confirmation, "action", "deny")
+        scope: str = getattr(tool_confirmation, "scope", "once")
+        tool_call_id: str = getattr(tool_confirmation, "tool_call_id", "")
+
+        try:
+            # 1. 校验会话访问权限
+            session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+            # 2. 从 Redis 读取确认详情（复用 __init__ 中初始化的单例）
+            if not self._confirmation_manager:
+                raise BadRequestError("ConfirmationManager 不可用，无法处理工具确认")
+            confirmation_mgr = self._confirmation_manager
+            detail = await confirmation_mgr.read(session_id, tool_call_id)
+            if not detail:
+                raise NotFoundError(
+                    f"工具确认请求[{tool_call_id}]不存在或已过期"
+                )
+            if detail.status != "pending":
+                raise BadRequestError(
+                    f"工具确认请求[{tool_call_id}]状态为{detail.status}，无法处理"
+                )
+
+            # 3. 标记为 PROCESSING，防止重复处理
+            await confirmation_mgr.mark_processing(session_id, tool_call_id)
+
+            # 4. 获取或创建 task + resume（失败时回退为 pending）
+            try:
+                task = await self._get_task(session)
+                if task is None:
+                    task = await self._create_task(session)
+                    if not task:
+                        raise RuntimeError(f"会话[{session_id}]创建任务失败")
+
+                # 5. 构造 Command(resume=...) 并调用 task.resume()
+                resume_value = {"action": action, "scope": scope}
+                await task.resume(Command(resume=resume_value))
+            except Exception as _resume_err:
+                # 回退为 pending，允许用户重试或超时扫描接管
+                try:
+                    await confirmation_mgr.mark_pending(session_id, tool_call_id)
+                except Exception:
+                    logger.warning("回退确认状态为 pending 失败: %s:%s", session_id, tool_call_id)
+                raise _resume_err
+
+            logger.info(
+                "会话[%s] 工具确认恢复: tool_call_id=%s action=%s scope=%s",
+                session_id, tool_call_id, action, scope,
+            )
+
+            # 6. 根据 action + scope 写入 ApprovalCache / 创建永久规则，并记录审计日志
+            if action == "approve":
+                if scope == "session" and self._redis_client and hasattr(self._redis_client, "client"):
+                    try:
+                        from app.domain.services.approval_cache import ApprovalCache
+                        cache = ApprovalCache(redis=self._redis_client.client)
+                        await cache.write_session(
+                            session_id=session_id,
+                            tool_name=detail.tool_name,
+                            arg_digest=detail.arg_digest,
+                        )
+                        logger.info(
+                            "会话[%s] 写入 session-level ApprovalCache: tool=%s",
+                            session_id, detail.tool_name,
+                        )
+                    except Exception as _cache_err:
+                        logger.warning("写入 ApprovalCache 失败: %s", _cache_err)
+
+                elif scope == "always":
+                    try:
+                        from app.domain.models.tool_approval_rule import ToolApprovalRule
+                        from app.infrastructure.repositories.db_tool_approval_rule_repository import (
+                            DBToolApprovalRuleRepository,
+                        )
+                        from app.infrastructure.storage.postgres import get_postgres
+                        async with get_postgres().session_factory() as _session:
+                            rule_repo = DBToolApprovalRuleRepository(_session)
+                            # Escape glob special chars so the rule is an exact match.
+                            # User can later broaden it in the settings page.
+                            import re as _re
+                            def _escape_glob(s: str) -> str:
+                                """Escape *, ?, [ for fnmatch literal matching."""
+                                return _re.sub(r'([\*\?\[\]])', r'[\1]', s)
+
+                            rule = ToolApprovalRule(
+                                user_id=user_id,
+                                tool_name=detail.tool_name,
+                                rule="always_allow",
+                                command_pattern=_escape_glob(detail.primary_arg) if detail.primary_arg else "*",
+                                dir_pattern=_escape_glob(detail.dir_arg) if detail.dir_arg else "",
+                            )
+                            await rule_repo.create(rule)
+                            await _session.commit()
+                        logger.info(
+                            "会话[%s] 创建永久 always_allow 规则: tool=%s pattern=%s",
+                            session_id, detail.tool_name, detail.primary_arg,
+                        )
+                    except Exception as _rule_err:
+                        logger.warning("创建永久审批规则失败: %s", _rule_err)
+
+            # 记录审计日志
+            try:
+                async with self._uow_factory() as _audit_uow:
+                    await _audit_uow.tool_approval_log.create(
+                        user_id=user_id,
+                        session_id=session_id,
+                        tool_name=detail.tool_name,
+                        tool_args=detail.tool_args,
+                        risk_level=detail.risk_level,
+                        action=action,
+                        scope=scope,
+                        approved_by="user",
+                    )
+            except Exception as _log_err:
+                logger.warning("写入工具审批审计日志失败: %s", _log_err)
+
+            # 7. 清理确认截止时间
+            await confirmation_mgr.cleanup(session_id, tool_call_id)
+
+            # 8. 从 task 输出流中读取事件并 yield
+            latest_event_id = None
+            while True:
+                event_id, event_str = await task.output_stream.get(
+                    start_id=latest_event_id, block_ms=OUTPUT_STREAM_POLL_BLOCK_MS
+                )
+                if event_str is None:
+                    if task.done:
+                        break
+                    continue
+                latest_event_id = event_id
+
+                event = TypeAdapter(Event).validate_json(event_str)
+                event.id = event_id
+
+                async with self._uow_factory() as uow:
+                    await uow.session.update_unread_message_count(session_id, 0)
+
+                yield event
+                if isinstance(event, (DoneEvent, ErrorEvent, WaitEvent, ControlEvent)):
+                    break
+
+            logger.info(f"会话[{session_id}]工具确认恢复完成")
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as e:
+            logger.error(f"会话[{session_id}]工具确认恢复出错: {str(e)}")
+            event = ErrorEvent(error=str(e))
+            try:
+                async with self._uow_factory() as uow:
+                    await uow.session.add_event(session_id, event)
+            except (asyncio.CancelledError, Exception) as add_err:
+                logger.warning(
+                    f"会话[{session_id}]添加错误事件失败: {add_err}"
+                )
+            yield event
+        finally:
+            try:
+                asyncio.create_task(self._safe_update_unread_count(session_id))
+            except RuntimeError:
+                logger.warning(f"会话[{session_id}]无法创建后台任务更新未读消息计数")
 
     async def _get_accessible_session(
         self, session_id: str, user_id: str, is_admin: bool = False
@@ -258,10 +464,19 @@ class AgentService:
         message: Optional[str] = None,
         attachments: Optional[List[str]] = None,
         skill_confirmation_action: SkillConfirmationAction | None = None,
+        tool_confirmation: object | None = None,
         latest_event_id: Optional[str] = None,
         timestamp: Optional[datetime] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的信息调用Agent服务发起对话请求"""
+        # 危险工具确认恢复路径：直接走 resume 流程，不走正常 chat 分支
+        if tool_confirmation is not None:
+            async for event in self._resume_tool_confirmation(
+                session_id, user_id, is_admin, tool_confirmation
+            ):
+                yield event
+            return
+
         try:
             # 1.检查会话是否存在
             session = await self._get_accessible_session(session_id, user_id, is_admin)
@@ -298,6 +513,19 @@ class AgentService:
                             raise RuntimeError(f"会话[{session_id}]创建任务失败")
                 elif session.status != SessionStatus.RUNNING or task is None:
                     if session.status == SessionStatus.WAITING:
+                        # Check if waiting due to tool_confirmation — if so, reject plain text.
+                        # Tool confirmations must go through the dedicated _resume_tool_confirmation() path.
+                        if self._confirmation_manager:
+                            try:
+                                has_pending = await self._confirmation_manager.has_pending_for_session(session_id)
+                                if has_pending:
+                                    raise BadRequestError(
+                                        "当前会话正在等待工具确认，请通过确认卡片操作，不支持文本输入"
+                                    )
+                            except BadRequestError:
+                                raise
+                            except Exception:
+                                pass  # Redis failure should not block normal chat
                         logger.info(
                             "会话[%s] WAITING状态恢复: 将创建新任务并从数据库加载中断状态",
                             session_id,
@@ -1428,8 +1656,82 @@ end
             "remaining_seconds": remaining_seconds,
         }
 
+    def start_sweep_task(self) -> None:
+        """Start the background confirmation-sweep asyncio.Task.
+
+        Should be called once from the FastAPI lifespan after all services are
+        initialized.  Safe to call multiple times — no-ops if already running.
+        """
+        if self._confirmation_sweep_task is not None and not self._confirmation_sweep_task.done():
+            return
+        self._confirmation_sweep_task = asyncio.create_task(
+            self._confirmation_sweep_loop(),
+            name="confirmation_sweep",
+        )
+
+    async def _confirmation_sweep_loop(self) -> None:
+        """Background task: sweep expired confirmations every 30s."""
+        import uuid
+        worker_id = str(uuid.uuid4())[:8]
+        while True:
+            try:
+                await asyncio.sleep(30)
+                if not self._confirmation_manager:
+                    continue
+                if not await self._confirmation_manager.acquire_sweep_lock(worker_id):
+                    continue
+                expired = await self._confirmation_manager.find_expired()
+                for detail in expired:
+                    try:
+                        await self._confirmation_manager.mark_processing(detail.session_id, detail.tool_call_id)
+                        logger.info(
+                            "Confirmation timeout: session=%s tool_call=%s, resuming with timeout_fallback",
+                            detail.session_id,
+                            detail.tool_call_id,
+                        )
+                        # Resume the interrupted graph with timeout_fallback action
+                        resume_ok = False
+                        try:
+                            async with self._uow_factory() as _sweep_uow:
+                                session = await _sweep_uow.session.get_by_id(detail.session_id)
+                            if session:
+                                task = await self._get_task(session)
+                                if task is None:
+                                    task = await self._create_task(session)
+                                if task:
+                                    from langgraph.types import Command
+                                    await task.resume(Command(resume={"action": "timeout_fallback", "scope": "once"}))
+                                    resume_ok = True
+                        except Exception:
+                            logger.exception(
+                                "Timeout resume failed for session=%s, rolling back to pending",
+                                detail.session_id,
+                            )
+                        if resume_ok:
+                            await self._confirmation_manager.cleanup(detail.session_id, detail.tool_call_id)
+                        else:
+                            # Roll back to pending so next sweep cycle can retry
+                            await self._confirmation_manager.mark_pending(detail.session_id, detail.tool_call_id)
+                    except Exception:
+                        logger.exception(
+                            "Sweep failed for %s:%s",
+                            detail.session_id,
+                            detail.tool_call_id,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Confirmation sweep error")
+
     async def shutdown(self) -> None:
         """关闭Agent服务"""
+        if self._confirmation_sweep_task is not None and not self._confirmation_sweep_task.done():
+            self._confirmation_sweep_task.cancel()
+            try:
+                await self._confirmation_sweep_task
+            except asyncio.CancelledError:
+                pass
+        self._confirmation_sweep_task = None
         for task in list(self._pending_timeout_tasks.values()):
             if not task.done():
                 task.cancel()

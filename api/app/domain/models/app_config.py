@@ -162,6 +162,15 @@ class MemoryConfig(BaseModel):
     hybrid_alpha: float = Field(0.7, ge=0.0, le=1.0)  # C7 仅占位不参与计算, C8 生效
 
 
+class ToolConfirmationConfig(BaseModel):
+    """危险工具确认策略配置"""
+
+    enabled: bool = Field(default=True, description="是否启用危险工具确认（关闭后所有工具直接执行）")
+    timeout_seconds: int = Field(default=300, ge=30, le=3600, description="确认超时秒数")
+    smart_approve_enabled: bool = Field(default=False, description="启用 Smart Approve（LLM 辅助审批）")
+    smart_approve_medium_only: bool = Field(default=False, description="Smart Approve 仅对 medium 工具生效")
+
+
 class AgentConfig(BaseModel):
     """Agent通用配置"""
 
@@ -171,6 +180,7 @@ class AgentConfig(BaseModel):
     skill_selection: SkillSelectionPolicy = Field(default_factory=SkillSelectionPolicy)
     skill_embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    tool_confirmation: ToolConfirmationConfig = Field(default_factory=ToolConfirmationConfig)
 
 
 class MCPTransport(str, Enum):

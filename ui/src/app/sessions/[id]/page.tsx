@@ -16,6 +16,7 @@ import {
 import { ChatInput } from "@/components/chat-input";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
+import { ToolConfirmationCard } from "@/components/tool-confirmation-card";
 import { StatusIndicator } from "@/components/status-indicator";
 import { SessionTaskDock } from "@/components/session-task-dock";
 import { WorkbenchPanel } from "@/components/workbench-panel";
@@ -343,6 +344,10 @@ function renderEventItem(
   streamingAssistantEventId?: string | null
 ) {
   const eventKey = getSessionEventStableKey(event, index);
+
+  if (event.event === "tool_confirmation") {
+    return <ToolConfirmationCard key={eventKey} data={event.data as Parameters<typeof ToolConfirmationCard>[0]["data"]} />;
+  }
 
   if (event.event === "message") {
     const role = String(event.data.role || "assistant");

@@ -151,7 +151,7 @@ function resolveStatusFromEvent(
   if (event.type === "finishing") {
     return "finishing";
   }
-  if (event.type === "wait") {
+  if (event.type === "wait" || event.type === "tool_confirmation") {
     return "waiting";
   }
   if (event.type === "done" || event.type === "error") {
@@ -228,6 +228,17 @@ function eventSemanticKey(event: SessionEventRecord): string | null {
     const stepId = event.data?.id;
     if (typeof stepId === "string" && stepId.trim()) {
       return `step:${stepId}`;
+    }
+  }
+
+  if (event.event === "tool_confirmation") {
+    const toolCallId = event.data?.tool_call_id;
+    if (typeof toolCallId === "string" && toolCallId.trim()) {
+      return `tool_confirmation:${toolCallId}`;
+    }
+    const eventId = event.data?.event_id;
+    if (typeof eventId === "string" && eventId.trim()) {
+      return `tool_confirmation:${eventId}`;
     }
   }
 
@@ -828,6 +839,7 @@ export const useSessionStore = create<SessionStore>()(
             if (
               event.type === "done" ||
               event.type === "wait" ||
+              event.type === "tool_confirmation" ||
               event.type === "error" ||
               event.type === "control" ||
               event.type === "finishing"

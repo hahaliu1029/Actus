@@ -31,11 +31,11 @@ class Settings(BaseSettings):
 
     # 请求限流配置
     rate_limit_window_seconds: int = 60
-    rate_limit_read_per_minute: int = 120
-    rate_limit_write_per_minute: int = 60
-    rate_limit_chat_per_minute: int = 60
-    rate_limit_sse_concurrent: int = 10
-    rate_limit_ws_concurrent: int = 5
+    rate_limit_read_per_minute: int = 600
+    rate_limit_write_per_minute: int = 300
+    rate_limit_chat_per_minute: int = 300
+    rate_limit_sse_concurrent: int = 20
+    rate_limit_ws_concurrent: int = 10
     rate_limit_connection_ttl_seconds: int = 120
     rate_limit_heartbeat_seconds: int = 30
     rate_limit_auth_per_minute: int = 10  # 认证端点 IP 限流
@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     feature_takeover_lease_ttl_seconds: int = 900
     feature_takeover_reopen_window_seconds: int = 300
     feature_takeover_lease_guard_interval_seconds: int = 15
+
+    # 危险工具确认配置
+    tool_confirmation_timeout_seconds: int = 300
+    smart_approve_enabled: bool = False
 
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶

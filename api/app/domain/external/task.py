@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from app.domain.external.message_queue import MessageQueue
 
@@ -10,6 +10,11 @@ class TaskRunner(ABC):
     @abstractmethod
     async def invoke(self, task: "Task") -> None:
         """调用任务并执行"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def resume(self, task: "Task", command: Any) -> None:
+        """Resume a paused task with a LangGraph Command."""
         raise NotImplementedError
 
     @abstractmethod
@@ -28,6 +33,10 @@ class Task(Protocol):
 
     async def invoke(self) -> None:
         """运行当前任务"""
+        ...
+
+    async def resume(self, command: Any) -> None:
+        """Resume this task with a LangGraph Command."""
         ...
 
     def cancel(self, reason: str = "stop") -> bool:
