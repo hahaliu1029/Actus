@@ -220,6 +220,7 @@ from fastapi.responses import RedirectResponse
 async def wechat_authorize(
     state: str | None = None,
     scope: str = "snsapi_userinfo",
+    _rl: None = Depends(rate_limit_auth),
 ) -> Response:
     """获取微信授权 URL"""
     settings = get_settings()
@@ -248,6 +249,7 @@ async def wechat_authorize(
 async def wechat_callback(
     code: str,
     state: str = "",
+    _rl: None = Depends(rate_limit_auth),
 ) -> RedirectResponse:
     """微信授权回调
 

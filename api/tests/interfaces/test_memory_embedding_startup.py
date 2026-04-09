@@ -41,7 +41,10 @@ def _enter_base_patches(stack: ExitStack) -> None:
     )
     stack.enter_context(patch("app.main.command"))  # skip Alembic migrations
     stack.enter_context(
-        patch("app.main.get_agent_service", return_value=MagicMock(shutdown=AsyncMock()))
+        patch(
+            "app.interfaces.service_dependencies._build_agent_service",
+            return_value=MagicMock(shutdown=AsyncMock()),
+        )
     )
     stack.enter_context(
         patch("app.infrastructure.checkpointer_pool.CheckpointerPool", return_value=MagicMock(

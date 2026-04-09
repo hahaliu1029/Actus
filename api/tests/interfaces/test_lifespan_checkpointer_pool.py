@@ -27,7 +27,7 @@ async def test_lifespan_opens_and_closes_checkpointer_pool():
     ), patch(
         "app.main.command"  # skip Alembic migrations
     ), patch(
-        "app.main.get_agent_service", return_value=MagicMock(shutdown=AsyncMock())
+        "app.interfaces.service_dependencies._build_agent_service", return_value=MagicMock(shutdown=AsyncMock())
     ):
         async with lifespan(app):
             # Startup complete — open() should have been called

@@ -118,7 +118,7 @@ class AuthService:
             raise ValueError("用户名或密码错误")
 
         if not user.is_active():
-            raise ValueError("账户已被禁用")
+            raise ValueError("用户名或密码错误")
 
         tokens = create_tokens(user.id, user.username or "", user.role.value)
         logger.info(f"User logged in: {user.id}")
@@ -148,11 +148,8 @@ class AuthService:
             raise ValueError("无效的令牌")
 
         user = await self.user_repository.get_by_id(user_id)
-        if not user:
-            raise ValueError("用户不存在")
-
-        if not user.is_active():
-            raise ValueError("账户已被禁用")
+        if not user or not user.is_active():
+            raise ValueError("无效的刷新令牌")
 
         tokens = create_tokens(user.id, user.username or "", user.role.value)
         logger.info(f"Token refreshed for user: {user.id}")

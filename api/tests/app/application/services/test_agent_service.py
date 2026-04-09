@@ -4,8 +4,9 @@ from typing import Optional
 import pytest
 from app.application.errors.exceptions import BadRequestError
 from app.application.services.agent_service import AgentService
-from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.session import Session, SessionStatus
+
+from tests.app.application.services.conftest import default_snapshot as _default_snapshot
 
 pytestmark = pytest.mark.anyio
 
@@ -114,10 +115,7 @@ class _DummyInputStream:
 async def test_chat_polling_does_not_block_when_no_output_event(monkeypatch) -> None:
     service = AgentService(
         uow_factory=_uow_factory,
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=_DummyTaskClass,
         search_engine=object(),
@@ -170,10 +168,7 @@ async def test_chat_polling_does_not_block_when_no_output_event(monkeypatch) -> 
 async def test_chat_with_message_yields_user_message_event_immediately(monkeypatch) -> None:
     service = AgentService(
         uow_factory=_uow_factory,
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=_DummyTaskClass,
         search_engine=object(),
@@ -223,10 +218,7 @@ async def test_chat_with_message_forbidden_in_takeover_states(
 ) -> None:
     service = AgentService(
         uow_factory=_uow_factory,
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=_DummyTaskClass,
         search_engine=object(),

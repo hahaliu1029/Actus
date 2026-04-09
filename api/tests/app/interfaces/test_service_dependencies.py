@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+"""Tests for service_dependencies: _build_config_snapshot, _build_agent_service, get_agent_service."""
+from unittest.mock import MagicMock, patch
 
 from app.domain.models.app_config import (
     A2AConfig,
@@ -40,7 +41,7 @@ class _CapturedAgentService:
         self.kwargs = kwargs
 
 
-def test_get_agent_service_builds_context_overflow_config_from_llm(monkeypatch) -> None:
+def test_build_config_snapshot_builds_context_overflow_config_from_llm(monkeypatch) -> None:
     app_config = AppConfig(
         llm_config=LLMConfig(
             base_url="https://api.openai.com/v1",
@@ -76,12 +77,12 @@ def test_get_agent_service_builds_context_overflow_config_from_llm(monkeypatch) 
     )
     monkeypatch.setattr(service_dependencies, "ActusChatModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
-    monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
-    monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
-    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: MagicMock(session_factory=MagicMock()))
 
-    service = service_dependencies.get_agent_service(minio_store=object())
-    overflow_config = service.kwargs["overflow_config"]
+    # Clear LLM cache to avoid stale entries from other tests
+    service_dependencies._llm_cache.clear()
+
+    snapshot = service_dependencies._build_config_snapshot(app_config)
+    overflow_config = snapshot.overflow_config
 
     assert overflow_config.context_window == 131072
     assert overflow_config.context_overflow_guard_enabled is True
@@ -95,7 +96,7 @@ def test_get_agent_service_builds_context_overflow_config_from_llm(monkeypatch) 
     assert overflow_config.unknown_model_context_window == 65536
 
 
-def test_get_agent_service_builds_dedicated_summary_llm(monkeypatch) -> None:
+def test_build_config_snapshot_builds_dedicated_summary_llm(monkeypatch) -> None:
     app_config = AppConfig(
         llm_config=LLMConfig(
             base_url="https://api.openai.com/v1",
@@ -120,20 +121,19 @@ def test_get_agent_service_builds_dedicated_summary_llm(monkeypatch) -> None:
     )
     monkeypatch.setattr(service_dependencies, "ActusChatModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
-    monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
-    monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
-    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: MagicMock(session_factory=MagicMock()))
 
-    service = service_dependencies.get_agent_service(minio_store=object())
-    summary_llm = service.kwargs["summary_llm"]
+    # Clear LLM cache to avoid stale entries from other tests
+    service_dependencies._llm_cache.clear()
+
+    snapshot = service_dependencies._build_config_snapshot(app_config)
+    summary_llm = snapshot.summary_llm
 
     assert isinstance(summary_llm, _FakeLLM)
     assert summary_llm.kwargs["model_name"] == "gpt-4o-mini"
 
 
-def test_get_agent_service_passes_memory_deps(monkeypatch) -> None:
-    """C6: get_agent_service passes memory_embedding_provider,
-    memory_session_factory, memory_repo_factory to AgentService."""
+def test_build_agent_service_passes_memory_deps(monkeypatch) -> None:
+    """_build_agent_service passes memory deps through to AgentService."""
     from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
 
     app_config = AppConfig(
@@ -163,10 +163,18 @@ def test_get_agent_service_passes_memory_deps(monkeypatch) -> None:
     mock_postgres.session_factory = mock_session_factory
     monkeypatch.setattr(service_dependencies, "get_postgres", lambda: mock_postgres)
 
+    # Clear caches to avoid stale entries from other tests
+    service_dependencies._llm_cache.clear()
+    service_dependencies._config_cache = None
+    service_dependencies._config_expiry = 0.0
+
     mock_provider = MagicMock()
 
-    service = service_dependencies.get_agent_service(
+    service = service_dependencies._build_agent_service(
         minio_store=object(),
+        redis_client=MagicMock(),
+        checkpointer_pool=MagicMock(),
+        flush_service=MagicMock(),
         memory_embedding_provider=mock_provider,
     )
 

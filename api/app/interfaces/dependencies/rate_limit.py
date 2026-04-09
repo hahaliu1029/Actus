@@ -240,12 +240,26 @@ async def _enforce_ip_limit(
         raise ServiceUnavailableError("限流服务不可用，请稍后重试")
 
 
+def _get_client_ip(request: Request) -> str:
+    """Extract real client IP, respecting reverse proxy headers when configured."""
+    settings = get_settings()
+    if settings.rate_limit_trust_proxy:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            # First IP in X-Forwarded-For is the original client
+            return forwarded.split(",")[0].strip()
+        real_ip = request.headers.get("x-real-ip", "")
+        if real_ip:
+            return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
 async def rate_limit_auth(
     request: Request,
     redis_client: RedisClient = Depends(get_redis),
 ) -> None:
     """Auth endpoint rate limit — keyed by client IP, no login required."""
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _get_client_ip(request)
     await _enforce_ip_limit(
         bucket=RateLimitBucket.AUTH,
         client_ip=client_ip,

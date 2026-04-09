@@ -80,17 +80,11 @@ async def resolve_user_from_access_token(token: str) -> User:
         user_repo = DBUserRepository(session)
         user = await user_repo.get_by_id(user_id)
 
-        if not user:
+        if not user or not user.is_active():
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="用户不存在",
+                detail="无效的访问令牌",
                 headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        if not user.is_active():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="账户已被禁用",
             )
 
         return user

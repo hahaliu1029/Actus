@@ -5,9 +5,10 @@ from datetime import datetime
 import pytest
 from app.application.services.agent_service import AgentService
 from app.application.errors.exceptions import BadRequestError, ConflictError, ForbiddenError
-from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.event import ControlAction, ControlEvent, ControlScope, ControlSource
 from app.domain.models.session import Session, SessionStatus
+
+from tests.app.application.services.conftest import default_snapshot as _default_snapshot
 
 pytestmark = pytest.mark.anyio
 
@@ -100,10 +101,7 @@ class _ResumableTask:
 def _make_service(uow: _Uow) -> AgentService:
     return AgentService(
         uow_factory=lambda: uow,
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=object,
         search_engine=object(),
@@ -710,10 +708,7 @@ async def test_append_control_event_uses_isolated_uow_instance() -> None:
 
     service = AgentService(
         uow_factory=_uow_factory,
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=object,
         search_engine=object(),
@@ -729,10 +724,11 @@ async def test_append_control_event_uses_isolated_uow_instance() -> None:
     )
 
     assert isinstance(control_event.id, str)
-    assert len(created_uows) >= 2
-    assert created_uows[0].session.add_event_calls == []
-    assert created_uows[1].session.add_event_calls
-    assert created_uows[1].session.add_event_calls[0][0] == "s1"
+    # __init__ no longer creates a UoW (Task 5), so only the _append_control_event
+    # call itself should have created one isolated UoW instance.
+    assert len(created_uows) >= 1
+    assert created_uows[0].session.add_event_calls
+    assert created_uows[0].session.add_event_calls[0][0] == "s1"
 
 
 async def test_start_takeover_forbidden_when_feature_disabled(
@@ -1031,10 +1027,7 @@ async def test_shutdown_cancels_background_tasks() -> None:
 
     service = AgentService(
         uow_factory=lambda: _Uow(),
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=_DummyTaskCls,
         search_engine=object(),

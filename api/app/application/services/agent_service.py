@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Callable, Dict, List, Optional, Type
 
@@ -55,67 +56,63 @@ TAKEOVER_CANCEL_TIMEOUT_SECONDS = 15
 TAKEOVER_LEASE_TTL_SECONDS = 15 * 60
 
 
+@dataclass(frozen=True)
+class _ConfigSnapshot:
+    """Immutable config-dependent dependency bundle. Atomically swapped on refresh."""
+    llm: BaseChatModel
+    agent_config: "AgentConfig"
+    mcp_config: "MCPConfig"
+    a2a_config: "A2AConfig"
+    skill_risk_policy: "SkillRiskPolicy"
+    overflow_config: "ContextOverflowConfig"
+    summary_llm: BaseChatModel | None
+    vision_fallback_model: BaseChatModel | None
+    skill_creator_service: "SkillCreatorService"
+    supports_vision: bool
+    supports_pdf_input: bool
+    file_understanding_config: "FileUnderstandingConfig | None"
+
+
 class AgentService:
     """Manus智能体服务"""
 
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],
-        llm: BaseChatModel,
-        agent_config: AgentConfig,
-        mcp_config: MCPConfig,
-        a2a_config: A2AConfig,
+        config_snapshot: _ConfigSnapshot,
         sandbox_cls: Type[Sandbox],
         task_cls: Type[Task],
         search_engine: SearchEngine,
         file_storage: FileStorage,
-        skill_risk_policy: SkillRiskPolicy | None = None,
-        overflow_config: ContextOverflowConfig | None = None,
         redis_client: object | None = None,
-        skill_creator_service=None,
-        summary_llm: BaseChatModel | None = None,
         checkpointer_pool: object | None = None,
-        supports_vision: bool = True,
-        supports_pdf_input: bool = False,
-        file_understanding_config=None,
-        vision_fallback_model=None,
         memory_flusher: MemoryFlusher | None = None,
         memory_embedding_provider=None,
         memory_session_factory=None,
         memory_repo_factory=None,
-        # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
-        self._memory_flusher = memory_flusher
-        self._memory_embedding_provider = memory_embedding_provider
-        self._memory_session_factory = memory_session_factory
-        self._memory_repo_factory = memory_repo_factory
-        self._supports_vision = supports_vision
-        self._supports_pdf_input = supports_pdf_input
-        self._file_understanding_config = file_understanding_config
-        self._vision_fallback_model = vision_fallback_model
+        self._config_snapshot = config_snapshot
         self._uow_factory = uow_factory
-        self._uow = uow_factory()
-        self._llm = llm
-        self._agent_config = agent_config
-        self._mcp_config = mcp_config
-        self._a2a_config = a2a_config
-        self._skill_risk_policy = skill_risk_policy or SkillRiskPolicy()
-        self._overflow_config = overflow_config or ContextOverflowConfig()
         self._sandbox_cls = sandbox_cls
         self._task_cls = task_cls
         self._search_engine = search_engine
         self._file_storage = file_storage
         self._redis_client = redis_client
-        self._skill_creator_service = skill_creator_service
-        self._summary_llm = summary_llm
         self._checkpointer_pool = checkpointer_pool
+        self._memory_flusher = memory_flusher
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
         self._takeover_timeout_tasks: dict[str, asyncio.Task] = {}
         self._settings = get_settings()
-        # self._file_repository = file_repository
-        logger.info(f"AgentService初始化成功")
+        logger.info("AgentService初始化成功")
+
+    def _refresh_config(self, snapshot: _ConfigSnapshot) -> None:
+        """Atomically replace config snapshot. CPython GIL guarantees single-attr assignment is atomic."""
+        self._config_snapshot = snapshot
 
     async def _get_task(self, session: Session) -> Optional[Task]:
         """根据传递的任务会话获取任务实例"""
@@ -129,6 +126,8 @@ class AgentService:
 
     async def _create_task(self, session: Session) -> Task:
         """根据传递的会话创建一个新任务"""
+        snap = self._config_snapshot  # local capture — immune to concurrent refresh
+
         # 1.获取沙箱实例
         sandbox = None
         sandbox_id = session.sandbox_id
@@ -140,8 +139,8 @@ class AgentService:
             # 3.沙箱不存在则创建一个新的(有可能被释放了)
             sandbox = await self._sandbox_cls.create()
             session.sandbox_id = sandbox.id
-            async with self._uow:
-                await self._uow.session.save(session)
+            async with self._uow_factory() as uow:
+                await uow.session.save(session)
 
         # 4.从沙箱中获取浏览器实例
         browser = await sandbox.get_browser()
@@ -151,7 +150,7 @@ class AgentService:
 
         # 5.构造 file_view 处理器（延迟到此处，因为需要运行时 sandbox + file_storage）
         file_processor_lookup = None
-        if self._file_understanding_config:
+        if snap.file_understanding_config:
             from app.infrastructure.external.file_processors.registry import FileProcessorRegistry
 
             async def _upload_bytes(file_bytes: bytes, filename: str) -> str | None:
@@ -168,33 +167,31 @@ class AgentService:
             file_processor_lookup = FileProcessorRegistry(
                 sandbox=sandbox,
                 file_uploader=_upload_bytes,
-                vision_model=self._vision_fallback_model,
-                audio_config=self._file_understanding_config.audio,
-                video_config=self._file_understanding_config.video,
+                vision_model=snap.vision_fallback_model,
+                audio_config=snap.file_understanding_config.audio,
+                video_config=snap.file_understanding_config.video,
             )
 
         # 6.创建AgentTaskRunner
         task_runner = AgentTaskRunner(
             uow_factory=self._uow_factory,
-            llm=self._llm,
-            agent_config=self._agent_config,
-            mcp_config=self._mcp_config,
-            a2a_config=self._a2a_config,
-            skill_risk_policy=self._skill_risk_policy,
-            overflow_config=self._overflow_config,
+            llm=snap.llm,
+            agent_config=snap.agent_config,
+            mcp_config=snap.mcp_config,
+            a2a_config=snap.a2a_config,
+            skill_risk_policy=snap.skill_risk_policy,
+            overflow_config=snap.overflow_config,
             session_id=session.id,
             user_id=session.user_id,
-            # session_repository=self._session_repository,
             file_storage=self._file_storage,
-            # file_repository=self._file_repository,
             browser=browser,
             search_engine=self._search_engine,
             sandbox=sandbox,
-            skill_creator_service=self._skill_creator_service,
-            summary_llm=self._summary_llm,
+            skill_creator_service=snap.skill_creator_service,
+            summary_llm=snap.summary_llm,
             checkpointer_pool=self._checkpointer_pool,
-            supports_vision=self._supports_vision,
-            supports_pdf_input=self._supports_pdf_input,
+            supports_vision=snap.supports_vision,
+            supports_pdf_input=snap.supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
             memory_flusher=self._memory_flusher,
             memory_embedding_provider=self._memory_embedding_provider,
@@ -205,8 +202,8 @@ class AgentService:
         # 6.创建任务Task并更新会话中的信息
         task = self._task_cls.create(task_runner=task_runner)
         session.task_id = task.id
-        async with self._uow:
-            await self._uow.session.save(session)
+        async with self._uow_factory() as uow:
+            await uow.session.save(session)
 
         return task
 
@@ -228,8 +225,8 @@ class AgentService:
         self, session_id: str, user_id: str, is_admin: bool = False
     ) -> Session:
         """根据用户权限获取可访问会话"""
-        async with self._uow:
-            session = await self._uow.session.get_by_id(session_id)
+        async with self._uow_factory() as uow:
+            session = await uow.session.get_by_id(session_id)
         if not session:
             logger.error(f"尝试访问不存在的会话[{session_id}]")
             raise NotFoundError("任务会话不存在, 请核实后重试")
@@ -245,9 +242,9 @@ class AgentService:
         if not attachments:
             return
 
-        async with self._uow:
+        async with self._uow_factory() as uow:
             for attachment_id in attachments:
-                file = await self._uow.file.get_by_id(attachment_id)
+                file = await uow.file.get_by_id(attachment_id)
                 if not file:
                     raise NotFoundError(f"附件[{attachment_id}]不存在")
                 if not is_admin and (not file.user_id or file.user_id != user_id):
@@ -312,8 +309,8 @@ class AgentService:
                         raise RuntimeError(f"会话[{session_id}]创建任务失败")
 
                 # 6.传递了消息则更新会话中的最后一条消息
-                async with self._uow:
-                    await self._uow.session.update_latest_message(
+                async with self._uow_factory() as uow:
+                    await uow.session.update_latest_message(
                         session_id=session_id,
                         message=message,
                         timestamp=timestamp or datetime.now(),
@@ -334,8 +331,8 @@ class AgentService:
                 # 8.将事件添加到任务的输入流中，好让Agent获取到数据
                 event_id = await task.input_stream.put(message_event.model_dump_json())
                 message_event.id = event_id
-                async with self._uow:
-                    await self._uow.session.add_event(session_id, message_event)
+                async with self._uow_factory() as uow:
+                    await uow.session.add_event(session_id, message_event)
 
                 # 9.立刻把用户消息返回给前端，避免依赖后续拉取导致消息缺失
                 yield message_event
@@ -350,8 +347,8 @@ class AgentService:
                     "会话[%s]状态自愈: status_reconciled=true from=running to=completed message_present=false task_exists=false",
                     session_id,
                 )
-                async with self._uow:
-                    await self._uow.session.update_status(
+                async with self._uow_factory() as uow:
+                    await uow.session.update_status(
                         session_id, SessionStatus.COMPLETED
                     )
                 session = session.model_copy(update={"status": SessionStatus.COMPLETED})
@@ -390,8 +387,8 @@ class AgentService:
                         self._cancel_pending_timeout(session_id)
 
                 # 15.将未读消息数重置为0
-                async with self._uow:
-                    await self._uow.session.update_unread_message_count(session_id, 0)
+                async with self._uow_factory() as uow:
+                    await uow.session.update_unread_message_count(session_id, 0)
 
                 # 16.将事件返回并判断事件类型是否为结束类型
                 yield event
@@ -407,8 +404,8 @@ class AgentService:
             logger.error(f"任务会话[{session_id}]对话出错: {str(e)}")
             event = ErrorEvent(error=str(e))
             try:
-                async with self._uow:
-                    await self._uow.session.add_event(session_id, event)
+                async with self._uow_factory() as uow:
+                    await uow.session.add_event(session_id, event)
             except (asyncio.CancelledError, Exception) as add_err:
                 logger.warning(
                     f"会话[{session_id}]添加错误事件失败(可能是客户端断开连接): {add_err}"
@@ -441,8 +438,8 @@ class AgentService:
             task.cancel(reason="stop")
 
         # 3.更新会话任务状态
-        async with self._uow:
-            await self._uow.session.update_status(session_id, SessionStatus.COMPLETED)
+        async with self._uow_factory() as uow:
+            await uow.session.update_status(session_id, SessionStatus.COMPLETED)
 
     @staticmethod
     def _get_latest_control_event(session: Session) -> Optional[ControlEvent]:
@@ -1140,8 +1137,8 @@ end
         if session.status == SessionStatus.TAKEOVER_PENDING:
             self._cancel_pending_timeout(session_id)
 
-        async with self._uow:
-            await self._uow.session.update_status(session_id, SessionStatus.TAKEOVER)
+        async with self._uow_factory() as uow:
+            await uow.session.update_status(session_id, SessionStatus.TAKEOVER)
         await self._append_control_event(
             session_id,
             action=ControlAction.STARTED,
@@ -1261,8 +1258,8 @@ end
                 )
                 return {"status": SessionStatus.COMPLETED, "reason": "resume_failed"}
 
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.RUNNING)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.RUNNING)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.REJECTED,
@@ -1275,8 +1272,8 @@ end
             return {"status": SessionStatus.RUNNING, "reason": "continue"}
 
         if decision_normalized == "terminate":
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.COMPLETED)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.REJECTED,
@@ -1340,8 +1337,8 @@ end
                     "handoff_mode": "complete",
                 }
 
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.RUNNING)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.RUNNING)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.ENDED,
@@ -1359,8 +1356,8 @@ end
             return {"status": SessionStatus.RUNNING, "handoff_mode": "continue"}
 
         if mode == "complete":
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.COMPLETED)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.ENDED,
@@ -1398,7 +1395,7 @@ end
         if window_seconds <= 0:
             raise BadRequestError("REOPEN_DISABLED")
 
-        # 使用 _uow_factory() 创建独立 UoW，避免 self._uow 单例共享 DB session
+        # 使用 _uow_factory() 创建独立 UoW，避免单例共享 DB session
         uow = self._uow_factory()
         async with uow:
             # 事务内加锁重读，防并发

@@ -1792,11 +1792,11 @@ class AgentTaskRunner(TaskRunner):
                     usage_ratio_after=compaction_result.usage_ratio_after,
                 )
 
-    async def _do_postprocess(self, task: Task) -> None:
-        """Execute post-processing: persist + flush + user-visible summary.
+    async def _do_persist_and_flush(self) -> None:
+        """Phase 1+2: persist state then submit flush.
 
-        Phase 1 failure -> exception propagates to caller (DoneEvent + COMPLETED).
-        Phase 3 failure -> silent degradation (summary loss is acceptable).
+        Runs inside asyncio.shield() so CancelledError cannot interrupt
+        mid-persist (which includes an LLM summary call when enabled).
         """
         flow = self._flow
 
@@ -1810,11 +1810,29 @@ class AgentTaskRunner(TaskRunner):
         if flush_batch and self._memory_flusher:
             self._memory_flusher.submit(flush_batch)
 
+    async def _do_postprocess(self, task: Task) -> None:
+        """Execute post-processing: persist + flush + user-visible summary.
+
+        Phase 1+2 are shielded from cancellation to guarantee persistence
+        completes even when the user sends a follow-up message.
+        Phase 3 failure -> silent degradation (summary loss is acceptable).
+        """
+        # Shield Phase 1+2: CancelledError cannot reach _persist_after_graph
+        # or flush submit.  If the outer task is cancelled while shield is
+        # running, CancelledError is raised HERE after shield finishes.
+        await asyncio.shield(self._do_persist_and_flush())
+
         # Phase 3: user-visible streaming summary
+        flow = self._flow
         messages = flow._deferred_final_state.get("messages", [])
         if messages:
+            summary_stream_id: str | None = None
+
             try:
                 async def _on_summary_event(evt: BaseEvent) -> None:
+                    nonlocal summary_stream_id
+                    if isinstance(evt, MessageEvent) and evt.stream_id:
+                        summary_stream_id = evt.stream_id
                     is_final = isinstance(evt, MessageEvent) and not evt.partial
                     await self._put_and_add_event(task, evt, persist=is_final)
                     # Final summary drives sidebar preview + unread count
@@ -1835,6 +1853,18 @@ class AgentTaskRunner(TaskRunner):
 
                 await run_background_summary(messages, flow.summary_llm, _on_summary_event)
             except asyncio.CancelledError:
+                # Send a final non-partial message to clear the ghost partial
+                # in the frontend (which upserts by stream_id).
+                if summary_stream_id:
+                    try:
+                        await self._put_and_add_event(task, MessageEvent(
+                            role="assistant",
+                            message="",
+                            stream_id=summary_stream_id,
+                            partial=False,
+                        ))
+                    except Exception:
+                        pass
                 raise
             except Exception as e:
                 logger.warning("Phase 3 用户可见摘要失败（静默降级）: %s", e)

@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     rate_limit_connection_ttl_seconds: int = 120
     rate_limit_heartbeat_seconds: int = 30
     rate_limit_auth_per_minute: int = 10  # 认证端点 IP 限流
+    rate_limit_trust_proxy: bool = False  # 反代部署时设为 True，从 X-Forwarded-For 取真实 IP
 
     # MinIO对象存储配置
     minio_endpoint: str = "s3.example.com"
@@ -87,6 +88,9 @@ class Settings(BaseSettings):
     checkpointer_pool_min_size: int = 2
     checkpointer_pool_max_size: int = 10
     checkpointer_pool_timeout: float = 30.0
+
+    # Config 缓存 TTL (秒)
+    config_cache_ttl: int = 60
 
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"

@@ -12,7 +12,7 @@ from app.infrastructure.storage.postgres import get_postgres
 from app.infrastructure.storage.redis import get_redis
 from app.interfaces.endpoints.routes import router as api_router
 from app.interfaces.errors.exception_handlers import register_exception_handlers
-from app.interfaces.service_dependencies import get_agent_service
+
 from core.config import get_settings
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
@@ -171,6 +171,17 @@ async def lifespan(app: FastAPI):
         app.state.flush_service = flush_service
         logger.info("MemoryFlushService 初始化完成")
 
+        # 8. 创建 AgentService 单例 (D2)
+        from app.interfaces.service_dependencies import _build_agent_service
+        app.state.agent_service = _build_agent_service(
+            minio_store=minio_client,
+            redis_client=redis_client,
+            checkpointer_pool=checkpointer_pool.pool,
+            flush_service=flush_service,
+            memory_embedding_provider=app.state.memory_embedding_provider,
+        )
+        logger.info("AgentService 单例初始化完成")
+
         # Clean stale FINISHING sessions (best-effort: deferred_final_state lost on restart)
         try:
             from sqlalchemy import update
@@ -202,7 +213,9 @@ async def lifespan(app: FastAPI):
     finally:
         try:
             logger.info("Manus应用正在关闭")
-            await asyncio.wait_for(get_agent_service().shutdown(), timeout=30.0)
+            agent_svc = getattr(app.state, "agent_service", None)
+            if agent_svc:
+                await asyncio.wait_for(agent_svc.shutdown(), timeout=30.0)
             logger.info("Agent服务成功关闭")
         except asyncio.TimeoutError:
             logger.warning("Agent服务关闭超时, 强制关闭, 部分任务将被释放")
