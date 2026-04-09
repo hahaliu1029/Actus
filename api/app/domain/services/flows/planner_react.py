@@ -96,6 +96,8 @@ class PlannerReActFlow(BaseFlow):
         self._uow_factory = uow_factory
         self._session_id = session_id
         self._summary_llm = summary_llm or llm
+        self._deferred_final_state: dict | None = None
+        self._deferred_summaries: list | None = None
         self.status = FlowStatus.IDLE
         self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
@@ -166,6 +168,10 @@ class PlannerReActFlow(BaseFlow):
         self._memory_session_factory = memory_session_factory
         self._memory_repo_factory = memory_repo_factory
         self._has_memory_tools = False  # set by _collect_all_tools
+
+    @property
+    def summary_llm(self):
+        return self._summary_llm
 
     async def _get_checkpointer(self):
         """Lazy-initialize checkpointer.
@@ -877,7 +883,13 @@ class PlannerReActFlow(BaseFlow):
             #  导致本 async generator 被 aclose()、GeneratorExit 抛入 yield 处）。
             # bridge.run() 的 finally 会 await 图任务完成，
             # 因此此处 bridge.final_state 已包含完整的图输出。
-            await self._persist_after_graph(bridge.final_state, summaries)
+            if bridge.final_state.get("should_interrupt"):
+                # 中断路径：同步持久化（保留原逻辑）
+                await self._persist_after_graph(bridge.final_state, summaries)
+            else:
+                # 正常完成路径：延迟到 invoke() 的 FINISHING 阶段
+                self._deferred_final_state = bridge.final_state
+                self._deferred_summaries = summaries
 
     async def _persist_after_graph(
         self, final: dict, summaries: list[ConversationSummary],

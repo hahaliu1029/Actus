@@ -305,6 +305,12 @@ def build_react_graph(
                 if tool_fn is None:
                     result_str = f"Error: Unknown tool '{tool_name}'"
                     tool_success = False
+                elif getattr(tool_fn, "metadata", {}).get("require_confirmation"):
+                    # Runtime enforcement: dangerous tools must go through
+                    # user confirmation via interrupt, not just prompt hints.
+                    result_str = "WAITING_FOR_USER"
+                    should_interrupt = True
+                    logger.info(f"require_confirmation: interrupting for tool '{tool_name}'")
                 else:
                     try:
                         raw_result = await tool_fn.ainvoke(args)

@@ -212,7 +212,7 @@ def build_main_graph(
 
     async def executor_node(
         state: MainGraphState, config: RunnableConfig,
-    ) -> Command[Literal["updater_node", "summarizer_node", "interrupt_node"]]:
+    ) -> Command[Literal["updater_node", "interrupt_node"]]:
         """Execute current step via react_graph sub-graph.
 
         Streams react events to the event_queue in real-time so the frontend
@@ -231,14 +231,14 @@ def build_main_graph(
 
         step = state["current_step"]
         if not step:
-            logger.warning("executor_node: current_step is None, routing to summarizer")
+            logger.warning("executor_node: current_step is None, routing to END")
             return Command(
                 update={
-                    "flow_status": FlowStatus.SUMMARIZING.value,
+                    "flow_status": FlowStatus.COMPLETED.value,
                     "events": [],
                     "messages": state.get("messages", []),
                 },
-                goto="summarizer_node",
+                goto=END,
             )
 
         # Phase 3: 获取当前 step 的编译后 react_graph（渐进式 Skill 加载）
@@ -455,7 +455,7 @@ def build_main_graph(
 
     async def updater_node(
         state: MainGraphState, config: RunnableConfig,
-    ) -> Command[Literal["executor_node", "summarizer_node"]]:
+    ) -> Command[Literal["executor_node", "__end__"]]:
         """Update the plan after step execution — mark step done, call planner
         to update remaining steps with execution context, then get next step.
 
@@ -472,8 +472,8 @@ def build_main_graph(
         plan = state["plan"]
         if not plan:
             return Command(
-                update={"flow_status": FlowStatus.SUMMARIZING.value, "events": []},
-                goto="summarizer_node",
+                update={"flow_status": FlowStatus.COMPLETED.value, "events": []},
+                goto=END,
             )
 
         # 1. Sync completed step back into plan.steps
@@ -563,15 +563,20 @@ def build_main_graph(
                     logger.warning("Step-level skill refresh 失败: %s", exc)
 
         if not next_step:
+            plan.status = ExecutionStatus.COMPLETED
+            events.append(PlanEvent(plan=plan, status=PlanEventStatus.COMPLETED))
+            if event_queue is not None:
+                for evt in events:
+                    await event_queue.put(evt)
             return Command(
                 update={
                     "plan": plan,
                     "current_step": None,
-                    "flow_status": FlowStatus.SUMMARIZING.value,
+                    "flow_status": FlowStatus.COMPLETED.value,
                     "skill_context": new_skill_context,
-                    "events": events,
+                    "events": [],  # already emitted via queue
                 },
-                goto="summarizer_node",
+                goto=END,
             )
 
         return Command(
@@ -710,7 +715,7 @@ def build_main_graph(
     # ---- Routing ------------------------------------------------------- #
 
     def route_entry(state: MainGraphState) -> Literal[
-        "planner_node", "executor_node", "updater_node", "summarizer_node",
+        "planner_node", "executor_node", "updater_node",
     ]:
         """Route from START based on flow_status."""
         status = state.get("flow_status", FlowStatus.IDLE.value)
@@ -719,9 +724,7 @@ def build_main_graph(
             return "planner_node"
         if status == FlowStatus.EXECUTING.value:
             return "executor_node"
-        if status == FlowStatus.UPDATING.value:
-            return "updater_node"
-        return "summarizer_node"
+        return "updater_node"
 
     # ---- Build Graph --------------------------------------------------- #
 
@@ -738,7 +741,6 @@ def build_main_graph(
     g.add_node("planner_node", planner_node, retry_policy=planner_retry)
     g.add_node("executor_node", executor_node)
     g.add_node("updater_node", updater_node)
-    g.add_node("summarizer_node", summarizer_node)
     g.add_node("interrupt_node", interrupt_node)
 
     g.add_conditional_edges(START, route_entry)
@@ -746,6 +748,5 @@ def build_main_graph(
     # executor_node and updater_node use Command(goto=...) for routing —
     # no conditional edges needed. Command handles all outgoing transitions.
     g.add_edge("interrupt_node", "executor_node")
-    g.add_edge("summarizer_node", END)
 
     return g.compile(checkpointer=checkpointer)

@@ -218,6 +218,12 @@ class DoneSSEEvent(BaseSSEEvent):
     event: Literal["done"] = "done"
 
 
+class FinishingSSEEvent(BaseSSEEvent):
+    """FINISHING 流式事件"""
+
+    event: Literal["finishing"] = "finishing"
+
+
 class WaitSSEEvent(BaseSSEEvent):
     """等待人类输入流式事件"""
 
@@ -286,6 +292,7 @@ AgentSSEEvent = Union[
     PlanSSEEvent,
     ToolSSEEvent,
     DoneSSEEvent,
+    FinishingSSEEvent,
     ErrorSSEEvent,
     WaitSSEEvent,
     ControlSSEEvent,

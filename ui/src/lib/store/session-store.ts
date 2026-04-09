@@ -15,6 +15,7 @@ import type {
 } from "@/lib/api/types";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
+import { normalizeSessionStatus } from "@/lib/utils/session-status";
 
 type SessionState = {
   sessions: ListSessionItem[];
@@ -48,6 +49,7 @@ type SessionActions = {
   ) => Promise<void>;
   sendChat: (sessionId: string, params: ChatParams) => Promise<void>;
   stopChat: () => void;
+  updateSessionStatus: (sessionId: string, status: Session["status"]) => void;
   stopSession: (sessionId: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
   clearUnread: (sessionId: string) => Promise<void>;
@@ -146,6 +148,9 @@ function resolveStatusFromEvent(
   currentStatus: Session["status"],
   event: SSEEventData
 ): Session["status"] {
+  if (event.type === "finishing") {
+    return "finishing";
+  }
   if (event.type === "wait") {
     return "waiting";
   }
@@ -154,6 +159,10 @@ function resolveStatusFromEvent(
   }
   if (event.type === "control") {
     return resolveControlStatus(currentStatus, asRecord(event.data));
+  }
+  // Finishing guard: don't let content events revert finishing back to running
+  if (currentStatus === "finishing") {
+    return "finishing";
   }
   return "running";
 }
@@ -552,7 +561,12 @@ export const useSessionStore = create<SessionStore>()(
       set({ isLoadingSessions: true });
       try {
         const sessions = await sessionApi.getSessions();
-        set({ sessions });
+        set({
+          sessions: sessions.map((s) => ({
+            ...s,
+            status: normalizeSessionStatus(s.status),
+          })),
+        });
       } catch (error) {
         showMessage(
           "error",
@@ -582,16 +596,17 @@ export const useSessionStore = create<SessionStore>()(
               state.sessions.map((s) => [s.session_id, s.status])
             );
             const merged = remote.map((item) => {
+              const normalizedStatus = normalizeSessionStatus(item.status);
               const localStatus = localStatusMap.get(item.session_id);
               if (
                 localStatus &&
-                localStatus !== item.status &&
+                localStatus !== normalizedStatus &&
                 (localStatus === "completed" || localStatus === "waiting") &&
-                item.status === "running"
+                normalizedStatus === "running"
               ) {
                 return { ...item, status: localStatus };
               }
-              return item;
+              return { ...item, status: normalizedStatus };
             });
             return { sessions: merged };
           });
@@ -628,6 +643,7 @@ export const useSessionStore = create<SessionStore>()(
         const session = await sessionApi.getSession(sessionId);
         const normalizedRemote: Session = {
           ...session,
+          status: normalizeSessionStatus(session.status),
           title: pickTitle(session),
           events: normalizeSessionEvents(session.events as SessionEventRecord[]),
         };
@@ -722,6 +738,15 @@ export const useSessionStore = create<SessionStore>()(
     sendChat: async (sessionId, params) => {
       get().stopChat();
 
+      // Reset FINISHING → RUNNING before opening new SSE
+      const currentSession = get().currentSession;
+      if (
+        currentSession?.session_id === sessionId &&
+        currentSession.status === "finishing"
+      ) {
+        get().updateSessionStatus(sessionId, "running");
+      }
+
       set({ isChatting: true, chatSessionId: sessionId });
 
       const current = get().currentSession;
@@ -804,18 +829,22 @@ export const useSessionStore = create<SessionStore>()(
               event.type === "done" ||
               event.type === "wait" ||
               event.type === "error" ||
-              event.type === "control"
+              event.type === "control" ||
+              event.type === "finishing"
             ) {
-              shouldClearAbortAfterBind = true;
+              const isFinishing = event.type === "finishing";
+              shouldClearAbortAfterBind = !isFinishing;
               return {
                 currentSession: {
                   ...next,
                   status: nextStatus,
                 },
                 sessions: nextSessions,
-                ...(shouldResetStreaming
+                ...(shouldResetStreaming && !isFinishing
                   ? { isChatting: false, chatSessionId: null }
-                  : {}),
+                  : isFinishing
+                    ? { isChatting: false }
+                    : {}),
               };
             }
 
@@ -850,6 +879,18 @@ export const useSessionStore = create<SessionStore>()(
         chatAbort();
       }
       set({ chatAbort: null, isChatting: false, chatSessionId: null });
+    },
+
+    updateSessionStatus: (sessionId: string, status: Session["status"]) => {
+      set((state) => ({
+        currentSession:
+          state.currentSession?.session_id === sessionId
+            ? { ...state.currentSession, status }
+            : state.currentSession,
+        sessions: state.sessions.map((s) =>
+          s.session_id === sessionId ? { ...s, status } : s
+        ),
+      }));
     },
 
     stopSession: async (sessionId: string) => {

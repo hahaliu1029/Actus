@@ -22,6 +22,7 @@ const SESSION_STATUS_MAP: Record<string, StatusMeta> = {
   pending: { text: "待执行", tone: "muted", icon: "circle-dashed" },
   running: { text: "执行中", tone: "warning", icon: "loader", spinning: true },
   waiting: { text: "等待中", tone: "warning", icon: "clock" },
+  finishing: { text: "整理中", tone: "info", icon: "loader" },
   completed: { text: "已完成", tone: "success", icon: "check-circle" },
   failed: { text: "失败", tone: "danger", icon: "x-circle" },
   takeover_pending: { text: "待接管", tone: "warning", icon: "alert-circle" },

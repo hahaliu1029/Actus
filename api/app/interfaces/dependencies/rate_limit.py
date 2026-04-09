@@ -10,7 +10,7 @@ from app.application.errors.exceptions import ServiceUnavailableError, TooManyRe
 from app.domain.models.user import User
 from app.infrastructure.storage.redis import RedisClient, get_redis
 from core.config import get_settings
-from fastapi import Depends
+from fastapi import Depends, Request
 from redis.asyncio import Redis
 
 from .auth import CurrentUser
@@ -22,6 +22,7 @@ class RateLimitBucket(str, Enum):
     READ = "read"
     WRITE = "write"
     CHAT = "chat"
+    AUTH = "auth"
 
 
 class RateLimitChannel(str, Enum):
@@ -35,6 +36,8 @@ def _get_limit(bucket: RateLimitBucket) -> int:
         return settings.rate_limit_read_per_minute
     if bucket == RateLimitBucket.WRITE:
         return settings.rate_limit_write_per_minute
+    if bucket == RateLimitBucket.AUTH:
+        return settings.rate_limit_auth_per_minute
     return settings.rate_limit_chat_per_minute
 
 
@@ -200,5 +203,51 @@ async def rate_limit_chat(
     await enforce_request_limit(
         bucket=RateLimitBucket.CHAT,
         current_user=current_user,
+        redis_client=redis_client,
+    )
+
+
+async def _enforce_ip_limit(
+    bucket: RateLimitBucket,
+    client_ip: str,
+    redis_client: RedisClient,
+) -> None:
+    """IP-based rate limiting for unauthenticated endpoints."""
+    settings = get_settings()
+    limit = _get_limit(bucket)
+    window_seconds = settings.rate_limit_window_seconds
+    window = int(time.time() // window_seconds)
+    key = f"rl:ip:{bucket.value}:{client_ip}:{window}"
+    redis = redis_client.client
+
+    try:
+        current = await redis.incr(key)
+        if current == 1:
+            await redis.expire(key, window_seconds + 1)
+        if current > limit:
+            ttl = await redis.ttl(key)
+            retry_after = ttl if isinstance(ttl, int) and ttl > 0 else window_seconds
+            raise TooManyRequestsError(
+                retry_after=retry_after,
+                limit=limit,
+                window_seconds=window_seconds,
+                bucket=bucket.value,
+            )
+    except TooManyRequestsError:
+        raise
+    except Exception as exc:
+        logger.error(f"IP 限流失败: {exc}")
+        raise ServiceUnavailableError("限流服务不可用，请稍后重试")
+
+
+async def rate_limit_auth(
+    request: Request,
+    redis_client: RedisClient = Depends(get_redis),
+) -> None:
+    """Auth endpoint rate limit — keyed by client IP, no login required."""
+    client_ip = request.client.host if request.client else "unknown"
+    await _enforce_ip_limit(
+        bucket=RateLimitBucket.AUTH,
+        client_ip=client_ip,
         redis_client=redis_client,
     )

@@ -265,6 +265,8 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         result = await browser.console_exec(javascript)
         return _unwrap(result)
 
+    browser_console_exec.metadata = {"require_confirmation": True}
+
     @lc_tool
     async def browser_console_view(max_lines: int = 50) -> str:
         """View the browser console output."""

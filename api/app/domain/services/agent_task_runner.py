@@ -42,6 +42,7 @@ from app.domain.models.event import (
     ErrorEvent,
     Event,
     FileToolContent,
+    FinishingEvent,
     MCPToolContent,
     MessageEvent,
     SearchToolContent,
@@ -68,6 +69,7 @@ from app.domain.repositories.uow import IUnitOfWork
 from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
+from app.domain.services.graphs.background_summary import run_background_summary
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.brainstorm_skill import BrainstormSkillTool
 from app.domain.services.tools.create_skill import CreateSkillTool
@@ -1790,10 +1792,67 @@ class AgentTaskRunner(TaskRunner):
                     usage_ratio_after=compaction_result.usage_ratio_after,
                 )
 
-        # 7. 读取 flush batch 并提交到后台刷写队列（C5.0）
-        flush_batch = getattr(self._flow, "_pending_flush_batch", None)
+    async def _do_postprocess(self, task: Task) -> None:
+        """Execute post-processing: persist + flush + user-visible summary.
+
+        Phase 1 failure -> exception propagates to caller (DoneEvent + COMPLETED).
+        Phase 3 failure -> silent degradation (summary loss is acceptable).
+        """
+        flow = self._flow
+
+        # Phase 1: persist (Memory/ConversationSummary/flush gate/overflow check)
+        await flow._persist_after_graph(
+            flow._deferred_final_state, flow._deferred_summaries
+        )
+
+        # Phase 2: flush submit (synchronous fire-and-forget)
+        flush_batch = getattr(flow, "_pending_flush_batch", None)
         if flush_batch and self._memory_flusher:
             self._memory_flusher.submit(flush_batch)
+
+        # Phase 3: user-visible streaming summary
+        messages = flow._deferred_final_state.get("messages", [])
+        if messages:
+            try:
+                async def _on_summary_event(evt: BaseEvent) -> None:
+                    should_persist = isinstance(evt, MessageEvent) and not evt.partial
+                    await self._put_and_add_event(task, evt, persist=should_persist)
+
+                await run_background_summary(messages, flow.summary_llm, _on_summary_event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Phase 3 用户可见摘要失败（静默降级）: %s", e)
+
+    async def _run_postprocess_or_cancel(self, task: Task) -> bool:
+        """Run post-processing; cancel if new message arrives. Returns True if cancelled."""
+        postprocess = asyncio.create_task(self._do_postprocess(task))
+
+        try:
+            while not postprocess.done():
+                if not await task.input_stream.is_empty():
+                    postprocess.cancel()
+                    try:
+                        await postprocess
+                    except asyncio.CancelledError:
+                        pass
+                    return True
+                await asyncio.sleep(0.2)
+
+            await postprocess  # propagate exceptions
+
+            # Drain check: catch messages that arrived between last poll and completion
+            if not await task.input_stream.is_empty():
+                return True
+
+            return False
+        except asyncio.CancelledError:
+            postprocess.cancel()
+            try:
+                await postprocess
+            except asyncio.CancelledError:
+                pass
+            raise
 
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
@@ -1914,179 +1973,204 @@ class AgentTaskRunner(TaskRunner):
                 self._flow._activated_mcp_tools_ref = lambda: self._activated_mcp_tools
                 self._flow._mcp_always_bind_names = self._get_always_bind_tool_names()
 
-            # 3.循环读取任务中的输入消息队列
-            while not await task.input_stream.is_empty():
-                # 4.从输入流中获取数据
-                event = await self._pop_event(task)
-                if event is None:
-                    continue
-                message = ""
+            # 3. 主消息循环 + FINISHING 后处理
+            try:
+                while True:
+                    # Phase A: 处理所有待处理消息
+                    while not await task.input_stream.is_empty():
+                        event = await self._pop_event(task)
+                        if event is None:
+                            continue
+                        message = ""
 
-                # 5.判断事件类型是否为消息事件，如果是则处理消息并将附件同步到沙箱中
-                image_content_blocks: list[dict] = []
-                if isinstance(event, MessageEvent):
-                    message = event.message or ""
-                    await self._sync_message_attachments_to_sandbox(event)
-                    # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
-                    print(f"[DEBUG-IMG] before _build_image_content_blocks: "
-                          f"attachments count={len(event.attachments)}, "
-                          f"types={[type(a).__name__ for a in event.attachments]}, "
-                          f"mimes={[getattr(a, 'mime_type', 'N/A') for a in event.attachments]}", flush=True)
-                    image_content_blocks = await self._build_image_content_blocks(
-                        event.attachments
-                    )
-                    print(f"[DEBUG-IMG] after _build_image_content_blocks: "
-                          f"blocks={len(image_content_blocks)}", flush=True)
-                    logger.info(
-                        "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
-                        len(message),
-                        hashlib.sha256(message.encode("utf-8")).hexdigest(),
-                        len(image_content_blocks),
-                    )
-
-                # 6.将消息事件转换称消息对象
-                # 附件路径附带外部可访问 URL（MCP 工具无法访问沙箱文件系统）
-                attachment_paths: list[str] = []
-                if isinstance(event, MessageEvent):
-                    for att in event.attachments:
-                        path = att.filepath
-                        url = self._image_url_map.get(path)
-                        if url:
-                            attachment_paths.append(
-                                f"{path} (external_url: {url})"
+                        # 5.判断事件类型是否为消息事件，如果是则处理消息并将附件同步到沙箱中
+                        image_content_blocks: list[dict] = []
+                        if isinstance(event, MessageEvent):
+                            message = event.message or ""
+                            await self._sync_message_attachments_to_sandbox(event)
+                            # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
+                            print(f"[DEBUG-IMG] before _build_image_content_blocks: "
+                                  f"attachments count={len(event.attachments)}, "
+                                  f"types={[type(a).__name__ for a in event.attachments]}, "
+                                  f"mimes={[getattr(a, 'mime_type', 'N/A') for a in event.attachments]}", flush=True)
+                            image_content_blocks = await self._build_image_content_blocks(
+                                event.attachments
                             )
+                            print(f"[DEBUG-IMG] after _build_image_content_blocks: "
+                                  f"blocks={len(image_content_blocks)}", flush=True)
+                            logger.info(
+                                "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
+                                len(message),
+                                hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                                len(image_content_blocks),
+                            )
+
+                        # 6.将消息事件转换称消息对象
+                        # 附件路径附带外部可访问 URL（MCP 工具无法访问沙箱文件系统）
+                        attachment_paths: list[str] = []
+                        if isinstance(event, MessageEvent):
+                            for att in event.attachments:
+                                path = att.filepath
+                                url = self._image_url_map.get(path)
+                                if url:
+                                    attachment_paths.append(
+                                        f"{path} (external_url: {url})"
+                                    )
+                                else:
+                                    attachment_paths.append(path)
+                        message_obj = Message(
+                            message=message,
+                            attachments=attachment_paths,
+                            image_content_blocks=image_content_blocks,
+                            skill_confirmation_action=(
+                                event.skill_confirmation_action
+                                if isinstance(event, MessageEvent)
+                                else None
+                            ),
+                        )
+
+                        selected_skills, _ = await self._select_skills_for_message(
+                            self._session_skill_pool,
+                            message_obj.message,
+                        )
+                        self._current_message_text = message_obj.message
+                        self._current_message_selected_skills = list(selected_skills)
+                        self._step_skill_state = None
+                        self._last_virtual_step_id = ""
+                        self._activated_mcp_tools.clear()  # Reset MCP activation per message
+                        await self._initialize_skill_tool_if_needed(selected_skills)
+                        self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
+
+                        # Phase 2+3: 设置 LangGraph configurable 回调
+                        if hasattr(self._flow, '_skill_context_refresher'):
+                            self._flow._skill_context_refresher = self._refresh_skill_context_for_step
+                            self._flow._react_graph_provider = self._build_step_react_graph
+                            self._flow._skill_guide_injector = SkillGuideInjector(
+                                selected_skills, self._tier2_preloaded_skill_ids
+                            )
+
+                        # 7.传递消息对象并运行PlannerReActFlow
+                        async for event in self._run_flow(message_obj):
+                            await self._handle_step_skill_lock(event, message_obj.message)
+                            emitted_events: List[Event] = []
+                            if isinstance(event, MessageEvent) and event.role == "assistant":
+                                async for chunked_event in self._stream_assistant_message_event(
+                                    event
+                                ):
+                                    emitted_events.append(chunked_event)
+                            else:
+                                emitted_events.append(event)
+
+                            for emitted_event in emitted_events:
+                                # 8.将得到的事件添加到消息队列中
+                                should_persist = not (
+                                    isinstance(emitted_event, MessageEvent)
+                                    and emitted_event.partial
+                                )
+                                await self._put_and_add_event(
+                                    task, emitted_event, persist=should_persist
+                                )
+
+                                # 9.如果事件类型为标题事件则更新会话标题
+                                if isinstance(emitted_event, TitleEvent):
+                                    async with self._uow:
+                                        await self._uow.session.update_title(
+                                            self._session_id, emitted_event.title
+                                        )
+                                elif isinstance(emitted_event, MessageEvent) and not emitted_event.partial:
+                                    # 10.如果事件为最终消息事件，则更新最新消息并新增未读消息数
+                                    async with self._uow:
+                                        await self._uow.session.update_latest_message(
+                                            self._session_id,
+                                            emitted_event.message,
+                                            emitted_event.created_at,
+                                        )
+                                        await self._uow.session.increment_unread_message_count(
+                                            self._session_id
+                                        )
+                                elif isinstance(emitted_event, WaitEvent):
+                                    # 11.如果事件为等待，则更新会话状态并终止程序
+                                    async with self._uow:
+                                        await self._uow.session.update_status(
+                                            self._session_id, SessionStatus.WAITING
+                                        )
+                                    return
+                                elif (
+                                    isinstance(emitted_event, ControlEvent)
+                                    and emitted_event.action == ControlAction.REQUESTED
+                                ):
+                                    # 12.control.requested 进入接管待决状态并立即停机
+                                    async with self._uow:
+                                        await self._uow.session.update_status(
+                                            self._session_id, SessionStatus.TAKEOVER_PENDING
+                                        )
+                                    return
+
+                        # 单条消息执行结束后重置step锁定状态
+                        self._step_skill_state = None
+
+                    # Phase B: 无消息且有延迟后处理 -> FINISHING
+                    if self._flow and getattr(self._flow, '_deferred_final_state', None):
+                        async with self._uow:
+                            await self._uow.session.update_status(
+                                self._session_id, SessionStatus.FINISHING
+                            )
+                        await self._put_and_add_event(task, FinishingEvent())
+
+                        try:
+                            cancelled = await self._run_postprocess_or_cancel(task)
+                        except Exception as e:
+                            logger.error("后处理失败 (postprocess_incomplete): %s", e)
+                            await self._put_and_add_event(task, DoneEvent())
+                            break
+
+                        if cancelled:
+                            # Reset deferred state to prevent stale re-entry
+                            self._flow._deferred_final_state = None
+                            self._flow._deferred_summaries = None
+                            async with self._uow:
+                                await self._uow.session.update_status(
+                                    self._session_id, SessionStatus.RUNNING
+                                )
+                            continue
                         else:
-                            attachment_paths.append(path)
-                message_obj = Message(
-                    message=message,
-                    attachments=attachment_paths,
-                    image_content_blocks=image_content_blocks,
-                    skill_confirmation_action=(
-                        event.skill_confirmation_action
-                        if isinstance(event, MessageEvent)
-                        else None
-                    ),
-                )
+                            await self._put_and_add_event(task, DoneEvent())
+                            break
+                    else:
+                        break
 
-                selected_skills, _ = await self._select_skills_for_message(
-                    self._session_skill_pool,
-                    message_obj.message,
-                )
-                self._current_message_text = message_obj.message
-                self._current_message_selected_skills = list(selected_skills)
-                self._step_skill_state = None
-                self._last_virtual_step_id = ""
-                self._activated_mcp_tools.clear()  # Reset MCP activation per message
-                await self._initialize_skill_tool_if_needed(selected_skills)
-                self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
-
-                # Phase 2+3: 设置 LangGraph configurable 回调
-                if hasattr(self._flow, '_skill_context_refresher'):
-                    self._flow._skill_context_refresher = self._refresh_skill_context_for_step
-                    self._flow._react_graph_provider = self._build_step_react_graph
-                    self._flow._skill_guide_injector = SkillGuideInjector(
-                        selected_skills, self._tier2_preloaded_skill_ids
+                # Normal completion
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.COMPLETED
                     )
 
-                # 7.传递消息对象并运行PlannerReActFlow
-                async for event in self._run_flow(message_obj):
-                    await self._handle_step_skill_lock(event, message_obj.message)
-                    emitted_events: List[Event] = []
-                    if isinstance(event, MessageEvent) and event.role == "assistant":
-                        async for chunked_event in self._stream_assistant_message_event(
-                            event
-                        ):
-                            emitted_events.append(chunked_event)
-                    else:
-                        emitted_events.append(event)
+            except asyncio.CancelledError:
+                cancel_reason = getattr(task, "cancel_reason", "stop")
+                logger.info("AgentTaskRunner任务运行取消，reason=%s", cancel_reason)
 
-                    for emitted_event in emitted_events:
-                        # 8.将得到的事件添加到消息队列中
-                        should_persist = not (
-                            isinstance(emitted_event, MessageEvent)
-                            and emitted_event.partial
-                        )
-                        await self._put_and_add_event(
-                            task, emitted_event, persist=should_persist
-                        )
+                if cancel_reason in {"takeover_start", "takeover_timeout"}:
+                    raise
 
-                        # 9.如果事件类型为标题事件则更新会话标题
-                        if isinstance(emitted_event, TitleEvent):
-                            async with self._uow:
-                                await self._uow.session.update_title(
-                                    self._session_id, emitted_event.title
-                                )
-                        elif isinstance(emitted_event, MessageEvent) and not emitted_event.partial:
-                            # 10.如果事件为最终消息事件，则更新最新消息并新增未读消息数
-                            async with self._uow:
-                                await self._uow.session.update_latest_message(
-                                    self._session_id,
-                                    emitted_event.message,
-                                    emitted_event.created_at,
-                                )
-                                await self._uow.session.increment_unread_message_count(
-                                    self._session_id
-                                )
-                        elif isinstance(emitted_event, WaitEvent):
-                            # 11.如果事件为等待，则更新会话状态并终止程序
-                            async with self._uow:
-                                await self._uow.session.update_status(
-                                    self._session_id, SessionStatus.WAITING
-                                )
-                            return
-                        elif (
-                            isinstance(emitted_event, ControlEvent)
-                            and emitted_event.action == ControlAction.REQUESTED
-                        ):
-                            # 12.control.requested 进入接管待决状态并立即停机
-                            async with self._uow:
-                                await self._uow.session.update_status(
-                                    self._session_id, SessionStatus.TAKEOVER_PENDING
-                                )
-                            return
+                if cancel_reason == "session_delete":
+                    raise
 
-                # 13.判断如果输入消息队列为空则跳出循环
-                if not await task.input_stream.is_empty():
-                    break
-
-                # 单条消息执行结束后重置step锁定状态
-                self._step_skill_state = None
-
-            # 14.更新会话状态为已完成
-            print(f"[STATUS-DEBUG] 即将更新会话状态为COMPLETED: session={self._session_id}", flush=True)
-            async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.COMPLETED
-                )
-            print(f"[STATUS-DEBUG] 会话状态已更新为COMPLETED", flush=True)
-        except asyncio.CancelledError:
-            # 15.异步任务被取消，根据取消原因分流处理
-            cancel_reason = getattr(task, "cancel_reason", "stop")
-            logger.info(
-                "AgentTaskRunner任务运行取消，reason=%s",
-                cancel_reason,
-            )
-
-            if cancel_reason in {"takeover_start", "takeover_timeout"}:
-                # takeover_* 由上层控制事件驱动状态流转，这里只做资源清理
+                await self._put_and_add_event(task, DoneEvent())
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.COMPLETED
+                    )
                 raise
 
-            await self._put_and_add_event(task, DoneEvent())
-            async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.COMPLETED
+            except Exception as e:
+                logger.exception(f"AgentTaskRunner运行出错: {str(e)}")
+                await self._put_and_add_event(
+                    task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
                 )
-            raise
-        except Exception as e:
-            # 16.记录日志并往任务队列/消息队列中写入异常事件并更新会话状态
-            logger.exception(f"AgentTaskRunner运行出错: {str(e)}")
-            await self._put_and_add_event(
-                task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
-            )
-            async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.COMPLETED
-                )
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.COMPLETED
+                    )
         finally:
             # 17.在同一个asyncio Task上下文中清理MCP/A2A工具资源
             # 这是关键：streamablehttp_client内部使用anyio.create_task_group()，

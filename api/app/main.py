@@ -171,6 +171,32 @@ async def lifespan(app: FastAPI):
         app.state.flush_service = flush_service
         logger.info("MemoryFlushService 初始化完成")
 
+        # Clean stale FINISHING sessions (best-effort: deferred_final_state lost on restart)
+        try:
+            from sqlalchemy import update
+            from app.infrastructure.models.session import SessionModel
+            from datetime import datetime, timedelta
+
+            stale_threshold = datetime.now() - timedelta(seconds=120)
+            async with postgres_client.session_factory() as db_session:
+                stmt = (
+                    update(SessionModel)
+                    .where(
+                        SessionModel.status == "finishing",
+                        SessionModel.updated_at < stale_threshold,
+                    )
+                    .values(status="completed", completed_at=datetime.now())
+                )
+                result = await db_session.execute(stmt)
+                await db_session.commit()
+                if result.rowcount > 0:
+                    logger.warning(
+                        "postprocess_skipped_on_restart: cleaned %d stale FINISHING sessions",
+                        result.rowcount,
+                    )
+        except Exception as e:
+            logger.warning("Failed to clean stale FINISHING sessions: %s", e)
+
         # lifespan分界点
         yield
     finally:

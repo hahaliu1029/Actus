@@ -47,8 +47,8 @@ class AuthService:
             raise ValueError("用户名或邮箱至少提供一个")
         if not password:
             raise ValueError("密码不能为空")
-        if len(password) < 6:
-            raise ValueError("密码长度至少6位")
+        if len(password) < 8:
+            raise ValueError("密码长度至少8位")
 
         # 检查用户名是否已存在
         if username:
@@ -109,13 +109,13 @@ class AuthService:
             raise ValueError("请提供用户名或邮箱")
 
         if not user:
-            raise ValueError("用户不存在")
+            raise ValueError("用户名或密码错误")
 
         if not user.password_hash:
             raise ValueError("该账户未设置密码，请使用第三方登录")
 
         if not verify_password(password, user.password_hash):
-            raise ValueError("密码错误")
+            raise ValueError("用户名或密码错误")
 
         if not user.is_active():
             raise ValueError("账户已被禁用")

@@ -14,7 +14,7 @@ class RegisterRequest(BaseModel):
         None, min_length=3, max_length=64, description="用户名"
     )
     email: Optional[EmailStr] = Field(None, description="邮箱")
-    password: str = Field(..., min_length=6, max_length=128, description="密码")
+    password: str = Field(..., min_length=8, max_length=72, description="密码")
     nickname: Optional[str] = Field(None, max_length=64, description="昵称")
 
     class Config:

@@ -290,7 +290,16 @@ class AgentService:
                     raise BadRequestError("当前会话处于接管状态，暂不支持聊天输入")
 
                 # 4.判断会话的状态是什么,如果不是运行中则表示已完成或者空闲中
-                if session.status != SessionStatus.RUNNING or task is None:
+                if session.status == SessionStatus.FINISHING:
+                    # FINISHING: task 仍在运行（invoke 在后处理阶段）
+                    # 复用现有 task，push 到 input_stream 触发 cancel 后处理
+                    task = await self._get_task(session)
+                    if task is None:
+                        task = await self._create_task(session)
+                        if not task:
+                            logger.error(f"会话[{session_id}]创建任务失败")
+                            raise RuntimeError(f"会话[{session_id}]创建任务失败")
+                elif session.status != SessionStatus.RUNNING or task is None:
                     if session.status == SessionStatus.WAITING:
                         logger.info(
                             "会话[%s] WAITING状态恢复: 将创建新任务并从数据库加载中断状态",

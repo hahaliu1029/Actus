@@ -52,6 +52,8 @@ class SkillExportService:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for file_path in sorted(skill_dir.rglob("*")):
+                if file_path.is_symlink():
+                    continue
                 if file_path.is_file():
                     arcname = f"{slug}/{file_path.relative_to(skill_dir)}"
                     zf.write(file_path, arcname)
@@ -120,7 +122,7 @@ class SkillExportService:
         if not bundle_dir.is_dir():
             return
         for file_path in sorted(bundle_dir.rglob("*")):
-            if not file_path.is_file():
+            if file_path.is_symlink() or not file_path.is_file():
                 continue
             ext = file_path.suffix.lower()
             rel = file_path.relative_to(bundle_dir)

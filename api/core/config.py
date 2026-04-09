@@ -1,7 +1,11 @@
+import logging
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -34,6 +38,7 @@ class Settings(BaseSettings):
     rate_limit_ws_concurrent: int = 5
     rate_limit_connection_ttl_seconds: int = 120
     rate_limit_heartbeat_seconds: int = 30
+    rate_limit_auth_per_minute: int = 10  # 认证端点 IP 限流
 
     # MinIO对象存储配置
     minio_endpoint: str = "s3.example.com"
@@ -99,6 +104,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
+
+    @model_validator(mode="after")
+    def _reject_default_jwt_secret(self) -> "Settings":
+        if self.jwt_secret_key == "change-me-in-env" and self.env != "test":
+            raise ValueError(
+                "JWT_SECRET_KEY 仍为默认值 'change-me-in-env'，"
+                "请在 .env 或环境变量中设置一个安全的随机密钥"
+            )
+        return self
 
 
 @lru_cache()

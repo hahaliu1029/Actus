@@ -63,6 +63,7 @@ export type SessionStatus =
   | "takeover_pending"
   | "takeover"
   | "waiting"
+  | "finishing"
   | "completed";
 
 /**
@@ -463,6 +464,12 @@ export type DoneEvent = {
   [key: string]: unknown;
 };
 
+export type FinishingEvent = {
+  event_id?: string;
+  created_at?: number;
+  [key: string]: unknown;
+};
+
 export type SSEEventType =
   | "message"
   | "title"
@@ -471,6 +478,7 @@ export type SSEEventType =
   | "tool"
   | "control"
   | "wait"
+  | "finishing"
   | "done"
   | "error"
   | "sessions";
@@ -483,6 +491,7 @@ export type SSEEventData =
   | { type: "tool"; data: ToolEvent }
   | { type: "control"; data: ControlEvent }
   | { type: "wait"; data: WaitEvent }
+  | { type: "finishing"; data: FinishingEvent }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
   | { type: "sessions"; data: ListSessionResponse };

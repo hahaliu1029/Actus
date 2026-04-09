@@ -227,6 +227,12 @@ class CompactionEvent(BaseEvent):
     usage_ratio_after: float = 0.0
 
 
+class FinishingEvent(BaseEvent):
+    """主回复完成，进入后台收尾阶段。前端收到后解锁输入框。"""
+
+    type: Literal["finishing"] = "finishing"
+
+
 class DoneEvent(BaseEvent):
     """结束事件类型"""
 
@@ -246,6 +252,7 @@ Event = Annotated[
         ErrorEvent,
         ContextStatusEvent,
         CompactionEvent,
+        FinishingEvent,
         DoneEvent,
     ],
     Field(discriminator="type"),
