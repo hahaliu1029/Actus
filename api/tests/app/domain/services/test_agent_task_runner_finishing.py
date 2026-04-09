@@ -20,7 +20,7 @@ def _make_runner_with_mocks():
     from app.domain.services.agent_task_runner import AgentTaskRunner
 
     runner = object.__new__(AgentTaskRunner)
-    # _do_postprocess needs: self._flow, self._memory_flusher
+    # _do_postprocess needs: self._flow, self._memory_flusher, self._uow, self._session_id
     runner._flow = MagicMock()
     runner._flow._deferred_final_state = {"messages": [MagicMock()]}
     runner._flow._deferred_summaries = []
@@ -29,6 +29,15 @@ def _make_runner_with_mocks():
     runner._flow.summary_llm = MagicMock()
     runner._memory_flusher = MagicMock()
     runner._memory_flusher.submit = MagicMock()
+    # UoW mock for latest_message + unread updates
+    runner._session_id = "test-session-id"
+    mock_uow = MagicMock()
+    mock_uow.__aenter__ = AsyncMock(return_value=mock_uow)
+    mock_uow.__aexit__ = AsyncMock(return_value=False)
+    mock_uow.session = MagicMock()
+    mock_uow.session.update_latest_message = AsyncMock()
+    mock_uow.session.increment_unread_message_count = AsyncMock()
+    runner._uow = mock_uow
     # _put_and_add_event mock
     runner._events_log = []
     async def mock_put(task, event, persist=True):
@@ -200,6 +209,53 @@ async def test_do_postprocess_summary_partial_persist_false():
     partials = [(e, p) for e, p in runner._events_log if isinstance(e, MessageEvent)]
     assert partials[0][1] is False, "partial=True must have persist=False"
     assert partials[1][1] is True, "partial=False must have persist=True"
+
+
+@pytest.mark.anyio
+async def test_do_postprocess_summary_updates_latest_message_and_unread():
+    """Final summary (partial=False) must update latest_message and increment unread count."""
+    runner = _make_runner_with_mocks()
+    task = MagicMock()
+
+    with patch(
+        "app.domain.services.agent_task_runner.run_background_summary",
+        new_callable=AsyncMock,
+    ) as mock_summary:
+        async def emit_final(msgs, llm, on_event):
+            await on_event(MessageEvent(role="assistant", message="Final summary", partial=False))
+        mock_summary.side_effect = emit_final
+
+        await runner._do_postprocess(task)
+
+    # Verify latest_message was updated with the final summary text
+    runner._uow.session.update_latest_message.assert_awaited_once()
+    call_args = runner._uow.session.update_latest_message.call_args
+    assert call_args[0][0] == "test-session-id"
+    assert call_args[0][1] == "Final summary"
+
+    # Verify unread count was incremented
+    runner._uow.session.increment_unread_message_count.assert_awaited_once_with("test-session-id")
+
+
+@pytest.mark.anyio
+async def test_do_postprocess_partial_summary_does_not_update_latest_message():
+    """Partial summary (partial=True) must NOT update latest_message or unread."""
+    runner = _make_runner_with_mocks()
+    task = MagicMock()
+
+    with patch(
+        "app.domain.services.agent_task_runner.run_background_summary",
+        new_callable=AsyncMock,
+    ) as mock_summary:
+        async def emit_partial_only(msgs, llm, on_event):
+            await on_event(MessageEvent(role="assistant", message="Partial...", partial=True))
+        mock_summary.side_effect = emit_partial_only
+
+        await runner._do_postprocess(task)
+
+    # latest_message must NOT be called for partial
+    runner._uow.session.update_latest_message.assert_not_awaited()
+    runner._uow.session.increment_unread_message_count.assert_not_awaited()
 
 
 def test_run_flow_no_sync_flush():

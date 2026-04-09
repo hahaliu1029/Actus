@@ -1815,8 +1815,23 @@ class AgentTaskRunner(TaskRunner):
         if messages:
             try:
                 async def _on_summary_event(evt: BaseEvent) -> None:
-                    should_persist = isinstance(evt, MessageEvent) and not evt.partial
-                    await self._put_and_add_event(task, evt, persist=should_persist)
+                    is_final = isinstance(evt, MessageEvent) and not evt.partial
+                    await self._put_and_add_event(task, evt, persist=is_final)
+                    # Final summary drives sidebar preview + unread count
+                    # (matches original summarizer_node behavior in main event loop)
+                    if is_final:
+                        try:
+                            async with self._uow:
+                                await self._uow.session.update_latest_message(
+                                    self._session_id,
+                                    evt.message,
+                                    evt.created_at,
+                                )
+                                await self._uow.session.increment_unread_message_count(
+                                    self._session_id
+                                )
+                        except Exception as e:
+                            logger.warning("Summary latest_message update failed: %s", e)
 
                 await run_background_summary(messages, flow.summary_llm, _on_summary_event)
             except asyncio.CancelledError:
