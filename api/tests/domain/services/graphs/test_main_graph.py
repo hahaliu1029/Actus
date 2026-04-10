@@ -112,6 +112,7 @@ class TestBuildMainGraph:
     def test_graph_compiles(self, mock_planner_llm):
         from app.domain.services.graphs.main_graph import build_main_graph
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=mock_planner_llm,
             react_graph=_make_mock_react_graph(),
             summary_llm=mock_planner_llm,
@@ -132,6 +133,7 @@ class TestMainGraphFlow:
         mock_uow.session.get_skill_graph_state = AsyncMock(return_value=None)
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=mock_planner_llm,
             react_graph=_make_mock_react_graph(),
             summary_llm=mock_planner_llm,
@@ -168,6 +170,7 @@ class TestMainGraphFlow:
         from app.domain.services.graphs.main_graph import build_main_graph
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=mock_planner_llm,
             react_graph=_make_mock_react_graph(),
             summary_llm=mock_planner_llm,
@@ -227,6 +230,7 @@ class TestMainGraphFlow:
         planner_llm.with_structured_output = MagicMock(side_effect=_with_structured_output)
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=_make_mock_react_graph(),
             summary_llm=_make_mock_summary_llm(),
@@ -283,6 +287,7 @@ class TestMainGraphFlow:
         )
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=FailingReactGraph(),
             summary_llm=planner_llm,
@@ -341,6 +346,7 @@ class TestMainGraphFlow:
         )
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=_make_mock_react_graph(),
             summary_llm=summary_llm,
@@ -444,6 +450,7 @@ class TestExecutorMessageBranching:
         )
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=CapturingReactGraph(),
             summary_llm=planner_llm,
@@ -502,6 +509,7 @@ class TestExecutorMessageBranching:
         ], message="ok", status=ExecutionStatus.RUNNING)
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=CapturingReactGraph(),
             summary_llm=_make_mock_summary_llm(),
@@ -567,6 +575,7 @@ class TestExecutorMessageBranching:
         plan = Plan(title="T", goal="G", language="zh", steps=[step], message="ok", status=ExecutionStatus.RUNNING)
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=CapturingReactGraph(),
             summary_llm=_make_mock_summary_llm(),
@@ -649,6 +658,7 @@ class TestUpdaterNodePlanUpdate:
                 }}
 
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=MockReactGraph(),
             summary_llm=planner_llm,
@@ -716,6 +726,7 @@ class TestInterruptResume:
 
         checkpointer = MemorySaver()
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=InterruptingReactGraph(),
             summary_llm=planner_llm,
@@ -807,6 +818,7 @@ class TestInterruptResume:
 
         checkpointer = MemorySaver()
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=InterruptThenCompleteReactGraph(),
             summary_llm=planner_llm,
@@ -874,6 +886,7 @@ class TestInterruptResume:
 
         checkpointer = MemorySaver()
         graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
             planner_llm=planner_llm,
             react_graph=InterruptingReactGraph(),
             summary_llm=planner_llm,

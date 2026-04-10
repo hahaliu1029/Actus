@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from app.domain.models.plan import Plan, Step
 from app.domain.services.flows.base import FlowStatus
@@ -50,6 +50,18 @@ class MainGraphState(TypedDict):
     original_request: str
     skill_context: str
     conversation_summaries: list[str]  # 历史对话摘要文本（to_prompt_text() 输出）
+
+    # B5 C5a: per-step prompt assembly metadata (optional — older checkpoints
+    # won't have these; ``state.get(key)`` returns None for missing keys).
+    # - ``skill_names_in_context``: authoritative skill ids that produced the
+    #   current step's skill_context (written by executor_node or falls back
+    #   to updater_node's skill_context_refresher).
+    # - ``system_prompt_version_hash`` / ``system_prompt_tokens``: observability
+    #   only, written by executor_node via the PromptAssembler path.
+    #   See B5 design doc "Two-clock architecture".
+    skill_names_in_context: NotRequired[list[str]]
+    system_prompt_version_hash: NotRequired[str]
+    system_prompt_tokens: NotRequired[int]
 
 
 class ReactGraphState(TypedDict):

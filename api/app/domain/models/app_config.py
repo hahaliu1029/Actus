@@ -54,6 +54,10 @@ class LLMConfig(BaseModel):
     tool_compress_trigger_ratio: float = Field(
         0.75, gt=0, le=1
     )  # Phase 1 工具结果压缩触发比例（占预算百分比）
+    system_prompt_max_tokens: int = Field(
+        3500, ge=0
+    )  # B5 C9: system prompt token 预算上限。PromptAssembler 用这个硬封顶 section 装配结果，
+    # compute_effective_window() 把它从 context_window 里扣掉，留给 history 的预算。
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):

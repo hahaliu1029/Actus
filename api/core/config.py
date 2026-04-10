@@ -88,6 +88,15 @@ class Settings(BaseSettings):
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 
+    # B5 C11: Prompt telemetry log directory
+    # JsonlPromptTelemetry writes three JSONL files here:
+    # - assembly.jsonl (PromptAssembler.assemble events)
+    # - llm_invocation.jsonl (per-LLM-call metadata from the adapter hook)
+    # - degradation.jsonl (lc_tools fallback events from C5a)
+    # Consumed by B5.5 for caching-viability analysis (stable system_prompt
+    # and tools across a session → cache_control is worth enabling).
+    prompt_telemetry_log_dir: str = "/app/data/telemetry/prompt"
+
     # Checkpointer 连接池配置
     checkpointer_pool_min_size: int = 2
     checkpointer_pool_max_size: int = 10

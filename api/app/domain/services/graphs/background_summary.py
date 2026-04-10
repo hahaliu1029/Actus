@@ -28,6 +28,7 @@ async def run_background_summary(
     messages: list[BaseMessage],
     summary_llm: BaseChatModel,
     on_event: Callable[[BaseEvent], Awaitable[None]],
+    lang: str = "zh",
 ) -> str | None:
     """Generate a user-visible streaming summary, independent of the graph.
 
@@ -38,13 +39,14 @@ async def run_background_summary(
 
     Returns the parsed summary text, or None if LLM produced no content.
     """
-    from app.domain.services.prompts.react import SUMMARIZE_PROMPT
+    from app.domain.services.prompts import get_prompt_bundle
 
+    bundle = get_prompt_bundle(lang)
     chunks: list[str] = []
     stream_id = str(uuid4())
 
     async for chunk in summary_llm.astream(
-        messages + [HumanMessage(content=SUMMARIZE_PROMPT)]
+        messages + [HumanMessage(content=bundle.SUMMARIZE_PROMPT)]
     ):
         if chunk.content:
             chunks.append(chunk.content)

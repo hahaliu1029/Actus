@@ -7,7 +7,10 @@ so that AgentTaskRunner requires minimal changes.
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional, Sequence
+
+if TYPE_CHECKING:
+    from app.domain.services.prompts.assembler import PromptAssembler
 
 
 from langchain_core.language_models import BaseChatModel
@@ -92,6 +95,8 @@ class PlannerReActFlow(BaseFlow):
         memory_repo_factory=None,
         approval_cache: Any = None,  # ApprovalCache | None
         confirmation_manager: Any = None,  # ConfirmationManager | None
+        prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
+        _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
     ) -> None:
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
@@ -144,11 +149,29 @@ class PlannerReActFlow(BaseFlow):
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
         self._checkpointer_pool = checkpointer_pool
         self._assembler = None
+        # B5 C5b: PromptAssembler instance for section-based system prompt
+        # assembly. Consumed by main_graph executor/planner/updater nodes
+        # and by ``_run_planner_for_detection``. Constructed by
+        # ``AgentTaskRunner`` and passed in at flow construction time.
+        self._prompt_assembler = prompt_assembler
+        # B5 post-audit (HIGH #1): test-only escape hatch matching the
+        # ``build_main_graph`` contract. When True AND
+        # ``prompt_assembler is None``, both the graph construction path
+        # and the detection-path planner silently build a minimal default
+        # assembler; production callers (``AgentTaskRunner``) always pass
+        # a configured instance and leave this False.
+        self._allow_default_prompt_assembler = _allow_default_prompt_assembler
 
         # Phase 3: 动态 skill 切换回调（由 AgentTaskRunner 在 invoke 前设置）
         self._skill_context_refresher = None
         self._react_graph_provider = None
         self._skill_guide_injector = None
+        # B5 post-audit LOW #1: optional language_callback set by
+        # AgentTaskRunner. main_graph.planner_node calls it via
+        # configurable["language_callback"](plan.language) after parsing
+        # the planner output so downstream telemetry picks up the real
+        # session language. None = feature disabled (test paths).
+        self._language_callback: "Callable[[str], None] | None" = None
 
         # 会话 Skill 池 getter（由 AgentTaskRunner 在 run() 中设置），
         # 用于 get_skill_guide 工具按需加载完整 SKILL.md。
@@ -327,19 +350,32 @@ class PlannerReActFlow(BaseFlow):
         # Context assembler (B2)
         from app.domain.services.graphs.context_assembler import ContextAssembler
         from app.domain.services.context.model_context_window import resolve_context_window
+        from app.domain.services.prompts.budget import compute_effective_window
 
         assembler = None
         if self._overflow_config:
-            context_window = resolve_context_window(
+            total_context_window = resolve_context_window(
                 self._overflow_config.model_name, self._overflow_config,
+            )
+            # B5 C9: compute the effective history window by subtracting the
+            # system prompt budget and the reserved output allocation. Both
+            # ``ContextAssembler`` (here) and ``GradualCompactor.try_compact``
+            # (in ``_check_overflow``) read this via the same helper so their
+            # budgets stay in sync.
+            effective_window = compute_effective_window(
+                total_context_window=total_context_window,
+                system_prompt_max_tokens=self._overflow_config.system_prompt_max_tokens,
+                reserved_output_tokens=self._overflow_config.reserved_output_tokens,
             )
             assembler = ContextAssembler(
                 estimator=TokenEstimator(
                     strategy=self._overflow_config.token_estimator,
                     model_name=self._overflow_config.model_name,
                 ),
-                context_window=context_window,
-                reserved_output_tokens=self._overflow_config.reserved_output_tokens,
+                effective_window=effective_window,
+                # B5 C9: reserved_output_tokens is NOT passed here in the
+                # new-API path — compute_effective_window already subtracted
+                # it when deriving effective_window.
                 safety_factor=self._overflow_config.token_safety_factor,
                 tool_compress_trigger_ratio=self._overflow_config.tool_compress_trigger_ratio,
             )
@@ -362,7 +398,9 @@ class PlannerReActFlow(BaseFlow):
             agent_config=self._agent_config,
             checkpointer=checkpointer,
             assembler=assembler,
+            prompt_assembler=self._prompt_assembler,
             supports_vision=self._supports_vision,
+            _allow_default_prompt_assembler=self._allow_default_prompt_assembler,
         )
         self._graphs_built = True
 
@@ -446,13 +484,15 @@ class PlannerReActFlow(BaseFlow):
         self, existing: list[ConversationSummary], plan: Plan,
     ) -> ConversationSummary:
         """调用 LLM 生成结构化对话摘要。"""
-        from app.domain.services.prompts.summary import GENERATE_SUMMARY_PROMPT
+        from app.domain.services.prompts import get_prompt_bundle
+
+        bundle = get_prompt_bundle(getattr(plan, "language", "zh"))
         steps_summary = "\n".join(
             f"- {s.description}: {'完成' if s.status == ExecutionStatus.COMPLETED else '未完成'}"
             + (f"\n  结果: {s.result[:200]}" if s.result else "")
             for s in plan.steps
         )
-        prompt = GENERATE_SUMMARY_PROMPT.format(
+        prompt = bundle.GENERATE_SUMMARY_PROMPT.format(
             round_number=len(existing) + 1,
             plan_goal=plan.goal,
             steps_summary=steps_summary,
@@ -477,12 +517,22 @@ class PlannerReActFlow(BaseFlow):
             return None
         # _compactor is always non-None when _overflow_config is non-None (see __init__)
         from app.domain.services.context.model_context_window import resolve_context_window
-        msgs = dicts_to_messages(memory.messages)
-        window = resolve_context_window(self._overflow_config.model_name, self._overflow_config)
 
+        msgs = dicts_to_messages(memory.messages)
+        total_window = resolve_context_window(
+            self._overflow_config.model_name, self._overflow_config
+        )
+        # B5 C9: pass the TOTAL context window to GradualCompactor, not the
+        # effective window. The compactor's soft/hard trigger ratios (0.85 /
+        # 0.95) are calibrated against the full model context — feeding it
+        # the effective_window would shift thresholds earlier and cause
+        # premature hard-compaction in the 0.85 - 0.95 utilization band.
+        # The assembler still uses effective_window (see _build_graphs) —
+        # both layers derive from the same config, but each uses the
+        # appropriate input for its internal math.
         result = await self._compactor.try_compact(
             messages=msgs,
-            context_window=window,
+            context_window=total_window,
             summary_llm=self._summary_llm,
         )
 
@@ -654,14 +704,19 @@ class PlannerReActFlow(BaseFlow):
         creation subgraph or normal main_graph flow. The plan is reused by
         main_graph (skipping planner_node) to avoid double LLM calls.
         """
-        from app.domain.services.prompts.planner import (
-            PLANNER_SYSTEM_PROMPT,
-            CREATE_PLAN_PROMPT,
+        from app.domain.services.prompts import (
+            get_prompt_bundle,
+            get_prompt_section_bundle,
         )
+        from app.domain.services.prompts.render_context import build_render_context
+        from app.domain.services.prompts.section import PromptMode
+
+        bundle = get_prompt_bundle(getattr(message, "language", "zh"))
+        lang = getattr(message, "language", "zh")
 
         attachments = getattr(message, "attachments", [])
         image_blocks = getattr(message, "image_content_blocks", [])
-        prompt = CREATE_PLAN_PROMPT.format(
+        prompt = bundle.CREATE_PLAN_PROMPT.format(
             message=message.message,
             attachments=format_attachments_text(
                 attachments, has_image_blocks=bool(image_blocks), for_planner=True,
@@ -669,17 +724,57 @@ class PlannerReActFlow(BaseFlow):
             ),
         )
 
-        system_content = PLANNER_SYSTEM_PROMPT
+        # B5 C7.5 + post-audit MEDIUM #2: PromptAssembler is the single code
+        # path. This call site is OUTSIDE the main graph (pre-graph language
+        # detection), so we build a minimal state dict from local fields.
+        # The DI contract mirrors ``build_main_graph``: missing assembler is
+        # a production misconfiguration, test-only paths opt in via
+        # ``_allow_default_prompt_assembler``.
+        if self._prompt_assembler is None:
+            if not self._allow_default_prompt_assembler:
+                raise RuntimeError(
+                    "_run_planner_for_detection requires a PromptAssembler "
+                    "instance. In production, AgentTaskRunner._build_prompt_assembler "
+                    "constructs one and passes it via PlannerReActFlow. If "
+                    "this is a test that needs the default, construct the "
+                    "flow with _allow_default_prompt_assembler=True."
+                )
+            from app.domain.services.graphs.token_estimator import TokenEstimator
+            from app.domain.services.prompts.assembler import (
+                PromptAssembler as _PromptAssemblerImpl,
+            )
+            from app.domain.services.prompts.budget import SystemPromptBudget
 
-        # Inject tool summary (same logic as main_graph planner_node)
-        skill_context = self._skill_context
-        tool_summary_marker = "## Available Tool Summary"
-        if tool_summary_marker in skill_context:
-            tool_summary = skill_context[skill_context.index(tool_summary_marker):]
-            system_content += f"\n\n{tool_summary}"
-
-        if summary_texts:
-            system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(summary_texts)
+            logger.warning(
+                "PlannerReActFlow._run_planner_for_detection: "
+                "prompt_assembler is None and _allow_default_prompt_assembler=True — "
+                "constructing a minimal default. This path is intended for "
+                "tests only; production should always inject a configured "
+                "PromptAssembler via AgentTaskRunner."
+            )
+            self._prompt_assembler = _PromptAssemblerImpl(
+                budget=SystemPromptBudget(max_tokens=3500),
+                token_estimator=TokenEstimator(strategy="hybrid"),
+                telemetry=None,
+            )
+        section_bundle = get_prompt_section_bundle(lang)
+        detection_state = {
+            "language": lang,
+            "skill_context": self._skill_context,
+            "conversation_summaries": list(summary_texts),
+        }
+        detection_config = {"configurable": {}}
+        ctx = build_render_context(
+            detection_state, detection_config, self._agent_config
+        )
+        result = self._prompt_assembler.assemble(
+            section_bundle.planner,
+            ctx,
+            PromptMode.FULL,
+            # Detection-path planner has no react_graph_provider by design.
+            fallback_used=False,
+        )
+        system_content = result.text
 
         # Planner 不传图片（同 main_graph.planner_node），避免幻觉图片内容
         messages = [
@@ -782,6 +877,17 @@ class PlannerReActFlow(BaseFlow):
                 "execution_control": control,
                 "tool_failure_tracker": self._tool_failure_tracker,
                 "execution_metrics": self._execution_metrics,
+                # B5 C5a: make the LLM adapter and AgentConfig available to
+                # executor_node so PromptAssembler consumers (C5b) can read
+                # provider name / model details without re-injecting via state.
+                # bound_tool_names is NOT injected here — it is per-step and
+                # gets written by react_graph_provider on each call (C5a Phase 3).
+                "llm": self._llm,
+                "agent_config": self._agent_config,
+                # B5 post-audit LOW #1: optional callback for main_graph
+                # nodes to notify the runner of session language changes.
+                # Injected by ``AgentTaskRunner`` before each session start.
+                "language_callback": self._language_callback,
             }
         }
 

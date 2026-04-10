@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Literal, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -60,6 +60,10 @@ class ActusChatModel(BaseChatModel):
     supports_response_format: bool = True
     supports_vision: bool = True
     supports_pdf_input: bool = False
+    # B5 C0a: provider identification for prompt rendering (system-reminder format etc.)
+    # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
+    # introduce real Anthropic routing via LLMConfig.provider field.
+    provider_name: Literal["openai", "anthropic"] = "openai"
 
     # Tools bound via bind_tools() — None means no tools bound
     _bound_tools: Optional[list[dict[str, Any]]] = None
@@ -67,12 +71,33 @@ class ActusChatModel(BaseChatModel):
     _bound_tool_names: frozenset[str] = frozenset()
     # tool_choice bound via bind_tools() — critical for with_structured_output
     _bound_tool_choice: Optional[Any] = None
+    # B5 C11: telemetry port attached via attach_telemetry(). None means
+    # the _agenerate hook no-ops. Never serialized.
+    _telemetry: Optional[Any] = None
 
     # ---- Properties ------------------------------------------------------ #
 
     @property
     def _llm_type(self) -> str:
         return "actus-chat"
+
+    # ---- B5 C11: telemetry hook ----------------------------------------- #
+
+    def attach_telemetry(self, telemetry: Any, lang: str = "zh") -> None:
+        """Attach a ``PromptTelemetryPort`` for LLM-invocation logging.
+
+        Passing ``None`` detaches. Non-blocking — telemetry failures
+        never propagate to the main call path. Call once at session
+        setup time (typically from ``AgentTaskRunner.__init__``).
+
+        ``lang`` is recorded on every subsequent invocation telemetry
+        event. Defaults to ``"zh"`` matching the pre-audit hardcode.
+        """
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            attach_telemetry,
+        )
+
+        attach_telemetry(self, telemetry, lang=lang)
 
     # ---- Client factory -------------------------------------------------- #
 
@@ -432,6 +457,13 @@ class ActusChatModel(BaseChatModel):
         if all_tools:
             params["tools"] = all_tools
 
+        # B5 C11: emit telemetry (non-blocking — any failure is swallowed)
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            emit_invocation_telemetry,
+        )
+
+        emit_invocation_telemetry(self, messages, all_tools)
+
         # tool_choice: per-call kwarg > bound value from bind_tools
         # LangChain uses "any" internally (e.g. with_structured_output),
         # but OpenAI API expects "required" for the same semantics.
@@ -528,6 +560,13 @@ class ActusChatModel(BaseChatModel):
         if all_tools:
             params["tools"] = all_tools
 
+        # B5 C11: emit telemetry (non-blocking — any failure is swallowed)
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            emit_invocation_telemetry,
+        )
+
+        emit_invocation_telemetry(self, messages, all_tools)
+
         # tool_choice: per-call kwarg > bound value from bind_tools
         # LangChain uses "any" internally (e.g. with_structured_output),
         # but OpenAI API expects "required" for the same semantics.
@@ -613,12 +652,21 @@ class ActusChatModel(BaseChatModel):
         """Return a new ActusChatModel with tool schemas bound for LLM calls.
 
         Uses LangChain's convert_to_openai_tool to normalize tool definitions.
+
+        **Codex audit HIGH #3 fix**: the clone must preserve
+        ``provider_name`` (otherwise it defaults back to ``"openai"``
+        even if the source was Anthropic) AND ``_telemetry`` (otherwise
+        bound models never emit invocation events because LangGraph
+        binds tools once per react_graph and all LLM calls go through
+        the clone).
         """
         from langchain_core.utils.function_calling import convert_to_openai_tool
 
         converted = [convert_to_openai_tool(t) for t in tools]
 
-        # Create a new instance with the same config but tools bound
+        # Create a new instance with the same config but tools bound.
+        # ``provider_name`` flows through the Pydantic config field so the
+        # cloned model correctly identifies itself to telemetry consumers.
         new_model = ActusChatModel(
             base_url=self.base_url,
             api_key=self.api_key,
@@ -628,6 +676,7 @@ class ActusChatModel(BaseChatModel):
             supports_response_format=self.supports_response_format,
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
+            provider_name=self.provider_name,
         )
         new_model._bound_tools = converted
         new_model._bound_tool_names = frozenset(
@@ -638,4 +687,13 @@ class ActusChatModel(BaseChatModel):
         # Preserve tool_choice from kwargs (critical for with_structured_output)
         if "tool_choice" in kwargs:
             new_model._bound_tool_choice = kwargs["tool_choice"]
+        # Preserve telemetry port attachment so bound model invocations
+        # still emit record_llm_invocation events. ``_telemetry_lang``
+        # carries the attach-time language (post-audit LOW #4).
+        object.__setattr__(
+            new_model, "_telemetry", getattr(self, "_telemetry", None)
+        )
+        object.__setattr__(
+            new_model, "_telemetry_lang", getattr(self, "_telemetry_lang", "zh")
+        )
         return new_model

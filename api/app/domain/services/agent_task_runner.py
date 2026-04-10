@@ -10,7 +10,10 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, BinaryIO, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from app.domain.services.prompts.assembler import PromptAssembler
 
 from langchain_core.language_models import BaseChatModel
 
@@ -287,6 +290,18 @@ class AgentTaskRunner(TaskRunner):
         self._current_embedding_scores: list[float] | None = None
         self._tier2_preloaded_skill_ids: set[str] = set()
         self._last_skill_context: str = ""
+        # B5 C5a: per-step authoritative metadata persisted across calls.
+        # These three fields — together with self._last_initialized_skill_ids —
+        # are updated atomically by _apply_refreshed_skills + Phase 3 of
+        # _build_step_react_graph. Any partial update must be rolled back to
+        # the pre-call snapshot (see atomicity tests in test_refresh_skills_atomicity.py).
+        self._last_skill_ids: tuple[str, ...] = ()
+        self._last_bound_tool_names: frozenset[str] = frozenset()
+        # B5 C5a: per-step lc_tools cache keyed by (mode, skill_ids_tuple,
+        # activated_mcp_tools_frozenset). Never cleaned (bounded by the set
+        # of skill_id combinations actually used in this session). Cache is
+        # valid because lc_tools construction is a pure function of the key.
+        self._lc_tools_cache: dict[tuple, list[Any]] = {}
         self._activated_mcp_tools: set[str] = set()
         self._image_url_map: dict[str, str] = {}  # sandbox filepath → presigned URL
         self._supports_vision = supports_vision
@@ -296,6 +311,45 @@ class AgentTaskRunner(TaskRunner):
         # self._file_repository = file_repository
         self._browser = browser
         self._search_engine = search_engine
+
+        # B5 post-audit MEDIUM #3: eagerly import the ZH/EN bundles at
+        # session startup. The import triggers ``SectionRegistry.__post_init__``
+        # first-use validation (render each section against ``_FIXTURE_CTX``
+        # and scan for dangling skill tool refs). By doing this in the
+        # ``AgentTaskRunner.__init__`` — which runs once per session — we
+        # get practical startup fail-fast semantics without forcing the
+        # lightweight ``get_prompt_bundle`` path to pay the validation
+        # cost on every ``import app.domain.services.prompts`` call.
+        from app.domain.services.prompts.bundles import EN_BUNDLE, ZH_BUNDLE  # noqa: F401
+
+        # B5 C11: construct a JsonlPromptTelemetry instance and attach it
+        # to both (a) the PromptAssembler (assembly events) and (b) the
+        # LLM adapters (per-invocation events). All writes are
+        # fire-and-forget — failures never propagate to the main path.
+        self._prompt_telemetry = self._build_prompt_telemetry()
+
+        # B5 C5b: construct PromptAssembler for section-based system prompt
+        # assembly. Consumed by executor_node, planner_node, updater_node,
+        # and planner_react._run_planner_for_detection.
+        # B5 C9: budget routes through ``ContextOverflowConfig.system_prompt_max_tokens``.
+        # B5 C7.5: no longer gated by a feature flag — always constructed.
+        # B5 C11: telemetry is the JsonlPromptTelemetry built above.
+        prompt_assembler = self._build_prompt_assembler()
+
+        # B5 C11 + post-audit LOW #1: track the current session language
+        # and wire telemetry into all LLM adapters with that language.
+        # The initial value is ``"zh"`` because the actual language is
+        # only known after ``planner_node`` runs and parses the user
+        # message. ``set_language`` re-attaches telemetry with the new
+        # language once main_graph notifies us via the
+        # ``language_callback`` injected into ``configurable``.
+        # Note: ``self._llm`` was already assigned at line ~212; here we
+        # just stash ``summary_llm`` (which isn't stored elsewhere) and
+        # track the language.
+        self._current_language: str = "zh"
+        self._summary_llm_for_telemetry = summary_llm
+        self._attach_telemetry_to_llms(self._current_language)
+
         self._flow = PlannerReActFlow(
             uow_factory=uow_factory,
             llm=llm,
@@ -322,6 +376,125 @@ class AgentTaskRunner(TaskRunner):
             memory_repo_factory=self._memory_repo_factory,
             approval_cache=self._approval_cache,
             confirmation_manager=self._confirmation_manager,
+            prompt_assembler=prompt_assembler,
+        )
+
+    def _build_prompt_telemetry(self) -> Any:
+        """Construct the ``JsonlPromptTelemetry`` instance used by
+        the ``PromptAssembler`` and LLM adapter hooks.
+
+        Log directory comes from ``settings.prompt_telemetry_log_dir``.
+        If the directory can't be created, ``JsonlPromptTelemetry`` logs
+        a warning at construction time and continues to accept writes
+        (each write is also try/except-guarded — see C1 implementation).
+
+        Returns a plain ``JsonlPromptTelemetry`` instance; can also be
+        a ``None``-compatible stub for tests if the config is missing,
+        but at the moment the default is always populated by settings.
+        """
+        from pathlib import Path
+
+        from app.infrastructure.telemetry.prompt_telemetry import (
+            JsonlPromptTelemetry,
+        )
+
+        log_dir = Path(get_settings().prompt_telemetry_log_dir)
+        return JsonlPromptTelemetry(log_dir=log_dir)
+
+    def _attach_telemetry_to_llms(self, lang: str) -> None:
+        """Attach ``self._prompt_telemetry`` to the primary and summary LLMs.
+
+        B5 post-audit LOW #1: called once at ``__init__`` with the default
+        language (``"zh"``), then again from ``set_language`` after
+        ``planner_node`` detects the real session language. The method is
+        idempotent — calling with the same lang is a no-op in effect.
+
+        Swallows ``AttributeError`` for test mocks that don't implement
+        ``attach_telemetry``.
+        """
+        llm = getattr(self, "_llm", None)
+        if llm is not None and hasattr(llm, "attach_telemetry"):
+            llm.attach_telemetry(self._prompt_telemetry, lang=lang)
+        summary_llm = getattr(self, "_summary_llm_for_telemetry", None)
+        if (
+            summary_llm is not None
+            and summary_llm is not llm
+            and hasattr(summary_llm, "attach_telemetry")
+        ):
+            summary_llm.attach_telemetry(self._prompt_telemetry, lang=lang)
+
+    def set_language(self, lang: str) -> None:
+        """Update the session language and re-attach telemetry.
+
+        B5 post-audit LOW #1: called from ``main_graph.planner_node``
+        after parsing ``plan.language`` so the invocation telemetry
+        records the correct language for every subsequent LLM call
+        in this session.
+
+        No-op if ``lang`` equals the current language. Non-blocking —
+        the underlying ``attach_telemetry`` swallows any adapter error.
+        """
+        if not lang or lang == self._current_language:
+            return
+        logger.info(
+            "[Telemetry] session language updated: %s → %s",
+            self._current_language,
+            lang,
+        )
+        self._current_language = lang
+        try:
+            self._attach_telemetry_to_llms(lang)
+        except Exception as exc:
+            logger.warning(
+                "[Telemetry] set_language failed to re-attach telemetry: %s",
+                exc,
+            )
+
+    def _build_prompt_assembler(self) -> "PromptAssembler":
+        """Construct the ``PromptAssembler`` used for all system-prompt assembly.
+
+        Post-C7.5: this method always returns a real instance — there is no
+        feature flag to gate it anymore. Consumers in ``main_graph`` and
+        ``planner_react`` require a non-None assembler and raise
+        ``RuntimeError`` if DI is misconfigured.
+
+        Budget: ``ContextOverflowConfig.system_prompt_max_tokens`` (canonical
+        source since B5 C9). Falls back to the pre-C9 hardcoded default of
+        3500 when no overflow_config is attached (test fixtures).
+        Telemetry: ``self._prompt_telemetry`` populated by
+        ``_build_prompt_telemetry`` (B5 C11). ``None`` when the runner
+        skipped telemetry setup (test path that bypasses ``__init__``).
+        """
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from app.domain.services.prompts.assembler import (
+            PromptAssembler as _PromptAssembler,
+        )
+        from app.domain.services.prompts.budget import SystemPromptBudget
+
+        # B5 C9: budget comes from ``ContextOverflowConfig.system_prompt_max_tokens``
+        # (canonical config source). When no overflow_config is attached
+        # (e.g. in tests), fall back to the pre-C9 hardcoded default of 3500.
+        max_tokens = (
+            self._overflow_config.system_prompt_max_tokens
+            if self._overflow_config
+            else 3500
+        )
+        budget = SystemPromptBudget(max_tokens=max_tokens)
+        strategy = (
+            self._overflow_config.token_estimator
+            if self._overflow_config
+            else "hybrid"
+        )
+        model_name = (
+            self._overflow_config.model_name
+            if self._overflow_config
+            else ""
+        )
+        estimator = TokenEstimator(strategy=strategy, model_name=model_name)
+        return _PromptAssembler(
+            budget=budget,
+            token_estimator=estimator,
+            telemetry=getattr(self, "_prompt_telemetry", None),
         )
 
     async def _put_and_add_event(
@@ -1207,7 +1380,36 @@ class AgentTaskRunner(TaskRunner):
             self._flow.set_skill_context(context)
 
     async def _refresh_skill_context_for_step(self, step_description: str) -> str:
-        """Phase 3: 根据 step 描述重新选择 skill 并构建上下文。"""
+        """Legacy entry point — kept for ``skill_context_refresher`` injection.
+
+        B5 C5a: the implementation is now a thin wrapper around the pure
+        ``_compute_refreshed_skills`` + atomic ``_apply_refreshed_skills``
+        pair. ``updater_node`` still calls this to refresh the two-clock
+        fallback (``state.skill_context``). New C5a call sites in
+        ``_build_step_react_graph`` use the split pair directly.
+        """
+        result = await self._compute_refreshed_skills(step_description)
+        if result is None:
+            # Sticky: embedding top-1 score too low — keep previous selection.
+            return self._last_skill_context
+        await self._apply_refreshed_skills(result)
+        return self._last_skill_context
+
+    async def _compute_refreshed_skills(
+        self, step_description: str
+    ) -> "RefreshedSkillsResult | None":
+        """Pure compute: select skills + build context, no side effects.
+
+        Returns ``None`` when the embedding top-1 score is too low — the
+        caller should keep ``self._last_*`` unchanged (sticky behavior).
+        Otherwise returns a frozen ``RefreshedSkillsResult`` that
+        ``_apply_refreshed_skills`` will apply atomically.
+
+        **Must not mutate any ``self._*`` field.** Every state mutation
+        happens in ``_apply_refreshed_skills``.
+        """
+        from app.domain.services.graphs.step_metadata import RefreshedSkillsResult
+
         query_parts = [step_description]
         if self._current_message_text:
             query_parts.append(self._current_message_text)
@@ -1217,7 +1419,7 @@ class AgentTaskRunner(TaskRunner):
             try:
                 results = await self._embedding_index.query(query, top_k=12)
                 if results and results[0][1] < 0.2:
-                    return self._last_skill_context
+                    return None  # sticky
                 id_to_skill = {s.id: s for s in self._session_skill_pool}
                 skills = [id_to_skill[sid] for sid, _ in results if sid in id_to_skill]
                 scores = [score for sid, score in results if sid in id_to_skill]
@@ -1229,11 +1431,51 @@ class AgentTaskRunner(TaskRunner):
             skills = self._skill_selector.select(self._session_skill_pool, query)
             scores = None
 
-        if skills:
-            await self._initialize_skill_tool_if_needed(skills)
         context = self._build_runtime_system_context(skills, scores=scores)
-        self._last_skill_context = context
-        return context
+        return RefreshedSkillsResult(
+            skills=tuple(skills),
+            context=context,
+            skill_ids=tuple(s.id for s in skills),
+            scores=tuple(scores) if scores is not None else None,
+        )
+
+    async def _apply_refreshed_skills(
+        self, result: "RefreshedSkillsResult"
+    ) -> None:
+        """Atomic mutation point for the refreshed skill selection.
+
+        Applies ``RefreshedSkillsResult`` to three persistent fields in
+        one go:
+        - ``self._last_initialized_skill_ids`` (via ``_initialize_skill_tool_if_needed``)
+        - ``self._last_skill_context``
+        - ``self._last_skill_ids``
+
+        If ``_initialize_skill_tool_if_needed`` raises, rollback restores
+        all three fields to their pre-call snapshot. ``SkillTool`` itself
+        may be left in a partially-initialized state — that is the known
+        limitation documented in the B5 design doc (out-of-scope for B5).
+        """
+        snapshot_initialized_ids = self._last_initialized_skill_ids
+        snapshot_last_ctx = self._last_skill_context
+        snapshot_last_ids = self._last_skill_ids
+
+        try:
+            if result.skills:
+                await self._initialize_skill_tool_if_needed(list(result.skills))
+            # Atomic commit: only reaches here if initialize succeeded or was
+            # a no-op (skill_ids unchanged). Both halves of the commit must
+            # succeed together so callers see a consistent view.
+            self._last_skill_context = result.context
+            self._last_skill_ids = result.skill_ids
+        except Exception:
+            # Rollback: initialize may have partially updated
+            # self._last_initialized_skill_ids before raising (the current
+            # implementation assigns after the await, so it is safe — but
+            # we restore defensively in case that ordering changes).
+            self._last_initialized_skill_ids = snapshot_initialized_ids
+            self._last_skill_context = snapshot_last_ctx
+            self._last_skill_ids = snapshot_last_ids
+            raise
 
     def _get_always_bind_tool_names(self) -> set[str]:
         """从 MCPConfig 提取所有 always_bind 工具名，组装完整前缀名。"""
@@ -1248,106 +1490,349 @@ class AgentTaskRunner(TaskRunner):
                 names.add(f"{prefix}_{tool_short_name}")
         return names
 
-    async def _build_step_react_graph(self, step_description: str = ""):
-        """Phase 3: 渐进式构建 react_graph — 按步骤描述选择相关 Skill 工具。
+    # B5 C5a: category sets for the shared _build_lc_tools_from_categories helper.
+    # _ALL_CATEGORIES is the normal path (every tool source bound).
+    # _MINIMAL_CATEGORIES is the degraded path used when _skill_tool is in a
+    # partial-mutation state and dynamic skill tool construction would raise.
+    _ALL_CATEGORIES: frozenset[str] = frozenset(
+        {
+            "native",
+            "mcp_auto",
+            "a2a",
+            "skill_static",
+            "dynamic_skill",
+            "skill_guide",
+            "memory",
+        }
+    )
+    _MINIMAL_CATEGORIES: frozenset[str] = frozenset(
+        {
+            "native",
+            "mcp_always_bind",
+            "skill_guide",
+        }
+    )
 
-        1. 根据 step_description 刷新 Skill 选择（更新 _skill_tool）
-        2. 构建包含基础工具 + 当前步骤相关 Skill 工具的 react_graph
+    def _build_lc_tools_from_categories(
+        self, categories: frozenset[str]
+    ) -> list[Any]:
+        """Shared lc_tools factory used by both normal and minimal paths.
+
+        Normal path: ``categories = _ALL_CATEGORIES``.
+        Degraded path: ``categories = _MINIMAL_CATEGORIES`` — skips anything
+        that reads ``self._skill_tool`` (which may be in a partially-
+        initialized state after ``_initialize_skill_tool_if_needed`` raised).
         """
-        # 按步骤描述刷新 skill 选择
-        if step_description:
-            try:
-                await self._refresh_skill_context_for_step(step_description)
-            except Exception as exc:
-                logger.warning("[ProgressiveSkillLoad] 步骤级 skill 刷新失败: %s", exc)
-
         from app.domain.services.tools.langchain_tools import create_native_tools
         from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
         from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
-        from app.domain.services.tools.langchain_skill_tools import create_skill_langchain_tools
-        from app.domain.services.tools.langchain_dynamic_skill_tools import create_dynamic_skill_langchain_tools
+        from app.domain.services.tools.langchain_skill_tools import (
+            create_skill_guide_tool,
+            create_skill_langchain_tools,
+        )
+        from app.domain.services.tools.langchain_dynamic_skill_tools import (
+            create_dynamic_skill_langchain_tools,
+        )
+
+        lc_tools: list[Any] = []
+
+        if "native" in categories:
+            lc_tools.extend(
+                create_native_tools(
+                    sandbox=self._sandbox,
+                    browser=self._browser,
+                    search_engine=self._search_engine,
+                    processor_lookup=self._file_processor_lookup,
+                    supports_vision=self._supports_vision,
+                    supports_pdf_input=self._supports_pdf_input,
+                )
+            )
+
+        # MCP: two sub-modes. "mcp_auto" = progressive auto-bind threshold
+        # logic identical to pre-refactor behavior. "mcp_always_bind" = the
+        # degraded subset (only always-bind names, no discovery tools).
+        if "mcp_auto" in categories:
+            MCP_AUTO_BIND_THRESHOLD = 15
+            all_mcp_tools = self._mcp_tool.get_tools()
+            _url_map_ref = lambda: self._image_url_map
+            _sandbox_uploader = self._upload_sandbox_file_for_mcp
+            if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
+                lc_tools.extend(
+                    create_mcp_langchain_tools(
+                        self._mcp_tool,
+                        tool_names=None,
+                        url_map_ref=_url_map_ref,
+                        sandbox_file_uploader=_sandbox_uploader,
+                    )
+                )
+            else:
+                mcp_bind_names = (
+                    self._get_always_bind_tool_names() | self._activated_mcp_tools
+                )
+                lc_tools.extend(
+                    create_mcp_langchain_tools(
+                        self._mcp_tool,
+                        tool_names=mcp_bind_names,
+                        url_map_ref=_url_map_ref,
+                        sandbox_file_uploader=_sandbox_uploader,
+                    )
+                )
+                from app.domain.services.tools.langchain_mcp_discovery import (
+                    create_mcp_discovery_tools,
+                )
+                lc_tools.extend(
+                    create_mcp_discovery_tools(
+                        mcp_tool_ref=lambda: self._mcp_tool,
+                        activated_tools_ref=lambda: self._activated_mcp_tools,
+                    )
+                )
+        elif "mcp_always_bind" in categories:
+            # Degraded: only always-bind MCP tools, no activated set, no discovery.
+            _url_map_ref = lambda: self._image_url_map
+            _sandbox_uploader = self._upload_sandbox_file_for_mcp
+            always_bind = self._get_always_bind_tool_names()
+            if always_bind:
+                lc_tools.extend(
+                    create_mcp_langchain_tools(
+                        self._mcp_tool,
+                        tool_names=always_bind,
+                        url_map_ref=_url_map_ref,
+                        sandbox_file_uploader=_sandbox_uploader,
+                    )
+                )
+
+        if "a2a" in categories:
+            lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
+
+        if "skill_static" in categories:
+            lc_tools.extend(
+                create_skill_langchain_tools(
+                    brainstorm_skill_tool=self._brainstorm_skill_tool,
+                    create_skill_tool=self._create_skill_tool,
+                )
+            )
+
+        if "dynamic_skill" in categories:
+            # Only reads self._skill_tool — skipped by the minimal path so
+            # a partially-initialized SkillTool can't poison lc_tools.
+            lc_tools.extend(
+                create_dynamic_skill_langchain_tools(self._skill_tool)
+            )
+
+        if "skill_guide" in categories:
+            lc_tools.append(
+                create_skill_guide_tool(
+                    skill_pool_ref=lambda: self._session_skill_pool,
+                    file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
+                    sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
+                )
+            )
+
+        if "memory" in categories:
+            if self._memory_session_factory and self._memory_repo_factory:
+                from app.domain.services.tools.memory_tools import create_memory_tools
+                memory_config = self._flow._memory_config
+                lc_tools.extend(
+                    create_memory_tools(
+                        embedding_provider=self._memory_embedding_provider,
+                        session_factory=self._memory_session_factory,
+                        repo_factory=self._memory_repo_factory,
+                        user_id=self._user_id,
+                        half_life_days=memory_config.half_life_days,
+                        mmr_lambda=memory_config.mmr_lambda,
+                    )
+                )
+
+        return lc_tools
+
+    def _build_lc_tools_for_step(self) -> list[Any]:
+        """Normal-path lc_tools construction with per-step cache.
+
+        Cache key is ``(mode, skill_ids, activated_mcp_tools)``. These are
+        the fields that change BETWEEN STEPS within a single user message.
+        ``_build_lc_tools_from_categories`` also reads several instance
+        attributes that are stable WITHIN a session but could vary across
+        sessions or messages — namely ``self._skill_tool`` internal state,
+        ``self._memory_session_factory`` / ``_memory_repo_factory``,
+        ``self._user_id``, and ``self._flow._memory_config``. These are
+        NOT in the cache key because they do not change mid-message in
+        the current architecture.
+
+        The cache is cleared at each message boundary (alongside
+        ``_activated_mcp_tools.clear()``) to eliminate cross-message
+        staleness risk. Within a message, re-using cached entries is safe
+        because the implicit dependencies listed above are session-stable.
+        """
+        cache_key = (
+            "FULL",
+            self._last_skill_ids,
+            frozenset(self._activated_mcp_tools),
+        )
+        cached = self._lc_tools_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        tools = self._build_lc_tools_from_categories(self._ALL_CATEGORIES)
+        self._lc_tools_cache[cache_key] = tools
+        return tools
+
+    def _build_minimal_lc_tools_for_step(self) -> list[Any]:
+        """Degraded-path lc_tools: native + always-bind MCP + skill_guide only.
+
+        Used when normal-path construction raises (e.g., because
+        ``_skill_tool`` is in a half-initialized state). This keeps the
+        step alive with a minimal viable tool set rather than aborting
+        the whole session.
+        """
+        cache_key = ("MINIMAL", (), frozenset())
+        cached = self._lc_tools_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        tools = self._build_lc_tools_from_categories(self._MINIMAL_CATEGORIES)
+        self._lc_tools_cache[cache_key] = tools
+        return tools
+
+    async def _build_step_react_graph(
+        self, step_description: str = ""
+    ) -> "tuple[Any, StepMetadata]":
+        """Phase 3: progressive react_graph build + per-step metadata.
+
+        B5 C5a: returns a 2-tuple ``(CompiledStateGraph, StepMetadata)``.
+        The metadata is the authoritative per-step truth about tools bound
+        and skill context in scope. See ``step_metadata.py`` for field
+        semantics.
+
+        **Atomicity contract (post-audit HIGH #1)**: the 4 bookkeeping
+        fields ``_last_skill_context``, ``_last_skill_ids``,
+        ``_last_bound_tool_names``, ``_last_initialized_skill_ids`` must
+        be updated as a group. The entire 3-phase sequence is wrapped in
+        a snapshot/restore guard so that if ANY phase raises (including
+        the final ``build_react_graph`` call), all 4 fields are rolled
+        back to their pre-call values and the exception propagates to
+        the caller. Earlier partial-commit versions of this method
+        violated the contract when Phase 1 succeeded and Phase 3
+        raised — see test_refresh_skills_atomicity.py scenario 10.
+
+        3 phases (any can fail independently):
+        1. **Refresh skills** — ``_compute_refreshed_skills`` + atomic
+           ``_apply_refreshed_skills``. On exception: rollback + caller
+           observes the exception.
+        2. **Build lc_tools** — normal path with cache. Falls back to
+           ``_build_minimal_lc_tools_for_step`` on exception (graceful
+           degradation, no rollback needed for this recoverable path).
+        3. **Build react_graph** — if this raises, the whole function's
+           snapshot/restore restores all 4 fields and re-raises.
+        """
         from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.graphs.step_metadata import StepMetadata
 
-        lc_tools = create_native_tools(
-            sandbox=self._sandbox, browser=self._browser,
-            search_engine=self._search_engine,
-            processor_lookup=self._file_processor_lookup,
-            supports_vision=self._supports_vision,
-            supports_pdf_input=self._supports_pdf_input,
-        )
-        # MCP: progressive loading with auto-bind threshold
-        # When total MCP tools ≤ threshold, bind all directly (skip discovery overhead)
-        # When > threshold, only bind always_bind + activated tools
-        MCP_AUTO_BIND_THRESHOLD = 15
-        all_mcp_tools = self._mcp_tool.get_tools()
-        # URL map ref + sandbox uploader: MCP tools auto-resolve sandbox paths → presigned URLs
-        _url_map_ref = lambda: self._image_url_map
-        _sandbox_uploader = self._upload_sandbox_file_for_mcp
-        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
-            lc_tools.extend(create_mcp_langchain_tools(
-                self._mcp_tool, tool_names=None,
-                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
-            ))
-        else:
-            mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
-            lc_tools.extend(create_mcp_langchain_tools(
-                self._mcp_tool, tool_names=mcp_bind_names,
-                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
-            ))
-            # Discovery tools only needed for large tool sets
-            from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
-            lc_tools.extend(create_mcp_discovery_tools(
-                mcp_tool_ref=lambda: self._mcp_tool,
-                activated_tools_ref=lambda: self._activated_mcp_tools,
-            ))
-        lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
-        lc_tools.extend(create_skill_langchain_tools(
-            brainstorm_skill_tool=self._brainstorm_skill_tool,
-            create_skill_tool=self._create_skill_tool,
-        ))
+        # Snapshot all 4 bookkeeping fields at function entry. Any
+        # exception from any phase below restores them and re-raises so
+        # the atomicity contract holds across the entire method.
+        snapshot_skill_context = self._last_skill_context
+        snapshot_skill_ids = self._last_skill_ids
+        snapshot_bound_tool_names = self._last_bound_tool_names
+        snapshot_initialized_skill_ids = self._last_initialized_skill_ids
 
-        # 渐进式注入：只绑定当前步骤相关的 Skill 工具
-        dynamic_tools = create_dynamic_skill_langchain_tools(self._skill_tool)
-        lc_tools.extend(dynamic_tools)
+        try:
+            # Phase 1: try refresh skills (pure compute + atomic apply).
+            # ``_apply_refreshed_skills`` has its own internal rollback for
+            # ``_initialize_skill_tool_if_needed`` failures and re-raises;
+            # we catch here to mark the step as degraded and keep going
+            # with the sticky previous selection rather than aborting.
+            refresh_failed = False
+            if step_description:
+                try:
+                    refreshed = await self._compute_refreshed_skills(step_description)
+                    if refreshed is not None:
+                        await self._apply_refreshed_skills(refreshed)
+                    # refreshed is None → sticky: self._last_* unchanged
+                except Exception as exc:
+                    logger.warning(
+                        "[ProgressiveSkillLoad] 刷新失败，继续使用上次选择: %s", exc
+                    )
+                    refresh_failed = True
+                    # self._last_* already rolled back by _apply_refreshed_skills
 
-        # get_skill_guide 始终可用（空 pool 时返回友好提示），让 LLM 能按需获取完整 SKILL.md
-        from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
-        lc_tools.append(create_skill_guide_tool(
-            skill_pool_ref=lambda: self._session_skill_pool,
-            file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
-            sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
-        ))
+            # Phase 2: build lc_tools with degraded-path fallback
+            try:
+                lc_tools = self._build_lc_tools_for_step()
+                fresh_bound_tool_names = frozenset(t.name for t in lc_tools)
+            except Exception as exc:
+                logger.error(
+                    "[ProgressiveSkillLoad] lc_tools 构造失败，降级到最小工具集: %s", exc
+                )
+                lc_tools = self._build_minimal_lc_tools_for_step()
+                fresh_bound_tool_names = frozenset(t.name for t in lc_tools)
+                refresh_failed = True
+                # Audit MEDIUM #6 fix: degradation telemetry reads the runner's
+                # own port, not self._flow._telemetry (which was never wired).
+                telemetry = getattr(self, "_prompt_telemetry", None)
+                if telemetry is not None:
+                    try:
+                        telemetry.record_lc_tools_degradation(
+                            reason="lc_tools_build_failed"
+                        )
+                    except Exception:
+                        pass  # telemetry never propagates
 
-        # Memory tools (C6): 与 PlannerReActFlow._collect_memory_tools 保持一致
-        if self._memory_session_factory and self._memory_repo_factory:
-            from app.domain.services.tools.memory_tools import create_memory_tools
-            memory_config = self._flow._memory_config
-            lc_tools.extend(create_memory_tools(
-                embedding_provider=self._memory_embedding_provider,
-                session_factory=self._memory_session_factory,
-                repo_factory=self._memory_repo_factory,
-                user_id=self._user_id,
-                half_life_days=memory_config.half_life_days,
-                mmr_lambda=memory_config.mmr_lambda,
-            ))
+            # Decide the StepMetadata.bound_tool_names value. If refresh
+            # failed, advertise the pre-call set (lower bound); otherwise
+            # advance to the fresh set. The actual commit to
+            # self._last_bound_tool_names happens AFTER build_react_graph
+            # succeeds so the rollback path covers it too.
+            if refresh_failed:
+                stable_bound_tool_names = self._last_bound_tool_names
+            else:
+                stable_bound_tool_names = fresh_bound_tool_names
 
-        skill_tool_names = [t.name for t in dynamic_tools]
-        logger.info(
-            "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
-            step_description[:80] if step_description else "(无步骤描述)",
-            len(skill_tool_names),
-            skill_tool_names,
-            bool(self._session_skill_pool),
-        )
+            dynamic_tool_names = [
+                t.name for t in lc_tools if t.name.startswith("skill_")
+            ]
+            logger.info(
+                "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s, refresh_failed=%s",
+                step_description[:80] if step_description else "(无步骤描述)",
+                len(dynamic_tool_names),
+                dynamic_tool_names,
+                bool(self._session_skill_pool),
+                refresh_failed,
+            )
 
-        return build_react_graph(
-            llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
-            tool_result_max_chars=(
-                self._flow._overflow_config.tool_result_max_chars
-                if self._flow._overflow_config else 8000
-            ),
-            assembler=getattr(self._flow, '_assembler', None),
-        )
+            # Phase 3: build the react_graph. If this raises, the outer
+            # try/except restores all 4 snapshot fields before re-raising.
+            step_react = build_react_graph(
+                llm=self._llm,
+                tools=lc_tools,
+                agent_config=self._agent_config,
+                tool_result_max_chars=(
+                    self._flow._overflow_config.tool_result_max_chars
+                    if self._flow._overflow_config
+                    else 8000
+                ),
+                assembler=getattr(self._flow, "_assembler", None),
+            )
+
+            # Post-build atomic commit: only now do we advance
+            # _last_bound_tool_names. All 4 fields are now consistent with
+            # a successful step build.
+            if not refresh_failed:
+                self._last_bound_tool_names = fresh_bound_tool_names
+
+            metadata = StepMetadata(
+                bound_tool_names=stable_bound_tool_names,
+                skill_context=self._last_skill_context,
+                skill_ids=self._last_skill_ids,
+            )
+            return step_react, metadata
+        except Exception:
+            # Whole-function rollback: any uncaught exception (including
+            # build_react_graph failure) restores the 4 bookkeeping fields
+            # to pre-call state before propagating. This guarantees the
+            # "4 fields atomic" contract from the C5a design doc.
+            self._last_skill_context = snapshot_skill_context
+            self._last_skill_ids = snapshot_skill_ids
+            self._last_bound_tool_names = snapshot_bound_tool_names
+            self._last_initialized_skill_ids = snapshot_initialized_skill_ids
+            raise
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
         """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。"""
@@ -1390,7 +1875,24 @@ class AgentTaskRunner(TaskRunner):
         selected_skills: list[Skill] | None = None,
         is_virtual: bool = False,
     ) -> None:
-        """按 step 锁定技能集并更新运行时上下文。"""
+        """按 step 锁定技能集并更新运行时上下文。
+
+        **B5 C5a note**: this is a pre-B5 legacy path that bypasses the
+        C5a ``_compute_refreshed_skills`` / ``_apply_refreshed_skills``
+        atomic pair. It writes ``_last_initialized_skill_ids`` (via
+        ``_initialize_skill_tool_if_needed``) and ``_last_skill_context``
+        (via ``_set_runtime_system_context``) without taking a snapshot.
+
+        This is intentional: the step-skill-lock flow is an unknown-tool
+        emergency reselection path and is NOT covered by the C5a
+        atomicity guarantee. If this path raises partway, ``_last_*``
+        fields may be in an inconsistent state until the next successful
+        ``_build_step_react_graph`` call overwrites them.
+
+        See design doc 'C5a scope boundary' section. Converting this
+        path to route through ``_apply_refreshed_skills`` is a
+        follow-up task tracked in TODOS.md.
+        """
         if (
             self._step_skill_state
             and self._step_skill_state.step_id == step_id
@@ -1941,7 +2443,10 @@ class AgentTaskRunner(TaskRunner):
                         except Exception as e:
                             logger.warning("Summary latest_message update failed: %s", e)
 
-                await run_background_summary(messages, flow.summary_llm, _on_summary_event)
+                _summary_lang = (flow._deferred_final_state or {}).get("language", "zh")
+                await run_background_summary(
+                    messages, flow.summary_llm, _on_summary_event, lang=_summary_lang,
+                )
             except asyncio.CancelledError:
                 # Send a final non-partial message to clear the ghost partial
                 # in the frontend (which upserts by stream_id).
@@ -2174,6 +2679,13 @@ class AgentTaskRunner(TaskRunner):
                         self._step_skill_state = None
                         self._last_virtual_step_id = ""
                         self._activated_mcp_tools.clear()  # Reset MCP activation per message
+                        # B5 C5a: clear lc_tools cache at the message boundary.
+                        # Cache entries are keyed by (mode, skill_ids, mcp_activation)
+                        # but also implicitly depend on instance state that can't
+                        # be practically added to the key (e.g. _skill_tool internal
+                        # state, _memory_session_factory wiring). Clearing here is
+                        # cheap and eliminates cross-message staleness risk.
+                        self._lc_tools_cache.clear()
                         await self._initialize_skill_tool_if_needed(selected_skills)
                         self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
 
@@ -2184,6 +2696,13 @@ class AgentTaskRunner(TaskRunner):
                             self._flow._skill_guide_injector = SkillGuideInjector(
                                 selected_skills, self._tier2_preloaded_skill_ids
                             )
+                        # B5 post-audit LOW #1: inject language callback so
+                        # main_graph.planner_node can notify us of the real
+                        # session language after parsing the plan. The flow
+                        # stores it and ``_build_config`` forwards it via
+                        # ``configurable["language_callback"]``.
+                        if hasattr(self._flow, "_language_callback"):
+                            self._flow._language_callback = self.set_language
 
                         # 7.传递消息对象并运行PlannerReActFlow
                         async for event in self._run_flow(message_obj):

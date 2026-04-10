@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Iterator, List, Optional
+from typing import Any, AsyncIterator, Iterator, List, Literal, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -64,17 +64,37 @@ class ActusResponsesModel(BaseChatModel):
     max_tokens: int = 8192
     supports_vision: bool = True
     supports_pdf_input: bool = False
+    # B5 C0a: provider identification for prompt rendering (system-reminder format etc.)
+    # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
+    # introduce real Anthropic routing via LLMConfig.provider field.
+    provider_name: Literal["openai", "anthropic"] = "openai"
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
     # tool_choice bound via bind_tools() — critical for with_structured_output
     _bound_tool_choice: Optional[Any] = None
+    # B5 C11: telemetry port attached via attach_telemetry(). None means
+    # the _agenerate hook no-ops. Never serialized.
+    _telemetry: Optional[Any] = None
 
     # ---- Properties ------------------------------------------------------ #
 
     @property
     def _llm_type(self) -> str:
         return "actus-responses"
+
+    # ---- B5 C11: telemetry hook ----------------------------------------- #
+
+    def attach_telemetry(self, telemetry: Any, lang: str = "zh") -> None:
+        """Attach a ``PromptTelemetryPort`` for LLM-invocation logging.
+
+        Non-blocking — see ``ActusChatModel.attach_telemetry`` docstring.
+        """
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            attach_telemetry,
+        )
+
+        attach_telemetry(self, telemetry, lang=lang)
 
     # ---- Client factory -------------------------------------------------- #
 
@@ -419,6 +439,16 @@ class ActusResponsesModel(BaseChatModel):
         else:
             logger.info("调用Responses API未携带工具: %s", self.model_name)
 
+        # B5 C11: emit telemetry (non-blocking — any failure is swallowed).
+        # Note: Responses API tool format differs from Chat Completions —
+        # _extract_tool_names handles the nested ``function.name`` shape
+        # that both formats share.
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            emit_invocation_telemetry,
+        )
+
+        emit_invocation_telemetry(self, messages, all_tools)
+
         # tool_choice: per-call kwarg > bound value from bind_tools
         # LangChain uses "any" internally (e.g. with_structured_output),
         # but OpenAI API expects "required" for the same semantics.
@@ -507,6 +537,11 @@ class ActusResponsesModel(BaseChatModel):
 
         Uses LangChain's convert_to_openai_tool to normalize tool definitions,
         then converts from Chat Completions format to Responses API format.
+
+        **Codex audit HIGH #3 fix**: preserve ``provider_name`` and
+        ``_telemetry`` on the clone so bound invocations still record
+        correct provider + telemetry events (LangGraph binds once, so
+        every subsequent LLM call goes through this clone, not ``self``).
         """
         from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -524,9 +559,19 @@ class ActusResponsesModel(BaseChatModel):
             max_tokens=self.max_tokens,
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
+            provider_name=self.provider_name,
         )
         new_model._bound_tools = responses_format
         # Preserve tool_choice from kwargs (critical for with_structured_output)
         if "tool_choice" in kwargs:
             new_model._bound_tool_choice = kwargs["tool_choice"]
+        # Preserve telemetry port attachment so bound model invocations
+        # still emit record_llm_invocation events. ``_telemetry_lang``
+        # carries the attach-time language (post-audit LOW #4).
+        object.__setattr__(
+            new_model, "_telemetry", getattr(self, "_telemetry", None)
+        )
+        object.__setattr__(
+            new_model, "_telemetry_lang", getattr(self, "_telemetry_lang", "zh")
+        )
         return new_model

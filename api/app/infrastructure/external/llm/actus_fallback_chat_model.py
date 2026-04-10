@@ -13,7 +13,7 @@ both inner models so that tool schemas stay consistent.
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Literal, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -34,10 +34,37 @@ class ActusFallbackChatModel(BaseChatModel):
 
     primary: BaseChatModel
     fallback: BaseChatModel
+    # B5 C0a: provider identification — independent field, NOT delegated to inner adapters.
+    # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
+    # introduce real Anthropic routing via LLMConfig.provider field.
+    provider_name: Literal["openai", "anthropic"] = "openai"
 
     @property
     def _llm_type(self) -> str:
         return "actus-fallback"
+
+    # ---- B5 C11: telemetry hook ----------------------------------------- #
+
+    def attach_telemetry(self, telemetry: Any, lang: str = "zh") -> None:
+        """Forward telemetry attachment to both primary and fallback.
+
+        When the primary succeeds, ``primary._agenerate`` emits one
+        event. When the primary fails and the fallback path runs,
+        ``fallback._agenerate`` emits a second event. The two events
+        for a single logical call are distinguishable by the
+        ``provider`` field (and by the ``tools_hash`` if they differ).
+
+        Downstream analysis can dedup adjacent events with the same
+        ``(system_prompt_hash, tools_hash)`` if a single-event view
+        is desired.
+
+        ``lang`` is forwarded identically to both inner adapters so the
+        two events carry the same language attribution.
+        """
+        if hasattr(self.primary, "attach_telemetry"):
+            self.primary.attach_telemetry(telemetry, lang=lang)
+        if hasattr(self.fallback, "attach_telemetry"):
+            self.fallback.attach_telemetry(telemetry, lang=lang)
 
     # ---- sync (not used — project is async-only) ------------------------- #
 

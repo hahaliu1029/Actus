@@ -74,6 +74,7 @@ class TestFullFlowIntegration:
     ):
         """PlannerReActFlow.invoke() should yield Plan + Message + Done events."""
         flow = PlannerReActFlow(
+            _allow_default_prompt_assembler=True,
             uow_factory=MagicMock(return_value=mock_uow),
             llm=mock_llm,
             agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
@@ -114,6 +115,7 @@ class TestFullFlowIntegration:
     ):
         """After invoke(), flow.plan should be set and flow.done should be True."""
         flow = PlannerReActFlow(
+            _allow_default_prompt_assembler=True,
             uow_factory=MagicMock(return_value=mock_uow),
             llm=mock_llm,
             agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
@@ -144,6 +146,7 @@ class TestFullFlowIntegration:
     ):
         """Skill context should be accessible in the flow."""
         flow = PlannerReActFlow(
+            _allow_default_prompt_assembler=True,
             uow_factory=MagicMock(return_value=mock_uow),
             llm=mock_llm,
             agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),

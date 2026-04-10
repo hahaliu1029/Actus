@@ -49,6 +49,7 @@ from .state import MainGraphState
 
 if TYPE_CHECKING:
     from .context_assembler import ContextAssembler
+    from app.domain.services.prompts.assembler import PromptAssembler
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,9 @@ def build_main_graph(
     agent_config: AgentConfig | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     assembler: ContextAssembler | None = None,
+    prompt_assembler: "PromptAssembler | None" = None,
     supports_vision: bool = True,
+    _allow_default_prompt_assembler: bool = False,
 ) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
 
@@ -129,17 +132,66 @@ def build_main_graph(
     uow_factory : Factory for UoW instances.
     session_id : Current session ID.
     checkpointer : LangGraph checkpointer for interrupt/resume support.
+    assembler : ContextAssembler for cross-step message trimming (unchanged).
+    prompt_assembler : B5 C5b PromptAssembler for section-based system prompt
+        assembly. Required for executor/planner/updater nodes to run. In
+        production this MUST be provided (``AgentTaskRunner`` constructs
+        a configured instance and passes it in). Missing it raises
+        ``RuntimeError`` unless ``_allow_default_prompt_assembler=True``.
+    _allow_default_prompt_assembler : Test-only escape hatch (leading
+        underscore to mark internal). When True AND ``prompt_assembler``
+        is None, this constructor builds a minimal-budget default
+        assembler and logs a WARNING. Production callers should NEVER
+        set this — missing DI should fail loud.
     """
-    from app.domain.services.prompts.planner import PLANNER_SYSTEM_PROMPT, CREATE_PLAN_PROMPT, UPDATE_PLAN_PROMPT
+    from app.domain.services.prompts import (
+        get_prompt_bundle,
+        get_prompt_section_bundle,
+    )
+    from app.domain.services.prompts.render_context import build_render_context
+    from app.domain.services.prompts.section import PromptMode
+
+    # B5 C7.5 + audit MEDIUM #7: by default a missing ``prompt_assembler``
+    # is a production DI bug — raise loud. Test fixtures that exercise
+    # ``build_main_graph`` directly pass ``_allow_default_prompt_assembler=True``
+    # to opt into the legacy test-ergonomics behavior.
+    if prompt_assembler is None:
+        if not _allow_default_prompt_assembler:
+            raise RuntimeError(
+                "build_main_graph requires a PromptAssembler instance. "
+                "In production, AgentTaskRunner._build_prompt_assembler "
+                "constructs one and passes it via PlannerReActFlow. If "
+                "this is a test that needs the default, pass "
+                "_allow_default_prompt_assembler=True explicitly."
+            )
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from app.domain.services.prompts.assembler import (
+            PromptAssembler as _PromptAssemblerImpl,
+        )
+        from app.domain.services.prompts.budget import SystemPromptBudget
+
+        logger.warning(
+            "build_main_graph: prompt_assembler is None and "
+            "_allow_default_prompt_assembler=True — constructing a minimal "
+            "default. This path is intended for tests only; production "
+            "should always inject a configured PromptAssembler via "
+            "AgentTaskRunner._build_prompt_assembler."
+        )
+        prompt_assembler = _PromptAssemblerImpl(
+            budget=SystemPromptBudget(max_tokens=3500),
+            token_estimator=TokenEstimator(strategy="hybrid"),
+            telemetry=None,
+        )
 
     # ---- Nodes --------------------------------------------------------- #
 
-    async def planner_node(state: MainGraphState) -> dict:
+    async def planner_node(state: MainGraphState, config: RunnableConfig) -> dict:
         """Call planner LLM to create a plan from user message."""
+        bundle = get_prompt_bundle(state.get("language", "zh"))
         attachments = state.get("attachments", [])
         image_blocks = state.get("image_content_blocks", [])
         # Planner 不传图片但需要知道附件包含图片，使用 planner 专用提示
-        prompt = CREATE_PLAN_PROMPT.format(
+        prompt = bundle.CREATE_PLAN_PROMPT.format(
             message=state["message"],
             attachments=format_attachments_text(
                 attachments, has_image_blocks=bool(image_blocks), for_planner=True,
@@ -147,20 +199,25 @@ def build_main_graph(
             ),
         )
 
-        # Build system prompt with optional tool summary and conversation summaries
-        system_content = PLANNER_SYSTEM_PROMPT
-
-        # Inject available tool summary so planner knows about dedicated tools
-        # (e.g. brainstorm_skill, generate_skill) and can plan accordingly
-        skill_context = state.get("skill_context") or ""
-        tool_summary_marker = "## Available Tool Summary"
-        if tool_summary_marker in skill_context:
-            tool_summary = skill_context[skill_context.index(tool_summary_marker):]
-            system_content += f"\n\n{tool_summary}"
-
-        conversation_summaries = state.get("conversation_summaries") or []
-        if conversation_summaries:
-            system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
+        # B5 C7.5: PromptAssembler is the single code path. planner_node
+        # does not receive the LangGraph ``config`` (only ``state``), so
+        # we build a dummy config with an empty ``configurable`` —
+        # ``bound_tool_names`` will be empty, which is correct: the planner
+        # runs BEFORE react_graph_provider and has no per-step tool binding.
+        section_bundle = get_prompt_section_bundle(state.get("language", "zh"))
+        planner_config = {"configurable": {}}
+        ctx = build_render_context(state, planner_config, agent_config)
+        result = prompt_assembler.assemble(
+            section_bundle.planner,
+            ctx,
+            PromptMode.FULL,
+            # ``fallback_used`` tracks executor degradation only. Planner
+            # never has ``react_graph_provider`` (it runs before execution
+            # starts), so the planner call is not a fallback — pass False
+            # to keep the telemetry metric semantically clean.
+            fallback_used=False,
+        )
+        system_content = result.text
 
         # Planner 不传图片：planner 识图不可靠，容易幻觉图片内容并写入 step description，
         # 导致 executor 被错误的描述误导。图片分析留给 executor 通过 MCP 工具完成。
@@ -196,6 +253,23 @@ def build_main_graph(
             status=ExecutionStatus.RUNNING,
         )
 
+        # B5 post-audit LOW #1: notify the runner of the detected session
+        # language so subsequent LLM calls' telemetry events record the
+        # real lang instead of the default "zh". Injected via
+        # configurable["language_callback"] by ``planner_react._build_config``
+        # after AgentTaskRunner wires ``self.set_language`` as the callback.
+        language_callback = (
+            config.get("configurable", {}).get("language_callback")
+        )
+        if callable(language_callback) and plan.language:
+            try:
+                language_callback(plan.language)
+            except Exception as exc:
+                logger.warning(
+                    "planner_node: language_callback failed (swallowed): %s",
+                    exc,
+                )
+
         events = [
             TitleEvent(title=plan.title),
             MessageEvent(role="assistant", message=plan.message),
@@ -208,6 +282,11 @@ def build_main_graph(
             "flow_status": FlowStatus.EXECUTING.value,
             "original_request": plan.goal,
             "events": events,
+            # B5 C0a fix: write LLM-detected language back to state so executor /
+            # updater / summarizer can read it via state["language"]. Without this,
+            # state["language"] keeps the initial "zh" default from planner_react,
+            # and the bundle dispatch in subsequent nodes is inert.
+            "language": plan.language,
         }
 
     async def executor_node(
@@ -219,8 +298,9 @@ def build_main_graph(
         sees tool calls / results as they happen, rather than after the entire
         step completes.
         """
-        from app.domain.services.prompts.react import REACT_SYSTEM_PROMPT, EXECUTION_PROMPT
         from app.domain.services.execution_watchdog import _should_terminate
+
+        bundle = get_prompt_bundle(state.get("language", "zh"))
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
@@ -260,16 +340,35 @@ def build_main_graph(
             )
 
         # Phase 3: 获取当前 step 的编译后 react_graph（渐进式 Skill 加载）
-        # 传递步骤描述，使 provider 能按步骤选择相关 Skill 工具
+        # B5 C5a: react_graph_provider now returns (CompiledStateGraph, StepMetadata).
+        # StepMetadata carries per-step authoritative bound_tool_names / skill_context
+        # / skill_ids. The executor reads these LOCALLY for prompt assembly — see
+        # the "Two-Clock Architecture" section in CONTRIBUTING.md. This node must
+        # NOT write skill_context back to state (enforced by the AST lint at
+        # tests/domain/services/graphs/test_executor_no_skill_context_writeback.py).
         react_graph_provider = (config.get("configurable") or {}).get("react_graph_provider")
+        fresh_config = config
         if react_graph_provider:
             try:
-                step_react = await react_graph_provider(step.description)
+                step_react, step_meta = await react_graph_provider(step.description)
+                # Inject per-step bound_tool_names into a fresh configurable for
+                # downstream consumers (C5b PromptAssembler will read it).
+                fresh_configurable = {
+                    **(config.get("configurable") or {}),
+                    "bound_tool_names": step_meta.bound_tool_names,
+                }
+                fresh_config = {**config, "configurable": fresh_configurable}
+                fresh_skill_context = step_meta.skill_context
+                fresh_skill_ids: list[str] = list(step_meta.skill_ids)
             except Exception:
                 logger.warning("react_graph_provider 失败，使用默认（无动态Skill工具）")
                 step_react = react_graph
+                fresh_skill_context = state.get("skill_context", "") or ""
+                fresh_skill_ids = list(state.get("skill_names_in_context") or [])
         else:
             step_react = react_graph
+            fresh_skill_context = state.get("skill_context", "") or ""
+            fresh_skill_ids = list(state.get("skill_names_in_context") or [])
 
         resume_value = state.get("resume_value")
 
@@ -281,29 +380,51 @@ def build_main_graph(
         attachments = state.get("attachments", [])
         image_blocks = state.get("image_content_blocks", [])
         language = state.get("language", "zh")
-        skill_context = state.get("skill_context", "")
 
-        system_content = REACT_SYSTEM_PROMPT
+        # B5 C5b: section_assembly_meta carries {version_hash, tokens_used}
+        # for the main_graph state writeback. Stays empty on the resume
+        # path (system_content is not rebuilt).
+        section_assembly_meta: dict[str, Any] = {}
 
-        # Inject file_view hint when the tool is available
-        has_file_view = (config.get("configurable") or {}).get("has_file_view", False)
-        if has_file_view:
-            from app.domain.services.prompts.react import FILE_VIEW_HINT
-            system_content += FILE_VIEW_HINT
+        # Resume path reuses ``saved_messages`` verbatim and appends a
+        # HumanMessage(resume_hint) — it never uses ``system_content``. Skip
+        # the whole system prompt build when resuming so the PromptAssembler
+        # path doesn't run wastefully.
+        system_content = ""
 
-        # Inject memory tools hint when available (C6)
-        has_memory_tools = (config.get("configurable") or {}).get("has_memory_tools", False)
-        if has_memory_tools:
-            from app.domain.services.prompts.react import MEMORY_TOOLS_HINT
-            system_content += MEMORY_TOOLS_HINT
-
-        if skill_context:
-            system_content += f"\n\n{skill_context}"
-
-        # 注入历史对话摘要
-        conversation_summaries = state.get("conversation_summaries") or []
-        if conversation_summaries:
-            system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
+        # B5 C7.5: PromptAssembler is the single code path. The whole
+        # build is gated on ``resume_value is None`` so resume completely
+        # skips prompt assembly. See CONTRIBUTING.md "Prompt Assembly 不变式"
+        # section for the two-clock architecture around ``skill_context``.
+        if resume_value is None:
+            section_bundle = get_prompt_section_bundle(language)
+            # Build a LOCAL state view with the fresh per-step skill context.
+            # This is the two-clock architecture: we do NOT write skill_context
+            # back to state — we only use this view for prompt assembly.
+            state_for_render = {
+                **state,
+                "skill_context": fresh_skill_context,
+                "skill_names_in_context": fresh_skill_ids,
+            }
+            # NOTE: ``agent_config`` here is the ``build_main_graph`` closure
+            # parameter (not per-request state). It's stable for the lifetime
+            # of the graph and safe to read via ``getattr(..., default)``
+            # inside ``build_render_context``.
+            ctx = build_render_context(state_for_render, fresh_config, agent_config)
+            # fallback_used=True when react_graph_provider was unavailable
+            # and we're relying on the legacy state.skill_context path.
+            fallback_used = react_graph_provider is None
+            assembly_result = prompt_assembler.assemble(
+                section_bundle.executor,
+                ctx,
+                PromptMode.FULL,
+                fallback_used=fallback_used,
+            )
+            system_content = assembly_result.text
+            section_assembly_meta = {
+                "system_prompt_version_hash": assembly_result.version_hash,
+                "system_prompt_tokens": assembly_result.tokens_used,
+            }
 
         # 两分支 messages 构建逻辑（使用 LangChain 消息类型）
         # resume_value 由 interrupt_node 在恢复时设置，或由 DB fallback 路径直接注入
@@ -335,7 +456,7 @@ def build_main_graph(
             initial_messages = [
                 updated_first,
                 *saved_messages[1:],
-                HumanMessage(content=EXECUTION_PROMPT.format(
+                HumanMessage(content=bundle.EXECUTION_PROMPT.format(
                     message=state["message"],
                     attachments=format_attachments_text(attachments),
                     language=language,
@@ -348,7 +469,7 @@ def build_main_graph(
                 attachments, has_image_blocks=bool(image_blocks),
                 supports_vision=supports_vision,
             )
-            execution_text = EXECUTION_PROMPT.format(
+            execution_text = bundle.EXECUTION_PROMPT.format(
                 message=state["message"],
                 attachments=attachments_text,
                 language=language,
@@ -392,8 +513,12 @@ def build_main_graph(
         react_final: dict[str, Any] = {}
         all_react_messages: list = []
         seen_interrupt = False
+        # B5 C5a: pass fresh_config (with injected bound_tool_names) so
+        # downstream PromptAssembler consumers (C5b) can read the per-step
+        # bound tool set. When react_graph_provider is None, fresh_config is
+        # simply the original config.
         async for chunk in step_react.astream(
-            react_input, config=config, stream_mode="updates",
+            react_input, config=fresh_config, stream_mode="updates",
         ):
             for _node_name, node_output in chunk.items():
                 if not isinstance(node_output, dict):
@@ -446,6 +571,9 @@ def build_main_graph(
                     "flow_status": FlowStatus.EXECUTING.value,
                     "original_request": state.get("original_request", ""),
                     "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
+                    # B5 C5b: observability — only populated when PromptAssembler path ran.
+                    # Never includes skill_context (two-clock architecture).
+                    **section_assembly_meta,
                 },
                 goto="interrupt_node",
             )
@@ -475,6 +603,9 @@ def build_main_graph(
                 "resume_value": None,
                 "flow_status": FlowStatus.UPDATING.value,
                 "events": [],  # already emitted via queue
+                # B5 C5b: observability — only populated when PromptAssembler path ran.
+                # Never includes skill_context (two-clock architecture).
+                **section_assembly_meta,
             },
             goto="updater_node",
         )
@@ -492,6 +623,8 @@ def build_main_graph(
         4. Emit PlanEvent(UPDATED)
         """
         from app.domain.services.execution_watchdog import _should_terminate
+
+        bundle = get_prompt_bundle(state.get("language", "zh"))
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
@@ -529,19 +662,29 @@ def build_main_graph(
         plan_updated = False
         if completed_step and execution_summary:
             try:
-                query = UPDATE_PLAN_PROMPT.format(
+                query = bundle.UPDATE_PLAN_PROMPT.format(
                     plan=plan.model_dump_json(),
                     step=completed_step.model_dump_json(),
-                    execution_summary=execution_summary or "无额外执行详情",
+                    execution_summary=execution_summary or bundle.EXECUTION_SUMMARY_NONE_FALLBACK,
                 )
 
-                system_content = PLANNER_SYSTEM_PROMPT
-                # Inject tool summary so planner can reference available tools
-                skill_context = state.get("skill_context") or ""
-                tool_summary_marker = "## Available Tool Summary"
-                if tool_summary_marker in skill_context:
-                    tool_summary = skill_context[skill_context.index(tool_summary_marker):]
-                    system_content += f"\n\n{tool_summary}"
+                # B5 C7.5: PromptAssembler is the single code path.
+                # Updater runs without ``react_graph_provider`` by design
+                # (it has no per-step tool binding), so ``fallback_used``
+                # is always False. The updater registry shares sections
+                # with the planner registry — see bundles/zh.py.
+                section_bundle = get_prompt_section_bundle(
+                    state.get("language", "zh")
+                )
+                updater_config = {"configurable": {}}
+                ctx = build_render_context(state, updater_config, agent_config)
+                result = prompt_assembler.assemble(
+                    section_bundle.updater,
+                    ctx,
+                    PromptMode.FULL,
+                    fallback_used=False,
+                )
+                system_content = result.text
 
                 update_messages = [
                     SystemMessage(content=system_content),
@@ -636,7 +779,7 @@ def build_main_graph(
         frontend updates. The final MessageEvent carries partial=False,
         the same stream_id, and parsed attachments.
         """
-        from app.domain.services.prompts.react import SUMMARIZE_PROMPT
+        bundle = get_prompt_bundle(state.get("language", "zh"))
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
@@ -664,7 +807,7 @@ def build_main_graph(
             try:
                 # summary_llm is BaseChatModel — pass LangChain messages directly
                 messages: list[BaseMessage] = list(react_messages) + [
-                    HumanMessage(content=SUMMARIZE_PROMPT),
+                    HumanMessage(content=bundle.SUMMARIZE_PROMPT),
                 ]
 
                 # Stream with cumulative prefix for frontend

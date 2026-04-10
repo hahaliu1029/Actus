@@ -5,7 +5,9 @@ Used at the boundary between LangGraph (BaseMessage) and Memory/raw-LLM (dict).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from typing import Any
 
 from langchain_core.messages import (
@@ -126,22 +128,155 @@ def dicts_to_messages(dicts: list[dict[str, Any]]) -> list[BaseMessage]:
     return messages
 
 
-def dedup_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Deduplicate messages by ID — later message with same ID replaces earlier.
+def _content_hash(content: Any) -> str:
+    """Return a short fingerprint of message content for dedup.
 
-    Replicates langgraph.graph.message.add_messages dedup semantics.
-    Messages without an id (or id=None) are always appended without dedup.
+    B5 C10: hashes ``content[:500] + content[-200:]`` — this avoids the
+    cost of hashing multi-kB tool outputs in full while still
+    distinguishing messages that share an opening but diverge in the
+    tail. Multimodal content is flattened via
+    ``_flatten_multimodal_content`` first so a text-only change isn't
+    masked by identical base64 image bytes.
     """
-    seen: dict[str, int] = {}  # id -> index in result
-    result: list[BaseMessage] = []
+    flat = _flatten_multimodal_content(content)
+    if len(flat) <= 700:
+        key = flat
+    else:
+        key = flat[:500] + flat[-200:]
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def dedup_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Deduplicate messages by ID and by ``(role, content_hash)``.
+
+    B5 C10: two-pass "last one wins" dedup.
+
+    **Pass 1 — id dedup**: later message with the same id replaces the
+    earlier one at the same position. This preserves the
+    ``langgraph.graph.message.add_messages`` contract.
+
+    **Pass 2 — (role, content_hash) dedup**: for messages without an id
+    (or whose id was not a duplicate), messages sharing both role and
+    content_hash are deduplicated with later-wins semantics — the
+    earlier copy is dropped and the later copy stays at its original
+    position. This catches cases where the same message body is
+    appended twice without ids (common in retry loops and resume
+    paths).
+
+    The role is part of the dedup key so a HumanMessage and an
+    AIMessage with identical text are NOT merged — they represent
+    different speakers.
+    """
+    # Pass 1: id dedup (unchanged pre-C10 behavior)
+    id_seen: dict[str, int] = {}
+    id_result: list[BaseMessage] = []
     for msg in messages:
         msg_id = getattr(msg, "id", None)
-        if msg_id and msg_id in seen:
-            result[seen[msg_id]] = msg  # replace
+        if msg_id and msg_id in id_seen:
+            id_result[id_seen[msg_id]] = msg  # replace in place
         else:
             if msg_id:
-                seen[msg_id] = len(result)
+                id_seen[msg_id] = len(id_result)
+            id_result.append(msg)
+
+    # Pass 2: (role, content_hash) dedup for messages that passed pass 1.
+    # Walk in order, remember the latest index for each (role, hash), and
+    # on collision drop the earlier index from the result.
+    #
+    # We build the final list by walking the indices we want to keep.
+    content_seen: dict[tuple[type, str], int] = {}
+    keep: list[bool] = [True] * len(id_result)
+    for idx, msg in enumerate(id_result):
+        key = (type(msg), _content_hash(msg.content))
+        prev_idx = content_seen.get(key)
+        if prev_idx is not None:
+            keep[prev_idx] = False  # drop the earlier copy (later wins)
+        content_seen[key] = idx
+    return [msg for idx, msg in enumerate(id_result) if keep[idx]]
+
+
+# B5 C10: regex patterns for extracting the static skeleton of EXECUTION_PROMPT
+# from both ZH and EN variants. The patterns strip the first `{step}`
+# substitution (which is the only piece that varies across adjacent repeated
+# execution prompts) so the fingerprint reflects the template, not the step.
+_EXECUTION_PROMPT_STEP_PATTERN_ZH = re.compile(
+    r"你正在执行任务：\n.*?\n\n", flags=re.DOTALL
+)
+_EXECUTION_PROMPT_STEP_PATTERN_EN = re.compile(
+    r"You are executing the task:\n.*?\n\n", flags=re.DOTALL
+)
+
+
+def _execution_prompt_fingerprint(text: str) -> str | None:
+    """Return a fingerprint for an EXECUTION_PROMPT body, or None.
+
+    The fingerprint is the SHA256 of the first 300 chars of the text
+    with the step-description block stripped out. Returns None if the
+    text does not look like an EXECUTION_PROMPT (neither the ZH nor
+    the EN step-description header is present).
+    """
+    stripped: str | None = None
+    if _EXECUTION_PROMPT_STEP_PATTERN_ZH.search(text):
+        stripped = _EXECUTION_PROMPT_STEP_PATTERN_ZH.sub("", text, count=1)
+    elif _EXECUTION_PROMPT_STEP_PATTERN_EN.search(text):
+        stripped = _EXECUTION_PROMPT_STEP_PATTERN_EN.sub("", text, count=1)
+    if stripped is None:
+        return None
+    return hashlib.sha256(stripped[:300].encode("utf-8")).hexdigest()
+
+
+def dedup_execution_prompts(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Collapse **adjacent** duplicate ``EXECUTION_PROMPT`` HumanMessages.
+
+    B5 C10: during long sessions with retries, ``executor_node`` can
+    inject multiple back-to-back ``HumanMessage(EXECUTION_PROMPT...)``
+    entries whose only difference is the step description. When the
+    same step is retried, the prompts become byte-identical (modulo
+    the stripped step block). This function detects byte-identical
+    fingerprints of **strictly adjacent** ``HumanMessage`` instances
+    and keeps only the LAST copy.
+
+    Non-adjacent duplicates (separated by any other message, even
+    another ``HumanMessage`` with a different fingerprint) are
+    preserved — this keeps the function narrowly scoped to the retry
+    collapse case and leaves semantic judgements about broader
+    conversation history to higher layers.
+
+    Only ``HumanMessage`` instances whose content looks like an
+    EXECUTION_PROMPT (has the ZH or EN step-description header) are
+    considered for dedup. Every other message type passes through
+    unchanged.
+
+    This function is not yet wired into any production code path as
+    of C10 — it's published for future ``executor_node`` optimization.
+    """
+    if len(messages) < 2:
+        return list(messages)
+
+    result: list[BaseMessage] = []
+    for msg in messages:
+        if not isinstance(msg, HumanMessage):
             result.append(msg)
+            continue
+        text = _flatten_multimodal_content(msg.content)
+        fp = _execution_prompt_fingerprint(text)
+        if fp is None:
+            # Not an EXECUTION_PROMPT-shaped HumanMessage — leave alone.
+            result.append(msg)
+            continue
+        # Strictly adjacent: check if the immediately previous entry in
+        # the result is also an EXECUTION_PROMPT HumanMessage with the
+        # same fingerprint.
+        if result:
+            prev = result[-1]
+            if isinstance(prev, HumanMessage):
+                prev_text = _flatten_multimodal_content(prev.content)
+                prev_fp = _execution_prompt_fingerprint(prev_text)
+                if prev_fp == fp:
+                    # Drop the earlier copy; later wins.
+                    result[-1] = msg
+                    continue
+        result.append(msg)
     return result
 
 
