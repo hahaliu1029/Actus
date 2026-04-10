@@ -667,4 +667,150 @@ describe("session-store", () => {
       expect(mockedSessionApi.downloadSandboxFile).toHaveBeenCalledWith("s1", "/path/file.txt", { onProgress });
     });
   });
+
+  describe("D5: health event reducer", () => {
+    it("TERMINATED health event pins session status to timed_out across subsequent done", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "health",
+          data: {
+            event_id: "evt-health",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "terminated",
+            reason: "执行已超时终止",
+            action: "terminated",
+            metrics: {
+              tool_calls_total: 5,
+              tool_success_rate: 0.8,
+            },
+          },
+        });
+        onEvent({
+          type: "done",
+          data: {
+            event_id: "evt-done",
+            created_at: Math.floor(Date.now() / 1000),
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-timeout", { message: "hi" });
+
+      const current = useSessionStore.getState().currentSession;
+      // done must NOT revert timed_out to completed
+      expect(current?.status).toBe("timed_out");
+    });
+
+    it("TERMINATING health event sets timed_out immediately", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "health",
+          data: {
+            event_id: "evt-terminating",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "terminating",
+            reason: "执行即将超时终止",
+            action: "hard_terminate",
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-terminating", { message: "hi" });
+
+      const current = useSessionStore.getState().currentSession;
+      expect(current?.status).toBe("timed_out");
+    });
+
+    it("DEGRADED health event does not change running status", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "message",
+          data: {
+            event_id: "evt-msg",
+            created_at: Math.floor(Date.now() / 1000),
+            role: "assistant",
+            message: "working",
+            attachments: [],
+          },
+        });
+        onEvent({
+          type: "health",
+          data: {
+            event_id: "evt-degraded",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "degraded",
+            reason: "Agent 似乎遇到了困难，正在尝试恢复...",
+            action: "soft_recovery",
+            idle_seconds: 120.0,
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-degraded", { message: "hi" });
+
+      const current = useSessionStore.getState().currentSession;
+      // DEGRADED is informational — session stays running (no done yet)
+      expect(current?.status).toBe("running");
+    });
+
+    it("content events after TERMINATED do not revert timed_out", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "health",
+          data: {
+            event_id: "evt-term",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "terminated",
+            reason: "执行已超时终止",
+            action: "terminated",
+          },
+        });
+        // A late MessageEvent arriving after TERMINATED must not flip status
+        // back to running.
+        onEvent({
+          type: "message",
+          data: {
+            event_id: "evt-late",
+            created_at: Math.floor(Date.now() / 1000),
+            role: "assistant",
+            message: "late partial",
+            partial: true,
+            attachments: [],
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-late", { message: "hi" });
+
+      const current = useSessionStore.getState().currentSession;
+      expect(current?.status).toBe("timed_out");
+    });
+
+    it("health event appends to events array for rendering", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "health",
+          data: {
+            event_id: "evt-health-render",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "degraded",
+            reason: "Agent 似乎遇到了困难",
+            action: "soft_recovery",
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-append", { message: "hi" });
+
+      const events = useSessionStore.getState().currentSession?.events ?? [];
+      const healthEvent = events.find((e) => e.event === "health");
+      expect(healthEvent).toBeDefined();
+      expect(healthEvent?.data?.status).toBe("degraded");
+    });
+  });
 });

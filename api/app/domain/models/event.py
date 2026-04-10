@@ -237,6 +237,29 @@ class DoneEvent(BaseEvent):
     """结束事件类型"""
 
     type: Literal["done"] = "done"
+    metrics: Optional[Dict[str, Any]] = None  # D5: execution metrics snapshot
+
+
+class HealthStatus(str, Enum):
+    """执行健康状态"""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"          # idle timeout 触发，尝试恢复中
+    TERMINATING = "terminating"    # 总超时或恢复失败，正在终止
+    TERMINATED = "terminated"      # 已强制终止
+
+
+class HealthEvent(BaseEvent):
+    """执行健康状态事件"""
+
+    type: Literal["health"] = "health"
+    status: HealthStatus
+    reason: str                         # 用户友好原因
+    last_node: Optional[str] = None     # 最后活跃 graph node
+    idle_seconds: Optional[float] = None
+    tool_failures: int = 0
+    action: str = "monitoring"          # monitoring/soft_recovery/hard_terminate
+    metrics: Optional[Dict[str, Any]] = None
 
 
 class ToolConfirmationEvent(BaseEvent):
@@ -268,6 +291,7 @@ Event = Annotated[
         ContextStatusEvent,
         CompactionEvent,
         FinishingEvent,
+        HealthEvent,
         ToolConfirmationEvent,
         DoneEvent,
     ],

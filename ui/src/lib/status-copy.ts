@@ -27,6 +27,7 @@ const SESSION_STATUS_MAP: Record<string, StatusMeta> = {
   failed: { text: "失败", tone: "danger", icon: "x-circle" },
   takeover_pending: { text: "待接管", tone: "warning", icon: "alert-circle" },
   takeover: { text: "接管中", tone: "info", icon: "hand" },
+  timed_out: { text: "已超时", tone: "danger", icon: "alert-circle" },
 };
 
 const STEP_STATUS_MAP: Record<string, StatusMeta> = {

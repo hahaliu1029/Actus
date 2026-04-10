@@ -212,7 +212,7 @@ def build_main_graph(
 
     async def executor_node(
         state: MainGraphState, config: RunnableConfig,
-    ) -> Command[Literal["updater_node", "interrupt_node"]]:
+    ) -> Command[Literal["updater_node", "interrupt_node", "__end__"]]:
         """Execute current step via react_graph sub-graph.
 
         Streams react events to the event_queue in real-time so the frontend
@@ -220,6 +220,7 @@ def build_main_graph(
         step completes.
         """
         from app.domain.services.prompts.react import REACT_SYSTEM_PROMPT, EXECUTION_PROMPT
+        from app.domain.services.execution_watchdog import _should_terminate
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
@@ -228,6 +229,23 @@ def build_main_graph(
         async def _emit(evt: Any) -> None:
             if event_queue is not None:
                 await event_queue.put(evt)
+
+        # D5: Cooperative termination check
+        if _should_terminate(config):
+            logger.info("executor_node: should_terminate=True, routing to END")
+            return Command(
+                update={
+                    "flow_status": FlowStatus.COMPLETED.value,
+                    "events": [],
+                    "messages": state.get("messages", []),
+                },
+                goto=END,
+            )
+
+        # D5: Reset tracker blocked set at step boundary
+        tracker = config.get("configurable", {}).get("tool_failure_tracker")
+        if tracker is not None:
+            tracker.reset_blocked()
 
         step = state["current_step"]
         if not step:
@@ -441,6 +459,14 @@ def build_main_graph(
         })
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
+        # D5: Record step outcome in metrics
+        _metrics = config.get("configurable", {}).get("execution_metrics")
+        if _metrics is not None:
+            if step_success:
+                _metrics.steps_completed += 1
+            else:
+                _metrics.steps_failed += 1
+
         return Command(
             update={
                 "messages": final_messages,
@@ -465,9 +491,22 @@ def build_main_graph(
         3. Replace pending steps with planner's updated steps
         4. Emit PlanEvent(UPDATED)
         """
+        from app.domain.services.execution_watchdog import _should_terminate
+
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
         )
+
+        # D5: Cooperative termination check
+        if _should_terminate(config):
+            logger.info("updater_node: should_terminate=True, routing to END")
+            return Command(
+                update={
+                    "flow_status": FlowStatus.COMPLETED.value,
+                    "events": [],
+                },
+                goto=END,
+            )
 
         plan = state["plan"]
         if not plan:

@@ -10,7 +10,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, BinaryIO, Callable, List
+from typing import Any, AsyncGenerator, BinaryIO, Callable, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 
@@ -43,6 +43,8 @@ from app.domain.models.event import (
     Event,
     FileToolContent,
     FinishingEvent,
+    HealthEvent,
+    HealthStatus,
     MCPToolContent,
     MessageEvent,
     SearchToolContent,
@@ -279,6 +281,8 @@ class AgentTaskRunner(TaskRunner):
         self._last_initialized_skill_ids: tuple[str, ...] = ()
         self._last_virtual_step_id: str = ""
         self._embedding_available: bool = False
+        # D5: Watchdog termination flag (set when HealthEvent TERMINATING is emitted)
+        self._was_timed_out: bool = False
         self._embedding_index = None  # SkillEmbeddingIndex | None
         self._current_embedding_scores: list[float] | None = None
         self._tier2_preloaded_skill_ids: set[str] = set()
@@ -1739,6 +1743,18 @@ class AgentTaskRunner(TaskRunner):
         except Exception as e:
             logger.exception("AgentTaskRunner生成工具内容失败: %s", e)
 
+    def _snapshot_metrics(self) -> Optional[Dict[str, Any]]:
+        """D5: Snapshot execution metrics for inclusion in terminal events."""
+        if not self._flow:
+            return None
+        _em = getattr(self._flow, "_execution_metrics", None)
+        if not _em:
+            return None
+        try:
+            return _em.to_dict()
+        except Exception:
+            return None
+
     async def _emit_flow_event(self, task: Task, event: BaseEvent) -> str | None:
         """Emit a single flow event to the task output stream and apply side effects.
 
@@ -1795,6 +1811,11 @@ class AgentTaskRunner(TaskRunner):
                         self._session_id, SessionStatus.TAKEOVER_PENDING
                     )
                 return "takeover"
+            # D5: Track watchdog termination
+            elif isinstance(emitted_event, HealthEvent) and emitted_event.status in (
+                HealthStatus.TERMINATING, HealthStatus.TERMINATED,
+            ):
+                self._was_timed_out = True
 
         return None
 
@@ -1854,6 +1875,12 @@ class AgentTaskRunner(TaskRunner):
                     messages_removed=compaction_result.messages_removed,
                     usage_ratio_after=compaction_result.usage_ratio_after,
                 )
+                # D5: Track compaction count for metrics
+                if self._flow:
+                    _em = getattr(self._flow, "_execution_metrics", None)
+                    if _em:
+                        _em.compaction_count += 1
+                        _em.context_usage_ratio = compaction_result.usage_ratio_after
 
     async def _do_persist_and_flush(self) -> None:
         """Phase 1+2: persist state then submit flush.
@@ -2181,7 +2208,7 @@ class AgentTaskRunner(TaskRunner):
                             cancelled = await self._run_postprocess_or_cancel(task)
                         except Exception as e:
                             logger.error("后处理失败 (postprocess_incomplete): %s", e)
-                            await self._put_and_add_event(task, DoneEvent())
+                            await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                             break
 
                         if cancelled:
@@ -2194,16 +2221,29 @@ class AgentTaskRunner(TaskRunner):
                                 )
                             continue
                         else:
-                            await self._put_and_add_event(task, DoneEvent())
+                            await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                             break
                     else:
                         break
 
-                # Normal completion
-                async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, SessionStatus.COMPLETED
-                    )
+                # Normal completion (or watchdog termination)
+                if self._was_timed_out:
+                    # D5: Emit HealthEvent(TERMINATED) with execution metrics
+                    await self._put_and_add_event(task, HealthEvent(
+                        status=HealthStatus.TERMINATED,
+                        reason="执行已超时终止，请查看已完成的进展",
+                        action="terminated",
+                        metrics=self._snapshot_metrics(),
+                    ))
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, SessionStatus.TIMED_OUT
+                        )
+                else:
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, SessionStatus.COMPLETED
+                        )
 
             except asyncio.CancelledError:
                 cancel_reason = getattr(task, "cancel_reason", "stop")
@@ -2275,7 +2315,7 @@ class AgentTaskRunner(TaskRunner):
                     cancelled = await self._run_postprocess_or_cancel(task)
                 except Exception as e:
                     logger.error("resume 后处理失败 (postprocess_incomplete): %s", e)
-                    await self._put_and_add_event(task, DoneEvent())
+                    await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                     async with self._uow:
                         await self._uow.session.update_status(
                             self._session_id, SessionStatus.COMPLETED
@@ -2283,16 +2323,18 @@ class AgentTaskRunner(TaskRunner):
                     return
 
                 if not cancelled:
-                    await self._put_and_add_event(task, DoneEvent())
+                    await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                    _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
                     async with self._uow:
                         await self._uow.session.update_status(
-                            self._session_id, SessionStatus.COMPLETED
+                            self._session_id, _final_status
                         )
             else:
-                await self._put_and_add_event(task, DoneEvent())
+                await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
                 async with self._uow:
                     await self._uow.session.update_status(
-                        self._session_id, SessionStatus.COMPLETED
+                        self._session_id, _final_status
                     )
 
         except Exception as e:

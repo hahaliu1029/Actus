@@ -1628,7 +1628,10 @@ end
         async with uow:
             # 事务内加锁重读，防并发
             session = await uow.session.get_by_id_for_update(session_id)
-            if not session or session.status != SessionStatus.COMPLETED:
+            if not session or session.status not in (
+                SessionStatus.COMPLETED,
+                SessionStatus.TIMED_OUT,
+            ):
                 raise BadRequestError("当前状态不支持恢复接管")
             if not session.completed_at:
                 raise BadRequestError("REOPEN_WINDOW_EXPIRED")

@@ -13,7 +13,13 @@ import asyncio
 import logging
 from typing import Any, AsyncGenerator
 
-from app.domain.models.event import BaseEvent
+from app.domain.models.event import BaseEvent, HealthEvent, HealthStatus
+from app.domain.services.execution_watchdog import (
+    ExecutionControl,
+    ExecutionWatchdog,
+    WatchdogVerdict,
+    _is_progress_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,11 @@ class GraphEventBridge:
                 else:
                     merged_config[key] = value
 
+        # D5: Extract watchdog + control from config (created by PlannerReActFlow)
+        configurable = merged_config.get("configurable", {})
+        watchdog: ExecutionWatchdog | None = configurable.get("execution_watchdog")
+        control: ExecutionControl | None = configurable.get("execution_control")
+
         async def _drive_graph() -> None:
             """Run the graph and forward state-path events to the queue."""
             try:
@@ -86,6 +97,9 @@ class GraphEventBridge:
                         if not isinstance(node_output, dict):
                             continue
                         self._final_state.update(node_output)
+                        # D5: Record progress from astream path
+                        if watchdog is not None:
+                            watchdog.record_progress(node_name=_node_name)
                         # Emit events that were NOT already pushed via queue
                         # (nodes using queue return events=[])
                         for evt in node_output.get("events") or []:
@@ -110,32 +124,136 @@ class GraphEventBridge:
 
         task = asyncio.create_task(_drive_graph())
 
-        # Track whether the consumer exited normally (sentinel received)
-        # vs via GeneratorExit (caller closed the generator, e.g. after WaitEvent).
-        # In the cleanup path, suppress _drive_graph exceptions to prevent
-        # WAITING → COMPLETED overwrite in agent_task_runner's except handler.
-        _normal_exit = False
+        # Track exit path for the finally block:
+        #   _sentinel_exit = True  → graph finished naturally (sentinel received)
+        #   _watchdog_terminated = True → HARD_TERMINATE cancelled the task
+        #   neither → GeneratorExit from caller cleanup (e.g. WaitEvent)
+        _sentinel_exit = False
+        _watchdog_terminated = False
+
+        def _emit_terminating() -> HealthEvent:
+            """Build the HealthEvent(TERMINATING) payload."""
+            return HealthEvent(
+                status=HealthStatus.TERMINATING,
+                reason="执行即将超时终止",
+                last_node=watchdog.last_node if watchdog else None,
+                idle_seconds=round(watchdog.idle_seconds, 1) if watchdog else None,
+                action="hard_terminate",
+            )
+
         try:
             while True:
-                event = await queue.get()
+                # D5: Use wait_for with idle timeout when watchdog is active.
+                # When total_timeout is finite and smaller than idle_timeout,
+                # shrink the wait so the total cap is not starved waiting for
+                # the idle tick. Minimum wait of 0.1s to avoid a tight loop.
+                if watchdog is not None:
+                    _wait_timeout = watchdog.idle_timeout_seconds
+                    if watchdog.total_timeout_seconds > 0:
+                        _remaining_total = max(
+                            0.1,
+                            watchdog.total_timeout_seconds - watchdog.elapsed_seconds,
+                        )
+                        _wait_timeout = min(_wait_timeout, _remaining_total)
+                    try:
+                        event = await asyncio.wait_for(
+                            queue.get(),
+                            timeout=_wait_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        # Always check total-only first (it's the hard cap).
+                        # If the wait was shortened for total, evaluate() may
+                        # still classify as HEALTHY for idle but HARD for total.
+                        verdict = watchdog.evaluate()
+                        if verdict == WatchdogVerdict.SOFT_RECOVER:
+                            logger.warning(
+                                "watchdog SOFT_RECOVER: idle=%.1fs last_node=%s session=%s",
+                                watchdog.idle_seconds,
+                                watchdog.last_node,
+                                configurable.get("session_id", "?"),
+                            )
+                            yield HealthEvent(
+                                status=HealthStatus.DEGRADED,
+                                reason="Agent 似乎遇到了困难，正在尝试恢复...",
+                                last_node=watchdog.last_node,
+                                idle_seconds=round(watchdog.idle_seconds, 1),
+                                action="soft_recovery",
+                            )
+                            # Inject recovery hint for llm_node
+                            if control is not None:
+                                control.idle_recovery_hint = (
+                                    "[SYSTEM] You appear stuck with no progress. "
+                                    "Try a different approach or summarize current progress."
+                                )
+                            continue
+                        elif verdict == WatchdogVerdict.HARD_TERMINATE:
+                            logger.warning(
+                                "watchdog HARD_TERMINATE: elapsed=%.1fs idle=%.1fs last_node=%s session=%s",
+                                watchdog.elapsed_seconds,
+                                watchdog.idle_seconds,
+                                watchdog.last_node,
+                                configurable.get("session_id", "?"),
+                            )
+                            # Set internal state FIRST so callers that react
+                            # synchronously to TERMINATING (and then stop
+                            # consuming) still see should_terminate=True.
+                            if control is not None:
+                                control.should_terminate = True
+                            task.cancel()
+                            _watchdog_terminated = True
+                            yield _emit_terminating()
+                            break
+                        else:
+                            # HEALTHY after re-evaluation (e.g. total not yet reached)
+                            continue
+                else:
+                    event = await queue.get()
+
                 if event is None:
+                    _sentinel_exit = True
                     break
+
+                # D5: Record progress from queue-path events
+                if watchdog is not None and _is_progress_event(event):
+                    watchdog.record_progress()
+
+                # D5: Check total_timeout on every event (not just idle).
+                # Otherwise a graph that keeps producing output bypasses
+                # the total cap entirely.
+                if watchdog is not None and watchdog.check_total_only():
+                    logger.warning(
+                        "watchdog HARD_TERMINATE(total): elapsed=%.1fs last_node=%s session=%s",
+                        watchdog.elapsed_seconds,
+                        watchdog.last_node,
+                        configurable.get("session_id", "?"),
+                    )
+                    # Set state first so sync break-on-TERMINATING still sees it.
+                    if control is not None:
+                        control.should_terminate = True
+                    task.cancel()
+                    _watchdog_terminated = True
+                    # Yield the triggering event first so the frontend sees
+                    # it before the termination notice.
+                    yield event
+                    yield _emit_terminating()
+                    break
+
                 yield event
-            _normal_exit = True
         finally:
-            if _normal_exit:
+            if _sentinel_exit and not _watchdog_terminated:
+                # Normal finish: task should complete cleanly.
                 await task
             else:
                 try:
                     await task
-                except Exception:
+                except (Exception, asyncio.CancelledError):
                     # Suppress _drive_graph exceptions during cleanup.
-                    # This is critical: when agent_task_runner processes WaitEvent
-                    # and returns, the generator cleanup chain runs. If _drive_graph
-                    # raises (e.g. interrupt() error), the exception propagates to
-                    # agent_task_runner's `except Exception` handler, which overwrites
-                    # WAITING status to COMPLETED. Errors are already logged by
-                    # _drive_graph's own exception handler.
+                    # Three scenarios:
+                    # 1. WaitEvent cleanup (GeneratorExit from caller): interrupt() errors suppressed.
+                    # 2. HARD_TERMINATE: we cancelled the task, CancelledError expected.
+                    # 3. Other non-normal exits: already logged by _drive_graph's except.
+                    # Without this suppression, errors propagate to agent_task_runner's
+                    # `except Exception` handler, which overwrites WAITING status to COMPLETED.
                     logger.warning(
                         "GraphEventBridge: suppressed _drive_graph error during "
                         "generator cleanup (error already logged above)"

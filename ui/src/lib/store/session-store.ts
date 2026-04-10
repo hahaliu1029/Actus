@@ -154,7 +154,22 @@ function resolveStatusFromEvent(
   if (event.type === "wait" || event.type === "tool_confirmation") {
     return "waiting";
   }
+  // D5: Watchdog health events. TERMINATED pins the session to timed_out so
+  // the subsequent "done" event doesn't collapse it back to "completed".
+  if (event.type === "health") {
+    const data = asRecord(event.data);
+    const healthStatus = typeof data.status === "string" ? data.status : "";
+    if (healthStatus === "terminated" || healthStatus === "terminating") {
+      return "timed_out";
+    }
+    // DEGRADED is informational — keep current status (running/finishing).
+    return currentStatus;
+  }
   if (event.type === "done" || event.type === "error") {
+    // D5: Preserve timed_out (set by preceding health event) across done.
+    if (currentStatus === "timed_out") {
+      return "timed_out";
+    }
     return "completed";
   }
   if (event.type === "control") {
@@ -163,6 +178,10 @@ function resolveStatusFromEvent(
   // Finishing guard: don't let content events revert finishing back to running
   if (currentStatus === "finishing") {
     return "finishing";
+  }
+  // Timed-out guard: don't let content events revert timed_out back to running
+  if (currentStatus === "timed_out") {
+    return "timed_out";
   }
   return "running";
 }
@@ -842,17 +861,19 @@ export const useSessionStore = create<SessionStore>()(
               event.type === "tool_confirmation" ||
               event.type === "error" ||
               event.type === "control" ||
-              event.type === "finishing"
+              event.type === "finishing" ||
+              event.type === "health"
             ) {
               const isFinishing = event.type === "finishing";
-              shouldClearAbortAfterBind = !isFinishing;
+              const isHealth = event.type === "health";
+              shouldClearAbortAfterBind = !isFinishing && !isHealth;
               return {
                 currentSession: {
                   ...next,
                   status: nextStatus,
                 },
                 sessions: nextSessions,
-                ...(shouldResetStreaming && !isFinishing
+                ...(shouldResetStreaming && !isFinishing && !isHealth
                   ? { isChatting: false, chatSessionId: null }
                   : isFinishing
                     ? { isChatting: false }
@@ -860,10 +881,14 @@ export const useSessionStore = create<SessionStore>()(
               };
             }
 
+            // D5: Preserve timed_out across content events (set by prior health event)
+            const fallbackStatus: Session["status"] =
+              currentStatus === "timed_out" ? "timed_out" : "running";
+
             return {
               currentSession: {
                 ...next,
-                status: "running",
+                status: fallbackStatus,
               },
               sessions: nextSessions,
             };

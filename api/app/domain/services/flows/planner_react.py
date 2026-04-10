@@ -176,6 +176,15 @@ class PlannerReActFlow(BaseFlow):
         self._approval_cache = approval_cache
         self._confirmation_manager = confirmation_manager
 
+        # D5: Execution health monitoring — persist across invoke/resume
+        self._execution_config = agent_config.execution
+        from app.domain.services.tools.tool_failure_tracker import ToolFailureTracker
+        from app.domain.services.execution_metrics import ExecutionMetrics
+        self._tool_failure_tracker = ToolFailureTracker(
+            max_same_failures=self._execution_config.max_same_tool_failures,
+        )
+        self._execution_metrics = ExecutionMetrics()
+
     @property
     def summary_llm(self):
         return self._summary_llm
@@ -733,12 +742,24 @@ class PlannerReActFlow(BaseFlow):
 
     def _build_config(self) -> dict:
         """Build the LangGraph config dict shared by invoke() and resume()."""
+        from app.domain.services.execution_watchdog import ExecutionControl, ExecutionWatchdog
+
         # Read tool confirmation settings from AgentConfig (config.yaml, user-editable)
         tc = getattr(self._agent_config, "tool_confirmation", None)
         tc_enabled = getattr(tc, "enabled", True) if tc else True
         tc_timeout = getattr(tc, "timeout_seconds", 300) if tc else 300
         tc_smart_approve = getattr(tc, "smart_approve_enabled", False) if tc else False
         tc_smart_approve_medium_only = getattr(tc, "smart_approve_medium_only", False) if tc else False
+
+        # D5: Create fresh watchdog + control per invoke/resume (timer resets).
+        # Tracker + metrics persist on self (survive across invoke/resume).
+        ec = self._execution_config
+        watchdog = ExecutionWatchdog(
+            total_timeout_seconds=ec.total_timeout_seconds,
+            idle_timeout_seconds=ec.idle_timeout_seconds,
+        )
+        control = ExecutionControl()
+
         return {
             "configurable": {
                 "thread_id": self._session_id,
@@ -756,6 +777,11 @@ class PlannerReActFlow(BaseFlow):
                 "smart_approve_medium_only": tc_smart_approve_medium_only,
                 "summary_llm": self._summary_llm if hasattr(self, "_summary_llm") else None,
                 "tool_confirmation_timeout_seconds": tc_timeout,
+                # D5: Execution health monitoring
+                "execution_watchdog": watchdog,
+                "execution_control": control,
+                "tool_failure_tracker": self._tool_failure_tracker,
+                "execution_metrics": self._execution_metrics,
             }
         }
 

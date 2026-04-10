@@ -64,7 +64,8 @@ export type SessionStatus =
   | "takeover"
   | "waiting"
   | "finishing"
-  | "completed";
+  | "completed"
+  | "timed_out";
 
 /**
  * 执行状态
@@ -471,10 +472,42 @@ export type WaitEvent = {
   [key: string]: unknown;
 };
 
+export type ExecutionMetrics = {
+  tool_success_rate?: number;
+  avg_tool_latency_ms?: number;
+  avg_llm_latency_ms?: number;
+  tool_calls_total?: number;
+  tool_calls_failed?: number;
+  llm_calls_total?: number;
+  steps_completed?: number;
+  steps_failed?: number;
+  context_usage_ratio?: number;
+  compaction_count?: number;
+};
+
 export type DoneEvent = {
   event_id?: string;
   created_at?: number;
+  metrics?: ExecutionMetrics | null;
   [key: string]: unknown;
+};
+
+export type HealthEventStatus =
+  | "healthy"
+  | "degraded"
+  | "terminating"
+  | "terminated";
+
+export type HealthEvent = {
+  event_id?: string;
+  created_at?: number;
+  status: HealthEventStatus;
+  reason: string;
+  last_node?: string | null;
+  idle_seconds?: number | null;
+  tool_failures?: number;
+  action?: string;
+  metrics?: ExecutionMetrics | null;
 };
 
 export type FinishingEvent = {
@@ -521,6 +554,7 @@ export type SSEEventData =
   | { type: "wait"; data: WaitEvent }
   | { type: "tool_confirmation"; event_id?: string; created_at?: number; data: ToolConfirmationEventData }
   | { type: "finishing"; data: FinishingEvent }
+  | { type: "health"; data: HealthEvent }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
   | { type: "sessions"; data: ListSessionResponse };

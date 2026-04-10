@@ -171,6 +171,14 @@ class ToolConfirmationConfig(BaseModel):
     smart_approve_medium_only: bool = Field(default=False, description="Smart Approve 仅对 medium 工具生效")
 
 
+class ExecutionConfig(BaseModel):
+    """执行健康监控配置"""
+
+    total_timeout_seconds: float = Field(default=600.0, ge=0, description="总执行超时秒数（0=无限制）")
+    idle_timeout_seconds: float = Field(default=120.0, ge=10, description="idle 无输出超时秒数")
+    max_same_tool_failures: int = Field(default=3, ge=1, le=20, description="同签名工具最大连续失败数")
+
+
 class AgentConfig(BaseModel):
     """Agent通用配置"""
 
@@ -181,6 +189,7 @@ class AgentConfig(BaseModel):
     skill_embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     tool_confirmation: ToolConfirmationConfig = Field(default_factory=ToolConfirmationConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
 
 class MCPTransport(str, Enum):

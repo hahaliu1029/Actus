@@ -190,9 +190,24 @@ def build_react_graph(
             logger.info("context_assembler(in-step): %s", result.actions)
         return {"llm_input_messages": result.messages}
 
-    async def llm_node(state: ReactGraphState) -> dict:
+    async def llm_node(state: ReactGraphState, config: RunnableConfig) -> dict:
         """Call the LLM with current messages."""
-        messages = state.get("llm_input_messages") or state["messages"]
+        import time as _time
+        messages = list(state.get("llm_input_messages") or state["messages"])
+
+        # D5: Inject recovery hint and blocked summary into messages (not state)
+        _configurable = config.get("configurable", {})
+        _control = _configurable.get("execution_control")
+        _tracker = _configurable.get("tool_failure_tracker")
+        _metrics = _configurable.get("execution_metrics")
+
+        if _control and _control.idle_recovery_hint:
+            messages = messages + [SystemMessage(content=_control.idle_recovery_hint)]
+            _control.idle_recovery_hint = None  # consume once
+        if _tracker:
+            blocked = _tracker.get_blocked_summary()
+            if blocked:
+                messages = messages + [SystemMessage(content=blocked)]
 
         # 诊断日志：检查多模态内容是否到达 react_graph
         multimodal_msgs = [
@@ -206,7 +221,11 @@ def build_react_graph(
                 len(multimodal_msgs), multimodal_msgs,
             )
 
+        _llm_start = _time.monotonic()
         response: AIMessage = await llm_with_tools.ainvoke(messages)
+        # D5: Record LLM latency
+        if _metrics:
+            _metrics.record_llm_call((_time.monotonic() - _llm_start) * 1000)
 
         new_events = []
 
@@ -267,10 +286,22 @@ def build_react_graph(
         - Approved calls proceed to normal execution; denied/timed-out calls
           return an error string without executing.
         """
+        import time as _time
         configurable = (config or {}).get("configurable", {}) if config else {}
         guide_injector = configurable.get("skill_guide_injector")
         event_queue = configurable.get("event_queue")
         confirmation_manager = configurable.get("confirmation_manager")
+        _tracker = configurable.get("tool_failure_tracker")
+        _metrics = configurable.get("execution_metrics")
+
+        # D5: Cooperative termination — set should_interrupt for routing
+        _control = configurable.get("execution_control")
+        if _control and _control.should_terminate:
+            return {
+                "should_interrupt": True,
+                "messages": [],
+                "events": [],
+            }
 
         messages = state["messages"]
         last_msg = messages[-1]
@@ -327,6 +358,7 @@ def build_react_graph(
             tool_name = tc["name"]
             args = tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"])
             call_id = tc["id"]
+            _tool_start = _time.monotonic()
 
             # ---- message_ask_user: SOFT_HINT gating ---- #
             tool_success = True
@@ -348,6 +380,25 @@ def build_react_graph(
                     logger.info("message_ask_user: user input required (after SOFT_HINT)")
             else:
                 # ---- Normal tool execution (with risk assessment gate) ---- #
+                # D5: Check if this tool+args signature is blocked by tracker
+                if _tracker and _tracker.is_blocked(tool_name, args):
+                    result_str = f"[BLOCKED] 此工具调用模式（{tool_name}）因连续失败已被暂停，请尝试不同的工具或参数"
+                    tool_success = False
+                    new_messages.append(ToolMessage(content=f"[TOOL_ERROR] {result_str}", tool_call_id=call_id, name=tool_name))
+                    new_events.append(ToolEvent(
+                        tool_call_id=call_id, tool_name=_classify_tool_name(tool_name),
+                        function_name=tool_name, function_args=args,
+                        function_result=ToolResult(success=False, message=result_str),
+                        status=ToolEventStatus.CALLED,
+                    ))
+                    new_failures += 1
+                    if _metrics:
+                        _metrics.record_tool_call(
+                            success=False,
+                            latency_ms=(_time.monotonic() - _tool_start) * 1000,
+                        )
+                    continue
+
                 tool_fn = tool_map.get(tool_name)
                 if tool_fn is None:
                     result_str = f"Error: Unknown tool '{tool_name}'"
@@ -493,6 +544,20 @@ def build_react_graph(
                     else:
                         # No risk metadata — execute directly (original path)
                         result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
+
+            # D5: Record tool outcome in tracker + metrics
+            if _tracker:
+                if tool_success:
+                    _tracker.record_success(tool_name, args)
+                else:
+                    _tracker.record_failure(tool_name, args)
+            if _metrics and tool_name != "message_ask_user":
+                # Exclude message_ask_user from latency stats (it's a gating mechanism,
+                # not a real tool execution).
+                _metrics.record_tool_call(
+                    success=tool_success,
+                    latency_ms=(_time.monotonic() - _tool_start) * 1000,
+                )
 
             if not tool_success:
                 new_failures += 1
