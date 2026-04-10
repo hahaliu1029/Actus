@@ -8,9 +8,18 @@ class Sandbox(Protocol):
     """沙箱服务扩展协议，包含文件工具协议、Shell工具协议以及沙箱本身的扩展"""
 
     async def exec_command(
-        self, session_id: str, exec_dir: str, command: str
+        self,
+        session_id: str,
+        exec_dir: str,
+        command: str,
+        wait_seconds: Optional[int] = None,
     ) -> ToolResult:
-        """根据传递的会话id+目录+命令执行对应的命令"""
+        """根据传递的会话id+目录+命令执行对应的命令
+
+        ``wait_seconds`` 控制同步等待命令结束的最长秒数，超过后 ToolResult
+        的 data 中 ``status`` 为 ``"running"``，调用方需要用
+        ``wait_process``/``read_shell_output`` 轮询。
+        """
         ...
 
     async def read_shell_output(

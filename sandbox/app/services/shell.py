@@ -539,11 +539,19 @@ class ShellService:
         session_id: str,
         exec_dir: Optional[str],
         command: str,
+        wait_seconds: Optional[int] = None,
     ) -> ShellExecuteResult:
-        """传递会话id+执行目录+命令在沙箱中执行后返回"""
+        """传递会话id+执行目录+命令在沙箱中执行后返回
+
+        ``wait_seconds`` 控制同步等待命令结束的最长秒数，超过后立即返回
+        ``status=running`` 由上层轮询。未传或非正数时使用默认值 5 秒。
+        """
         # 1.记录日志并判断执行目录是否存在
         normalized_command = self._normalize_non_interactive_command(command)
-        logger.info(f"正在会话 {session_id} 中执行命令: {normalized_command}")
+        sync_wait = wait_seconds if wait_seconds and wait_seconds > 0 else 5
+        logger.info(
+            f"正在会话 {session_id} 中执行命令: {normalized_command} (同步等待 {sync_wait}s)"
+        )
         if not exec_dir or exec_dir == "":
             exec_dir = os.path.expanduser("~")
         if not os.path.exists(exec_dir):
@@ -609,9 +617,11 @@ class ShellService:
 
             try:
 
-                # 13.尝试等待子进程执行(最多等待5s)
-                logger.debug(f"正在等待会话中的进程完成: {session_id}")
-                wait_result = await self.wait_process(session_id, seconds=5)
+                # 13.尝试等待子进程执行(最多等待 sync_wait 秒)
+                logger.debug(
+                    f"正在等待会话中的进程完成: {session_id} (超时 {sync_wait}s)"
+                )
+                wait_result = await self.wait_process(session_id, seconds=sync_wait)
 
                 # 14.判断返回代码是否非空(已结束)则同步返回执行结果
                 if wait_result.returncode is not None:

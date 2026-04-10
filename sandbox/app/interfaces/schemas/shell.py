@@ -13,6 +13,11 @@ class ShellExecuteRequest(BaseModel):
         default=None, description="执行命令的工作目录(必须使用绝对路径)"
     )
     command: str = Field(..., description="要执行的 Shell 命令")
+    wait_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="同步等待命令完成的最长秒数, 超过后返回 status=running 由调用方轮询; 未传则使用服务端默认值",
+    )
 
 
 class ShellReadRequest(BaseModel):

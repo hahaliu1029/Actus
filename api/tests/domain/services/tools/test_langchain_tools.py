@@ -96,3 +96,223 @@ class TestMessageTools:
         ask = next(t for t in tools if t.name == "message_ask_user")
         result = await ask.ainvoke({"text": "confirm?"})
         assert result is not None
+
+
+class TestShellExecuteStatusHandling:
+    """Regression tests for the shell_execute wrapper status+timeout handling.
+
+    The original bug: when the sandbox returned status="running" with
+    output=None (e.g. ``apt-get update`` exceeding the 5s sync wait), the
+    wrapper collapsed the payload to the literal string ``"None"``, so the
+    LLM thought the command had finished with empty output and proceeded.
+    """
+
+    def _build_tools(self, sandbox):
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        return create_native_tools(sandbox=sandbox, browser=AsyncMock(), search_engine=AsyncMock())
+
+    async def test_running_status_returns_poll_instructions(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                message="",
+                data={
+                    "session_id": "default",
+                    "command": "apt-get update && apt-get install -y unzip",
+                    "status": "running",
+                    "returncode": None,
+                    "output": None,
+                },
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        result = await shell.ainvoke({"command": "apt-get update && apt-get install -y unzip"})
+
+        assert isinstance(result, str)
+        assert result != "None"
+        assert "still running" in result
+        assert "shell_wait_process" in result
+        assert "default" in result
+
+    async def test_completed_status_returns_output(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"status": "completed", "returncode": 0, "output": "hello world"},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        result = await shell.ainvoke({"command": "echo hello world"})
+        assert result == "hello world"
+
+    async def test_completed_empty_output_reports_exit_code(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"status": "completed", "returncode": 0, "output": None},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        result = await shell.ainvoke({"command": "touch /tmp/x"})
+        assert "None" not in result
+        assert "exit code 0" in result
+
+    async def test_completed_nonzero_exit_includes_code(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"status": "completed", "returncode": 1, "output": "not found"},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        result = await shell.ainvoke({"command": "ls /nope"})
+        assert "not found" in result
+        assert "exit code: 1" in result
+
+    async def test_wait_seconds_is_forwarded_to_sandbox(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"status": "completed", "returncode": 0, "output": "ok"},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        await shell.ainvoke({"command": "sleep 10", "wait_seconds": 60})
+
+        sandbox.exec_command.assert_awaited_once()
+        call_kwargs = sandbox.exec_command.await_args.kwargs
+        assert call_kwargs["wait_seconds"] == 60
+        assert call_kwargs["command"] == "sleep 10"
+
+    async def test_legacy_mock_without_data_still_works(self, mock_browser, mock_search_engine):
+        # Backward compat: tests that mock exec_command with only ``message`` (no data dict).
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(return_value=ToolResult(success=True, message="hello"))
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        result = await shell.ainvoke({"command": "echo hello"})
+        assert result == "hello"
+
+    async def test_sandbox_failure_raises_runtime_error(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(success=False, message="sandbox unreachable", data=None)
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        with pytest.raises(RuntimeError, match="sandbox unreachable"):
+            await shell.ainvoke({"command": "ls"})
+
+    async def test_wait_seconds_is_clamped_to_max(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"status": "completed", "returncode": 0, "output": "ok"},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        # LLM passes an absurd value — wrapper must clamp below the httpx 600s timeout.
+        await shell.ainvoke({"command": "sleep 1", "wait_seconds": 99999})
+
+        forwarded = sandbox.exec_command.await_args.kwargs["wait_seconds"]
+        assert forwarded is not None
+        assert 1 <= forwarded <= 599  # strictly below httpx timeout
+
+    async def test_wait_seconds_nonpositive_falls_back_to_sandbox_default(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"status": "completed", "returncode": 0, "output": "ok"},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        await shell.ainvoke({"command": "ls", "wait_seconds": 0})
+        assert sandbox.exec_command.await_args.kwargs["wait_seconds"] is None
+
+        sandbox.exec_command.reset_mock()
+        sandbox.exec_command.return_value = ToolResult(
+            success=True,
+            data={"status": "completed", "returncode": 0, "output": "ok"},
+        )
+        await shell.ainvoke({"command": "ls", "wait_seconds": -5})
+        assert sandbox.exec_command.await_args.kwargs["wait_seconds"] is None
+
+    async def test_running_status_fetches_partial_output(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={
+                    "session_id": "default",
+                    "status": "running",
+                    "returncode": None,
+                    "output": None,
+                },
+            )
+        )
+        sandbox.read_shell_output = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"session_id": "default", "output": "Reading package lists... 35%"},
+            )
+        )
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        result = await shell.ainvoke({"command": "apt-get update"})
+
+        sandbox.read_shell_output.assert_awaited_once()
+        assert "still running" in result
+        assert "Reading package lists... 35%" in result
+        assert "partial output" in result
+
+    async def test_running_status_tolerates_peek_failure(self, mock_browser, mock_search_engine):
+        sandbox = AsyncMock()
+        sandbox.exec_command = AsyncMock(
+            return_value=ToolResult(
+                success=True,
+                data={"session_id": "default", "status": "running", "output": None},
+            )
+        )
+        sandbox.read_shell_output = AsyncMock(side_effect=RuntimeError("transient network blip"))
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        shell = next(t for t in tools if t.name == "shell_execute")
+
+        # Peek failure must not break the running-status message.
+        result = await shell.ainvoke({"command": "apt-get update"})
+        assert "still running" in result
+        assert "None" not in result
