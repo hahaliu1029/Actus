@@ -199,6 +199,7 @@ class AgentTaskRunner(TaskRunner):
         memory_repo_factory=None,  # C6: 记忆仓库工厂
         approval_cache=None,  # Task 17: ApprovalCache | None
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
+        initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._approval_cache = approval_cache
@@ -346,7 +347,11 @@ class AgentTaskRunner(TaskRunner):
         # Note: ``self._llm`` was already assigned at line ~212; here we
         # just stash ``summary_llm`` (which isn't stored elsewhere) and
         # track the language.
-        self._current_language: str = "zh"
+        # B5 #29: seed current language from application layer.
+        # ``initial_language`` is computed by ``AgentService._create_task``
+        # from the already-hydrated ``session.get_latest_plan()``.
+        # Falls back to "zh" for brand-new sessions (no plan history yet).
+        self._current_language: str = initial_language
         self._summary_llm_for_telemetry = summary_llm
         self._attach_telemetry_to_llms(self._current_language)
 
@@ -2668,6 +2673,7 @@ class AgentTaskRunner(TaskRunner):
                                 if isinstance(event, MessageEvent)
                                 else None
                             ),
+                            language=self._current_language,  # B5 #29: bootstrap hint
                         )
 
                         selected_skills, _ = await self._select_skills_for_message(

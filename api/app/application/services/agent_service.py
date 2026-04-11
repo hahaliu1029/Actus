@@ -201,6 +201,18 @@ class AgentService:
         # Reuse the service-level ConfirmationManager (initialized in __init__)
         confirmation_manager_inst = self._confirmation_manager
 
+        # B5 #29: compute bootstrap language from the already-loaded session.
+        # ``_get_accessible_session`` upstream already hydrated events via
+        # ``get_by_id().to_domain()``, so ``session.get_latest_plan()`` is a
+        # zero-cost in-memory Python lookup. Falls back to "zh" for brand-new
+        # sessions (no plan history) or plan.language == "" (empty string).
+        latest_plan = session.get_latest_plan()
+        initial_language = (
+            latest_plan.language
+            if latest_plan is not None and latest_plan.language
+            else "zh"
+        )
+
         # 6.创建AgentTaskRunner
         task_runner = AgentTaskRunner(
             uow_factory=self._uow_factory,
@@ -228,6 +240,7 @@ class AgentService:
             memory_repo_factory=self._memory_repo_factory,
             approval_cache=approval_cache,
             confirmation_manager=confirmation_manager_inst,
+            initial_language=initial_language,
         )
 
         # 6.创建任务Task并更新会话中的信息

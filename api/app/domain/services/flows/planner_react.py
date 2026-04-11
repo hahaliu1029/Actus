@@ -711,8 +711,8 @@ class PlannerReActFlow(BaseFlow):
         from app.domain.services.prompts.render_context import build_render_context
         from app.domain.services.prompts.section import PromptMode
 
-        bundle = get_prompt_bundle(getattr(message, "language", "zh"))
-        lang = getattr(message, "language", "zh")
+        bundle = get_prompt_bundle(message.language)
+        lang = message.language
 
         attachments = getattr(message, "attachments", [])
         image_blocks = getattr(message, "image_content_blocks", [])
@@ -792,7 +792,7 @@ class PlannerReActFlow(BaseFlow):
             parsed = PlanResponse(
                 title="Task",
                 goal=message.message,
-                language=getattr(message, "language", "zh"),
+                language=message.language,
                 steps=[StepDef(description=message.message)],
                 message="好的，我来帮你处理。",
             )
@@ -806,7 +806,7 @@ class PlannerReActFlow(BaseFlow):
         plan = Plan(
             title=parsed.title or "Task",
             goal=parsed.goal or message.message,
-            language=parsed.language or getattr(message, "language", "zh"),
+            language=parsed.language or message.language,
             steps=steps,
             message=parsed.message or "",
             status=ExecutionStatus.RUNNING,
@@ -996,7 +996,7 @@ class PlannerReActFlow(BaseFlow):
                 # by setting flow_status=executing
                 input_for_graph = {
                     "message": message.message,
-                    "language": getattr(message, "language", "zh"),
+                    "language": message.language,
                     "attachments": getattr(message, "attachments", []),
                     "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": plan,
@@ -1019,7 +1019,7 @@ class PlannerReActFlow(BaseFlow):
                 # No skill creation tools → normal flow with planner_node
                 input_for_graph = {
                     "message": message.message,
-                    "language": getattr(message, "language", "zh"),
+                    "language": message.language,
                     "attachments": getattr(message, "attachments", []),
                     "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": self.plan,
