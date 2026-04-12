@@ -688,6 +688,7 @@ export default function SessionPage() {
   const setActiveSession = useSessionStore((state) => state.setActiveSession);
   const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
   const fetchSessionFiles = useSessionStore((state) => state.fetchSessionFiles);
+  const recoverSession = useSessionStore((state) => state.recoverSession);
   const downloadFile = useSessionStore((state) => state.downloadFile);
   const downloadSandboxFile = useSessionStore((state) => state.downloadSandboxFile);
   const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
@@ -835,6 +836,39 @@ export default function SessionPage() {
     sessionRunning,
     isCurrentSessionStreaming,
   ]);
+
+  // E2: SSE 状态恢复 — visibilitychange 触发
+  useEffect(() => {
+    if (!sessionId) return;
+
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+
+      const session = useSessionStore.getState().currentSession;
+      if (!session || session.session_id !== sessionId) return;
+
+      // 已 COMPLETED 不触发
+      if (session.status === "completed") return;
+
+      // 正在流式中（stream 会实时推送），不需要恢复
+      const { isChatting, chatSessionId } = useSessionStore.getState();
+      if (isChatting && chatSessionId === sessionId) return;
+
+      // 1s debounce
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        void recoverSession(sessionId);
+      }, 1000);
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  }, [sessionId, recoverSession]);
 
   const streamingAssistantEventId = useMemo(() => {
     if (!isCurrentSessionStreaming) {

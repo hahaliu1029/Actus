@@ -31,6 +31,7 @@ from app.infrastructure.external.llm.actus_responses_model import ActusResponses
 from langchain_core.language_models import BaseChatModel
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.external.github_search_client import GitHubSearchClient
+from app.infrastructure.external.event_recovery.redis_event_recovery import RedisEventRecovery
 from app.infrastructure.external.search.bing_search import BingSearchEngine
 from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
 
@@ -317,6 +318,7 @@ def _build_agent_service(
         memory_embedding_provider=memory_embedding_provider,
         memory_session_factory=get_postgres().session_factory,
         memory_repo_factory=DBMemoryChunkRepository,
+        event_recovery=RedisEventRecovery(),
     )
     _last_refresh_generation = _config_generation
     return agent_svc

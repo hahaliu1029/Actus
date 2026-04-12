@@ -61,6 +61,14 @@ class GetSessionResponse(BaseModel):
     events: List[AgentSSEEvent] = Field(default_factory=list)
 
 
+class EventsSinceResponse(BaseModel):
+    """增量事件恢复响应"""
+
+    events: List[AgentSSEEvent] = Field(default_factory=list)
+    session_status: SessionStatus
+    has_more: bool = False
+
+
 class GetSessionFilesResponse(BaseModel):
     """获取会话文件列表响应结构"""
 

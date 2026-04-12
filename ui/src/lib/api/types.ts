@@ -306,6 +306,12 @@ export type Session = {
   events: AgentSSEEvent[];
 };
 
+export type EventsSinceResponse = {
+  events: AgentSSEEvent[];
+  session_status: SessionStatus;
+  has_more: boolean;
+};
+
 export type CreateSessionParams = {
   title?: string;
 };

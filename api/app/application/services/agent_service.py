@@ -92,6 +92,7 @@ class AgentService:
         memory_embedding_provider=None,
         memory_session_factory=None,
         memory_repo_factory=None,
+        event_recovery=None,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -106,6 +107,7 @@ class AgentService:
         self._memory_embedding_provider = memory_embedding_provider
         self._memory_session_factory = memory_session_factory
         self._memory_repo_factory = memory_repo_factory
+        self._event_recovery = event_recovery
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
         self._takeover_timeout_tasks: dict[str, asyncio.Task] = {}
@@ -453,6 +455,75 @@ class AgentService:
             logger.error(f"用户[{user_id}]无权访问会话[{session_id}]")
             raise ForbiddenError("无权访问此会话")
         return session
+
+    async def get_events_since(
+        self,
+        session_id: str,
+        since_event_id: str | None,
+        user_id: str,
+        is_admin: bool = False,
+    ) -> dict:
+        """获取 session 在 since_event_id 之后的增量事件。
+
+        PG 为主（跨 invoke 权威来源），Redis 补充当前 task 的 in-flight 事件。
+        """
+        session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+        # 1. PG 主路径：找到 since_event_id 位置，取其后所有事件
+        pg_events = session.events or []
+        if since_event_id:
+            found_idx = None
+            for i, evt in enumerate(pg_events):
+                if getattr(evt, "id", None) == since_event_id:
+                    found_idx = i
+                    break
+            if found_idx is not None:
+                pg_events = pg_events[found_idx + 1:]
+            # else: 找不到 → 返回全量（宁可多发不漏发）
+
+        # 2. Redis 补充路径
+        redis_only_events = []
+        redis_has_more = False
+        if session.task_id and self._event_recovery:
+            # 取 PG 增量中最后一个有 id 的事件作为 Redis 起始点
+            redis_start_id = None
+            for evt in reversed(pg_events):
+                if getattr(evt, "id", None):
+                    redis_start_id = evt.id
+                    break
+            if not redis_start_id:
+                redis_start_id = since_event_id  # 可能为 None
+
+            try:
+                recovery_result = await self._event_recovery.get_recent_events(
+                    task_id=session.task_id,
+                    after_event_id=redis_start_id,
+                )
+                # 过滤掉 PG 中已有的 event_id
+                pg_event_ids = {
+                    getattr(e, "id", None)
+                    for e in pg_events
+                    if getattr(e, "id", None)
+                }
+                redis_only_events = [
+                    e
+                    for e in recovery_result.events
+                    if getattr(e, "id", None) not in pg_event_ids
+                ]
+                redis_has_more = recovery_result.has_more
+            except Exception:
+                logger.warning(
+                    "event_recovery: Redis 补充失败 session=%s task=%s",
+                    session_id,
+                    session.task_id,
+                )
+
+        merged = list(pg_events) + redis_only_events
+        return {
+            "events": merged,
+            "session_status": session.status,
+            "has_more": redis_has_more,
+        }
 
     async def _check_attachments_access(
         self, attachments: Optional[List[str]], user_id: str, is_admin: bool = False

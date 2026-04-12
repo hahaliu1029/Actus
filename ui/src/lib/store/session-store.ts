@@ -28,6 +28,7 @@ type SessionState = {
   chatSessionId: string | null;
   chatAbort: (() => void) | null;
   sessionsAbort: (() => void) | null;
+  _isRecovering: boolean;
 };
 
 type SessionActions = {
@@ -67,11 +68,12 @@ type SessionActions = {
     filepath: string,
     options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }
   ) => Promise<Blob>;
+  recoverSession: (sessionId: string) => Promise<void>;
 };
 
 type SessionStore = SessionState & SessionActions;
 
-type SessionEventRecord = {
+export type SessionEventRecord = {
   event: string;
   data: Record<string, unknown>;
 };
@@ -87,6 +89,7 @@ const initialState: SessionState = {
   chatSessionId: null,
   chatAbort: null,
   sessionsAbort: null,
+  _isRecovering: false,
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -417,6 +420,64 @@ function mergeSessionEvents(
   return merged;
 }
 
+const STATUS_ORDER: Record<string, number> = {
+  pending: 0,
+  running: 1,
+  waiting: 2,
+  takeover_pending: 3,
+  takeover: 4,
+  finishing: 5,
+  completed: 6,
+  timed_out: 7,
+};
+
+export function pickMoreAdvancedStatus(
+  ...statuses: (Session["status"] | null | undefined)[]
+): Session["status"] | null {
+  let best: Session["status"] | null = null;
+  let bestOrder = -1;
+  for (const s of statuses) {
+    if (s == null) continue;
+    const order = STATUS_ORDER[s] ?? -1;
+    if (order > bestOrder) {
+      bestOrder = order;
+      best = s;
+    }
+  }
+  return best;
+}
+
+const SIGNAL_EVENT_TYPES = new Set([
+  "done", "error", "wait", "tool_confirmation",
+  "control", "health", "finishing",
+]);
+
+export function deriveStatusFromEvents(
+  events: SessionEventRecord[]
+): Session["status"] | null {
+  let derived: Session["status"] = "running";
+  let sawSignal = false;
+
+  for (const event of events) {
+    if (!SIGNAL_EVENT_TYPES.has(event.event)) {
+      continue;
+    }
+    sawSignal = true;
+    const sseEvent = {
+      type: event.event,
+      data: event.data ?? {},
+    } as SSEEventData;
+    derived = resolveStatusFromEvent(derived, sseEvent);
+  }
+
+  if (!sawSignal) {
+    return null;
+  }
+  // E1 normalization: "finishing" in a historical event log means the session
+  // completed — the live "finishing" transient state should not persist.
+  return derived === "finishing" ? "completed" : derived;
+}
+
 function showMessage(type: "success" | "error" | "info", text: string) {
   useUIStore.getState().setMessage({ type, text });
 }
@@ -696,6 +757,11 @@ export const useSessionStore = create<SessionStore>()(
             ...normalizedRemote,
             title: normalizedRemote.title || localSession.title,
             events: mergedEvents,
+            // E2: 防止远端滞后 status 覆盖本地已推导的更晚状态（如 timed_out）
+            status: pickMoreAdvancedStatus(
+              normalizedRemote.status,
+              localSession.status
+            ) ?? normalizedRemote.status,
           };
 
           if (isSameSessionSnapshot(localSession, nextSession)) {
@@ -738,6 +804,74 @@ export const useSessionStore = create<SessionStore>()(
             set({ isLoadingCurrentSession: false });
           }
         }
+      }
+    },
+
+    recoverSession: async (sessionId: string) => {
+      const state = get();
+      const localSession = state.currentSession;
+      if (!localSession || localSession.session_id !== sessionId) {
+        return;
+      }
+      if (localSession.status === "completed") {
+        return;
+      }
+      if (get()._isRecovering) {
+        return;
+      }
+      set({ _isRecovering: true });
+
+      try {
+        const lastEventId = getLatestEventId(
+          localSession.events as SessionEventRecord[]
+        );
+        const response = await sessionApi.getEventsSince(
+          sessionId,
+          lastEventId
+        );
+
+        const recoveredEvents = (response.events ?? []) as SessionEventRecord[];
+        const remoteStatus = normalizeSessionStatus(response.session_status as Session["status"]);
+        const eventDerivedStatus = deriveStatusFromEvents(recoveredEvents);
+
+        if (recoveredEvents.length === 0) {
+          set((s) => {
+            const local = s.currentSession;
+            if (!local || local.session_id !== sessionId) return {};
+            const finalStatus =
+              pickMoreAdvancedStatus(remoteStatus, local.status) ??
+              local.status;
+            if (finalStatus === local.status) return {};
+            return { currentSession: { ...local, status: finalStatus } };
+          });
+          return;
+        }
+
+        const normalized = normalizeSessionEvents(recoveredEvents);
+
+        set((s) => {
+          const local = s.currentSession;
+          if (!local || local.session_id !== sessionId) return {};
+          const merged = mergeSessionEvents(
+            local.events as SessionEventRecord[],
+            normalized
+          );
+          const finalStatus =
+            pickMoreAdvancedStatus(
+              remoteStatus,
+              eventDerivedStatus,
+              local.status
+            ) ?? local.status;
+          return {
+            currentSession: { ...local, events: merged, status: finalStatus },
+          };
+        });
+
+        showMessage("info", `连接已恢复，已同步 ${recoveredEvents.length} 条新事件`);
+      } catch {
+        // 静默忽略，下次触发重试
+      } finally {
+        set({ _isRecovering: false });
       }
     },
 
@@ -794,6 +928,8 @@ export const useSessionStore = create<SessionStore>()(
 
       let abortRef: (() => void) | null = null;
       let shouldClearAbortAfterBind = false;
+      let sawTerminalEvent = false;
+      let streamConnected = false;
 
       const clearChatState = () => {
         if (!abortRef) {
@@ -819,6 +955,17 @@ export const useSessionStore = create<SessionStore>()(
             event.data.status === "called"
           ) {
             void get().fetchSessionFiles(sessionId);
+          }
+
+          // E2: 标记是否收到终止事件（在 set() 外部）
+          if (
+            event.type === "done" ||
+            event.type === "error" ||
+            event.type === "wait" ||
+            event.type === "tool_confirmation" ||
+            event.type === "control"
+          ) {
+            sawTerminalEvent = true;
           }
 
           set((state) => {
@@ -895,11 +1042,33 @@ export const useSessionStore = create<SessionStore>()(
           });
         },
         (error) => {
-          showMessage("error", error.message || "聊天流中断");
+          // E2: 仅当 SSE 连接已建立且未收到终止事件时抑制错误（即将触发恢复）。
+          // createSSEStream() 未成功时 streamConnected=false，必须报错。
+          const isRecoverableDisconnect = streamConnected && !sawTerminalEvent;
+          if (!isRecoverableDisconnect) {
+            showMessage("error", error.message || "聊天流中断");
+          }
           clearChatState();
         },
         () => {
           clearChatState();
+          // E2: 仅在"SSE 连接已建立但意外断开"时触发恢复。
+          // createSSEStream() 未成功时不触发（避免对 401/5xx 做无意义恢复）。
+          if (streamConnected && !sawTerminalEvent) {
+            const sessionAfterClose = get().currentSession;
+            if (
+              sessionAfterClose &&
+              sessionAfterClose.session_id === sessionId
+            ) {
+              setTimeout(() => {
+                void get().recoverSession(sessionId);
+              }, 2000);
+            }
+          }
+        },
+        // E2: onConnected — createSSEStream() 成功后调用
+        () => {
+          streamConnected = true;
         }
       );
 
