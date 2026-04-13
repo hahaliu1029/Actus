@@ -23,10 +23,9 @@ logger = logging.getLogger(__name__)
 class JsonlPromptTelemetry(PromptTelemetryPort):
     """Append-only JSONL writer for prompt assembly + LLM invocation telemetry.
 
-    Three log files (created on demand under ``log_dir``):
+    Two log files (created on demand under ``log_dir``):
     - ``assembly.jsonl`` — one record per ``PromptAssembler.assemble`` call
     - ``llm_invocation.jsonl`` — one record per LLM adapter invoke (C11)
-    - ``degradation.jsonl`` — one record per ``_build_lc_tools`` fallback
 
     All writes are best-effort. On failure the error is logged at WARN
     level and the call returns normally — never raises.
@@ -90,15 +89,6 @@ class JsonlPromptTelemetry(PromptTelemetryPort):
                 "tools_hash": tools_hash,
                 "lang": lang,
                 "provider": provider,
-            },
-        )
-
-    def record_lc_tools_degradation(self, *, reason: str) -> None:
-        self._append(
-            "degradation.jsonl",
-            {
-                "ts": _now_iso(),
-                "reason": reason,
             },
         )
 

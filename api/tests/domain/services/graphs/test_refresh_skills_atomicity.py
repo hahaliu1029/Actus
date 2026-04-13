@@ -65,11 +65,8 @@ class _FakeSkillTool:
     def __init__(self) -> None:
         self.initialize_calls: list[list[Skill]] = []
         self.raise_on_initialize: Exception | None = None
-        self.side_effect_before_raise: Any = None  # callable to simulate partial mutation
 
     async def initialize(self, skills: list[Skill]) -> None:
-        if self.side_effect_before_raise is not None:
-            self.side_effect_before_raise()
         if self.raise_on_initialize is not None:
             raise self.raise_on_initialize
         self.initialize_calls.append(list(skills))
@@ -187,11 +184,6 @@ def _make_runner(monkeypatch: pytest.MonkeyPatch) -> AgentTaskRunner:
             SimpleNamespace(name="file_read"),
         ],
     )
-    monkeypatch.setattr(
-        runner,
-        "_build_minimal_lc_tools_for_step",
-        lambda: [SimpleNamespace(name="shell_execute")],
-    )
     # Stub build_react_graph so we don't need real LLM/tools plumbing
     monkeypatch.setattr(
         "app.domain.services.graphs.react_graph.build_react_graph",
@@ -295,9 +287,9 @@ async def test_scenario_3_initialize_raises_rolls_back(
     """_initialize_skill_tool_if_needed raises → _apply_refreshed_skills rollback.
 
     After the call:
-    - All 4 _last_* fields equal their pre-call snapshot
+    - 3 skill-related _last_* fields equal their pre-call snapshot
+    - _last_bound_tool_names IS allowed to advance (Phase 2 still succeeds)
     - No exception propagates to the caller
-    - StepMetadata.bound_tool_names == pre-call (because refresh_failed=True)
     """
     runner = _make_runner(monkeypatch)
     snapshot = _seed_pre_call_state(runner)
@@ -321,12 +313,16 @@ async def test_scenario_3_initialize_raises_rolls_back(
 
     step_react, metadata = await runner._build_step_react_graph("new step")
 
-    # All 4 fields rolled back to pre-call state
-    _assert_state_matches_snapshot(runner, snapshot)
-    # Metadata reflects the rolled-back state
+    # 3 skill-related fields rolled back to pre-call state
+    assert runner._last_skill_context == snapshot["skill_context"]
+    assert runner._last_skill_ids == snapshot["skill_ids"]
+    assert runner._last_initialized_skill_ids == snapshot["initialized_skill_ids"]
+    # _last_bound_tool_names advances (Phase 2 succeeded post-#27)
+    assert runner._last_bound_tool_names == frozenset({"shell_execute", "file_read"})
+    # Metadata reflects the rolled-back skill state + fresh bound tools
     assert metadata.skill_context == snapshot["skill_context"]
     assert metadata.skill_ids == snapshot["skill_ids"]
-    assert metadata.bound_tool_names == snapshot["bound_tool_names"]
+    assert metadata.bound_tool_names == frozenset({"shell_execute", "file_read"})
 
 
 # ---- Scenario 4: _compute raises ----------------------------------------- #
@@ -335,7 +331,11 @@ async def test_scenario_3_initialize_raises_rolls_back(
 async def test_scenario_4_compute_raises_preserves_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_compute_refreshed_skills raises → _apply never called → state unchanged."""
+    """_compute_refreshed_skills raises → _apply never called → skill state unchanged.
+
+    Post-#27: _last_bound_tool_names IS allowed to advance since Phase 2
+    still runs successfully — only the 3 skill-related fields stay sticky.
+    """
     runner = _make_runner(monkeypatch)
     snapshot = _seed_pre_call_state(runner)
 
@@ -346,7 +346,12 @@ async def test_scenario_4_compute_raises_preserves_state(
 
     step_react, metadata = await runner._build_step_react_graph("new step")
 
-    _assert_state_matches_snapshot(runner, snapshot)
+    # Skill-related fields unchanged (sticky)
+    assert runner._last_skill_context == snapshot["skill_context"]
+    assert runner._last_skill_ids == snapshot["skill_ids"]
+    assert runner._last_initialized_skill_ids == snapshot["initialized_skill_ids"]
+    # But _last_bound_tool_names advances (Phase 2 succeeded)
+    assert runner._last_bound_tool_names == frozenset({"shell_execute", "file_read"})
 
 
 # ---- Scenario 5: First call (empty state) -------------------------------- #
@@ -435,240 +440,182 @@ async def test_scenario_6_same_skill_ids_fast_path(
     )
 
 
-# ---- Scenario 7: Partial mutation on initialize raise -------------------- #
+# ---- Scenario 7: SkillTool.initialize raise preserves runner state ------- #
 
 
-async def test_scenario_7_initialize_partial_mutation_then_raise(
+async def test_skill_tool_initialize_raise_preserves_runner_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_skill_tool.initialize() writes some internal state, then raises.
+    """Scenario 7 (rewritten for #27): with SkillTool.initialize() now atomic,
+    the runner's 4 _last_* bookkeeping fields must remain at their pre-call
+    snapshot when _initialize_skill_tool_if_needed raises.
 
-    This exercises the documented limitation: SkillTool's internal state
-    may be partially updated, but the runner's 4 bookkeeping fields are
-    still rolled back atomically. StepMetadata.bound_tool_names equals
-    the pre-call value (lower bound); step_react may technically bind
-    a superset, but the contract is "LLM only uses what the prompt
-    advertises", which is governed by StepMetadata.
+    This no longer needs to simulate a partial-state SkillTool (that state is
+    impossible post-#27). It exercises the simpler contract: runner rollback
+    works because the field assignments in _apply_refreshed_skills all happen
+    AFTER the await to _initialize_skill_tool_if_needed.
     """
     runner = _make_runner(monkeypatch)
     snapshot = _seed_pre_call_state(runner)
 
-    refreshed = RefreshedSkillsResult(
-        skills=(_build_skill("s_partial"),),
-        context="## partial",
-        skill_ids=("s_partial",),
-        scores=None,
+    # Inject: _FakeSkillTool.initialize raises via the existing flag
+    runner._skill_tool.raise_on_initialize = RuntimeError(
+        "simulated SkillTool.initialize failure"
     )
 
-    async def fake_compute(step_desc: str) -> RefreshedSkillsResult:
-        return refreshed
+    # _compute_refreshed_skills returns a new selection, _apply_refreshed_skills
+    # will try to initialize and fail
+    async def return_new_refreshed(step_description: str) -> RefreshedSkillsResult:
+        return RefreshedSkillsResult(
+            skills=(_build_skill("s_new"),),
+            context="## new context",
+            skill_ids=("s_new",),
+            scores=None,
+        )
 
-    # Simulate partial mutation: imagine initialize() wrote to some
-    # internal _activated_tool_names-style field, THEN raised
-    partial_mutation_log: list[str] = []
+    monkeypatch.setattr(
+        runner, "_compute_refreshed_skills", return_new_refreshed
+    )
 
-    async def fake_initialize(skills: list[Skill]) -> None:
-        partial_mutation_log.append("partial write before raise")
-        raise RuntimeError("partial mutation failure")
+    # Phase 1 catch converts the raise into a logged warning and sticky fallback
+    step_react, metadata = await runner._build_step_react_graph(
+        step_description="do something"
+    )
 
-    monkeypatch.setattr(runner, "_compute_refreshed_skills", fake_compute)
-    monkeypatch.setattr(runner, "_initialize_skill_tool_if_needed", fake_initialize)
-
-    step_react, metadata = await runner._build_step_react_graph("partial step")
-
-    # Partial mutation DID happen
-    assert partial_mutation_log == ["partial write before raise"]
-    # But all 4 runner bookkeeping fields are rolled back
-    _assert_state_matches_snapshot(runner, snapshot)
-    # StepMetadata is the LOWER BOUND — matches rolled-back state
-    assert metadata.bound_tool_names == snapshot["bound_tool_names"]
+    # 3 skill-related fields preserved (sticky).
+    # _last_bound_tool_names is allowed to advance because Phase 2 still ran
+    # successfully with the sticky skill selection (same behavior as
+    # scenarios 3 and 4).
+    assert runner._last_skill_context == snapshot["skill_context"]
+    assert runner._last_skill_ids == snapshot["skill_ids"]
+    assert runner._last_initialized_skill_ids == snapshot["initialized_skill_ids"]
+    # StepMetadata reflects sticky values for skill fields
     assert metadata.skill_context == snapshot["skill_context"]
     assert metadata.skill_ids == snapshot["skill_ids"]
 
 
-# ---- Scenario 8: lc_tools construction raises on partial SkillTool ------- #
-
-
-async def test_scenario_8_lc_tools_construction_failure_degrades(
+async def test_runner_recovers_after_skill_tool_initialize_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Phase 2 lc_tools construction raises → degrades to minimal path.
+    """Recovery: after a failed initialize sticky-falls-back once, the next
+    successful build_step_react_graph call must advance all 4 _last_* fields
+    cleanly (no residue from the failed attempt).
 
-    Should NOT propagate the exception. StepMetadata.bound_tool_names
-    equals the pre-call value. Actual lc_tools equals the minimal set.
+    Replaces scenario 9 (split-brain recovery), which was specific to the
+    now-deleted minimal-path state.
     """
     runner = _make_runner(monkeypatch)
-    snapshot = _seed_pre_call_state(runner)
+    initial_snapshot = _seed_pre_call_state(runner)
 
-    refreshed = RefreshedSkillsResult(
-        skills=(_build_skill("s_lc_fail"),),
-        context="## lc fail",
-        skill_ids=("s_lc_fail",),
-        scores=None,
-    )
+    # First call: SkillTool.initialize raises → sticky fallback
+    call_count = {"n": 0}
 
-    async def fake_compute(step_desc: str) -> RefreshedSkillsResult:
-        return refreshed
+    async def flaky_initialize(skills: list[Skill]) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("transient failure")
+        # Second call: succeed
 
-    monkeypatch.setattr(runner, "_compute_refreshed_skills", fake_compute)
-
-    # Phase 1 succeeds (apply commits). Phase 2 raises.
-    def raising_build_lc_tools() -> list[Any]:
-        raise RuntimeError("dynamic skill tool construction failed")
-
-    monkeypatch.setattr(runner, "_build_lc_tools_for_step", raising_build_lc_tools)
-
-    step_react, metadata = await runner._build_step_react_graph("lc-fail step")
-
-    # Phase 2 degradation: refresh_failed=True branch kicked in
-    # → stable_bound_tool_names == pre-call _last_bound_tool_names
-    assert metadata.bound_tool_names == snapshot["bound_tool_names"]
-    # But Phase 1 already committed the new skill_context/skill_ids
-    assert runner._last_skill_context == "## lc fail"
-    assert runner._last_skill_ids == ("s_lc_fail",)
-    # And _last_bound_tool_names stayed pinned to pre-call
-    assert runner._last_bound_tool_names == snapshot["bound_tool_names"]
-    # StepMetadata mirrors the atomic commit for skill fields
-    assert metadata.skill_context == "## lc fail"
-    assert metadata.skill_ids == ("s_lc_fail",)
-
-
-# ---- Scenario 9: Split-brain carry-over ---------------------------------- #
-
-
-async def test_scenario_9_split_brain_carries_over_cleanly(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """After a Scenario-8-style split-brain (skill_context advanced, but
-    bound_tool_names stayed pinned to pre-call), a SECOND follow-up call
-    with normal-path success must correctly advance ALL four fields to
-    the NEXT state — not resurrect the stale pinned bound_tool_names.
-
-    Guards against the failure mode where Phase 3's "refresh_failed
-    preserves pre-call bound_tool_names" logic inadvertently freezes
-    the field across calls.
-    """
-    runner = _make_runner(monkeypatch)
-    pre_snapshot = _seed_pre_call_state(runner)
-
-    # First call: scenario-8 split brain
-    refreshed_1 = RefreshedSkillsResult(
-        skills=(_build_skill("s_split"),),
-        context="## split ctx",
-        skill_ids=("s_split",),
-        scores=None,
-    )
-
-    async def compute_1(step_desc: str) -> RefreshedSkillsResult:
-        return refreshed_1
-
-    monkeypatch.setattr(runner, "_compute_refreshed_skills", compute_1)
-
-    def raise_lc_tools() -> list[Any]:
-        raise RuntimeError("phase 2 degrade")
-
-    monkeypatch.setattr(runner, "_build_lc_tools_for_step", raise_lc_tools)
-
-    _, meta1 = await runner._build_step_react_graph("first")
-    # After call 1: skill fields advanced, bound_tool_names stayed pinned
-    assert runner._last_skill_ids == ("s_split",)
-    assert runner._last_skill_context == "## split ctx"
-    assert runner._last_bound_tool_names == pre_snapshot["bound_tool_names"]
-    assert meta1.bound_tool_names == pre_snapshot["bound_tool_names"]
-
-    # Second call: normal path. Must advance ALL fields cleanly — no stale
-    # bound_tool_names carryover from the split-brain state.
-    refreshed_2 = RefreshedSkillsResult(
-        skills=(_build_skill("s_next"),),
-        context="## next ctx",
-        skill_ids=("s_next",),
-        scores=None,
-    )
-
-    async def compute_2(step_desc: str) -> RefreshedSkillsResult:
-        return refreshed_2
-
-    monkeypatch.setattr(runner, "_compute_refreshed_skills", compute_2)
-    # Restore the working _build_lc_tools_for_step stub (from _make_runner)
     monkeypatch.setattr(
-        runner,
-        "_build_lc_tools_for_step",
-        lambda: [
-            SimpleNamespace(name="shell_execute"),
-            SimpleNamespace(name="file_read"),
-        ],
+        runner._skill_tool, "initialize", flaky_initialize
     )
 
-    _, meta2 = await runner._build_step_react_graph("second")
-
-    # All fields match the NEW state, not the pre-snapshot AND not the
-    # split-brain state from call 1.
-    assert runner._last_skill_ids == ("s_next",)
-    assert runner._last_skill_context == "## next ctx"
-    assert runner._last_bound_tool_names == frozenset(
-        {"shell_execute", "file_read"}
+    refreshed_result = RefreshedSkillsResult(
+        skills=(_build_skill("s_recovered"),),
+        context="## recovered context",
+        skill_ids=("s_recovered",),
+        scores=None,
     )
-    assert meta2.skill_ids == ("s_next",)
-    assert meta2.skill_context == "## next ctx"
-    assert meta2.bound_tool_names == frozenset({"shell_execute", "file_read"})
+
+    async def return_refreshed(step_description: str) -> RefreshedSkillsResult:
+        return refreshed_result
+
+    monkeypatch.setattr(
+        runner, "_compute_refreshed_skills", return_refreshed
+    )
+
+    # First call: initialize fails, sticky fallback
+    await runner._build_step_react_graph(step_description="step 1")
+    # The 3 skill-related fields stay sticky (bound_tool_names may advance — see Task 9)
+    assert runner._last_skill_context == initial_snapshot["skill_context"]
+    assert runner._last_skill_ids == initial_snapshot["skill_ids"]
+    assert runner._last_initialized_skill_ids == initial_snapshot["initialized_skill_ids"]
+
+    # Second call: initialize succeeds, all 4 fields advance cleanly
+    _, metadata = await runner._build_step_react_graph(step_description="step 2")
+    assert runner._last_skill_ids == ("s_recovered",)
+    assert runner._last_skill_context == "## recovered context"
+    assert runner._last_initialized_skill_ids == ("s_recovered",)
+    assert metadata.skill_ids == ("s_recovered",)
+
+
+async def test_mcp_activation_survives_refresh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH 1 regression: a newly-activated MCP tool (activated during step N
+    via get_mcp_tool) must surface in step N+1's StepMetadata.bound_tool_names
+    even when step N+1's Phase 1 skill refresh fails.
+
+    Pre-#27 code pinned bound_tool_names to stale self._last_bound_tool_names
+    (snapshotted before step N started executing, i.e., before the MCP
+    activation), which hid the newly-activated MCP tool for one step. #27
+    removes that pin; this test locks in the new behavior.
+
+    See design doc §已知行为变化 for the full timeline analysis.
+    """
+    runner = _make_runner(monkeypatch)
+
+    class _FakeLCTool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    # Override the default _build_lc_tools_for_step stub so that it actually
+    # reflects _activated_mcp_tools (instead of the fixture's fixed native
+    # tool list). This is the minimum faithful model needed to exercise the
+    # behavior change.
+    def dynamic_build_lc_tools_for_step() -> list[Any]:
+        tools: list[Any] = [
+            _FakeLCTool("native_shell"),
+            _FakeLCTool("native_file_read"),
+        ]
+        for mcp_name in sorted(runner._activated_mcp_tools):
+            tools.append(_FakeLCTool(mcp_name))
+        return tools
+
+    monkeypatch.setattr(
+        runner, "_build_lc_tools_for_step", dynamic_build_lc_tools_for_step
+    )
+
+    # Seed: step N committed _last_bound_tool_names BEFORE "mcp_foo" was
+    # activated. Then step N's LLM called get_mcp_tool("mcp_foo") during
+    # execution, mutating _activated_mcp_tools. Now step N+1 is starting.
+    runner._last_bound_tool_names = frozenset(
+        {"native_shell", "native_file_read"}
+    )
+    runner._last_skill_ids = ("skill_a",)
+    runner._last_skill_context = "## skill_a context"
+    runner._last_initialized_skill_ids = ("skill_a",)
+    runner._activated_mcp_tools.add("mcp_foo")
+
+    # Step N+1: Phase 1 raises (e.g., embedding query transient timeout)
+    async def fail_refresh(*args: Any, **kwargs: Any) -> RefreshedSkillsResult:
+        raise RuntimeError("embedding query timeout")
+
+    monkeypatch.setattr(runner, "_compute_refreshed_skills", fail_refresh)
+
+    _, metadata = await runner._build_step_react_graph(
+        step_description="do something"
+    )
+
+    # StepMetadata advertises the activated MCP tool (refactored behavior)
+    assert "mcp_foo" in metadata.bound_tool_names
+    assert "native_shell" in metadata.bound_tool_names
+    # Sticky skills context preserved on refresh failure
+    assert metadata.skill_context == "## skill_a context"
+    assert metadata.skill_ids == ("skill_a",)
 
 
 # ---- Scenario 10: build_react_graph raises after Phase 1 commit --------- #
-
-
-async def test_lc_tools_degradation_writes_to_runner_telemetry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Post-audit MEDIUM #6 regression: the lc_tools degradation path
-    (Phase 2 fallback to _build_minimal_lc_tools_for_step) must record
-    a ``record_lc_tools_degradation`` event via the runner's own
-    ``_prompt_telemetry`` port. Pre-fix, the code read
-    ``self._flow._telemetry`` which was never wired, so the degradation
-    signal silently dropped."""
-    runner = _make_runner(monkeypatch)
-    _seed_pre_call_state(runner)
-
-    # Inject a recording telemetry port on the runner
-    class _Spy:
-        def __init__(self) -> None:
-            self.degradation_calls: list[str] = []
-
-        def record_assembly(self, **kwargs: Any) -> None:
-            pass
-
-        def record_llm_invocation(self, **kwargs: Any) -> None:
-            pass
-
-        def record_lc_tools_degradation(self, *, reason: str) -> None:
-            self.degradation_calls.append(reason)
-
-    spy = _Spy()
-    runner._prompt_telemetry = spy
-
-    # Stub _compute_refreshed_skills to return a clean result so Phase 1
-    # succeeds, then make Phase 2 fail to trigger the degradation path.
-    refreshed = RefreshedSkillsResult(
-        skills=(_build_skill("s_degrade"),),
-        context="## degrade",
-        skill_ids=("s_degrade",),
-        scores=None,
-    )
-
-    async def fake_compute(step_desc: str) -> RefreshedSkillsResult:
-        return refreshed
-
-    monkeypatch.setattr(runner, "_compute_refreshed_skills", fake_compute)
-
-    # Make the normal lc_tools path raise so the degraded path fires
-    def raising_build_lc_tools() -> list[Any]:
-        raise RuntimeError("simulated lc_tools build failure")
-
-    monkeypatch.setattr(runner, "_build_lc_tools_for_step", raising_build_lc_tools)
-
-    await runner._build_step_react_graph("degrade step")
-
-    # Degradation telemetry was recorded on the runner's port
-    assert spy.degradation_calls == ["lc_tools_build_failed"]
 
 
 async def test_scenario_10_build_react_graph_exception_rolls_back_all_fields(

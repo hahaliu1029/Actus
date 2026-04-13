@@ -50,8 +50,19 @@ def attach_telemetry(
     invocation from this adapter. Defaults to ``"zh"`` to match the
     pre-audit hardcode. B5 post-audit LOW #4 moved this from a buried
     hardcode in ``emit_invocation_telemetry`` to a caller-facing
-    parameter so downstream code can plumb real per-session language
-    through ``AgentTaskRunner`` when it becomes available (TODOS #32).
+    parameter; ``AgentTaskRunner.set_language`` re-invokes this helper
+    from ``main_graph.planner_node``'s ``language_callback`` on every
+    turn, so the per-session precision is actually **per-turn** and
+    already sufficient for the B5.5 bench use case.
+
+    **TODOS #32 deferred (2026-04-13 brainstorm)**: moving to a
+    per-message read via ``var_child_runnable_config.get()`` +
+    ``configurable["session_language"]`` was considered and deferred
+    as YAGNI. All three reference products (Claude Code / Hermes /
+    OpenClaw) don't track language as a telemetry dimension at all,
+    no observed bug exists, and the per-turn mechanism already covers
+    every edge case the refactor would fix. See TODOS.md #32 for
+    unblock conditions.
     """
     object.__setattr__(adapter, "_telemetry", telemetry)
     object.__setattr__(adapter, "_telemetry_lang", lang)

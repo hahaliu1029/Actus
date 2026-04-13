@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
@@ -57,6 +58,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# D5.1: combined (primary + fallback) threshold above which fallback-path
+# worst case may saturate ExecutionConfig.total_timeout_seconds (default 600s).
+# Derived as: total_timeout_seconds_default / graph_retry_count = 600 / 3 = 200.
+_FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS: float = 200.0
 
 # --- Config cache (D2) ---
 _config_cache: "AppConfig | None" = None
@@ -161,7 +167,14 @@ _llm_lock = threading.Lock()
 
 
 def _llm_fingerprint(llm_config: LLMConfig, supports_pdf_input: bool = False) -> str:
-    """Content-addressable key for LLM instances."""
+    """Content-addressable key for LLM instances.
+
+    D5.1 note: timeout_seconds is included so configs differing only in
+    timeout produce distinct cache entries. This is a selective hash — if
+    LLMConfig gains new fields in the future, they must also be added.
+    TODO(post-D5.1): consider switching to a model_dump-based fingerprint
+    to avoid per-field drift between LLMConfig and this function.
+    """
     parts = (
         str(llm_config.base_url),
         llm_config.api_key,
@@ -172,6 +185,8 @@ def _llm_fingerprint(llm_config: LLMConfig, supports_pdf_input: bool = False) ->
         str(getattr(llm_config, "supports_response_format", True)),
         str(getattr(llm_config, "supports_vision", True)),
         str(supports_pdf_input),
+        # D5.1: different timeouts must produce different cached instances.
+        str(llm_config.timeout_seconds),
     )
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
@@ -196,6 +211,8 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
 
         from app.infrastructure.external.llm.actus_fallback_chat_model import ActusFallbackChatModel
 
+        timeout_seconds = llm_config.timeout_seconds
+
         chat = ActusChatModel(
             base_url=str(llm_config.base_url),
             api_key=llm_config.api_key,
@@ -205,6 +222,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             supports_response_format=getattr(llm_config, 'supports_response_format', True),
             supports_vision=getattr(llm_config, 'supports_vision', True),
             supports_pdf_input=supports_pdf_input,
+            timeout_seconds=timeout_seconds,
         )
         responses = ActusResponsesModel(
             base_url=str(llm_config.base_url),
@@ -214,10 +232,28 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             max_tokens=llm_config.max_tokens,
             supports_vision=getattr(llm_config, 'supports_vision', True),
             supports_pdf_input=supports_pdf_input,
+            timeout_seconds=timeout_seconds,
         )
         if llm_config.api_type == "responses":
             llm = responses
         elif llm_config.api_type == "auto":
+            # D5.1 budget warning heuristic: if primary + fallback combined
+            # budget is large, fallback path worst case may approach or
+            # exceed D5 ExecutionWatchdog total_timeout_seconds. Log warning
+            # (non-hard) so operators see it during config load.
+            combined = timeout_seconds * 2
+            if combined > _FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS:
+                logger.warning(
+                    "[D5.1 budget warning] ActusFallbackChatModel with "
+                    "timeout_seconds=%.0fs may approach D5 ExecutionWatchdog "
+                    "total_timeout_seconds budget. Fallback worst case = "
+                    "%.0fs x 3 graph retries = %.0fs. Consider lowering "
+                    "timeout_seconds or raising "
+                    "ExecutionConfig.total_timeout_seconds.",
+                    timeout_seconds,
+                    combined,
+                    combined * 3,
+                )
             llm = ActusFallbackChatModel(primary=chat, fallback=responses)
         else:
             llm = chat
@@ -243,8 +279,20 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
 
     summary_llm = None
     if app_config.agent_config.memory.summary_model:
+        # D5.1: summary_timeout_seconds overrides the main LLM timeout for the
+        # summarizer path. None means "inherit main llm_config.timeout_seconds".
+        # The summarizer runs with no tools and short prompts, so it usually
+        # wants a tighter bound than the main agent.
+        summary_timeout_override = (
+            app_config.agent_config.memory.summary_timeout_seconds
+        )
+        summary_update: dict[str, Any] = {
+            "model_name": app_config.agent_config.memory.summary_model,
+        }
+        if summary_timeout_override is not None:
+            summary_update["timeout_seconds"] = summary_timeout_override
         summary_llm_config = app_config.llm_config.model_copy(
-            update={"model_name": app_config.agent_config.memory.summary_model}
+            update=summary_update
         )
         summary_llm = _build_llm(summary_llm_config)
 

@@ -177,3 +177,31 @@ class TestLLMCacheByFingerprint:
                 for c in configs:
                     _build_llm(c)
         assert len(_llm_cache) == 4  # maxsize=4, oldest evicted
+
+
+class TestLlmFingerprintTimeoutSeconds:
+    """D5.1: fingerprint must include timeout_seconds to isolate cache entries."""
+
+    def test_different_timeouts_produce_different_fingerprints(self) -> None:
+        from app.domain.models.app_config import LLMConfig
+        from app.interfaces.service_dependencies import _llm_fingerprint
+
+        cfg_a = LLMConfig(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            timeout_seconds=60.0,
+        )
+        cfg_b = LLMConfig(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            timeout_seconds=120.0,
+        )
+
+        fp_a = _llm_fingerprint(cfg_a)
+        fp_b = _llm_fingerprint(cfg_b)
+        assert fp_a != fp_b, (
+            "Cache fingerprint is identical for configs differing only in "
+            "timeout_seconds — different instances would be confused"
+        )

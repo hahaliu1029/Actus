@@ -36,9 +36,6 @@ class _FakeTelemetry:
     def record_llm_invocation(self, **kwargs: Any) -> None:  # pragma: no cover - unused
         pass
 
-    def record_lc_tools_degradation(self, *, reason: str) -> None:  # pragma: no cover
-        pass
-
 
 def _section(
     section_id: str,
@@ -307,9 +304,6 @@ def test_telemetry_failure_does_not_propagate() -> None:
             raise RuntimeError("telemetry exploded")
 
         def record_llm_invocation(self, **kwargs: Any) -> None:  # pragma: no cover
-            pass
-
-        def record_lc_tools_degradation(self, *, reason: str) -> None:  # pragma: no cover
             pass
 
     s = _section("identity", text="hi", priority=10)

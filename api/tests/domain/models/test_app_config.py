@@ -1,10 +1,13 @@
 import pytest
+from pydantic import ValidationError
+
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
     AppConfig,
     LLMConfig,
     MCPConfig,
+    MemoryConfig,
 )
 
 
@@ -128,3 +131,55 @@ def test_app_config_accepts_legacy_bool_skill_risk_mode() -> None:
     )
 
     assert config.skill_risk_policy.mode.value == "off"
+
+
+class TestLLMConfigTimeoutSeconds:
+    """D5.1: per-call LLM hard timeout field."""
+
+    def test_default_value_is_120(self) -> None:
+        cfg = LLMConfig()
+        assert cfg.timeout_seconds == 120.0
+
+    def test_explicit_value_accepted(self) -> None:
+        cfg = LLMConfig(timeout_seconds=45.0)
+        assert cfg.timeout_seconds == 45.0
+
+    def test_zero_accepted_as_escape_hatch(self) -> None:
+        cfg = LLMConfig(timeout_seconds=0.0)
+        assert cfg.timeout_seconds == 0.0
+
+    def test_max_3600_accepted(self) -> None:
+        cfg = LLMConfig(timeout_seconds=3600.0)
+        assert cfg.timeout_seconds == 3600.0
+
+    def test_negative_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            LLMConfig(timeout_seconds=-1.0)
+
+    def test_over_3600_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            LLMConfig(timeout_seconds=3601.0)
+
+
+class TestMemoryConfigSummaryTimeoutSeconds:
+    """D5.1: summarizer LLM hard timeout override."""
+
+    def test_default_value_is_30(self) -> None:
+        cfg = MemoryConfig()
+        assert cfg.summary_timeout_seconds == 30.0
+
+    def test_none_accepted_for_inherit_semantics(self) -> None:
+        cfg = MemoryConfig(summary_timeout_seconds=None)
+        assert cfg.summary_timeout_seconds is None
+
+    def test_zero_accepted(self) -> None:
+        cfg = MemoryConfig(summary_timeout_seconds=0.0)
+        assert cfg.summary_timeout_seconds == 0.0
+
+    def test_negative_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            MemoryConfig(summary_timeout_seconds=-1.0)
+
+    def test_over_3600_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            MemoryConfig(summary_timeout_seconds=3601.0)

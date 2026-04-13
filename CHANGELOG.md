@@ -28,6 +28,14 @@
 - `main_graph.py` 优化：支持中断节点、改进路由逻辑
 - `actus_chat_model.py` 增强：支持视觉模式、PDF 输入、消息清洗
 - 前端设置页扩展：新增文件理解配置面板
+- **[D5.1] LLM per-call hard timeout** (`TODOS.md #22`)：
+  1. `LLMConfig.timeout_seconds` default 120s and `MemoryConfig.summary_timeout_seconds` default 30s are added as assumption-based defaults. No production wall-time data supports these values; they are expected to be re-evaluated after wall-time sampling (see TODOS #24 B5.5 bench). Existing `config.yaml` without the new fields will inherit the Pydantic defaults.
+  2. `ActusFallbackChatModel` (when `api_type=auto`) behavior changes: each child adapter now enforces its own hard timeout. Worst case fallback path wall-time is now bounded (~240s at the default 120/120 budget) where previously it was unbounded.
+  3. Escape hatch: `timeout_seconds: 0` disables the per-call `asyncio.wait_for` wrap for debugging. This reverts to the pre-D5.1 behavior but **still** disables SDK retries (see point 5).
+  4. `AsyncOpenAI` client construction now passes `max_retries=0`, disabling SDK-level retry. LangGraph `RetryPolicy(max_attempts=3)` at `react_graph.llm_node` and `main_graph.planner_node` is now the single retry authority. This prevents a worst case of `3 (graph) × 3 (SDK) = 9` HTTP attempts per logical call.
+  5. `service_dependencies._build_llm` logs a budget warning when `api_type=auto` and `primary + fallback > 200s`（derived as `ExecutionWatchdog.total_timeout_seconds / 3 graph retries = 600 / 3 = 200`，即 `primary + fallback > 200s`）. Warning only — no hard raise. Extracted as the module-level constant `_FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS`.
+  6. All three LLM adapters (`ActusChatModel` / `ActusResponsesModel` / `ActusFallbackChatModel`) and their `bind_tools` / `with_structured_output` clone paths now propagate `timeout_seconds` to the cloned instance. Without this, `react_graph.py:180` and `planner_react.py:501-503` would silently drop user-configured timeouts.
+  7. Shared helper: `api/app/infrastructure/external/llm/_timeout_helpers.py` with a free function `with_llm_timeout(adapter, coro)` — mirrors the existing `_telemetry_mixin.py` idiom.
 
 ### 修复
 

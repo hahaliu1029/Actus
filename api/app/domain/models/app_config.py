@@ -18,6 +18,20 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(
         8192, ge=0
     )  # 最大输出token数，默认设置为deepseek-chat模型的最大输出限制
+    timeout_seconds: float = Field(
+        120.0,
+        ge=0,
+        le=3600,
+        description=(
+            "Per-call LLM hard timeout in seconds. Default 120s is an "
+            "assumption — no production wall-time data backs it; adjust "
+            "after wall-time sampling (see TODOS #24 B5.5 bench). "
+            "0 disables the per-call wrap (use sparingly for debugging). "
+            "Wrapped by asyncio.wait_for in each adapter's _agenerate/"
+            "_astream; TimeoutError is converted to ServerRequestsError "
+            "so LangGraph RetryPolicy handles retries."
+        ),
+    )
     context_window: int | None = Field(
         default=None, ge=1024
     )  # 上下文窗口大小，空表示根据模型映射自动推断
@@ -140,6 +154,17 @@ class MemoryConfig(BaseModel):
 
     summary_enabled: bool = True
     summary_model: Optional[str] = None
+    summary_timeout_seconds: float | None = Field(
+        default=30.0,
+        ge=0,
+        le=3600,
+        description=(
+            "Per-call timeout for the summarizer LLM. If None, inherits "
+            "llm_config.timeout_seconds. Default 30s is an assumption — "
+            "summarizer has no tools and short prompts, so calls are "
+            "expected to finish within 15s; 30s leaves 2x buffer."
+        ),
+    )
     summary_max_rounds: int = Field(5, ge=1, le=20)
     summary_token_budget: int = Field(2000, ge=200, le=10000)
     summary_min_steps: int = Field(1, ge=1, le=10)

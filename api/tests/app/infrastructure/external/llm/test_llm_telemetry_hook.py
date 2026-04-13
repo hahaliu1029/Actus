@@ -34,16 +34,12 @@ class _RecordingTelemetry:
     def __init__(self) -> None:
         self.assembly_calls: list[dict] = []
         self.llm_calls: list[dict] = []
-        self.degradation_calls: list[dict] = []
 
     def record_assembly(self, **kwargs: Any) -> None:
         self.assembly_calls.append(kwargs)
 
     def record_llm_invocation(self, **kwargs: Any) -> None:
         self.llm_calls.append(kwargs)
-
-    def record_lc_tools_degradation(self, **kwargs: Any) -> None:
-        self.degradation_calls.append(kwargs)
 
 
 class _RaisingTelemetry:
@@ -53,9 +49,6 @@ class _RaisingTelemetry:
         raise RuntimeError("simulated telemetry failure")
 
     def record_assembly(self, **kwargs: Any) -> None:
-        raise RuntimeError("simulated telemetry failure")
-
-    def record_lc_tools_degradation(self, **kwargs: Any) -> None:
         raise RuntimeError("simulated telemetry failure")
 
 

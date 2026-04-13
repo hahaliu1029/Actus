@@ -1447,40 +1447,22 @@ class AgentTaskRunner(TaskRunner):
     async def _apply_refreshed_skills(
         self, result: "RefreshedSkillsResult"
     ) -> None:
-        """Atomic mutation point for the refreshed skill selection.
+        """Atomic mutation point for the refreshed skill selection (#27).
 
-        Applies ``RefreshedSkillsResult`` to three persistent fields in
-        one go:
-        - ``self._last_initialized_skill_ids`` (via ``_initialize_skill_tool_if_needed``)
-        - ``self._last_skill_context``
-        - ``self._last_skill_ids``
+        Atomicity is guaranteed by assignment order: the two ``_last_*`` writes
+        happen AFTER ``_initialize_skill_tool_if_needed`` returns successfully.
+        If initialize raises, those two assignments are skipped, and
+        ``_last_initialized_skill_ids`` is similarly guarded inside
+        ``_initialize_skill_tool_if_needed`` (its own assignment is after the
+        await). Since #27 makes ``SkillTool.initialize()`` atomic, the internal
+        rollback layer that was here under B5 is no longer needed.
 
-        If ``_initialize_skill_tool_if_needed`` raises, rollback restores
-        all three fields to their pre-call snapshot. ``SkillTool`` itself
-        may be left in a partially-initialized state — that is the known
-        limitation documented in the B5 design doc (out-of-scope for B5).
+        See design: docs/superpowers/specs/2026-04-13-skill-tool-initialize-atomicity-design.md
         """
-        snapshot_initialized_ids = self._last_initialized_skill_ids
-        snapshot_last_ctx = self._last_skill_context
-        snapshot_last_ids = self._last_skill_ids
-
-        try:
-            if result.skills:
-                await self._initialize_skill_tool_if_needed(list(result.skills))
-            # Atomic commit: only reaches here if initialize succeeded or was
-            # a no-op (skill_ids unchanged). Both halves of the commit must
-            # succeed together so callers see a consistent view.
-            self._last_skill_context = result.context
-            self._last_skill_ids = result.skill_ids
-        except Exception:
-            # Rollback: initialize may have partially updated
-            # self._last_initialized_skill_ids before raising (the current
-            # implementation assigns after the await, so it is safe — but
-            # we restore defensively in case that ordering changes).
-            self._last_initialized_skill_ids = snapshot_initialized_ids
-            self._last_skill_context = snapshot_last_ctx
-            self._last_skill_ids = snapshot_last_ids
-            raise
+        if result.skills:
+            await self._initialize_skill_tool_if_needed(list(result.skills))
+        self._last_skill_context = result.context
+        self._last_skill_ids = result.skill_ids
 
     def _get_always_bind_tool_names(self) -> set[str]:
         """从 MCPConfig 提取所有 always_bind 工具名，组装完整前缀名。"""
@@ -1495,38 +1477,15 @@ class AgentTaskRunner(TaskRunner):
                 names.add(f"{prefix}_{tool_short_name}")
         return names
 
-    # B5 C5a: category sets for the shared _build_lc_tools_from_categories helper.
-    # _ALL_CATEGORIES is the normal path (every tool source bound).
-    # _MINIMAL_CATEGORIES is the degraded path used when _skill_tool is in a
-    # partial-mutation state and dynamic skill tool construction would raise.
-    _ALL_CATEGORIES: frozenset[str] = frozenset(
-        {
-            "native",
-            "mcp_auto",
-            "a2a",
-            "skill_static",
-            "dynamic_skill",
-            "skill_guide",
-            "memory",
-        }
-    )
-    _MINIMAL_CATEGORIES: frozenset[str] = frozenset(
-        {
-            "native",
-            "mcp_always_bind",
-            "skill_guide",
-        }
-    )
+    def _build_lc_tools_full(self) -> list[Any]:
+        """Build the full lc_tools set for a step.
 
-    def _build_lc_tools_from_categories(
-        self, categories: frozenset[str]
-    ) -> list[Any]:
-        """Shared lc_tools factory used by both normal and minimal paths.
-
-        Normal path: ``categories = _ALL_CATEGORIES``.
-        Degraded path: ``categories = _MINIMAL_CATEGORIES`` — skips anything
-        that reads ``self._skill_tool`` (which may be in a partially-
-        initialized state after ``_initialize_skill_tool_if_needed`` raised).
+        Post-#27: all tool sources (native / mcp_auto / a2a / skill_static /
+        dynamic_skill / skill_guide / memory) are always included. The
+        category-selection mechanism (``_ALL_CATEGORIES`` / ``_MINIMAL_CATEGORIES``)
+        was retired alongside the B5 graceful degradation path once
+        ``SkillTool.initialize()`` became atomic. See design:
+        docs/superpowers/specs/2026-04-13-skill-tool-initialize-atomicity-design.md
         """
         from app.domain.services.tools.langchain_tools import create_native_tools
         from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
@@ -1541,121 +1500,96 @@ class AgentTaskRunner(TaskRunner):
 
         lc_tools: list[Any] = []
 
-        if "native" in categories:
+        lc_tools.extend(
+            create_native_tools(
+                sandbox=self._sandbox,
+                browser=self._browser,
+                search_engine=self._search_engine,
+                processor_lookup=self._file_processor_lookup,
+                supports_vision=self._supports_vision,
+                supports_pdf_input=self._supports_pdf_input,
+            )
+        )
+
+        # MCP: progressive auto-bind with discovery tools above the threshold.
+        MCP_AUTO_BIND_THRESHOLD = 15
+        all_mcp_tools = self._mcp_tool.get_tools()
+        _url_map_ref = lambda: self._image_url_map
+        _sandbox_uploader = self._upload_sandbox_file_for_mcp
+        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
             lc_tools.extend(
-                create_native_tools(
-                    sandbox=self._sandbox,
-                    browser=self._browser,
-                    search_engine=self._search_engine,
-                    processor_lookup=self._file_processor_lookup,
-                    supports_vision=self._supports_vision,
-                    supports_pdf_input=self._supports_pdf_input,
+                create_mcp_langchain_tools(
+                    self._mcp_tool,
+                    tool_names=None,
+                    url_map_ref=_url_map_ref,
+                    sandbox_file_uploader=_sandbox_uploader,
                 )
             )
-
-        # MCP: two sub-modes. "mcp_auto" = progressive auto-bind threshold
-        # logic identical to pre-refactor behavior. "mcp_always_bind" = the
-        # degraded subset (only always-bind names, no discovery tools).
-        if "mcp_auto" in categories:
-            MCP_AUTO_BIND_THRESHOLD = 15
-            all_mcp_tools = self._mcp_tool.get_tools()
-            _url_map_ref = lambda: self._image_url_map
-            _sandbox_uploader = self._upload_sandbox_file_for_mcp
-            if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
-                lc_tools.extend(
-                    create_mcp_langchain_tools(
-                        self._mcp_tool,
-                        tool_names=None,
-                        url_map_ref=_url_map_ref,
-                        sandbox_file_uploader=_sandbox_uploader,
-                    )
-                )
-            else:
-                mcp_bind_names = (
-                    self._get_always_bind_tool_names() | self._activated_mcp_tools
-                )
-                lc_tools.extend(
-                    create_mcp_langchain_tools(
-                        self._mcp_tool,
-                        tool_names=mcp_bind_names,
-                        url_map_ref=_url_map_ref,
-                        sandbox_file_uploader=_sandbox_uploader,
-                    )
-                )
-                from app.domain.services.tools.langchain_mcp_discovery import (
-                    create_mcp_discovery_tools,
-                )
-                lc_tools.extend(
-                    create_mcp_discovery_tools(
-                        mcp_tool_ref=lambda: self._mcp_tool,
-                        activated_tools_ref=lambda: self._activated_mcp_tools,
-                    )
-                )
-        elif "mcp_always_bind" in categories:
-            # Degraded: only always-bind MCP tools, no activated set, no discovery.
-            _url_map_ref = lambda: self._image_url_map
-            _sandbox_uploader = self._upload_sandbox_file_for_mcp
-            always_bind = self._get_always_bind_tool_names()
-            if always_bind:
-                lc_tools.extend(
-                    create_mcp_langchain_tools(
-                        self._mcp_tool,
-                        tool_names=always_bind,
-                        url_map_ref=_url_map_ref,
-                        sandbox_file_uploader=_sandbox_uploader,
-                    )
-                )
-
-        if "a2a" in categories:
-            lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
-
-        if "skill_static" in categories:
+        else:
+            mcp_bind_names = (
+                self._get_always_bind_tool_names() | self._activated_mcp_tools
+            )
             lc_tools.extend(
-                create_skill_langchain_tools(
-                    brainstorm_skill_tool=self._brainstorm_skill_tool,
-                    create_skill_tool=self._create_skill_tool,
+                create_mcp_langchain_tools(
+                    self._mcp_tool,
+                    tool_names=mcp_bind_names,
+                    url_map_ref=_url_map_ref,
+                    sandbox_file_uploader=_sandbox_uploader,
                 )
             )
-
-        if "dynamic_skill" in categories:
-            # Only reads self._skill_tool — skipped by the minimal path so
-            # a partially-initialized SkillTool can't poison lc_tools.
+            from app.domain.services.tools.langchain_mcp_discovery import (
+                create_mcp_discovery_tools,
+            )
             lc_tools.extend(
-                create_dynamic_skill_langchain_tools(self._skill_tool)
-            )
-
-        if "skill_guide" in categories:
-            lc_tools.append(
-                create_skill_guide_tool(
-                    skill_pool_ref=lambda: self._session_skill_pool,
-                    file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
-                    sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
+                create_mcp_discovery_tools(
+                    mcp_tool_ref=lambda: self._mcp_tool,
+                    activated_tools_ref=lambda: self._activated_mcp_tools,
                 )
             )
 
-        if "memory" in categories:
-            if self._memory_session_factory and self._memory_repo_factory:
-                from app.domain.services.tools.memory_tools import create_memory_tools
-                memory_config = self._flow._memory_config
-                lc_tools.extend(
-                    create_memory_tools(
-                        embedding_provider=self._memory_embedding_provider,
-                        session_factory=self._memory_session_factory,
-                        repo_factory=self._memory_repo_factory,
-                        user_id=self._user_id,
-                        half_life_days=memory_config.half_life_days,
-                        mmr_lambda=memory_config.mmr_lambda,
-                    )
+        lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
+
+        lc_tools.extend(
+            create_skill_langchain_tools(
+                brainstorm_skill_tool=self._brainstorm_skill_tool,
+                create_skill_tool=self._create_skill_tool,
+            )
+        )
+
+        lc_tools.extend(
+            create_dynamic_skill_langchain_tools(self._skill_tool)
+        )
+
+        lc_tools.append(
+            create_skill_guide_tool(
+                skill_pool_ref=lambda: self._session_skill_pool,
+                file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
+                sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
+            )
+        )
+
+        if self._memory_session_factory and self._memory_repo_factory:
+            from app.domain.services.tools.memory_tools import create_memory_tools
+            memory_config = self._flow._memory_config
+            lc_tools.extend(
+                create_memory_tools(
+                    embedding_provider=self._memory_embedding_provider,
+                    session_factory=self._memory_session_factory,
+                    repo_factory=self._memory_repo_factory,
+                    user_id=self._user_id,
+                    half_life_days=memory_config.half_life_days,
+                    mmr_lambda=memory_config.mmr_lambda,
                 )
+            )
 
         return lc_tools
 
     def _build_lc_tools_for_step(self) -> list[Any]:
         """Normal-path lc_tools construction with per-step cache.
 
-        Cache key is ``(mode, skill_ids, activated_mcp_tools)``. These are
+        Cache key is ``(skill_ids, activated_mcp_tools)``. These are
         the fields that change BETWEEN STEPS within a single user message.
-        ``_build_lc_tools_from_categories`` also reads several instance
+        ``_build_lc_tools_full`` also reads several instance
         attributes that are stable WITHIN a session but could vary across
         sessions or messages — namely ``self._skill_tool`` internal state,
         ``self._memory_session_factory`` / ``_memory_repo_factory``,
@@ -1669,30 +1603,13 @@ class AgentTaskRunner(TaskRunner):
         because the implicit dependencies listed above are session-stable.
         """
         cache_key = (
-            "FULL",
             self._last_skill_ids,
             frozenset(self._activated_mcp_tools),
         )
         cached = self._lc_tools_cache.get(cache_key)
         if cached is not None:
             return cached
-        tools = self._build_lc_tools_from_categories(self._ALL_CATEGORIES)
-        self._lc_tools_cache[cache_key] = tools
-        return tools
-
-    def _build_minimal_lc_tools_for_step(self) -> list[Any]:
-        """Degraded-path lc_tools: native + always-bind MCP + skill_guide only.
-
-        Used when normal-path construction raises (e.g., because
-        ``_skill_tool`` is in a half-initialized state). This keeps the
-        step alive with a minimal viable tool set rather than aborting
-        the whole session.
-        """
-        cache_key = ("MINIMAL", (), frozenset())
-        cached = self._lc_tools_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        tools = self._build_lc_tools_from_categories(self._MINIMAL_CATEGORIES)
+        tools = self._build_lc_tools_full()
         self._lc_tools_cache[cache_key] = tools
         return tools
 
@@ -1721,9 +1638,8 @@ class AgentTaskRunner(TaskRunner):
         1. **Refresh skills** — ``_compute_refreshed_skills`` + atomic
            ``_apply_refreshed_skills``. On exception: rollback + caller
            observes the exception.
-        2. **Build lc_tools** — normal path with cache. Falls back to
-           ``_build_minimal_lc_tools_for_step`` on exception (graceful
-           degradation, no rollback needed for this recoverable path).
+        2. **Build lc_tools** — factory errors propagate to the outer
+           whole-function rollback (per #27, no graceful degradation).
         3. **Build react_graph** — if this raises, the whole function's
            snapshot/restore restores all 4 fields and re-raises.
         """
@@ -1744,7 +1660,6 @@ class AgentTaskRunner(TaskRunner):
             # ``_initialize_skill_tool_if_needed`` failures and re-raises;
             # we catch here to mark the step as degraded and keep going
             # with the sticky previous selection rather than aborting.
-            refresh_failed = False
             if step_description:
                 try:
                     refreshed = await self._compute_refreshed_skills(step_description)
@@ -1755,51 +1670,28 @@ class AgentTaskRunner(TaskRunner):
                     logger.warning(
                         "[ProgressiveSkillLoad] 刷新失败，继续使用上次选择: %s", exc
                     )
-                    refresh_failed = True
                     # self._last_* already rolled back by _apply_refreshed_skills
 
-            # Phase 2: build lc_tools with degraded-path fallback
-            try:
-                lc_tools = self._build_lc_tools_for_step()
-                fresh_bound_tool_names = frozenset(t.name for t in lc_tools)
-            except Exception as exc:
-                logger.error(
-                    "[ProgressiveSkillLoad] lc_tools 构造失败，降级到最小工具集: %s", exc
-                )
-                lc_tools = self._build_minimal_lc_tools_for_step()
-                fresh_bound_tool_names = frozenset(t.name for t in lc_tools)
-                refresh_failed = True
-                # Audit MEDIUM #6 fix: degradation telemetry reads the runner's
-                # own port, not self._flow._telemetry (which was never wired).
-                telemetry = getattr(self, "_prompt_telemetry", None)
-                if telemetry is not None:
-                    try:
-                        telemetry.record_lc_tools_degradation(
-                            reason="lc_tools_build_failed"
-                        )
-                    except Exception:
-                        pass  # telemetry never propagates
+            # Phase 2: build lc_tools (factory errors propagate to outer
+            # whole-function rollback, per #27).
+            lc_tools = self._build_lc_tools_for_step()
+            fresh_bound_tool_names = frozenset(t.name for t in lc_tools)
 
-            # Decide the StepMetadata.bound_tool_names value. If refresh
-            # failed, advertise the pre-call set (lower bound); otherwise
-            # advance to the fresh set. The actual commit to
-            # self._last_bound_tool_names happens AFTER build_react_graph
-            # succeeds so the rollback path covers it too.
-            if refresh_failed:
-                stable_bound_tool_names = self._last_bound_tool_names
-            else:
-                stable_bound_tool_names = fresh_bound_tool_names
+            # StepMetadata.bound_tool_names always advances to the fresh
+            # set. The actual commit to self._last_bound_tool_names happens
+            # AFTER build_react_graph succeeds so the rollback path covers
+            # it too.
+            stable_bound_tool_names = fresh_bound_tool_names
 
             dynamic_tool_names = [
                 t.name for t in lc_tools if t.name.startswith("skill_")
             ]
             logger.info(
-                "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s, refresh_failed=%s",
+                "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
                 step_description[:80] if step_description else "(无步骤描述)",
                 len(dynamic_tool_names),
                 dynamic_tool_names,
                 bool(self._session_skill_pool),
-                refresh_failed,
             )
 
             # Phase 3: build the react_graph. If this raises, the outer
@@ -1819,8 +1711,7 @@ class AgentTaskRunner(TaskRunner):
             # Post-build atomic commit: only now do we advance
             # _last_bound_tool_names. All 4 fields are now consistent with
             # a successful step build.
-            if not refresh_failed:
-                self._last_bound_tool_names = fresh_bound_tool_names
+            self._last_bound_tool_names = fresh_bound_tool_names
 
             metadata = StepMetadata(
                 bound_tool_names=stable_bound_tool_names,

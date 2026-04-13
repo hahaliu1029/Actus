@@ -35,6 +35,9 @@ from langchain_core.messages import (
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from openai import AsyncOpenAI
 
+from app.application.errors.exceptions import ServerRequestsError
+from app.infrastructure.external.llm._timeout_helpers import with_llm_timeout
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +51,10 @@ class ActusChatModel(BaseChatModel):
         temperature: Sampling temperature.
         max_tokens: Maximum tokens to generate.
         supports_response_format: Whether the model supports response_format param.
+        timeout_seconds: per-call hard timeout in seconds (D5.1). Default 120.
+            0 disables the wrap. Wraps LLM client calls in asyncio.wait_for
+            and translates timeouts to ServerRequestsError for LangGraph
+            RetryPolicy.
     """
 
     # ---- Pydantic config fields ------------------------------------------ #
@@ -64,6 +71,9 @@ class ActusChatModel(BaseChatModel):
     # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
     # introduce real Anthropic routing via LLMConfig.provider field.
     provider_name: Literal["openai", "anthropic"] = "openai"
+    # D5.1: per-call hard timeout (seconds). 0 disables the wait_for wrap.
+    # See docs/superpowers/specs/2026-04-13-per-operation-llm-timeout-design.md
+    timeout_seconds: float = 120.0
 
     # Tools bound via bind_tools() — None means no tools bound
     _bound_tools: Optional[list[dict[str, Any]]] = None
@@ -102,10 +112,16 @@ class ActusChatModel(BaseChatModel):
     # ---- Client factory -------------------------------------------------- #
 
     def _get_client(self) -> AsyncOpenAI:
-        """Create AsyncOpenAI client. Extracted as method for testability."""
+        """Create AsyncOpenAI client. Extracted as method for testability.
+
+        D5.1: ``max_retries=0`` disables SDK-level retry so the LangGraph
+        ``RetryPolicy(max_attempts=3)`` at ``react_graph.llm_node`` and
+        ``main_graph.planner_node`` is the single retry authority.
+        """
         return AsyncOpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
+            max_retries=0,
         )
 
     # ---- Message conversion (private) ------------------------------------ #
@@ -492,14 +508,14 @@ class ActusChatModel(BaseChatModel):
             self.model_name, len(all_tools), tool_choice, multimodal_count,
         )
 
-        response = await client.chat.completions.create(**params)
+        response = await with_llm_timeout(
+            self, client.chat.completions.create(**params)
+        )
 
         # Validate response — some OpenAI-compatible proxies may return raw
         # strings (e.g. error text with 200 status).  Raise ServerRequestsError
         # so LangGraph's RetryPolicy can retry the call automatically.
         if not hasattr(response, "choices") or not response.choices:
-            from app.application.errors.exceptions import ServerRequestsError
-
             raw = str(response)[:200]
             raise ServerRequestsError(
                 f"LLM ({self.model_name}) returned unexpected response "
@@ -520,8 +536,6 @@ class ActusChatModel(BaseChatModel):
         # almost always a provider-side error (e.g. 404 wrapped in 200).
         # Raise ServerRequestsError so RetryPolicy / fallback can act on it.
         if not content and not tool_calls:
-            from app.application.errors.exceptions import ServerRequestsError
-
             raise ServerRequestsError(
                 f"LLM ({self.model_name}) returned empty response "
                 f"(no content, no tool_calls)"
@@ -592,13 +606,35 @@ class ActusChatModel(BaseChatModel):
             self.model_name, multimodal_count,
         )
 
-        response = client.chat.completions.create(**params)
-        # AsyncOpenAI with stream=True returns an awaitable that resolves to
-        # an async iterator. Some mocks may return an async generator directly.
-        if hasattr(response, "__aiter__"):
-            stream = response
-        else:
-            stream = await response
+        # D5.1: Bound the "obtain stream object" step with a hard timeout.
+        # Because AsyncOpenAI's stream=True call returns an awaitable that
+        # resolves to an async iterator, but some mocks return the iterator
+        # directly, we encapsulate both branches in an inner async helper.
+        # wait_for bounds the helper's coroutine as a whole.
+        #
+        # Asymmetry to note:
+        # - ``await response`` branch (real AsyncOpenAI): wait_for bounds the
+        #   HTTP connection setup network I/O — this is the actual protection.
+        # - ``__aiter__`` branch (direct async generator, typically mocks):
+        #   _obtain_stream() returns instantly, so wait_for wraps a near-no-op
+        #   await. This branch is not usefully bounded by the timeout — it
+        #   exists purely to keep mocks working and to keep the code symmetric.
+        #
+        # Chunk iteration below is intentionally unwrapped because legitimate
+        # long streams run for minutes; mid-stream stalls are handled by D5
+        # ExecutionWatchdog idle_timeout_seconds at the graph level.
+        #
+        # NOTE: if a second streaming adapter is added in the future (e.g. a
+        # real Responses API streaming path), extract this helper to
+        # _timeout_helpers.py as a free function taking the ``client`` and
+        # ``params`` captured by the closure.
+        async def _obtain_stream():
+            response = client.chat.completions.create(**params)
+            if hasattr(response, "__aiter__"):
+                return response
+            return await response
+
+        stream = await with_llm_timeout(self, _obtain_stream())
 
         has_content = False
         async for chunk in stream:
@@ -639,8 +675,6 @@ class ActusChatModel(BaseChatModel):
 
         # Validate: stream produced zero useful chunks (same 404-in-200 scenario)
         if not has_content:
-            from app.application.errors.exceptions import ServerRequestsError
-
             raise ServerRequestsError(
                 f"LLM ({self.model_name}) stream returned empty response "
                 f"(no content, no tool_calls in any chunk)"
@@ -673,6 +707,7 @@ class ActusChatModel(BaseChatModel):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            timeout_seconds=self.timeout_seconds,  # D5.1: must propagate
             supports_response_format=self.supports_response_format,
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,

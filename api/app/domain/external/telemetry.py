@@ -5,10 +5,12 @@ B5 C1: defines ``PromptTelemetryPort`` Protocol consumed by ``PromptAssembler``
 
 The port keeps file I/O out of the domain layer (Clean Architecture).
 
-Known design debt (B5 eng review): the port currently has 4 methods. If a
-second consumer is added (Datadog adapter etc.), the port should be split
-into ``AssemblyTelemetryPort`` / ``InvocationTelemetryPort`` /
-``DegradationTelemetryPort`` per ISP. See TODOS.md #28.
+Deferred design debt (B5 eng review, TODOS.md #28): the port currently has
+2 methods (``record_assembly`` / ``record_llm_invocation``). If a second
+consumer is added (Datadog / Langfuse / OTel adapter etc.), the port should
+be split into ``AssemblyTelemetryPort`` / ``InvocationTelemetryPort`` per
+ISP. **Blocked on**: a concrete second consumer being in flight. Do not
+split preemptively — YAGNI.
 """
 from __future__ import annotations
 
@@ -57,15 +59,5 @@ class PromptTelemetryPort(Protocol):
 
         Used by B5.5 follow-up to compute hit-rate ceilings before deciding
         whether to enable Anthropic prompt caching.
-        """
-        ...
-
-    def record_lc_tools_degradation(
-        self,
-        *,
-        reason: str,
-    ) -> None:
-        """Called by ``_build_step_react_graph`` when it falls back to
-        ``_build_minimal_lc_tools_for_step`` due to skill tool init failure.
         """
         ...

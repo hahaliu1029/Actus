@@ -12,6 +12,7 @@ llm_config:
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
   # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
   # supports_pdf_input: false             # 是否支持原生 PDF 文件输入（需要模型支持，如 gpt-4o）
+  # timeout_seconds: 120.0                # D5.1: 单次 LLM 调用硬超时（秒）。0 表示关闭 wait_for 包装（仅调试用）；其它值会被 adapter 的 _agenerate/_astream 包成 asyncio.wait_for，超时抛 ServerRequestsError 让 LangGraph RetryPolicy 接管重试。生产默认 120s 是经验值，未经 wall-time 抽样验证。
   # context_overflow_guard_enabled: false  # 开启上下文超限治理
   # token_estimator: hybrid               # token 估算策略: char(最快) / hybrid(推荐) / provider_api(需安装 tiktoken)
   # token_safety_factor: 1.15             # token 估算安全系数
@@ -27,6 +28,7 @@ llm_config:
 #   model_name: gpt-5.4
 #   temperature: 0.7
 #   max_tokens: 8192
+#   timeout_seconds: 120.0                # D5.1: 单次 LLM 调用硬超时（秒）。api_type=auto 时注意 primary+fallback 总预算 > 200s 会触发 budget warning（600s watchdog / 3 graph retries）
 #   api_type: auto
 #   supports_response_format: true
 
@@ -37,6 +39,7 @@ llm_config:
 #   model_name: gpt-5.4-pro
 #   temperature: 0.7
 #   max_tokens: 8192
+#   timeout_seconds: 120.0                # D5.1: 单次 LLM 调用硬超时（秒）
 #   api_type: responses
 #   supports_response_format: true
 
@@ -83,6 +86,8 @@ agent_config:
       - "^(ok|okay)([,\\s]+(go on|continue))?$"
   memory:
     summary_enabled: true
+    # summary_model: ""                   # 可选：覆盖 summarizer 的模型名。留空则复用 llm_config.model_name。
+    # summary_timeout_seconds: 30.0       # D5.1: summarizer 单次调用硬超时（秒）。三态语义：（1）注释掉/省略本字段 → 使用模型默认值 30s（**不自动继承** llm_config.timeout_seconds）；（2）显式写数值（如 5.0）→ 覆盖；（3）显式写 null → 继承 llm_config.timeout_seconds。summarizer 无工具、prompt 短，通常比主 Agent 更短；默认 30s 是经验值（15s 预期完成 + 2x 缓冲）。
     summary_max_rounds: 5
     summary_token_budget: 2000
     summary_min_steps: 1

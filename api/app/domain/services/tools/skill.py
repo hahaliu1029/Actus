@@ -65,13 +65,23 @@ class SkillTool(BaseTool):
             self._skill_sandbox_bundle_root = "/home/ubuntu/workspace/.skills"
 
     async def initialize(self, skills: list[Skill]) -> None:
-        """初始化可用 Skill 列表并生成工具声明"""
-        self._skills = [skill for skill in skills if skill.enabled]
-        self._tools = []
-        self._tool_bindings = {}
-        self._tool_name_index = {}
+        """初始化可用 Skill 列表并生成工具声明
 
-        for skill in self._skills:
+        原子性契约（#27）：构造失败时，self._skills / _tools / _tool_bindings /
+        _tool_name_index / _tools_cache 五个字段保持调用前的值不变。实现方式
+        是"local 变量累积 + 末尾批量赋值"——循环中途 raise 则 local 变量随
+        栈丢弃，self._* 从未被触碰。
+
+        注意：本方法 body 内无 `await`，因此构成同 event loop 上不可被其它
+        协程抢占的临界区。末尾五行赋值整体对 reader 原子可见。详见 design doc
+        docs/superpowers/specs/2026-04-13-skill-tool-initialize-atomicity-design.md
+        """
+        new_skills = [skill for skill in skills if skill.enabled]
+        new_tools: list[dict[str, Any]] = []
+        new_tool_bindings: dict[str, dict[str, Any]] = {}
+        new_tool_name_index: dict[str, int] = {}
+
+        for skill in new_skills:
             runtime_type = skill.runtime_type
             manifest_tools = (skill.manifest or {}).get("tools", [])
             if not isinstance(manifest_tools, list):
@@ -88,7 +98,9 @@ class SkillTool(BaseTool):
                 if not self._is_model_invocable(skill, manifest_tool):
                     continue
 
-                function_name = self._build_function_name(skill.slug, raw_tool_name)
+                function_name = self._build_function_name(
+                    skill.slug, raw_tool_name, new_tool_name_index
+                )
                 parameters = manifest_tool.get("parameters")
                 required = manifest_tool.get("required")
                 description = self._build_tool_description(skill, manifest_tool)
@@ -110,18 +122,27 @@ class SkillTool(BaseTool):
                         },
                     },
                 }
-                self._tools.append(tool_schema)
-                self._tool_bindings[function_name] = {
+                new_tools.append(tool_schema)
+                new_tool_bindings[function_name] = {
                     "skill": skill,
                     "runtime_type": runtime_type,
                     "manifest_tool": manifest_tool,
                 }
 
-        self._tools_cache = self._tools
+        # Batch atomic assignment. No `await` between these five lines, so
+        # on a single asyncio event loop no other coroutine can observe an
+        # intermediate state. Python's GIL also guarantees each individual
+        # attribute assignment is atomic at the bytecode level.
+        self._skills = new_skills
+        self._tools = new_tools
+        self._tool_bindings = new_tool_bindings
+        self._tool_name_index = new_tool_name_index
+        self._tools_cache = new_tools
+
         logger.info(
             "SkillTool 初始化完成: enabled_skills=%s, available_tools=%s",
-            len(self._skills),
-            [tool["function"]["name"] for tool in self._tools],
+            len(new_skills),
+            [tool["function"]["name"] for tool in new_tools],
         )
 
     def get_tools(self) -> List[Dict[str, Any]]:
@@ -163,9 +184,16 @@ class SkillTool(BaseTool):
         return ToolResult(success=False, message=f"暂不支持的Skill运行时: {runtime_type}")
 
     async def cleanup(self) -> None:
+        """清空 SkillTool 内部状态（对称于 initialize 的原子性契约 #27）。
+
+        五个字段（_skills / _tools / _tool_bindings / _tool_name_index /
+        _tools_cache）在连续赋值中清空。本方法无 await，对同 event loop
+        上的 reader 原子可见。
+        """
         self._skills = []
         self._tools = []
         self._tool_bindings = {}
+        self._tool_name_index = {}
         self._tools_cache = []
 
     async def _invoke_native(
@@ -274,12 +302,14 @@ class SkillTool(BaseTool):
         normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", raw or "").strip("_").lower()
         return normalized or "tool"
 
-    def _build_function_name(self, skill_slug: str, tool_name: str) -> str:
+    def _build_function_name(
+        self, skill_slug: str, tool_name: str, name_index: dict[str, int]
+    ) -> str:
         slug_part = self._normalize_function_part(skill_slug)
         tool_part = self._normalize_function_part(tool_name)
         base = f"skill_{slug_part}_{tool_part}"
-        suffix_num = self._tool_name_index.get(base, 0)
-        self._tool_name_index[base] = suffix_num + 1
+        suffix_num = name_index.get(base, 0)
+        name_index[base] = suffix_num + 1
 
         candidate = base if suffix_num == 0 else f"{base}_{suffix_num}"
         if len(candidate) <= TOOL_NAME_MAX_LENGTH:

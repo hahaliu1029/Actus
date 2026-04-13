@@ -32,9 +32,6 @@ class _RecordingTelemetry:
     def record_assembly(self, **kwargs) -> None:
         pass
 
-    def record_lc_tools_degradation(self, **kwargs) -> None:
-        pass
-
 
 class TestAgentTaskRunnerSetLanguage:
     def test_set_language_updates_adapter_lang_field(self) -> None:

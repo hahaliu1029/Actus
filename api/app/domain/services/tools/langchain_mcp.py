@@ -8,6 +8,7 @@ into LangChain tools. This preserves the existing MCP client management.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from enum import Enum
 from typing import Any, Literal, Optional, Union
@@ -16,6 +17,8 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
 
 from app.domain.services.tools.mcp import MCPTool
+
+logger = logging.getLogger(__name__)
 
 # JSON Schema type → Python type 映射
 _JSON_TYPE_MAP: dict[str, type] = {
@@ -213,18 +216,26 @@ def create_mcp_langchain_tools(
         if tool_names is not None and name not in tool_names:
             continue
 
-        args_schema = _json_schema_to_pydantic(name, parameters)
+        try:
+            args_schema = _json_schema_to_pydantic(name, parameters)
 
-        tool = StructuredTool.from_function(
-            coroutine=_make_mcp_coroutine(
-                mcp_tool, name,
-                url_map_ref=url_map_ref,
-                sandbox_file_uploader=sandbox_file_uploader,
-            ),
-            name=name,
-            description=description,
-            args_schema=args_schema,
-        )
-        tools.append(tool)
+            tool = StructuredTool.from_function(
+                coroutine=_make_mcp_coroutine(
+                    mcp_tool, name,
+                    url_map_ref=url_map_ref,
+                    sandbox_file_uploader=sandbox_file_uploader,
+                ),
+                name=name,
+                description=description,
+                args_schema=args_schema,
+            )
+            tools.append(tool)
+        except Exception:
+            logger.warning(
+                "Skipping malformed MCP tool schema: %s",
+                name,
+                exc_info=True,
+            )
+            continue
 
     return tools
