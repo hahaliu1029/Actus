@@ -13,6 +13,7 @@ from app.domain.models.app_config import (
     MemoryConfig,
     MCPConfig,
     SkillRiskPolicy,
+    VisionFallbackConfig,
 )
 from app.interfaces import service_dependencies
 
@@ -312,6 +313,82 @@ class TestBuildConfigSnapshotSummaryTimeout:
         assert snap.summary_llm is not None
         # Inherits primary's 120.0 because override is None
         assert snap.summary_llm.timeout_seconds == 120.0
+
+
+class TestBuildConfigSnapshotVisionFallbackTimeout:
+    """D5.1 cleanup: vision_fallback_model must inherit timeout_seconds
+    from the main llm_config (Codex review finding, MEDIUM).
+
+    Pre-fix: ``_build_config_snapshot`` constructed ``vision_llm_config``
+    without passing ``timeout_seconds``, so the vision fallback adapter
+    always fell back to ``LLMConfig.timeout_seconds``'s Pydantic default
+    (120s) regardless of what the user set in their main ``llm_config``.
+    Downstream (``image.py``, ``video.py``) used this adapter for vision
+    description and frame analysis, so their user-facing timeout was
+    effectively pinned at 120s.
+
+    Fix: inherit ``app_config.llm_config.timeout_seconds`` directly,
+    matching the ``summary_llm`` inheritance semantics used when
+    ``MemoryConfig.summary_timeout_seconds`` is ``None``.
+    """
+
+    def _make_app_config_with_vision_fallback(
+        self, *, main_timeout: float
+    ) -> AppConfig:
+        """Build a minimal AppConfig with vision_fallback enabled."""
+        memory = MemoryConfig(summary_model="gpt-4o-mini")
+        agent = AgentConfig(memory=memory)
+        llm = LLMConfig(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="primary-model",
+            timeout_seconds=main_timeout,
+        )
+        vision_fallback = VisionFallbackConfig(
+            enabled=True,
+            base_url="https://vision.test/v1",
+            api_key="vk",
+            model_name="vision-model",
+        )
+        file_understanding = FileUnderstandingConfig(
+            vision_fallback=vision_fallback,
+        )
+        return AppConfig(
+            llm_config=llm,
+            agent_config=agent,
+            mcp_config=MCPConfig(),
+            a2a_config=A2AConfig(),
+            file_understanding=file_understanding,
+            skill_risk_policy=SkillRiskPolicy(),
+        )
+
+    def test_vision_fallback_inherits_main_timeout_seconds(self) -> None:
+        from app.interfaces.service_dependencies import (
+            _build_config_snapshot,
+            _llm_cache,
+        )
+
+        _llm_cache.clear()
+        app_cfg = self._make_app_config_with_vision_fallback(main_timeout=55.0)
+        snap = _build_config_snapshot(app_cfg)
+        assert snap.vision_fallback_model is not None
+        assert snap.vision_fallback_model.timeout_seconds == 55.0, (
+            f"vision_fallback_model lost main timeout_seconds; got "
+            f"{snap.vision_fallback_model.timeout_seconds}, expected 55.0"
+        )
+
+    def test_vision_fallback_inherits_custom_main_timeout(self) -> None:
+        """Second data point: ensure it's not accidentally hardcoded to 55.0."""
+        from app.interfaces.service_dependencies import (
+            _build_config_snapshot,
+            _llm_cache,
+        )
+
+        _llm_cache.clear()
+        app_cfg = self._make_app_config_with_vision_fallback(main_timeout=180.0)
+        snap = _build_config_snapshot(app_cfg)
+        assert snap.vision_fallback_model is not None
+        assert snap.vision_fallback_model.timeout_seconds == 180.0
 
 
 class TestBuildLlmBudgetWarning:

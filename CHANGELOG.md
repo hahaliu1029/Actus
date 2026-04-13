@@ -36,6 +36,15 @@
   5. `service_dependencies._build_llm` logs a budget warning when `api_type=auto` and `primary + fallback > 200s`（derived as `ExecutionWatchdog.total_timeout_seconds / 3 graph retries = 600 / 3 = 200`，即 `primary + fallback > 200s`）. Warning only — no hard raise. Extracted as the module-level constant `_FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS`.
   6. All three LLM adapters (`ActusChatModel` / `ActusResponsesModel` / `ActusFallbackChatModel`) and their `bind_tools` / `with_structured_output` clone paths now propagate `timeout_seconds` to the cloned instance. Without this, `react_graph.py:180` and `planner_react.py:501-503` would silently drop user-configured timeouts.
   7. Shared helper: `api/app/infrastructure/external/llm/_timeout_helpers.py` with a free function `with_llm_timeout(adapter, coro)` — mirrors the existing `_telemetry_mixin.py` idiom.
+  8. `_build_config_snapshot` 构造 `vision_llm_config` 时现在也继承
+     `app_config.llm_config.timeout_seconds`(Codex review 发现的漏传 ——
+     之前 vision fallback adapter 永远使用 `LLMConfig.timeout_seconds` 的
+     Pydantic 默认 120s，不响应用户在主 config 里的覆盖；下游 `image.py` /
+     `video.py` 的视觉描述/帧抽取路径因此一直跑在 120s adapter timeout 下)。
+     `VisionFallbackConfig` 没有独立 `timeout_seconds` 字段 —— 默认行为是
+     继承主 config，和 `summary_llm` 在 `summary_timeout_seconds=None` 时
+     的继承语义对齐。如果未来需要 vision 独立 timeout，可以在
+     `VisionFallbackConfig` 加可选字段。
 
 ### 修复
 

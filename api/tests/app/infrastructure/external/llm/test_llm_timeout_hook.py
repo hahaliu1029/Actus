@@ -604,6 +604,51 @@ class TestFallbackModelBudgetIndependence:
         assert cloned.primary.timeout_seconds == 33.0
         assert cloned.fallback.timeout_seconds == 77.0
 
+    async def test_fallback_bind_tools_preserves_wrapper_provider_name(self) -> None:
+        """Codex review residual: ``ActusFallbackChatModel.bind_tools`` must
+        propagate the wrapper's own ``provider_name`` to the clone.
+
+        ``provider_name`` is an independent field on the wrapper (not delegated
+        to children — see the comment at ``actus_fallback_chat_model.py:38-40``).
+        Currently the main path always uses the default ``"openai"`` so this
+        wasn't a runtime bug, but if a non-default provider is ever set on the
+        wrapper layer (e.g. for B5.1 Anthropic routing), the clone would lose
+        it. Pin the invariant now so a future regression fails loudly.
+        """
+        @tool
+        def dummy_tool(x: int) -> int:
+            """A dummy tool."""
+            return x
+
+        primary = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="primary",
+        )
+        fallback = ActusChatModel(
+            base_url="https://y.test/v1",
+            api_key="k",
+            model_name="fallback",
+        )
+        # Construct the wrapper with a non-default provider_name to expose
+        # the propagation gap. (Default is "openai"; "anthropic" is the only
+        # other Literal value currently allowed.)
+        fallback_model = ActusFallbackChatModel(
+            primary=primary,
+            fallback=fallback,
+            provider_name="anthropic",
+        )
+        assert fallback_model.provider_name == "anthropic"
+
+        cloned = fallback_model.bind_tools([dummy_tool])
+        assert cloned.provider_name == "anthropic", (
+            f"FallbackChatModel.bind_tools clone lost wrapper provider_name; "
+            f"got {cloned.provider_name!r}, expected 'anthropic'. The clone "
+            f"is constructed without explicit provider_name, falling back to "
+            f"the default 'openai' — fix bind_tools to pass "
+            f"provider_name=self.provider_name."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task 11: with_structured_output regression test

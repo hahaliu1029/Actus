@@ -60,19 +60,34 @@ def _build_skill(skill_id: str, *, name: str = "") -> Skill:
 
 
 class _FakeSkillTool:
-    """Records calls to initialize() so tests can assert call patterns."""
+    """Test fake that models SkillTool internal state for #27 regression tests.
+
+    Tracks which skill IDs are currently "loaded" (mirroring SkillTool's
+    self._tools / self._tool_bindings shape at a coarse granularity). Tests
+    can inspect ``loaded_skill_ids`` to verify the outer rollback path
+    actively reset internal state, not just the 4 bookkeeping fields.
+    """
 
     def __init__(self) -> None:
         self.initialize_calls: list[list[Skill]] = []
         self.raise_on_initialize: Exception | None = None
+        self._loaded_skill_ids: tuple[str, ...] = ()
 
     async def initialize(self, skills: list[Skill]) -> None:
+        self.initialize_calls.append(list(skills))
         if self.raise_on_initialize is not None:
             raise self.raise_on_initialize
-        self.initialize_calls.append(list(skills))
+        # Success path: commit the new loaded state (atomic, mirrors
+        # real SkillTool.initialize() contract from #27).
+        self._loaded_skill_ids = tuple(s.id for s in skills)
+
+    @property
+    def loaded_skill_ids(self) -> tuple[str, ...]:
+        """Inspector for tests — what's currently loaded inside SkillTool."""
+        return self._loaded_skill_ids
 
     async def cleanup(self) -> None:
-        return None
+        self._loaded_skill_ids = ()
 
     def get_tools(self) -> list[dict[str, Any]]:
         return []
@@ -731,6 +746,164 @@ async def test_scenario_10_partial_phase3_rollback_keeps_next_call_clean(
     # the failed s_bad state (which leaked in the pre-fix version).
     assert runner._last_skill_ids != snapshot["skill_ids"]
     assert runner._last_skill_ids != ("s_bad",)
+
+
+# ---- #27 hotfix: SkillTool internal state rollback ---------------------- #
+
+
+async def test_phase3_failure_rollback_restores_skill_tool_internal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex review HIGH finding (#27 hotfix).
+
+    Reproduces the leak: when ``_build_step_react_graph``'s Phase 3 fails
+    after Phase 1 successfully refreshed skills (mutating SkillTool internal
+    state), the outer except must actively reset SkillTool back to the
+    snapshot state AND clear ``_lc_tools_cache``. Without this, sticky
+    follow-up calls would read the stale SkillTool (cache miss path) and
+    leak the failed step's tools into ``metadata.bound_tool_names`` while
+    ``metadata.skill_ids`` stays on the rolled-back old IDs.
+
+    Pre-fix: ``_FakeSkillTool.loaded_skill_ids`` would still be the new
+    skills after the failed ``_build_step_react_graph`` call.
+    After fix: ``loaded_skill_ids`` is back to the snapshot state, AND
+    ``_lc_tools_cache`` is empty, AND ``_last_initialized_skills`` is
+    rolled back to the snapshot list.
+    """
+    runner = _make_runner(monkeypatch)
+
+    # Seed: step 1 already ran successfully with skill_1 — SkillTool is
+    # initialized, _last_initialized_skill_ids/_last_initialized_skills
+    # reflect it, the 4 bookkeeping fields are committed.
+    skill_1 = _build_skill("skill_1", name="Skill One")
+    await runner._initialize_skill_tool_if_needed([skill_1])
+    runner._last_skill_context = "## skill_1 context"
+    runner._last_skill_ids = ("skill_1",)
+    runner._last_bound_tool_names = frozenset({"shell_execute", "file_read"})
+    # Prime _lc_tools_cache to simulate state from the successful step 1
+    cache_key_step1 = (
+        ("skill_1",),
+        frozenset(),
+    )
+    runner._lc_tools_cache[cache_key_step1] = [
+        SimpleNamespace(name="shell_execute"),
+        SimpleNamespace(name="file_read"),
+    ]
+
+    # Sanity pre-check: SkillTool internally loaded skill_1
+    assert runner._skill_tool.loaded_skill_ids == ("skill_1",)
+    assert runner._last_initialized_skills == [skill_1]
+
+    # Step 2: Phase 1 refreshes to skill_2 (successful SkillTool.initialize
+    # mutation). Phase 3 (build_react_graph) then raises.
+    skill_2 = _build_skill("skill_2", name="Skill Two")
+    refreshed = RefreshedSkillsResult(
+        skills=(skill_2,),
+        context="## skill_2 context",
+        skill_ids=("skill_2",),
+        scores=None,
+    )
+
+    async def fake_compute(step_desc: str) -> RefreshedSkillsResult:
+        return refreshed
+
+    monkeypatch.setattr(runner, "_compute_refreshed_skills", fake_compute)
+
+    # Phase 3 raises — build_react_graph failure triggers the outer rollback
+    def raising_build_react_graph(**kwargs: Any) -> None:
+        raise RuntimeError("simulated phase 3 failure")
+
+    monkeypatch.setattr(
+        "app.domain.services.graphs.react_graph.build_react_graph",
+        raising_build_react_graph,
+    )
+
+    # The call should raise
+    with pytest.raises(RuntimeError, match="simulated phase 3 failure"):
+        await runner._build_step_react_graph("step 2 with phase 3 failure")
+
+    # ---- Pre-fix would FAIL these assertions --------------------- #
+
+    # #27 hotfix: SkillTool internal state was reset to skill_1
+    # (not leaked as skill_2).
+    assert runner._skill_tool.loaded_skill_ids == ("skill_1",), (
+        f"SkillTool internal state leaked. Expected ('skill_1',) after "
+        f"rollback, got {runner._skill_tool.loaded_skill_ids}. "
+        f"initialize_calls={runner._skill_tool.initialize_calls}"
+    )
+
+    # #27 hotfix: _last_initialized_skills also rolled back
+    assert runner._last_initialized_skills == [skill_1]
+
+    # #27 hotfix: _lc_tools_cache cleared — prior step 1 cache entry is gone
+    assert runner._lc_tools_cache == {}, (
+        f"_lc_tools_cache not cleared; still has: {runner._lc_tools_cache}"
+    )
+
+    # The 4 bookkeeping fields rolled back (existing Scenario 10 contract)
+    assert runner._last_skill_context == "## skill_1 context"
+    assert runner._last_skill_ids == ("skill_1",)
+    assert runner._last_bound_tool_names == frozenset(
+        {"shell_execute", "file_read"}
+    )
+    assert runner._last_initialized_skill_ids == ("skill_1",)
+
+    # Post-rollback: _skill_tool.initialize was called at least TWICE —
+    # once by Phase 1 (→ skill_2), once by the rollback path (→ skill_1).
+    assert len(runner._skill_tool.initialize_calls) >= 2
+    # Last call should be the rollback restoration to skill_1
+    last_call = runner._skill_tool.initialize_calls[-1]
+    assert [s.id for s in last_call] == ["skill_1"]
+
+
+async def test_phase2_failure_rollback_restores_skill_tool_internal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex review HIGH finding — Phase 2 (lc_tools build) variant.
+
+    Same scenario as the Phase 3 test but with Phase 2 (``_build_lc_tools_for_step``)
+    as the failure point. Post-#27, ``_build_lc_tools_for_step`` errors also
+    propagate to the outer rollback and should trigger SkillTool state reset.
+    """
+    runner = _make_runner(monkeypatch)
+
+    skill_1 = _build_skill("skill_1", name="Skill One")
+    await runner._initialize_skill_tool_if_needed([skill_1])
+    runner._last_skill_context = "## skill_1 context"
+    runner._last_skill_ids = ("skill_1",)
+    runner._last_bound_tool_names = frozenset({"shell_execute", "file_read"})
+
+    assert runner._skill_tool.loaded_skill_ids == ("skill_1",)
+
+    skill_2 = _build_skill("skill_2", name="Skill Two")
+    refreshed = RefreshedSkillsResult(
+        skills=(skill_2,),
+        context="## skill_2 context",
+        skill_ids=("skill_2",),
+        scores=None,
+    )
+
+    async def fake_compute(step_desc: str) -> RefreshedSkillsResult:
+        return refreshed
+
+    monkeypatch.setattr(runner, "_compute_refreshed_skills", fake_compute)
+
+    # Phase 2 raises — lc_tools build failure
+    def raising_build_lc_tools_for_step() -> list[Any]:
+        raise RuntimeError("simulated phase 2 lc_tools failure")
+
+    monkeypatch.setattr(
+        runner, "_build_lc_tools_for_step", raising_build_lc_tools_for_step
+    )
+
+    with pytest.raises(RuntimeError, match="simulated phase 2 lc_tools failure"):
+        await runner._build_step_react_graph("step 2 with phase 2 failure")
+
+    # SkillTool reset to skill_1
+    assert runner._skill_tool.loaded_skill_ids == ("skill_1",)
+    assert runner._last_initialized_skills == [skill_1]
+    assert runner._lc_tools_cache == {}
+    assert runner._last_initialized_skill_ids == ("skill_1",)
 
 
 # ---- Bonus: legacy _refresh_skill_context_for_step still works ---------- #

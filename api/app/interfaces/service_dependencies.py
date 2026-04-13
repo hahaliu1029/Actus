@@ -306,6 +306,7 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
             model_name=vf.model_name,
             api_type=vf.api_type,
             supports_vision=True,
+            timeout_seconds=app_config.llm_config.timeout_seconds,  # D5.1: inherit from main; VisionFallbackConfig has no independent timeout field
         )
         vision_fallback_model = _build_llm(vision_llm_config)
 

@@ -136,7 +136,13 @@ class ActusFallbackChatModel(BaseChatModel):
     # ---- bind_tools / with_structured_output ----------------------------- #
 
     def bind_tools(self, tools: list, **kwargs: Any) -> "ActusFallbackChatModel":
+        # provider_name is an independent field on the wrapper (not delegated
+        # to children) — see line 40 comment. Propagate it to the clone so
+        # any non-default value set on the wrapper survives bind_tools. The
+        # children's bind_tools handles their own provider_name + telemetry +
+        # timeout_seconds propagation independently.
         return ActusFallbackChatModel(
             primary=self.primary.bind_tools(tools, **kwargs),
             fallback=self.fallback.bind_tools(tools, **kwargs),
+            provider_name=self.provider_name,
         )

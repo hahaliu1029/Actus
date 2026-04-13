@@ -283,6 +283,14 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_selected_skills: list[Skill] = []
         self._current_message_text: str = ""
         self._last_initialized_skill_ids: tuple[str, ...] = ()
+        # #27 hotfix: parallel to _last_initialized_skill_ids, this holds the
+        # actual Skill objects that were last passed to SkillTool.initialize.
+        # Required by _build_step_react_graph's outer rollback path so it can
+        # actively call await self._skill_tool.initialize(snapshot_skills) to
+        # reset SkillTool internal state when Phase 2 or Phase 3 fails after
+        # Phase 1 already mutated SkillTool. Snapshot of IDs alone is not
+        # enough because initialize() needs Skill objects.
+        self._last_initialized_skills: list[Skill] = []
         self._last_virtual_step_id: str = ""
         self._embedding_available: bool = False
         # D5: Watchdog termination flag (set when HealthEvent TERMINATING is emitted)
@@ -1653,6 +1661,13 @@ class AgentTaskRunner(TaskRunner):
         snapshot_skill_ids = self._last_skill_ids
         snapshot_bound_tool_names = self._last_bound_tool_names
         snapshot_initialized_skill_ids = self._last_initialized_skill_ids
+        # #27 hotfix: snapshot the Skill object list too. The 4 _last_* field
+        # rollback alone is not enough — SkillTool internal state was already
+        # mutated by Phase 1's _initialize_skill_tool_if_needed and stays on
+        # the new skills if Phase 2 or Phase 3 fails. The outer except will
+        # actively call await self._skill_tool.initialize(snapshot_skills) to
+        # reset SkillTool, which requires the Skill objects (not just IDs).
+        snapshot_initialized_skills = list(self._last_initialized_skills)
 
         try:
             # Phase 1: try refresh skills (pure compute + atomic apply).
@@ -1728,6 +1743,34 @@ class AgentTaskRunner(TaskRunner):
             self._last_skill_ids = snapshot_skill_ids
             self._last_bound_tool_names = snapshot_bound_tool_names
             self._last_initialized_skill_ids = snapshot_initialized_skill_ids
+            self._last_initialized_skills = snapshot_initialized_skills
+            # #27 hotfix: SkillTool internal state was already mutated by
+            # Phase 1's _initialize_skill_tool_if_needed before Phase 2 or
+            # Phase 3 raised. The 4-field bookkeeping rollback above does not
+            # touch self._skill_tool; without active restoration, sticky
+            # follow-up calls would leak the failed step's tools (cache miss
+            # + stale self._skill_tool in _build_lc_tools_full). Actively
+            # re-initialize SkillTool to the snapshot state so reader paths
+            # see the correct tools. SkillTool.initialize is itself atomic
+            # (#27 design), so restore is success-or-no-op.
+            try:
+                await self._skill_tool.initialize(snapshot_initialized_skills)
+            except Exception as restore_exc:
+                # Restore failed — log and continue raising the original
+                # exception. Subsequent calls may still see stale state,
+                # but at least we tried. The dominant exception (from
+                # Phase 2 or Phase 3) is more informative than this one.
+                logger.error(
+                    "[#27 hotfix] SkillTool state restoration failed during "
+                    "_build_step_react_graph rollback: %s. Subsequent step "
+                    "metadata may be inconsistent until next successful "
+                    "_initialize_skill_tool_if_needed call.",
+                    restore_exc,
+                )
+            # Also clear lc_tools cache — entries built during the failed
+            # step (with skill_2 tools) must not be reused under the
+            # rolled-back skill_ids key.
+            self._lc_tools_cache.clear()
             raise
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
@@ -1742,6 +1785,8 @@ class AgentTaskRunner(TaskRunner):
         prev_ids = self._last_initialized_skill_ids
         await self._skill_tool.initialize(skills)
         self._last_initialized_skill_ids = skill_ids
+        # #27 hotfix: keep object list in sync so outer rollback can restore.
+        self._last_initialized_skills = list(skills)
         logger.info(
             "[ProgressiveSkillLoad] SkillTool 已更新: %s → %s",
             list(prev_ids) if prev_ids else "[]",
@@ -2424,6 +2469,7 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_selected_skills = []
         self._current_message_text = ""
         self._last_initialized_skill_ids = ()
+        self._last_initialized_skills = []
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
