@@ -1387,11 +1387,6 @@ class AgentTaskRunner(TaskRunner):
         sections.append(self._build_available_tool_summary())
         return "\n\n".join(section for section in sections if section).strip()
 
-    def _set_runtime_system_context(self, skills: list[Skill], scores: list[float] | None = None) -> None:
-        context = self._build_runtime_system_context(skills, scores=scores)
-        if hasattr(self._flow, "set_skill_context"):
-            self._flow.set_skill_context(context)
-
     async def _refresh_skill_context_for_step(self, step_description: str) -> str:
         """Legacy entry point — kept for ``skill_context_refresher`` injection.
 
@@ -1471,6 +1466,92 @@ class AgentTaskRunner(TaskRunner):
             await self._initialize_skill_tool_if_needed(list(result.skills))
         self._last_skill_context = result.context
         self._last_skill_ids = result.skill_ids
+
+    async def _apply_preselected_skills(
+        self,
+        skills: list[Skill],
+        scores: list[float] | None = None,
+    ) -> None:
+        """Apply a pre-selected skill list atomically.
+
+        Used by the four non-``_build_step_react_graph`` code paths that
+        already know which skills to activate and skip the embedding-based
+        ``_compute_refreshed_skills`` query:
+
+        1. Session bootstrap (before the main event loop starts).
+        2. New-message boundary (right before ``flow.invoke``).
+        3. Step-lock activation on step START / virtual step.
+        4. Unknown-tool emergency reselection inside a running step.
+
+        **Semantics**: "apply exactly this selection". An empty ``skills``
+        list is an EXPLICIT CLEAR of the active skill selection — it calls
+        ``_initialize_skill_tool_if_needed([])`` which advances
+        ``_last_initialized_skill_ids`` to ``()`` and resets the skill
+        portion of ``SkillTool`` internal state. ``_last_skill_ids`` is
+        written to ``()``. ``_last_skill_context`` is written to whatever
+        ``_build_runtime_system_context([], scores=None)`` produces —
+        which is NOT an empty string: ``_build_runtime_system_context``
+        always appends ``_build_available_tool_summary()`` covering
+        native / MCP / A2A / memory tools, so empty-skills context is
+        "tool summary without the Active Skills section".
+
+        This intentionally differs from ``_apply_refreshed_skills`` (which
+        gates init on non-empty ``result.skills`` because
+        ``_compute_refreshed_skills`` uses empty tuples ambiguously).
+
+        **Dedup**: the helper deduplicates ``skills`` by ``skill.id``,
+        preserving first-occurrence order. Callers may pass lists with
+        duplicates (e.g., from set-union of multiple selectors) and the
+        helper will normalize before initializing ``SkillTool``. This
+        prevents spurious re-init on the next call with deduplicated
+        input.
+
+        **Ordering**: ``_initialize_skill_tool_if_needed`` runs FIRST so
+        that ``_build_runtime_system_context`` reads the fresh
+        ``SkillTool`` internal state when assembling the available-tool
+        summary. Reversing the order would produce a "new skill guide +
+        stale tool summary" mixed context.
+
+        **Atomicity**: single-coroutine runner, await-free critical section
+        between ``_initialize_skill_tool_if_needed`` returning and the two
+        final assignments. Failure modes:
+
+        - ``_initialize_skill_tool_if_needed`` raises → post-#27 atomic
+          guarantee keeps ``_last_initialized_skill_ids`` at its pre-call
+          value; the two assignments below do not run; all three fields
+          stay at their pre-call values.
+        - ``_build_runtime_system_context`` raises AFTER init succeeds →
+          ``_last_initialized_skill_ids`` has already advanced but the two
+          final assignments do not run, producing a small split-brain
+          window. This matches the old bypass path's risk level (it had
+          the same failure mode relative to clock 2). Documented as a
+          residual risk; no restore shell added.
+        - Synchronous assignments at the tail cannot raise.
+
+        ``_last_bound_tool_names`` is intentionally NOT touched — it
+        represents "tools actually bound on the currently compiled
+        step_react graph" and is owned exclusively by
+        ``_build_step_react_graph`` Phase 3.
+
+        See design: docs/superpowers/specs/2026-04-13-activate-step-skills-atomicity-design.md
+        """
+        # Dedup by skill.id, preserving first-occurrence order. Prevents
+        # spurious re-init when a caller passes duplicates: without dedup,
+        # _last_skill_ids would hold duplicate-containing tuples and the
+        # next call with already-deduplicated input would not match,
+        # triggering an unnecessary SkillTool.initialize. See spec §3.1
+        # "Dedup contract".
+        seen_ids: set[str] = set()
+        deduped_skills: list[Skill] = []
+        for skill in skills:
+            if skill.id not in seen_ids:
+                seen_ids.add(skill.id)
+                deduped_skills.append(skill)
+
+        await self._initialize_skill_tool_if_needed(deduped_skills)
+        context = self._build_runtime_system_context(deduped_skills, scores=scores)
+        self._last_skill_context = context
+        self._last_skill_ids = tuple(skill.id for skill in deduped_skills)
 
     def _get_always_bind_tool_names(self) -> set[str]:
         """从 MCPConfig 提取所有 always_bind 工具名，组装完整前缀名。"""
@@ -1816,23 +1897,16 @@ class AgentTaskRunner(TaskRunner):
         selected_skills: list[Skill] | None = None,
         is_virtual: bool = False,
     ) -> None:
-        """按 step 锁定技能集并更新运行时上下文。
+        """按 step 锁定技能集并更新运行时上下文（C5a 原子对路径）。
 
-        **B5 C5a note**: this is a pre-B5 legacy path that bypasses the
-        C5a ``_compute_refreshed_skills`` / ``_apply_refreshed_skills``
-        atomic pair. It writes ``_last_initialized_skill_ids`` (via
-        ``_initialize_skill_tool_if_needed``) and ``_last_skill_context``
-        (via ``_set_runtime_system_context``) without taking a snapshot.
-
-        This is intentional: the step-skill-lock flow is an unknown-tool
-        emergency reselection path and is NOT covered by the C5a
-        atomicity guarantee. If this path raises partway, ``_last_*``
-        fields may be in an inconsistent state until the next successful
-        ``_build_step_react_graph`` call overwrites them.
-
-        See design doc 'C5a scope boundary' section. Converting this
-        path to route through ``_apply_refreshed_skills`` is a
-        follow-up task tracked in TODOS.md.
+        Routes through ``_apply_preselected_skills`` so that
+        ``_last_initialized_skill_ids`` / ``_last_skill_context`` /
+        ``_last_skill_ids`` advance atomically together. If
+        ``_initialize_skill_tool_if_needed`` raises, all three fields
+        stay at their pre-call values (post-#27 atomic guarantee +
+        await-free critical section in the helper). See design:
+        docs/superpowers/specs/2026-04-13-activate-step-skills-atomicity-design.md
+        §3.2 Site 3.
         """
         if (
             self._step_skill_state
@@ -1848,8 +1922,7 @@ class AgentTaskRunner(TaskRunner):
                 user_message,
             )
 
-        await self._initialize_skill_tool_if_needed(target_skills)
-        self._set_runtime_system_context(target_skills)
+        await self._apply_preselected_skills(target_skills)
         self._step_skill_state = StepSkillActivationState(
             step_id=step_id,
             user_message=user_message,
@@ -1906,11 +1979,16 @@ class AgentTaskRunner(TaskRunner):
             self._session_skill_pool,
             user_message,
         )
-        state.locked_skills = list(selected_skills)
+        # Field split (TODO #30 spec §3.2 Site 4):
+        # - Attempt counters (reselect_count, consecutive_unknown_tool_calls)
+        #   advance BEFORE apply so max_reselect cap is preserved even if
+        #   _apply_preselected_skills raises.
+        # - Success commit (locked_skills) advances AFTER apply, only when
+        #   apply succeeds.
         state.reselect_count += 1
         state.consecutive_unknown_tool_calls = 0
-        await self._initialize_skill_tool_if_needed(selected_skills)
-        self._set_runtime_system_context(selected_skills)
+        await self._apply_preselected_skills(selected_skills)
+        state.locked_skills = list(selected_skills)
         logger.warning(
             "step内连续unknown-tool达到阈值，触发一次技能重选(step_id=%s, reselect_count=%s)",
             state.step_id,
@@ -2539,8 +2617,7 @@ class AgentTaskRunner(TaskRunner):
                 initial_selected=initial_skills,
             )
             await self._skill_bundle_sync.await_initial_sync()
-            await self._initialize_skill_tool_if_needed(initial_skills)
-            self._set_runtime_system_context(initial_skills)
+            await self._apply_preselected_skills(initial_skills)
             self._skill_bundle_sync.start_background_sync()
 
             # 传递 skill pool getter 和 file listings getter 给 flow，用于 get_skill_guide 按需加载
@@ -2629,8 +2706,7 @@ class AgentTaskRunner(TaskRunner):
                         # state, _memory_session_factory wiring). Clearing here is
                         # cheap and eliminates cross-message staleness risk.
                         self._lc_tools_cache.clear()
-                        await self._initialize_skill_tool_if_needed(selected_skills)
-                        self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
+                        await self._apply_preselected_skills(selected_skills, scores=self._current_embedding_scores)
 
                         # Phase 2+3: 设置 LangGraph configurable 回调
                         if hasattr(self._flow, '_skill_context_refresher'):
@@ -2646,6 +2722,14 @@ class AgentTaskRunner(TaskRunner):
                         # ``configurable["language_callback"]``.
                         if hasattr(self._flow, "_language_callback"):
                             self._flow._language_callback = self.set_language
+                        # TODO #30: clock 2 replacement — provider callback
+                        # reading runner's _last_skill_context. Wired here
+                        # (not in __init__) because this spec intentionally
+                        # matches the existing invoke-main-loop wiring pattern;
+                        # moving it to __init__ is part of the deferred #25 work.
+                        # See spec §3.4 / §1.4.
+                        if hasattr(self._flow, "_skill_context_provider"):
+                            self._flow._skill_context_provider = lambda: self._last_skill_context
 
                         # 7.传递消息对象并运行PlannerReActFlow
                         async for event in self._run_flow(message_obj):

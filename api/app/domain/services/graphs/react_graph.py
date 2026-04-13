@@ -32,6 +32,7 @@ from app.domain.models.event import (
     ToolEventStatus,
 )
 from app.domain.models.tool_result import ToolResult
+from app.domain.services.json_envelope import unwrap_message_envelope
 from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
 
 from .message_utils import truncate_tool_content
@@ -243,20 +244,18 @@ def build_react_graph(
                     )
                 )
 
-        # 最终回答（无 tool_calls 且有内容）发射 MessageEvent，使前端实时收到
-        # LLM 按 system prompt 要求返回 JSON 格式 {"success","result","attachments"}，
-        # 需要提取 result 字段作为用户可读消息，避免前端显示原始 JSON。
+        # 最终回答（无 tool_calls 且有内容）发射 MessageEvent，使前端实时收到。
+        # LLM 按 system prompt 要求返回 JSON 格式 {"success","result","attachments"}
+        # （见 prompts/sections/output_format.py），需要 unwrap 成用户可读文本。
+        # 使用 unwrap_message_envelope 做四级兜底解析，能容忍 LLM 在字符串值里
+        # 塞真换行的常见错误；同时兼容 {"message","attachments"} 形状，与
+        # SummarizerOutput 的 key 容忍度对齐。
         if not response.tool_calls and response.content:
             display_message = response.content
             if isinstance(display_message, str):
-                try:
-                    parsed = json.loads(display_message)
-                    if isinstance(parsed, dict) and "result" in parsed:
-                        extracted = parsed["result"]
-                        if isinstance(extracted, str) and extracted.strip():
-                            display_message = extracted
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                display_message, _envelope_attachments = unwrap_message_envelope(
+                    display_message
+                )
             new_events.append(
                 MessageEvent(role="assistant", message=display_message)
             )

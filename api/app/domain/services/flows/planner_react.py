@@ -123,7 +123,6 @@ class PlannerReActFlow(BaseFlow):
             token_safety_factor=self._overflow_config.token_safety_factor,
         ) if self._overflow_config else None
         self._last_compaction_result: CompactionResult | None = None
-        self._skill_context = ""
 
         # Skill creation subgraph
         self._user_id = user_id
@@ -166,6 +165,20 @@ class PlannerReActFlow(BaseFlow):
         self._skill_context_refresher = None
         self._react_graph_provider = None
         self._skill_guide_injector = None
+        # TODO #30: provider returning runner's current _last_skill_context.
+        # Replaces the ``self._skill_context`` instance field (clock 2) that
+        # bypass paths used to set via ``set_skill_context``. Read points are:
+        # (a) ``_run_planner_for_detection`` detection_state
+        # (b) ``input_for_graph["skill_context"]`` at invoke time (two branches)
+        # Wired by ``AgentTaskRunner`` in the invoke main loop L2590 block.
+        # Returns ``""`` when not wired (test harness / pre-wiring).
+        #
+        # NOTE: this is a narrow replacement for clock 2 field only. The LangGraph
+        # ``state.skill_context`` field + ``_skill_context_refresher`` fallback
+        # path + ``updater_node`` refresher block are NOT retired in this spec —
+        # they stay alive because the resume path relies on them.
+        # See spec §1.4 / §6.3.
+        self._skill_context_provider: Callable[[], str] | None = None
         # B5 post-audit LOW #1: optional language_callback set by
         # AgentTaskRunner. main_graph.planner_node calls it via
         # configurable["language_callback"](plan.language) after parsing
@@ -232,9 +245,17 @@ class PlannerReActFlow(BaseFlow):
         """Release checkpointer reference. Pool connections are managed by the pool."""
         self._checkpointer = None
 
-    def set_skill_context(self, skill_context: str) -> None:
-        """Set activated skill context for this round."""
-        self._skill_context = skill_context
+    def _get_skill_context_seed(self) -> str:
+        """Return the current skill context string from the runner callback.
+
+        Used by ``_run_planner_for_detection`` and ``invoke()``'s
+        ``input_for_graph`` construction to seed the skill_context value.
+        Returns ``""`` when the provider is not wired (test scenarios
+        that construct ``PlannerReActFlow`` without a runner).
+        """
+        if self._skill_context_provider is None:
+            return ""
+        return self._skill_context_provider()
 
     # -- Tool collection sub-methods ------------------------------------------
 
@@ -760,7 +781,7 @@ class PlannerReActFlow(BaseFlow):
         section_bundle = get_prompt_section_bundle(lang)
         detection_state = {
             "language": lang,
-            "skill_context": self._skill_context,
+            "skill_context": self._get_skill_context_seed(),
             "conversation_summaries": list(summary_texts),
         }
         detection_config = {"configurable": {}}
@@ -1009,7 +1030,7 @@ class PlannerReActFlow(BaseFlow):
                     "should_interrupt": False,
                     "resume_value": None,
                     "original_request": plan.goal,
-                    "skill_context": self._skill_context,
+                    "skill_context": self._get_skill_context_seed(),
                     "conversation_summaries": summary_texts,
                 }
                 # Emit pre-computed plan events before bridge
@@ -1032,7 +1053,7 @@ class PlannerReActFlow(BaseFlow):
                     "should_interrupt": False,
                     "resume_value": None,
                     "original_request": self.plan.goal if self.plan else "",
-                    "skill_context": self._skill_context,
+                    "skill_context": self._get_skill_context_seed(),
                     "conversation_summaries": summary_texts,
                 }
 

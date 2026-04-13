@@ -160,8 +160,8 @@ class TestFullFlowIntegration:
             checkpointer=MemorySaver(),
         )
 
-        flow.set_skill_context("Use the calculator skill")
-        assert flow._skill_context == "Use the calculator skill"
+        flow._skill_context_provider = lambda: "Use the calculator skill"
+        assert flow._get_skill_context_seed() == "Use the calculator skill"
 
         events = []
         async for event in flow.invoke(Message(message="calculate 2+2")):

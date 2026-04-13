@@ -39,6 +39,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+import httpx
 from openai import AsyncOpenAI
 
 from app.application.errors.exceptions import ServerRequestsError
@@ -59,7 +60,12 @@ class ActusResponsesModel(BaseChatModel):
         timeout_seconds: per-call hard timeout in seconds (D5.1). Default 120.
             0 disables the wrap. Wraps LLM client calls in asyncio.wait_for
             and translates timeouts to ServerRequestsError for LangGraph
-            RetryPolicy.
+            RetryPolicy. Also propagates to httpx as the read/write/pool
+            phase ceiling; 0 means unlimited for those phases.
+        connect_timeout_seconds: httpx connect-phase timeout (TCP+TLS
+            handshake). Default 60s — an order of magnitude above the OpenAI
+            SDK default of 5s, which is too tight for slow cross-border TLS
+            and was firing before timeout_seconds could take effect.
     """
 
     # ---- Pydantic config fields ------------------------------------------ #
@@ -78,6 +84,10 @@ class ActusResponsesModel(BaseChatModel):
     # D5.1: per-call hard timeout (seconds). 0 disables the wait_for wrap.
     # See docs/superpowers/specs/2026-04-13-per-operation-llm-timeout-design.md
     timeout_seconds: float = 120.0
+    # D5.2: httpx connect-phase timeout (TCP+TLS). Separate from
+    # timeout_seconds because the SDK default 5s fires before the outer
+    # asyncio.wait_for can rescue slow-handshake cases — see CHANGELOG.
+    connect_timeout_seconds: float = 60.0
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
@@ -114,11 +124,25 @@ class ActusResponsesModel(BaseChatModel):
         D5.1: ``max_retries=0`` disables SDK-level retry so the LangGraph
         ``RetryPolicy(max_attempts=3)`` at ``react_graph.llm_node`` and
         ``main_graph.planner_node`` is the single retry authority.
+
+        D5.2: Pass an explicit ``httpx.Timeout`` so the connect phase has a
+        dedicated budget. Without this, the SDK default connect=5s fires on
+        slow TLS handshakes before the outer ``asyncio.wait_for`` window is
+        reached, and bumping ``timeout_seconds`` has no effect on that class
+        of failure. ``timeout_seconds==0`` (escape hatch) sets read/write/pool
+        to unlimited but still bounds connect so a dead endpoint fails fast.
         """
+        default_timeout: float | None = (
+            self.timeout_seconds if self.timeout_seconds > 0 else None
+        )
         return AsyncOpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
             max_retries=0,
+            timeout=httpx.Timeout(
+                default_timeout,
+                connect=self.connect_timeout_seconds,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -572,6 +596,7 @@ class ActusResponsesModel(BaseChatModel):
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             timeout_seconds=self.timeout_seconds,  # D5.1: must propagate
+            connect_timeout_seconds=self.connect_timeout_seconds,  # D5.2: must propagate
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
             provider_name=self.provider_name,

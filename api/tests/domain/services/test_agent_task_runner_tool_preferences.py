@@ -80,11 +80,12 @@ def _uow_factory() -> _NoopUoW:
 
 class _DummyFlow:
     def __init__(self, **kwargs) -> None:
-        self.skill_contexts: list[str] = []
         self.kwargs = kwargs
-
-    def set_skill_context(self, skill_context: str) -> None:
-        self.skill_contexts.append(skill_context)
+        # TODO #30 — slot for runner-wired provider callback (Task 9 wires it).
+        # Declared here so the runner's ``hasattr`` guard in the L2590 block
+        # triggers during tests, allowing Task 9's integration test to assert
+        # the wiring happened.
+        self._skill_context_provider = None
 
     async def invoke(self, message):
         if False:
@@ -97,10 +98,11 @@ class _DummyFlow:
 class _CapturingFlow:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
-        self.skill_contexts: list[str] = []
-
-    def set_skill_context(self, skill_context: str) -> None:
-        self.skill_contexts.append(skill_context)
+        # TODO #30 — slot for runner-wired provider callback (Task 9 wires it).
+        # Declared here so the runner's ``hasattr`` guard in the L2590 block
+        # triggers during tests, allowing Task 9's integration test to assert
+        # the wiring happened.
+        self._skill_context_provider = None
 
     async def invoke(self, message):
         if False:
@@ -113,10 +115,11 @@ class _CapturingFlow:
 class _ControlRequestedFlow:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
-        self.skill_contexts: list[str] = []
-
-    def set_skill_context(self, skill_context: str) -> None:
-        self.skill_contexts.append(skill_context)
+        # TODO #30 — slot for runner-wired provider callback (Task 9 wires it).
+        # Declared here so the runner's ``hasattr`` guard in the L2590 block
+        # triggers during tests, allowing Task 9's integration test to assert
+        # the wiring happened.
+        self._skill_context_provider = None
 
     async def invoke(self, message):
         yield ControlEvent(
@@ -132,10 +135,11 @@ class _ControlRequestedFlow:
 class _WaitFlow:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
-        self.skill_contexts: list[str] = []
-
-    def set_skill_context(self, skill_context: str) -> None:
-        self.skill_contexts.append(skill_context)
+        # TODO #30 — slot for runner-wired provider callback (Task 9 wires it).
+        # Declared here so the runner's ``hasattr`` guard in the L2590 block
+        # triggers during tests, allowing Task 9's integration test to assert
+        # the wiring happened.
+        self._skill_context_provider = None
 
     async def invoke(self, message):
         yield WaitEvent()
@@ -147,10 +151,11 @@ class _WaitFlow:
 class _UnknownBurstFlow:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
-        self.skill_contexts: list[str] = []
-
-    def set_skill_context(self, skill_context: str) -> None:
-        self.skill_contexts.append(skill_context)
+        # TODO #30 — slot for runner-wired provider callback (Task 9 wires it).
+        # Declared here so the runner's ``hasattr`` guard in the L2590 block
+        # triggers during tests, allowing Task 9's integration test to assert
+        # the wiring happened.
+        self._skill_context_provider = None
 
     async def invoke(self, message):
         step = Step(id="step-1", description="执行步骤")
@@ -178,10 +183,11 @@ class _UnknownBurstFlow:
 class _ToolOnlyFlow:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
-        self.skill_contexts: list[str] = []
-
-    def set_skill_context(self, skill_context: str) -> None:
-        self.skill_contexts.append(skill_context)
+        # TODO #30 — slot for runner-wired provider callback (Task 9 wires it).
+        # Declared here so the runner's ``hasattr`` guard in the L2590 block
+        # triggers during tests, allowing Task 9's integration test to assert
+        # the wiring happened.
+        self._skill_context_provider = None
 
     async def invoke(self, message):
         yield ToolEvent(
@@ -501,8 +507,8 @@ async def test_invoke_applies_user_preferences_before_tool_initialization(
 
     assert fake_skill_tool.initialized_with is not None
     assert [skill.id for skill in fake_skill_tool.initialized_with] == ["skill-enabled"]
-    assert runner._flow.skill_contexts
-    assert "Skill Enabled" in runner._flow.skill_contexts[-1]
+    assert runner._last_skill_context, "expected runner._last_skill_context to be populated"
+    assert "Skill Enabled" in runner._last_skill_context
 
 
 async def test_invoke_starts_skill_sync_with_filtered_pool(monkeypatch) -> None:
@@ -902,3 +908,61 @@ def test_runtime_context_includes_capped_available_tool_summary() -> None:
     assert "browser" in summary.lower()
     assert "message_ask_user" in summary
     assert len(summary) < 4000
+
+
+async def test_invoke_wires_skill_context_provider_on_message_event(monkeypatch) -> None:
+    """REAL integration test for Codex round 4 HIGH #1.
+
+    Manual wiring simulation isn't sufficient because the production code path
+    runs inside the invoke main loop (L2590 block). This test drives
+    runner.invoke() through a real MessageEvent to confirm that the
+    ``_skill_context_provider`` lambda is installed on ``_flow`` after the
+    invoke-main-loop wiring block executes.
+    """
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _DummyFlow,
+    )
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-provider-wiring",
+        user_id="user-provider-wiring",
+        file_storage=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+    )
+
+    runner._mcp_tool = _FakeMCPTool()
+    runner._a2a_tool = _FakeA2ATool()
+    runner._skill_tool = _FakeSkillTool()
+    runner._skill_bundle_sync = _FakeSkillBundleSync()
+
+    async def fake_load_user_preferences_map(tool_type: ToolType) -> dict[str, bool]:
+        return {}
+
+    async def fake_load_enabled_skills() -> list[Skill]:
+        return [_build_skill("skill-wiring-test", name="Skill Wiring Test")]
+
+    monkeypatch.setattr(runner, "_load_user_preferences_map", fake_load_user_preferences_map)
+    monkeypatch.setattr(runner, "_load_enabled_skills", fake_load_enabled_skills)
+
+    await runner.invoke(_DummyMessageTask("hello wiring"))
+
+    assert runner._flow._skill_context_provider is not None, (
+        "_skill_context_provider should have been wired by the invoke main loop"
+    )
+    assert callable(runner._flow._skill_context_provider), (
+        "_skill_context_provider must be a callable (lambda)"
+    )
+    assert runner._flow._skill_context_provider() == runner._last_skill_context, (
+        "lambda must return runner._last_skill_context"
+    )
+    assert runner._last_skill_context, (
+        "_last_skill_context must be non-empty after _apply_preselected_skills"
+    )

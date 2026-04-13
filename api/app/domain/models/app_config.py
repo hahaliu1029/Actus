@@ -29,7 +29,26 @@ class LLMConfig(BaseModel):
             "0 disables the per-call wrap (use sparingly for debugging). "
             "Wrapped by asyncio.wait_for in each adapter's _agenerate/"
             "_astream; TimeoutError is converted to ServerRequestsError "
-            "so LangGraph RetryPolicy handles retries."
+            "so LangGraph RetryPolicy handles retries. Also passed through "
+            "to httpx as the read/write/pool timeout ceiling; see "
+            "connect_timeout_seconds for the TCP+TLS handshake budget."
+        ),
+    )
+    connect_timeout_seconds: float = Field(
+        60.0,
+        ge=1.0,
+        le=300.0,
+        description=(
+            "httpx connect-phase timeout in seconds (TCP establish + TLS "
+            "handshake). Separate from timeout_seconds because 'don't wait "
+            "300s for a dead endpoint' is a different SLO from 'don't wait "
+            "300s for a model to finish generating'. The OpenAI SDK default "
+            "is 5s which is too tight for slow cross-border networks, DNS "
+            "drift, or connection-pool churn — a single slow TLS handshake "
+            "raises httpcore.ConnectTimeout before the outer asyncio.wait_for "
+            "(timeout_seconds) window is reached. Default 60s covers typical "
+            "slow-network scenarios while still failing fast on truly dead "
+            "endpoints; the upper bound 300s is for extreme environments."
         ),
     )
     context_window: int | None = Field(

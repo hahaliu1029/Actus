@@ -187,6 +187,9 @@ def _llm_fingerprint(llm_config: LLMConfig, supports_pdf_input: bool = False) ->
         str(supports_pdf_input),
         # D5.1: different timeouts must produce different cached instances.
         str(llm_config.timeout_seconds),
+        # D5.2: connect_timeout_seconds likewise — configs differing only in
+        # the connect budget must not share a cached adapter instance.
+        str(llm_config.connect_timeout_seconds),
     )
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
@@ -212,6 +215,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
         from app.infrastructure.external.llm.actus_fallback_chat_model import ActusFallbackChatModel
 
         timeout_seconds = llm_config.timeout_seconds
+        connect_timeout_seconds = llm_config.connect_timeout_seconds
 
         chat = ActusChatModel(
             base_url=str(llm_config.base_url),
@@ -223,6 +227,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             supports_vision=getattr(llm_config, 'supports_vision', True),
             supports_pdf_input=supports_pdf_input,
             timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
         )
         responses = ActusResponsesModel(
             base_url=str(llm_config.base_url),
@@ -233,6 +238,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             supports_vision=getattr(llm_config, 'supports_vision', True),
             supports_pdf_input=supports_pdf_input,
             timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
         )
         if llm_config.api_type == "responses":
             llm = responses
@@ -307,6 +313,7 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
             api_type=vf.api_type,
             supports_vision=True,
             timeout_seconds=app_config.llm_config.timeout_seconds,  # D5.1: inherit from main; VisionFallbackConfig has no independent timeout field
+            connect_timeout_seconds=app_config.llm_config.connect_timeout_seconds,  # D5.2: inherit from main (same rationale as timeout_seconds)
         )
         vision_fallback_model = _build_llm(vision_llm_config)
 

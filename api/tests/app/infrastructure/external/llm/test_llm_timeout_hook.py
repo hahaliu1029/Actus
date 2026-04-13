@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
@@ -96,6 +97,93 @@ class TestChatModelFieldAndClient:
             mock_cls.assert_called_once()
             kwargs = mock_cls.call_args.kwargs
             assert kwargs.get("max_retries") == 0
+
+    # ---- D5.2: connect_timeout_seconds ----
+    def test_default_connect_timeout_seconds_is_60(self) -> None:
+        model = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+        )
+        assert model.connect_timeout_seconds == 60.0
+
+    def test_explicit_connect_timeout_seconds_set(self) -> None:
+        model = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            connect_timeout_seconds=45.0,
+        )
+        assert model.connect_timeout_seconds == 45.0
+
+    def test_get_client_passes_httpx_timeout_with_configured_connect(self) -> None:
+        """D5.2 regression pin: the AsyncOpenAI construction must pass an
+        ``httpx.Timeout`` object whose connect phase is ``connect_timeout_seconds``
+        (NOT the SDK default 5s) and whose read/write/pool phases inherit
+        ``timeout_seconds``.
+
+        This is the regression test for the actual production bug: before
+        D5.2, _get_client() called ``AsyncOpenAI(..., max_retries=0)`` with no
+        ``timeout=`` kwarg, so httpx fell back to the SDK default
+        ``Timeout(connect=5.0, read=600, write=600, pool=600)``. A single slow
+        TLS handshake then raised ``httpcore.ConnectTimeout`` before the outer
+        ``asyncio.wait_for(timeout_seconds)`` window could fire, making
+        ``timeout_seconds`` silently irrelevant to this failure class.
+        """
+        model = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            timeout_seconds=100.0,
+            connect_timeout_seconds=45.0,
+        )
+        with patch(
+            "app.infrastructure.external.llm.actus_chat_model.AsyncOpenAI"
+        ) as mock_cls:
+            model._get_client()
+            mock_cls.assert_called_once()
+            kwargs = mock_cls.call_args.kwargs
+            timeout = kwargs.get("timeout")
+            assert isinstance(timeout, httpx.Timeout), (
+                f"_get_client must pass an httpx.Timeout to AsyncOpenAI; "
+                f"got {type(timeout).__name__}. The SDK default 5s connect "
+                f"timeout will fire otherwise."
+            )
+            assert timeout.connect == 45.0, (
+                f"connect phase is not wired to connect_timeout_seconds; "
+                f"got {timeout.connect}s, expected 45.0s. This is the "
+                f"specific field that would default to the SDK's 5s without "
+                f"the D5.2 fix."
+            )
+            assert timeout.read == 100.0
+            assert timeout.write == 100.0
+            assert timeout.pool == 100.0
+
+    def test_get_client_zero_timeout_seconds_still_bounds_connect(self) -> None:
+        """Escape hatch: timeout_seconds=0 disables the read/write/pool cap
+        (so a legitimate long-running call can complete) but connect MUST
+        still be bounded. A dead endpoint should never hang forever on TCP
+        handshake — that's what ``connect_timeout_seconds`` is for, and it's
+        independent of the ``timeout_seconds=0`` escape hatch.
+        """
+        model = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            timeout_seconds=0,
+            connect_timeout_seconds=30.0,
+        )
+        with patch(
+            "app.infrastructure.external.llm.actus_chat_model.AsyncOpenAI"
+        ) as mock_cls:
+            model._get_client()
+            timeout = mock_cls.call_args.kwargs.get("timeout")
+            assert isinstance(timeout, httpx.Timeout)
+            assert timeout.connect == 30.0
+            # read/write/pool are unlimited via httpx (None)
+            assert timeout.read is None
+            assert timeout.write is None
+            assert timeout.pool is None
 
 
 class TestChatModelAgenerateTimeout:
@@ -350,6 +438,40 @@ class TestChatModelBindToolsClone:
         cloned = model.bind_tools([dummy_tool])
         assert cloned.timeout_seconds == 0
 
+    def test_bind_tools_preserves_custom_connect_timeout_seconds(self) -> None:
+        """D5.2: same hazard as the timeout_seconds clone bug — if bind_tools
+        doesn't pass ``connect_timeout_seconds`` to the clone, a user-
+        configured value silently decays to the Pydantic default on the
+        instance that ``react_graph.llm_node`` / ``planner_react.with_structured_output``
+        actually invokes, leaving the SDK-default connect window back in force.
+        """
+        @tool
+        def dummy_tool(x: int) -> int:
+            """A dummy tool for testing."""
+            return x
+
+        model = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="test-model",
+            timeout_seconds=45.0,
+            connect_timeout_seconds=25.0,  # non-default
+        )
+        cloned = model.bind_tools([dummy_tool])
+        assert cloned.connect_timeout_seconds == 25.0, (
+            "bind_tools clone lost connect_timeout_seconds — would cause "
+            "react_graph.llm_node to silently drop user-configured connect "
+            "budget and fall back to the Pydantic default 60s"
+        )
+        # Also pin that the cloned _get_client produces the same httpx.Timeout
+        with patch(
+            "app.infrastructure.external.llm.actus_chat_model.AsyncOpenAI"
+        ) as mock_cls:
+            cloned._get_client()
+            timeout = mock_cls.call_args.kwargs.get("timeout")
+            assert isinstance(timeout, httpx.Timeout)
+            assert timeout.connect == 25.0
+
 
 # ---------------------------------------------------------------------------
 # ResponsesModel: field + _get_client
@@ -389,6 +511,66 @@ class TestResponsesModelFieldAndClient:
             mock_cls.assert_called_once()
             kwargs = mock_cls.call_args.kwargs
             assert kwargs.get("max_retries") == 0
+
+    # ---- D5.2: connect_timeout_seconds (Responses API variant) ----
+    def test_default_connect_timeout_seconds_is_60(self) -> None:
+        model = ActusResponsesModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+        )
+        assert model.connect_timeout_seconds == 60.0
+
+    def test_explicit_connect_timeout_seconds_set(self) -> None:
+        model = ActusResponsesModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            connect_timeout_seconds=45.0,
+        )
+        assert model.connect_timeout_seconds == 45.0
+
+    def test_get_client_passes_httpx_timeout_with_configured_connect(self) -> None:
+        """D5.2 regression pin for Responses API. See the ChatModel sibling
+        test for the full rationale on why this specifically matters.
+        """
+        model = ActusResponsesModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            timeout_seconds=100.0,
+            connect_timeout_seconds=45.0,
+        )
+        with patch(
+            "app.infrastructure.external.llm.actus_responses_model.AsyncOpenAI"
+        ) as mock_cls:
+            model._get_client()
+            kwargs = mock_cls.call_args.kwargs
+            timeout = kwargs.get("timeout")
+            assert isinstance(timeout, httpx.Timeout)
+            assert timeout.connect == 45.0
+            assert timeout.read == 100.0
+            assert timeout.write == 100.0
+            assert timeout.pool == 100.0
+
+    def test_get_client_zero_timeout_seconds_still_bounds_connect(self) -> None:
+        model = ActusResponsesModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="m",
+            timeout_seconds=0,
+            connect_timeout_seconds=30.0,
+        )
+        with patch(
+            "app.infrastructure.external.llm.actus_responses_model.AsyncOpenAI"
+        ) as mock_cls:
+            model._get_client()
+            timeout = mock_cls.call_args.kwargs.get("timeout")
+            assert isinstance(timeout, httpx.Timeout)
+            assert timeout.connect == 30.0
+            assert timeout.read is None
+            assert timeout.write is None
+            assert timeout.pool is None
 
 
 class TestResponsesModelAgenerateTimeout:
@@ -499,6 +681,30 @@ class TestResponsesModelBindToolsClone:
         )
         cloned = model.bind_tools([dummy_tool])
         assert cloned.timeout_seconds == 45.0
+
+    def test_bind_tools_preserves_custom_connect_timeout_seconds(self) -> None:
+        """D5.2: ResponsesModel sibling of the ChatModel clone-propagation test."""
+        @tool
+        def dummy_tool(x: int) -> int:
+            """A dummy tool for testing."""
+            return x
+
+        model = ActusResponsesModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="test-model",
+            timeout_seconds=45.0,
+            connect_timeout_seconds=25.0,
+        )
+        cloned = model.bind_tools([dummy_tool])
+        assert cloned.connect_timeout_seconds == 25.0
+        with patch(
+            "app.infrastructure.external.llm.actus_responses_model.AsyncOpenAI"
+        ) as mock_cls:
+            cloned._get_client()
+            timeout = mock_cls.call_args.kwargs.get("timeout")
+            assert isinstance(timeout, httpx.Timeout)
+            assert timeout.connect == 25.0
 
 
 # ---------------------------------------------------------------------------

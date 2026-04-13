@@ -155,11 +155,22 @@ async def test_planner_react_flow_produces_plan_event(mock_llm, mock_uow):
     assert len(plan_events) >= 1
 
 
-def test_planner_react_flow_set_skill_context(mock_llm, mock_uow):
-    """set_skill_context should store the context."""
+def test_planner_react_flow_skill_context_provider(mock_llm, mock_uow):
+    """_skill_context_provider callback drives _get_skill_context_seed.
+
+    Replaces the legacy set_skill_context test (TODO #30 retired the
+    self._skill_context instance field; the provider callback is the
+    new clock 2 replacement).
+    """
     flow = _make_flow(mock_llm, mock_uow)
-    flow.set_skill_context("test context")
-    assert flow._skill_context == "test context"
+
+    # Default: no provider wired -> seed returns ""
+    assert flow._skill_context_provider is None
+    assert flow._get_skill_context_seed() == ""
+
+    # Wire a provider -> seed returns its value
+    flow._skill_context_provider = lambda: "## test context"
+    assert flow._get_skill_context_seed() == "## test context"
 
 
 async def test_persist_after_graph_saves_memory_on_interrupt(

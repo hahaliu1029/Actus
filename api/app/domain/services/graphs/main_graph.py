@@ -29,7 +29,7 @@ from app.domain.models.app_config import AgentConfig
 
 from app.application.errors.exceptions import ServerRequestsError
 from app.domain.models.file import File
-from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef, SummarizerOutput
+from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef
 from app.domain.models.event import (
     DoneEvent,
     MessageEvent,
@@ -43,6 +43,7 @@ from app.domain.models.event import (
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.flows.base import FlowStatus
+from app.domain.services.json_envelope import unwrap_message_envelope
 
 from .message_utils import build_multimodal_content, dedup_messages, format_attachments_text
 from .state import MainGraphState
@@ -825,22 +826,16 @@ def build_main_graph(
 
                 full_text = "".join(chunks)
 
-                # Parse {message, attachments} JSON from LLM output
+                # Tolerant {message, attachments} JSON unwrap — four-tier
+                # fallback handles pseudo-JSON with unescaped newlines in
+                # string values (common when markdown content is long).
+                # See app.domain.services.json_envelope.
                 summary_text = full_text
                 summary_attachments: list[str] = []
                 if full_text:
-                    try:
-                        parsed = SummarizerOutput.model_validate_json(full_text)
-                        if parsed.text:
-                            summary_text = parsed.text
-                        summary_attachments = [
-                            a for a in parsed.attachments
-                            if isinstance(a, str) and a.strip()
-                        ]
-                    except (ValueError, Exception):
-                        # LLM returned non-JSON or malformed JSON — use raw text
-                        summary_text = full_text
-                        summary_attachments = []
+                    summary_text, summary_attachments = unwrap_message_envelope(
+                        full_text
+                    )
 
                 # Build File attachments
                 file_attachments: list[File] = []

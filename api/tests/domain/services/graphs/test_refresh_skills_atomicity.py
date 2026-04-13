@@ -143,9 +143,6 @@ def _make_runner(monkeypatch: pytest.MonkeyPatch) -> AgentTaskRunner:
             self._telemetry = None
             self._memory_config = SimpleNamespace(half_life_days=30, mmr_lambda=0.5)
 
-        def set_skill_context(self, skill_context: str) -> None:
-            pass
-
         async def close(self) -> None:
             pass
 
@@ -934,3 +931,255 @@ async def test_legacy_refresh_wrapper_preserves_old_api(
     assert result == "## legacy wrapper"
     assert runner._last_skill_context == "## legacy wrapper"
     assert runner._last_skill_ids == ("leg1",)
+
+
+# ---- Scenario 13: Session bootstrap via _apply_preselected_skills --------- #
+
+
+async def test_scenario_13_session_bootstrap_advances_three_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct call to _apply_preselected_skills mirrors what session bootstrap does.
+
+    Verifies that after the call, all three skill-related _last_* fields advance
+    in sync. _last_bound_tool_names is intentionally untouched.
+    """
+    runner = _make_runner(monkeypatch)
+    initial_skills = [_build_skill("init_a"), _build_skill("init_b")]
+
+    await runner._apply_preselected_skills(initial_skills)
+
+    assert runner._last_skill_ids == ("init_a", "init_b")
+    assert runner._last_initialized_skill_ids == ("init_a", "init_b")
+    assert runner._last_skill_context == (
+        "## Active Skills\n- init_a\n- init_b"
+    )  # from the _build_runtime_system_context stub in _make_runner
+    # _last_bound_tool_names is unchanged from default
+    assert runner._last_bound_tool_names == frozenset()
+
+
+async def test_scenario_13_session_bootstrap_init_failure_keeps_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If SkillTool.initialize raises during bootstrap, all 3 fields stay default."""
+    runner = _make_runner(monkeypatch)
+    runner._skill_tool.raise_on_initialize = RuntimeError("simulated")
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        await runner._apply_preselected_skills([_build_skill("a")])
+
+    # All three remain at their default empty values
+    assert runner._last_skill_context == ""
+    assert runner._last_skill_ids == ()
+    assert runner._last_initialized_skill_ids == ()
+
+
+# ---- Scenario 14: New-message boundary via _apply_preselected_skills ------ #
+
+
+async def test_scenario_14_new_message_boundary_with_scores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-message apply forwards scores to _build_runtime_system_context."""
+    runner = _make_runner(monkeypatch)
+    captured_scores: list[list[float] | None] = []
+
+    monkeypatch.setattr(
+        runner,
+        "_build_runtime_system_context",
+        lambda skills, scores=None: (
+            captured_scores.append(scores)
+            or "## with scores"
+        ),
+    )
+
+    await runner._apply_preselected_skills(
+        [_build_skill("scored")], scores=[0.9, 0.7]
+    )
+
+    assert captured_scores == [[0.9, 0.7]]
+    assert runner._last_skill_context == "## with scores"
+    assert runner._last_skill_ids == ("scored",)
+
+
+async def test_scenario_14_new_message_boundary_init_failure_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Init failure during per-message apply preserves prior state."""
+    runner = _make_runner(monkeypatch)
+    _seed_pre_call_state(runner)
+
+    runner._skill_tool.raise_on_initialize = RuntimeError("init boom")
+
+    with pytest.raises(RuntimeError, match="init boom"):
+        await runner._apply_preselected_skills([_build_skill("new")])
+
+    assert runner._last_skill_context == "## Previous context"
+    assert runner._last_skill_ids == ("prev_skill_1",)
+    assert runner._last_initialized_skill_ids == ("prev_skill_1",)
+
+
+# ---- Scenario 15: Step-lock activation via _activate_step_skills --------- #
+
+
+async def test_scenario_15_step_lock_activation_routes_through_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_activate_step_skills now routes through _apply_preselected_skills.
+
+    Verifies that after step lock activation, the three _last_* fields advance.
+    """
+    runner = _make_runner(monkeypatch)
+    target_skills = [_build_skill("step_a"), _build_skill("step_b")]
+
+    await runner._activate_step_skills(
+        step_id="step-1",
+        user_message="dummy message",
+        selected_skills=target_skills,
+    )
+
+    assert runner._last_skill_ids == ("step_a", "step_b")
+    assert runner._last_initialized_skill_ids == ("step_a", "step_b")
+    assert "step_a" in runner._last_skill_context
+    assert runner._step_skill_state is not None
+    assert runner._step_skill_state.step_id == "step-1"
+
+
+async def test_scenario_15_step_lock_init_failure_no_state_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If apply raises in _activate_step_skills, _step_skill_state is NOT created."""
+    runner = _make_runner(monkeypatch)
+    runner._skill_tool.raise_on_initialize = RuntimeError("init boom")
+    snapshot = _seed_pre_call_state(runner)
+
+    with pytest.raises(RuntimeError, match="init boom"):
+        await runner._activate_step_skills(
+            step_id="step-fail",
+            user_message="dummy",
+            selected_skills=[_build_skill("new")],
+        )
+
+    # _step_skill_state was NOT created because apply raised before line that sets it
+    assert runner._step_skill_state is None
+    # Three _last_* fields preserved (rollback on init failure)
+    assert runner._last_skill_context == snapshot["skill_context"]
+    assert runner._last_skill_ids == snapshot["skill_ids"]
+    assert runner._last_initialized_skill_ids == snapshot["initialized_skill_ids"]
+
+
+# ---- Scenario 16: Unknown-tool reselect field split (Site 4) ------------- #
+
+
+async def test_scenario_16_unknown_tool_reselect_apply_success_advances_locked_skills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive _handle_step_skill_lock through a real ToolEvent with the
+    unknown-tool sentinel and verify the production field-split semantics
+    on the success path: all three state fields advance.
+    """
+    from app.domain.models.event import ToolEvent, ToolEventStatus
+    from app.domain.models.tool_result import ToolResult
+    from app.domain.services.agent_task_runner import StepSkillActivationState
+
+    runner = _make_runner(monkeypatch)
+    # Pre-seed _step_skill_state with consecutive_unknown_tool_calls just
+    # below threshold so the next event's increment trips the reselect path.
+    threshold = runner._skill_selection_policy.step_skill_reselect_unknown_tool_threshold
+    runner._step_skill_state = StepSkillActivationState(
+        step_id="s-1",
+        user_message="msg",
+        locked_skills=[_build_skill("old1")],
+    )
+    runner._step_skill_state.consecutive_unknown_tool_calls = threshold - 1
+    runner._step_skill_state.reselect_count = 0
+
+    # Stub _select_skills_for_message to return new skills
+    new_skills = [_build_skill("new1"), _build_skill("new2")]
+
+    async def fake_select(pool, msg):
+        return (list(new_skills), None)
+
+    monkeypatch.setattr(runner, "_select_skills_for_message", fake_select)
+
+    # Construct an unknown-tool ToolEvent
+    event = ToolEvent(
+        id="evt-1",
+        tool_call_id="tc-1",
+        tool_name="skills",
+        function_name="missing_tool",
+        function_args={},
+        function_result=ToolResult(success=False, data={"code": "UNKNOWN_TOOL"}),
+        status=ToolEventStatus.CALLED,
+    )
+
+    # Drive the production path
+    await runner._handle_step_skill_lock(event, "user message")
+
+    # Field-split assertions on the production state object
+    state = runner._step_skill_state
+    assert state.reselect_count == 1, "attempt counter advances on success"
+    assert state.consecutive_unknown_tool_calls == 0, "reset on success"
+    assert [s.id for s in state.locked_skills] == ["new1", "new2"], (
+        "success commit applied"
+    )
+    # Helper-side: _apply_preselected_skills also wrote runner._last_*
+    assert runner._last_skill_ids == ("new1", "new2")
+
+
+async def test_scenario_16_unknown_tool_reselect_apply_failure_attempt_counter_advances_lock_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive _handle_step_skill_lock through a real ToolEvent and force
+    _apply_preselected_skills to raise. Verify the production field-split
+    semantics on the failure path:
+      (a) state.locked_skills preserved (success commit semantics)
+      (b) state.reselect_count IS advanced (attempt counter semantics —
+          preserves max_reselect cap protection)
+      (c) state.consecutive_unknown_tool_calls reset (also advanced before raise)
+    """
+    from app.domain.models.event import ToolEvent, ToolEventStatus
+    from app.domain.models.tool_result import ToolResult
+    from app.domain.services.agent_task_runner import StepSkillActivationState
+
+    runner = _make_runner(monkeypatch)
+    threshold = runner._skill_selection_policy.step_skill_reselect_unknown_tool_threshold
+    pre_locked = [_build_skill("orig_a"), _build_skill("orig_b")]
+    runner._step_skill_state = StepSkillActivationState(
+        step_id="s-1",
+        user_message="msg",
+        locked_skills=list(pre_locked),
+    )
+    runner._step_skill_state.consecutive_unknown_tool_calls = threshold - 1
+    runner._step_skill_state.reselect_count = 0
+
+    new_skills = [_build_skill("new1")]
+
+    async def fake_select(pool, msg):
+        return (list(new_skills), None)
+
+    monkeypatch.setattr(runner, "_select_skills_for_message", fake_select)
+
+    runner._skill_tool.raise_on_initialize = RuntimeError("apply boom")
+
+    event = ToolEvent(
+        id="evt-2",
+        tool_call_id="tc-2",
+        tool_name="skills",
+        function_name="missing_tool",
+        function_args={},
+        function_result=ToolResult(success=False, data={"code": "UNKNOWN_TOOL"}),
+        status=ToolEventStatus.CALLED,
+    )
+
+    with pytest.raises(RuntimeError, match="apply boom"):
+        await runner._handle_step_skill_lock(event, "user message")
+
+    state = runner._step_skill_state
+    # Attempt counter advanced (a) — max_reselect cap protection preserved
+    assert state.reselect_count == 1, "reselect_count must advance on attempt"
+    assert state.consecutive_unknown_tool_calls == 0, "consecutive counter reset"
+    # Success commit NOT applied (b)
+    assert [s.id for s in state.locked_skills] == [s.id for s in pre_locked], (
+        "locked_skills preserved on apply failure"
+    )

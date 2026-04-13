@@ -2,26 +2,24 @@
 
 Preserves the original summarizer_node contract:
 - Streams raw LLM chunks as partial MessageEvents
-- Parses final output as JSON {message, attachments} via SummarizerOutput
+- Parses final output as JSON {message, attachments} via unwrap_message_envelope
+  (tolerant four-tier fallback: direct → code fence → brace slice → json_repair)
 - Emits final MessageEvent with parsed text + File attachments
 """
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from app.domain.models.event import BaseEvent, MessageEvent
 from app.domain.models.file import File
-from app.domain.models.llm_responses import SummarizerOutput
+from app.domain.services.json_envelope import unwrap_message_envelope
 from langchain_core.messages import HumanMessage
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
     from langchain_core.messages import BaseMessage
-
-logger = logging.getLogger(__name__)
 
 
 async def run_background_summary(
@@ -34,7 +32,7 @@ async def run_background_summary(
 
     Matches the original summarizer_node contract:
     1. Stream raw LLM chunks as partial MessageEvents
-    2. Parse final output as JSON {message, attachments} via SummarizerOutput
+    2. Parse final output as JSON {message, attachments} via unwrap_message_envelope
     3. Emit final MessageEvent with parsed text + File attachments
 
     Returns the parsed summary text, or None if LLM produced no content.
@@ -61,25 +59,18 @@ async def run_background_summary(
     if not full_text:
         return None
 
-    # Parse {message, attachments} JSON from LLM output
-    summary_text = full_text
+    # Tolerant unwrap — handles pseudo-JSON with unescaped newlines in string
+    # values (common when markdown content is long) via json_repair fallback.
+    summary_text, attachment_paths = unwrap_message_envelope(full_text)
     file_attachments: list[File] = []
-    try:
-        parsed = SummarizerOutput.model_validate_json(full_text)
-        if parsed.text:
-            summary_text = parsed.text
-        for path in parsed.attachments:
-            if isinstance(path, str) and path.strip():
-                filename = path.rsplit("/", 1)[-1]
-                ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
-                file_attachments.append(File(
-                    filename=filename,
-                    filepath=path,
-                    extension=ext,
-                ))
-    except (ValueError, Exception):
-        # LLM returned non-JSON or malformed — use raw text, no attachments
-        logger.debug("Summary output is not valid JSON, using raw text")
+    for path in attachment_paths:
+        filename = path.rsplit("/", 1)[-1]
+        ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+        file_attachments.append(File(
+            filename=filename,
+            filepath=path,
+            extension=ext,
+        ))
 
     # Final MessageEvent with parsed text + attachments
     await on_event(MessageEvent(
