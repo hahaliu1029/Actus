@@ -64,6 +64,7 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       CONTAINER_TIMEZONE: ${TZ:-Asia/Shanghai}
+      PYTHONUNBUFFERED: "1"
       ENV: ${ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       APP_CONFIG_FILEPATH: /app/data/config.yaml
