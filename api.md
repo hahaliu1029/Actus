@@ -33,6 +33,7 @@ Notes:
 - Exceeded limits return HTTP `429`
 - Example body: `{"code":429,"msg":"请求过多，请稍后重试","data":{"retry_after":N}}`
 - Redis is required for rate limiting; related endpoints return `503` if Redis is unavailable
+- Auth endpoints (`/auth/register`, `/auth/login`, `/auth/refresh`, `/auth/wechat/*`) carry an independent `rate_limit_auth` policy
 
 ### Streaming transports
 
@@ -40,17 +41,28 @@ Notes:
   - `POST /sessions/stream`
   - `POST /sessions/{session_id}/chat`
   - `POST /v2/skills/create`
+- HTTP incremental recovery:
+  - `GET /sessions/{session_id}/events?since=...` — fetch events after a known event id plus the current session status, used to resume after disconnect
 - WebSocket:
   - `/sessions/{session_id}/takeover/shell/ws?takeover_id=...&token=...`
   - `/sessions/{session_id}/vnc?token=...`
 
 ### Session status values
 
-`pending | running | takeover_pending | takeover | waiting | completed`
+`pending | running | takeover_pending | takeover | waiting | finishing | completed | timed_out`
+
+- `finishing` sits between `running` and `completed` and carries asynchronous wrap-up (final summary, attachment archival, unread-count refresh, lifespan cleanup)
+- `timed_out` is a terminal state written by the execution watchdog when total timeout or recovery failure forces termination
 
 ### Chat SSE event types
 
-`message | title | step | plan | tool | wait | control | done | error`
+`message | title | step | plan | tool | tool_confirmation | wait | control | context_status | compaction | finishing | health | done | error`
+
+Notes:
+- `tool_confirmation` drives the tool approval & confirmation system; the frontend renders a confirmation card and returns the user decision via the `tool_confirmation` field on the next `/chat` request
+- `finishing` is emitted right before the session enters the `finishing` state — clients should unlock input / show a "wrapping up" indicator
+- `health` carries backend liveness / degradation state for UI display
+- `context_status` and `compaction` report context window pressure and gradual-compaction events
 
 ## Runtime configuration
 
@@ -195,8 +207,9 @@ Important fields:
 | `GET` | `/sessions` | Yes | List sessions |
 | `POST` | `/sessions/{session_id}/clear-unread-message-count` | Yes | Clear unread count |
 | `POST` | `/sessions/{session_id}/delete` | Yes | Delete a session |
-| `POST` | `/sessions/{session_id}/chat` | Yes, SSE | Send a message and receive streamed events |
+| `POST` | `/sessions/{session_id}/chat` | Yes, SSE | Send a message and receive streamed events; body may carry `tool_confirmation` to submit an approval decision for a paused tool call |
 | `GET` | `/sessions/{session_id}` | Yes | Get session details and event history |
+| `GET` | `/sessions/{session_id}/events?since={event_id}` | Yes | Fetch incremental events after the given `event_id` plus the current session status — used by clients to resume after disconnect |
 | `GET` | `/sessions/{session_id}/takeover` | Yes | Get takeover state |
 | `POST` | `/sessions/{session_id}/takeover/start` | Yes | Start a takeover; returns HTTP `202` when `request_status=starting` |
 | `POST` | `/sessions/{session_id}/takeover/renew` | Yes | Renew the takeover lease |
@@ -231,6 +244,9 @@ Includes:
 - `model_name`
 - `temperature`
 - `max_tokens`
+- `api_type` — `chat_completions` / `responses` / `auto` (auto uses the fallback adapter; default is `chat_completions`)
+- `timeout_seconds` — Hard per-call timeout (default 120s, 0 disables the outer `asyncio.wait_for`). 300s recommended for complex flows
+- `connect_timeout_seconds` — Independent httpx connect-phase timeout (default 60s, 1.0 ≤ x ≤ 300.0); still enforced even when `timeout_seconds=0`
 - `context_window`
 - `context_overflow_guard_enabled`
 - `overflow_retry_cap`

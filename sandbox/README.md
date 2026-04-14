@@ -85,6 +85,7 @@ sandbox/
 其中：
 
 - `shell/ws` 提供 PTY 双向 WebSocket
+- `POST /api/shell/exec-command` 支持 `wait_seconds` 参数，允许调用方对短命令同步等待结果，避免"明知短命令但还要异步轮询"
 - 文件接口支持读取、写入、替换、搜索、上传、下载、删除
 - Supervisor 接口支持超时销毁、重启和状态查询
 

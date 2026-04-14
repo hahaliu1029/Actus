@@ -2,7 +2,65 @@
 
 本文件记录项目的版本变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased] - 2026-04-04
+## [Unreleased]
+
+_最新批次：2026-04-14_
+
+### 新增
+
+- **工具审批规则与确认系统**：组合三层策略
+  - **用户级永久规则**：`tool_approval_rule.py` 模型（`always_allow` / `always_deny`，按 command + dir glob 匹配，按 `user_id` 持久化），仓储 `tool_approval_rule_repository.py` / `tool_approval_log_repository.py`，ORM 与迁移 `s1_add_tool_approval_tables.py`
+  - **会话级允许缓存**：`approval_cache.py` 在 Redis 写 `approval:{session_id}:{tool_name}:{arg_digest}`（TTL 24h，仅缓存 approve；deny 不缓存）
+  - **运行时决策**：`risk_assessor.py` 划分风险等级，`smart_approve.py` 通过 `summary_llm` 做独立的 LLM 风险判定（返回 approve/deny/escalate），`confirmation_manager.py` 在需要显式确认时暂停 graph 并发出 `ToolConfirmationEvent`
+  - 前端 `tool-confirmation-card.tsx`：approve 提供 once / session / always 三档（对应"本次"/"本会话"/"始终"），deny 仅一次性
+- **会话事件恢复（SSE State Recovery）**：基于 Redis Stream 的 `infrastructure/external/event_recovery/redis_event_recovery.py`，支持刷新或断线重连后从最后位点恢复事件流；前端 `session-recovery.test.ts` 覆盖端到端恢复路径（对应 TODOS #23 E2）
+- **记忆系统下沉到 Agent 工具层**：
+  - 新增 `domain/services/tools/memory_tools.py`：`memory_search`（embedding 召回 + ranker 流水线）和 `memory_get`（按 chunk_id 取详情）两个 Agent 可调工具
+  - 新增 `domain/services/memory_ranker.py`：cosine 相似度 → 时间衰减（半衰期，带 `evergreen` 元数据豁免）→ MMR 多样性重排的检索流水线
+  - 新增 `domain/models/memory_chunk.py`、`memory_chunk_repository.py`、`infrastructure/models/memory_chunk_orm.py`、`db_memory_chunk_repository.py`
+  - 新增 alembic 迁移 `f1a2b3c4d5e6_add_memory_chunks.py`
+  - 对应 TODOS #14（Agent 记忆工具）和 #15（混合检索与排序）
+- **Embedding 熔断器**：`infrastructure/external/embedding/circuit_breaker_embedding_provider.py` 包装 OpenAI Embedding，连续失败时打开熔断
+- **会话 FINISHING 状态**：在 `RUNNING` 与 `COMPLETED` 之间引入 `FINISHING` 中间态，承载最终摘要、附件归档、未读计数刷新等异步收尾；`agent_task_runner.py` 加入 finishing 分支与 lifespan 清理逻辑（对应 TODOS #16 E1）
+- **后台摘要生成**：`graphs/background_summary.py` 与 `graphs/step_metadata.py` 把摘要工作从主 graph 拆出来，避免阻塞主流程
+- **执行健康监控（D5）**：新增 `execution_watchdog.py`（步骤级超时看门狗）+ `execution_metrics.py`（执行指标采集），对应 TODOS #19
+- **提示词模块化（B5）**：新建 `domain/services/prompts/` 子包，将单文件 prompt 拆成可组合单元
+  - `assembler.py` / `section.py` / `render_context.py` / `budget.py` / `invariants.py` / `errors.py`
+  - `sections/`：`identity`、`behavior_core`、`output_format`、`planner_identity`、`planner_tool_summary_legacy`、`sandbox_state`、`skill_context`、`tools_guide_dynamic`、`tools_guide_stable`、`conversation_summaries`
+  - `bundles/`：中英文 prompt bundle
+  - `reminders/`：可注册的提醒（`plan_mode`、`file_truncated`、`skill_install_confirm`）
+  - 强约束：`updater_node` 是 **唯一** 允许写 `state.skill_context` 的节点；CI gate `test_executor_no_skill_context_writeback.py` 通过 AST 扫描禁止 `executor_node` 写回（对应 TODOS #20）
+- **工具失败追踪器**：`tools/tool_failure_tracker.py` 跟踪每个工具的连续失败次数，触发降级或回退
+- **JSON Envelope**：`domain/services/json_envelope.py` 统一工具调用结果的封装格式，便于前后端解析对齐
+- **Telemetry hooks**：`infrastructure/external/llm/_telemetry_mixin.py` + `infrastructure/telemetry/prompt_telemetry.py`，记录 LLM 调用与 prompt 组装的关键指标；新增 `domain/external/telemetry.py` 协议
+- **多语言贯通**：`Message.language` 字段贯穿，`AgentService` / `AgentTaskRunner` 现在显式传递初始语言；prompt 按 language 派发 bundle（对应 TODOS #29）
+- **`shell_execute` 同步等待参数**：沙箱 `shell.py` 与 schema 新增 `wait_seconds`，调用方可指定明知短命令的同步等待时长，缩短"还要异步轮询"链路
+- **会话健康事件**：在状态机和事件流中新增 health 事件类型，前端可展示后端探活/降级状态
+- **前端 Markdown 渲染升级**：改用 `react-markdown` + `shiki` 实现稳定 markdown 渲染与代码语法高亮
+- **前端 Settings 视觉/音频面板**：`manus-settings.tsx` 文件理解配置区域重设计
+- **认证与限流重构**：`interfaces/dependencies/rate_limit.py` 重写；`AppConfig` 加入读取缓存层（`test_service_dependencies_cache.py` 覆盖）
+
+### 变更
+
+- `agent_task_runner.py` 进一步增强：集成审批确认、事件恢复、记忆工具、FINISHING 状态、telemetry、language plumbing；总行数从约 700 涨到约 2000
+- `planner_react.py` 重构：DI 门控 (`test_planner_react_di_gate.py`)、deferred tool 收集、skill context 局部化消费
+- `react_graph.py` / `main_graph.py`：集成 prompt assembler 输出、step_metadata 局部传递、updater 单写入约束
+- `service_dependencies.py`：加入 `_llm_fingerprint` 与 `_build_config_snapshot` 缓存，避免重复构造 LLM/Embedding 适配器
+- `actus_chat_model` / `actus_responses_model` clone 路径补齐 `connect_timeout_seconds` 透传
+- `docker-compose.yml`：加入 `PYTHONUNBUFFERED=1`，确保容器日志实时输出；config.yaml 挂载路径调整
+- 路由层：`session_routes.py` 新增 `GET /sessions/{id}/events?since=...` 事件恢复端点；`auth_routes.py` 的 `register` / `login` / `refresh_token` / `wechat_authorize` / `wechat_callback` 全部接入 `rate_limit_auth` 依赖；`schemas/auth.py` 把 `RegisterRequest.password` 长度约束从 `min=6, max=128` 调整为 `min=8, max=72`
+- 测试体量：单 PR 新增 ~70 个测试文件，覆盖 prompt sections、reminders、bundles、approval、watchdog、recovery、memory chunks 集成、telemetry hooks、timeout hooks、prompt language dispatch、skill context provider wiring 等
+
+### 修复
+
+- **codex review 残留项（commit `17c5a03`）**：
+  - `_build_config_snapshot` 构造 `vision_llm_config` 时显式继承主 config 的 `timeout_seconds`，修复视觉 fallback adapter 永远跑在 Pydantic 默认 120s 的回归
+  - TODOS #27 SkillTool.initialize 原子性的 rollback recovery 路径
+  - LLM fallback adapter `provider_name` 命名一致性
+- planner 与 react 之间的 skill_context 漂移（`test_executor_prompt_assembler_parity.py` 锁住）
+- `executor_node` 在恢复路径中错误注入"用户已完成接管"消息的旧分支（`test_executor_resume_path.py`）
+
+## [Pre-release 2026-04-04]
 
 ### 新增
 
@@ -60,7 +118,7 @@
 - `MemoryConfig` 中 `summary_min_steps` 默认值调整为 1
 - `file_processor_lookup` 参数类型注释修正
 
-## [Unreleased] - 2026-03-07
+## [Pre-release 2026-03-07]
 
 ### 文档
 
@@ -68,7 +126,7 @@
 - 修正文档中关于 `api/config.yaml`、`sandbox-image`、本地后端环境变量、前端构建时 API 地址注入方式的过时描述。
 - 重写中英文 README、部署说明、架构说明、子项目 README 和中英文 API 参考文档。
 
-## [Unreleased] - 2026-02-24
+## [Pre-release 2026-02-24]
 
 ### 变更
 

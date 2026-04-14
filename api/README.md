@@ -7,14 +7,22 @@
 - 用户注册、登录、刷新令牌、个人资料维护
 - 超级管理员用户管理
 - 会话创建、SSE 对话流、任务停止、文件读取
+- 会话事件恢复（基于 Redis Stream 的 SSE 状态续传）
 - `shell` / `browser` 接管、续期、结束、补救
 - LLM / MCP / A2A / Skill 风险策略配置
 - Skill v2 安装（GitHub / 本地 / SKILL.md）、启用、删除、详情查看、AI 创建
 - 多模态文件理解：音频转录、PDF 解析、图片处理、视频帧分析
 - 上下文溢出治理：两级渐进压缩 + 同步三阶段裁剪
+- 模块化提示词系统（B5）：sections / bundles / reminders / assembler / budget
+- Agent 记忆系统：`memory_search` / `memory_get` 工具 + 检索流水线（cosine 相似度 → 时间衰减 → MMR 多样性重排）
+- 工具审批与确认系统：风险评估、智能批准、明确确认、审批缓存、持久化日志
+- 执行健康监控（D5）：步骤级 watchdog + 执行指标 + 工具失败追踪 + 统一 JSON Envelope
+- LLM 调用预算：连接 / 读取阶段独立 timeout，与 LangGraph RetryPolicy 对齐
 - 基于 Embedding 的 Skill 语义选择、渐进式 MCP 工具发现
+- Embedding 熔断器（避免级联失败）
 - Checkpointer 连接池（psycopg AsyncConnectionPool）
 - 后台记忆刷新（Memory Flush，含指数退避 + 熔断器）
+- 多语言贯通：`Message.language` 派发中英文 prompt bundle
 - 文件上传、下载、删除
 - 健康检查与 MinIO 自检
 
@@ -116,26 +124,37 @@ pytest
 ```text
 api/
 ├── app/
-│   ├── application/      # 用例编排服务（Skill、Memory Flush）
+│   ├── application/      # 用例编排服务（Agent, Session, Skill, Memory Flush 等）
 │   ├── domain/           # 领域模型、工具、流程、Prompt、上下文治理
-│   │   ├── models/       # 领域模型（app_config, skill, memory_chunk 等）
-│   │   ├── external/     # 外部依赖协议（file_processor, embedding, memory_flusher）
+│   │   ├── models/       # 领域模型（app_config, skill, memory_chunk, tool_approval_rule, session 等）
+│   │   ├── external/     # 外部依赖协议（file_processor, embedding, memory_flusher, event_recovery, telemetry）
 │   │   ├── services/
-│   │   │   ├── graphs/   # LangGraph 图（main_graph, react_graph, compaction, context_assembler, token_estimator）
+│   │   │   ├── graphs/   # LangGraph 图（main_graph, react_graph, compaction, context_assembler,
+│   │   │   │             #               token_estimator, background_summary, step_metadata, message_utils）
 │   │   │   ├── flows/    # 流程编排（planner_react, skill_creation_graph）
-│   │   │   ├── tools/    # LangChain 工具（file, shell, browser, mcp_discovery, dynamic_skill）
-│   │   │   └── prompts/  # Prompt 模板
-│   │   └── repositories/ # 仓库接口 (ABC)
+│   │   │   ├── tools/    # LangChain 工具（file, shell, browser, mcp_discovery, dynamic_skill,
+│   │   │   │             #               memory_tools, tool_failure_tracker）
+│   │   │   ├── prompts/  # 模块化 Prompt 子包（assembler, section, render_context, budget,
+│   │   │   │             #                    invariants, errors, sections/, bundles/, reminders/）
+│   │   │   ├── risk_assessor.py / smart_approve.py / confirmation_manager.py / approval_cache.py
+│   │   │   ├── execution_watchdog.py / execution_metrics.py
+│   │   │   ├── memory_ranker.py / json_envelope.py
+│   │   │   └── skill_md_parser.py / skill_md_exporter.py
+│   │   └── repositories/ # 仓库接口 (ABC)，含 memory_chunk / tool_approval_rule / tool_approval_log
 │   ├── infrastructure/   # 仓储实现、外部服务、存储客户端
+│   │   ├── models/       # ORM（含 memory_chunk_orm, tool_approval_log, tool_approval_rule）
+│   │   ├── repositories/ # 仓储实现（含 db_memory_chunk_repository, db_tool_approval_*）
+│   │   ├── telemetry/    # Prompt + LLM telemetry 实现
 │   │   ├── external/
-│   │   │   ├── llm/      # LLM 适配器 + 消息清洗器
-│   │   │   ├── embedding/ # Embedding 提供者、缓存、向量索引
+│   │   │   ├── llm/      # LLM 适配器 + 消息清洗器 + telemetry mixin + timeout helpers
+│   │   │   ├── embedding/ # Embedding 提供者、缓存、向量索引、熔断器
 │   │   │   ├── file_processors/ # 文件处理器（audio, image, pdf, video）
+│   │   │   ├── event_recovery/  # Redis Stream 会话事件恢复
 │   │   │   └── ...       # sandbox, file_storage, task
 │   │   └── checkpointer_pool.py  # LangGraph 检查点连接池
-│   └── interfaces/       # FastAPI 路由、Schema、依赖注入
+│   └── interfaces/       # FastAPI 路由、Schema、依赖注入、限流
 ├── core/                 # 环境变量与安全配置
-├── alembic/              # 数据库迁移
+├── alembic/              # 数据库迁移（含 memory_chunks、tool_approval_tables）
 ├── scripts/              # 管理脚本
 ├── tests/                # 后端测试
 ├── config.yaml.example   # 本地运行时配置模板

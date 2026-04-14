@@ -9,19 +9,24 @@
 - 左侧会话列表、删除会话、主题切换
 - 会话详情页：
   - 流式消息展示
+  - Markdown 渲染（基于 `react-markdown`）+ `shiki` 代码语法高亮
   - 计划 / 步骤状态展示
+  - 工具确认卡片（响应 `tool_confirmation` 事件，承载工具审批与确认系统的用户决策）
   - 任务摘要与文件面板
   - 终端预览
   - 浏览器预览
   - VNC 画面
   - 时间线回放
+- 会话事件恢复（两条路径）：
+  - **页面刷新 / 重新进入**：先 `GET /sessions/{id}` 拉完整快照，再 `POST /sessions/{id}/chat` 携带 `event_id` 续流
+  - **运行中连接中断**：通过 `GET /sessions/{id}/events?since=...` 增量取后续事件
 - 设置弹窗：
   - Agent 通用配置
   - 模型提供商配置
   - MCP 服务器
   - A2A Agent 配置
   - Skill 生态
-  - 文件理解配置（视觉降级、音频转录、视频分析）
+  - 文件理解配置（视觉降级、音频转录、视频分析）— 视觉/音频面板新版样式
   - 用户管理
 - 文件传输面板：上传/下载进度跟踪、EMA 测速、取消和重试
 - 图片代理路由：`/api/image-proxy`
@@ -33,7 +38,7 @@
 - Tailwind CSS 4
 - Zustand
 - Radix UI
-- `markdown-it`
+- `react-markdown` + `shiki`（代码语法高亮）
 - noVNC
 - Vitest + Testing Library
 
@@ -111,6 +116,8 @@ ui/
 - `components/workbench-browser-preview.tsx`
 - `components/vnc-viewer.tsx`
 - `components/manus-settings.tsx`
+- `components/markdown-renderer.tsx` — react-markdown + shiki 渲染管道
+- `components/tool-confirmation-card.tsx` — 工具调用确认卡片，对接后端工具审批系统
 - `components/transfer-panel.tsx` — 文件传输进度面板
 - `components/transfer-progress.tsx` — 单个传输任务进度条
 

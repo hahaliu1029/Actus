@@ -27,12 +27,18 @@ The default execution model is a **LangGraph**-based `Planner + ReAct` flow: Act
 
 ## Core Capabilities
 
-- **LangGraph agent orchestration** — two-layer graph architecture with planning, step execution, and summarization
+- **LangGraph agent orchestration** — two-layer graph architecture (main_graph for planning + react_graph for tool execution loops), with a `FINISHING` intermediate state for asynchronous wrap-up (final summary, attachment archival, unread-count refresh)
 - **LangChain tool system** — file, shell, browser, search tools registered via `@tool` decorators
 - **MCP / A2A / Skill integrations** managed as first-class agent tools, with progressive MCP tool discovery and embedding-based skill selection
 - **Skill v2 filesystem storage** under `/app/data/skills`, supporting GitHub, local directory, and SKILL.md format installation
 - **Multimodal file understanding** — audio transcription (Whisper API / sandbox faster-whisper), PDF parsing (native / pymupdf4llm), image processing, video keyframe extraction + vision model analysis
 - **Context overflow management** — two-level gradual compaction (85% LLM summarization / 95% hard truncation) + synchronous 3-phase trimming for automatic context window protection
+- **Modular prompt system (B5)** — composable subpackage of sections / bundles / reminders / assembler / budget, with bilingual (en/zh) bundle dispatch and contextual reminders
+- **Agent memory subsystem** — `memory_search` / `memory_get` tools backed by a retrieval pipeline (cosine similarity → temporal decay → MMR diversity rerank) and an embedding circuit breaker
+- **Tool approval & confirmation** — user-scoped persistent allow/deny rules (`always_allow` / `always_deny`, matched by command + dir glob) + session-scoped allow cache (approve only) + LLM-assisted Smart Approve (independent risk evaluation by the summary LLM, returns approve/deny/escalate) + explicit confirmation (frontend approve supports once/session/always scopes, deny is one-shot), with risk assessment and a persistent audit log
+- **Session event recovery** — Redis Stream backed SSE state resume; reconnecting clients pick up from the last event id instead of losing in-flight tool/message events
+- **Execution health monitoring** — step-level watchdog, execution metrics, tool failure tracker, and a uniform JSON envelope for tool I/O
+- **LLM call budgets** — independent connect-phase / read-phase timeouts wired through every adapter clone path, aligned with LangGraph RetryPolicy to avoid 9× HTTP retry amplification
 - **Human takeover** for both `shell` and `browser` scopes
 - **Workbench UI** with terminal preview, browser preview, VNC, timeline scrubbing, and file preview
 - **Streaming transport** via SSE and WebSocket
@@ -40,6 +46,7 @@ The default execution model is a **LangGraph**-based `Planner + ReAct` flow: Act
 - **Attachment storage** through MinIO / S3-compatible object storage with transfer progress tracking
 - **JWT auth, admin tools, tool preferences, and runtime settings**
 - **SSH tunnel** — optional autossh reverse tunnel to expose the local API to a cloud server
+- **Language plumbing** — `Message.language` propagates end-to-end so the prompt assembler dispatches the correct (en/zh) bundle
 
 ## Architecture
 

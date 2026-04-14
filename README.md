@@ -27,12 +27,18 @@ Actus 由三个核心运行时组成：
 
 ## 核心能力
 
-- **LangGraph Agent 编排**：两层图架构（main_graph 规划调度 + react_graph 工具执行循环），支持规划、步骤执行、等待用户输入和任务完成总结
+- **LangGraph Agent 编排**：两层图架构（main_graph 规划调度 + react_graph 工具执行循环），支持规划、步骤执行、等待用户输入、最终总结，并通过 `FINISHING` 中间态承载异步收尾
 - **LangChain 工具体系**：文件、Shell、浏览器、搜索工具通过 `@tool` 装饰器统一注册
 - **MCP / A2A / Skill 扩展**：统一纳入 Agent 工具选择与运行时编排，支持渐进式 MCP 工具发现和基于 Embedding 的 Skill 语义选择
 - **Skill v2 文件系统存储**：Skill 保存在 `/app/data/skills`，支持 GitHub、本地目录和 SKILL.md 格式安装
 - **多模态文件理解**：音频转录（Whisper API / 沙箱 faster-whisper）、PDF 解析（原生 / pymupdf4llm）、图片处理、视频关键帧提取 + 视觉模型分析
 - **上下文溢出治理**：两级渐进压缩（85% LLM 摘要 / 95% 硬截断）+ 同步三阶段裁剪，自动保护上下文窗口
+- **模块化提示词系统（B5）**：sections / bundles / reminders / assembler / budget 子模块组合，支持中英文 bundle 和按情境注入的 reminders
+- **Agent 记忆系统**：`memory_search` / `memory_get` 工具 + 检索流水线（cosine 相似度 → 时间衰减 → MMR 多样性重排）+ Embedding 熔断器
+- **工具审批与确认系统**：用户级永久允许/拒绝规则（`always_allow` / `always_deny`，按 command/dir glob 匹配）+ 会话级允许缓存（仅对 approve 生效）+ Smart Approve 智能批准 + 显式确认（前端 approve 支持 once/session/always 三档，deny 为一次性），含风险评估和持久化审计日志
+- **会话事件恢复**：基于 Redis Stream 的 SSE 状态恢复，刷新或断线重连后从最后位点继续
+- **执行健康监控**：步骤级 watchdog + 执行指标采集 + 工具失败追踪 + 统一 JSON Envelope
+- **LLM 调用预算**：连接阶段 / 读取阶段独立 timeout 预算，与 LangGraph RetryPolicy 对齐，避免 9 次 HTTP 重试放大
 - **人工接管**：支持 `shell` 和 `browser` 两类接管，包含申请、续期、结束、补救流程
 - **工作台视图**：终端预览、浏览器预览、VNC 画面、时间线回放、文件预览
 - **流式交互**：会话列表与对话执行均支持 SSE；接管终端和 VNC 使用 WebSocket
@@ -40,6 +46,7 @@ Actus 由三个核心运行时组成：
 - **对象存储与附件**：上传文件落到 MinIO/S3 兼容存储，并与会话关联；文件传输支持进度跟踪、断点续传
 - **用户与管理**：JWT 鉴权、超级管理员、用户管理、工具偏好、应用设置
 - **SSH 隧道**：可选的 autossh 反向隧道，将本地 API 暴露到云服务器
+- **多语言贯通**：`Message.language` 字段贯穿 prompt assembler，按用户语言派发中英文 bundle
 
 ## 架构概览
 

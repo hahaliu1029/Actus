@@ -33,6 +33,7 @@
 - 超限返回 `429`
 - 响应体示例：`{"code":429,"msg":"请求过多，请稍后重试","data":{"retry_after":N}}`
 - 限流依赖 Redis；Redis 不可用时相关接口会返回 `503`
+- 认证类接口（`/auth/register`、`/auth/login`、`/auth/refresh`、`/auth/wechat/*`）应用独立的 `rate_limit_auth` 限流策略
 
 ### 流式与实时通道
 
@@ -40,17 +41,28 @@
   - `POST /sessions/stream`
   - `POST /sessions/{session_id}/chat`
   - `POST /v2/skills/create`
+- HTTP 增量恢复：
+  - `GET /sessions/{session_id}/events?since=...`（断线重连后获取增量事件 + 当前状态）
 - WebSocket：
   - `/sessions/{session_id}/takeover/shell/ws?takeover_id=...&token=...`
   - `/sessions/{session_id}/vnc?token=...`
 
 ### 会话状态
 
-`pending | running | takeover_pending | takeover | waiting | completed`
+`pending | running | takeover_pending | takeover | waiting | finishing | completed | timed_out`
+
+- `finishing` 是 `running → completed` 之间的中间态，承载最终摘要、附件归档、未读计数刷新等异步收尾
+- `timed_out` 是 watchdog 总超时或恢复失败时写入的终态
 
 ### 对话 SSE 事件类型
 
-`message | title | step | plan | tool | wait | control | done | error`
+`message | title | step | plan | tool | tool_confirmation | wait | control | context_status | compaction | finishing | health | done | error`
+
+补充：
+- `tool_confirmation` 用于工具审批与确认系统，前端展示工具确认卡片并把决策回传到 `/chat` 接口的 `tool_confirmation` 字段
+- `finishing` 在会话进入 `finishing` 状态前发出，前端应解锁输入框并展示"收尾中"指示
+- `health` 事件用于展示后端探活与降级状态
+- `context_status` / `compaction` 上报上下文窗口压力和渐进压缩动作
 
 ## 运行时配置说明
 
@@ -195,8 +207,9 @@
 | `GET` | `/sessions` | 是 | 获取会话列表 |
 | `POST` | `/sessions/{session_id}/clear-unread-message-count` | 是 | 清空未读消息数 |
 | `POST` | `/sessions/{session_id}/delete` | 是 | 删除会话 |
-| `POST` | `/sessions/{session_id}/chat` | 是，SSE | 向会话发送消息并流式接收事件 |
+| `POST` | `/sessions/{session_id}/chat` | 是，SSE | 向会话发送消息并流式接收事件；body 可携带 `tool_confirmation` 提交工具确认决策 |
 | `GET` | `/sessions/{session_id}` | 是 | 获取会话详情和历史事件 |
+| `GET` | `/sessions/{session_id}/events?since={event_id}` | 是 | 获取指定 event_id 之后的增量事件 + 当前会话状态，用于断线重连后的状态恢复 |
 | `GET` | `/sessions/{session_id}/takeover` | 是 | 获取当前接管状态 |
 | `POST` | `/sessions/{session_id}/takeover/start` | 是 | 发起接管；`request_status=starting` 时 HTTP 为 `202` |
 | `POST` | `/sessions/{session_id}/takeover/renew` | 是 | 续期接管租约 |
@@ -231,6 +244,9 @@
 - `model_name`
 - `temperature`
 - `max_tokens`
+- `api_type` — `chat_completions` / `responses` / `auto`（auto 走 fallback 适配器；默认 `chat_completions`）
+- `timeout_seconds` — LLM 单次调用硬超时（默认 120s，0 = 关闭外层 `asyncio.wait_for`）。建议复杂场景用 300s
+- `connect_timeout_seconds` — httpx 连接阶段独立超时（默认 60s，1.0 ≤ x ≤ 300.0），即使 `timeout_seconds=0` 也仍生效
 - `context_window`
 - `context_overflow_guard_enabled`
 - `overflow_retry_cap`
