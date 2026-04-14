@@ -87,7 +87,7 @@ class FakeRedisClient:
 
 def test_request_rate_limit_exceeded_returns_429() -> None:
     redis = FakeRedis()
-    redis.force_incr = 121
+    redis.force_incr = 601
     user = User(id="u-read")
 
     with pytest.raises(TooManyRequestsError) as exc:
@@ -124,7 +124,7 @@ def test_connection_limit_exceeded_returns_429() -> None:
     user_id = "u-sse"
     key = f"rl:conn:{RateLimitChannel.SSE.value}:{user_id}"
     now = time.time()
-    redis.zsets[key] = {f"conn-{idx}": now for idx in range(10)}
+    redis.zsets[key] = {f"conn-{idx}": now for idx in range(20)}
 
     with pytest.raises(TooManyRequestsError):
         asyncio.run(

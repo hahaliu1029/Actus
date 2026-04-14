@@ -69,6 +69,7 @@ class TestShutdownCancelsRealTasks:
         svc._background_tasks = set()
         svc._pending_timeout_tasks = {}
         svc._takeover_timeout_tasks = {}
+        svc._confirmation_sweep_task = None
         svc._task_cls = MagicMock()
         svc._task_cls.destroy = AsyncMock()
 

@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 
-from app.domain.models.event import PlanEvent, TitleEvent, MessageEvent, DoneEvent, PlanEventStatus
+from app.domain.models.event import PlanEvent, TitleEvent, MessageEvent, PlanEventStatus
 from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef
 from app.domain.models.plan import Plan, Step, ExecutionStatus
 
@@ -321,103 +321,57 @@ class TestMainGraphFlow:
         assert completed_steps[0].success is False
 
     async def test_summarizer_streams_and_emits_message_event(self):
-        """Summarizer should stream LLM via astream and emit partial+final MessageEvents."""
-        from app.domain.services.graphs.main_graph import build_main_graph
+        """run_background_summary should stream LLM via astream and emit partial+final MessageEvents.
 
-        # Mock summary_llm.astream() yielding AIMessageChunk objects
-        summary_llm = MagicMock()
+        summarizer_node was removed from the compiled graph (see E1 / test_main_graph_no_summarizer);
+        final-summary generation now lives in run_background_summary, invoked by
+        agent_task_runner._do_postprocess. This test exercises that replacement directly.
+        """
+        from app.domain.services.graphs.background_summary import run_background_summary
+
         json_response = '{"message": "Task done, here is the report.", "attachments": ["/home/ubuntu/report.md"]}'
-        # Split the JSON response into chunks to simulate streaming
         chunk1 = json_response[:30]
         chunk2 = json_response[30:]
+
+        summary_llm = MagicMock()
 
         async def mock_astream(messages, **kwargs):
             yield AIMessageChunk(content=chunk1)
             yield AIMessageChunk(content=chunk2)
         summary_llm.astream = mock_astream
 
-        planner_llm = MagicMock()
-        planner_llm.with_structured_output = MagicMock(return_value=AsyncMock())
+        messages = [
+            SystemMessage(content="system"),
+            HumanMessage(content="do something"),
+            AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
+        ]
 
-        plan = Plan(
-            title="T", goal="G", language="zh",
-            steps=[Step(description="done step", status=ExecutionStatus.COMPLETED)],
-            message="ok", status=ExecutionStatus.RUNNING,
-        )
+        captured_events: list = []
 
-        graph = build_main_graph(
-            _allow_default_prompt_assembler=True,
-            planner_llm=planner_llm,
-            react_graph=_make_mock_react_graph(),
-            summary_llm=summary_llm,
-            uow_factory=MagicMock(),
-            session_id="sess-sum",
-        )
+        async def on_event(evt):
+            captured_events.append(evt)
 
-        # Use event_queue to capture events emitted by summarizer
-        event_queue: asyncio.Queue = asyncio.Queue()
+        await run_background_summary(messages, summary_llm, on_event, lang="zh")
 
-        result = await graph.ainvoke(
-            {
-                "message": "summarize",
-                "language": "zh",
-                "attachments": [],
-                "image_content_blocks": [],
-                "plan": plan,
-                "current_step": None,
-                "messages": [
-                    SystemMessage(content="system"),
-                    HumanMessage(content="do something"),
-                    AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
-                ],
-                "execution_summary": "",
-                "events": [],
-                "flow_status": "summarizing",
-                "session_id": "sess-sum",
-                "should_interrupt": False,
-                "resume_value": None,
-                "original_request": "G",
-                "skill_context": "",
-                "conversation_summaries": [],
-            },
-            config={"configurable": {"event_queue": event_queue}},
-        )
-
-        # Collect all queued events
-        queued_events = []
-        while not event_queue.empty():
-            queued_events.append(event_queue.get_nowait())
-
-        # Should have PlanEvent(COMPLETED) + partial MessageEvents + final MessageEvent + DoneEvent
-        msg_events = [e for e in queued_events if isinstance(e, MessageEvent)]
+        msg_events = [e for e in captured_events if isinstance(e, MessageEvent)]
         partial_events = [e for e in msg_events if e.partial]
         final_events = [e for e in msg_events if not e.partial]
 
         assert len(partial_events) >= 1, "Should have at least one partial streaming event"
         assert len(final_events) == 1, "Should have exactly one final MessageEvent"
 
-        # All MessageEvents share the same stream_id
         stream_ids = {e.stream_id for e in msg_events}
         assert len(stream_ids) == 1, "All MessageEvents should share the same stream_id"
         assert None not in stream_ids, "stream_id should not be None"
 
-        # Partial events are cumulative (each one is longer than the previous)
         for i in range(1, len(partial_events)):
             assert len(partial_events[i].message) >= len(partial_events[i - 1].message)
 
-        # Final event has parsed message and attachments
         final = final_events[0]
         assert "report" in final.message.lower() or "done" in final.message.lower()
         assert len(final.attachments) == 1
         assert final.attachments[0].filepath == "/home/ubuntu/report.md"
         assert final.partial is False
-
-        # DoneEvent should be present
-        done_events = [e for e in queued_events if isinstance(e, DoneEvent)]
-        assert len(done_events) == 1
-
-        # State events should be empty (all emitted via queue)
-        assert result.get("events", []) == []
 
 
 class TestExecutorMessageBranching:

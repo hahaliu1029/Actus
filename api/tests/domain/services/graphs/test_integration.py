@@ -1,17 +1,14 @@
 """Integration test: full flow from message -> events via LangGraph."""
 
-import json
-
 import pytest
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.domain.models.app_config import AgentConfig
-from app.domain.models.event import BaseEvent, DoneEvent, PlanEvent, MessageEvent, TitleEvent
+from app.domain.models.event import PlanEvent, MessageEvent, TitleEvent
 from app.domain.models.llm_responses import PlanResponse, StepDef
 from app.domain.models.memory import Memory
 from app.domain.models.message import Message
@@ -72,7 +69,12 @@ class TestFullFlowIntegration:
     async def test_flow_produces_plan_and_done_events(
         self, mock_llm, mock_uow,
     ):
-        """PlannerReActFlow.invoke() should yield Plan + Message + Done events."""
+        """PlannerReActFlow.invoke() should yield Title + Plan + Message events and defer final state.
+
+        Note: DoneEvent is emitted by agent_task_runner._do_postprocess, not by the flow itself.
+        After a normal completion, the flow stores the final graph state in _deferred_final_state
+        for the runner's postprocess path.
+        """
         flow = PlannerReActFlow(
             _allow_default_prompt_assembler=True,
             uow_factory=MagicMock(return_value=mock_uow),
@@ -95,8 +97,8 @@ class TestFullFlowIntegration:
         # Should have at least some events
         assert len(events) > 0
 
-        # Must have a DoneEvent at the end
-        assert any(isinstance(e, DoneEvent) for e in events)
+        # Final state must be deferred to the runner's postprocess path
+        assert flow._deferred_final_state is not None
 
         # Should have a PlanEvent (plan was created)
         plan_events = [e for e in events if isinstance(e, PlanEvent)]
@@ -113,7 +115,10 @@ class TestFullFlowIntegration:
     async def test_flow_updates_plan_after_completion(
         self, mock_llm, mock_uow,
     ):
-        """After invoke(), flow.plan should be set and flow.done should be True."""
+        """After invoke() + _persist_after_graph, flow.plan should be set and flow.done should be True.
+
+        The runner calls _persist_after_graph in _do_postprocess; this test mirrors that contract.
+        """
         flow = PlannerReActFlow(
             _allow_default_prompt_assembler=True,
             uow_factory=MagicMock(return_value=mock_uow),
@@ -136,7 +141,11 @@ class TestFullFlowIntegration:
         async for event in flow.invoke(Message(message="do something")):
             events.append(event)
 
-        # Plan should be set after execution
+        # Runner's postprocess path assigns the plan via _persist_after_graph
+        await flow._persist_after_graph(
+            flow._deferred_final_state, flow._deferred_summaries,
+        )
+
         assert flow.plan is not None
         assert flow.plan.title == "Integration Test Plan"
         assert flow.done is True
@@ -144,7 +153,7 @@ class TestFullFlowIntegration:
     async def test_skill_context_passed_through(
         self, mock_llm, mock_uow,
     ):
-        """Skill context should be accessible in the flow."""
+        """Skill context should be accessible in the flow and the flow should complete normally."""
         flow = PlannerReActFlow(
             _allow_default_prompt_assembler=True,
             uow_factory=MagicMock(return_value=mock_uow),
@@ -167,4 +176,6 @@ class TestFullFlowIntegration:
         async for event in flow.invoke(Message(message="calculate 2+2")):
             events.append(event)
 
-        assert any(isinstance(e, DoneEvent) for e in events)
+        # Flow should complete normally: final state deferred, no interrupt
+        assert flow._deferred_final_state is not None
+        assert not flow._deferred_final_state.get("should_interrupt")
