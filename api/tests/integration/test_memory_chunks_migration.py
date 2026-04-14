@@ -28,6 +28,20 @@ def sample_chunk() -> MemoryChunkModel:
     )
 
 
+async def _ensure_user(db_session, user_id: str) -> None:
+    await db_session.execute(
+        text("INSERT INTO users (id) VALUES (:uid) ON CONFLICT DO NOTHING"),
+        {"uid": user_id},
+    )
+
+
+async def _ensure_session(db_session, session_id: str) -> None:
+    await db_session.execute(
+        text("INSERT INTO sessions (id) VALUES (:sid) ON CONFLICT DO NOTHING"),
+        {"sid": session_id},
+    )
+
+
 class TestMemoryChunksTable:
     async def test_vector_extension_exists(self, db_session):
         result = await db_session.execute(
@@ -36,6 +50,8 @@ class TestMemoryChunksTable:
         assert result.scalar() == 1
 
     async def test_insert_and_read(self, db_session, sample_chunk):
+        await _ensure_user(db_session, sample_chunk.user_id)
+        await _ensure_session(db_session, sample_chunk.session_id)
         db_session.add(sample_chunk)
         await db_session.flush()
 
@@ -56,6 +72,7 @@ class TestMemoryChunksTable:
             source="session_flush",
             embedding=embedding,
         )
+        await _ensure_user(db_session, chunk.user_id)
         db_session.add(chunk)
         await db_session.flush()
 
@@ -75,13 +92,15 @@ class TestMemoryChunksTable:
             source="session_flush",
             embedding=wrong_dim_embedding,
         )
+        await _ensure_user(db_session, chunk.user_id)
         db_session.add(chunk)
-        with pytest.raises(sa.exc.DBAPIError):
+        with pytest.raises(sa.exc.StatementError, match="expected 512 dimensions"):
             await db_session.flush()
 
     async def test_cosine_distance_query(self, db_session):
         """Verify HNSW index supports cosine distance queries."""
         user_id = str(uuid.uuid4())
+        await _ensure_user(db_session, user_id)
         # Insert two chunks with different embeddings
         for i, hash_char in enumerate(["a", "b"]):
             emb = [0.0] * MEMORY_EMBEDDING_DIM
@@ -122,6 +141,7 @@ class TestMemoryChunksTable:
             content_hash="d4c3b2a1" * 8,
             source="manual",
         )
+        await _ensure_user(db_session, chunk.user_id)
         db_session.add(chunk)
         await db_session.flush()
 
@@ -131,6 +151,8 @@ class TestMemoryChunksTable:
 
     async def test_dedup_constraint(self, db_session, sample_chunk):
         """Same user + content_hash should be rejected."""
+        await _ensure_user(db_session, sample_chunk.user_id)
+        await _ensure_session(db_session, sample_chunk.session_id)
         db_session.add(sample_chunk)
         await db_session.flush()
 
@@ -147,6 +169,8 @@ class TestMemoryChunksTable:
 
     async def test_different_user_same_hash_ok(self, db_session, sample_chunk):
         """Different user with same content_hash should succeed."""
+        await _ensure_user(db_session, sample_chunk.user_id)
+        await _ensure_session(db_session, sample_chunk.session_id)
         db_session.add(sample_chunk)
         await db_session.flush()
 
@@ -157,6 +181,7 @@ class TestMemoryChunksTable:
             content_hash=sample_chunk.content_hash,
             source="session_flush",
         )
+        await _ensure_user(db_session, other_user_chunk.user_id)
         db_session.add(other_user_chunk)
         await db_session.flush()  # should succeed
 

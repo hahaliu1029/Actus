@@ -5,7 +5,7 @@ from app.domain.services.confirmation_manager import ConfirmationManager, Confir
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class TestConfirmationManager:

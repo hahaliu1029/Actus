@@ -5,6 +5,10 @@ import {
   useSessionStore,
 } from "../session-store";
 import type { SessionEventRecord } from "../session-store";
+import type { sessionApi } from "../../api/session";
+import type { ChatParams, SSEEventHandler } from "../../api/types";
+
+type SessionApi = typeof sessionApi;
 
 vi.mock("../../api/session", () => ({
   sessionApi: {
@@ -341,16 +345,23 @@ describe("recoverSession", () => {
 describe("stream disconnect recovery with streamConnected + sawTerminalEvent", () => {
   // Helper: mock sessionApi.chat capturing all callbacks including onConnected (6th arg)
   type ChatCallbacks = {
-    onEvent: (event: any) => void;
+    onEvent: SSEEventHandler;
     onError: (error: Error) => void;
     onClose: () => void;
     onConnected: () => void;
   };
 
-  function mockChat(sessionApi: any, simulateConnected: boolean): ChatCallbacks {
+  function mockChat(api: SessionApi, simulateConnected: boolean): ChatCallbacks {
     const cbs = {} as ChatCallbacks;
-    (sessionApi.chat as ReturnType<typeof vi.fn>).mockImplementation(
-      (_sid: string, _params: any, onEvent: any, onError: any, onClose: any, onConnected: any) => {
+    (api.chat as ReturnType<typeof vi.fn>).mockImplementation(
+      (
+        _sid: string,
+        _params: ChatParams,
+        onEvent: SSEEventHandler,
+        onError: (error: Error) => void,
+        onClose: () => void,
+        onConnected: () => void
+      ) => {
         cbs.onEvent = onEvent;
         cbs.onError = onError;
         cbs.onClose = onClose;
@@ -408,7 +419,10 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
     });
 
     await useSessionStore.getState().sendChat("s1", {});
-    cbs.onEvent({ type: "message", data: { role: "assistant", stream_id: "s-1" } });
+    cbs.onEvent({
+      type: "message",
+      data: { role: "assistant", stream_id: "s-1", message: "", attachments: [] },
+    });
     cbs.onClose();
 
     await vi.advanceTimersByTimeAsync(3000);
@@ -443,7 +457,10 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
     const setMessageSpy = vi.spyOn(useUIStore.getState(), "setMessage");
 
     await useSessionStore.getState().sendChat("s1", {});
-    cbs.onEvent({ type: "message", data: { role: "assistant", stream_id: "s-1" } });
+    cbs.onEvent({
+      type: "message",
+      data: { role: "assistant", stream_id: "s-1", message: "", attachments: [] },
+    });
     cbs.onError(new Error("network disconnect"));
     cbs.onClose();
 
@@ -462,7 +479,20 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
     const cbs = mockChat(sessionApi, true);
 
     await useSessionStore.getState().sendChat("s1", {});
-    cbs.onEvent({ type: "tool_confirmation", data: { tool_call_id: "tc-1" } });
+    cbs.onEvent({
+      type: "tool_confirmation",
+      data: {
+        tool_call_id: "tc-1",
+        tool_name: "shell_execute",
+        tool_args: {},
+        risk_level: "high",
+        risk_reason: "",
+        matched_patterns: [],
+        suggested_alternative: null,
+        approval_options: [],
+        timeout_seconds: 60,
+      },
+    });
     cbs.onClose();
 
     await vi.advanceTimersByTimeAsync(3000);

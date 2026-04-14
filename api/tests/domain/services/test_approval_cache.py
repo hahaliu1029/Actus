@@ -6,7 +6,7 @@ from app.domain.models.tool_approval_rule import ToolApprovalRule
 
 def _run(coro):
     """Run an async coroutine synchronously — no pytest-asyncio needed."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class TestApprovalCache:

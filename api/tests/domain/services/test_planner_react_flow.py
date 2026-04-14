@@ -213,6 +213,7 @@ async def test_ensure_graphs_builds_tools_lazily(mock_llm, mock_uow):
 
     flow = _make_flow(mock_llm, mock_uow,
                       mcp_tool=mock_mcp, a2a_tool=mock_a2a)
+    flow._allow_default_prompt_assembler = True
 
     # Configure always_bind so MCP tools are queried during _ensure_graphs
     flow._mcp_always_bind_names = {"notion_search"}
@@ -237,6 +238,7 @@ async def test_ensure_graphs_passes_tool_result_max_chars(mock_llm, mock_uow):
 
     overflow = ContextOverflowConfig(tool_result_max_chars=4000)
     flow = _make_flow(mock_llm, mock_uow, overflow_config=overflow)
+    flow._allow_default_prompt_assembler = True
 
     with patch(
         "app.domain.services.flows.planner_react.build_react_graph",
