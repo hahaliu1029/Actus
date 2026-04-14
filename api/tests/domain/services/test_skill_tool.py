@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 
 import pytest
 
@@ -115,6 +116,89 @@ def _build_native_skill(
             ],
         },
         installed_by="admin-1",
+    )
+
+
+def _build_skill_with_tools(
+    *,
+    slug: str,
+    tool_names: list[str],
+    skill_id: str | None = None,
+) -> Skill:
+    """Factory for tests that need skills with a custom set of tool names.
+
+    Unlike ``_build_native_skill`` (hardcoded single "run_demo" tool), this
+    builder constructs a manifest with one entry per name in ``tool_names``,
+    each with a minimal parameters schema. Used by the atomicity tests to
+    verify behavior across multi-tool / multi-skill scenarios.
+    """
+    return Skill(
+        id=skill_id or f"{slug}--test",
+        slug=slug,
+        name=f"Demo {slug}",
+        source_type=SkillSourceType.GITHUB,
+        source_ref=f"github:test/{slug}",
+        runtime_type=SkillRuntimeType.NATIVE,
+        manifest={
+            "name": f"Demo {slug}",
+            "runtime_type": "native",
+            "skill_md": f"# {slug}\nTest skill.",
+            "bundle_file_count": 0,
+            "last_sync_at": "v1",
+            "tools": [
+                {
+                    "name": name,
+                    "description": f"Tool {name}",
+                    "parameters": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "entry": {
+                        "exec_dir": "/home/ubuntu/workspace",
+                        "command": f"echo {name}",
+                    },
+                }
+                for name in tool_names
+            ],
+        },
+        installed_by="admin-1",
+    )
+
+
+def _snapshot_skill_tool(st: SkillTool) -> dict:
+    """Capture SkillTool's 5 mutable state fields for atomicity assertions.
+
+    Used by the atomicity tests to verify that a failing initialize() call
+    leaves the internal state exactly equal to its pre-call value. Uses
+    ``copy.deepcopy`` on nested structures so that post-call mutation of
+    the live state cannot retroactively taint the snapshot.
+    """
+    return {
+        "skills": list(st._skills),
+        "tools": copy.deepcopy(st._tools),
+        "bindings": copy.deepcopy(st._tool_bindings),
+        "name_index": dict(st._tool_name_index),
+        "tools_cache": list(st._tools_cache) if st._tools_cache is not None else None,
+    }
+
+
+def _assert_skill_tool_matches(st: SkillTool, snap: dict) -> None:
+    """Assert SkillTool's 5 mutable fields equal a prior snapshot."""
+    assert [s.id for s in st._skills] == [s.id for s in snap["skills"]]
+    assert st._tools == snap["tools"]
+    assert st._tool_bindings == snap["bindings"]
+    assert st._tool_name_index == snap["name_index"]
+    assert st._tools_cache == snap["tools_cache"]
+
+
+def _make_bare_skill_tool() -> SkillTool:
+    """Construct a minimal SkillTool for atomicity tests.
+
+    Returns a SkillTool with fresh fake sandbox/mcp/a2a tools. Does NOT call
+    initialize() — callers control initialization order to exercise atomicity.
+    """
+    return SkillTool(
+        sandbox=_FakeSandbox(),
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
     )
 
 
@@ -350,3 +434,201 @@ async def test_skill_tool_normalizes_and_shortens_function_name() -> None:
     assert len(function_name) <= 64
     assert "/" not in function_name
     assert "-" not in function_name
+
+
+# ----- #27: SkillTool.initialize() atomicity — success-path (I3) ----- #
+
+
+async def test_initialize_atomicity_replaces_empty_state() -> None:
+    """I3: initialize on empty SkillTool populates all 5 fields."""
+    skill_tool = _make_bare_skill_tool()
+    s1 = _build_skill_with_tools(slug="sa", tool_names=["t1", "t2"])
+
+    await skill_tool.initialize([s1])
+
+    assert len(skill_tool._tools) == 2
+    assert "skill_sa_t1" in skill_tool._tool_bindings
+    assert "skill_sa_t2" in skill_tool._tool_bindings
+    assert skill_tool._tool_name_index["skill_sa_t1"] == 1
+    assert skill_tool._tool_name_index["skill_sa_t2"] == 1
+    assert skill_tool._tools_cache == skill_tool._tools
+
+
+async def test_initialize_atomicity_replaces_populated_state() -> None:
+    """I3: initialize with new skills replaces old state wholesale."""
+    skill_tool = _make_bare_skill_tool()
+    s1 = _build_skill_with_tools(slug="sa", tool_names=["t1"])
+    await skill_tool.initialize([s1])
+
+    s2 = _build_skill_with_tools(slug="sb", tool_names=["t2"])
+    await skill_tool.initialize([s2])
+
+    # sa binding is gone
+    assert "skill_sa_t1" not in skill_tool._tool_bindings
+    # sb binding is present
+    assert "skill_sb_t2" in skill_tool._tool_bindings
+    # name index does not carry sa's counter
+    assert "skill_sa_t1" not in skill_tool._tool_name_index
+    assert skill_tool._tool_name_index["skill_sb_t2"] == 1
+
+
+async def test_initialize_atomicity_to_empty_clears_state() -> None:
+    """I3: initialize([]) clears all 5 fields."""
+    skill_tool = _make_bare_skill_tool()
+    s1 = _build_skill_with_tools(slug="sa", tool_names=["t1"])
+    await skill_tool.initialize([s1])
+
+    await skill_tool.initialize([])
+
+    assert skill_tool._skills == []
+    assert skill_tool._tools == []
+    assert skill_tool._tool_bindings == {}
+    assert skill_tool._tool_name_index == {}
+    assert skill_tool._tools_cache == []
+
+
+# ----- #27: SkillTool.initialize() atomicity — failure-path (I1) ----- #
+
+
+async def test_initialize_atomicity_preserves_state_on_tool_description_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I1: exception from _build_tool_description mid-loop preserves state.
+
+    _build_tool_description has a stable signature (skill, manifest_tool)
+    across #27, so this test gives a clean RED against current code.
+    """
+    skill_tool = _make_bare_skill_tool()
+    s_good = _build_skill_with_tools(slug="good", tool_names=["t1"])
+    await skill_tool.initialize([s_good])
+    pre_call_snap = _snapshot_skill_tool(skill_tool)
+
+    def raising_description(self, skill, manifest_tool):
+        raise RuntimeError("simulated description-build failure")
+
+    monkeypatch.setattr(
+        SkillTool, "_build_tool_description", raising_description
+    )
+
+    s_bad = _build_skill_with_tools(slug="bad", tool_names=["tbad"])
+
+    with pytest.raises(RuntimeError, match="simulated description-build failure"):
+        await skill_tool.initialize([s_good, s_bad])
+
+    _assert_skill_tool_matches(skill_tool, pre_call_snap)
+    # Previously-valid tool is still invocable
+    assert skill_tool.has_tool("skill_good_t1") is True
+
+
+async def test_initialize_atomicity_preserves_state_on_is_model_invocable_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I1: exception from _is_model_invocable mid-loop preserves state.
+
+    Simulates a real-world failure mode: a manifest with unexpected policy
+    shape that triggers AttributeError inside _is_model_invocable.
+    _is_model_invocable has a stable signature across #27.
+    """
+    skill_tool = _make_bare_skill_tool()
+    s_good = _build_skill_with_tools(slug="good", tool_names=["t1"])
+    await skill_tool.initialize([s_good])
+    pre_call_snap = _snapshot_skill_tool(skill_tool)
+
+    def raising_invocable(self, skill, manifest_tool):
+        raise AttributeError("simulated is_model_invocable failure")
+
+    monkeypatch.setattr(SkillTool, "_is_model_invocable", raising_invocable)
+
+    s_bad = _build_skill_with_tools(slug="bad", tool_names=["tbad"])
+
+    with pytest.raises(AttributeError, match="simulated is_model_invocable failure"):
+        await skill_tool.initialize([s_good, s_bad])
+
+    _assert_skill_tool_matches(skill_tool, pre_call_snap)
+
+
+async def test_initialize_atomicity_preserves_state_on_build_function_name_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I1: exception from _build_function_name mid-loop preserves pre-call state.
+
+    Added in Task 5 (not Task 4) because _build_function_name signature was
+    changed in Task 5's refactor — a test with the new signature would have
+    TypeError'd against the old call site.
+    """
+    skill_tool = _make_bare_skill_tool()
+    s_good = _build_skill_with_tools(slug="good", tool_names=["t1"])
+    await skill_tool.initialize([s_good])
+    pre_call_snap = _snapshot_skill_tool(skill_tool)
+
+    def raising_build(self, skill_slug, tool_name, name_index):
+        raise RuntimeError("simulated name-build failure")
+
+    monkeypatch.setattr(SkillTool, "_build_function_name", raising_build)
+
+    s_bad = _build_skill_with_tools(slug="bad", tool_names=["tbad"])
+
+    with pytest.raises(RuntimeError, match="simulated name-build failure"):
+        await skill_tool.initialize([s_good, s_bad])
+
+    _assert_skill_tool_matches(skill_tool, pre_call_snap)
+    assert skill_tool.has_tool("skill_good_t1") is True
+
+
+async def test_initialize_atomicity_no_intermediate_state_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I2 static verification: a helper called mid-loop cannot observe
+    an intermediate view of self._* fields.
+
+    This is not a concurrency test (asyncio body has no await), but a
+    structural guardrail: if a future refactor reintroduces in-place
+    mutation, this test catches it by recording what get_tools() would
+    see at the moment _build_function_name runs inside the loop.
+    """
+    skill_tool = _make_bare_skill_tool()
+    s_old = _build_skill_with_tools(slug="old", tool_names=["t_old"])
+    await skill_tool.initialize([s_old])
+
+    observed: list[dict] = []
+    original = SkillTool._build_function_name
+
+    def observing_build(self, skill_slug, tool_name, name_index):
+        observed.append(
+            {
+                "tools_len": len(self._tools),
+                "bindings_len": len(self._tool_bindings),
+                "tools_cache_len": len(self._tools_cache or []),
+            }
+        )
+        return original(self, skill_slug, tool_name, name_index)
+
+    monkeypatch.setattr(SkillTool, "_build_function_name", observing_build)
+
+    s_new = _build_skill_with_tools(slug="new", tool_names=["t_new"])
+    await skill_tool.initialize([s_new])
+
+    # Mid-loop observation MUST still show the OLD state (not a half-
+    # built new state). Under build-in-locals + batch assign, this holds
+    # trivially because self._* is only reassigned after the loop ends.
+    assert len(observed) == 1
+    assert observed[0]["tools_len"] == 1  # old: 1 tool [t_old]
+    assert observed[0]["bindings_len"] == 1
+    assert observed[0]["tools_cache_len"] == 1
+
+
+async def test_cleanup_clears_all_five_fields() -> None:
+    """cleanup() symmetrically clears all 5 fields covered by the
+    atomicity contract (#27). Pre-#27 cleanup missed _tool_name_index."""
+    skill_tool = _make_bare_skill_tool()
+    s1 = _build_skill_with_tools(slug="sa", tool_names=["t1", "t2"])
+    await skill_tool.initialize([s1])
+    assert len(skill_tool._tools) == 2  # sanity
+
+    await skill_tool.cleanup()
+
+    assert skill_tool._skills == []
+    assert skill_tool._tools == []
+    assert skill_tool._tool_bindings == {}
+    assert skill_tool._tool_name_index == {}
+    assert skill_tool._tools_cache == []

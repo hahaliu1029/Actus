@@ -3,6 +3,7 @@ from typing import TypeVar
 
 from .file_repository import FileRepository
 from .session_repository import SessionRepository
+from .tool_approval_log_repository import ToolApprovalLogRepository
 
 T = TypeVar("T", bound="IUnitOfWork")
 
@@ -12,6 +13,7 @@ class IUnitOfWork(ABC):
 
     file: FileRepository
     session: SessionRepository
+    tool_approval_log: ToolApprovalLogRepository
 
     @abstractmethod
     async def commit(self):

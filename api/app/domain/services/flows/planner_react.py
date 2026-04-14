@@ -7,7 +7,11 @@ so that AgentTaskRunner requires minimal changes.
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional, Sequence
+
+if TYPE_CHECKING:
+    from app.domain.services.prompts.assembler import PromptAssembler
+
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -86,6 +90,13 @@ class PlannerReActFlow(BaseFlow):
         supports_vision: bool = True,
         supports_pdf_input: bool = False,
         file_processor_lookup: Any = None,  # FileProcessorLookup | None
+        memory_embedding_provider=None,
+        memory_session_factory=None,
+        memory_repo_factory=None,
+        approval_cache: Any = None,  # ApprovalCache | None
+        confirmation_manager: Any = None,  # ConfirmationManager | None
+        prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
+        _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
     ) -> None:
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
@@ -93,6 +104,8 @@ class PlannerReActFlow(BaseFlow):
         self._uow_factory = uow_factory
         self._session_id = session_id
         self._summary_llm = summary_llm or llm
+        self._deferred_final_state: dict | None = None
+        self._deferred_summaries: list | None = None
         self.status = FlowStatus.IDLE
         self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
@@ -110,7 +123,6 @@ class PlannerReActFlow(BaseFlow):
             token_safety_factor=self._overflow_config.token_safety_factor,
         ) if self._overflow_config else None
         self._last_compaction_result: CompactionResult | None = None
-        self._skill_context = ""
 
         # Skill creation subgraph
         self._user_id = user_id
@@ -136,11 +148,43 @@ class PlannerReActFlow(BaseFlow):
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
         self._checkpointer_pool = checkpointer_pool
         self._assembler = None
+        # B5 C5b: PromptAssembler instance for section-based system prompt
+        # assembly. Consumed by main_graph executor/planner/updater nodes
+        # and by ``_run_planner_for_detection``. Constructed by
+        # ``AgentTaskRunner`` and passed in at flow construction time.
+        self._prompt_assembler = prompt_assembler
+        # B5 post-audit (HIGH #1): test-only escape hatch matching the
+        # ``build_main_graph`` contract. When True AND
+        # ``prompt_assembler is None``, both the graph construction path
+        # and the detection-path planner silently build a minimal default
+        # assembler; production callers (``AgentTaskRunner``) always pass
+        # a configured instance and leave this False.
+        self._allow_default_prompt_assembler = _allow_default_prompt_assembler
 
         # Phase 3: 动态 skill 切换回调（由 AgentTaskRunner 在 invoke 前设置）
         self._skill_context_refresher = None
         self._react_graph_provider = None
         self._skill_guide_injector = None
+        # TODO #30: provider returning runner's current _last_skill_context.
+        # Replaces the ``self._skill_context`` instance field (clock 2) that
+        # bypass paths used to set via ``set_skill_context``. Read points are:
+        # (a) ``_run_planner_for_detection`` detection_state
+        # (b) ``input_for_graph["skill_context"]`` at invoke time (two branches)
+        # Wired by ``AgentTaskRunner`` in the invoke main loop L2590 block.
+        # Returns ``""`` when not wired (test harness / pre-wiring).
+        #
+        # NOTE: this is a narrow replacement for clock 2 field only. The LangGraph
+        # ``state.skill_context`` field + ``_skill_context_refresher`` fallback
+        # path + ``updater_node`` refresher block are NOT retired in this spec —
+        # they stay alive because the resume path relies on them.
+        # See spec §1.4 / §6.3.
+        self._skill_context_provider: Callable[[], str] | None = None
+        # B5 post-audit LOW #1: optional language_callback set by
+        # AgentTaskRunner. main_graph.planner_node calls it via
+        # configurable["language_callback"](plan.language) after parsing
+        # the planner output so downstream telemetry picks up the real
+        # session language. None = feature disabled (test paths).
+        self._language_callback: "Callable[[str], None] | None" = None
 
         # 会话 Skill 池 getter（由 AgentTaskRunner 在 run() 中设置），
         # 用于 get_skill_guide 工具按需加载完整 SKILL.md。
@@ -157,6 +201,29 @@ class PlannerReActFlow(BaseFlow):
         # Flush scheduling: cursor + pending batch
         self._flush_cursor: int = 0
         self._pending_flush_batch: FlushBatch | None = None
+
+        # Memory tools dependencies (C6)
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
+        self._has_memory_tools = False  # set by _collect_all_tools
+
+        # Dangerous tool approval cache (Task 17)
+        self._approval_cache = approval_cache
+        self._confirmation_manager = confirmation_manager
+
+        # D5: Execution health monitoring — persist across invoke/resume
+        self._execution_config = agent_config.execution
+        from app.domain.services.tools.tool_failure_tracker import ToolFailureTracker
+        from app.domain.services.execution_metrics import ExecutionMetrics
+        self._tool_failure_tracker = ToolFailureTracker(
+            max_same_failures=self._execution_config.max_same_tool_failures,
+        )
+        self._execution_metrics = ExecutionMetrics()
+
+    @property
+    def summary_llm(self):
+        return self._summary_llm
 
     async def _get_checkpointer(self):
         """Lazy-initialize checkpointer.
@@ -178,9 +245,17 @@ class PlannerReActFlow(BaseFlow):
         """Release checkpointer reference. Pool connections are managed by the pool."""
         self._checkpointer = None
 
-    def set_skill_context(self, skill_context: str) -> None:
-        """Set activated skill context for this round."""
-        self._skill_context = skill_context
+    def _get_skill_context_seed(self) -> str:
+        """Return the current skill context string from the runner callback.
+
+        Used by ``_run_planner_for_detection`` and ``invoke()``'s
+        ``input_for_graph`` construction to seed the skill_context value.
+        Returns ``""`` when the provider is not wired (test scenarios
+        that construct ``PlannerReActFlow`` without a runner).
+        """
+        if self._skill_context_provider is None:
+            return ""
+        return self._skill_context_provider()
 
     # -- Tool collection sub-methods ------------------------------------------
 
@@ -240,10 +315,24 @@ class PlannerReActFlow(BaseFlow):
             ))
         return tools
 
+    def _collect_memory_tools(self) -> list:
+        """Create memory search/get tools if dependencies are available."""
+        if not (self._memory_session_factory and self._memory_repo_factory):
+            return []
+        from app.domain.services.tools.memory_tools import create_memory_tools
+        return create_memory_tools(
+            embedding_provider=self._memory_embedding_provider,
+            session_factory=self._memory_session_factory,
+            repo_factory=self._memory_repo_factory,
+            user_id=self._user_id,
+            half_life_days=self._memory_config.half_life_days,
+            mmr_lambda=self._memory_config.mmr_lambda,
+        )
+
     async def _collect_all_tools(self) -> list:
         """Aggregate all tool categories for initial graph build.
 
-        Order: native -> MCP -> A2A -> skill creation.
+        Order: native -> MCP -> A2A -> skill creation -> memory.
         Dynamic Skill tools are NOT included here — they are injected
         per-step by react_graph_provider.
         """
@@ -252,6 +341,8 @@ class PlannerReActFlow(BaseFlow):
         tools.extend(await self._collect_mcp_tools())
         tools.extend(self._collect_a2a_tools())
         tools.extend(self._collect_skill_creation_tools())
+        tools.extend(self._collect_memory_tools())
+        self._has_memory_tools = any(t.name in ("memory_search", "memory_get") for t in tools)
         return tools
 
     # -- Graph construction ---------------------------------------------------
@@ -280,19 +371,32 @@ class PlannerReActFlow(BaseFlow):
         # Context assembler (B2)
         from app.domain.services.graphs.context_assembler import ContextAssembler
         from app.domain.services.context.model_context_window import resolve_context_window
+        from app.domain.services.prompts.budget import compute_effective_window
 
         assembler = None
         if self._overflow_config:
-            context_window = resolve_context_window(
+            total_context_window = resolve_context_window(
                 self._overflow_config.model_name, self._overflow_config,
+            )
+            # B5 C9: compute the effective history window by subtracting the
+            # system prompt budget and the reserved output allocation. Both
+            # ``ContextAssembler`` (here) and ``GradualCompactor.try_compact``
+            # (in ``_check_overflow``) read this via the same helper so their
+            # budgets stay in sync.
+            effective_window = compute_effective_window(
+                total_context_window=total_context_window,
+                system_prompt_max_tokens=self._overflow_config.system_prompt_max_tokens,
+                reserved_output_tokens=self._overflow_config.reserved_output_tokens,
             )
             assembler = ContextAssembler(
                 estimator=TokenEstimator(
                     strategy=self._overflow_config.token_estimator,
                     model_name=self._overflow_config.model_name,
                 ),
-                context_window=context_window,
-                reserved_output_tokens=self._overflow_config.reserved_output_tokens,
+                effective_window=effective_window,
+                # B5 C9: reserved_output_tokens is NOT passed here in the
+                # new-API path — compute_effective_window already subtracted
+                # it when deriving effective_window.
                 safety_factor=self._overflow_config.token_safety_factor,
                 tool_compress_trigger_ratio=self._overflow_config.tool_compress_trigger_ratio,
             )
@@ -315,7 +419,9 @@ class PlannerReActFlow(BaseFlow):
             agent_config=self._agent_config,
             checkpointer=checkpointer,
             assembler=assembler,
+            prompt_assembler=self._prompt_assembler,
             supports_vision=self._supports_vision,
+            _allow_default_prompt_assembler=self._allow_default_prompt_assembler,
         )
         self._graphs_built = True
 
@@ -399,13 +505,15 @@ class PlannerReActFlow(BaseFlow):
         self, existing: list[ConversationSummary], plan: Plan,
     ) -> ConversationSummary:
         """调用 LLM 生成结构化对话摘要。"""
-        from app.domain.services.prompts.summary import GENERATE_SUMMARY_PROMPT
+        from app.domain.services.prompts import get_prompt_bundle
+
+        bundle = get_prompt_bundle(getattr(plan, "language", "zh"))
         steps_summary = "\n".join(
             f"- {s.description}: {'完成' if s.status == ExecutionStatus.COMPLETED else '未完成'}"
             + (f"\n  结果: {s.result[:200]}" if s.result else "")
             for s in plan.steps
         )
-        prompt = GENERATE_SUMMARY_PROMPT.format(
+        prompt = bundle.GENERATE_SUMMARY_PROMPT.format(
             round_number=len(existing) + 1,
             plan_goal=plan.goal,
             steps_summary=steps_summary,
@@ -430,12 +538,22 @@ class PlannerReActFlow(BaseFlow):
             return None
         # _compactor is always non-None when _overflow_config is non-None (see __init__)
         from app.domain.services.context.model_context_window import resolve_context_window
-        msgs = dicts_to_messages(memory.messages)
-        window = resolve_context_window(self._overflow_config.model_name, self._overflow_config)
 
+        msgs = dicts_to_messages(memory.messages)
+        total_window = resolve_context_window(
+            self._overflow_config.model_name, self._overflow_config
+        )
+        # B5 C9: pass the TOTAL context window to GradualCompactor, not the
+        # effective window. The compactor's soft/hard trigger ratios (0.85 /
+        # 0.95) are calibrated against the full model context — feeding it
+        # the effective_window would shift thresholds earlier and cause
+        # premature hard-compaction in the 0.85 - 0.95 utilization band.
+        # The assembler still uses effective_window (see _build_graphs) —
+        # both layers derive from the same config, but each uses the
+        # appropriate input for its internal math.
         result = await self._compactor.try_compact(
             messages=msgs,
-            context_window=window,
+            context_window=total_window,
             summary_llm=self._summary_llm,
         )
 
@@ -607,14 +725,19 @@ class PlannerReActFlow(BaseFlow):
         creation subgraph or normal main_graph flow. The plan is reused by
         main_graph (skipping planner_node) to avoid double LLM calls.
         """
-        from app.domain.services.prompts.planner import (
-            PLANNER_SYSTEM_PROMPT,
-            CREATE_PLAN_PROMPT,
+        from app.domain.services.prompts import (
+            get_prompt_bundle,
+            get_prompt_section_bundle,
         )
+        from app.domain.services.prompts.render_context import build_render_context
+        from app.domain.services.prompts.section import PromptMode
+
+        bundle = get_prompt_bundle(message.language)
+        lang = message.language
 
         attachments = getattr(message, "attachments", [])
         image_blocks = getattr(message, "image_content_blocks", [])
-        prompt = CREATE_PLAN_PROMPT.format(
+        prompt = bundle.CREATE_PLAN_PROMPT.format(
             message=message.message,
             attachments=format_attachments_text(
                 attachments, has_image_blocks=bool(image_blocks), for_planner=True,
@@ -622,17 +745,57 @@ class PlannerReActFlow(BaseFlow):
             ),
         )
 
-        system_content = PLANNER_SYSTEM_PROMPT
+        # B5 C7.5 + post-audit MEDIUM #2: PromptAssembler is the single code
+        # path. This call site is OUTSIDE the main graph (pre-graph language
+        # detection), so we build a minimal state dict from local fields.
+        # The DI contract mirrors ``build_main_graph``: missing assembler is
+        # a production misconfiguration, test-only paths opt in via
+        # ``_allow_default_prompt_assembler``.
+        if self._prompt_assembler is None:
+            if not self._allow_default_prompt_assembler:
+                raise RuntimeError(
+                    "_run_planner_for_detection requires a PromptAssembler "
+                    "instance. In production, AgentTaskRunner._build_prompt_assembler "
+                    "constructs one and passes it via PlannerReActFlow. If "
+                    "this is a test that needs the default, construct the "
+                    "flow with _allow_default_prompt_assembler=True."
+                )
+            from app.domain.services.graphs.token_estimator import TokenEstimator
+            from app.domain.services.prompts.assembler import (
+                PromptAssembler as _PromptAssemblerImpl,
+            )
+            from app.domain.services.prompts.budget import SystemPromptBudget
 
-        # Inject tool summary (same logic as main_graph planner_node)
-        skill_context = self._skill_context
-        tool_summary_marker = "## Available Tool Summary"
-        if tool_summary_marker in skill_context:
-            tool_summary = skill_context[skill_context.index(tool_summary_marker):]
-            system_content += f"\n\n{tool_summary}"
-
-        if summary_texts:
-            system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(summary_texts)
+            logger.warning(
+                "PlannerReActFlow._run_planner_for_detection: "
+                "prompt_assembler is None and _allow_default_prompt_assembler=True — "
+                "constructing a minimal default. This path is intended for "
+                "tests only; production should always inject a configured "
+                "PromptAssembler via AgentTaskRunner."
+            )
+            self._prompt_assembler = _PromptAssemblerImpl(
+                budget=SystemPromptBudget(max_tokens=3500),
+                token_estimator=TokenEstimator(strategy="hybrid"),
+                telemetry=None,
+            )
+        section_bundle = get_prompt_section_bundle(lang)
+        detection_state = {
+            "language": lang,
+            "skill_context": self._get_skill_context_seed(),
+            "conversation_summaries": list(summary_texts),
+        }
+        detection_config = {"configurable": {}}
+        ctx = build_render_context(
+            detection_state, detection_config, self._agent_config
+        )
+        result = self._prompt_assembler.assemble(
+            section_bundle.planner,
+            ctx,
+            PromptMode.FULL,
+            # Detection-path planner has no react_graph_provider by design.
+            fallback_used=False,
+        )
+        system_content = result.text
 
         # Planner 不传图片（同 main_graph.planner_node），避免幻觉图片内容
         messages = [
@@ -650,7 +813,7 @@ class PlannerReActFlow(BaseFlow):
             parsed = PlanResponse(
                 title="Task",
                 goal=message.message,
-                language=getattr(message, "language", "zh"),
+                language=message.language,
                 steps=[StepDef(description=message.message)],
                 message="好的，我来帮你处理。",
             )
@@ -664,7 +827,7 @@ class PlannerReActFlow(BaseFlow):
         plan = Plan(
             title=parsed.title or "Task",
             goal=parsed.goal or message.message,
-            language=parsed.language or getattr(message, "language", "zh"),
+            language=parsed.language or message.language,
             steps=steps,
             message=parsed.message or "",
             status=ExecutionStatus.RUNNING,
@@ -693,6 +856,62 @@ class PlannerReActFlow(BaseFlow):
         text = " ".join(parts).lower()
         return "brainstorm_skill" in text or "generate_skill" in text
 
+    def _build_config(self) -> dict:
+        """Build the LangGraph config dict shared by invoke() and resume()."""
+        from app.domain.services.execution_watchdog import ExecutionControl, ExecutionWatchdog
+
+        # Read tool confirmation settings from AgentConfig (config.yaml, user-editable)
+        tc = getattr(self._agent_config, "tool_confirmation", None)
+        tc_enabled = getattr(tc, "enabled", True) if tc else True
+        tc_timeout = getattr(tc, "timeout_seconds", 300) if tc else 300
+        tc_smart_approve = getattr(tc, "smart_approve_enabled", False) if tc else False
+        tc_smart_approve_medium_only = getattr(tc, "smart_approve_medium_only", False) if tc else False
+
+        # D5: Create fresh watchdog + control per invoke/resume (timer resets).
+        # Tracker + metrics persist on self (survive across invoke/resume).
+        ec = self._execution_config
+        watchdog = ExecutionWatchdog(
+            total_timeout_seconds=ec.total_timeout_seconds,
+            idle_timeout_seconds=ec.idle_timeout_seconds,
+        )
+        control = ExecutionControl()
+
+        return {
+            "configurable": {
+                "thread_id": self._session_id,
+                "skill_context_refresher": self._skill_context_refresher,
+                "react_graph_provider": self._react_graph_provider,
+                "skill_guide_injector": self._skill_guide_injector,
+                "has_file_view": self._file_processor_lookup is not None,
+                "has_memory_tools": self._has_memory_tools,
+                "approval_cache": self._approval_cache,
+                "confirmation_manager": self._confirmation_manager,
+                "user_id": self._user_id,
+                "session_id": self._session_id,
+                "tool_confirmation_enabled": tc_enabled,
+                "smart_approve_enabled": tc_smart_approve,
+                "smart_approve_medium_only": tc_smart_approve_medium_only,
+                "summary_llm": self._summary_llm if hasattr(self, "_summary_llm") else None,
+                "tool_confirmation_timeout_seconds": tc_timeout,
+                # D5: Execution health monitoring
+                "execution_watchdog": watchdog,
+                "execution_control": control,
+                "tool_failure_tracker": self._tool_failure_tracker,
+                "execution_metrics": self._execution_metrics,
+                # B5 C5a: make the LLM adapter and AgentConfig available to
+                # executor_node so PromptAssembler consumers (C5b) can read
+                # provider name / model details without re-injecting via state.
+                # bound_tool_names is NOT injected here — it is per-step and
+                # gets written by react_graph_provider on each call (C5a Phase 3).
+                "llm": self._llm,
+                "agent_config": self._agent_config,
+                # B5 post-audit LOW #1: optional callback for main_graph
+                # nodes to notify the runner of session language changes.
+                # Injected by ``AgentTaskRunner`` before each session start.
+                "language_callback": self._language_callback,
+            }
+        }
+
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """Run the flow — delegates to LangGraph main_graph."""
         # 1. Continuation: existing skill graph state → drive subgraph
@@ -705,16 +924,7 @@ class PlannerReActFlow(BaseFlow):
         # 延迟绑定：每次 invoke 重新构建工具和图，确保 MCP/A2A 已初始化
         await self._ensure_graphs()
 
-        # LangGraph config with thread_id for checkpointer
-        config = {
-            "configurable": {
-                "thread_id": self._session_id,
-                "skill_context_refresher": self._skill_context_refresher,
-                "react_graph_provider": self._react_graph_provider,
-                "skill_guide_injector": self._skill_guide_injector,
-                "has_file_view": self._file_processor_lookup is not None,
-            }
-        }
+        config = self._build_config()
 
         # === Before Graph: load summaries ===
         async with self._uow_factory() as uow:
@@ -738,7 +948,13 @@ class PlannerReActFlow(BaseFlow):
             pass
 
         if is_resume:
-            # Resume path: checkpointer has saved full state, pass user response
+            # Resume path: checkpointer has saved full state, pass user response.
+            # IMPORTANT: If the interrupt was from a tool_confirmation (react_graph
+            # tool_node), the resume value must be a structured dict like
+            # {"action": "approve", "scope": "session"}. Plain text from the user
+            # should NOT be routed here — tool confirmations use the dedicated
+            # _resume_tool_confirmation() path in agent_service.
+            # This path only handles message_ask_user interrupts (plain text is fine).
             input_for_graph = Command(resume=message.message)
             logger.info(
                 "通过 checkpointer 恢复中断: session=%s, resume=%s",
@@ -801,7 +1017,7 @@ class PlannerReActFlow(BaseFlow):
                 # by setting flow_status=executing
                 input_for_graph = {
                     "message": message.message,
-                    "language": getattr(message, "language", "zh"),
+                    "language": message.language,
                     "attachments": getattr(message, "attachments", []),
                     "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": plan,
@@ -814,7 +1030,7 @@ class PlannerReActFlow(BaseFlow):
                     "should_interrupt": False,
                     "resume_value": None,
                     "original_request": plan.goal,
-                    "skill_context": self._skill_context,
+                    "skill_context": self._get_skill_context_seed(),
                     "conversation_summaries": summary_texts,
                 }
                 # Emit pre-computed plan events before bridge
@@ -824,7 +1040,7 @@ class PlannerReActFlow(BaseFlow):
                 # No skill creation tools → normal flow with planner_node
                 input_for_graph = {
                     "message": message.message,
-                    "language": getattr(message, "language", "zh"),
+                    "language": message.language,
                     "attachments": getattr(message, "attachments", []),
                     "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": self.plan,
@@ -837,7 +1053,7 @@ class PlannerReActFlow(BaseFlow):
                     "should_interrupt": False,
                     "resume_value": None,
                     "original_request": self.plan.goal if self.plan else "",
-                    "skill_context": self._skill_context,
+                    "skill_context": self._get_skill_context_seed(),
                     "conversation_summaries": summary_texts,
                 }
 
@@ -851,7 +1067,38 @@ class PlannerReActFlow(BaseFlow):
             #  导致本 async generator 被 aclose()、GeneratorExit 抛入 yield 处）。
             # bridge.run() 的 finally 会 await 图任务完成，
             # 因此此处 bridge.final_state 已包含完整的图输出。
-            await self._persist_after_graph(bridge.final_state, summaries)
+            if bridge.final_state.get("should_interrupt"):
+                # 中断路径：同步持久化（保留原逻辑）
+                await self._persist_after_graph(bridge.final_state, summaries)
+            else:
+                # 正常完成路径：延迟到 invoke() 的 FINISHING 阶段
+                self._deferred_final_state = bridge.final_state
+                self._deferred_summaries = summaries
+
+    async def resume(self, command: Any) -> AsyncGenerator[BaseEvent, None]:
+        """Resume the graph from a pending interrupt using a LangGraph Command.
+
+        The command (e.g. Command(resume=value)) is passed directly as input
+        to the main_graph. The same checkpointer/thread_id config is used so
+        that LangGraph can restore the interrupted state and continue.
+        """
+        await self._ensure_graphs()
+
+        config = self._build_config()
+
+        async with self._uow_factory() as uow:
+            summaries = await uow.session.get_summary(self._session_id)
+
+        bridge = GraphEventBridge()
+        try:
+            async for event in bridge.run(self._main_graph, command, config=config):
+                yield event
+        finally:
+            if bridge.final_state.get("should_interrupt"):
+                await self._persist_after_graph(bridge.final_state, summaries)
+            else:
+                self._deferred_final_state = bridge.final_state
+                self._deferred_summaries = summaries
 
     async def _persist_after_graph(
         self, final: dict, summaries: list[ConversationSummary],
@@ -1008,6 +1255,7 @@ class PlannerReActFlow(BaseFlow):
             target_cursor=current_len,
             chunks=tuple(chunks),
         )
+        self._flush_cursor = current_len  # C5.1: 乐观推进，在 persist 之前生效
 
     def _chunk_messages(
         self,

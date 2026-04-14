@@ -227,10 +227,54 @@ class CompactionEvent(BaseEvent):
     usage_ratio_after: float = 0.0
 
 
+class FinishingEvent(BaseEvent):
+    """主回复完成，进入后台收尾阶段。前端收到后解锁输入框。"""
+
+    type: Literal["finishing"] = "finishing"
+
+
 class DoneEvent(BaseEvent):
     """结束事件类型"""
 
     type: Literal["done"] = "done"
+    metrics: Optional[Dict[str, Any]] = None  # D5: execution metrics snapshot
+
+
+class HealthStatus(str, Enum):
+    """执行健康状态"""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"          # idle timeout 触发，尝试恢复中
+    TERMINATING = "terminating"    # 总超时或恢复失败，正在终止
+    TERMINATED = "terminated"      # 已强制终止
+
+
+class HealthEvent(BaseEvent):
+    """执行健康状态事件"""
+
+    type: Literal["health"] = "health"
+    status: HealthStatus
+    reason: str                         # 用户友好原因
+    last_node: Optional[str] = None     # 最后活跃 graph node
+    idle_seconds: Optional[float] = None
+    tool_failures: int = 0
+    action: str = "monitoring"          # monitoring/soft_recovery/hard_terminate
+    metrics: Optional[Dict[str, Any]] = None
+
+
+class ToolConfirmationEvent(BaseEvent):
+    """危险工具确认请求事件"""
+
+    type: Literal["tool_confirmation"] = "tool_confirmation"
+    tool_call_id: str
+    tool_name: str
+    tool_args: Dict[str, Any]
+    risk_level: str
+    risk_reason: str
+    matched_patterns: List[str]
+    suggested_alternative: Optional[str] = None
+    approval_options: List[str] = Field(default=["once", "session", "always", "deny"])
+    timeout_seconds: int
 
 
 # 定义应用事件类型声明
@@ -246,6 +290,9 @@ Event = Annotated[
         ErrorEvent,
         ContextStatusEvent,
         CompactionEvent,
+        FinishingEvent,
+        HealthEvent,
+        ToolConfirmationEvent,
         DoneEvent,
     ],
     Field(discriminator="type"),

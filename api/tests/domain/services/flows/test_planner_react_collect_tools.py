@@ -1,7 +1,7 @@
 """Characterization tests for PlannerReActFlow tool collection methods."""
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -166,3 +166,55 @@ class TestCollectAllTools:
         assert a2a_last < skill_first, (
             f"A2A should come before skill creation: a2a_last={a2a_last}, skill_first={skill_first}"
         )
+
+
+class TestCollectMemoryTools:
+    """C6: _collect_memory_tools creates memory_search + memory_get."""
+
+    def test_with_memory_deps_returns_two_tools(self) -> None:
+        flow = _make_flow(
+            memory_embedding_provider=AsyncMock(),
+            memory_session_factory=MagicMock(),
+            memory_repo_factory=MagicMock(),
+        )
+        tools = flow._collect_memory_tools()
+        assert len(tools) == 2
+        names = {t.name for t in tools}
+        assert "memory_search" in names
+        assert "memory_get" in names
+
+    def test_without_deps_returns_empty(self) -> None:
+        flow = _make_flow()
+        tools = flow._collect_memory_tools()
+        assert tools == []
+
+    def test_partial_deps_returns_empty(self) -> None:
+        flow = _make_flow(
+            memory_embedding_provider=AsyncMock(),
+            # missing session_factory and repo_factory
+        )
+        tools = flow._collect_memory_tools()
+        assert tools == []
+
+    def test_passes_config_to_create_memory_tools(self) -> None:
+        """_collect_memory_tools should read half_life_days and mmr_lambda from memory_config."""
+        mock_config = MagicMock()
+        mock_config.memory.half_life_days = 60
+        mock_config.memory.mmr_lambda = 0.3
+
+        flow = _make_flow(
+            agent_config=mock_config,
+            memory_embedding_provider=AsyncMock(),
+            memory_session_factory=MagicMock(),
+            memory_repo_factory=MagicMock(),
+        )
+
+        with patch(
+            "app.domain.services.tools.memory_tools.create_memory_tools",
+        ) as mock_create:
+            mock_create.return_value = [MagicMock(), MagicMock()]
+            flow._collect_memory_tools()
+            mock_create.assert_called_once()
+            call_kwargs = mock_create.call_args.kwargs
+            assert call_kwargs["half_life_days"] == 60
+            assert call_kwargs["mmr_lambda"] == 0.3

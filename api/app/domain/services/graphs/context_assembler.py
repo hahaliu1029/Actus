@@ -128,18 +128,62 @@ class ContextAssembler:
     def __init__(
         self,
         estimator: TokenEstimator,
-        context_window: int,
+        effective_window: int | None = None,
+        context_window: int | None = None,
         reserved_output_tokens: int = 4096,
         safety_factor: float = 1.15,
         tool_compress_trigger_ratio: float = 0.75,
         tool_compress_target_chars: int = 500,
     ) -> None:
+        """Construct the context assembler.
+
+        B5 C9: accepts either ``effective_window`` (preferred, new API) or
+        ``context_window`` (deprecated shim). The ``effective_window`` is the
+        amount of tokens history is allowed to use — already with system
+        prompt budget and reserved output subtracted via
+        ``compute_effective_window()``. The deprecated ``context_window``
+        path reproduces the pre-C9 formula
+        ``(context_window - reserved_output_tokens) / safety_factor``.
+
+        Must provide exactly one of the two window parameters. Passing both
+        favors ``effective_window``. Passing neither raises ``ValueError``.
+
+        The ``context_window`` shim will be removed alongside other legacy
+        cleanup in B5.5 / B5.6. Migrate callers to ``effective_window`` +
+        ``compute_effective_window()``.
+        """
+        if effective_window is None and context_window is None:
+            raise ValueError(
+                "ContextAssembler requires either 'effective_window' "
+                "(preferred) or 'context_window' (deprecated). Both are None."
+            )
         self._estimator = estimator
-        self._context_window = context_window
-        self._reserved_output_tokens = reserved_output_tokens
         self._safety_factor = safety_factor
         self._tool_compress_trigger_ratio = tool_compress_trigger_ratio
         self._tool_compress_target_chars = tool_compress_target_chars
+
+        if effective_window is not None:
+            # New API: caller already applied system + reserved subtraction
+            # via compute_effective_window(). Safety factor is still applied
+            # in _compute_budget() to match the legacy expectation that the
+            # estimator's output is over-counted by ~15%.
+            self._effective_window = effective_window
+            self._uses_shim = False
+        else:
+            # Deprecated shim: reproduce pre-C9 formula exactly. We
+            # pre-subtract reserved_output_tokens here so _compute_budget()
+            # can use the same formula for both paths.
+            import warnings
+
+            warnings.warn(
+                "ContextAssembler(context_window=...) is deprecated; "
+                "pass effective_window=compute_effective_window(...) instead. "
+                "The shim will be removed in B5.5/B5.6.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._effective_window = context_window - reserved_output_tokens
+            self._uses_shim = True
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -214,10 +258,16 @@ class ContextAssembler:
     # ── Budget ─────────────────────────────────────────────────────────────────
 
     def _compute_budget(self) -> int:
-        """Return the maximum number of input tokens available."""
-        return int(
-            (self._context_window - self._reserved_output_tokens) / self._safety_factor
-        )
+        """Return the maximum number of input tokens available.
+
+        B5 C9: ``self._effective_window`` is already net of system prompt
+        budget and reserved output (via ``compute_effective_window()`` in
+        the new API path). The legacy shim path pre-subtracted
+        ``reserved_output_tokens`` at construction time, so both paths land
+        at the same semantic: "remaining tokens for history, before applying
+        safety_factor".
+        """
+        return int(self._effective_window / self._safety_factor)
 
     # ── Protection ────────────────────────────────────────────────────────────
 

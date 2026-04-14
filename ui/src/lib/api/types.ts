@@ -63,7 +63,9 @@ export type SessionStatus =
   | "takeover_pending"
   | "takeover"
   | "waiting"
-  | "completed";
+  | "finishing"
+  | "completed"
+  | "timed_out";
 
 /**
  * 执行状态
@@ -103,10 +105,18 @@ export type LLMConfig = {
   unknown_model_context_window: number;
 };
 
+export type ToolConfirmationConfig = {
+  enabled: boolean;
+  timeout_seconds: number;
+  smart_approve_enabled: boolean;
+  smart_approve_medium_only: boolean;
+};
+
 export type AgentConfig = {
   max_iterations: number;
   max_retries: number;
   max_search_results: number;
+  tool_confirmation?: ToolConfirmationConfig;
 };
 
 export type VisionFallbackConfig = {
@@ -296,6 +306,12 @@ export type Session = {
   events: AgentSSEEvent[];
 };
 
+export type EventsSinceResponse = {
+  events: AgentSSEEvent[];
+  session_status: SessionStatus;
+  has_more: boolean;
+};
+
 export type CreateSessionParams = {
   title?: string;
 };
@@ -372,6 +388,11 @@ export type ChatParams = {
   message?: string;
   attachments?: string[];
   skill_confirmation_action?: "generate" | "revise" | "install" | "cancel";
+  tool_confirmation?: {
+    action: "approve" | "deny";
+    scope: "once" | "session" | "always";
+    tool_call_id: string;
+  };
   event_id?: string;
   timestamp?: number;
 };
@@ -457,7 +478,45 @@ export type WaitEvent = {
   [key: string]: unknown;
 };
 
+export type ExecutionMetrics = {
+  tool_success_rate?: number;
+  avg_tool_latency_ms?: number;
+  avg_llm_latency_ms?: number;
+  tool_calls_total?: number;
+  tool_calls_failed?: number;
+  llm_calls_total?: number;
+  steps_completed?: number;
+  steps_failed?: number;
+  context_usage_ratio?: number;
+  compaction_count?: number;
+};
+
 export type DoneEvent = {
+  event_id?: string;
+  created_at?: number;
+  metrics?: ExecutionMetrics | null;
+  [key: string]: unknown;
+};
+
+export type HealthEventStatus =
+  | "healthy"
+  | "degraded"
+  | "terminating"
+  | "terminated";
+
+export type HealthEvent = {
+  event_id?: string;
+  created_at?: number;
+  status: HealthEventStatus;
+  reason: string;
+  last_node?: string | null;
+  idle_seconds?: number | null;
+  tool_failures?: number;
+  action?: string;
+  metrics?: ExecutionMetrics | null;
+};
+
+export type FinishingEvent = {
   event_id?: string;
   created_at?: number;
   [key: string]: unknown;
@@ -471,9 +530,25 @@ export type SSEEventType =
   | "tool"
   | "control"
   | "wait"
+  | "tool_confirmation"
+  | "finishing"
   | "done"
   | "error"
   | "sessions";
+
+export type ToolConfirmationEventData = {
+  event_id?: string;
+  created_at?: number;
+  tool_call_id: string;
+  tool_name: string;
+  tool_args: Record<string, unknown>;
+  risk_level: "high" | "medium";
+  risk_reason: string;
+  matched_patterns: string[];
+  suggested_alternative: string | null;
+  approval_options: string[];
+  timeout_seconds: number;
+};
 
 export type SSEEventData =
   | { type: "message"; data: ChatMessageData }
@@ -483,6 +558,9 @@ export type SSEEventData =
   | { type: "tool"; data: ToolEvent }
   | { type: "control"; data: ControlEvent }
   | { type: "wait"; data: WaitEvent }
+  | { type: "tool_confirmation"; event_id?: string; created_at?: number; data: ToolConfirmationEventData }
+  | { type: "finishing"; data: FinishingEvent }
+  | { type: "health"; data: HealthEvent }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
   | { type: "sessions"; data: ListSessionResponse };

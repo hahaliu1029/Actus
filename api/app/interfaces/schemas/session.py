@@ -31,6 +31,14 @@ class ListSessionResponse(BaseModel):
     sessions: List[ListSessionItem]
 
 
+class ToolConfirmationAction(BaseModel):
+    """危险工具确认请求"""
+
+    action: Literal["approve", "deny"]
+    scope: Literal["once", "session", "always"]
+    tool_call_id: str
+
+
 class ChatRequest(BaseModel):
     """聊天请求结构"""
 
@@ -39,6 +47,7 @@ class ChatRequest(BaseModel):
         default_factory=list
     )  # 附件列表(传递的是文件id列表)
     skill_confirmation_action: Optional[SkillConfirmationAction] = None
+    tool_confirmation: Optional[ToolConfirmationAction] = None
     event_id: Optional[str] = None  # 最新事件id
     timestamp: Optional[int] = None  # 当前时间戳
 
@@ -50,6 +59,14 @@ class GetSessionResponse(BaseModel):
     title: Optional[str] = None
     status: SessionStatus
     events: List[AgentSSEEvent] = Field(default_factory=list)
+
+
+class EventsSinceResponse(BaseModel):
+    """增量事件恢复响应"""
+
+    events: List[AgentSSEEvent] = Field(default_factory=list)
+    session_status: SessionStatus
+    has_more: bool = False
 
 
 class GetSessionFilesResponse(BaseModel):

@@ -53,6 +53,7 @@ async def exec_command(
         session_id=request.session_id,
         exec_dir=request.exec_dir,
         command=request.command,
+        wait_seconds=request.wait_seconds,
     )
 
     return Response.success(data=result)

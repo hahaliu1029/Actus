@@ -77,11 +77,42 @@ describe("ChatInput takeover state", () => {
     expect(textarea).toBeDisabled();
   });
 
-  it("should not disable textarea when session is in waiting state", () => {
+  it("should not disable textarea when session is in waiting state (normal wait)", () => {
     mockCurrentSession.status = "waiting";
+    // No events or events ending with "wait" → normal message_ask_user wait
     render(<ChatInput sessionId="sid-1" />);
 
     const textarea = screen.getByRole("textbox");
     expect(textarea).not.toBeDisabled();
+  });
+
+  it("should disable textarea when waiting with pending tool_confirmation", () => {
+    mockCurrentSession.status = "waiting";
+    (mockCurrentSession as Record<string, unknown>).events = [
+      { event: "message", data: { role: "assistant", message: "Let me run a command" } },
+      { event: "tool_confirmation", data: { tool_call_id: "tc-1", tool_name: "shell_execute" } },
+    ];
+    render(<ChatInput sessionId="sid-1" />);
+
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toBeDisabled();
+
+    // cleanup
+    delete (mockCurrentSession as Record<string, unknown>).events;
+  });
+
+  it("should not disable textarea when waiting after tool_confirmation resolved by wait", () => {
+    mockCurrentSession.status = "waiting";
+    (mockCurrentSession as Record<string, unknown>).events = [
+      { event: "tool_confirmation", data: { tool_call_id: "tc-1" } },
+      { event: "wait", data: { pending_action: null } },
+    ];
+    render(<ChatInput sessionId="sid-1" />);
+
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).not.toBeDisabled();
+
+    // cleanup
+    delete (mockCurrentSession as Record<string, unknown>).events;
   });
 });

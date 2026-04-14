@@ -485,16 +485,27 @@ class DockerSandbox(Sandbox):
         return io.BytesIO(response.content)
 
     async def exec_command(
-        self, session_id: str, exec_dir: str, command: str
+        self,
+        session_id: str,
+        exec_dir: str,
+        command: str,
+        wait_seconds: Optional[int] = None,
     ) -> ToolResult:
-        """在沙箱中执行命令"""
+        """在沙箱中执行命令
+
+        ``wait_seconds`` 透传给沙箱端, 控制同步等待窗口。未指定时使用沙箱
+        默认 (5 秒)。
+        """
+        payload: dict = {
+            "session_id": session_id,
+            "exec_dir": exec_dir,
+            "command": command,
+        }
+        if wait_seconds is not None:
+            payload["wait_seconds"] = wait_seconds
         response = await self.client.post(
             f"{self._base_url}/api/shell/exec-command",
-            json={
-                "session_id": session_id,
-                "exec_dir": exec_dir,
-                "command": command,
-            },
+            json=payload,
         )
         return ToolResult.from_sandbox(**response.json())
 

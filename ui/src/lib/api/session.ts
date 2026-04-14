@@ -5,6 +5,7 @@ import type {
   CreateSessionResponse,
   EndTakeoverParams,
   EndTakeoverResponse,
+  EventsSinceResponse,
   FileReadResponse,
   GetTakeoverResponse,
   GetSessionFilesResponse,
@@ -86,12 +87,24 @@ export const sessionApi = {
     return get<Session>(`/sessions/${sessionId}`);
   },
 
+  getEventsSince: (
+    sessionId: string,
+    sinceEventId?: string
+  ): Promise<EventsSinceResponse> => {
+    const params: Record<string, string> = {};
+    if (sinceEventId) {
+      params.since = sinceEventId;
+    }
+    return get<EventsSinceResponse>(`/sessions/${sessionId}/events`, params);
+  },
+
   chat: (
     sessionId: string,
     params: ChatParams,
     onEvent: SSEEventHandler,
     onError?: (error: Error) => void,
-    onClose?: () => void
+    onClose?: () => void,
+    onConnected?: () => void
   ): (() => void) => {
     let aborted = false;
     let stream: ReadableStream<Uint8Array> | null = null;
@@ -99,6 +112,8 @@ export const sessionApi = {
     const startChat = async () => {
       try {
         stream = await createSSEStream(`/sessions/${sessionId}/chat`, params);
+        // E2: SSE 连接已建立（HTTP 200 + response.body），通知调用方
+        if (!aborted) onConnected?.();
 
         await parseSSEStream(
           stream,

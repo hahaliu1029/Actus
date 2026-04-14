@@ -23,6 +23,14 @@ class ContextOverflowConfig(BaseModel):
     tool_compress_trigger_ratio: float = Field(0.75, gt=0, le=1)
     target_ratio: float = Field(0.65, gt=0, le=1)
     summary_max_chars: int = Field(16_000, ge=1000)
+    system_prompt_max_tokens: int = Field(3500, ge=0)
+    """B5 C9: system prompt token 预算上限（canonical config source）。
+
+    Consumed by:
+    - ``PromptAssembler`` via ``SystemPromptBudget(max_tokens=...)``
+    - ``compute_effective_window()`` to derive the history window
+      (``total - system_prompt_max_tokens - reserved_output_tokens``).
+    """
 
     @classmethod
     def from_llm_config(cls, llm_config: LLMConfig) -> "ContextOverflowConfig":
@@ -41,4 +49,5 @@ class ContextOverflowConfig(BaseModel):
             model_name=llm_config.model_name,
             tool_result_max_chars=llm_config.tool_result_max_chars,
             tool_compress_trigger_ratio=llm_config.tool_compress_trigger_ratio,
+            system_prompt_max_tokens=llm_config.system_prompt_max_tokens,
         )

@@ -2,8 +2,9 @@ import asyncio
 
 import pytest
 from app.application.services.agent_service import AgentService
-from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.session import Session, SessionStatus
+
+from tests.app.application.services.conftest import default_snapshot as _default_snapshot
 
 pytestmark = pytest.mark.anyio
 
@@ -80,10 +81,7 @@ class _DummyTask:
 def _make_service(uow: _Uow) -> AgentService:
     return AgentService(
         uow_factory=lambda: uow,
-        llm=object(),
-        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
-        mcp_config=MCPConfig(),
-        a2a_config=A2AConfig(),
+        config_snapshot=_default_snapshot(),
         sandbox_cls=object,
         task_cls=object,
         search_engine=object(),

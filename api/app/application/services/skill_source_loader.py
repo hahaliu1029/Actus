@@ -67,6 +67,8 @@ class SkillSourceLoader:
         for file_path in sorted(skill_root.rglob("*")):
             if not file_path.is_file():
                 continue
+            if file_path.is_symlink():
+                raise ValidationError(msg=f"检测到符号链接，拒绝加载: {file_path.name}")
 
             relative_path = file_path.relative_to(skill_root).as_posix()
             normalized_path = self._normalize_relative_path(relative_path)

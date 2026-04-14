@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Iterator, List, Optional
+from typing import Any, AsyncIterator, List, Literal, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -39,7 +39,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+import httpx
 from openai import AsyncOpenAI
+
+from app.application.errors.exceptions import ServerRequestsError
+from app.infrastructure.external.llm._timeout_helpers import with_llm_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,15 @@ class ActusResponsesModel(BaseChatModel):
         model_name: Model identifier (e.g. "gpt-5.4-pro").
         temperature: Sampling temperature.
         max_tokens: Maximum tokens to generate (mapped to max_output_tokens internally).
+        timeout_seconds: per-call hard timeout in seconds (D5.1). Default 120.
+            0 disables the wrap. Wraps LLM client calls in asyncio.wait_for
+            and translates timeouts to ServerRequestsError for LangGraph
+            RetryPolicy. Also propagates to httpx as the read/write/pool
+            phase ceiling; 0 means unlimited for those phases.
+        connect_timeout_seconds: httpx connect-phase timeout (TCP+TLS
+            handshake). Default 60s — an order of magnitude above the OpenAI
+            SDK default of 5s, which is too tight for slow cross-border TLS
+            and was firing before timeout_seconds could take effect.
     """
 
     # ---- Pydantic config fields ------------------------------------------ #
@@ -64,11 +77,25 @@ class ActusResponsesModel(BaseChatModel):
     max_tokens: int = 8192
     supports_vision: bool = True
     supports_pdf_input: bool = False
+    # B5 C0a: provider identification for prompt rendering (system-reminder format etc.)
+    # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
+    # introduce real Anthropic routing via LLMConfig.provider field.
+    provider_name: Literal["openai", "anthropic"] = "openai"
+    # D5.1: per-call hard timeout (seconds). 0 disables the wait_for wrap.
+    # See docs/superpowers/specs/2026-04-13-per-operation-llm-timeout-design.md
+    timeout_seconds: float = 120.0
+    # D5.2: httpx connect-phase timeout (TCP+TLS). Separate from
+    # timeout_seconds because the SDK default 5s fires before the outer
+    # asyncio.wait_for can rescue slow-handshake cases — see CHANGELOG.
+    connect_timeout_seconds: float = 60.0
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
     # tool_choice bound via bind_tools() — critical for with_structured_output
     _bound_tool_choice: Optional[Any] = None
+    # B5 C11: telemetry port attached via attach_telemetry(). None means
+    # the _agenerate hook no-ops. Never serialized.
+    _telemetry: Optional[Any] = None
 
     # ---- Properties ------------------------------------------------------ #
 
@@ -76,13 +103,46 @@ class ActusResponsesModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "actus-responses"
 
+    # ---- B5 C11: telemetry hook ----------------------------------------- #
+
+    def attach_telemetry(self, telemetry: Any, lang: str = "zh") -> None:
+        """Attach a ``PromptTelemetryPort`` for LLM-invocation logging.
+
+        Non-blocking — see ``ActusChatModel.attach_telemetry`` docstring.
+        """
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            attach_telemetry,
+        )
+
+        attach_telemetry(self, telemetry, lang=lang)
+
     # ---- Client factory -------------------------------------------------- #
 
     def _get_client(self) -> AsyncOpenAI:
-        """Create AsyncOpenAI client. Extracted as method for testability."""
+        """Create AsyncOpenAI client. Extracted as method for testability.
+
+        D5.1: ``max_retries=0`` disables SDK-level retry so the LangGraph
+        ``RetryPolicy(max_attempts=3)`` at ``react_graph.llm_node`` and
+        ``main_graph.planner_node`` is the single retry authority.
+
+        D5.2: Pass an explicit ``httpx.Timeout`` so the connect phase has a
+        dedicated budget. Without this, the SDK default connect=5s fires on
+        slow TLS handshakes before the outer ``asyncio.wait_for`` window is
+        reached, and bumping ``timeout_seconds`` has no effect on that class
+        of failure. ``timeout_seconds==0`` (escape hatch) sets read/write/pool
+        to unlimited but still bounds connect so a dead endpoint fails fast.
+        """
+        default_timeout: float | None = (
+            self.timeout_seconds if self.timeout_seconds > 0 else None
+        )
         return AsyncOpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
+            max_retries=0,
+            timeout=httpx.Timeout(
+                default_timeout,
+                connect=self.connect_timeout_seconds,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -419,6 +479,16 @@ class ActusResponsesModel(BaseChatModel):
         else:
             logger.info("调用Responses API未携带工具: %s", self.model_name)
 
+        # B5 C11: emit telemetry (non-blocking — any failure is swallowed).
+        # Note: Responses API tool format differs from Chat Completions —
+        # _extract_tool_names handles the nested ``function.name`` shape
+        # that both formats share.
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            emit_invocation_telemetry,
+        )
+
+        emit_invocation_telemetry(self, messages, all_tools)
+
         # tool_choice: per-call kwarg > bound value from bind_tools
         # LangChain uses "any" internally (e.g. with_structured_output),
         # but OpenAI API expects "required" for the same semantics.
@@ -431,13 +501,13 @@ class ActusResponsesModel(BaseChatModel):
         logger.info("ActusResponsesModel._agenerate: model=%s, tools=%d",
                      self.model_name, len(all_tools))
 
-        response = await client.responses.create(**params)
+        response = await with_llm_timeout(
+            self, client.responses.create(**params)
+        )
 
         # Validate response — proxies may return strings, ints, or other
         # non-object types instead of a proper Responses API object.
         if not hasattr(response, "model_dump") and not isinstance(response, dict):
-            from app.application.errors.exceptions import ServerRequestsError
-
             raw = str(response)[:200]
             raise ServerRequestsError(
                 f"LLM ({self.model_name}) returned unexpected response "
@@ -453,8 +523,6 @@ class ActusResponsesModel(BaseChatModel):
         # error (e.g. 404 wrapped in 200, or empty output array).
         # Raise ServerRequestsError so RetryPolicy / fallback can act on it.
         if not content and not tool_calls:
-            from app.application.errors.exceptions import ServerRequestsError
-
             raise ServerRequestsError(
                 f"LLM ({self.model_name}) returned empty response "
                 f"(no content, no tool_calls)"
@@ -507,6 +575,11 @@ class ActusResponsesModel(BaseChatModel):
 
         Uses LangChain's convert_to_openai_tool to normalize tool definitions,
         then converts from Chat Completions format to Responses API format.
+
+        **Codex audit HIGH #3 fix**: preserve ``provider_name`` and
+        ``_telemetry`` on the clone so bound invocations still record
+        correct provider + telemetry events (LangGraph binds once, so
+        every subsequent LLM call goes through this clone, not ``self``).
         """
         from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -522,11 +595,23 @@ class ActusResponsesModel(BaseChatModel):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            timeout_seconds=self.timeout_seconds,  # D5.1: must propagate
+            connect_timeout_seconds=self.connect_timeout_seconds,  # D5.2: must propagate
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
+            provider_name=self.provider_name,
         )
         new_model._bound_tools = responses_format
         # Preserve tool_choice from kwargs (critical for with_structured_output)
         if "tool_choice" in kwargs:
             new_model._bound_tool_choice = kwargs["tool_choice"]
+        # Preserve telemetry port attachment so bound model invocations
+        # still emit record_llm_invocation events. ``_telemetry_lang``
+        # carries the attach-time language (post-audit LOW #4).
+        object.__setattr__(
+            new_model, "_telemetry", getattr(self, "_telemetry", None)
+        )
+        object.__setattr__(
+            new_model, "_telemetry_lang", getattr(self, "_telemetry_lang", "zh")
+        )
         return new_model

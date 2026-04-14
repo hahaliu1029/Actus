@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Callable, Dict, List, Optional, Type
 
@@ -46,7 +47,9 @@ from app.domain.models.session import Session, SessionStatus
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.confirmation_manager import ConfirmationManager
 from core.config import get_settings
+from langgraph.types import Command
 from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
@@ -55,61 +58,76 @@ TAKEOVER_CANCEL_TIMEOUT_SECONDS = 15
 TAKEOVER_LEASE_TTL_SECONDS = 15 * 60
 
 
+@dataclass(frozen=True)
+class _ConfigSnapshot:
+    """Immutable config-dependent dependency bundle. Atomically swapped on refresh."""
+    llm: BaseChatModel
+    agent_config: "AgentConfig"
+    mcp_config: "MCPConfig"
+    a2a_config: "A2AConfig"
+    skill_risk_policy: "SkillRiskPolicy"
+    overflow_config: "ContextOverflowConfig"
+    summary_llm: BaseChatModel | None
+    vision_fallback_model: BaseChatModel | None
+    skill_creator_service: "SkillCreatorService"
+    supports_vision: bool
+    supports_pdf_input: bool
+    file_understanding_config: "FileUnderstandingConfig | None"
+
+
 class AgentService:
     """Manus智能体服务"""
 
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],
-        llm: BaseChatModel,
-        agent_config: AgentConfig,
-        mcp_config: MCPConfig,
-        a2a_config: A2AConfig,
+        config_snapshot: _ConfigSnapshot,
         sandbox_cls: Type[Sandbox],
         task_cls: Type[Task],
         search_engine: SearchEngine,
         file_storage: FileStorage,
-        skill_risk_policy: SkillRiskPolicy | None = None,
-        overflow_config: ContextOverflowConfig | None = None,
         redis_client: object | None = None,
-        skill_creator_service=None,
-        summary_llm: BaseChatModel | None = None,
         checkpointer_pool: object | None = None,
-        supports_vision: bool = True,
-        supports_pdf_input: bool = False,
-        file_understanding_config=None,
-        vision_fallback_model=None,
         memory_flusher: MemoryFlusher | None = None,
-        # file_repository: FileRepository,
+        memory_embedding_provider=None,
+        memory_session_factory=None,
+        memory_repo_factory=None,
+        event_recovery=None,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
-        self._memory_flusher = memory_flusher
-        self._supports_vision = supports_vision
-        self._supports_pdf_input = supports_pdf_input
-        self._file_understanding_config = file_understanding_config
-        self._vision_fallback_model = vision_fallback_model
+        self._config_snapshot = config_snapshot
         self._uow_factory = uow_factory
-        self._uow = uow_factory()
-        self._llm = llm
-        self._agent_config = agent_config
-        self._mcp_config = mcp_config
-        self._a2a_config = a2a_config
-        self._skill_risk_policy = skill_risk_policy or SkillRiskPolicy()
-        self._overflow_config = overflow_config or ContextOverflowConfig()
         self._sandbox_cls = sandbox_cls
         self._task_cls = task_cls
         self._search_engine = search_engine
         self._file_storage = file_storage
         self._redis_client = redis_client
-        self._skill_creator_service = skill_creator_service
-        self._summary_llm = summary_llm
         self._checkpointer_pool = checkpointer_pool
+        self._memory_flusher = memory_flusher
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
+        self._event_recovery = event_recovery
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
         self._takeover_timeout_tasks: dict[str, asyncio.Task] = {}
+        self._confirmation_sweep_task: asyncio.Task | None = None
         self._settings = get_settings()
-        # self._file_repository = file_repository
-        logger.info(f"AgentService初始化成功")
+        # Eagerly init ConfirmationManager so sweep and chat() guard work from startup
+        self._confirmation_manager: ConfirmationManager | None = None
+        if redis_client and hasattr(redis_client, "client"):
+            try:
+                self._confirmation_manager = ConfirmationManager(
+                    redis=redis_client.client,
+                    timeout_seconds=self._settings.tool_confirmation_timeout_seconds,
+                )
+            except Exception:
+                logger.warning("Failed to init ConfirmationManager at startup")
+        logger.info("AgentService初始化成功")
+
+    def _refresh_config(self, snapshot: _ConfigSnapshot) -> None:
+        """Atomically replace config snapshot. CPython GIL guarantees single-attr assignment is atomic."""
+        self._config_snapshot = snapshot
 
     async def _get_task(self, session: Session) -> Optional[Task]:
         """根据传递的任务会话获取任务实例"""
@@ -123,6 +141,8 @@ class AgentService:
 
     async def _create_task(self, session: Session) -> Task:
         """根据传递的会话创建一个新任务"""
+        snap = self._config_snapshot  # local capture — immune to concurrent refresh
+
         # 1.获取沙箱实例
         sandbox = None
         sandbox_id = session.sandbox_id
@@ -134,8 +154,8 @@ class AgentService:
             # 3.沙箱不存在则创建一个新的(有可能被释放了)
             sandbox = await self._sandbox_cls.create()
             session.sandbox_id = sandbox.id
-            async with self._uow:
-                await self._uow.session.save(session)
+            async with self._uow_factory() as uow:
+                await uow.session.save(session)
 
         # 4.从沙箱中获取浏览器实例
         browser = await sandbox.get_browser()
@@ -145,7 +165,7 @@ class AgentService:
 
         # 5.构造 file_view 处理器（延迟到此处，因为需要运行时 sandbox + file_storage）
         file_processor_lookup = None
-        if self._file_understanding_config:
+        if snap.file_understanding_config:
             from app.infrastructure.external.file_processors.registry import FileProcessorRegistry
 
             async def _upload_bytes(file_bytes: bytes, filename: str) -> str | None:
@@ -162,42 +182,74 @@ class AgentService:
             file_processor_lookup = FileProcessorRegistry(
                 sandbox=sandbox,
                 file_uploader=_upload_bytes,
-                vision_model=self._vision_fallback_model,
-                audio_config=self._file_understanding_config.audio,
-                video_config=self._file_understanding_config.video,
+                vision_model=snap.vision_fallback_model,
+                audio_config=snap.file_understanding_config.audio,
+                video_config=snap.file_understanding_config.video,
             )
+
+        # Build ApprovalCache if Redis is available
+        approval_cache = None
+        if self._redis_client and hasattr(self._redis_client, "client"):
+            try:
+                from app.domain.services.approval_cache import ApprovalCache
+                from app.infrastructure.storage.postgres import get_postgres
+                approval_cache = ApprovalCache(
+                    redis=self._redis_client.client,
+                    session_factory=get_postgres().session_factory,
+                )
+            except Exception:
+                logger.warning("Failed to build ApprovalCache, tool confirmations will always prompt")
+
+        # Reuse the service-level ConfirmationManager (initialized in __init__)
+        confirmation_manager_inst = self._confirmation_manager
+
+        # B5 #29: compute bootstrap language from the already-loaded session.
+        # ``_get_accessible_session`` upstream already hydrated events via
+        # ``get_by_id().to_domain()``, so ``session.get_latest_plan()`` is a
+        # zero-cost in-memory Python lookup. Falls back to "zh" for brand-new
+        # sessions (no plan history) or plan.language == "" (empty string).
+        latest_plan = session.get_latest_plan()
+        initial_language = (
+            latest_plan.language
+            if latest_plan is not None and latest_plan.language
+            else "zh"
+        )
 
         # 6.创建AgentTaskRunner
         task_runner = AgentTaskRunner(
             uow_factory=self._uow_factory,
-            llm=self._llm,
-            agent_config=self._agent_config,
-            mcp_config=self._mcp_config,
-            a2a_config=self._a2a_config,
-            skill_risk_policy=self._skill_risk_policy,
-            overflow_config=self._overflow_config,
+            llm=snap.llm,
+            agent_config=snap.agent_config,
+            mcp_config=snap.mcp_config,
+            a2a_config=snap.a2a_config,
+            skill_risk_policy=snap.skill_risk_policy,
+            overflow_config=snap.overflow_config,
             session_id=session.id,
             user_id=session.user_id,
-            # session_repository=self._session_repository,
             file_storage=self._file_storage,
-            # file_repository=self._file_repository,
             browser=browser,
             search_engine=self._search_engine,
             sandbox=sandbox,
-            skill_creator_service=self._skill_creator_service,
-            summary_llm=self._summary_llm,
+            skill_creator_service=snap.skill_creator_service,
+            summary_llm=snap.summary_llm,
             checkpointer_pool=self._checkpointer_pool,
-            supports_vision=self._supports_vision,
-            supports_pdf_input=self._supports_pdf_input,
+            supports_vision=snap.supports_vision,
+            supports_pdf_input=snap.supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
             memory_flusher=self._memory_flusher,
+            memory_embedding_provider=self._memory_embedding_provider,
+            memory_session_factory=self._memory_session_factory,
+            memory_repo_factory=self._memory_repo_factory,
+            approval_cache=approval_cache,
+            confirmation_manager=confirmation_manager_inst,
+            initial_language=initial_language,
         )
 
         # 6.创建任务Task并更新会话中的信息
         task = self._task_cls.create(task_runner=task_runner)
         session.task_id = task.id
-        async with self._uow:
-            await self._uow.session.save(session)
+        async with self._uow_factory() as uow:
+            await uow.session.save(session)
 
         return task
 
@@ -215,12 +267,187 @@ class AgentService:
         except Exception as e:
             logger.warning(f"会话[{session_id}]后台更新未读消息计数失败: {e}")
 
+    async def _resume_tool_confirmation(
+        self,
+        session_id: str,
+        user_id: str,
+        is_admin: bool,
+        tool_confirmation: object,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """处理危险工具确认的恢复路径。
+
+        1. 从 ConfirmationManager 读取确认详情
+        2. 标记为 PROCESSING
+        3. 获取/创建 task 并调用 task.resume(Command(resume=...))
+        4. 清理确认截止时间
+        5. 从 task 输出流中 yield 事件
+        """
+        action: str = getattr(tool_confirmation, "action", "deny")
+        scope: str = getattr(tool_confirmation, "scope", "once")
+        tool_call_id: str = getattr(tool_confirmation, "tool_call_id", "")
+
+        try:
+            # 1. 校验会话访问权限
+            session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+            # 2. 从 Redis 读取确认详情（复用 __init__ 中初始化的单例）
+            if not self._confirmation_manager:
+                raise BadRequestError("ConfirmationManager 不可用，无法处理工具确认")
+            confirmation_mgr = self._confirmation_manager
+            detail = await confirmation_mgr.read(session_id, tool_call_id)
+            if not detail:
+                raise NotFoundError(
+                    f"工具确认请求[{tool_call_id}]不存在或已过期"
+                )
+            if detail.status != "pending":
+                raise BadRequestError(
+                    f"工具确认请求[{tool_call_id}]状态为{detail.status}，无法处理"
+                )
+
+            # 3. 标记为 PROCESSING，防止重复处理
+            await confirmation_mgr.mark_processing(session_id, tool_call_id)
+
+            # 4. 获取或创建 task + resume（失败时回退为 pending）
+            try:
+                task = await self._get_task(session)
+                if task is None:
+                    task = await self._create_task(session)
+                    if not task:
+                        raise RuntimeError(f"会话[{session_id}]创建任务失败")
+
+                # 5. 构造 Command(resume=...) 并调用 task.resume()
+                resume_value = {"action": action, "scope": scope}
+                await task.resume(Command(resume=resume_value))
+            except Exception as _resume_err:
+                # 回退为 pending，允许用户重试或超时扫描接管
+                try:
+                    await confirmation_mgr.mark_pending(session_id, tool_call_id)
+                except Exception:
+                    logger.warning("回退确认状态为 pending 失败: %s:%s", session_id, tool_call_id)
+                raise _resume_err
+
+            logger.info(
+                "会话[%s] 工具确认恢复: tool_call_id=%s action=%s scope=%s",
+                session_id, tool_call_id, action, scope,
+            )
+
+            # 6. 根据 action + scope 写入 ApprovalCache / 创建永久规则，并记录审计日志
+            if action == "approve":
+                if scope == "session" and self._redis_client and hasattr(self._redis_client, "client"):
+                    try:
+                        from app.domain.services.approval_cache import ApprovalCache
+                        cache = ApprovalCache(redis=self._redis_client.client)
+                        await cache.write_session(
+                            session_id=session_id,
+                            tool_name=detail.tool_name,
+                            arg_digest=detail.arg_digest,
+                        )
+                        logger.info(
+                            "会话[%s] 写入 session-level ApprovalCache: tool=%s",
+                            session_id, detail.tool_name,
+                        )
+                    except Exception as _cache_err:
+                        logger.warning("写入 ApprovalCache 失败: %s", _cache_err)
+
+                elif scope == "always":
+                    try:
+                        from app.domain.models.tool_approval_rule import ToolApprovalRule
+                        from app.infrastructure.repositories.db_tool_approval_rule_repository import (
+                            DBToolApprovalRuleRepository,
+                        )
+                        from app.infrastructure.storage.postgres import get_postgres
+                        async with get_postgres().session_factory() as _session:
+                            rule_repo = DBToolApprovalRuleRepository(_session)
+                            # Escape glob special chars so the rule is an exact match.
+                            # User can later broaden it in the settings page.
+                            import re as _re
+                            def _escape_glob(s: str) -> str:
+                                """Escape *, ?, [ for fnmatch literal matching."""
+                                return _re.sub(r'([\*\?\[\]])', r'[\1]', s)
+
+                            rule = ToolApprovalRule(
+                                user_id=user_id,
+                                tool_name=detail.tool_name,
+                                rule="always_allow",
+                                command_pattern=_escape_glob(detail.primary_arg) if detail.primary_arg else "*",
+                                dir_pattern=_escape_glob(detail.dir_arg) if detail.dir_arg else "",
+                            )
+                            await rule_repo.create(rule)
+                            await _session.commit()
+                        logger.info(
+                            "会话[%s] 创建永久 always_allow 规则: tool=%s pattern=%s",
+                            session_id, detail.tool_name, detail.primary_arg,
+                        )
+                    except Exception as _rule_err:
+                        logger.warning("创建永久审批规则失败: %s", _rule_err)
+
+            # 记录审计日志
+            try:
+                async with self._uow_factory() as _audit_uow:
+                    await _audit_uow.tool_approval_log.create(
+                        user_id=user_id,
+                        session_id=session_id,
+                        tool_name=detail.tool_name,
+                        tool_args=detail.tool_args,
+                        risk_level=detail.risk_level,
+                        action=action,
+                        scope=scope,
+                        approved_by="user",
+                    )
+            except Exception as _log_err:
+                logger.warning("写入工具审批审计日志失败: %s", _log_err)
+
+            # 7. 清理确认截止时间
+            await confirmation_mgr.cleanup(session_id, tool_call_id)
+
+            # 8. 从 task 输出流中读取事件并 yield
+            latest_event_id = None
+            while True:
+                event_id, event_str = await task.output_stream.get(
+                    start_id=latest_event_id, block_ms=OUTPUT_STREAM_POLL_BLOCK_MS
+                )
+                if event_str is None:
+                    if task.done:
+                        break
+                    continue
+                latest_event_id = event_id
+
+                event = TypeAdapter(Event).validate_json(event_str)
+                event.id = event_id
+
+                async with self._uow_factory() as uow:
+                    await uow.session.update_unread_message_count(session_id, 0)
+
+                yield event
+                if isinstance(event, (DoneEvent, ErrorEvent, WaitEvent, ControlEvent)):
+                    break
+
+            logger.info(f"会话[{session_id}]工具确认恢复完成")
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as e:
+            logger.error(f"会话[{session_id}]工具确认恢复出错: {str(e)}")
+            event = ErrorEvent(error=str(e))
+            try:
+                async with self._uow_factory() as uow:
+                    await uow.session.add_event(session_id, event)
+            except (asyncio.CancelledError, Exception) as add_err:
+                logger.warning(
+                    f"会话[{session_id}]添加错误事件失败: {add_err}"
+                )
+            yield event
+        finally:
+            try:
+                asyncio.create_task(self._safe_update_unread_count(session_id))
+            except RuntimeError:
+                logger.warning(f"会话[{session_id}]无法创建后台任务更新未读消息计数")
+
     async def _get_accessible_session(
         self, session_id: str, user_id: str, is_admin: bool = False
     ) -> Session:
         """根据用户权限获取可访问会话"""
-        async with self._uow:
-            session = await self._uow.session.get_by_id(session_id)
+        async with self._uow_factory() as uow:
+            session = await uow.session.get_by_id(session_id)
         if not session:
             logger.error(f"尝试访问不存在的会话[{session_id}]")
             raise NotFoundError("任务会话不存在, 请核实后重试")
@@ -229,6 +456,75 @@ class AgentService:
             raise ForbiddenError("无权访问此会话")
         return session
 
+    async def get_events_since(
+        self,
+        session_id: str,
+        since_event_id: str | None,
+        user_id: str,
+        is_admin: bool = False,
+    ) -> dict:
+        """获取 session 在 since_event_id 之后的增量事件。
+
+        PG 为主（跨 invoke 权威来源），Redis 补充当前 task 的 in-flight 事件。
+        """
+        session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+        # 1. PG 主路径：找到 since_event_id 位置，取其后所有事件
+        pg_events = session.events or []
+        if since_event_id:
+            found_idx = None
+            for i, evt in enumerate(pg_events):
+                if getattr(evt, "id", None) == since_event_id:
+                    found_idx = i
+                    break
+            if found_idx is not None:
+                pg_events = pg_events[found_idx + 1:]
+            # else: 找不到 → 返回全量（宁可多发不漏发）
+
+        # 2. Redis 补充路径
+        redis_only_events = []
+        redis_has_more = False
+        if session.task_id and self._event_recovery:
+            # 取 PG 增量中最后一个有 id 的事件作为 Redis 起始点
+            redis_start_id = None
+            for evt in reversed(pg_events):
+                if getattr(evt, "id", None):
+                    redis_start_id = evt.id
+                    break
+            if not redis_start_id:
+                redis_start_id = since_event_id  # 可能为 None
+
+            try:
+                recovery_result = await self._event_recovery.get_recent_events(
+                    task_id=session.task_id,
+                    after_event_id=redis_start_id,
+                )
+                # 过滤掉 PG 中已有的 event_id
+                pg_event_ids = {
+                    getattr(e, "id", None)
+                    for e in pg_events
+                    if getattr(e, "id", None)
+                }
+                redis_only_events = [
+                    e
+                    for e in recovery_result.events
+                    if getattr(e, "id", None) not in pg_event_ids
+                ]
+                redis_has_more = recovery_result.has_more
+            except Exception:
+                logger.warning(
+                    "event_recovery: Redis 补充失败 session=%s task=%s",
+                    session_id,
+                    session.task_id,
+                )
+
+        merged = list(pg_events) + redis_only_events
+        return {
+            "events": merged,
+            "session_status": session.status,
+            "has_more": redis_has_more,
+        }
+
     async def _check_attachments_access(
         self, attachments: Optional[List[str]], user_id: str, is_admin: bool = False
     ) -> None:
@@ -236,9 +532,9 @@ class AgentService:
         if not attachments:
             return
 
-        async with self._uow:
+        async with self._uow_factory() as uow:
             for attachment_id in attachments:
-                file = await self._uow.file.get_by_id(attachment_id)
+                file = await uow.file.get_by_id(attachment_id)
                 if not file:
                     raise NotFoundError(f"附件[{attachment_id}]不存在")
                 if not is_admin and (not file.user_id or file.user_id != user_id):
@@ -252,10 +548,19 @@ class AgentService:
         message: Optional[str] = None,
         attachments: Optional[List[str]] = None,
         skill_confirmation_action: SkillConfirmationAction | None = None,
+        tool_confirmation: object | None = None,
         latest_event_id: Optional[str] = None,
         timestamp: Optional[datetime] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的信息调用Agent服务发起对话请求"""
+        # 危险工具确认恢复路径：直接走 resume 流程，不走正常 chat 分支
+        if tool_confirmation is not None:
+            async for event in self._resume_tool_confirmation(
+                session_id, user_id, is_admin, tool_confirmation
+            ):
+                yield event
+            return
+
         try:
             # 1.检查会话是否存在
             session = await self._get_accessible_session(session_id, user_id, is_admin)
@@ -281,8 +586,30 @@ class AgentService:
                     raise BadRequestError("当前会话处于接管状态，暂不支持聊天输入")
 
                 # 4.判断会话的状态是什么,如果不是运行中则表示已完成或者空闲中
-                if session.status != SessionStatus.RUNNING or task is None:
+                if session.status == SessionStatus.FINISHING:
+                    # FINISHING: task 仍在运行（invoke 在后处理阶段）
+                    # 复用现有 task，push 到 input_stream 触发 cancel 后处理
+                    task = await self._get_task(session)
+                    if task is None:
+                        task = await self._create_task(session)
+                        if not task:
+                            logger.error(f"会话[{session_id}]创建任务失败")
+                            raise RuntimeError(f"会话[{session_id}]创建任务失败")
+                elif session.status != SessionStatus.RUNNING or task is None:
                     if session.status == SessionStatus.WAITING:
+                        # Check if waiting due to tool_confirmation — if so, reject plain text.
+                        # Tool confirmations must go through the dedicated _resume_tool_confirmation() path.
+                        if self._confirmation_manager:
+                            try:
+                                has_pending = await self._confirmation_manager.has_pending_for_session(session_id)
+                                if has_pending:
+                                    raise BadRequestError(
+                                        "当前会话正在等待工具确认，请通过确认卡片操作，不支持文本输入"
+                                    )
+                            except BadRequestError:
+                                raise
+                            except Exception:
+                                pass  # Redis failure should not block normal chat
                         logger.info(
                             "会话[%s] WAITING状态恢复: 将创建新任务并从数据库加载中断状态",
                             session_id,
@@ -294,8 +621,8 @@ class AgentService:
                         raise RuntimeError(f"会话[{session_id}]创建任务失败")
 
                 # 6.传递了消息则更新会话中的最后一条消息
-                async with self._uow:
-                    await self._uow.session.update_latest_message(
+                async with self._uow_factory() as uow:
+                    await uow.session.update_latest_message(
                         session_id=session_id,
                         message=message,
                         timestamp=timestamp or datetime.now(),
@@ -316,8 +643,8 @@ class AgentService:
                 # 8.将事件添加到任务的输入流中，好让Agent获取到数据
                 event_id = await task.input_stream.put(message_event.model_dump_json())
                 message_event.id = event_id
-                async with self._uow:
-                    await self._uow.session.add_event(session_id, message_event)
+                async with self._uow_factory() as uow:
+                    await uow.session.add_event(session_id, message_event)
 
                 # 9.立刻把用户消息返回给前端，避免依赖后续拉取导致消息缺失
                 yield message_event
@@ -332,8 +659,8 @@ class AgentService:
                     "会话[%s]状态自愈: status_reconciled=true from=running to=completed message_present=false task_exists=false",
                     session_id,
                 )
-                async with self._uow:
-                    await self._uow.session.update_status(
+                async with self._uow_factory() as uow:
+                    await uow.session.update_status(
                         session_id, SessionStatus.COMPLETED
                     )
                 session = session.model_copy(update={"status": SessionStatus.COMPLETED})
@@ -372,8 +699,8 @@ class AgentService:
                         self._cancel_pending_timeout(session_id)
 
                 # 15.将未读消息数重置为0
-                async with self._uow:
-                    await self._uow.session.update_unread_message_count(session_id, 0)
+                async with self._uow_factory() as uow:
+                    await uow.session.update_unread_message_count(session_id, 0)
 
                 # 16.将事件返回并判断事件类型是否为结束类型
                 yield event
@@ -389,8 +716,8 @@ class AgentService:
             logger.error(f"任务会话[{session_id}]对话出错: {str(e)}")
             event = ErrorEvent(error=str(e))
             try:
-                async with self._uow:
-                    await self._uow.session.add_event(session_id, event)
+                async with self._uow_factory() as uow:
+                    await uow.session.add_event(session_id, event)
             except (asyncio.CancelledError, Exception) as add_err:
                 logger.warning(
                     f"会话[{session_id}]添加错误事件失败(可能是客户端断开连接): {add_err}"
@@ -423,8 +750,8 @@ class AgentService:
             task.cancel(reason="stop")
 
         # 3.更新会话任务状态
-        async with self._uow:
-            await self._uow.session.update_status(session_id, SessionStatus.COMPLETED)
+        async with self._uow_factory() as uow:
+            await uow.session.update_status(session_id, SessionStatus.COMPLETED)
 
     @staticmethod
     def _get_latest_control_event(session: Session) -> Optional[ControlEvent]:
@@ -1122,8 +1449,8 @@ end
         if session.status == SessionStatus.TAKEOVER_PENDING:
             self._cancel_pending_timeout(session_id)
 
-        async with self._uow:
-            await self._uow.session.update_status(session_id, SessionStatus.TAKEOVER)
+        async with self._uow_factory() as uow:
+            await uow.session.update_status(session_id, SessionStatus.TAKEOVER)
         await self._append_control_event(
             session_id,
             action=ControlAction.STARTED,
@@ -1243,8 +1570,8 @@ end
                 )
                 return {"status": SessionStatus.COMPLETED, "reason": "resume_failed"}
 
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.RUNNING)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.RUNNING)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.REJECTED,
@@ -1257,8 +1584,8 @@ end
             return {"status": SessionStatus.RUNNING, "reason": "continue"}
 
         if decision_normalized == "terminate":
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.COMPLETED)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.REJECTED,
@@ -1322,8 +1649,8 @@ end
                     "handoff_mode": "complete",
                 }
 
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.RUNNING)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.RUNNING)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.ENDED,
@@ -1341,8 +1668,8 @@ end
             return {"status": SessionStatus.RUNNING, "handoff_mode": "continue"}
 
         if mode == "complete":
-            async with self._uow:
-                await self._uow.session.update_status(session_id, SessionStatus.COMPLETED)
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.ENDED,
@@ -1380,12 +1707,15 @@ end
         if window_seconds <= 0:
             raise BadRequestError("REOPEN_DISABLED")
 
-        # 使用 _uow_factory() 创建独立 UoW，避免 self._uow 单例共享 DB session
+        # 使用 _uow_factory() 创建独立 UoW，避免单例共享 DB session
         uow = self._uow_factory()
         async with uow:
             # 事务内加锁重读，防并发
             session = await uow.session.get_by_id_for_update(session_id)
-            if not session or session.status != SessionStatus.COMPLETED:
+            if not session or session.status not in (
+                SessionStatus.COMPLETED,
+                SessionStatus.TIMED_OUT,
+            ):
                 raise BadRequestError("当前状态不支持恢复接管")
             if not session.completed_at:
                 raise BadRequestError("REOPEN_WINDOW_EXPIRED")
@@ -1413,8 +1743,82 @@ end
             "remaining_seconds": remaining_seconds,
         }
 
+    def start_sweep_task(self) -> None:
+        """Start the background confirmation-sweep asyncio.Task.
+
+        Should be called once from the FastAPI lifespan after all services are
+        initialized.  Safe to call multiple times — no-ops if already running.
+        """
+        if self._confirmation_sweep_task is not None and not self._confirmation_sweep_task.done():
+            return
+        self._confirmation_sweep_task = asyncio.create_task(
+            self._confirmation_sweep_loop(),
+            name="confirmation_sweep",
+        )
+
+    async def _confirmation_sweep_loop(self) -> None:
+        """Background task: sweep expired confirmations every 30s."""
+        import uuid
+        worker_id = str(uuid.uuid4())[:8]
+        while True:
+            try:
+                await asyncio.sleep(30)
+                if not self._confirmation_manager:
+                    continue
+                if not await self._confirmation_manager.acquire_sweep_lock(worker_id):
+                    continue
+                expired = await self._confirmation_manager.find_expired()
+                for detail in expired:
+                    try:
+                        await self._confirmation_manager.mark_processing(detail.session_id, detail.tool_call_id)
+                        logger.info(
+                            "Confirmation timeout: session=%s tool_call=%s, resuming with timeout_fallback",
+                            detail.session_id,
+                            detail.tool_call_id,
+                        )
+                        # Resume the interrupted graph with timeout_fallback action
+                        resume_ok = False
+                        try:
+                            async with self._uow_factory() as _sweep_uow:
+                                session = await _sweep_uow.session.get_by_id(detail.session_id)
+                            if session:
+                                task = await self._get_task(session)
+                                if task is None:
+                                    task = await self._create_task(session)
+                                if task:
+                                    from langgraph.types import Command
+                                    await task.resume(Command(resume={"action": "timeout_fallback", "scope": "once"}))
+                                    resume_ok = True
+                        except Exception:
+                            logger.exception(
+                                "Timeout resume failed for session=%s, rolling back to pending",
+                                detail.session_id,
+                            )
+                        if resume_ok:
+                            await self._confirmation_manager.cleanup(detail.session_id, detail.tool_call_id)
+                        else:
+                            # Roll back to pending so next sweep cycle can retry
+                            await self._confirmation_manager.mark_pending(detail.session_id, detail.tool_call_id)
+                    except Exception:
+                        logger.exception(
+                            "Sweep failed for %s:%s",
+                            detail.session_id,
+                            detail.tool_call_id,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Confirmation sweep error")
+
     async def shutdown(self) -> None:
         """关闭Agent服务"""
+        if self._confirmation_sweep_task is not None and not self._confirmation_sweep_task.done():
+            self._confirmation_sweep_task.cancel()
+            try:
+                await self._confirmation_sweep_task
+            except asyncio.CancelledError:
+                pass
+        self._confirmation_sweep_task = None
         for task in list(self._pending_timeout_tasks.values()):
             if not task.done():
                 task.cancel()

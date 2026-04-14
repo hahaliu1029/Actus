@@ -184,3 +184,216 @@ class TestGraphEventBridge:
             pass
 
         assert bridge.was_interrupted is True
+
+
+class TestGraphEventBridgeWatchdog:
+    """D5: Watchdog integration tests.
+
+    Covers:
+    - Idle timeout → HealthEvent(DEGRADED) → recovery hint injection
+    - Total timeout with total < idle_timeout → HARD_TERMINATE (the shortened-wait path)
+    - HARD_TERMINATE must NOT leak CancelledError to the caller
+    - total_timeout_seconds=0 = unlimited (no spurious termination)
+    """
+
+    async def test_idle_timeout_emits_degraded_and_sets_hint(self):
+        import asyncio
+        from app.domain.models.event import HealthEvent, HealthStatus
+        from app.domain.services.execution_watchdog import (
+            ExecutionControl,
+            ExecutionWatchdog,
+        )
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        watchdog = ExecutionWatchdog(
+            total_timeout_seconds=100,
+            idle_timeout_seconds=0.05,
+        )
+        control = ExecutionControl()
+
+        class SilentThenEventGraph:
+            """Graph that stays silent long enough to trigger idle, then emits."""
+
+            async def astream(self, input_state, config=None, **kwargs):
+                # Hold so the bridge's wait_for times out at least once
+                await asyncio.sleep(0.15)
+                yield {
+                    "executor_node": {
+                        "events": [MessageEvent(role="assistant", message="back")],
+                        "flow_status": "completed",
+                    }
+                }
+
+        config = {
+            "configurable": {
+                "execution_watchdog": watchdog,
+                "execution_control": control,
+            }
+        }
+        bridge = GraphEventBridge()
+        events = []
+        async for event in bridge.run(SilentThenEventGraph(), {}, config=config):
+            events.append(event)
+
+        degraded = [
+            e
+            for e in events
+            if isinstance(e, HealthEvent) and e.status == HealthStatus.DEGRADED
+        ]
+        assert len(degraded) >= 1
+        # Recovery hint must have been injected onto the control object
+        # (bridge sets it on SOFT_RECOVER).
+        # The hint is consumed by llm_node in real use, but for this test
+        # we only assert it was set — consumption is tested elsewhere.
+        # (In this test the graph finishes before another llm cycle, so the
+        # hint stays on control after DEGRADED is emitted.)
+        assert control.idle_recovery_hint is not None
+
+    async def test_total_timeout_smaller_than_idle_triggers_terminate(self):
+        """Regression: when total_timeout < idle_timeout, the bridge must still
+        fire HARD_TERMINATE at total_timeout instead of waiting for the full
+        idle tick. This is the 'total < idle' scenario called out by review.
+        """
+        import asyncio
+        import time
+        from app.domain.models.event import HealthEvent, HealthStatus
+        from app.domain.services.execution_watchdog import (
+            ExecutionControl,
+            ExecutionWatchdog,
+        )
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        watchdog = ExecutionWatchdog(
+            total_timeout_seconds=0.1,      # 100ms hard cap
+            idle_timeout_seconds=10.0,       # 10s idle — MUCH larger
+        )
+        control = ExecutionControl()
+
+        class ForeverSilentGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                # Never yield anything so the queue stays empty.
+                await asyncio.sleep(30)
+                yield {"node": {"events": []}}  # unreachable
+
+        config = {
+            "configurable": {
+                "execution_watchdog": watchdog,
+                "execution_control": control,
+            }
+        }
+        bridge = GraphEventBridge()
+        events = []
+        started = time.monotonic()
+        async for event in bridge.run(ForeverSilentGraph(), {}, config=config):
+            events.append(event)
+            if isinstance(event, HealthEvent) and event.status == HealthStatus.TERMINATING:
+                break  # terminating reached — sanity short-circuit
+        elapsed = time.monotonic() - started
+
+        # Must terminate quickly (within ~1s, well under the 10s idle tick)
+        assert elapsed < 1.0, f"Bridge waited {elapsed:.2f}s — exceeded total cap"
+        # Must have emitted the terminating health event
+        terminating = [
+            e
+            for e in events
+            if isinstance(e, HealthEvent) and e.status == HealthStatus.TERMINATING
+        ]
+        assert len(terminating) == 1
+        # Control flag must be set so cooperative exit works
+        assert control.should_terminate is True
+
+    async def test_hard_terminate_does_not_leak_cancelled_error(self):
+        """Regression: HARD_TERMINATE must not propagate CancelledError from
+        task.cancel() to the caller. Previously _normal_exit = True ran after
+        break, and await task raised CancelledError unhandled.
+        """
+        import asyncio
+        from app.domain.services.execution_watchdog import (
+            ExecutionControl,
+            ExecutionWatchdog,
+        )
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        watchdog = ExecutionWatchdog(
+            total_timeout_seconds=0.05,
+            idle_timeout_seconds=10.0,
+        )
+        control = ExecutionControl()
+
+        class ForeverSilentGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                await asyncio.sleep(30)
+                yield {"node": {"events": []}}
+
+        config = {
+            "configurable": {
+                "execution_watchdog": watchdog,
+                "execution_control": control,
+            }
+        }
+        bridge = GraphEventBridge()
+
+        # If CancelledError leaks, this async for block raises and the test fails.
+        events = []
+        try:
+            async for event in bridge.run(ForeverSilentGraph(), {}, config=config):
+                events.append(event)
+        except asyncio.CancelledError:
+            pytest.fail("CancelledError leaked from bridge.run() on HARD_TERMINATE")
+
+        # Ensure we actually reached HARD_TERMINATE, not something else.
+        from app.domain.models.event import HealthEvent, HealthStatus
+        terminating = [
+            e
+            for e in events
+            if isinstance(e, HealthEvent) and e.status == HealthStatus.TERMINATING
+        ]
+        assert len(terminating) == 1
+
+    async def test_total_timeout_zero_is_unlimited(self):
+        """Regression: total_timeout_seconds=0 must mean 'no hard cap', not
+        'expire immediately'."""
+        import asyncio
+        from app.domain.services.execution_watchdog import (
+            ExecutionControl,
+            ExecutionWatchdog,
+        )
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        watchdog = ExecutionWatchdog(
+            total_timeout_seconds=0,         # unlimited
+            idle_timeout_seconds=1.0,
+        )
+        control = ExecutionControl()
+
+        class QuickGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                yield {
+                    "executor_node": {
+                        "events": [MessageEvent(role="assistant", message="ok")],
+                        "flow_status": "completed",
+                    }
+                }
+
+        config = {
+            "configurable": {
+                "execution_watchdog": watchdog,
+                "execution_control": control,
+            }
+        }
+        bridge = GraphEventBridge()
+        events = []
+        async for event in bridge.run(QuickGraph(), {}, config=config):
+            events.append(event)
+
+        # Must NOT have terminated — normal completion
+        from app.domain.models.event import HealthEvent, HealthStatus
+        terminating = [
+            e
+            for e in events
+            if isinstance(e, HealthEvent) and e.status == HealthStatus.TERMINATING
+        ]
+        assert terminating == []
+        assert control.should_terminate is False
+        # Normal event flowed through
+        assert any(isinstance(e, MessageEvent) for e in events)

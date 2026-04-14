@@ -231,7 +231,7 @@ class DBSessionRepository(SessionRepository):
         """更新会话状态"""
         # 1.构建更新值
         values = {"status": status.value, "updated_at": datetime.now()}
-        if status == SessionStatus.COMPLETED:
+        if status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
             values["completed_at"] = datetime.now()
         elif status == SessionStatus.TAKEOVER_PENDING:
             # reopen 场景：从 completed 恢复时清空 completed_at，

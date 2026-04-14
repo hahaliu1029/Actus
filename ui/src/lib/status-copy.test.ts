@@ -11,6 +11,13 @@ describe("status-copy", () => {
     expect(getSessionStatusMeta("takeover").text).toBe("接管中");
   });
 
+  it("returns finishing meta", () => {
+    const meta = getSessionStatusMeta("finishing");
+    expect(meta.text).toBe("整理中");
+    expect(meta.tone).toBe("info");
+    expect(meta.spinning).toBeUndefined();
+  });
+
   it("maps known step statuses", () => {
     expect(getStepStatusMeta("started").text).toBe("执行中");
     expect(getStepStatusMeta("failed").text).toBe("失败");

@@ -28,6 +28,30 @@
 - `main_graph.py` 优化：支持中断节点、改进路由逻辑
 - `actus_chat_model.py` 增强：支持视觉模式、PDF 输入、消息清洗
 - 前端设置页扩展：新增文件理解配置面板
+- **[D5.1] LLM per-call hard timeout** (`TODOS.md #22`)：
+  1. `LLMConfig.timeout_seconds` default 120s and `MemoryConfig.summary_timeout_seconds` default 30s are added as assumption-based defaults. No production wall-time data supports these values; they are expected to be re-evaluated after wall-time sampling (see TODOS #24 B5.5 bench). Existing `config.yaml` without the new fields will inherit the Pydantic defaults.
+  2. `ActusFallbackChatModel` (when `api_type=auto`) behavior changes: each child adapter now enforces its own hard timeout. Worst case fallback path wall-time is now bounded (~240s at the default 120/120 budget) where previously it was unbounded.
+  3. Escape hatch: `timeout_seconds: 0` disables the per-call `asyncio.wait_for` wrap for debugging. This reverts to the pre-D5.1 behavior but **still** disables SDK retries (see point 5).
+  4. `AsyncOpenAI` client construction now passes `max_retries=0`, disabling SDK-level retry. LangGraph `RetryPolicy(max_attempts=3)` at `react_graph.llm_node` and `main_graph.planner_node` is now the single retry authority. This prevents a worst case of `3 (graph) × 3 (SDK) = 9` HTTP attempts per logical call.
+  5. `service_dependencies._build_llm` logs a budget warning when `api_type=auto` and `primary + fallback > 200s`（derived as `ExecutionWatchdog.total_timeout_seconds / 3 graph retries = 600 / 3 = 200`，即 `primary + fallback > 200s`）. Warning only — no hard raise. Extracted as the module-level constant `_FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS`.
+  6. All three LLM adapters (`ActusChatModel` / `ActusResponsesModel` / `ActusFallbackChatModel`) and their `bind_tools` / `with_structured_output` clone paths now propagate `timeout_seconds` to the cloned instance. Without this, `react_graph.py:180` and `planner_react.py:501-503` would silently drop user-configured timeouts.
+  7. Shared helper: `api/app/infrastructure/external/llm/_timeout_helpers.py` with a free function `with_llm_timeout(adapter, coro)` — mirrors the existing `_telemetry_mixin.py` idiom.
+  8. `_build_config_snapshot` 构造 `vision_llm_config` 时现在也继承
+     `app_config.llm_config.timeout_seconds`(Codex review 发现的漏传 ——
+     之前 vision fallback adapter 永远使用 `LLMConfig.timeout_seconds` 的
+     Pydantic 默认 120s，不响应用户在主 config 里的覆盖；下游 `image.py` /
+     `video.py` 的视觉描述/帧抽取路径因此一直跑在 120s adapter timeout 下)。
+     `VisionFallbackConfig` 没有独立 `timeout_seconds` 字段 —— 默认行为是
+     继承主 config，和 `summary_llm` 在 `summary_timeout_seconds=None` 时
+     的继承语义对齐。如果未来需要 vision 独立 timeout，可以在
+     `VisionFallbackConfig` 加可选字段。
+- **[D5.2] httpx connect-phase timeout**：补齐 D5.1 漏掉的连接阶段超时预算。
+  1. **背景**：D5.1 只给 `_agenerate` / `_astream` 包了外层 `asyncio.wait_for(timeout_seconds)`，但 `AsyncOpenAI(...)` 客户端构造时没传 `timeout=` 参数，因此 httpx 仍然使用 SDK 默认 `Timeout(connect=5.0, read=600, write=600, pool=600)`。慢网 / VPN / 连接池复用失效 / DNS 漂移等场景下一次 TLS 握手稍慢就会直接抛 `httpcore.ConnectTimeout → httpx.ConnectTimeout → openai.APITimeoutError`，外层 `asyncio.wait_for` 根本来不及生效 —— 提 `timeout_seconds` 对这类失败完全无效。D5.1 spec 第 13 行把该缺口描述成「仅 600s read timeout」，遗漏了 5s connect 这条独立天花板；spec 第 155/620 行据此把 `AsyncOpenAI(timeout=httpx.Timeout(...))` 当作「双保险 / 过度设计」否掉，结论只对 read 阶段成立，对 connect 阶段被本修复反证。
+  2. **新增字段** `LLMConfig.connect_timeout_seconds: float = Field(60.0, ge=1.0, le=300.0)`。与 `timeout_seconds` 独立是因为「不要为死端点等 300s」和「不要为一次模型生成等 300s」是两个 SLO。默认 60s 比 SDK 默认大一个数量级，覆盖典型慢网 / 跨境 TLS / 连接池 churn 场景；上界 300s 留给极端环境；真正死端点仍能在 ≤ 1 分钟失败。
+  3. **`ActusChatModel._get_client` / `ActusResponsesModel._get_client`** 构造 `AsyncOpenAI` 时新增 `timeout=httpx.Timeout(<default>, connect=self.connect_timeout_seconds)`，其中 `<default>` 用 `self.timeout_seconds if self.timeout_seconds > 0 else None`：`timeout_seconds == 0` 的 escape hatch 下 read/write/pool 回到无限制，但 **connect 依然被 `connect_timeout_seconds` 硬切**，保证「禁用主 timeout 包装」不会倒退到「连死端点都要等 5s」的原始行为。
+  4. **Clone 路径**：`ActusChatModel.bind_tools` / `ActusResponsesModel.bind_tools` 的 clone 构造同步加 `connect_timeout_seconds=self.connect_timeout_seconds`。否则 `react_graph.py` 和 `planner_react.py` 里 `llm.bind_tools(tools)` / `with_structured_output(...)` 产生的克隆实例会静默丢失这个字段，跟 D5.1 `timeout_seconds` clone hazard 的语义完全一致。
+  5. **`service_dependencies`**：`_llm_fingerprint` 加入 `str(llm_config.connect_timeout_seconds)` 参与哈希（不同 connect 预算不能共享缓存的 adapter 实例）；`_build_llm` 对 `ActusChatModel` / `ActusResponsesModel` 透传新字段；`_build_config_snapshot` 构造 `vision_llm_config` 时显式继承 `app_config.llm_config.connect_timeout_seconds`（与 D5.1 对 `timeout_seconds` 的继承逻辑对称）。`summary_llm_config` 走 `model_copy(update=...)`，新字段自动携带无需改动。
+  6. **迁移路径**：旧 `config.yaml` 不需要改 —— 不写 `connect_timeout_seconds` 会自动继承 Pydantic 默认 60s；已有 `timeout_seconds: 300` 的配置从此同时获得 60s connect 保护。`config.yaml.example` 新增注释示例说明什么场景该提高。
 
 ### 修复
 

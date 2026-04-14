@@ -1,7 +1,11 @@
+import logging
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -27,13 +31,15 @@ class Settings(BaseSettings):
 
     # 请求限流配置
     rate_limit_window_seconds: int = 60
-    rate_limit_read_per_minute: int = 120
-    rate_limit_write_per_minute: int = 60
-    rate_limit_chat_per_minute: int = 60
-    rate_limit_sse_concurrent: int = 10
-    rate_limit_ws_concurrent: int = 5
+    rate_limit_read_per_minute: int = 600
+    rate_limit_write_per_minute: int = 300
+    rate_limit_chat_per_minute: int = 300
+    rate_limit_sse_concurrent: int = 20
+    rate_limit_ws_concurrent: int = 10
     rate_limit_connection_ttl_seconds: int = 120
     rate_limit_heartbeat_seconds: int = 30
+    rate_limit_auth_per_minute: int = 10  # 认证端点 IP 限流
+    rate_limit_trust_proxy: bool = False  # 反代部署时设为 True，从 X-Forwarded-For 取真实 IP
 
     # MinIO对象存储配置
     minio_endpoint: str = "s3.example.com"
@@ -75,13 +81,28 @@ class Settings(BaseSettings):
     feature_takeover_reopen_window_seconds: int = 300
     feature_takeover_lease_guard_interval_seconds: int = 15
 
+    # 危险工具确认配置
+    tool_confirmation_timeout_seconds: int = 300
+    smart_approve_enabled: bool = False
+
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
+
+    # B5 C11: Prompt telemetry log directory
+    # JsonlPromptTelemetry writes two JSONL files here:
+    # - assembly.jsonl (PromptAssembler.assemble events)
+    # - llm_invocation.jsonl (per-LLM-call metadata from the adapter hook)
+    # Consumed by B5.5 for caching-viability analysis (stable system_prompt
+    # and tools across a session → cache_control is worth enabling).
+    prompt_telemetry_log_dir: str = "/app/data/telemetry/prompt"
 
     # Checkpointer 连接池配置
     checkpointer_pool_min_size: int = 2
     checkpointer_pool_max_size: int = 10
     checkpointer_pool_timeout: float = 30.0
+
+    # Config 缓存 TTL (秒)
+    config_cache_ttl: int = 60
 
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"
@@ -99,6 +120,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
+
+    @model_validator(mode="after")
+    def _reject_default_jwt_secret(self) -> "Settings":
+        if self.jwt_secret_key == "change-me-in-env" and self.env != "test":
+            raise ValueError(
+                "JWT_SECRET_KEY 仍为默认值 'change-me-in-env'，"
+                "请在 .env 或环境变量中设置一个安全的随机密钥"
+            )
+        return self
 
 
 @lru_cache()

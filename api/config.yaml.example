@@ -12,12 +12,15 @@ llm_config:
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
   # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
   # supports_pdf_input: false             # 是否支持原生 PDF 文件输入（需要模型支持，如 gpt-4o）
+  # timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）。0 表示关闭 wait_for 包装（仅调试用）；其它值会被 adapter 的 _agenerate/_astream 包成 asyncio.wait_for，超时抛 ServerRequestsError 让 LangGraph RetryPolicy 接管重试。代码默认 120s；长上下文/多模态/复杂推理场景推荐 300s，配合下方 agent_config.execution 的 idle/total 超时同步调整。同时作为 httpx read/write/pool 阶段上限。
+  # connect_timeout_seconds: 60.0         # D5.2: httpx connect 阶段（TCP+TLS 握手）专用超时（秒）。与 timeout_seconds 独立是因为 OpenAI SDK 默认只给 connect 5s，跨境慢网/连接池复用失效/DNS 漂移等场景下 TLS 握手会直接被 5s 砍掉，提 timeout_seconds 毫无作用（外层 asyncio.wait_for 根本来不及生效就被 httpcore.ConnectTimeout 冒出来）。代码默认 60s，上界 300s 留给极端环境；真正死端点仍能在 1 分钟内快速失败。
   # context_overflow_guard_enabled: false  # 开启上下文超限治理
   # token_estimator: hybrid               # token 估算策略: char(最快) / hybrid(推荐) / provider_api(需安装 tiktoken)
   # token_safety_factor: 1.15             # token 估算安全系数
   # tool_compress_trigger_ratio: 0.75    # Phase 1 工具结果压缩触发比例
   # target_ratio: 0.65                   # Level 2 压缩后目标水位
   # summary_max_chars: 16000             # 摘要上限字符数
+  # system_prompt_max_tokens: 3500       # B5 C9: system prompt token 预算上限（PromptAssembler 硬封顶 + effective_window 基数）
 
 # OpenAI 官方 API 示例（gpt-5.4，推荐）
 # llm_config:
@@ -26,6 +29,7 @@ llm_config:
 #   model_name: gpt-5.4
 #   temperature: 0.7
 #   max_tokens: 8192
+#   timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）。api_type=auto 时注意 primary+fallback 总预算 > 200s 会触发 budget warning（代码默认 600s watchdog / 3 graph retries）。若设 300s 需同步把 agent_config.execution.total_timeout_seconds 拉到 900s+
 #   api_type: auto
 #   supports_response_format: true
 
@@ -36,6 +40,7 @@ llm_config:
 #   model_name: gpt-5.4-pro
 #   temperature: 0.7
 #   max_tokens: 8192
+#   timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）
 #   api_type: responses
 #   supports_response_format: true
 
@@ -82,6 +87,8 @@ agent_config:
       - "^(ok|okay)([,\\s]+(go on|continue))?$"
   memory:
     summary_enabled: true
+    # summary_model: ""                   # 可选：覆盖 summarizer 的模型名。留空则复用 llm_config.model_name。
+    # summary_timeout_seconds: 30.0       # D5.1: summarizer 单次调用硬超时（秒）。三态语义：（1）注释掉/省略本字段 → 使用模型默认值 30s（**不自动继承** llm_config.timeout_seconds）；（2）显式写数值（如 5.0）→ 覆盖；（3）显式写 null → 继承 llm_config.timeout_seconds。summarizer 无工具、prompt 短，通常比主 Agent 更短；默认 30s 是经验值（15s 预期完成 + 2x 缓冲）。
     summary_max_rounds: 5
     summary_token_budget: 2000
     summary_min_steps: 1
@@ -93,6 +100,22 @@ agent_config:
     flush_min_new_tokens: 3000
     flush_max_retries: 3
     flush_circuit_breaker_threshold: 3
+    # Embedding（记忆向量化，独立于 skill embedding）
+    embedding_enabled: false
+    embedding_api_base: ""          # OpenAI 兼容 API base URL
+    embedding_api_key: ""           # API key
+    embedding_dim: 512              # 必须与 DB pgvector 列维度一致
+    embedding_model: "text-embedding-3-small"
+    embedding_circuit_breaker_threshold: 3    # 连续失败次数后熔断
+    embedding_circuit_breaker_recovery_seconds: 300.0  # 熔断恢复时间（秒）
+    # C7: 混合检索与排序
+    half_life_days: 30                # 时间衰减半衰期（天）
+    mmr_lambda: 0.7                   # MMR 多样性参数 (0=纯多样性, 1=纯相关性)
+    hybrid_alpha: 0.7                 # 向量/文本混合权重 (C7 仅占位不参与计算, C8 生效)
+  # execution:                        # 执行健康监控（ExecutionWatchdog 双层超时）
+  #   total_timeout_seconds: 900.0    # 整图执行总超时（秒）。代码默认 600s；配合 llm_config.timeout_seconds=300s 时建议 900s（300 x 3 graph retries）
+  #   idle_timeout_seconds: 300.0     # 空闲无进度事件超时（秒）。代码默认 120s；非流式 LLM 调用需 >= llm_config.timeout_seconds，否则 watchdog 会先触发
+  #   max_same_tool_failures: 3       # 同签名工具最大连续失败数
 
 mcp_config:
   mcpServers:

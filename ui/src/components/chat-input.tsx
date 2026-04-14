@@ -257,8 +257,20 @@ export function ChatInput({
     : false;
   const isCurrentSessionRunning = sessionStatus === "running";
   const isTakeoverActive = sessionStatus === "takeover" || sessionStatus === "takeover_pending";
+  // Check if waiting for tool confirmation — disable input so users must use the confirmation card
+  const hasToolConfirmationPending = useMemo(() => {
+    if (sessionStatus !== "waiting" || !currentSession?.events) return false;
+    const events = currentSession.events;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e?.event === "tool_confirmation") return true;
+      if (e?.event === "wait") return false; // normal wait, not tool confirmation
+      if (e?.event === "done" || e?.event === "error") return false;
+    }
+    return false;
+  }, [sessionStatus, currentSession?.events]);
   const showStopAction = Boolean(sessionId) && (isCurrentSessionStreaming || isCurrentSessionRunning);
-  const disableInput = uploading || showStopAction || isTakeoverActive;
+  const disableInput = uploading || showStopAction || isTakeoverActive || hasToolConfirmationPending;
   const canSubmit = Boolean(text.trim()) || pendingFiles.length > 0;
 
   const handleStopTask = async () => {

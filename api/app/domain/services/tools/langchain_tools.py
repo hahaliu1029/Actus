@@ -40,7 +40,10 @@ def _unwrap(result: object) -> str:
         if isinstance(data, dict):
             # Common sandbox pattern: {"returncode": 0, "output": "..."}
             if "output" in data:
-                return str(data["output"])
+                # Guard: bare ``str(None)`` would leak the literal "None" to the
+                # LLM and hide empty-output success cases.
+                output = data["output"]
+                return output if isinstance(output, str) else ("" if output is None else str(output))
             import json
             return json.dumps(data, ensure_ascii=False)
         return str(data)
@@ -117,11 +120,15 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
         )
         return _unwrap(result) if result else "File written successfully"
 
+    file_write.metadata = {"risk_level": "medium"}
+
     @lc_tool
     async def file_str_replace(filepath: str, old_str: str, new_str: str, sudo: bool = False) -> str:
         """Replace a string in a file."""
         result = await sandbox.replace_in_file(filepath, old_str, new_str, sudo=sudo)
         return _unwrap(result) if result else "Replacement done"
+
+    file_str_replace.metadata = {"risk_level": "medium"}
 
     @lc_tool
     async def file_find_in_content(filepath: str, regex: str, sudo: bool = False) -> str:
@@ -152,13 +159,98 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
 def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
     """Create shell tools that delegate to sandbox."""
 
-    @lc_tool
-    async def shell_execute(command: str, session_id: str = "default", exec_dir: str = "") -> str:
-        """Execute a shell command in the sandbox."""
-        result = await sandbox.exec_command(session_id=session_id, exec_dir=exec_dir, command=command)
-        return _unwrap(result)
+    _DEFAULT_WAIT_SECONDS = 5  # Matches sandbox service default, kept in sync intentionally.
+    # Upper bound on the sync wait window. Stays under the httpx client timeout
+    # (``DockerSandbox`` uses ``timeout=600``) so an LLM-supplied value can never
+    # cause a ReadTimeout that would orphan the background command.
+    _MAX_WAIT_SECONDS = 580
 
-    shell_execute.metadata = {"require_confirmation": True}
+    @lc_tool
+    async def shell_execute(
+        command: str,
+        session_id: str = "default",
+        exec_dir: str = "",
+        wait_seconds: Optional[int] = None,
+    ) -> str:
+        """Execute a shell command in the sandbox.
+
+        The sandbox synchronously waits up to ``wait_seconds`` (default 5s) for
+        the command to finish. If the command is still running when the wait
+        window elapses, this returns a message describing how to poll for
+        completion via ``shell_wait_process`` or ``shell_read_output`` — the
+        command keeps running in the background on ``session_id``.
+
+        For long-running commands (package installs, downloads, builds, etc.)
+        pass a larger ``wait_seconds`` so the tool blocks until completion
+        instead of returning early. Values are clamped to a safe ceiling that
+        stays below the underlying HTTP client timeout.
+        """
+        # Clamp LLM-supplied wait_seconds so it cannot exceed the httpx client
+        # timeout (which would orphan the command) or slip through as a non-positive.
+        clamped_wait: Optional[int] = None
+        if wait_seconds is not None and wait_seconds > 0:
+            clamped_wait = min(wait_seconds, _MAX_WAIT_SECONDS)
+
+        result = await sandbox.exec_command(
+            session_id=session_id,
+            exec_dir=exec_dir,
+            command=command,
+            wait_seconds=clamped_wait,
+        )
+        if hasattr(result, "success") and not result.success:
+            raise RuntimeError(getattr(result, "message", None) or str(result))
+
+        data = getattr(result, "data", None)
+        # Legacy / mocked sandbox that doesn't return structured data — fall
+        # through to the generic unwrap path.
+        if not isinstance(data, dict):
+            return _unwrap(result)
+
+        status = data.get("status")
+        output = data.get("output")
+        if not isinstance(output, str):
+            output = "" if output is None else str(output)
+        returncode = data.get("returncode")
+
+        if status == "running":
+            effective_wait = clamped_wait or _DEFAULT_WAIT_SECONDS
+            # Sandbox only populates ``output`` on completion; fetch whatever
+            # has buffered so far via ``read_shell_output`` (best-effort) so the
+            # LLM can see progress without an extra poll round-trip.
+            partial_text = ""
+            try:
+                peek = await sandbox.read_shell_output(session_id=session_id)
+                peek_data = getattr(peek, "data", None)
+                if isinstance(peek_data, dict):
+                    raw = peek_data.get("output")
+                    if isinstance(raw, str) and raw.strip():
+                        partial_text = f"\n--- partial output ---\n{raw}"
+            except Exception:
+                # Best-effort: the LLM can still call shell_read_output explicitly.
+                pass
+            return (
+                f"[shell_execute] Command is still running on session '{session_id}' "
+                f"after the {effective_wait}s sync wait window. The process keeps running "
+                f"in the background.\n"
+                f"Next step: call shell_wait_process(session_id='{session_id}', seconds=N) "
+                f"to wait longer, or shell_read_output(session_id='{session_id}') to peek "
+                f"current output. For long operations (apt/pip install, downloads, builds) "
+                f"you can also re-invoke shell_execute with a larger wait_seconds."
+                f"{partial_text}"
+            )
+
+        # status == "completed" (or unknown/legacy) — surface output + returncode.
+        if output:
+            if returncode is not None and returncode != 0:
+                return f"{output}\n[shell_execute] exit code: {returncode}"
+            return output
+        if returncode == 0:
+            return "[shell_execute] Command completed successfully with no output (exit code 0)."
+        if returncode is not None:
+            return f"[shell_execute] Command completed with no output (exit code {returncode})."
+        return "[shell_execute] Command completed with no output."
+
+    shell_execute.metadata = {"risk_level": "high"}
 
     @lc_tool
     async def shell_read_output(session_id: str = "default") -> str:
@@ -264,6 +356,8 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         """Execute JavaScript in the browser console."""
         result = await browser.console_exec(javascript)
         return _unwrap(result)
+
+    browser_console_exec.metadata = {"risk_level": "high"}
 
     @lc_tool
     async def browser_console_view(max_lines: int = 50) -> str:

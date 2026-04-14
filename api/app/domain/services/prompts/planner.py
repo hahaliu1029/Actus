@@ -1,11 +1,12 @@
-# 规划Agent系统预设prompt
-PLANNER_SYSTEM_PROMPT = """
-你是一个任务规划智能体 (Task Planner Agent), 你需要为任务创建或更新计划:
-1. 分析用户的消息并理解用户的需求;
-2. 确定完成任务需要使用哪些工具;
-3. 根据用户的消息确定工作语言;
-4. 生成计划的目标和步骤;
-"""
+# B5 C7.5: PLANNER_SYSTEM_PROMPT has been migrated into the
+# ``planner_identity`` section and removed from this file. The surviving
+# constants (EXECUTION_SUMMARY_NONE_FALLBACK, CREATE_PLAN_PROMPT,
+# UPDATE_PLAN_PROMPT) are HumanMessage templates with {placeholders},
+# still consumed by main_graph.py and planner_react.py.
+
+# Fallback string when execution_summary is empty (used by main_graph.updater_node
+# when calling UPDATE_PLAN_PROMPT.format(execution_summary=...))
+EXECUTION_SUMMARY_NONE_FALLBACK = "无额外执行详情"
 
 # 创建Plan规划提示词模板，内部有message+attachments占位符
 CREATE_PLAN_PROMPT = """

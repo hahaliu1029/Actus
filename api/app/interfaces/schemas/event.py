@@ -8,8 +8,11 @@ from app.domain.models.event import (
     ControlScope,
     ControlSource,
     Event,
+    HealthEvent,
+    HealthStatus,
     PlanEvent,
     StepEvent,
+    ToolConfirmationEvent,
     ToolEvent,
     ToolEventStatus,
 )
@@ -212,10 +215,32 @@ class ToolSSEEvent(BaseSSEEvent):
         )
 
 
+class DoneEventData(BaseEventData):
+    """结束事件数据"""
+
+    metrics: Optional[Dict[str, Any]] = None
+
+
 class DoneSSEEvent(BaseSSEEvent):
     """停止流式事件"""
 
     event: Literal["done"] = "done"
+    data: DoneEventData
+
+    @classmethod
+    def from_event(cls, event) -> Self:
+        return cls(
+            data=DoneEventData(
+                **BaseEventData.base_event_data(event),
+                metrics=getattr(event, "metrics", None),
+            )
+        )
+
+
+class FinishingSSEEvent(BaseSSEEvent):
+    """FINISHING 流式事件"""
+
+    event: Literal["finishing"] = "finishing"
 
 
 class WaitSSEEvent(BaseSSEEvent):
@@ -264,6 +289,44 @@ class ControlSSEEvent(BaseSSEEvent):
         )
 
 
+class ToolConfirmationEventData(BaseEventData):
+    """危险工具确认请求事件数据"""
+
+    tool_call_id: str
+    tool_name: str
+    tool_args: dict[str, Any]
+    risk_level: str
+    risk_reason: str
+    matched_patterns: list[str]
+    suggested_alternative: str | None = None
+    approval_options: list[str] = ["once", "session", "always", "deny"]
+    timeout_seconds: int
+
+
+class ToolConfirmationSSEEvent(BaseSSEEvent):
+    """危险工具确认请求流式事件"""
+
+    event: Literal["tool_confirmation"] = "tool_confirmation"
+    data: ToolConfirmationEventData
+
+    @classmethod
+    def from_event(cls, event: ToolConfirmationEvent) -> "ToolConfirmationSSEEvent":
+        return cls(
+            data=ToolConfirmationEventData(
+                **BaseEventData.base_event_data(event),
+                tool_call_id=event.tool_call_id,
+                tool_name=event.tool_name,
+                tool_args=event.tool_args,
+                risk_level=event.risk_level,
+                risk_reason=event.risk_reason,
+                matched_patterns=event.matched_patterns,
+                suggested_alternative=event.suggested_alternative,
+                approval_options=event.approval_options,
+                timeout_seconds=event.timeout_seconds,
+            )
+        )
+
+
 class ErrorEventData(BaseEventData):
     """错误事件数据"""
 
@@ -277,6 +340,40 @@ class ErrorSSEEvent(BaseSSEEvent):
     data: ErrorEventData
 
 
+class HealthEventData(BaseEventData):
+    """执行健康状态事件数据"""
+
+    status: HealthStatus
+    reason: str
+    last_node: Optional[str] = None
+    idle_seconds: Optional[float] = None
+    tool_failures: int = 0
+    action: str = "monitoring"
+    metrics: Optional[Dict[str, Any]] = None
+
+
+class HealthSSEEvent(BaseSSEEvent):
+    """执行健康状态流式事件"""
+
+    event: Literal["health"] = "health"
+    data: HealthEventData
+
+    @classmethod
+    def from_event(cls, event: HealthEvent) -> Self:
+        return cls(
+            data=HealthEventData(
+                **BaseEventData.base_event_data(event),
+                status=event.status,
+                reason=event.reason,
+                last_node=event.last_node,
+                idle_seconds=event.idle_seconds,
+                tool_failures=event.tool_failures,
+                action=event.action,
+                metrics=event.metrics,
+            )
+        )
+
+
 # 定义Agent流式事件类型集合
 AgentSSEEvent = Union[
     CommonSSEEvent,
@@ -286,9 +383,12 @@ AgentSSEEvent = Union[
     PlanSSEEvent,
     ToolSSEEvent,
     DoneSSEEvent,
+    FinishingSSEEvent,
     ErrorSSEEvent,
     WaitSSEEvent,
     ControlSSEEvent,
+    HealthSSEEvent,
+    ToolConfirmationSSEEvent,
 ]
 
 

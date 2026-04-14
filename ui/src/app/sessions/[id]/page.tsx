@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import {
+  AlertCircle,
   Bot,
   CheckCircle2,
   CircleDashed,
@@ -16,6 +17,7 @@ import {
 import { ChatInput } from "@/components/chat-input";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
+import { ToolConfirmationCard } from "@/components/tool-confirmation-card";
 import { StatusIndicator } from "@/components/status-indicator";
 import { SessionTaskDock } from "@/components/session-task-dock";
 import { WorkbenchPanel } from "@/components/workbench-panel";
@@ -314,7 +316,9 @@ function extractEmbeddedJsonResult(message: string): {
           : typeof parsed.message === "string" ? parsed.message
           : null;
         if (resultText !== null) {
-          const prefix = message.slice(0, openBrace).trim();
+          // Strip trailing code fence markers (e.g. ```json) from prefix —
+          // LLMs sometimes wrap JSON output in markdown code blocks
+          const prefix = message.slice(0, openBrace).trim().replace(/```\w*\s*$/, "").trim();
           const text = prefix ? `${prefix}\n\n${resultText}` : resultText;
           const attachments: string[] = Array.isArray(parsed.attachments)
             ? parsed.attachments.filter((a: unknown): a is string => typeof a === "string")
@@ -341,6 +345,10 @@ function renderEventItem(
   streamingAssistantEventId?: string | null
 ) {
   const eventKey = getSessionEventStableKey(event, index);
+
+  if (event.event === "tool_confirmation") {
+    return <ToolConfirmationCard key={eventKey} data={event.data as Parameters<typeof ToolConfirmationCard>[0]["data"]} />;
+  }
 
   if (event.event === "message") {
     const role = String(event.data.role || "assistant");
@@ -381,11 +389,7 @@ function renderEventItem(
           <span className="text-xs text-muted-foreground">{timeText}</span>
         </div>
         <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
-          {isPartial ? (
-            <p className="whitespace-pre-wrap leading-7">{stripXmlTags(displayMessage) || "（空消息）"}</p>
-          ) : (
-            <MarkdownRenderer content={displayMessage || "（空消息）"} />
-          )}
+          <MarkdownRenderer content={isPartial ? (stripXmlTags(displayMessage) || "（空消息）") : (displayMessage || "（空消息）")} />
           {renderMessageAttachments(attachments, onPreviewFile)}
           {embeddedAttachments.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-2">
@@ -594,6 +598,73 @@ function renderEventItem(
     );
   }
 
+  // D5: Health event — watchdog恢复/终止提示
+  if (event.event === "health") {
+    const data = event.data as Record<string, unknown>;
+    const status = String(data.status || "");
+    const reason = String(data.reason || "");
+    const lastNode = typeof data.last_node === "string" ? data.last_node : null;
+    const idleSeconds = typeof data.idle_seconds === "number" ? data.idle_seconds : null;
+    const metrics = data.metrics && typeof data.metrics === "object"
+      ? (data.metrics as Record<string, unknown>)
+      : null;
+
+    // DEGRADED: 黄色警告 (恢复中)
+    // TERMINATING: 红色警告 (即将终止)
+    // TERMINATED: 红色终态 (已终止 + 指标摘要)
+    // HEALTHY: 不渲染 (正常态无需提示)
+    if (status === "healthy") {
+      return null;
+    }
+
+    const toneClass =
+      status === "degraded"
+        ? "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
+        : "border-red-200 bg-red-50 text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400";
+
+    const title =
+      status === "degraded"
+        ? "执行正在恢复"
+        : status === "terminating"
+          ? "执行即将终止"
+          : status === "terminated"
+            ? "执行已终止"
+            : "执行状态";
+
+    return (
+      <div key={eventKey} className={`mt-3 rounded-xl border px-3 py-2 text-sm ${toneClass}`}>
+        <div className="flex items-center gap-2 font-medium">
+          <AlertCircle size={14} />
+          {title}
+        </div>
+        {reason ? <p className="mt-1 text-xs">{reason}</p> : null}
+        {(lastNode || idleSeconds !== null) && (
+          <p className="mt-1 text-xs opacity-80">
+            {lastNode ? `最后活跃节点: ${lastNode}` : null}
+            {lastNode && idleSeconds !== null ? " · " : null}
+            {idleSeconds !== null ? `空闲 ${idleSeconds.toFixed(1)}s` : null}
+          </p>
+        )}
+        {metrics ? (
+          <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs opacity-80 sm:grid-cols-4">
+            {typeof metrics.tool_calls_total === "number" && (
+              <span>工具调用 {String(metrics.tool_calls_total)}</span>
+            )}
+            {typeof metrics.tool_success_rate === "number" && (
+              <span>成功率 {(Number(metrics.tool_success_rate) * 100).toFixed(0)}%</span>
+            )}
+            {typeof metrics.llm_calls_total === "number" && (
+              <span>LLM {String(metrics.llm_calls_total)}</span>
+            )}
+            {typeof metrics.steps_completed === "number" && (
+              <span>步骤 {String(metrics.steps_completed)}</span>
+            )}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
   const fallbackText =
     (typeof event.data.text === "string" && event.data.text) ||
     (typeof event.data.message === "string" && event.data.message);
@@ -617,6 +688,7 @@ export default function SessionPage() {
   const setActiveSession = useSessionStore((state) => state.setActiveSession);
   const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
   const fetchSessionFiles = useSessionStore((state) => state.fetchSessionFiles);
+  const recoverSession = useSessionStore((state) => state.recoverSession);
   const downloadFile = useSessionStore((state) => state.downloadFile);
   const downloadSandboxFile = useSessionStore((state) => state.downloadSandboxFile);
   const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
@@ -764,6 +836,39 @@ export default function SessionPage() {
     sessionRunning,
     isCurrentSessionStreaming,
   ]);
+
+  // E2: SSE 状态恢复 — visibilitychange 触发
+  useEffect(() => {
+    if (!sessionId) return;
+
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+
+      const session = useSessionStore.getState().currentSession;
+      if (!session || session.session_id !== sessionId) return;
+
+      // 已 COMPLETED 不触发
+      if (session.status === "completed") return;
+
+      // 正在流式中（stream 会实时推送），不需要恢复
+      const { isChatting, chatSessionId } = useSessionStore.getState();
+      if (isChatting && chatSessionId === sessionId) return;
+
+      // 1s debounce
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        void recoverSession(sessionId);
+      }, 1000);
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  }, [sessionId, recoverSession]);
 
   const streamingAssistantEventId = useMemo(() => {
     if (!isCurrentSessionStreaming) {

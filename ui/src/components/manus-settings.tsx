@@ -120,6 +120,12 @@ export function ManusSettings() {
     max_iterations: 100,
     max_retries: 3,
     max_search_results: 10,
+    tool_confirmation: {
+      enabled: true,
+      timeout_seconds: 300,
+      smart_approve_enabled: false,
+      smart_approve_medium_only: false,
+    },
   });
 
   const [llmForm, setLLMForm] = useState<LLMConfig>({
@@ -461,6 +467,107 @@ export function ManusSettings() {
                       <p className="mt-1 text-xs text-muted-foreground">
                       </p>
                     </label>
+                  </div>
+
+                  {/* 工具确认安全策略 */}
+                  <div className="mt-8 border-t border-border pt-6">
+                    <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                      安全策略
+                    </h3>
+                    <p className="mb-4 text-sm text-muted-foreground">
+                      控制 Agent 执行危险工具（如终端命令、文件写入）时的确认行为。
+                    </p>
+                    <div className="grid max-w-[420px] grid-cols-1 gap-5">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="text-sm text-foreground/85">启用危险工具确认</span>
+                          <p className="text-xs text-muted-foreground">
+                            关闭后所有工具将直接执行，不再弹出确认卡片。
+                          </p>
+                        </div>
+                        <Switch
+                          checked={agentForm.tool_confirmation?.enabled ?? true}
+                          onCheckedChange={(checked) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              tool_confirmation: {
+                                ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                enabled: checked,
+                              },
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <label className="text-sm text-foreground/85">
+                        确认超时（秒）
+                        <Input
+                          type="number"
+                          min={30}
+                          max={3600}
+                          value={agentForm.tool_confirmation?.timeout_seconds ?? 300}
+                          onChange={(event) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              tool_confirmation: {
+                                ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                timeout_seconds: Number(event.target.value),
+                              },
+                            }))
+                          }
+                          className="mt-1"
+                          disabled={!(agentForm.tool_confirmation?.enabled ?? true)}
+                        />
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          超时后 Agent 将自动尝试安全替代方案。
+                        </p>
+                      </label>
+
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="text-sm text-foreground/85">Smart Approve（LLM 辅助审批）</span>
+                          <p className="text-xs text-muted-foreground">
+                            启用后，低风险命令可由辅助 LLM 自动审批通过。
+                          </p>
+                        </div>
+                        <Switch
+                          checked={agentForm.tool_confirmation?.smart_approve_enabled ?? false}
+                          onCheckedChange={(checked) =>
+                            setAgentForm((prev) => ({
+                              ...prev,
+                              tool_confirmation: {
+                                ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                smart_approve_enabled: checked,
+                              },
+                            }))
+                          }
+                          disabled={!(agentForm.tool_confirmation?.enabled ?? true)}
+                        />
+                      </div>
+
+                      {(agentForm.tool_confirmation?.smart_approve_enabled) && (
+                        <div className="flex items-center justify-between pl-4">
+                          <div>
+                            <span className="text-sm text-foreground/85">仅 Medium 工具启用</span>
+                            <p className="text-xs text-muted-foreground">
+                              High 风险工具始终需人工确认。
+                            </p>
+                          </div>
+                          <Switch
+                            checked={agentForm.tool_confirmation?.smart_approve_medium_only ?? false}
+                            onCheckedChange={(checked) =>
+                              setAgentForm((prev) => ({
+                                ...prev,
+                                tool_confirmation: {
+                                  ...prev.tool_confirmation ?? { enabled: true, timeout_seconds: 300, smart_approve_enabled: false, smart_approve_medium_only: false },
+                                  smart_approve_medium_only: checked,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               ) : null}
@@ -1457,33 +1564,32 @@ export function ManusSettings() {
                     配置 file_view 工具的文件理解能力，让 Agent 能够查看和理解图片、PDF、音频、视频等文件。
                   </p>
 
-                  <div className="grid max-w-[420px] grid-cols-1 gap-5">
-                    <fieldset className="space-y-4 rounded-lg border border-border/50 p-4">
+                  <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+                    {/* ---- 视觉模型 Fallback ---- */}
+                    <fieldset className="space-y-3 rounded-lg border border-border/50 p-4">
                       <legend className="px-2 text-sm font-medium">视觉模型 Fallback</legend>
                       <p className="text-xs text-muted-foreground">
-                        当主模型不支持视觉（supports_vision=false）时，使用此模型描述图片/视频帧内容。可使用不同 provider。
+                        当主模型不支持视觉时，使用备用模型描述图片/视频帧内容。
                       </p>
 
-                      <label className="text-sm text-foreground/85">
-                        启用
-                        <div className="mt-2 flex items-center gap-3">
-                          <Switch
-                            className="data-[state=checked]:bg-primary"
-                            checked={fileForm.vision_fallback.enabled}
-                            onCheckedChange={(checked) =>
-                              setFileForm((prev) => ({
-                                ...prev,
-                                vision_fallback: { ...prev.vision_fallback, enabled: checked },
-                              }))
-                            }
-                          />
-                        </div>
-                      </label>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-foreground/85">启用</span>
+                        <Switch
+                          className="data-[state=checked]:bg-primary"
+                          checked={fileForm.vision_fallback.enabled}
+                          onCheckedChange={(checked) =>
+                            setFileForm((prev) => ({
+                              ...prev,
+                              vision_fallback: { ...prev.vision_fallback, enabled: checked },
+                            }))
+                          }
+                        />
+                      </div>
 
                       {fileForm.vision_fallback.enabled && (
-                        <>
+                        <div className="space-y-3 border-t border-border/30 pt-3">
                           <label className="text-sm text-foreground/85">
-                            base_url
+                            Base URL
                             <Input
                               value={fileForm.vision_fallback.base_url}
                               placeholder="留空则复用主 LLM 的 base_url"
@@ -1498,7 +1604,7 @@ export function ManusSettings() {
                           </label>
 
                           <label className="text-sm text-foreground/85">
-                            api_key
+                            API Key
                             <Input
                               type="password"
                               value={fileForm.vision_fallback.api_key ?? ""}
@@ -1514,7 +1620,7 @@ export function ManusSettings() {
                           </label>
 
                           <label className="text-sm text-foreground/85">
-                            model_name
+                            模型名称
                             <Input
                               value={fileForm.vision_fallback.model_name}
                               placeholder="如 gpt-4o-mini"
@@ -1529,7 +1635,7 @@ export function ManusSettings() {
                           </label>
 
                           <label className="text-sm text-foreground/85">
-                            api_type
+                            API 类型
                             <select
                               value={fileForm.vision_fallback.api_type}
                               onChange={(e) =>
@@ -1541,109 +1647,157 @@ export function ManusSettings() {
                                   },
                                 }))
                               }
-                              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                              className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                             >
                               <option value="chat_completions">Chat Completions</option>
                               <option value="responses">Responses</option>
                               <option value="auto">Auto (先 Chat 后 Responses)</option>
                             </select>
                           </label>
-                        </>
+                        </div>
                       )}
                     </fieldset>
 
-                    <fieldset className="space-y-4 rounded-lg border border-border/50 p-4">
-                      <legend className="px-2 text-sm font-medium">音频处理</legend>
+                    {/* ---- 右列：音频 + 视频 ---- */}
+                    <div className="space-y-5">
+                      {/* 音频处理 */}
+                      <fieldset className="space-y-3 rounded-lg border border-border/50 p-4">
+                        <legend className="px-2 text-sm font-medium">音频处理</legend>
 
-                      <label className="text-sm text-foreground/85">
-                        转录提供商
-                        <select
-                          value={fileForm.audio.provider}
-                          onChange={(e) =>
-                            setFileForm((prev) => ({
-                              ...prev,
-                              audio: { ...prev.audio, provider: e.target.value as "disabled" | "sandbox_whisper" | "openai_api" },
-                            }))
-                          }
-                          className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                        >
-                          <option value="disabled">禁用</option>
-                          <option value="sandbox_whisper">沙箱 Whisper</option>
-                          <option value="openai_api">OpenAI Whisper API</option>
-                        </select>
-                      </label>
+                        <label className="text-sm text-foreground/85">
+                          转录提供商
+                          <select
+                            value={fileForm.audio.provider}
+                            onChange={(e) =>
+                              setFileForm((prev) => ({
+                                ...prev,
+                                audio: { ...prev.audio, provider: e.target.value as "disabled" | "sandbox_whisper" | "openai_api" },
+                              }))
+                            }
+                            className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          >
+                            <option value="disabled">禁用</option>
+                            <option value="sandbox_whisper">沙箱 Whisper</option>
+                            <option value="openai_api">OpenAI Whisper API</option>
+                          </select>
+                        </label>
 
-                      {fileForm.audio.provider === "openai_api" && (
-                        <>
+                        {fileForm.audio.provider === "openai_api" && (
+                          <div className="space-y-3 border-t border-border/30 pt-3">
+                            <label className="text-sm text-foreground/85">
+                              API Key
+                              <Input
+                                type="password"
+                                value={fileForm.audio.openai_api_key ?? ""}
+                                onChange={(e) =>
+                                  setFileForm((prev) => ({
+                                    ...prev,
+                                    audio: { ...prev.audio, openai_api_key: e.target.value },
+                                  }))
+                                }
+                                className="mt-1"
+                              />
+                            </label>
+                            <label className="text-sm text-foreground/85">
+                              Base URL
+                              <Input
+                                value={fileForm.audio.openai_base_url ?? "https://api.openai.com/v1"}
+                                onChange={(e) =>
+                                  setFileForm((prev) => ({
+                                    ...prev,
+                                    audio: { ...prev.audio, openai_base_url: e.target.value },
+                                  }))
+                                }
+                                placeholder="https://api.openai.com/v1"
+                                className="mt-1"
+                              />
+                            </label>
+                            <label className="text-sm text-foreground/85">
+                              模型名称
+                              <Input
+                                value={fileForm.audio.openai_model ?? "whisper-1"}
+                                onChange={(e) =>
+                                  setFileForm((prev) => ({
+                                    ...prev,
+                                    audio: { ...prev.audio, openai_model: e.target.value },
+                                  }))
+                                }
+                                placeholder="whisper-1"
+                                className="mt-1"
+                              />
+                            </label>
+                          </div>
+                        )}
+                      </fieldset>
+
+                      {/* 视频处理 */}
+                      <fieldset className="space-y-3 rounded-lg border border-border/50 p-4">
+                        <legend className="px-2 text-sm font-medium">视频处理</legend>
+
+                        <div className="grid grid-cols-2 gap-3">
                           <label className="text-sm text-foreground/85">
-                            OpenAI API Key
+                            最大关键帧数
                             <Input
-                              type="password"
-                              value={fileForm.audio.openai_api_key ?? ""}
+                              type="number"
+                              min={1}
+                              max={20}
+                              value={fileForm.video.max_keyframes}
                               onChange={(e) =>
                                 setFileForm((prev) => ({
                                   ...prev,
-                                  audio: { ...prev.audio, openai_api_key: e.target.value },
+                                  video: { ...prev.video, max_keyframes: Number(e.target.value) },
                                 }))
                               }
                               className="mt-1"
                             />
                           </label>
+
                           <label className="text-sm text-foreground/85">
-                            Base URL
-                            <Input
-                              value={fileForm.audio.openai_base_url ?? "https://api.openai.com/v1"}
+                            帧提取策略
+                            <select
+                              value={fileForm.video.frame_strategy ?? "scene"}
                               onChange={(e) =>
                                 setFileForm((prev) => ({
                                   ...prev,
-                                  audio: { ...prev.audio, openai_base_url: e.target.value },
+                                  video: { ...prev.video, frame_strategy: e.target.value as "scene" | "uniform" },
                                 }))
                               }
-                              placeholder="https://api.openai.com/v1"
-                              className="mt-1"
-                            />
+                              className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                            >
+                              <option value="scene">场景检测</option>
+                              <option value="uniform">均匀采样</option>
+                            </select>
                           </label>
+                        </div>
+
+                        {fileForm.video.frame_strategy === "scene" && (
                           <label className="text-sm text-foreground/85">
-                            模型名称
+                            场景检测阈值
                             <Input
-                              value={fileForm.audio.openai_model ?? "whisper-1"}
+                              type="number"
+                              min={0.1}
+                              max={0.9}
+                              step={0.05}
+                              value={fileForm.video.scene_threshold ?? 0.3}
                               onChange={(e) =>
                                 setFileForm((prev) => ({
                                   ...prev,
-                                  audio: { ...prev.audio, openai_model: e.target.value },
+                                  video: { ...prev.video, scene_threshold: Number(e.target.value) },
                                 }))
                               }
-                              placeholder="whisper-1"
                               className="mt-1"
                             />
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              值越低提取帧越多，推荐 0.3
+                            </p>
                           </label>
-                        </>
-                      )}
-                    </fieldset>
+                        )}
 
-                    <fieldset className="space-y-4 rounded-lg border border-border/50 p-4">
-                      <legend className="px-2 text-sm font-medium">视频处理</legend>
-
-                      <label className="text-sm text-foreground/85">
-                        最大关键帧数
-                        <Input
-                          type="number"
-                          min={1}
-                          max={20}
-                          value={fileForm.video.max_keyframes}
-                          onChange={(e) =>
-                            setFileForm((prev) => ({
-                              ...prev,
-                              video: { ...prev.video, max_keyframes: Number(e.target.value) },
-                            }))
-                          }
-                          className="mt-1"
-                        />
-                      </label>
-
-                      <label className="text-sm text-foreground/85">
-                        提取音频转录
-                        <div className="mt-2 flex items-center gap-3">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <span className="text-sm text-foreground/85">提取音频转录</span>
+                            <p className="text-xs text-muted-foreground">从视频中提取音轨并转录</p>
+                          </div>
                           <Switch
                             className="data-[state=checked]:bg-primary"
                             checked={fileForm.video.extract_audio}
@@ -1654,52 +1808,9 @@ export function ManusSettings() {
                               }))
                             }
                           />
-                          <span className="text-xs text-muted-foreground">
-                            从视频中提取音轨并转录为文字
-                          </span>
                         </div>
-                      </label>
-
-                      <label className="text-sm text-foreground/85">
-                        帧提取策略
-                        <select
-                          value={fileForm.video.frame_strategy ?? "scene"}
-                          onChange={(e) =>
-                            setFileForm((prev) => ({
-                              ...prev,
-                              video: { ...prev.video, frame_strategy: e.target.value as "scene" | "uniform" },
-                            }))
-                          }
-                          className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                        >
-                          <option value="scene">场景检测</option>
-                          <option value="uniform">均匀采样</option>
-                        </select>
-                      </label>
-
-                      {fileForm.video.frame_strategy === "scene" && (
-                        <label className="text-sm text-foreground/85">
-                          场景检测阈值
-                          <Input
-                            type="number"
-                            min={0.1}
-                            max={0.9}
-                            step={0.05}
-                            value={fileForm.video.scene_threshold ?? 0.3}
-                            onChange={(e) =>
-                              setFileForm((prev) => ({
-                                ...prev,
-                                video: { ...prev.video, scene_threshold: Number(e.target.value) },
-                              }))
-                            }
-                            className="mt-1"
-                          />
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            值越低提取帧越多，推荐 0.3
-                          </p>
-                        </label>
-                      )}
-                    </fieldset>
+                      </fieldset>
+                    </div>
                   </div>
                 </div>
               ) : null}

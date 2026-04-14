@@ -18,6 +18,39 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(
         8192, ge=0
     )  # 最大输出token数，默认设置为deepseek-chat模型的最大输出限制
+    timeout_seconds: float = Field(
+        120.0,
+        ge=0,
+        le=3600,
+        description=(
+            "Per-call LLM hard timeout in seconds. Default 120s is an "
+            "assumption — no production wall-time data backs it; adjust "
+            "after wall-time sampling (see TODOS #24 B5.5 bench). "
+            "0 disables the per-call wrap (use sparingly for debugging). "
+            "Wrapped by asyncio.wait_for in each adapter's _agenerate/"
+            "_astream; TimeoutError is converted to ServerRequestsError "
+            "so LangGraph RetryPolicy handles retries. Also passed through "
+            "to httpx as the read/write/pool timeout ceiling; see "
+            "connect_timeout_seconds for the TCP+TLS handshake budget."
+        ),
+    )
+    connect_timeout_seconds: float = Field(
+        60.0,
+        ge=1.0,
+        le=300.0,
+        description=(
+            "httpx connect-phase timeout in seconds (TCP establish + TLS "
+            "handshake). Separate from timeout_seconds because 'don't wait "
+            "300s for a dead endpoint' is a different SLO from 'don't wait "
+            "300s for a model to finish generating'. The OpenAI SDK default "
+            "is 5s which is too tight for slow cross-border networks, DNS "
+            "drift, or connection-pool churn — a single slow TLS handshake "
+            "raises httpcore.ConnectTimeout before the outer asyncio.wait_for "
+            "(timeout_seconds) window is reached. Default 60s covers typical "
+            "slow-network scenarios while still failing fast on truly dead "
+            "endpoints; the upper bound 300s is for extreme environments."
+        ),
+    )
     context_window: int | None = Field(
         default=None, ge=1024
     )  # 上下文窗口大小，空表示根据模型映射自动推断
@@ -54,6 +87,10 @@ class LLMConfig(BaseModel):
     tool_compress_trigger_ratio: float = Field(
         0.75, gt=0, le=1
     )  # Phase 1 工具结果压缩触发比例（占预算百分比）
+    system_prompt_max_tokens: int = Field(
+        3500, ge=0
+    )  # B5 C9: system prompt token 预算上限。PromptAssembler 用这个硬封顶 section 装配结果，
+    # compute_effective_window() 把它从 context_window 里扣掉，留给 history 的预算。
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):
@@ -136,6 +173,17 @@ class MemoryConfig(BaseModel):
 
     summary_enabled: bool = True
     summary_model: Optional[str] = None
+    summary_timeout_seconds: float | None = Field(
+        default=30.0,
+        ge=0,
+        le=3600,
+        description=(
+            "Per-call timeout for the summarizer LLM. If None, inherits "
+            "llm_config.timeout_seconds. Default 30s is an assumption — "
+            "summarizer has no tools and short prompts, so calls are "
+            "expected to finish within 15s; 30s leaves 2x buffer."
+        ),
+    )
     summary_max_rounds: int = Field(5, ge=1, le=20)
     summary_token_budget: int = Field(2000, ge=200, le=10000)
     summary_min_steps: int = Field(1, ge=1, le=10)
@@ -148,6 +196,35 @@ class MemoryConfig(BaseModel):
     # Flush 容错
     flush_max_retries: int = Field(3, ge=0, le=10)
     flush_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
+    # Embedding（C1 基础设施 + C4 连接字段 + 容错）
+    embedding_enabled: bool = False
+    embedding_api_base: str = ""
+    embedding_api_key: str = ""
+    embedding_dim: int = Field(512, ge=1, description="pgvector 列维度，须与 DB schema 一致")
+    embedding_model: str = "text-embedding-3-small"
+    embedding_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
+    embedding_circuit_breaker_recovery_seconds: float = Field(300.0, ge=10, le=3600)
+    # C7: 混合检索与排序
+    half_life_days: int = Field(30, ge=1, le=365)
+    mmr_lambda: float = Field(0.7, ge=0.0, le=1.0)
+    hybrid_alpha: float = Field(0.7, ge=0.0, le=1.0)  # C7 仅占位不参与计算, C8 生效
+
+
+class ToolConfirmationConfig(BaseModel):
+    """危险工具确认策略配置"""
+
+    enabled: bool = Field(default=True, description="是否启用危险工具确认（关闭后所有工具直接执行）")
+    timeout_seconds: int = Field(default=300, ge=30, le=3600, description="确认超时秒数")
+    smart_approve_enabled: bool = Field(default=False, description="启用 Smart Approve（LLM 辅助审批）")
+    smart_approve_medium_only: bool = Field(default=False, description="Smart Approve 仅对 medium 工具生效")
+
+
+class ExecutionConfig(BaseModel):
+    """执行健康监控配置"""
+
+    total_timeout_seconds: float = Field(default=600.0, ge=0, description="总执行超时秒数（0=无限制）")
+    idle_timeout_seconds: float = Field(default=120.0, ge=10, description="idle 无输出超时秒数")
+    max_same_tool_failures: int = Field(default=3, ge=1, le=20, description="同签名工具最大连续失败数")
 
 
 class AgentConfig(BaseModel):
@@ -159,6 +236,8 @@ class AgentConfig(BaseModel):
     skill_selection: SkillSelectionPolicy = Field(default_factory=SkillSelectionPolicy)
     skill_embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    tool_confirmation: ToolConfirmationConfig = Field(default_factory=ToolConfirmationConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
 
 class MCPTransport(str, Enum):

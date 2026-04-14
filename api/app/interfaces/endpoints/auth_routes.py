@@ -19,6 +19,7 @@ from app.interfaces.schemas.auth import (
     UpdateUserRequest,
     UserResponse,
 )
+from app.interfaces.dependencies.rate_limit import rate_limit_auth
 from fastapi import APIRouter, Depends, HTTPException, status
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ def user_to_response(user: User) -> UserResponse:
 )
 async def register(
     request: RegisterRequest,
+    _rl: None = Depends(rate_limit_auth),
 ) -> Response:
     """用户注册"""
     postgres = get_postgres()
@@ -93,6 +95,7 @@ async def register(
 )
 async def login(
     request: LoginRequest,
+    _rl: None = Depends(rate_limit_auth),
 ) -> Response:
     """用户登录"""
     postgres = get_postgres()
@@ -129,6 +132,7 @@ async def login(
 )
 async def refresh_token(
     request: RefreshTokenRequest,
+    _rl: None = Depends(rate_limit_auth),
 ) -> Response:
     """刷新令牌"""
     postgres = get_postgres()
@@ -216,6 +220,7 @@ from fastapi.responses import RedirectResponse
 async def wechat_authorize(
     state: str | None = None,
     scope: str = "snsapi_userinfo",
+    _rl: None = Depends(rate_limit_auth),
 ) -> Response:
     """获取微信授权 URL"""
     settings = get_settings()
@@ -244,6 +249,7 @@ async def wechat_authorize(
 async def wechat_callback(
     code: str,
     state: str = "",
+    _rl: None = Depends(rate_limit_auth),
 ) -> RedirectResponse:
     """微信授权回调
 

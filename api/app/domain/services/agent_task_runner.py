@@ -10,7 +10,10 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, BinaryIO, Callable, List
+from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from app.domain.services.prompts.assembler import PromptAssembler
 
 from langchain_core.language_models import BaseChatModel
 
@@ -42,6 +45,9 @@ from app.domain.models.event import (
     ErrorEvent,
     Event,
     FileToolContent,
+    FinishingEvent,
+    HealthEvent,
+    HealthStatus,
     MCPToolContent,
     MessageEvent,
     SearchToolContent,
@@ -50,6 +56,7 @@ from app.domain.models.event import (
     StepEvent,
     StepEventStatus,
     TitleEvent,
+    ToolConfirmationEvent,
     ToolEvent,
     ToolEventStatus,
     WaitEvent,
@@ -68,6 +75,7 @@ from app.domain.repositories.uow import IUnitOfWork
 from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
+from app.domain.services.graphs.background_summary import run_background_summary
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.brainstorm_skill import BrainstormSkillTool
 from app.domain.services.tools.create_skill import CreateSkillTool
@@ -186,9 +194,20 @@ class AgentTaskRunner(TaskRunner):
         supports_pdf_input: bool = False,  # 是否支持原生 PDF 文件输入
         file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
         memory_flusher: MemoryFlusher | None = None,  # 记忆刷写调度器
+        memory_embedding_provider=None,  # C6: 记忆向量化 provider
+        memory_session_factory=None,  # C6: 记忆 DB session 工厂
+        memory_repo_factory=None,  # C6: 记忆仓库工厂
+        approval_cache=None,  # Task 17: ApprovalCache | None
+        confirmation_manager=None,  # Task 17: ConfirmationManager | None
+        initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        self._approval_cache = approval_cache
+        self._confirmation_manager = confirmation_manager
         self._memory_flusher = memory_flusher
+        self._memory_embedding_provider = memory_embedding_provider
+        self._memory_session_factory = memory_session_factory
+        self._memory_repo_factory = memory_repo_factory
         self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
         self._llm = llm
@@ -264,12 +283,34 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_selected_skills: list[Skill] = []
         self._current_message_text: str = ""
         self._last_initialized_skill_ids: tuple[str, ...] = ()
+        # #27 hotfix: parallel to _last_initialized_skill_ids, this holds the
+        # actual Skill objects that were last passed to SkillTool.initialize.
+        # Required by _build_step_react_graph's outer rollback path so it can
+        # actively call await self._skill_tool.initialize(snapshot_skills) to
+        # reset SkillTool internal state when Phase 2 or Phase 3 fails after
+        # Phase 1 already mutated SkillTool. Snapshot of IDs alone is not
+        # enough because initialize() needs Skill objects.
+        self._last_initialized_skills: list[Skill] = []
         self._last_virtual_step_id: str = ""
         self._embedding_available: bool = False
+        # D5: Watchdog termination flag (set when HealthEvent TERMINATING is emitted)
+        self._was_timed_out: bool = False
         self._embedding_index = None  # SkillEmbeddingIndex | None
         self._current_embedding_scores: list[float] | None = None
         self._tier2_preloaded_skill_ids: set[str] = set()
         self._last_skill_context: str = ""
+        # B5 C5a: per-step authoritative metadata persisted across calls.
+        # These three fields — together with self._last_initialized_skill_ids —
+        # are updated atomically by _apply_refreshed_skills + Phase 3 of
+        # _build_step_react_graph. Any partial update must be rolled back to
+        # the pre-call snapshot (see atomicity tests in test_refresh_skills_atomicity.py).
+        self._last_skill_ids: tuple[str, ...] = ()
+        self._last_bound_tool_names: frozenset[str] = frozenset()
+        # B5 C5a: per-step lc_tools cache keyed by (mode, skill_ids_tuple,
+        # activated_mcp_tools_frozenset). Never cleaned (bounded by the set
+        # of skill_id combinations actually used in this session). Cache is
+        # valid because lc_tools construction is a pure function of the key.
+        self._lc_tools_cache: dict[tuple, list[Any]] = {}
         self._activated_mcp_tools: set[str] = set()
         self._image_url_map: dict[str, str] = {}  # sandbox filepath → presigned URL
         self._supports_vision = supports_vision
@@ -279,6 +320,49 @@ class AgentTaskRunner(TaskRunner):
         # self._file_repository = file_repository
         self._browser = browser
         self._search_engine = search_engine
+
+        # B5 post-audit MEDIUM #3: eagerly import the ZH/EN bundles at
+        # session startup. The import triggers ``SectionRegistry.__post_init__``
+        # first-use validation (render each section against ``_FIXTURE_CTX``
+        # and scan for dangling skill tool refs). By doing this in the
+        # ``AgentTaskRunner.__init__`` — which runs once per session — we
+        # get practical startup fail-fast semantics without forcing the
+        # lightweight ``get_prompt_bundle`` path to pay the validation
+        # cost on every ``import app.domain.services.prompts`` call.
+        from app.domain.services.prompts.bundles import EN_BUNDLE, ZH_BUNDLE  # noqa: F401
+
+        # B5 C11: construct a JsonlPromptTelemetry instance and attach it
+        # to both (a) the PromptAssembler (assembly events) and (b) the
+        # LLM adapters (per-invocation events). All writes are
+        # fire-and-forget — failures never propagate to the main path.
+        self._prompt_telemetry = self._build_prompt_telemetry()
+
+        # B5 C5b: construct PromptAssembler for section-based system prompt
+        # assembly. Consumed by executor_node, planner_node, updater_node,
+        # and planner_react._run_planner_for_detection.
+        # B5 C9: budget routes through ``ContextOverflowConfig.system_prompt_max_tokens``.
+        # B5 C7.5: no longer gated by a feature flag — always constructed.
+        # B5 C11: telemetry is the JsonlPromptTelemetry built above.
+        prompt_assembler = self._build_prompt_assembler()
+
+        # B5 C11 + post-audit LOW #1: track the current session language
+        # and wire telemetry into all LLM adapters with that language.
+        # The initial value is ``"zh"`` because the actual language is
+        # only known after ``planner_node`` runs and parses the user
+        # message. ``set_language`` re-attaches telemetry with the new
+        # language once main_graph notifies us via the
+        # ``language_callback`` injected into ``configurable``.
+        # Note: ``self._llm`` was already assigned at line ~212; here we
+        # just stash ``summary_llm`` (which isn't stored elsewhere) and
+        # track the language.
+        # B5 #29: seed current language from application layer.
+        # ``initial_language`` is computed by ``AgentService._create_task``
+        # from the already-hydrated ``session.get_latest_plan()``.
+        # Falls back to "zh" for brand-new sessions (no plan history yet).
+        self._current_language: str = initial_language
+        self._summary_llm_for_telemetry = summary_llm
+        self._attach_telemetry_to_llms(self._current_language)
+
         self._flow = PlannerReActFlow(
             uow_factory=uow_factory,
             llm=llm,
@@ -300,6 +384,130 @@ class AgentTaskRunner(TaskRunner):
             supports_vision=supports_vision,
             supports_pdf_input=supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
+            memory_embedding_provider=self._memory_embedding_provider,
+            memory_session_factory=self._memory_session_factory,
+            memory_repo_factory=self._memory_repo_factory,
+            approval_cache=self._approval_cache,
+            confirmation_manager=self._confirmation_manager,
+            prompt_assembler=prompt_assembler,
+        )
+
+    def _build_prompt_telemetry(self) -> Any:
+        """Construct the ``JsonlPromptTelemetry`` instance used by
+        the ``PromptAssembler`` and LLM adapter hooks.
+
+        Log directory comes from ``settings.prompt_telemetry_log_dir``.
+        If the directory can't be created, ``JsonlPromptTelemetry`` logs
+        a warning at construction time and continues to accept writes
+        (each write is also try/except-guarded — see C1 implementation).
+
+        Returns a plain ``JsonlPromptTelemetry`` instance; can also be
+        a ``None``-compatible stub for tests if the config is missing,
+        but at the moment the default is always populated by settings.
+        """
+        from pathlib import Path
+
+        from app.infrastructure.telemetry.prompt_telemetry import (
+            JsonlPromptTelemetry,
+        )
+
+        log_dir = Path(get_settings().prompt_telemetry_log_dir)
+        return JsonlPromptTelemetry(log_dir=log_dir)
+
+    def _attach_telemetry_to_llms(self, lang: str) -> None:
+        """Attach ``self._prompt_telemetry`` to the primary and summary LLMs.
+
+        B5 post-audit LOW #1: called once at ``__init__`` with the default
+        language (``"zh"``), then again from ``set_language`` after
+        ``planner_node`` detects the real session language. The method is
+        idempotent — calling with the same lang is a no-op in effect.
+
+        Swallows ``AttributeError`` for test mocks that don't implement
+        ``attach_telemetry``.
+        """
+        llm = getattr(self, "_llm", None)
+        if llm is not None and hasattr(llm, "attach_telemetry"):
+            llm.attach_telemetry(self._prompt_telemetry, lang=lang)
+        summary_llm = getattr(self, "_summary_llm_for_telemetry", None)
+        if (
+            summary_llm is not None
+            and summary_llm is not llm
+            and hasattr(summary_llm, "attach_telemetry")
+        ):
+            summary_llm.attach_telemetry(self._prompt_telemetry, lang=lang)
+
+    def set_language(self, lang: str) -> None:
+        """Update the session language and re-attach telemetry.
+
+        B5 post-audit LOW #1: called from ``main_graph.planner_node``
+        after parsing ``plan.language`` so the invocation telemetry
+        records the correct language for every subsequent LLM call
+        in this session.
+
+        No-op if ``lang`` equals the current language. Non-blocking —
+        the underlying ``attach_telemetry`` swallows any adapter error.
+        """
+        if not lang or lang == self._current_language:
+            return
+        logger.info(
+            "[Telemetry] session language updated: %s → %s",
+            self._current_language,
+            lang,
+        )
+        self._current_language = lang
+        try:
+            self._attach_telemetry_to_llms(lang)
+        except Exception as exc:
+            logger.warning(
+                "[Telemetry] set_language failed to re-attach telemetry: %s",
+                exc,
+            )
+
+    def _build_prompt_assembler(self) -> "PromptAssembler":
+        """Construct the ``PromptAssembler`` used for all system-prompt assembly.
+
+        Post-C7.5: this method always returns a real instance — there is no
+        feature flag to gate it anymore. Consumers in ``main_graph`` and
+        ``planner_react`` require a non-None assembler and raise
+        ``RuntimeError`` if DI is misconfigured.
+
+        Budget: ``ContextOverflowConfig.system_prompt_max_tokens`` (canonical
+        source since B5 C9). Falls back to the pre-C9 hardcoded default of
+        3500 when no overflow_config is attached (test fixtures).
+        Telemetry: ``self._prompt_telemetry`` populated by
+        ``_build_prompt_telemetry`` (B5 C11). ``None`` when the runner
+        skipped telemetry setup (test path that bypasses ``__init__``).
+        """
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from app.domain.services.prompts.assembler import (
+            PromptAssembler as _PromptAssembler,
+        )
+        from app.domain.services.prompts.budget import SystemPromptBudget
+
+        # B5 C9: budget comes from ``ContextOverflowConfig.system_prompt_max_tokens``
+        # (canonical config source). When no overflow_config is attached
+        # (e.g. in tests), fall back to the pre-C9 hardcoded default of 3500.
+        max_tokens = (
+            self._overflow_config.system_prompt_max_tokens
+            if self._overflow_config
+            else 3500
+        )
+        budget = SystemPromptBudget(max_tokens=max_tokens)
+        strategy = (
+            self._overflow_config.token_estimator
+            if self._overflow_config
+            else "hybrid"
+        )
+        model_name = (
+            self._overflow_config.model_name
+            if self._overflow_config
+            else ""
+        )
+        estimator = TokenEstimator(strategy=strategy, model_name=model_name)
+        return _PromptAssembler(
+            budget=budget,
+            token_estimator=estimator,
+            telemetry=getattr(self, "_prompt_telemetry", None),
         )
 
     async def _put_and_add_event(
@@ -1160,6 +1368,11 @@ class AgentTaskRunner(TaskRunner):
                 + ", ".join(a2a_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
 
+        # Memory tools（C6: memory_search + memory_get）
+        # 直接从 runner 已知依赖判断（_build_available_tool_summary 在 flow.invoke 前执行）
+        if self._memory_session_factory and self._memory_repo_factory:
+            lines.append("- memory: memory_search, memory_get")
+
         summary = "\n".join(lines).strip()
         if len(summary) > char_budget:
             summary = summary[:char_budget].rstrip() + "\n...(truncated)"
@@ -1174,13 +1387,37 @@ class AgentTaskRunner(TaskRunner):
         sections.append(self._build_available_tool_summary())
         return "\n\n".join(section for section in sections if section).strip()
 
-    def _set_runtime_system_context(self, skills: list[Skill], scores: list[float] | None = None) -> None:
-        context = self._build_runtime_system_context(skills, scores=scores)
-        if hasattr(self._flow, "set_skill_context"):
-            self._flow.set_skill_context(context)
-
     async def _refresh_skill_context_for_step(self, step_description: str) -> str:
-        """Phase 3: 根据 step 描述重新选择 skill 并构建上下文。"""
+        """Legacy entry point — kept for ``skill_context_refresher`` injection.
+
+        B5 C5a: the implementation is now a thin wrapper around the pure
+        ``_compute_refreshed_skills`` + atomic ``_apply_refreshed_skills``
+        pair. ``updater_node`` still calls this to refresh the two-clock
+        fallback (``state.skill_context``). New C5a call sites in
+        ``_build_step_react_graph`` use the split pair directly.
+        """
+        result = await self._compute_refreshed_skills(step_description)
+        if result is None:
+            # Sticky: embedding top-1 score too low — keep previous selection.
+            return self._last_skill_context
+        await self._apply_refreshed_skills(result)
+        return self._last_skill_context
+
+    async def _compute_refreshed_skills(
+        self, step_description: str
+    ) -> "RefreshedSkillsResult | None":
+        """Pure compute: select skills + build context, no side effects.
+
+        Returns ``None`` when the embedding top-1 score is too low — the
+        caller should keep ``self._last_*`` unchanged (sticky behavior).
+        Otherwise returns a frozen ``RefreshedSkillsResult`` that
+        ``_apply_refreshed_skills`` will apply atomically.
+
+        **Must not mutate any ``self._*`` field.** Every state mutation
+        happens in ``_apply_refreshed_skills``.
+        """
+        from app.domain.services.graphs.step_metadata import RefreshedSkillsResult
+
         query_parts = [step_description]
         if self._current_message_text:
             query_parts.append(self._current_message_text)
@@ -1190,7 +1427,7 @@ class AgentTaskRunner(TaskRunner):
             try:
                 results = await self._embedding_index.query(query, top_k=12)
                 if results and results[0][1] < 0.2:
-                    return self._last_skill_context
+                    return None  # sticky
                 id_to_skill = {s.id: s for s in self._session_skill_pool}
                 skills = [id_to_skill[sid] for sid, _ in results if sid in id_to_skill]
                 scores = [score for sid, score in results if sid in id_to_skill]
@@ -1202,11 +1439,119 @@ class AgentTaskRunner(TaskRunner):
             skills = self._skill_selector.select(self._session_skill_pool, query)
             scores = None
 
-        if skills:
-            await self._initialize_skill_tool_if_needed(skills)
         context = self._build_runtime_system_context(skills, scores=scores)
+        return RefreshedSkillsResult(
+            skills=tuple(skills),
+            context=context,
+            skill_ids=tuple(s.id for s in skills),
+            scores=tuple(scores) if scores is not None else None,
+        )
+
+    async def _apply_refreshed_skills(
+        self, result: "RefreshedSkillsResult"
+    ) -> None:
+        """Atomic mutation point for the refreshed skill selection (#27).
+
+        Atomicity is guaranteed by assignment order: the two ``_last_*`` writes
+        happen AFTER ``_initialize_skill_tool_if_needed`` returns successfully.
+        If initialize raises, those two assignments are skipped, and
+        ``_last_initialized_skill_ids`` is similarly guarded inside
+        ``_initialize_skill_tool_if_needed`` (its own assignment is after the
+        await). Since #27 makes ``SkillTool.initialize()`` atomic, the internal
+        rollback layer that was here under B5 is no longer needed.
+
+        See design: docs/superpowers/specs/2026-04-13-skill-tool-initialize-atomicity-design.md
+        """
+        if result.skills:
+            await self._initialize_skill_tool_if_needed(list(result.skills))
+        self._last_skill_context = result.context
+        self._last_skill_ids = result.skill_ids
+
+    async def _apply_preselected_skills(
+        self,
+        skills: list[Skill],
+        scores: list[float] | None = None,
+    ) -> None:
+        """Apply a pre-selected skill list atomically.
+
+        Used by the four non-``_build_step_react_graph`` code paths that
+        already know which skills to activate and skip the embedding-based
+        ``_compute_refreshed_skills`` query:
+
+        1. Session bootstrap (before the main event loop starts).
+        2. New-message boundary (right before ``flow.invoke``).
+        3. Step-lock activation on step START / virtual step.
+        4. Unknown-tool emergency reselection inside a running step.
+
+        **Semantics**: "apply exactly this selection". An empty ``skills``
+        list is an EXPLICIT CLEAR of the active skill selection — it calls
+        ``_initialize_skill_tool_if_needed([])`` which advances
+        ``_last_initialized_skill_ids`` to ``()`` and resets the skill
+        portion of ``SkillTool`` internal state. ``_last_skill_ids`` is
+        written to ``()``. ``_last_skill_context`` is written to whatever
+        ``_build_runtime_system_context([], scores=None)`` produces —
+        which is NOT an empty string: ``_build_runtime_system_context``
+        always appends ``_build_available_tool_summary()`` covering
+        native / MCP / A2A / memory tools, so empty-skills context is
+        "tool summary without the Active Skills section".
+
+        This intentionally differs from ``_apply_refreshed_skills`` (which
+        gates init on non-empty ``result.skills`` because
+        ``_compute_refreshed_skills`` uses empty tuples ambiguously).
+
+        **Dedup**: the helper deduplicates ``skills`` by ``skill.id``,
+        preserving first-occurrence order. Callers may pass lists with
+        duplicates (e.g., from set-union of multiple selectors) and the
+        helper will normalize before initializing ``SkillTool``. This
+        prevents spurious re-init on the next call with deduplicated
+        input.
+
+        **Ordering**: ``_initialize_skill_tool_if_needed`` runs FIRST so
+        that ``_build_runtime_system_context`` reads the fresh
+        ``SkillTool`` internal state when assembling the available-tool
+        summary. Reversing the order would produce a "new skill guide +
+        stale tool summary" mixed context.
+
+        **Atomicity**: single-coroutine runner, await-free critical section
+        between ``_initialize_skill_tool_if_needed`` returning and the two
+        final assignments. Failure modes:
+
+        - ``_initialize_skill_tool_if_needed`` raises → post-#27 atomic
+          guarantee keeps ``_last_initialized_skill_ids`` at its pre-call
+          value; the two assignments below do not run; all three fields
+          stay at their pre-call values.
+        - ``_build_runtime_system_context`` raises AFTER init succeeds →
+          ``_last_initialized_skill_ids`` has already advanced but the two
+          final assignments do not run, producing a small split-brain
+          window. This matches the old bypass path's risk level (it had
+          the same failure mode relative to clock 2). Documented as a
+          residual risk; no restore shell added.
+        - Synchronous assignments at the tail cannot raise.
+
+        ``_last_bound_tool_names`` is intentionally NOT touched — it
+        represents "tools actually bound on the currently compiled
+        step_react graph" and is owned exclusively by
+        ``_build_step_react_graph`` Phase 3.
+
+        See design: docs/superpowers/specs/2026-04-13-activate-step-skills-atomicity-design.md
+        """
+        # Dedup by skill.id, preserving first-occurrence order. Prevents
+        # spurious re-init when a caller passes duplicates: without dedup,
+        # _last_skill_ids would hold duplicate-containing tuples and the
+        # next call with already-deduplicated input would not match,
+        # triggering an unnecessary SkillTool.initialize. See spec §3.1
+        # "Dedup contract".
+        seen_ids: set[str] = set()
+        deduped_skills: list[Skill] = []
+        for skill in skills:
+            if skill.id not in seen_ids:
+                seen_ids.add(skill.id)
+                deduped_skills.append(skill)
+
+        await self._initialize_skill_tool_if_needed(deduped_skills)
+        context = self._build_runtime_system_context(deduped_skills, scores=scores)
         self._last_skill_context = context
-        return context
+        self._last_skill_ids = tuple(skill.id for skill in deduped_skills)
 
     def _get_always_bind_tool_names(self) -> set[str]:
         """从 MCPConfig 提取所有 always_bind 工具名，组装完整前缀名。"""
@@ -1221,93 +1566,293 @@ class AgentTaskRunner(TaskRunner):
                 names.add(f"{prefix}_{tool_short_name}")
         return names
 
-    async def _build_step_react_graph(self, step_description: str = ""):
-        """Phase 3: 渐进式构建 react_graph — 按步骤描述选择相关 Skill 工具。
+    def _build_lc_tools_full(self) -> list[Any]:
+        """Build the full lc_tools set for a step.
 
-        1. 根据 step_description 刷新 Skill 选择（更新 _skill_tool）
-        2. 构建包含基础工具 + 当前步骤相关 Skill 工具的 react_graph
+        Post-#27: all tool sources (native / mcp_auto / a2a / skill_static /
+        dynamic_skill / skill_guide / memory) are always included. The
+        category-selection mechanism (``_ALL_CATEGORIES`` / ``_MINIMAL_CATEGORIES``)
+        was retired alongside the B5 graceful degradation path once
+        ``SkillTool.initialize()`` became atomic. See design:
+        docs/superpowers/specs/2026-04-13-skill-tool-initialize-atomicity-design.md
         """
-        # 按步骤描述刷新 skill 选择
-        if step_description:
-            try:
-                await self._refresh_skill_context_for_step(step_description)
-            except Exception as exc:
-                logger.warning("[ProgressiveSkillLoad] 步骤级 skill 刷新失败: %s", exc)
-
         from app.domain.services.tools.langchain_tools import create_native_tools
         from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
         from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
-        from app.domain.services.tools.langchain_skill_tools import create_skill_langchain_tools
-        from app.domain.services.tools.langchain_dynamic_skill_tools import create_dynamic_skill_langchain_tools
-        from app.domain.services.graphs.react_graph import build_react_graph
-
-        lc_tools = create_native_tools(
-            sandbox=self._sandbox, browser=self._browser,
-            search_engine=self._search_engine,
-            processor_lookup=self._file_processor_lookup,
-            supports_vision=self._supports_vision,
-            supports_pdf_input=self._supports_pdf_input,
+        from app.domain.services.tools.langchain_skill_tools import (
+            create_skill_guide_tool,
+            create_skill_langchain_tools,
         )
-        # MCP: progressive loading with auto-bind threshold
-        # When total MCP tools ≤ threshold, bind all directly (skip discovery overhead)
-        # When > threshold, only bind always_bind + activated tools
+        from app.domain.services.tools.langchain_dynamic_skill_tools import (
+            create_dynamic_skill_langchain_tools,
+        )
+
+        lc_tools: list[Any] = []
+
+        lc_tools.extend(
+            create_native_tools(
+                sandbox=self._sandbox,
+                browser=self._browser,
+                search_engine=self._search_engine,
+                processor_lookup=self._file_processor_lookup,
+                supports_vision=self._supports_vision,
+                supports_pdf_input=self._supports_pdf_input,
+            )
+        )
+
+        # MCP: progressive auto-bind with discovery tools above the threshold.
         MCP_AUTO_BIND_THRESHOLD = 15
         all_mcp_tools = self._mcp_tool.get_tools()
-        # URL map ref + sandbox uploader: MCP tools auto-resolve sandbox paths → presigned URLs
         _url_map_ref = lambda: self._image_url_map
         _sandbox_uploader = self._upload_sandbox_file_for_mcp
         if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
-            lc_tools.extend(create_mcp_langchain_tools(
-                self._mcp_tool, tool_names=None,
-                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
-            ))
+            lc_tools.extend(
+                create_mcp_langchain_tools(
+                    self._mcp_tool,
+                    tool_names=None,
+                    url_map_ref=_url_map_ref,
+                    sandbox_file_uploader=_sandbox_uploader,
+                )
+            )
         else:
-            mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
-            lc_tools.extend(create_mcp_langchain_tools(
-                self._mcp_tool, tool_names=mcp_bind_names,
-                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
-            ))
-            # Discovery tools only needed for large tool sets
-            from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
-            lc_tools.extend(create_mcp_discovery_tools(
-                mcp_tool_ref=lambda: self._mcp_tool,
-                activated_tools_ref=lambda: self._activated_mcp_tools,
-            ))
+            mcp_bind_names = (
+                self._get_always_bind_tool_names() | self._activated_mcp_tools
+            )
+            lc_tools.extend(
+                create_mcp_langchain_tools(
+                    self._mcp_tool,
+                    tool_names=mcp_bind_names,
+                    url_map_ref=_url_map_ref,
+                    sandbox_file_uploader=_sandbox_uploader,
+                )
+            )
+            from app.domain.services.tools.langchain_mcp_discovery import (
+                create_mcp_discovery_tools,
+            )
+            lc_tools.extend(
+                create_mcp_discovery_tools(
+                    mcp_tool_ref=lambda: self._mcp_tool,
+                    activated_tools_ref=lambda: self._activated_mcp_tools,
+                )
+            )
+
         lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
-        lc_tools.extend(create_skill_langchain_tools(
-            brainstorm_skill_tool=self._brainstorm_skill_tool,
-            create_skill_tool=self._create_skill_tool,
-        ))
 
-        # 渐进式注入：只绑定当前步骤相关的 Skill 工具
-        dynamic_tools = create_dynamic_skill_langchain_tools(self._skill_tool)
-        lc_tools.extend(dynamic_tools)
-
-        # get_skill_guide 始终可用（空 pool 时返回友好提示），让 LLM 能按需获取完整 SKILL.md
-        from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
-        lc_tools.append(create_skill_guide_tool(
-            skill_pool_ref=lambda: self._session_skill_pool,
-            file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
-            sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
-        ))
-
-        skill_tool_names = [t.name for t in dynamic_tools]
-        logger.info(
-            "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
-            step_description[:80] if step_description else "(无步骤描述)",
-            len(skill_tool_names),
-            skill_tool_names,
-            bool(self._session_skill_pool),
+        lc_tools.extend(
+            create_skill_langchain_tools(
+                brainstorm_skill_tool=self._brainstorm_skill_tool,
+                create_skill_tool=self._create_skill_tool,
+            )
         )
 
-        return build_react_graph(
-            llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
-            tool_result_max_chars=(
-                self._flow._overflow_config.tool_result_max_chars
-                if self._flow._overflow_config else 8000
-            ),
-            assembler=getattr(self._flow, '_assembler', None),
+        lc_tools.extend(
+            create_dynamic_skill_langchain_tools(self._skill_tool)
         )
+
+        lc_tools.append(
+            create_skill_guide_tool(
+                skill_pool_ref=lambda: self._session_skill_pool,
+                file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
+                sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
+            )
+        )
+
+        if self._memory_session_factory and self._memory_repo_factory:
+            from app.domain.services.tools.memory_tools import create_memory_tools
+            memory_config = self._flow._memory_config
+            lc_tools.extend(
+                create_memory_tools(
+                    embedding_provider=self._memory_embedding_provider,
+                    session_factory=self._memory_session_factory,
+                    repo_factory=self._memory_repo_factory,
+                    user_id=self._user_id,
+                    half_life_days=memory_config.half_life_days,
+                    mmr_lambda=memory_config.mmr_lambda,
+                )
+            )
+
+        return lc_tools
+
+    def _build_lc_tools_for_step(self) -> list[Any]:
+        """Normal-path lc_tools construction with per-step cache.
+
+        Cache key is ``(skill_ids, activated_mcp_tools)``. These are
+        the fields that change BETWEEN STEPS within a single user message.
+        ``_build_lc_tools_full`` also reads several instance
+        attributes that are stable WITHIN a session but could vary across
+        sessions or messages — namely ``self._skill_tool`` internal state,
+        ``self._memory_session_factory`` / ``_memory_repo_factory``,
+        ``self._user_id``, and ``self._flow._memory_config``. These are
+        NOT in the cache key because they do not change mid-message in
+        the current architecture.
+
+        The cache is cleared at each message boundary (alongside
+        ``_activated_mcp_tools.clear()``) to eliminate cross-message
+        staleness risk. Within a message, re-using cached entries is safe
+        because the implicit dependencies listed above are session-stable.
+        """
+        cache_key = (
+            self._last_skill_ids,
+            frozenset(self._activated_mcp_tools),
+        )
+        cached = self._lc_tools_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        tools = self._build_lc_tools_full()
+        self._lc_tools_cache[cache_key] = tools
+        return tools
+
+    async def _build_step_react_graph(
+        self, step_description: str = ""
+    ) -> "tuple[Any, StepMetadata]":
+        """Phase 3: progressive react_graph build + per-step metadata.
+
+        B5 C5a: returns a 2-tuple ``(CompiledStateGraph, StepMetadata)``.
+        The metadata is the authoritative per-step truth about tools bound
+        and skill context in scope. See ``step_metadata.py`` for field
+        semantics.
+
+        **Atomicity contract (post-audit HIGH #1)**: the 4 bookkeeping
+        fields ``_last_skill_context``, ``_last_skill_ids``,
+        ``_last_bound_tool_names``, ``_last_initialized_skill_ids`` must
+        be updated as a group. The entire 3-phase sequence is wrapped in
+        a snapshot/restore guard so that if ANY phase raises (including
+        the final ``build_react_graph`` call), all 4 fields are rolled
+        back to their pre-call values and the exception propagates to
+        the caller. Earlier partial-commit versions of this method
+        violated the contract when Phase 1 succeeded and Phase 3
+        raised — see test_refresh_skills_atomicity.py scenario 10.
+
+        3 phases (any can fail independently):
+        1. **Refresh skills** — ``_compute_refreshed_skills`` + atomic
+           ``_apply_refreshed_skills``. On exception: rollback + caller
+           observes the exception.
+        2. **Build lc_tools** — factory errors propagate to the outer
+           whole-function rollback (per #27, no graceful degradation).
+        3. **Build react_graph** — if this raises, the whole function's
+           snapshot/restore restores all 4 fields and re-raises.
+        """
+        from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.graphs.step_metadata import StepMetadata
+
+        # Snapshot all 4 bookkeeping fields at function entry. Any
+        # exception from any phase below restores them and re-raises so
+        # the atomicity contract holds across the entire method.
+        snapshot_skill_context = self._last_skill_context
+        snapshot_skill_ids = self._last_skill_ids
+        snapshot_bound_tool_names = self._last_bound_tool_names
+        snapshot_initialized_skill_ids = self._last_initialized_skill_ids
+        # #27 hotfix: snapshot the Skill object list too. The 4 _last_* field
+        # rollback alone is not enough — SkillTool internal state was already
+        # mutated by Phase 1's _initialize_skill_tool_if_needed and stays on
+        # the new skills if Phase 2 or Phase 3 fails. The outer except will
+        # actively call await self._skill_tool.initialize(snapshot_skills) to
+        # reset SkillTool, which requires the Skill objects (not just IDs).
+        snapshot_initialized_skills = list(self._last_initialized_skills)
+
+        try:
+            # Phase 1: try refresh skills (pure compute + atomic apply).
+            # ``_apply_refreshed_skills`` has its own internal rollback for
+            # ``_initialize_skill_tool_if_needed`` failures and re-raises;
+            # we catch here to mark the step as degraded and keep going
+            # with the sticky previous selection rather than aborting.
+            if step_description:
+                try:
+                    refreshed = await self._compute_refreshed_skills(step_description)
+                    if refreshed is not None:
+                        await self._apply_refreshed_skills(refreshed)
+                    # refreshed is None → sticky: self._last_* unchanged
+                except Exception as exc:
+                    logger.warning(
+                        "[ProgressiveSkillLoad] 刷新失败，继续使用上次选择: %s", exc
+                    )
+                    # self._last_* already rolled back by _apply_refreshed_skills
+
+            # Phase 2: build lc_tools (factory errors propagate to outer
+            # whole-function rollback, per #27).
+            lc_tools = self._build_lc_tools_for_step()
+            fresh_bound_tool_names = frozenset(t.name for t in lc_tools)
+
+            # StepMetadata.bound_tool_names always advances to the fresh
+            # set. The actual commit to self._last_bound_tool_names happens
+            # AFTER build_react_graph succeeds so the rollback path covers
+            # it too.
+            stable_bound_tool_names = fresh_bound_tool_names
+
+            dynamic_tool_names = [
+                t.name for t in lc_tools if t.name.startswith("skill_")
+            ]
+            logger.info(
+                "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
+                step_description[:80] if step_description else "(无步骤描述)",
+                len(dynamic_tool_names),
+                dynamic_tool_names,
+                bool(self._session_skill_pool),
+            )
+
+            # Phase 3: build the react_graph. If this raises, the outer
+            # try/except restores all 4 snapshot fields before re-raising.
+            step_react = build_react_graph(
+                llm=self._llm,
+                tools=lc_tools,
+                agent_config=self._agent_config,
+                tool_result_max_chars=(
+                    self._flow._overflow_config.tool_result_max_chars
+                    if self._flow._overflow_config
+                    else 8000
+                ),
+                assembler=getattr(self._flow, "_assembler", None),
+            )
+
+            # Post-build atomic commit: only now do we advance
+            # _last_bound_tool_names. All 4 fields are now consistent with
+            # a successful step build.
+            self._last_bound_tool_names = fresh_bound_tool_names
+
+            metadata = StepMetadata(
+                bound_tool_names=stable_bound_tool_names,
+                skill_context=self._last_skill_context,
+                skill_ids=self._last_skill_ids,
+            )
+            return step_react, metadata
+        except Exception:
+            # Whole-function rollback: any uncaught exception (including
+            # build_react_graph failure) restores the 4 bookkeeping fields
+            # to pre-call state before propagating. This guarantees the
+            # "4 fields atomic" contract from the C5a design doc.
+            self._last_skill_context = snapshot_skill_context
+            self._last_skill_ids = snapshot_skill_ids
+            self._last_bound_tool_names = snapshot_bound_tool_names
+            self._last_initialized_skill_ids = snapshot_initialized_skill_ids
+            self._last_initialized_skills = snapshot_initialized_skills
+            # #27 hotfix: SkillTool internal state was already mutated by
+            # Phase 1's _initialize_skill_tool_if_needed before Phase 2 or
+            # Phase 3 raised. The 4-field bookkeeping rollback above does not
+            # touch self._skill_tool; without active restoration, sticky
+            # follow-up calls would leak the failed step's tools (cache miss
+            # + stale self._skill_tool in _build_lc_tools_full). Actively
+            # re-initialize SkillTool to the snapshot state so reader paths
+            # see the correct tools. SkillTool.initialize is itself atomic
+            # (#27 design), so restore is success-or-no-op.
+            try:
+                await self._skill_tool.initialize(snapshot_initialized_skills)
+            except Exception as restore_exc:
+                # Restore failed — log and continue raising the original
+                # exception. Subsequent calls may still see stale state,
+                # but at least we tried. The dominant exception (from
+                # Phase 2 or Phase 3) is more informative than this one.
+                logger.error(
+                    "[#27 hotfix] SkillTool state restoration failed during "
+                    "_build_step_react_graph rollback: %s. Subsequent step "
+                    "metadata may be inconsistent until next successful "
+                    "_initialize_skill_tool_if_needed call.",
+                    restore_exc,
+                )
+            # Also clear lc_tools cache — entries built during the failed
+            # step (with skill_2 tools) must not be reused under the
+            # rolled-back skill_ids key.
+            self._lc_tools_cache.clear()
+            raise
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
         """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。"""
@@ -1321,6 +1866,8 @@ class AgentTaskRunner(TaskRunner):
         prev_ids = self._last_initialized_skill_ids
         await self._skill_tool.initialize(skills)
         self._last_initialized_skill_ids = skill_ids
+        # #27 hotfix: keep object list in sync so outer rollback can restore.
+        self._last_initialized_skills = list(skills)
         logger.info(
             "[ProgressiveSkillLoad] SkillTool 已更新: %s → %s",
             list(prev_ids) if prev_ids else "[]",
@@ -1350,7 +1897,17 @@ class AgentTaskRunner(TaskRunner):
         selected_skills: list[Skill] | None = None,
         is_virtual: bool = False,
     ) -> None:
-        """按 step 锁定技能集并更新运行时上下文。"""
+        """按 step 锁定技能集并更新运行时上下文（C5a 原子对路径）。
+
+        Routes through ``_apply_preselected_skills`` so that
+        ``_last_initialized_skill_ids`` / ``_last_skill_context`` /
+        ``_last_skill_ids`` advance atomically together. If
+        ``_initialize_skill_tool_if_needed`` raises, all three fields
+        stay at their pre-call values (post-#27 atomic guarantee +
+        await-free critical section in the helper). See design:
+        docs/superpowers/specs/2026-04-13-activate-step-skills-atomicity-design.md
+        §3.2 Site 3.
+        """
         if (
             self._step_skill_state
             and self._step_skill_state.step_id == step_id
@@ -1365,8 +1922,7 @@ class AgentTaskRunner(TaskRunner):
                 user_message,
             )
 
-        await self._initialize_skill_tool_if_needed(target_skills)
-        self._set_runtime_system_context(target_skills)
+        await self._apply_preselected_skills(target_skills)
         self._step_skill_state = StepSkillActivationState(
             step_id=step_id,
             user_message=user_message,
@@ -1423,11 +1979,16 @@ class AgentTaskRunner(TaskRunner):
             self._session_skill_pool,
             user_message,
         )
-        state.locked_skills = list(selected_skills)
+        # Field split (TODO #30 spec §3.2 Site 4):
+        # - Attempt counters (reselect_count, consecutive_unknown_tool_calls)
+        #   advance BEFORE apply so max_reselect cap is preserved even if
+        #   _apply_preselected_skills raises.
+        # - Success commit (locked_skills) advances AFTER apply, only when
+        #   apply succeeds.
         state.reselect_count += 1
         state.consecutive_unknown_tool_calls = 0
-        await self._initialize_skill_tool_if_needed(selected_skills)
-        self._set_runtime_system_context(selected_skills)
+        await self._apply_preselected_skills(selected_skills)
+        state.locked_skills = list(selected_skills)
         logger.warning(
             "step内连续unknown-tool达到阈值，触发一次技能重选(step_id=%s, reselect_count=%s)",
             state.step_id,
@@ -1531,11 +2092,11 @@ class AgentTaskRunner(TaskRunner):
             # 1.如果事件状态为已调用则执行以下代码
             if event.status == ToolEventStatus.CALLED:
                 category = self._classify_tool_name(event.tool_name)
-                print(f"[SNAPSHOT-DEBUG] 处理工具事件: tool_name={event.tool_name}, function={event.function_name}, category={category}", flush=True)
+                logger.debug("处理工具事件: tool_name=%s, function=%s, category=%s", event.tool_name, event.function_name, category)
                 # 2.工具为浏览器则补全工具浏览器工具内容
                 if category == "browser":
                     screenshot_url = await self._get_browser_screenshot()
-                    print(f"[SNAPSHOT-DEBUG] 浏览器截图完成: url={screenshot_url[:80] if screenshot_url else '(empty)'}", flush=True)
+                    logger.debug("浏览器截图完成: url=%s", screenshot_url[:80] if screenshot_url else "(empty)")
                     event.tool_content = BrowserToolContent(
                         screenshot=screenshot_url,
                     )
@@ -1701,10 +2262,83 @@ class AgentTaskRunner(TaskRunner):
                             skill_result="(Skill Creator 工具无可用结果)"
                         )
         except Exception as e:
-            import traceback
-            print(f"[SNAPSHOT-DEBUG] ❌ AgentTaskRunner生成工具内容失败: {e}", flush=True)
-            traceback.print_exc()
-            logger.exception(f"AgentTaskRunner生成工具内容失败: {str(e)}")
+            logger.exception("AgentTaskRunner生成工具内容失败: %s", e)
+
+    def _snapshot_metrics(self) -> Optional[Dict[str, Any]]:
+        """D5: Snapshot execution metrics for inclusion in terminal events."""
+        if not self._flow:
+            return None
+        _em = getattr(self._flow, "_execution_metrics", None)
+        if not _em:
+            return None
+        try:
+            return _em.to_dict()
+        except Exception:
+            return None
+
+    async def _emit_flow_event(self, task: Task, event: BaseEvent) -> str | None:
+        """Emit a single flow event to the task output stream and apply side effects.
+
+        Handles:
+        - Streaming chunked assistant messages
+        - Persisting events (skip partial MessageEvents)
+        - Side effects: TitleEvent, MessageEvent, WaitEvent, ControlEvent
+
+        Returns:
+            "wait"     — caller should return immediately (WaitEvent received)
+            "takeover" — caller should return immediately (ControlEvent REQUESTED received)
+            None       — continue normally
+        """
+        emitted_events: List[Event] = []
+        if isinstance(event, MessageEvent) and event.role == "assistant":
+            async for chunked_event in self._stream_assistant_message_event(event):
+                emitted_events.append(chunked_event)
+        else:
+            emitted_events.append(event)
+
+        for emitted_event in emitted_events:
+            should_persist = not (
+                isinstance(emitted_event, MessageEvent) and emitted_event.partial
+            )
+            await self._put_and_add_event(task, emitted_event, persist=should_persist)
+
+            if isinstance(emitted_event, TitleEvent):
+                async with self._uow:
+                    await self._uow.session.update_title(
+                        self._session_id, emitted_event.title
+                    )
+            elif isinstance(emitted_event, MessageEvent) and not emitted_event.partial:
+                async with self._uow:
+                    await self._uow.session.update_latest_message(
+                        self._session_id,
+                        emitted_event.message,
+                        emitted_event.created_at,
+                    )
+                    await self._uow.session.increment_unread_message_count(
+                        self._session_id
+                    )
+            elif isinstance(emitted_event, (WaitEvent, ToolConfirmationEvent)):
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.WAITING
+                    )
+                return "wait"
+            elif (
+                isinstance(emitted_event, ControlEvent)
+                and emitted_event.action == ControlAction.REQUESTED
+            ):
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.TAKEOVER_PENDING
+                    )
+                return "takeover"
+            # D5: Track watchdog termination
+            elif isinstance(emitted_event, HealthEvent) and emitted_event.status in (
+                HealthStatus.TERMINATING, HealthStatus.TERMINATED,
+            ):
+                self._was_timed_out = True
+
+        return None
 
     async def _run_flow(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """根据消息对象运行PlannerReActFlow"""
@@ -1720,7 +2354,7 @@ class AgentTaskRunner(TaskRunner):
             if isinstance(event, ToolEvent):
                 await self._handle_tool_event(event)
                 if event.status == ToolEventStatus.CALLED:
-                    print(f"[SNAPSHOT-DEBUG] enrichment结果: tool_name={event.tool_name}, function={event.function_name}, tool_content={type(event.tool_content).__name__}, is_none={event.tool_content is None}", flush=True)
+                    logger.debug("enrichment结果: tool_name=%s, function=%s, tool_content=%s, is_none=%s", event.tool_name, event.function_name, type(event.tool_content).__name__, event.tool_content is None)
             elif isinstance(event, MessageEvent):
                 # 4.如果是消息事件则将AI消息事件中的附件同步到存储中
                 await self._sync_message_attachments_to_storage(event)
@@ -1762,11 +2396,122 @@ class AgentTaskRunner(TaskRunner):
                     messages_removed=compaction_result.messages_removed,
                     usage_ratio_after=compaction_result.usage_ratio_after,
                 )
+                # D5: Track compaction count for metrics
+                if self._flow:
+                    _em = getattr(self._flow, "_execution_metrics", None)
+                    if _em:
+                        _em.compaction_count += 1
+                        _em.context_usage_ratio = compaction_result.usage_ratio_after
 
-        # 7. 读取 flush batch 并提交到后台刷写队列（C5.0）
-        flush_batch = getattr(self._flow, "_pending_flush_batch", None)
+    async def _do_persist_and_flush(self) -> None:
+        """Phase 1+2: persist state then submit flush.
+
+        Runs inside asyncio.shield() so CancelledError cannot interrupt
+        mid-persist (which includes an LLM summary call when enabled).
+        """
+        flow = self._flow
+
+        # Phase 1: persist (Memory/ConversationSummary/flush gate/overflow check)
+        await flow._persist_after_graph(
+            flow._deferred_final_state, flow._deferred_summaries
+        )
+
+        # Phase 2: flush submit (synchronous fire-and-forget)
+        flush_batch = getattr(flow, "_pending_flush_batch", None)
         if flush_batch and self._memory_flusher:
             self._memory_flusher.submit(flush_batch)
+
+    async def _do_postprocess(self, task: Task) -> None:
+        """Execute post-processing: persist + flush + user-visible summary.
+
+        Phase 1+2 are shielded from cancellation to guarantee persistence
+        completes even when the user sends a follow-up message.
+        Phase 3 failure -> silent degradation (summary loss is acceptable).
+        """
+        # Shield Phase 1+2: CancelledError cannot reach _persist_after_graph
+        # or flush submit.  If the outer task is cancelled while shield is
+        # running, CancelledError is raised HERE after shield finishes.
+        await asyncio.shield(self._do_persist_and_flush())
+
+        # Phase 3: user-visible streaming summary
+        flow = self._flow
+        messages = flow._deferred_final_state.get("messages", [])
+        if messages:
+            summary_stream_id: str | None = None
+
+            try:
+                async def _on_summary_event(evt: BaseEvent) -> None:
+                    nonlocal summary_stream_id
+                    if isinstance(evt, MessageEvent) and evt.stream_id:
+                        summary_stream_id = evt.stream_id
+                    is_final = isinstance(evt, MessageEvent) and not evt.partial
+                    await self._put_and_add_event(task, evt, persist=is_final)
+                    # Final summary drives sidebar preview + unread count
+                    # (matches original summarizer_node behavior in main event loop)
+                    if is_final:
+                        try:
+                            async with self._uow:
+                                await self._uow.session.update_latest_message(
+                                    self._session_id,
+                                    evt.message,
+                                    evt.created_at,
+                                )
+                                await self._uow.session.increment_unread_message_count(
+                                    self._session_id
+                                )
+                        except Exception as e:
+                            logger.warning("Summary latest_message update failed: %s", e)
+
+                _summary_lang = (flow._deferred_final_state or {}).get("language", "zh")
+                await run_background_summary(
+                    messages, flow.summary_llm, _on_summary_event, lang=_summary_lang,
+                )
+            except asyncio.CancelledError:
+                # Send a final non-partial message to clear the ghost partial
+                # in the frontend (which upserts by stream_id).
+                if summary_stream_id:
+                    try:
+                        await self._put_and_add_event(task, MessageEvent(
+                            role="assistant",
+                            message="",
+                            stream_id=summary_stream_id,
+                            partial=False,
+                        ))
+                    except Exception:
+                        pass
+                raise
+            except Exception as e:
+                logger.warning("Phase 3 用户可见摘要失败（静默降级）: %s", e)
+
+    async def _run_postprocess_or_cancel(self, task: Task) -> bool:
+        """Run post-processing; cancel if new message arrives. Returns True if cancelled."""
+        postprocess = asyncio.create_task(self._do_postprocess(task))
+
+        try:
+            while not postprocess.done():
+                if not await task.input_stream.is_empty():
+                    postprocess.cancel()
+                    try:
+                        await postprocess
+                    except asyncio.CancelledError:
+                        pass
+                    return True
+                await asyncio.sleep(0.2)
+
+            await postprocess  # propagate exceptions
+
+            # Drain check: catch messages that arrived between last poll and completion
+            if not await task.input_stream.is_empty():
+                return True
+
+            return False
+        except asyncio.CancelledError:
+            postprocess.cancel()
+            try:
+                await postprocess
+            except asyncio.CancelledError:
+                pass
+            raise
 
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
@@ -1802,6 +2547,7 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_selected_skills = []
         self._current_message_text = ""
         self._last_initialized_skill_ids = ()
+        self._last_initialized_skills = []
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
@@ -1871,8 +2617,7 @@ class AgentTaskRunner(TaskRunner):
                 initial_selected=initial_skills,
             )
             await self._skill_bundle_sync.await_initial_sync()
-            await self._initialize_skill_tool_if_needed(initial_skills)
-            self._set_runtime_system_context(initial_skills)
+            await self._apply_preselected_skills(initial_skills)
             self._skill_bundle_sync.start_background_sync()
 
             # 传递 skill pool getter 和 file listings getter 给 flow，用于 get_skill_guide 按需加载
@@ -1887,185 +2632,262 @@ class AgentTaskRunner(TaskRunner):
                 self._flow._activated_mcp_tools_ref = lambda: self._activated_mcp_tools
                 self._flow._mcp_always_bind_names = self._get_always_bind_tool_names()
 
-            # 3.循环读取任务中的输入消息队列
-            while not await task.input_stream.is_empty():
-                # 4.从输入流中获取数据
-                event = await self._pop_event(task)
-                if event is None:
-                    continue
-                message = ""
+            # 3. 主消息循环 + FINISHING 后处理
+            try:
+                while True:
+                    # Phase A: 处理所有待处理消息
+                    while not await task.input_stream.is_empty():
+                        event = await self._pop_event(task)
+                        if event is None:
+                            continue
+                        message = ""
 
-                # 5.判断事件类型是否为消息事件，如果是则处理消息并将附件同步到沙箱中
-                image_content_blocks: list[dict] = []
-                if isinstance(event, MessageEvent):
-                    message = event.message or ""
-                    await self._sync_message_attachments_to_sandbox(event)
-                    # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
-                    print(f"[DEBUG-IMG] before _build_image_content_blocks: "
-                          f"attachments count={len(event.attachments)}, "
-                          f"types={[type(a).__name__ for a in event.attachments]}, "
-                          f"mimes={[getattr(a, 'mime_type', 'N/A') for a in event.attachments]}", flush=True)
-                    image_content_blocks = await self._build_image_content_blocks(
-                        event.attachments
-                    )
-                    print(f"[DEBUG-IMG] after _build_image_content_blocks: "
-                          f"blocks={len(image_content_blocks)}", flush=True)
-                    logger.info(
-                        "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
-                        len(message),
-                        hashlib.sha256(message.encode("utf-8")).hexdigest(),
-                        len(image_content_blocks),
-                    )
-
-                # 6.将消息事件转换称消息对象
-                # 附件路径附带外部可访问 URL（MCP 工具无法访问沙箱文件系统）
-                attachment_paths: list[str] = []
-                if isinstance(event, MessageEvent):
-                    for att in event.attachments:
-                        path = att.filepath
-                        url = self._image_url_map.get(path)
-                        if url:
-                            attachment_paths.append(
-                                f"{path} (external_url: {url})"
+                        # 5.判断事件类型是否为消息事件，如果是则处理消息并将附件同步到沙箱中
+                        image_content_blocks: list[dict] = []
+                        if isinstance(event, MessageEvent):
+                            message = event.message or ""
+                            await self._sync_message_attachments_to_sandbox(event)
+                            # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
+                            logger.debug(
+                                "before _build_image_content_blocks: attachments count=%d, types=%s, mimes=%s",
+                                len(event.attachments),
+                                [type(a).__name__ for a in event.attachments],
+                                [getattr(a, "mime_type", "N/A") for a in event.attachments],
                             )
+                            image_content_blocks = await self._build_image_content_blocks(
+                                event.attachments
+                            )
+                            logger.debug("after _build_image_content_blocks: blocks=%d", len(image_content_blocks))
+                            logger.info(
+                                "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
+                                len(message),
+                                hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                                len(image_content_blocks),
+                            )
+
+                        # 6.将消息事件转换称消息对象
+                        # 附件路径附带外部可访问 URL（MCP 工具无法访问沙箱文件系统）
+                        attachment_paths: list[str] = []
+                        if isinstance(event, MessageEvent):
+                            for att in event.attachments:
+                                path = att.filepath
+                                url = self._image_url_map.get(path)
+                                if url:
+                                    attachment_paths.append(
+                                        f"{path} (external_url: {url})"
+                                    )
+                                else:
+                                    attachment_paths.append(path)
+                        message_obj = Message(
+                            message=message,
+                            attachments=attachment_paths,
+                            image_content_blocks=image_content_blocks,
+                            skill_confirmation_action=(
+                                event.skill_confirmation_action
+                                if isinstance(event, MessageEvent)
+                                else None
+                            ),
+                            language=self._current_language,  # B5 #29: bootstrap hint
+                        )
+
+                        selected_skills, _ = await self._select_skills_for_message(
+                            self._session_skill_pool,
+                            message_obj.message,
+                        )
+                        self._current_message_text = message_obj.message
+                        self._current_message_selected_skills = list(selected_skills)
+                        self._step_skill_state = None
+                        self._last_virtual_step_id = ""
+                        self._activated_mcp_tools.clear()  # Reset MCP activation per message
+                        # B5 C5a: clear lc_tools cache at the message boundary.
+                        # Cache entries are keyed by (mode, skill_ids, mcp_activation)
+                        # but also implicitly depend on instance state that can't
+                        # be practically added to the key (e.g. _skill_tool internal
+                        # state, _memory_session_factory wiring). Clearing here is
+                        # cheap and eliminates cross-message staleness risk.
+                        self._lc_tools_cache.clear()
+                        await self._apply_preselected_skills(selected_skills, scores=self._current_embedding_scores)
+
+                        # Phase 2+3: 设置 LangGraph configurable 回调
+                        if hasattr(self._flow, '_skill_context_refresher'):
+                            self._flow._skill_context_refresher = self._refresh_skill_context_for_step
+                            self._flow._react_graph_provider = self._build_step_react_graph
+                            self._flow._skill_guide_injector = SkillGuideInjector(
+                                selected_skills, self._tier2_preloaded_skill_ids
+                            )
+                        # B5 post-audit LOW #1: inject language callback so
+                        # main_graph.planner_node can notify us of the real
+                        # session language after parsing the plan. The flow
+                        # stores it and ``_build_config`` forwards it via
+                        # ``configurable["language_callback"]``.
+                        if hasattr(self._flow, "_language_callback"):
+                            self._flow._language_callback = self.set_language
+                        # TODO #30: clock 2 replacement — provider callback
+                        # reading runner's _last_skill_context. Wired here
+                        # (not in __init__) because this spec intentionally
+                        # matches the existing invoke-main-loop wiring pattern;
+                        # moving it to __init__ is part of the deferred #25 work.
+                        # See spec §3.4 / §1.4.
+                        if hasattr(self._flow, "_skill_context_provider"):
+                            self._flow._skill_context_provider = lambda: self._last_skill_context
+
+                        # 7.传递消息对象并运行PlannerReActFlow
+                        async for event in self._run_flow(message_obj):
+                            await self._handle_step_skill_lock(event, message_obj.message)
+                            # 8-12. 发送事件到输出流并处理各类侧效应
+                            result = await self._emit_flow_event(task, event)
+                            if result in ("wait", "takeover"):
+                                return
+
+                        # 单条消息执行结束后重置step锁定状态
+                        self._step_skill_state = None
+
+                    # Phase B: 无消息且有延迟后处理 -> FINISHING
+                    if self._flow and getattr(self._flow, '_deferred_final_state', None):
+                        async with self._uow:
+                            await self._uow.session.update_status(
+                                self._session_id, SessionStatus.FINISHING
+                            )
+                        await self._put_and_add_event(task, FinishingEvent())
+
+                        try:
+                            cancelled = await self._run_postprocess_or_cancel(task)
+                        except Exception as e:
+                            logger.error("后处理失败 (postprocess_incomplete): %s", e)
+                            await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                            break
+
+                        if cancelled:
+                            # Reset deferred state to prevent stale re-entry
+                            self._flow._deferred_final_state = None
+                            self._flow._deferred_summaries = None
+                            async with self._uow:
+                                await self._uow.session.update_status(
+                                    self._session_id, SessionStatus.RUNNING
+                                )
+                            continue
                         else:
-                            attachment_paths.append(path)
-                message_obj = Message(
-                    message=message,
-                    attachments=attachment_paths,
-                    image_content_blocks=image_content_blocks,
-                    skill_confirmation_action=(
-                        event.skill_confirmation_action
-                        if isinstance(event, MessageEvent)
-                        else None
-                    ),
-                )
-
-                selected_skills, _ = await self._select_skills_for_message(
-                    self._session_skill_pool,
-                    message_obj.message,
-                )
-                self._current_message_text = message_obj.message
-                self._current_message_selected_skills = list(selected_skills)
-                self._step_skill_state = None
-                self._last_virtual_step_id = ""
-                self._activated_mcp_tools.clear()  # Reset MCP activation per message
-                await self._initialize_skill_tool_if_needed(selected_skills)
-                self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
-
-                # Phase 2+3: 设置 LangGraph configurable 回调
-                if hasattr(self._flow, '_skill_context_refresher'):
-                    self._flow._skill_context_refresher = self._refresh_skill_context_for_step
-                    self._flow._react_graph_provider = self._build_step_react_graph
-                    self._flow._skill_guide_injector = SkillGuideInjector(
-                        selected_skills, self._tier2_preloaded_skill_ids
-                    )
-
-                # 7.传递消息对象并运行PlannerReActFlow
-                async for event in self._run_flow(message_obj):
-                    await self._handle_step_skill_lock(event, message_obj.message)
-                    emitted_events: List[Event] = []
-                    if isinstance(event, MessageEvent) and event.role == "assistant":
-                        async for chunked_event in self._stream_assistant_message_event(
-                            event
-                        ):
-                            emitted_events.append(chunked_event)
+                            await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                            break
                     else:
-                        emitted_events.append(event)
+                        break
 
-                    for emitted_event in emitted_events:
-                        # 8.将得到的事件添加到消息队列中
-                        should_persist = not (
-                            isinstance(emitted_event, MessageEvent)
-                            and emitted_event.partial
+                # Normal completion (or watchdog termination)
+                if self._was_timed_out:
+                    # D5: Emit HealthEvent(TERMINATED) with execution metrics
+                    await self._put_and_add_event(task, HealthEvent(
+                        status=HealthStatus.TERMINATED,
+                        reason="执行已超时终止，请查看已完成的进展",
+                        action="terminated",
+                        metrics=self._snapshot_metrics(),
+                    ))
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, SessionStatus.TIMED_OUT
                         )
-                        await self._put_and_add_event(
-                            task, emitted_event, persist=should_persist
+                else:
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, SessionStatus.COMPLETED
                         )
 
-                        # 9.如果事件类型为标题事件则更新会话标题
-                        if isinstance(emitted_event, TitleEvent):
-                            async with self._uow:
-                                await self._uow.session.update_title(
-                                    self._session_id, emitted_event.title
-                                )
-                        elif isinstance(emitted_event, MessageEvent) and not emitted_event.partial:
-                            # 10.如果事件为最终消息事件，则更新最新消息并新增未读消息数
-                            async with self._uow:
-                                await self._uow.session.update_latest_message(
-                                    self._session_id,
-                                    emitted_event.message,
-                                    emitted_event.created_at,
-                                )
-                                await self._uow.session.increment_unread_message_count(
-                                    self._session_id
-                                )
-                        elif isinstance(emitted_event, WaitEvent):
-                            # 11.如果事件为等待，则更新会话状态并终止程序
-                            async with self._uow:
-                                await self._uow.session.update_status(
-                                    self._session_id, SessionStatus.WAITING
-                                )
-                            return
-                        elif (
-                            isinstance(emitted_event, ControlEvent)
-                            and emitted_event.action == ControlAction.REQUESTED
-                        ):
-                            # 12.control.requested 进入接管待决状态并立即停机
-                            async with self._uow:
-                                await self._uow.session.update_status(
-                                    self._session_id, SessionStatus.TAKEOVER_PENDING
-                                )
-                            return
+            except asyncio.CancelledError:
+                cancel_reason = getattr(task, "cancel_reason", "stop")
+                logger.info("AgentTaskRunner任务运行取消，reason=%s", cancel_reason)
 
-                # 13.判断如果输入消息队列为空则跳出循环
-                if not await task.input_stream.is_empty():
-                    break
+                if cancel_reason in {"takeover_start", "takeover_timeout"}:
+                    raise
 
-                # 单条消息执行结束后重置step锁定状态
-                self._step_skill_state = None
+                if cancel_reason == "session_delete":
+                    raise
 
-            # 14.更新会话状态为已完成
-            print(f"[STATUS-DEBUG] 即将更新会话状态为COMPLETED: session={self._session_id}", flush=True)
-            async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.COMPLETED
-                )
-            print(f"[STATUS-DEBUG] 会话状态已更新为COMPLETED", flush=True)
-        except asyncio.CancelledError:
-            # 15.异步任务被取消，根据取消原因分流处理
-            cancel_reason = getattr(task, "cancel_reason", "stop")
-            logger.info(
-                "AgentTaskRunner任务运行取消，reason=%s",
-                cancel_reason,
-            )
-
-            if cancel_reason in {"takeover_start", "takeover_timeout"}:
-                # takeover_* 由上层控制事件驱动状态流转，这里只做资源清理
+                await self._put_and_add_event(task, DoneEvent())
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.COMPLETED
+                    )
                 raise
 
-            await self._put_and_add_event(task, DoneEvent())
-            async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.COMPLETED
+            except Exception as e:
+                logger.exception(f"AgentTaskRunner运行出错: {str(e)}")
+                await self._put_and_add_event(
+                    task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
                 )
-            raise
-        except Exception as e:
-            # 16.记录日志并往任务队列/消息队列中写入异常事件并更新会话状态
-            logger.exception(f"AgentTaskRunner运行出错: {str(e)}")
-            await self._put_and_add_event(
-                task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
-            )
-            async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.COMPLETED
-                )
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.COMPLETED
+                    )
         finally:
             # 17.在同一个asyncio Task上下文中清理MCP/A2A工具资源
             # 这是关键：streamablehttp_client内部使用anyio.create_task_group()，
             # 要求在同一个Task中进入和退出cancel scope，
             # 所以必须在invoke()的finally块（即初始化MCP的同一个Task）中清理
             await self._cleanup_tools()
+
+    async def resume(self, task: Task, command: Any) -> None:
+        """Resume a paused task with a LangGraph Command.
+
+        Streams events from flow.resume(command) and bridges them to the task's
+        output stream using the same event-handling logic as invoke().
+        Includes FINISHING state and DoneEvent emission to match invoke() behaviour.
+        """
+        try:
+            async for event in self._flow.resume(command):
+                # Enrich ToolEvents and sync MessageEvent attachments (mirrors _run_flow)
+                if isinstance(event, ToolEvent):
+                    await self._handle_tool_event(event)
+                    if event.status == ToolEventStatus.CALLED:
+                        logger.debug(
+                            "enrichment结果: tool_name=%s, function=%s, tool_content=%s, is_none=%s",
+                            event.tool_name, event.function_name,
+                            type(event.tool_content).__name__, event.tool_content is None,
+                        )
+                elif isinstance(event, MessageEvent):
+                    await self._sync_message_attachments_to_storage(event)
+
+                result = await self._emit_flow_event(task, event)
+                if result in ("wait", "takeover"):
+                    return
+
+            # FINISHING: run deferred post-processing then emit DoneEvent (mirrors invoke())
+            if self._flow and getattr(self._flow, "_deferred_final_state", None):
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, SessionStatus.FINISHING
+                    )
+                await self._put_and_add_event(task, FinishingEvent())
+
+                try:
+                    cancelled = await self._run_postprocess_or_cancel(task)
+                except Exception as e:
+                    logger.error("resume 后处理失败 (postprocess_incomplete): %s", e)
+                    await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, SessionStatus.COMPLETED
+                        )
+                    return
+
+                if not cancelled:
+                    await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                    _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, _final_status
+                        )
+            else:
+                await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
+                async with self._uow:
+                    await self._uow.session.update_status(
+                        self._session_id, _final_status
+                    )
+
+        except Exception as e:
+            logger.exception(f"AgentTaskRunner.resume 运行出错: {str(e)}")
+            await self._put_and_add_event(
+                task, ErrorEvent(error=f"AgentTaskRunner.resume 出错: {str(e)}")
+            )
 
     async def destroy(self) -> None:
         """销毁任务运行器并释放资源（best-effort：每步独立 try/except，确保后续清理不被跳过）"""

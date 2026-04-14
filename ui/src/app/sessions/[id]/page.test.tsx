@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 type MockSession = {
   session_id: string;
   title: string | null;
-  status: "pending" | "running" | "waiting" | "completed";
+  status: "pending" | "running" | "waiting" | "completed" | "timed_out";
   events: Array<{ event: string; data: Record<string, unknown> }>;
 };
 
@@ -230,5 +230,124 @@ describe("SessionPage", () => {
     expect(screen.getByTestId("markdown-renderer")).toHaveTextContent(
       "输入方式（选 A/B/C，可多选）："
     );
+  });
+
+  describe("D5: HealthEvent rendering", () => {
+    it("renders DEGRADED health event with recovery copy", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "running",
+        events: [
+          {
+            event: "health",
+            data: {
+              event_id: "evt-degraded",
+              status: "degraded",
+              reason: "Agent 似乎遇到了困难，正在尝试恢复...",
+              last_node: "executor_node",
+              idle_seconds: 121.3,
+              action: "soft_recovery",
+            },
+          },
+        ],
+      };
+
+      render(<SessionPage />);
+
+      expect(screen.getByText("执行正在恢复")).toBeInTheDocument();
+      expect(
+        screen.getByText("Agent 似乎遇到了困难，正在尝试恢复...")
+      ).toBeInTheDocument();
+      expect(screen.getByText(/executor_node/)).toBeInTheDocument();
+      expect(screen.getByText(/121\.3s/)).toBeInTheDocument();
+    });
+
+    it("renders TERMINATING health event in red tone", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "running",
+        events: [
+          {
+            event: "health",
+            data: {
+              event_id: "evt-terminating",
+              status: "terminating",
+              reason: "执行即将超时终止",
+              action: "hard_terminate",
+            },
+          },
+        ],
+      };
+
+      render(<SessionPage />);
+
+      expect(screen.getByText("执行即将终止")).toBeInTheDocument();
+      expect(screen.getByText("执行即将超时终止")).toBeInTheDocument();
+    });
+
+    it("renders TERMINATED health event with metrics grid", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "timed_out",
+        events: [
+          {
+            event: "health",
+            data: {
+              event_id: "evt-terminated",
+              status: "terminated",
+              reason: "执行已超时终止，请查看已完成的进展",
+              action: "terminated",
+              metrics: {
+                tool_calls_total: 12,
+                tool_success_rate: 0.75,
+                llm_calls_total: 8,
+                steps_completed: 3,
+              },
+            },
+          },
+        ],
+      };
+
+      render(<SessionPage />);
+
+      expect(screen.getByText("执行已终止")).toBeInTheDocument();
+      expect(
+        screen.getByText("执行已超时终止，请查看已完成的进展")
+      ).toBeInTheDocument();
+      // metrics grid
+      expect(screen.getByText("工具调用 12")).toBeInTheDocument();
+      expect(screen.getByText("成功率 75%")).toBeInTheDocument();
+      expect(screen.getByText("LLM 8")).toBeInTheDocument();
+      expect(screen.getByText("步骤 3")).toBeInTheDocument();
+    });
+
+    it("does NOT render HEALTHY health event (noise suppression)", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "running",
+        events: [
+          {
+            event: "health",
+            data: {
+              event_id: "evt-healthy",
+              status: "healthy",
+              reason: "monitoring",
+              action: "monitoring",
+            },
+          },
+        ],
+      };
+
+      render(<SessionPage />);
+
+      // No health title should appear
+      expect(screen.queryByText("执行正在恢复")).not.toBeInTheDocument();
+      expect(screen.queryByText("执行即将终止")).not.toBeInTheDocument();
+      expect(screen.queryByText("执行已终止")).not.toBeInTheDocument();
+    });
   });
 });

@@ -155,11 +155,22 @@ async def test_planner_react_flow_produces_plan_event(mock_llm, mock_uow):
     assert len(plan_events) >= 1
 
 
-def test_planner_react_flow_set_skill_context(mock_llm, mock_uow):
-    """set_skill_context should store the context."""
+def test_planner_react_flow_skill_context_provider(mock_llm, mock_uow):
+    """_skill_context_provider callback drives _get_skill_context_seed.
+
+    Replaces the legacy set_skill_context test (TODO #30 retired the
+    self._skill_context instance field; the provider callback is the
+    new clock 2 replacement).
+    """
     flow = _make_flow(mock_llm, mock_uow)
-    flow.set_skill_context("test context")
-    assert flow._skill_context == "test context"
+
+    # Default: no provider wired -> seed returns ""
+    assert flow._skill_context_provider is None
+    assert flow._get_skill_context_seed() == ""
+
+    # Wire a provider -> seed returns its value
+    flow._skill_context_provider = lambda: "## test context"
+    assert flow._get_skill_context_seed() == "## test context"
 
 
 async def test_persist_after_graph_saves_memory_on_interrupt(
@@ -275,3 +286,286 @@ async def test_generator_early_close_still_persists(
 
     # Memory should be saved via finally block, even on early close
     mock_uow.session.save_memory.assert_called()
+
+
+class TestRunPlannerForDetectionLanguageDispatch:
+    """#29 — verify ``_run_planner_for_detection`` honors ``message.language``.
+
+    These tests directly target the 6 ``getattr(message, "language", "zh")``
+    call sites replaced in Task 2: lines ~714, 715, 795, 809, 999, 1022.
+
+    All assertions are on function-externally-observable outputs (the
+    returned ``plan`` or the ``input_for_graph`` dict passed to
+    ``build_main_graph``), never on internal local variables.
+
+    TDD note: tests 11, 12, 14, 15 pass immediately on first run because
+    Task 1 added ``Message.language`` and ``getattr`` finds the real field.
+    They serve as post-replacement regression guards. Test 13 has a
+    slightly stronger RED state because it exercises the ``or`` fallback.
+    """
+
+    async def test_run_planner_for_detection_en_loads_en_prompt_bundle(
+        self, mock_llm, mock_uow, monkeypatch
+    ) -> None:
+        """#29 test 11: Message(language="en") selects EN PromptBundle.
+
+        Covers planner_react.py lines ~714 and ~715
+        (get_prompt_bundle + get_prompt_section_bundle both use message.language).
+
+        NOTE: The functions are imported *locally* inside
+        ``_run_planner_for_detection`` (not at module level), so they are
+        resolved from ``app.domain.services.prompts`` at call time.
+        We patch the source module attributes; the local ``from ... import``
+        then picks up the spy wrappers.
+        """
+        from app.domain.models.message import Message
+        import app.domain.services.prompts as prompts_mod
+
+        flow = _make_flow(mock_llm, mock_uow)
+        flow._supports_vision = False
+        flow._prompt_assembler = None
+        flow._allow_default_prompt_assembler = True
+
+        calls: list[tuple[str, str]] = []
+        real_get_bundle = prompts_mod.get_prompt_bundle
+        real_get_section = prompts_mod.get_prompt_section_bundle
+
+        def _spy_bundle(lang: str):
+            calls.append(("bundle", lang))
+            return real_get_bundle(lang)
+
+        def _spy_section(lang: str):
+            calls.append(("section", lang))
+            return real_get_section(lang)
+
+        monkeypatch.setattr(prompts_mod, "get_prompt_bundle", _spy_bundle)
+        monkeypatch.setattr(prompts_mod, "get_prompt_section_bundle", _spy_section)
+
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            side_effect=Exception("force fallback so we don't need a real plan")
+        )
+
+        msg = Message(message="hello", language="en")
+        await flow._run_planner_for_detection(msg, [])
+
+        bundle_langs = [lang for kind, lang in calls if kind == "bundle"]
+        section_langs = [lang for kind, lang in calls if kind == "section"]
+        assert "en" in bundle_langs, f"expected 'en' in {bundle_langs}"
+        assert "en" in section_langs, f"expected 'en' in {section_langs}"
+
+    async def test_run_planner_for_detection_fallback_plan_inherits_message_language(
+        self, mock_llm, mock_uow
+    ) -> None:
+        """#29 test 12: structured output raises → fallback PlanResponse
+        is built from message.language, then wrapped into plan.language.
+
+        Covers planner_react.py line ~795 (fallback PlanResponse.language).
+        Assertion is on the observable returned ``plan.language``, NOT
+        on the internal local ``PlanResponse`` variable.
+        """
+        from app.domain.models.message import Message
+
+        flow = _make_flow(mock_llm, mock_uow)
+        flow._supports_vision = False
+        flow._prompt_assembler = None
+        flow._allow_default_prompt_assembler = True
+
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            side_effect=RuntimeError("simulated structured output failure")
+        )
+
+        msg = Message(message="please help", language="en")
+        plan, _ = await flow._run_planner_for_detection(msg, [])
+
+        assert plan.language == "en", (
+            "fallback path should inherit message.language; "
+            f"got plan.language={plan.language!r}"
+        )
+
+    async def test_run_planner_for_detection_parsed_plan_inherits_message_language_when_empty(
+        self, mock_llm, mock_uow
+    ) -> None:
+        """#29 test 13: structured output returns PlanResponse(language="")
+        → plan.language falls back to message.language via the `or` chain.
+
+        Covers planner_react.py line ~809
+        (``parsed.language or message.language``).
+        """
+        from app.domain.models.message import Message
+        from app.domain.models.llm_responses import PlanResponse, StepDef
+
+        flow = _make_flow(mock_llm, mock_uow)
+        flow._supports_vision = False
+        flow._prompt_assembler = None
+        flow._allow_default_prompt_assembler = True
+
+        # Return a valid PlanResponse but with empty language
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            return_value=PlanResponse(
+                title="Task",
+                goal="help",
+                language="",  # empty → should fall back to message.language
+                steps=[StepDef(description="do something")],
+                message="on it",
+            )
+        )
+
+        msg = Message(message="please help", language="en")
+        plan, _ = await flow._run_planner_for_detection(msg, [])
+
+        assert plan.language == "en", (
+            "empty parsed.language should fall back to message.language via "
+            f"`or`; got plan.language={plan.language!r}"
+        )
+
+    async def test_run_planner_for_detection_en_when_skill_tools_available_but_not_used(
+        self, mock_llm, mock_uow, monkeypatch
+    ) -> None:
+        """#29 test 14: skill creation tools configured AND skill graph
+        canary active, but planner's plan does NOT reference skill creation
+        → reaches the branch that constructs ``input_for_graph`` via
+        pre-computed plan.
+
+        Covers planner_react.py line ~999.
+
+        NOTE 1: this is NOT the real "skill creation path" — that returns
+        early at the subgraph dispatch. This path triggers when
+        ``_skill_tools_available`` is True but ``_plan_uses_skill_creation``
+        is False.
+
+        NOTE 2: line ~977's ``_skill_tools_available`` gate has TWO
+        conditions — non-None tools AND ``_is_skill_graph_active()``
+        returning True. The canary gate depends on
+        ``skill_graph_canary_percent``, which defaults to 0 in
+        ``_make_flow``'s kwargs → gate defaults to False. We must force
+        the gate open via instance-level monkeypatch; otherwise the test
+        silently falls through to the no-skill-tools branch (wrong branch).
+        """
+        from app.domain.models.message import Message
+        from app.domain.models.llm_responses import PlanResponse, StepDef
+
+        # Give the flow non-None skill creation tools
+        flow = _make_flow(
+            mock_llm,
+            mock_uow,
+            create_skill_tool=MagicMock(),
+            brainstorm_skill_tool=MagicMock(),
+        )
+        flow._supports_vision = False
+        flow._prompt_assembler = None
+        flow._allow_default_prompt_assembler = True
+
+        # CRITICAL: force the canary gate open. Without this,
+        # _skill_tools_available is False regardless of the tools above.
+        monkeypatch.setattr(
+            flow,
+            "_is_skill_graph_active",
+            lambda: True,
+        )
+
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            return_value=PlanResponse(
+                title="Do work",
+                goal="do work",
+                language="en",
+                steps=[StepDef(description="just a normal step")],
+                message="sure",
+            )
+        )
+
+        # Force _plan_uses_skill_creation → False so we don't take the
+        # subgraph early-return branch. Instance-level patch avoids
+        # staticmethod descriptor binding issues.
+        monkeypatch.setattr(
+            flow,
+            "_plan_uses_skill_creation",
+            lambda _plan: False,
+        )
+
+        # Intercept build_main_graph → capture input_for_graph
+        captured_inputs: list[dict] = []
+
+        class _FakeGraph:
+            async def astream(self, input_dict, *args, **kwargs):
+                del args, kwargs  # mock ignores the astream kwargs
+                captured_inputs.append(input_dict)
+                # empty async generator: iterate over a runtime-assigned
+                # empty list so Pylance doesn't flag the yield as
+                # statically unreachable
+                _empty: list = []
+                for item in _empty:
+                    yield item
+
+        def _fake_build_main_graph(*args, **kwargs):
+            del args, kwargs
+            return _FakeGraph()
+
+        monkeypatch.setattr(
+            "app.domain.services.flows.planner_react.build_main_graph",
+            _fake_build_main_graph,
+        )
+
+        msg = Message(message="please help with english work", language="en")
+        async for _ in flow.invoke(msg):
+            pass
+
+        assert captured_inputs, "expected at least one astream call"
+        assert captured_inputs[0].get("language") == "en", (
+            "skill-tools-available-no-skill-intent path should pass en to "
+            f"input_for_graph; got {captured_inputs[0].get('language')!r}"
+        )
+
+    async def test_run_planner_for_detection_en_without_skill_creation_tools(
+        self, mock_llm, mock_uow, monkeypatch
+    ) -> None:
+        """#29 test 15: no skill creation tools configured
+        (``_skill_tools_available`` is False) → reaches the else branch
+        that constructs ``input_for_graph`` without pre-computed planning.
+
+        Covers planner_react.py line ~1022.
+
+        NOTE: contrasts with test 14 — that test forces the canary gate
+        OPEN; this test leaves the default-False canary gate alone AND
+        sets tools to None, so either condition alone would land us in
+        this else branch.
+        """
+        from app.domain.models.message import Message
+
+        flow = _make_flow(
+            mock_llm,
+            mock_uow,
+            create_skill_tool=None,
+            brainstorm_skill_tool=None,
+        )
+        flow._supports_vision = False
+        flow._prompt_assembler = None
+        flow._allow_default_prompt_assembler = True
+
+        captured_inputs: list[dict] = []
+
+        class _FakeGraph:
+            async def astream(self, input_dict, *args, **kwargs):
+                del args, kwargs  # mock ignores the astream kwargs
+                captured_inputs.append(input_dict)
+                _empty: list = []
+                for item in _empty:
+                    yield item
+
+        def _fake_build_main_graph(*args, **kwargs):
+            del args, kwargs
+            return _FakeGraph()
+
+        monkeypatch.setattr(
+            "app.domain.services.flows.planner_react.build_main_graph",
+            _fake_build_main_graph,
+        )
+
+        msg = Message(message="please help", language="en")
+        async for _ in flow.invoke(msg):
+            pass
+
+        assert captured_inputs, "expected at least one astream call"
+        assert captured_inputs[0].get("language") == "en", (
+            "no-skill-tools path should pass en to input_for_graph; "
+            f"got {captured_inputs[0].get('language')!r}"
+        )

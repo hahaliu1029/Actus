@@ -104,6 +104,46 @@ cd api
 pytest
 ```
 
+## Prompt Assembly 不变式（B5 两时钟架构）
+
+修改 `api/app/domain/services/graphs/main_graph.py` 时必须了解 `state.skill_context`
+的**两时钟架构**（详见 B5 设计文档 "Two-Clock Architecture" 章节，
+位于 `~/.gstack/projects/hahaliu1029-Actus/liuyixuan-develop-design-*.md`）：
+
+- **`updater_node` 是唯一允许写 `state.skill_context` 的节点。** 它通过
+  LangGraph `configurable` 字典里注入的 `skill_context_refresher` callable 写入。
+- **`executor_node`**（以及未来任何节点）必须把 `StepMetadata.skill_context`
+  作为**当前 step 的局部变量**消费，用于 prompt 组装。它**禁止**通过
+  `Command(update=...)` 写回 `state["skill_context"]`。
+- **`planner_node` 和 `summarizer_node`** 同样禁止写 `skill_context`。
+
+CI gate 位于
+`api/tests/domain/services/graphs/test_executor_no_skill_context_writeback.py`，
+通过 AST 扫描 `executor_node` 函数体检测
+`Command(update={"skill_context": ...})` 直接写回。
+
+**间接写回**（helper 函数、变量间接、`dict(**base, skill_context=...)` 等）
+AST 扫描**无法捕获**——依赖 code review 保障。
+
+如果你认为确实需要在 executor 侧写 `skill_context`：
+
+1. 重新阅读 B5 设计文档 "Two-Clock Architecture" 章节
+2. 仍有需要时在 PR 里说明原因并 @ 核心 reviewer
+3. 考虑是否应该写一个不同的 state 字段（比如 `system_prompt_version_hash`）
+
+### 为什么要这样
+
+B5 引入了 `skill_context` 的两个数据源：
+
+| 数据源 | 写入者 | 读取者 | 用途 |
+|--------|--------|--------|------|
+| `state.skill_context` | `updater_node`（通过 `skill_context_refresher` 回调） | `executor_node`（仅当 `react_graph_provider` 为 None 的老 fallback 路径） | 老架构兼容 |
+| `StepMetadata.skill_context`（即 `self._last_skill_context`） | `_build_step_react_graph` 通过 `_apply_refreshed_skills` | `executor_node`（`react_graph_provider` 存在时的主路径） | B5 step 级权威源 |
+
+executor_node 在默认生产路径下**局部**消费 `StepMetadata.skill_context`，
+**不**走 state。如果它也写回 state，两个数据源会竞争写入，updater 的值会
+在下一 loop 被 executor 覆盖。
+
 ## 前端开发
 
 ```bash

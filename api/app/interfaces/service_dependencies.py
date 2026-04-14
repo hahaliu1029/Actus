@@ -1,4 +1,9 @@
+import hashlib
 import logging
+import threading
+import time
+from pathlib import Path
+from typing import Any
 
 from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
@@ -20,12 +25,14 @@ from app.infrastructure.external.health_checker.postgres_health_checker import (
 from app.infrastructure.external.health_checker.redis_health_checker import (
     RedisHealthChecker,
 )
-from app.domain.models.app_config import LLMConfig
+from app.domain.models.app_config import LLMConfig, SkillRiskPolicy
+from app.application.services.agent_service import _ConfigSnapshot
 from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
 from app.infrastructure.external.llm.actus_responses_model import ActusResponsesModel
 from langchain_core.language_models import BaseChatModel
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.external.github_search_client import GitHubSearchClient
+from app.infrastructure.external.event_recovery.redis_event_recovery import RedisEventRecovery
 from app.infrastructure.external.search.bing_search import BingSearchEngine
 from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
 
@@ -34,9 +41,10 @@ from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.infrastructure.repositories.file_app_config_repository import (
     FileAppConfigRepository,
 )
+from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.minio import MinioStore, get_minio
-from app.infrastructure.storage.postgres import get_db_session, get_uow
+from app.infrastructure.storage.postgres import get_db_session, get_postgres, get_uow
 from app.infrastructure.storage.redis import RedisClient, get_redis
 
 # from app.interfaces.repository_dependencies import get_db_session_repository
@@ -50,6 +58,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# D5.1: combined (primary + fallback) threshold above which fallback-path
+# worst case may saturate ExecutionConfig.total_timeout_seconds (default 600s).
+# Derived as: total_timeout_seconds_default / graph_retry_count = 600 / 3 = 200.
+_FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS: float = 200.0
+
+# --- Config cache (D2) ---
+_config_cache: "AppConfig | None" = None
+_config_mtime: float = 0.0
+_config_size: int = 0
+_config_expiry: float = 0.0
+_config_generation: int = 0
+_config_lock = threading.Lock()
 
 
 # @lru_cache()
@@ -108,11 +129,69 @@ def get_session_service() -> SessionService:
     )
 
 
-def _load_app_config():
-    app_config_repository = FileAppConfigRepository(
-        config_path=settings.app_config_filepath
+def _load_app_config() -> "AppConfig":
+    """TTL + mtime/size cached config loader. Generation counter for downstream refresh."""
+    global _config_cache, _config_mtime, _config_size, _config_expiry, _config_generation
+    now = time.monotonic()
+    path = Path(settings.app_config_filepath).resolve()
+
+    with _config_lock:
+        if _config_cache is not None:
+            try:
+                st = path.stat()
+            except OSError:
+                return _config_cache
+            if (now < _config_expiry
+                    and st.st_mtime == _config_mtime
+                    and st.st_size == _config_size):
+                return _config_cache
+
+        repo = FileAppConfigRepository(settings.app_config_filepath)
+        _config_cache = repo.load()
+        try:
+            st = path.stat()
+            _config_mtime = st.st_mtime
+            _config_size = st.st_size
+        except OSError:
+            _config_mtime = 0.0
+            _config_size = 0
+        _config_expiry = now + settings.config_cache_ttl
+        _config_generation += 1
+        return _config_cache
+
+
+# --- LLM cache (D2) ---
+_MAX_LLM_CACHE_SIZE = 4  # main + summary + vision_fallback + 1 余量
+_llm_cache: dict[str, BaseChatModel] = {}
+_llm_lock = threading.Lock()
+
+
+def _llm_fingerprint(llm_config: LLMConfig, supports_pdf_input: bool = False) -> str:
+    """Content-addressable key for LLM instances.
+
+    D5.1 note: timeout_seconds is included so configs differing only in
+    timeout produce distinct cache entries. This is a selective hash — if
+    LLMConfig gains new fields in the future, they must also be added.
+    TODO(post-D5.1): consider switching to a model_dump-based fingerprint
+    to avoid per-field drift between LLMConfig and this function.
+    """
+    parts = (
+        str(llm_config.base_url),
+        llm_config.api_key,
+        llm_config.model_name,
+        str(llm_config.temperature),
+        str(llm_config.max_tokens),
+        llm_config.api_type,
+        str(getattr(llm_config, "supports_response_format", True)),
+        str(getattr(llm_config, "supports_vision", True)),
+        str(supports_pdf_input),
+        # D5.1: different timeouts must produce different cached instances.
+        str(llm_config.timeout_seconds),
+        # D5.2: connect_timeout_seconds likewise — configs differing only in
+        # the connect budget must not share a cached adapter instance.
+        str(llm_config.connect_timeout_seconds),
     )
-    return app_config_repository.load()
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
 def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> BaseChatModel:
@@ -128,36 +207,177 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
     导致 NameError: name 'builtins' is not defined。
     改用 ActusFallbackChatModel 在 BaseChatModel 层面内部处理回退逻辑。
     """
-    from app.infrastructure.external.llm.actus_fallback_chat_model import ActusFallbackChatModel
+    fp = _llm_fingerprint(llm_config, supports_pdf_input)
+    with _llm_lock:
+        if fp in _llm_cache:
+            return _llm_cache[fp]
 
-    chat = ActusChatModel(
-        base_url=str(llm_config.base_url),
-        api_key=llm_config.api_key,
-        model_name=llm_config.model_name,
-        temperature=llm_config.temperature,
-        max_tokens=llm_config.max_tokens,
-        supports_response_format=getattr(llm_config, 'supports_response_format', True),
-        supports_vision=getattr(llm_config, 'supports_vision', True),
-        supports_pdf_input=supports_pdf_input,
-    )
-    responses = ActusResponsesModel(
-        base_url=str(llm_config.base_url),
-        api_key=llm_config.api_key,
-        model_name=llm_config.model_name,
-        temperature=llm_config.temperature,
-        max_tokens=llm_config.max_tokens,
-        supports_vision=getattr(llm_config, 'supports_vision', True),
-        supports_pdf_input=supports_pdf_input,
-    )
-    if llm_config.api_type == "responses":
-        return responses
-    if llm_config.api_type == "auto":
-        return ActusFallbackChatModel(primary=chat, fallback=responses)
-    return chat
+        from app.infrastructure.external.llm.actus_fallback_chat_model import ActusFallbackChatModel
+
+        timeout_seconds = llm_config.timeout_seconds
+        connect_timeout_seconds = llm_config.connect_timeout_seconds
+
+        chat = ActusChatModel(
+            base_url=str(llm_config.base_url),
+            api_key=llm_config.api_key,
+            model_name=llm_config.model_name,
+            temperature=llm_config.temperature,
+            max_tokens=llm_config.max_tokens,
+            supports_response_format=getattr(llm_config, 'supports_response_format', True),
+            supports_vision=getattr(llm_config, 'supports_vision', True),
+            supports_pdf_input=supports_pdf_input,
+            timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
+        )
+        responses = ActusResponsesModel(
+            base_url=str(llm_config.base_url),
+            api_key=llm_config.api_key,
+            model_name=llm_config.model_name,
+            temperature=llm_config.temperature,
+            max_tokens=llm_config.max_tokens,
+            supports_vision=getattr(llm_config, 'supports_vision', True),
+            supports_pdf_input=supports_pdf_input,
+            timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
+        )
+        if llm_config.api_type == "responses":
+            llm = responses
+        elif llm_config.api_type == "auto":
+            # D5.1 budget warning heuristic: if primary + fallback combined
+            # budget is large, fallback path worst case may approach or
+            # exceed D5 ExecutionWatchdog total_timeout_seconds. Log warning
+            # (non-hard) so operators see it during config load.
+            combined = timeout_seconds * 2
+            if combined > _FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS:
+                logger.warning(
+                    "[D5.1 budget warning] ActusFallbackChatModel with "
+                    "timeout_seconds=%.0fs may approach D5 ExecutionWatchdog "
+                    "total_timeout_seconds budget. Fallback worst case = "
+                    "%.0fs x 3 graph retries = %.0fs. Consider lowering "
+                    "timeout_seconds or raising "
+                    "ExecutionConfig.total_timeout_seconds.",
+                    timeout_seconds,
+                    combined,
+                    combined * 3,
+                )
+            llm = ActusFallbackChatModel(primary=chat, fallback=responses)
+        else:
+            llm = chat
+
+        if len(_llm_cache) >= _MAX_LLM_CACHE_SIZE:
+            oldest = next(iter(_llm_cache))
+            del _llm_cache[oldest]
+        _llm_cache[fp] = llm
+        return llm
 
 
 def _build_skill_service() -> SkillService:
     return SkillService(FileSkillRepository(settings.skills_root_dir))
+
+
+def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
+    """Build an immutable config snapshot from app_config. Sub-deps use caches."""
+    effective_pdf_input = (
+        getattr(app_config.llm_config, 'supports_pdf_input', False)
+        and app_config.llm_config.supports_vision
+    )
+    llm = _build_llm(app_config.llm_config, supports_pdf_input=effective_pdf_input)
+
+    summary_llm = None
+    if app_config.agent_config.memory.summary_model:
+        # D5.1: summary_timeout_seconds overrides the main LLM timeout for the
+        # summarizer path. None means "inherit main llm_config.timeout_seconds".
+        # The summarizer runs with no tools and short prompts, so it usually
+        # wants a tighter bound than the main agent.
+        summary_timeout_override = (
+            app_config.agent_config.memory.summary_timeout_seconds
+        )
+        summary_update: dict[str, Any] = {
+            "model_name": app_config.agent_config.memory.summary_model,
+        }
+        if summary_timeout_override is not None:
+            summary_update["timeout_seconds"] = summary_timeout_override
+        summary_llm_config = app_config.llm_config.model_copy(
+            update=summary_update
+        )
+        summary_llm = _build_llm(summary_llm_config)
+
+    vision_fallback_model = None
+    vf = app_config.file_understanding.vision_fallback
+    if vf.enabled and vf.model_name:
+        from app.domain.models.app_config import LLMConfig as LLMConfigModel
+        vision_llm_config = LLMConfigModel(
+            base_url=vf.base_url or str(app_config.llm_config.base_url),
+            api_key=vf.api_key or app_config.llm_config.api_key,
+            model_name=vf.model_name,
+            api_type=vf.api_type,
+            supports_vision=True,
+            timeout_seconds=app_config.llm_config.timeout_seconds,  # D5.1: inherit from main; VisionFallbackConfig has no independent timeout field
+            connect_timeout_seconds=app_config.llm_config.connect_timeout_seconds,  # D5.2: inherit from main (same rationale as timeout_seconds)
+        )
+        vision_fallback_model = _build_llm(vision_llm_config)
+
+    skill_creator_service = SkillCreatorService(
+        llm=llm,
+        github_client=GitHubSearchClient(token=settings.github_token or None),
+        skill_service=_build_skill_service(),
+    )
+
+    overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
+
+    return _ConfigSnapshot(
+        llm=llm,
+        agent_config=app_config.agent_config,
+        mcp_config=app_config.mcp_config,
+        a2a_config=app_config.a2a_config,
+        skill_risk_policy=app_config.skill_risk_policy or SkillRiskPolicy(),
+        overflow_config=overflow_config,
+        summary_llm=summary_llm,
+        vision_fallback_model=vision_fallback_model,
+        skill_creator_service=skill_creator_service,
+        supports_vision=app_config.llm_config.supports_vision,
+        supports_pdf_input=effective_pdf_input,
+        file_understanding_config=app_config.file_understanding,
+    )
+
+
+# --- AgentService refresh (D2) ---
+_last_refresh_generation: int = 0
+_refresh_lock = threading.Lock()
+
+
+def _build_agent_service(
+    minio_store: MinioStore,
+    redis_client: RedisClient,
+    checkpointer_pool: AsyncConnectionPool,
+    flush_service: object | None,
+    memory_embedding_provider: object | None,
+) -> AgentService:
+    """Called once in lifespan. Creates AgentService singleton and seeds generation."""
+    global _last_refresh_generation
+    app_config = _load_app_config()
+    snapshot = _build_config_snapshot(app_config)
+    agent_svc = AgentService(
+        uow_factory=get_uow,
+        config_snapshot=snapshot,
+        sandbox_cls=DockerSandbox,
+        task_cls=RedisStreamTask,
+        search_engine=BingSearchEngine(),
+        file_storage=MinioFileStorage(
+            bucket=settings.minio_bucket_name,
+            minio_store=minio_store,
+            uow_factory=get_uow,
+        ),
+        redis_client=redis_client,
+        checkpointer_pool=checkpointer_pool,
+        memory_flusher=flush_service,
+        memory_embedding_provider=memory_embedding_provider,
+        memory_session_factory=get_postgres().session_factory,
+        memory_repo_factory=DBMemoryChunkRepository,
+        event_recovery=RedisEventRecovery(),
+    )
+    _last_refresh_generation = _config_generation
+    return agent_svc
 
 
 def get_skill_creator_service() -> SkillCreatorService:
@@ -182,79 +402,34 @@ def get_flush_service(request: Request):
     return getattr(request.app.state, "flush_service", None)
 
 
-# @lru_cache()
-def get_agent_service(
-    minio_store: MinioStore = Depends(get_minio),
-    redis_client: RedisClient = Depends(get_redis),
-    checkpointer_pool: AsyncConnectionPool = Depends(get_checkpointer_pool),
-    flush_service=Depends(get_flush_service),
-) -> AgentService:
-    # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
-    app_config = _load_app_config()
-    # file_repository = DBFileRepository(db_session=db_session)
-    overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
+def get_memory_embedding_provider(request: Request):
+    """Extract memory embedding provider from app state (C4 构建)."""
+    return getattr(request.app.state, "memory_embedding_provider", None)
 
-    # 2.构建依赖实例
-    effective_pdf_input = (
-        getattr(app_config.llm_config, 'supports_pdf_input', False)
-        and app_config.llm_config.supports_vision
-    )
-    llm = _build_llm(app_config.llm_config, supports_pdf_input=effective_pdf_input)
-    summary_llm = None
-    if app_config.agent_config.memory.summary_model:
-        summary_llm_config = app_config.llm_config.model_copy(
-            update={"model_name": app_config.agent_config.memory.summary_model}
-        )
-        summary_llm = _build_llm(summary_llm_config)
-    file_storage = MinioFileStorage(
-        bucket=settings.minio_bucket_name,
-        minio_store=minio_store,
-        uow_factory=get_uow,
-    )
-    skill_creator_service = SkillCreatorService(
-        llm=llm,
-        github_client=GitHubSearchClient(token=settings.github_token or None),
-        skill_service=_build_skill_service(),
-    )
 
-    # 3.构造 vision fallback model（非多模态主模型时用于描述图片/视频帧）
-    vision_fallback_model = None
-    vf = app_config.file_understanding.vision_fallback
-    if vf.enabled and vf.model_name:
-        from app.domain.models.app_config import LLMConfig as LLMConfigModel
-        vision_llm_config = LLMConfigModel(
-            base_url=vf.base_url or str(app_config.llm_config.base_url),
-            api_key=vf.api_key or app_config.llm_config.api_key,
-            model_name=vf.model_name,
-            api_type=vf.api_type,
-            supports_vision=True,  # Force: fallback model MUST support vision
-        )
-        vision_fallback_model = _build_llm(vision_llm_config)
+def get_agent_service(request: Request) -> AgentService:
+    """Return app.state singleton. Atomic refresh on config generation change."""
+    global _last_refresh_generation
+    agent_svc = request.app.state.agent_service
 
-    # 4.实例Agent服务并返回
-    return AgentService(
-        uow_factory=get_uow,
-        llm=llm,
-        agent_config=app_config.agent_config,
-        mcp_config=app_config.mcp_config,
-        a2a_config=app_config.a2a_config,
-        overflow_config=overflow_config,
-        skill_risk_policy=app_config.skill_risk_policy,
-        sandbox_cls=DockerSandbox,
-        task_cls=RedisStreamTask,
-        search_engine=BingSearchEngine(),
-        file_storage=file_storage,
-        redis_client=redis_client,
-        skill_creator_service=skill_creator_service,
-        summary_llm=summary_llm,
-        checkpointer_pool=checkpointer_pool,
-        supports_vision=app_config.llm_config.supports_vision,
-        supports_pdf_input=effective_pdf_input,
-        file_understanding_config=app_config.file_understanding,
-        vision_fallback_model=vision_fallback_model,
-        memory_flusher=flush_service,
-        # file_repository=file_repository,
-    )
+    _load_app_config()  # trigger possible generation increment
+
+    # Fast path (no lock): generation unchanged
+    # NOTE: safe under CPython GIL — int read is atomic. Double-check inside lock handles races.
+    if _config_generation == _last_refresh_generation:
+        return agent_svc
+
+    # Slow path: lock, pin generation, build, commit
+    with _refresh_lock:
+        gen = _config_generation
+        if gen <= _last_refresh_generation:
+            return agent_svc
+        snapshot = _build_config_snapshot(_config_cache)
+        agent_svc._refresh_config(snapshot)
+        _last_refresh_generation = gen
+        logger.info("AgentService config refreshed (generation=%d)", gen)
+
+    return agent_svc
 
 
 def get_skill_export_service() -> SkillExportService:

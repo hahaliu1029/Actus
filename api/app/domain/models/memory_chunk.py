@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 
@@ -25,3 +26,23 @@ class FlushBatch:
     from_cursor: int
     target_cursor: int
     chunks: tuple[RawChunk, ...]
+
+
+@dataclass(frozen=True)
+class MemoryChunk:
+    """已持久化的记忆分块——Repository 的读取返回类型。
+
+    与 RawChunk（flush 管道输入，无 id/embedding/timestamps）形成
+    生命周期分界：RawChunk 是"写入前"，MemoryChunk 是"读取后"。
+    """
+
+    id: str
+    user_id: str
+    content: str
+    content_hash: str
+    source: str  # "session_flush" | "manual" | "file"
+    metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    session_id: str | None = None
+    embedding: tuple[float, ...] | None = None

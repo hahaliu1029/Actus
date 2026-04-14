@@ -8,10 +8,25 @@ from sqlalchemy import engine_from_config, pool
 # access to the values within the .ini file in use.
 config = context.config
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Skip alembic's logging config entirely. The application's
+# ``app.infrastructure.logging.setup_logging`` (called at module import
+# time of ``app.main``) already installs a root StreamHandler at INFO
+# level pointing at sys.stdout. If we call ``fileConfig`` here, alembic
+# would re-configure the root logger using ``[logger_root]`` from
+# ``alembic.ini`` (level=WARNING, handler→sys.stderr), which would
+# (a) demote root to WARNING — silencing main.py's own INFO logs like
+# ``数据库迁移完成`` and ``Postgres 客户端初始化完成``,
+# (b) optionally disable every ``app.*`` logger not listed in alembic.ini.
+# Skipping fileConfig leaves the root logger as setup_logging configured
+# it; alembic's own loggers (``logging.getLogger("alembic")``,
+# ``logging.getLogger("sqlalchemy.engine")``) inherit from root and still
+# emit normally.
+#
+# Note: this means ``alembic.ini``'s [logger_*] / [handler_*] /
+# [formatter_*] sections are now effectively dead config inside the
+# Actus application. Standalone ``alembic upgrade head`` from the CLI
+# still uses them because the CLI doesn't import ``app.main`` first.
+_ = fileConfig  # keep the import live for lints / future fallback use
 
 # add your model's MetaData object here
 # for 'autogenerate' support

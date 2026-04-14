@@ -89,3 +89,23 @@ class ServerRequestsError(AppException):
 
     def __init__(self, msg: str = "服务器请求错误"):
         super().__init__(code=500, status_code=500, msg=msg)
+
+
+# ---- B5 prompt assembly errors (HTTP wrappers) -------------------------- #
+# The domain layer defines the canonical exceptions in
+# ``app.domain.services.prompts.errors``. These wrappers exist only so the
+# interfaces layer's HTTP handler can return structured error responses.
+# Domain code should raise the domain exceptions directly; the interfaces
+# exception handler catches and converts them to HTTP 500.
+
+
+class PromptAssemblyHTTPError(AppException):
+    """HTTP wrapper for any ``PromptAssemblyError`` raised at runtime.
+
+    The interfaces exception handler catches ``PromptAssemblyError`` from
+    the domain layer and re-raises as this AppException subclass to surface
+    a structured 500 to the client.
+    """
+
+    def __init__(self, msg: str):
+        super().__init__(code=500, status_code=500, msg=msg)
