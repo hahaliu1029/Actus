@@ -31,6 +31,7 @@ from app.domain.models.app_config import (
     AgentConfig,
     MCPConfig,
     SkillRiskPolicy,
+    ToolRuntimeConfig,
 )
 from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
@@ -203,6 +204,7 @@ class AgentTaskRunner(TaskRunner):
         approval_cache=None,  # Task 17: ApprovalCache | None
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
         initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
+        tool_runtime: ToolRuntimeConfig | None = None,  # R2 CS2: wrapper cap + smart-approve timeout
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._approval_cache = approval_cache
@@ -213,6 +215,7 @@ class AgentTaskRunner(TaskRunner):
         self._memory_repo_factory = memory_repo_factory
         self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
+        self._tool_runtime = tool_runtime or ToolRuntimeConfig()
         self._llm = llm
         self._uow_factory = uow_factory
         self._uow = uow_factory()
@@ -393,6 +396,7 @@ class AgentTaskRunner(TaskRunner):
             approval_cache=self._approval_cache,
             confirmation_manager=self._confirmation_manager,
             prompt_assembler=prompt_assembler,
+            tool_runtime=self._tool_runtime,
         )
 
     def _build_prompt_telemetry(self) -> Any:
@@ -1811,6 +1815,7 @@ class AgentTaskRunner(TaskRunner):
                     else 8000
                 ),
                 assembler=getattr(self._flow, "_assembler", None),
+                tool_runtime_config=self._tool_runtime,
             )
 
             # Post-build atomic commit: only now do we advance

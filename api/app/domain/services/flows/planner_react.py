@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional, Sequence
 
 if TYPE_CHECKING:
+    from app.domain.models.app_config import ToolRuntimeConfig
     from app.domain.services.prompts.assembler import PromptAssembler
 
 
@@ -97,6 +98,7 @@ class PlannerReActFlow(BaseFlow):
         confirmation_manager: Any = None,  # ConfirmationManager | None
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
         _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
+        tool_runtime: "ToolRuntimeConfig | None" = None,  # R2 CS2
     ) -> None:
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
@@ -110,6 +112,7 @@ class PlannerReActFlow(BaseFlow):
         self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
         self._overflow_config = overflow_config
+        self._tool_runtime = tool_runtime
         self._token_estimator = TokenEstimator(
             strategy=self._overflow_config.token_estimator,
             model_name=self._overflow_config.model_name,
@@ -409,6 +412,7 @@ class PlannerReActFlow(BaseFlow):
                 if self._overflow_config else 8000
             ),
             assembler=assembler,
+            tool_runtime_config=self._tool_runtime,
         )
         self._main_graph = build_main_graph(
             planner_llm=self._llm,

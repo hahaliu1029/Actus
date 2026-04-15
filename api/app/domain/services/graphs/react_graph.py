@@ -53,12 +53,18 @@ from app.domain.models.tool_result import (
 )
 from app.domain.services.json_envelope import unwrap_message_envelope
 from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
-from app.domain.services.tools.tool_source_resolver import ToolSource, resolve_tool_source
+from app.domain.services.tools.tool_source_resolver import (
+    ToolSource,
+    ToolSourceUnknownError,
+    resolve_tool_source,
+)
 
 from .message_utils import truncate_tool_content
 from .state import ReactGraphState
 
 if TYPE_CHECKING:
+    from app.domain.models.app_config import ToolRuntimeConfig
+
     from .context_assembler import ContextAssembler
 
 logger = logging.getLogger(__name__)
@@ -525,6 +531,128 @@ async def _translate_outcome(
     return msg, deferred, events
 
 
+def _maybe_convert_shell_outcome_with_images(
+    outcome: ToolOutcome,
+    tool_name: str,
+) -> ToolOutcome:
+    """Legacy compat: shell tools sometimes embed base64 images in stdout.
+
+    The current ``shell_execute`` / ``shell_read_output`` wrappers emit
+    ``AllowSuccess(content=<raw stdout>)`` and leave image extraction to
+    the dispatcher (historically inside the now-retired ``_run_tool``
+    helper). This post-processor inspects ``AllowSuccess`` outcomes for
+    shell tools, extracts ``data:image/...;base64,...`` payloads via
+    ``_extract_shell_images``, and if any are found converts the
+    outcome to a ``Passthrough`` carrying a typed
+    ``MultimodalPayload``. Everything else passes through unchanged.
+
+    This lets ``_translate_outcome``'s ``Passthrough`` branch attach
+    the images as a deferred ``HumanMessage`` so the LLM actually
+    sees them — which is what the legacy ``multimodal_blocks``
+    pipeline used to do before R2.
+
+    N.B. a cleaner fix would move this into the ``shell_execute``
+    wrapper so the dispatcher doesn't know about tool-specific
+    post-processing. Keeping it here for now minimizes Chunk 3
+    blast radius; a follow-up can promote it into the wrapper.
+    """
+    if tool_name not in ("shell_execute", "shell_read_output"):
+        return outcome
+    if not isinstance(outcome, AllowSuccess):
+        return outcome
+    if not isinstance(outcome.content, str):
+        return outcome
+    if "data:image/" not in outcome.content:
+        return outcome
+
+    cleaned, image_dicts = _extract_shell_images(outcome.content)
+    if not image_dicts:
+        return outcome
+
+    typed_blocks: list[ImageUrlBlock] = []
+    for block_dict in image_dicts:
+        image_url_dict = block_dict.get("image_url") or {}
+        typed_blocks.append(
+            ImageUrlBlock(
+                image_url=ImageUrlPayload(
+                    url=image_url_dict.get("url", ""),
+                    detail=image_url_dict.get("detail", "auto"),
+                )
+            )
+        )
+
+    return Passthrough(
+        content=cleaned,
+        data=MultimodalPayload(blocks=typed_blocks),
+    )
+
+
+def _too_large_outcome(tool_name: str, byte_len: int, max_bytes: int) -> AllowError:
+    return AllowError(
+        content=(
+            f"工具 '{tool_name}' 输出超长 "
+            f"({byte_len} bytes > {max_bytes})"
+        ),
+        reason=DecisionReason(
+            type="exception",
+            code="wrapper_output_too_large",
+            message=f"{byte_len} bytes",
+        ),
+        retryable=False,
+    )
+
+
+def _legacy_raw_to_outcome(tool_name: str, raw: Any) -> ToolOutcome:
+    """Coerce a pre-R2 wrapper return value (``response_format='content'``)
+    into a typed ``ToolOutcome``.
+
+    Branches:
+    - ``FileProcessResult`` → ``Passthrough`` carrying a ``MultimodalPayload``
+      with the tool's image / document blocks (restores pre-R2 file_view
+      behavior that predates the ``content_and_artifact`` wrapper migration).
+    - ``str`` → ``AllowSuccess(content=<str>)``.
+    - anything else → ``AllowSuccess(content=str(raw))`` fallback.
+    """
+    if isinstance(raw, FileProcessResult):
+        typed_blocks: list[Any] = []
+        for block in list(raw.image_blocks):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "image_url":
+                img = block.get("image_url") or {}
+                typed_blocks.append(
+                    ImageUrlBlock(
+                        image_url=ImageUrlPayload(
+                            url=img.get("url", ""),
+                            detail=img.get("detail", "auto"),
+                        )
+                    )
+                )
+        for block in list(getattr(raw, "document_blocks", None) or []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "file":
+                file = block.get("file") or {}
+                typed_blocks.append(
+                    FileBlock(
+                        file=FilePayload(
+                            filename=file.get("filename", "document"),
+                            file_data=file.get("file_data", ""),
+                        )
+                    )
+                )
+        if typed_blocks:
+            return Passthrough(
+                content=raw.text,
+                data=MultimodalPayload(blocks=typed_blocks),
+            )
+        return AllowSuccess(content=raw.text)
+    if isinstance(raw, str):
+        return AllowSuccess(content=raw)
+    return AllowSuccess(content=str(raw))
+
+
 async def _invoke_wrapper(
     tool: BaseTool,
     tool_call: ToolCall,
@@ -550,6 +678,48 @@ async def _invoke_wrapper(
         else _MAX_WRAPPER_OUTPUT_BYTES
     )
     del tool_source
+
+    legacy_response_format = (
+        getattr(tool, "response_format", "content") != "content_and_artifact"
+    )
+
+    # Legacy branch: tool predates the CS2 wrapper migration. Call
+    # ``ainvoke(args)`` to receive the raw Python object so we can
+    # special-case ``FileProcessResult``, preserving the pre-R2 file_view
+    # multimodal path under the new dispatcher.
+    if legacy_response_format:
+        try:
+            raw = await tool.ainvoke(tool_call["args"])
+        except asyncio.TimeoutError as exc:
+            return AllowError(
+                content=f"工具 '{tool.name}' 执行超时: {exc}",
+                reason=DecisionReason(
+                    type="timeout",
+                    code="wrapper_ainvoke_timeout",
+                    message=str(exc),
+                ),
+                retryable=True,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected wrapper exception for %s", tool.name)
+            return AllowError(
+                content=f"工具 '{tool.name}' 内部异常: {exc}",
+                reason=DecisionReason(
+                    type="exception",
+                    code=type(exc).__name__,
+                    message=str(exc),
+                ),
+                retryable=False,
+            )
+
+        outcome = _legacy_raw_to_outcome(tool.name, raw)
+        if isinstance(outcome.content, str) and len(outcome.content) > max_bytes:
+            return _too_large_outcome(tool.name, len(outcome.content), max_bytes)
+        return outcome
+
+    # R2 CS2 typed path: tool opts into ``content_and_artifact``, so
+    # ``ainvoke(ToolCall dict)`` returns a ``ToolMessage`` whose
+    # ``artifact`` is the pre-built ``ToolOutcome``.
     try:
         tool_msg = await tool.ainvoke(
             {
@@ -596,18 +766,17 @@ async def _invoke_wrapper(
         )
 
     if isinstance(tool_msg.content, str) and len(tool_msg.content) > max_bytes:
-        return AllowError(
-            content=(
-                f"工具 '{tool.name}' 输出超长 "
-                f"({len(tool_msg.content)} bytes > {max_bytes})"
-            ),
-            reason=DecisionReason(
-                type="exception",
-                code="wrapper_output_too_large",
-                message=f"{len(tool_msg.content)} bytes",
-            ),
-            retryable=False,
+        return _too_large_outcome(tool.name, len(tool_msg.content), max_bytes)
+
+    # Safety net: wrapper declared ``content_and_artifact`` but didn't
+    # populate the artifact (misconfigured tool). Fall back to
+    # ``AllowSuccess`` from the text content so the dispatcher doesn't
+    # crash the whole step.
+    if tool_msg.artifact is None:
+        raw_content = tool_msg.content if isinstance(tool_msg.content, str) else str(
+            tool_msg.content
         )
+        return AllowSuccess(content=raw_content)
 
     try:
         return TOOL_OUTCOME_ADAPTER.validate_python(tool_msg.artifact)
@@ -857,47 +1026,75 @@ def build_react_graph(
         )
         new_completed_ids: list[str] = []
 
-        new_messages = []
-        new_events = []
+        new_messages: list = []
+        new_events: list = []
         should_interrupt = False
         new_failures = 0
-        # Collect multimodal HumanMessages from file_view results.
-        # Appended AFTER all ToolMessages to preserve AIMessage → ToolMessage*
-        # pairing for group_messages() (context_assembler.py).
-        deferred_human_messages: list[HumanMessage] = []
-        deferred_document_messages: list[HumanMessage] = []
+        # R2 CS2: Passthrough deferred HumanMessage list, appended AFTER all
+        # ToolMessages so the AIMessage → ToolMessage* pairing survives for
+        # group_messages() (context_assembler.py). _translate_outcome
+        # appends to this; tool_node owns the final flush.
+        new_deferred_human: list[HumanMessage] = []
 
-        async def _run_tool(
-            tool_fn: BaseTool,
-            tool_name: str,
-            args: dict,
-        ) -> tuple[str, bool, list[dict]]:
-            """Execute a tool and handle result type coercion.
+        session_ctx = _session_ctx_from(config)
 
-            Returns (result_str, success, multimodal_blocks).
-            Side effect: may append to ``deferred_document_messages``.
+        async def _finalize_outcome(
+            tc: dict,
+            tc_args: dict,
+            tool_source: ToolSource,
+            outcome: ToolOutcome,
+            tool_start_ts: float,
+        ) -> None:
+            """Layer 3 translate + tracker/metrics bookkeeping.
+
+            Shared tail of the execution flow, used by:
+            - tracker-blocked synthesis (AllowError)
+            - unknown tool synthesis (AllowError)
+            - cache deny / smart-approve deny synthesis (Denied)
+            - legacy risk gate "allow" path via Layer 2 (_invoke_wrapper)
+            - low-risk / no-risk path via Layer 2 (_invoke_wrapper)
+
+            Every path that reaches this helper has a typed ``ToolOutcome``,
+            so the ToolMessage that lands in ``new_messages`` carries a
+            real typed ``artifact`` field. That is what makes Chunk 4's
+            LLM adapter prefix injection (``[TOOL_FAILED: timeout]`` /
+            ``[TOOL_DENIED: ast_validator]``) actually fire in
+            production — the pre-fix dispatcher handed the adapter bare
+            strings with ``artifact=None``, so the adapter always fell
+            back to the generic ``[TOOL_ERROR]``.
             """
-            mm_blocks: list[dict] = []
-            try:
-                raw_result = await tool_fn.ainvoke(args)
-                if isinstance(raw_result, FileProcessResult):
-                    r_str = raw_result.text
-                    mm_blocks = list(raw_result.image_blocks)
-                    if raw_result.document_blocks:
-                        doc_blocks: list[dict] = list(raw_result.document_blocks)
-                        doc_blocks.insert(0, {"type": "text", "text": "[file_view: PDF document attached]"})
-                        deferred_document_messages.append(HumanMessage(content=doc_blocks))
-                elif isinstance(raw_result, str):
-                    r_str = raw_result
+            nonlocal new_failures
+
+            msg, deferred, events = await _translate_outcome(
+                outcome,
+                tc,
+                tool_source,
+                session_ctx,
+                tool_result_max_chars=tool_result_max_chars,
+                guide_injector=guide_injector,
+            )
+            if msg is not None:
+                new_messages.append(msg)
+            new_deferred_human.extend(deferred)
+            for evt in events:
+                new_events.append(evt)
+
+            is_success = isinstance(outcome, (AllowSuccess, Passthrough))
+            tc_name = tc["name"]
+            if _tracker:
+                if is_success:
+                    _tracker.record_success(tc_name, tc_args)
                 else:
-                    r_str = str(raw_result)
-                # Shell image detection (M1d)
-                if tool_name in ("shell_execute", "shell_read_output"):
-                    r_str, shell_images = _extract_shell_images(r_str)
-                    mm_blocks.extend(shell_images)
-                return r_str, True, mm_blocks
-            except Exception as exc:
-                return f"Error executing {tool_name}: {exc}", False, []
+                    _tracker.record_failure(tc_name, tc_args)
+            if _metrics:
+                _metrics.record_tool_call(
+                    success=is_success,
+                    latency_ms=(_time.monotonic() - tool_start_ts) * 1000,
+                )
+            if not is_success:
+                new_failures += 1
+
+            new_completed_ids.append(tc["id"])
 
         for tc in tool_calls:
             tool_name = tc["name"]
@@ -915,323 +1112,379 @@ def build_react_graph(
             # entirely on the replay following an approve resume.
             _bypass_risk_gate = call_id in pre_approved
 
-            # ---- message_ask_user: SOFT_HINT gating ---- #
-            tool_success = True
-            multimodal_blocks: list[dict] = []
+            # ---- message_ask_user: SOFT_HINT gating ----
+            # Pseudo-tool for user-input gating, not a real wrapper — it
+            # stays on the legacy manual ToolMessage construction path
+            # because it has no ``ToolSource`` entry and no typed artifact
+            # semantics. SOFT_HINT / WAITING_FOR_USER strings are
+            # consumed by agent_task_runner / interfaces layer, not the
+            # LLM adapter's prefix logic.
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
                 if suggest in {"browser", "shell"}:
-                    # Takeover request → always interrupt
                     result_str = "WAITING_FOR_USER"
                     should_interrupt = True
                 elif not has_prior_soft_hint:
-                    # First non-takeover ask → return SOFT_HINT
                     result_str = "SOFT_HINT"
                     logger.info("message_ask_user: returning SOFT_HINT (first attempt)")
                 else:
-                    # Second call after SOFT_HINT → truly needs user input
                     result_str = "WAITING_FOR_USER"
                     should_interrupt = True
                     logger.info("message_ask_user: user input required (after SOFT_HINT)")
-            else:
-                # ---- Normal tool execution (with risk assessment gate) ---- #
-                # D5: Check if this tool+args signature is blocked by tracker
-                if _tracker and _tracker.is_blocked(tool_name, args):
-                    result_str = f"[BLOCKED] 此工具调用模式（{tool_name}）因连续失败已被暂停，请尝试不同的工具或参数"
-                    tool_success = False
-                    new_messages.append(ToolMessage(content=f"[TOOL_ERROR] {result_str}", tool_call_id=call_id, name=tool_name))
-                    new_events.append(ToolEvent(
-                        tool_call_id=call_id, tool_name=resolve_tool_source(tool_name).category,
-                        function_name=tool_name, function_args=args,
-                        function_result=ToolResult(success=False, message=result_str),
+
+                new_messages.append(
+                    ToolMessage(
+                        content=result_str,
+                        tool_call_id=call_id,
+                        name=tool_name,
+                    )
+                )
+                new_events.append(
+                    ToolEvent(
+                        tool_call_id=call_id,
+                        tool_name=resolve_tool_source(tool_name).category,
+                        function_name=tool_name,
+                        function_args=args,
+                        function_result=ToolResult(success=True, message=result_str),
                         status=ToolEventStatus.CALLED,
-                    ))
-                    new_failures += 1
-                    if _metrics:
-                        _metrics.record_tool_call(
-                            success=False,
-                            latency_ms=(_time.monotonic() - _tool_start) * 1000,
+                    )
+                )
+                new_completed_ids.append(call_id)
+                continue
+
+            # Resolve the tool's ``ToolSource`` once — every downstream
+            # branch (block, unknown, deny, execute) needs it for
+            # ``_translate_outcome``. Fall through to a sentinel native/
+            # unknown source if R1 has never seen this name (e.g. a
+            # dynamically-discovered MCP tool without a factory call).
+            try:
+                tool_source = resolve_tool_source(tool_name)
+            except ToolSourceUnknownError:
+                tool_source = ToolSource(
+                    source="native",
+                    category="shell",  # fallback bucket — nothing reads it
+                    canonical_name=tool_name,
+                )
+
+            # ---- D5 tracker: block signature with repeated failures ----
+            if _tracker and _tracker.is_blocked(tool_name, args):
+                blocked_outcome = AllowError(
+                    content=(
+                        f"[BLOCKED] 此工具调用模式（{tool_name}）因连续失败已被暂停，"
+                        "请尝试不同的工具或参数"
+                    ),
+                    reason=DecisionReason(
+                        type="exception",
+                        code="tool_blocked_by_failure_tracker",
+                        message="Tool signature hit the tracker blocklist threshold",
+                    ),
+                )
+                await _finalize_outcome(
+                    tc, args, tool_source, blocked_outcome, _tool_start
+                )
+                continue
+
+            # ---- Unknown tool: synthesize AllowError, let Layer 3 translate ----
+            tool_fn = tool_map.get(tool_name)
+            if tool_fn is None:
+                unknown_outcome = AllowError(
+                    content=f"Error: Unknown tool '{tool_name}'",
+                    reason=DecisionReason(
+                        type="exception",
+                        code="unknown_tool",
+                        message=f"Tool '{tool_name}' not in this graph's tool_map",
+                    ),
+                )
+                await _finalize_outcome(
+                    tc, args, tool_source, unknown_outcome, _tool_start
+                )
+                continue
+
+            # ---- Legacy risk gate (real ApprovalCache / SmartApprove) ----
+            #
+            # The Layer 1 ``_run_policy_chain`` helper exists as a typed
+            # facade but its internal stage stubs are not yet wired to
+            # real services (``_stage_s_ast_validate`` awaits N1,
+            # ``_stage_p1_approval_cache_check`` / ``_stage_p2_smart_approve``
+            # would need ``configurable`` threading). Rather than gate
+            # production on half-wired stubs, R2 keeps the legacy gate
+            # as the policy layer and only swaps the **execution + output
+            # construction** onto Layer 2 (``_invoke_wrapper``) + Layer 3
+            # (``_translate_outcome``). Result: every path that used to
+            # call ``_run_tool`` + build a raw ToolMessage now produces
+            # a typed ``ToolOutcome`` whose artifact flows through to
+            # Chunk 4's LLM adapter prefix injection.
+            risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
+            _tc_enabled = configurable.get("tool_confirmation_enabled", True)
+            _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
+
+            if (
+                not _bypass_risk_gate
+                and _tc_enabled
+                and risk_level_meta
+                and risk_level_meta in ("high", "medium")
+            ):
+                assessment = _risk_assessor.assess(tool_name, args)
+
+                if assessment.final_level >= RiskLevel.MEDIUM:
+                    approval_cache = configurable.get("approval_cache")
+                    _user_id = configurable.get("user_id") or ""
+                    _session_id = configurable.get("session_id") or ""
+
+                    cache_decision = "no_match"
+                    if approval_cache and _user_id and _session_id:
+                        try:
+                            cache_decision = await approval_cache.check(
+                                user_id=_user_id,
+                                session_id=_session_id,
+                                tool_name=tool_name,
+                                arg_digest=assessment.arg_digest,
+                                primary_arg=assessment.primary_arg,
+                                dir_arg=assessment.dir_arg,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "ApprovalCache.check failed for tool '%s', "
+                                "defaulting to no_match",
+                                tool_name,
+                            )
+                            cache_decision = "no_match"
+
+                    if cache_decision == "allow":
+                        outcome = await _invoke_wrapper(
+                            tool_fn,
+                            tc,
+                            tool_source,
+                            max_wrapper_output_bytes=_runtime_max_bytes,
                         )
-                    continue
+                        outcome = _maybe_convert_shell_outcome_with_images(
+                            outcome, tool_name
+                        )
+                        await _finalize_outcome(
+                            tc, args, tool_source, outcome, _tool_start
+                        )
+                        continue
 
-                tool_fn = tool_map.get(tool_name)
-                if tool_fn is None:
-                    result_str = f"Error: Unknown tool '{tool_name}'"
-                    tool_success = False
-                else:
-                    # Check tool risk_level metadata for confirmation gating
-                    risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
-                    _tc_enabled = configurable.get("tool_confirmation_enabled", True)
-                    # R2 CS2 (I-4.2): bypass the risk gate entirely for
-                    # tool_calls that interrupt_helper has already marked
-                    # as pre-approved on the replay path.
-                    if (
-                        not _bypass_risk_gate
-                        and _tc_enabled
-                        and risk_level_meta
-                        and risk_level_meta in ("high", "medium")
+                    if cache_decision == "deny":
+                        denied_outcome = Denied(
+                            content="此操作已被永久规则拒绝",
+                            reason=DecisionReason(
+                                type="approval_policy",
+                                code="cache_always_deny",
+                                message=(
+                                    "User-configured always-deny rule matched "
+                                    "for this tool+arg pattern"
+                                ),
+                            ),
+                        )
+                        await _finalize_outcome(
+                            tc, args, tool_source, denied_outcome, _tool_start
+                        )
+                        continue
+
+                    # cache miss — try SmartApprove before interrupting
+                    _sa_resolved = False
+                    _smart_approve_enabled = configurable.get(
+                        "smart_approve_enabled", False
+                    )
+                    _sa_medium_only = configurable.get(
+                        "smart_approve_medium_only", False
+                    )
+                    if _smart_approve_enabled and not (
+                        _sa_medium_only
+                        and assessment.final_level > RiskLevel.MEDIUM
                     ):
-                        assessment = _risk_assessor.assess(tool_name, args)
+                        from app.domain.services.smart_approve import (
+                            SmartApprove,
+                        )
 
-                        if assessment.final_level >= RiskLevel.MEDIUM:
-                            # Check ApprovalCache (session + always-rules)
-                            approval_cache = configurable.get("approval_cache")
-                            _user_id = configurable.get("user_id") or ""
-                            _session_id = configurable.get("session_id") or ""
-
-                            if approval_cache and _user_id and _session_id:
-                                try:
-                                    cache_decision = await approval_cache.check(
-                                        user_id=_user_id,
-                                        session_id=_session_id,
-                                        tool_name=tool_name,
-                                        arg_digest=assessment.arg_digest,
-                                        primary_arg=assessment.primary_arg,
-                                        dir_arg=assessment.dir_arg,
-                                    )
-                                except Exception:
-                                    logger.warning(
-                                        "ApprovalCache.check failed for tool '%s', defaulting to no_match",
-                                        tool_name,
-                                    )
-                                    cache_decision = "no_match"
-                            else:
-                                cache_decision = "no_match"
-
-                            if cache_decision == "allow":
-                                # Cached approval — execute directly
-                                result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
-                            elif cache_decision == "deny":
-                                result_str = "此操作已被永久规则拒绝"
-                                tool_success = False
-                            else:
-                                # SmartApprove: LLM-assisted auto-approval before interrupting
-                                _sa_resolved = False
-                                _smart_approve_enabled = configurable.get("smart_approve_enabled", False)
-                                _sa_medium_only = configurable.get("smart_approve_medium_only", False)
-                                # Skip SmartApprove if medium_only is set and tool is HIGH
-                                if _smart_approve_enabled and not (_sa_medium_only and assessment.final_level > RiskLevel.MEDIUM):
-                                    from app.domain.services.smart_approve import SmartApprove
-                                    _summary_llm = configurable.get("summary_llm")
-                                    if _summary_llm:
-                                        _smart = SmartApprove(llm=_summary_llm)
-                                        _sa_decision = await _smart.evaluate(
-                                            tool_name=tool_name,
-                                            tool_args=args,
-                                            risk_level=assessment.final_level.name.lower(),
-                                            matched_patterns=assessment.matched_patterns,
-                                            task_context="",
-                                        )
-                                        if _sa_decision == "approve":
-                                            logger.info(
-                                                "SmartApprove: auto-approved tool '%s', granting session scope",
-                                                tool_name,
-                                            )
-                                            if approval_cache and _session_id:
-                                                await approval_cache.write_session(
-                                                    _session_id, tool_name, assessment.arg_digest
-                                                )
-                                            result_str, tool_success, multimodal_blocks = await _run_tool(
-                                                tool_fn, tool_name, args
-                                            )
-                                            _sa_resolved = True
-                                        elif _sa_decision == "deny":
-                                            logger.info(
-                                                "SmartApprove: auto-denied tool '%s'", tool_name
-                                            )
-                                            result_str = "此操作已被自动安全策略拒绝"
-                                            tool_success = False
-                                            _sa_resolved = True
-                                        # else: "escalate" — fall through to interrupt path below
-
-                                if not _sa_resolved:
-                                    # R2 CS2 (I-4.1 / CS2.13): instead of
-                                    # calling interrupt() inline, route to
-                                    # the dedicated interrupt_helper node
-                                    # with the pending ask state written
-                                    # atomically. interrupt_helper is the
-                                    # ONLY node allowed to call interrupt().
-                                    _timeout_seconds = configurable.get(
-                                        "tool_confirmation_timeout_seconds", 300
-                                    )
-                                    confirmation_event = ToolConfirmationEvent(
-                                        tool_call_id=call_id,
+                        _summary_llm = configurable.get("summary_llm")
+                        if _summary_llm:
+                            _smart = SmartApprove(llm=_summary_llm)
+                            try:
+                                _sa_decision = await asyncio.wait_for(
+                                    _smart.evaluate(
                                         tool_name=tool_name,
                                         tool_args=args,
                                         risk_level=assessment.final_level.name.lower(),
-                                        risk_reason=assessment.risk_reason,
                                         matched_patterns=assessment.matched_patterns,
-                                        suggested_alternative=assessment.suggested_alternative,
-                                        timeout_seconds=_timeout_seconds,
+                                        task_context="",
+                                    ),
+                                    timeout=(
+                                        _tool_runtime_cfg.smart_approve_timeout_seconds
+                                    ),
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "SmartApprove timeout (%.1fs) for tool '%s' — "
+                                    "falling through to user-confirmation interrupt",
+                                    _tool_runtime_cfg.smart_approve_timeout_seconds,
+                                    tool_name,
+                                )
+                                _sa_decision = None
+                            if _sa_decision == "approve":
+                                logger.info(
+                                    "SmartApprove: auto-approved tool '%s', "
+                                    "granting session scope",
+                                    tool_name,
+                                )
+                                if approval_cache and _session_id:
+                                    await approval_cache.write_session(
+                                        _session_id,
+                                        tool_name,
+                                        assessment.arg_digest,
                                     )
-                                    if event_queue:
-                                        await event_queue.put(confirmation_event)
+                                outcome = await _invoke_wrapper(
+                                    tool_fn,
+                                    tc,
+                                    tool_source,
+                                    max_wrapper_output_bytes=_runtime_max_bytes,
+                                )
+                                outcome = _maybe_convert_shell_outcome_with_images(
+                                    outcome, tool_name
+                                )
+                                await _finalize_outcome(
+                                    tc, args, tool_source, outcome, _tool_start
+                                )
+                                _sa_resolved = True
+                            elif _sa_decision == "deny":
+                                logger.info(
+                                    "SmartApprove: auto-denied tool '%s'",
+                                    tool_name,
+                                )
+                                denied_outcome = Denied(
+                                    content="此操作已被自动安全策略拒绝",
+                                    reason=DecisionReason(
+                                        type="smart_approve",
+                                        code="smart_approve_deny",
+                                        message=(
+                                            "SmartApprove LLM evaluation rejected "
+                                            "this tool call"
+                                        ),
+                                    ),
+                                )
+                                await _finalize_outcome(
+                                    tc,
+                                    args,
+                                    tool_source,
+                                    denied_outcome,
+                                    _tool_start,
+                                )
+                                _sa_resolved = True
+                            # _sa_decision == "escalate" → fall through to
+                            # interrupt_helper routing below
 
-                                    # Persist confirmation detail to Redis so the
-                                    # resume path (_resume_tool_confirmation) can
-                                    # read it back after the graph is interrupted.
-                                    if confirmation_manager:
-                                        from app.domain.services.confirmation_manager import ConfirmationDetail
-                                        _detail = ConfirmationDetail(
-                                            session_id=_session_id,
-                                            tool_call_id=call_id,
-                                            user_id=_user_id,
-                                            tool_name=tool_name,
-                                            tool_args=args,
-                                            risk_level=assessment.final_level.name.lower(),
-                                            arg_digest=assessment.arg_digest,
-                                            primary_arg=assessment.primary_arg,
-                                            dir_arg=assessment.dir_arg,
-                                            matched_patterns=assessment.matched_patterns,
-                                            deadline_ts=_time.time() + confirmation_event.timeout_seconds,
-                                        )
-                                        await confirmation_manager.store(_detail)
+                    if _sa_resolved:
+                        continue
 
-                                    # Build typed Asked outcome + ToolArtifact
-                                    # for the pending_ask_* state fields. The
-                                    # pending artifact carries enough context
-                                    # for the interrupt_helper to recognize
-                                    # which tool_call is awaiting approval.
-                                    _pending_source = resolve_tool_source(tool_name)
-                                    _pending_outcome = Asked(
-                                        content="等待用户确认工具执行",
-                                        reason=DecisionReason(
-                                            type="risk_enforce",
-                                            code=assessment.final_level.name.lower(),
-                                            message=assessment.risk_reason or "",
-                                        ),
-                                    )
-                                    _pending_artifact = ToolArtifact(
-                                        tool_call_id=call_id,
-                                        tool_name=tool_name,
-                                        tool_source=_pending_source,
-                                        outcome=_pending_outcome,
-                                    )
+                    # Escalate to user: route to interrupt_helper with
+                    # typed pending_ask_* state.
+                    _timeout_seconds = configurable.get(
+                        "tool_confirmation_timeout_seconds", 300
+                    )
+                    confirmation_event = ToolConfirmationEvent(
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        tool_args=args,
+                        risk_level=assessment.final_level.name.lower(),
+                        risk_reason=assessment.risk_reason,
+                        matched_patterns=assessment.matched_patterns,
+                        suggested_alternative=assessment.suggested_alternative,
+                        timeout_seconds=_timeout_seconds,
+                    )
+                    if event_queue:
+                        await event_queue.put(confirmation_event)
 
-                                    # NOTE: confirmation_event is pushed to
-                                    # event_queue above (live stream only).
-                                    # Legacy convention: ConfirmationEvents
-                                    # are urgent-live, NOT state-persisted —
-                                    # see event_bridge.py:103-107, a node
-                                    # must pick ONE path (queue or state),
-                                    # not both, or the bridge double-emits.
-                                    _update = {
-                                        "messages": (
-                                            new_messages
-                                            + deferred_human_messages
-                                            + deferred_document_messages
-                                        ),
-                                        "events": new_events,
-                                        "attempt_count": state["attempt_count"] + 1,
-                                        "failure_count": state["failure_count"] + new_failures,
-                                        "completed_tool_call_prefix": (
-                                            list(already_done) + new_completed_ids
-                                        ),
-                                        "pending_ask_outcome": _pending_outcome.model_dump(
-                                            mode="json"
-                                        ),
-                                        "pending_ask_tool_call_id": call_id,
-                                        "pending_ask_artifact": _pending_artifact.model_dump(
-                                            mode="json", by_alias=True
-                                        ),
-                                        # R2 CS2: persist original args so
-                                        # interrupt_helper can feed them to
-                                        # _translate_outcome on deny — avoids
-                                        # dropping function_args on the
-                                        # audit path.
-                                        "pending_ask_tool_args": dict(args),
-                                    }
-                                    return Command(
-                                        goto="interrupt_helper",
-                                        update=_update,
-                                    )
-                        else:
-                            # Assessment resolved to none/low risk — execute directly
-                            result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
-                    else:
-                        # No risk metadata — execute directly (original path)
-                        result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
+                    if confirmation_manager:
+                        from app.domain.services.confirmation_manager import (
+                            ConfirmationDetail,
+                        )
 
-            # D5: Record tool outcome in tracker + metrics
-            if _tracker:
-                if tool_success:
-                    _tracker.record_success(tool_name, args)
-                else:
-                    _tracker.record_failure(tool_name, args)
-            if _metrics and tool_name != "message_ask_user":
-                # Exclude message_ask_user from latency stats (it's a gating mechanism,
-                # not a real tool execution).
-                _metrics.record_tool_call(
-                    success=tool_success,
-                    latency_ms=(_time.monotonic() - _tool_start) * 1000,
+                        _detail = ConfirmationDetail(
+                            session_id=_session_id,
+                            tool_call_id=call_id,
+                            user_id=_user_id,
+                            tool_name=tool_name,
+                            tool_args=args,
+                            risk_level=assessment.final_level.name.lower(),
+                            arg_digest=assessment.arg_digest,
+                            primary_arg=assessment.primary_arg,
+                            dir_arg=assessment.dir_arg,
+                            matched_patterns=assessment.matched_patterns,
+                            deadline_ts=_time.time()
+                            + confirmation_event.timeout_seconds,
+                        )
+                        await confirmation_manager.store(_detail)
+
+                    _pending_outcome = Asked(
+                        content="等待用户确认工具执行",
+                        reason=DecisionReason(
+                            type="risk_enforce",
+                            code=assessment.final_level.name.lower(),
+                            message=assessment.risk_reason or "",
+                        ),
+                    )
+                    _pending_artifact = ToolArtifact(
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        tool_source=tool_source,
+                        outcome=_pending_outcome,
+                    )
+
+                    _update = {
+                        "messages": new_messages + new_deferred_human,
+                        "events": new_events,
+                        "attempt_count": state["attempt_count"] + 1,
+                        "failure_count": state["failure_count"] + new_failures,
+                        "completed_tool_call_prefix": (
+                            list(already_done) + new_completed_ids
+                        ),
+                        "pending_ask_outcome": _pending_outcome.model_dump(
+                            mode="json"
+                        ),
+                        "pending_ask_tool_call_id": call_id,
+                        "pending_ask_artifact": _pending_artifact.model_dump(
+                            mode="json", by_alias=True
+                        ),
+                        "pending_ask_tool_args": dict(args),
+                    }
+                    return Command(
+                        goto="interrupt_helper",
+                        update=_update,
+                    )
+
+                # assessment < MEDIUM → execute directly
+                outcome = await _invoke_wrapper(
+                    tool_fn,
+                    tc,
+                    tool_source,
+                    max_wrapper_output_bytes=_runtime_max_bytes,
                 )
-
-            if not tool_success:
-                new_failures += 1
-                multimodal_blocks = []
-
-            # R2 CS2 (CS2.14): no longer prefix '[TOOL_ERROR]' here — the
-            # LLM adapter (_messages_for_api in ActusChatModel /
-            # ActusResponsesModel, Task 33/34) injects the prefix on the
-            # serialization boundary based on ToolMessage.status + artifact.
-            # Commit 1 runs in the 4-day window between this removal and
-            # the adapter landing; R2 accepts the temporary no-prefix state
-            # (documented in plan §Rollout Commit 1).
-            content = result_str
-
-            # Phase 2: 首次调用 Tier 1 skill 时注入 guide
-            if tool_success and guide_injector:
-                guide = guide_injector(tool_name)
-                if guide:
-                    content = f"{content}\n\n---\n[Skill Guide]\n{guide}"
-
-            # Tier 1: 截断超长工具结果，保护 ReAct 循环期间上下文窗口
-            content = truncate_tool_content(content, tool_result_max_chars)
-            result_str = truncate_tool_content(result_str, tool_result_max_chars)
-
-            new_messages.append(ToolMessage(
-                content=content,
-                tool_call_id=call_id,
-                name=tool_name,
-                status="success" if tool_success else "error",
-            ))
-
-            # Collect deferred HumanMessage for file_view multimodal results
-            if multimodal_blocks:
-                blocks: list[dict] = list(multimodal_blocks[:_MAX_FILE_VIEW_IMAGES])
-                omitted = len(multimodal_blocks) - len(blocks)
-                # Must include a text block so _compact_messages() and
-                # _flatten_multimodal_content() can extract a meaningful summary
-                # instead of falling back to str(content) JSON garbage.
-                blocks.insert(0, {
-                    "type": "text",
-                    "text": f"[file_view: {tool_name} — {len(blocks)} image(s) loaded]",
-                })
-                if omitted > 0:
-                    blocks.append({"type": "text", "text": f"[... {omitted} more images omitted]"})
-                deferred_human_messages.append(HumanMessage(content=blocks))
-
-            # Emit ToolEvent(CALLED) with correct success status
-            new_events.append(
-                ToolEvent(
-                    tool_call_id=call_id,
-                    tool_name=resolve_tool_source(tool_name).category,
-                    function_name=tool_name,
-                    function_args=args,
-                    function_result=ToolResult(success=tool_success, message=result_str),
-                    status=ToolEventStatus.CALLED,
+                outcome = _maybe_convert_shell_outcome_with_images(
+                    outcome, tool_name
                 )
+                await _finalize_outcome(
+                    tc, args, tool_source, outcome, _tool_start
+                )
+                continue
+
+            # No risk metadata (or bypass via pre-approved) → execute directly
+            outcome = await _invoke_wrapper(
+                tool_fn,
+                tc,
+                tool_source,
+                max_wrapper_output_bytes=_runtime_max_bytes,
             )
-
-            # R2 CS2 (I-4.1): mark this tool_call_id as completed for the
-            # in-batch prefix. On the happy-path return the full prefix
-            # will be reset to [] so future batches start clean.
-            new_completed_ids.append(call_id)
+            outcome = _maybe_convert_shell_outcome_with_images(
+                outcome, tool_name
+            )
+            await _finalize_outcome(
+                tc, args, tool_source, outcome, _tool_start
+            )
 
         # Append deferred HumanMessages AFTER all ToolMessages.
         # Preserves AIMessage → ToolMessage* pairing for group_messages().
-        new_messages.extend(deferred_human_messages)
-        new_messages.extend(deferred_document_messages)
+        new_messages.extend(new_deferred_human)
 
         # R2 CS2 happy path: the whole batch completed without hitting an
         # Asked outcome. Reset prefix + pre-approved set + pending state

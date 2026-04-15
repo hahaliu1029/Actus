@@ -282,7 +282,12 @@ class TestInvokeWrapperCommit2:
     """Layer 2 (_invoke_wrapper) — Commit 2a reads ToolMessage.artifact."""
 
     def test_plain_string_return_is_rejected_as_wrong_shape(self):
+        """Misconfigured typed wrapper (declares ``content_and_artifact`` but
+        returns a bare string instead of a ToolMessage) must raise the
+        ``wrong_ainvoke_shape`` contract error. Setting ``response_format``
+        explicitly documents what path this test exercises."""
         tool = AsyncMock()
+        tool.response_format = "content_and_artifact"
         tool.ainvoke = AsyncMock(return_value="hello")
         tool.name = "fake"
         tc = _make_tool_call("c1", "fake", {"arg": 1})
@@ -294,8 +299,26 @@ class TestInvokeWrapperCommit2:
         assert outcome.reason.type == "exception"
         assert outcome.reason.code == "wrong_ainvoke_shape"
 
+    def test_legacy_wrapper_string_return_becomes_allow_success(self):
+        """Legacy ``@lc_tool`` without ``response_format`` returns a plain
+        value; the dispatcher wraps it as ``AllowSuccess`` so the real
+        file_view / shell / memory tools keep working under the dual-path
+        dispatcher."""
+        tool = AsyncMock()
+        tool.response_format = "content"
+        tool.ainvoke = AsyncMock(return_value="legacy ok")
+        tool.name = "legacy_fake"
+        tc = _make_tool_call("c_legacy", "legacy_fake", {"x": 1})
+        source = _make_mcp_source()
+
+        outcome = _run(_invoke_wrapper(tool, tc, source))
+
+        assert isinstance(outcome, AllowSuccess)
+        assert outcome.content == "legacy ok"
+
     def test_returns_allow_error_on_exception(self):
         tool = AsyncMock()
+        tool.response_format = "content_and_artifact"
         tool.ainvoke = AsyncMock(side_effect=RuntimeError("boom"))
         tool.name = "fake"
         tc = _make_tool_call("c2", "fake")

@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Callable, Dict, List, Optional, Type
 
@@ -25,6 +25,7 @@ from app.domain.models.app_config import (
     AgentConfig,
     MCPConfig,
     SkillRiskPolicy,
+    ToolRuntimeConfig,
 )
 from app.domain.models.context_overflow_config import ContextOverflowConfig
 from app.domain.models.event import (
@@ -73,6 +74,7 @@ class _ConfigSnapshot:
     supports_vision: bool
     supports_pdf_input: bool
     file_understanding_config: "FileUnderstandingConfig | None"
+    tool_runtime: ToolRuntimeConfig = field(default_factory=ToolRuntimeConfig)
 
 
 class AgentService:
@@ -243,6 +245,7 @@ class AgentService:
             approval_cache=approval_cache,
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,
+            tool_runtime=snap.tool_runtime,
         )
 
         # 6.创建任务Task并更新会话中的信息

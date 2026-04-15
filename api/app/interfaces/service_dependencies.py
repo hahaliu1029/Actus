@@ -338,6 +338,7 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
         supports_vision=app_config.llm_config.supports_vision,
         supports_pdf_input=effective_pdf_input,
         file_understanding_config=app_config.file_understanding,
+        tool_runtime=app_config.tool_runtime,
     )
 
 
