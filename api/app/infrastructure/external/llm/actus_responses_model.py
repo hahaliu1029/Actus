@@ -253,10 +253,29 @@ class ActusResponsesModel(BaseChatModel):
                     ]
                 result.append(entry)
             elif isinstance(msg, ToolMessage):
+                content = msg.content or ""
+                # R2 CS2.14: inject error prefix from artifact when
+                # status == "error". Mirrors ActusChatModel Task 33 exactly
+                # — see that module for the full rationale (generic
+                # "[TOOL_ERROR]" fallback on missing artifact, conditional
+                # separator to avoid trailing space, ``isinstance(str)``
+                # guard for list content).
+                if getattr(msg, "status", None) == "error" and isinstance(
+                    content, str
+                ):
+                    from app.infrastructure.external.llm._error_prefix import (
+                        _format_error_prefix,
+                    )
+
+                    prefix = (
+                        _format_error_prefix(getattr(msg, "artifact", None))
+                        or "[TOOL_ERROR]"
+                    )
+                    content = f"{prefix} {content}" if content else prefix
                 result.append({
                     "role": "tool",
                     "tool_call_id": msg.tool_call_id,
-                    "content": msg.content or "",
+                    "content": content,
                 })
             else:
                 result.append({"role": "user", "content": str(msg.content)})

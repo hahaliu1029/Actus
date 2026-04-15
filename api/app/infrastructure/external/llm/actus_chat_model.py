@@ -198,10 +198,47 @@ class ActusChatModel(BaseChatModel):
                     ]
                 result.append(entry)
             elif isinstance(msg, ToolMessage):
+                content = msg.content or ""
+                # R2 CS2.14: inject error prefix from artifact when
+                # status == "error". The OpenAI tool-message schema has no
+                # status field, so the R2 success/error signal would be
+                # invisible to the LLM without this encoding step. See
+                # ``_error_prefix.py`` for the full rationale. Import is
+                # local (function body) to keep this module's import
+                # graph flat and avoid any domain/infrastructure circular
+                # risk if _error_prefix grows.
+                #
+                # Fallback: if status=="error" but artifact is missing /
+                # malformed, fall back to the legacy generic "[TOOL_ERROR]"
+                # marker so the LLM still sees _some_ error signal (matches
+                # R1 behavior). Silently dropping the prefix would let a
+                # producer bug in Layer 3 leak error outcomes to the model
+                # as plain success content.
+                #
+                # List ``content`` (multimodal blocks) is only produced by
+                # Passthrough (status=="success"), so the error branch
+                # won't hit it in practice. Keep the ``isinstance(str)``
+                # guard defensive — stringifying a block list would both
+                # break the multimodal wire format and drop the prefix.
+                if getattr(msg, "status", None) == "error" and isinstance(
+                    content, str
+                ):
+                    from app.infrastructure.external.llm._error_prefix import (
+                        _format_error_prefix,
+                    )
+
+                    prefix = (
+                        _format_error_prefix(getattr(msg, "artifact", None))
+                        or "[TOOL_ERROR]"
+                    )
+                    # Conditional separator avoids a trailing space when
+                    # ``content`` is empty: prefer "[TOOL_FAILED: x]" over
+                    # "[TOOL_FAILED: x] ".
+                    content = f"{prefix} {content}" if content else prefix
                 result.append({
                     "role": "tool",
                     "tool_call_id": msg.tool_call_id,
-                    "content": msg.content or "",
+                    "content": content,
                 })
             else:
                 # Fallback for unknown message types
