@@ -17,6 +17,9 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
 
 from app.domain.services.tools.mcp import MCPTool
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,4 +241,6 @@ def create_mcp_langchain_tools(
             )
             continue
 
+    for tool in tools:
+        annotate_and_register_tool_source(tool, source="mcp", category="mcp")
     return tools

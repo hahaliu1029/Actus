@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING, Any, Optional
 from langchain_core.tools import StructuredTool, ToolException
 from pydantic import Field, create_model
 
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
+
 if TYPE_CHECKING:
     from app.domain.services.tools.skill import SkillTool
 
@@ -118,5 +122,8 @@ def create_dynamic_skill_langchain_tools(
                 schema,
                 exc_info=True,
             )
+
+    for tool in tools:
+        annotate_and_register_tool_source(tool, source="skill", category="skill")
 
     return tools

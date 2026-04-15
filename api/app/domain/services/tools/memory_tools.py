@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field
 
 from app.domain.external.embedding_provider import EmbeddingUnavailableError
 from app.domain.services.memory_ranker import rank_memory_results
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -88,4 +91,7 @@ def create_memory_tools(
     memory_search.handle_tool_error = True
     memory_get.handle_tool_error = True
 
-    return [memory_search, memory_get]
+    tools = [memory_search, memory_get]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="memory")
+    return tools

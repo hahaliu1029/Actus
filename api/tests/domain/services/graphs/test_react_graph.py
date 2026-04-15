@@ -109,11 +109,18 @@ class TestBuildReactGraph:
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
         from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import (
+            annotate_and_register_tool_source,
+        )
 
         @lc_tool
         async def failing_tool(query: str) -> str:
             """A tool that always fails."""
             raise RuntimeError("connection refused")
+
+        annotate_and_register_tool_source(
+            failing_tool, source="native", category="search"
+        )
 
         call_count = 0
 
@@ -223,6 +230,9 @@ class TestToolNodeTruncation:
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
         from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import (
+            annotate_and_register_tool_source,
+        )
 
         large_output = "X" * 500
 
@@ -230,6 +240,10 @@ class TestToolNodeTruncation:
         async def big_tool(query: str) -> str:
             """Returns large output."""
             return large_output
+
+        annotate_and_register_tool_source(
+            big_tool, source="native", category="search"
+        )
 
         call_count = 0
 
@@ -272,11 +286,18 @@ class TestToolNodeTruncation:
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
         from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import (
+            annotate_and_register_tool_source,
+        )
 
         @lc_tool
         async def big_tool(query: str) -> str:
             """Returns large output."""
             return "Y" * 500
+
+        annotate_and_register_tool_source(
+            big_tool, source="native", category="search"
+        )
 
         call_count = 0
 
@@ -323,11 +344,18 @@ class TestToolNodeTruncation:
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
         from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import (
+            annotate_and_register_tool_source,
+        )
 
         @lc_tool
         async def medium_tool(query: str) -> str:
             """Returns medium output."""
             return "Z" * 200
+
+        annotate_and_register_tool_source(
+            medium_tool, source="native", category="search"
+        )
 
         call_count = 0
 

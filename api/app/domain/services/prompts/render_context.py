@@ -13,20 +13,10 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from app.domain.services.prompts.section import RenderContext
-
-_MEMORY_TOOL_NAMES = frozenset({"memory_search", "memory_get"})
-_A2A_TOOL_NAMES = frozenset({"get_remote_agent_cards", "call_remote_agent"})
-
-_NATIVE_TOOL_PREFIX_TO_CATEGORY = {
-    "shell_": "shell",
-    "file_": "file",
-    "browser_": "browser",
-    "message_": "message",
-    "memory_": "memory",
-    "search_": "search",
-    "mcp_": "mcp",
-    "skill_": "skill",
-}
+from app.domain.services.tools.tool_source_resolver import (
+    ToolSourceUnknownError,
+    resolve_tool_source,
+)
 
 
 def _infer_provider(llm: Any) -> Literal["openai", "anthropic"]:
@@ -43,20 +33,38 @@ def _infer_provider(llm: Any) -> Literal["openai", "anthropic"]:
 
 
 def _categorize_tools(bound_tool_names: frozenset[str]) -> frozenset[str]:
-    """Group bound tool names into category buckets for ``ctx.tool_categories``.
+    """Return the set of categories represented in ``bound_tool_names``.
+
+    Uses ``tool_source_resolver`` as the single source of truth. Any name
+    that cannot be resolved (truly unknown) is silently skipped — the
+    categorize function should not crash render_context on a rogue name.
 
     Returns ``frozenset`` to keep ``RenderContext`` immutable.
     """
     categories: set[str] = set()
     for name in bound_tool_names:
-        if name in _A2A_TOOL_NAMES:
-            categories.add("a2a")
+        try:
+            categories.add(resolve_tool_source(name).category)
+        except ToolSourceUnknownError:
             continue
-        for prefix, category in _NATIVE_TOOL_PREFIX_TO_CATEGORY.items():
-            if name.startswith(prefix):
-                categories.add(category)
-                break
     return frozenset(categories)
+
+
+def _has_category(bound_tool_names: frozenset[str], target: str) -> bool:
+    """Return True iff any bound tool resolves to ``target`` category.
+
+    Uses ``category ==`` (not ``source ==``) so discovery-only steps
+    (only ``list_mcp_tools`` / ``get_mcp_tool`` bound) are correctly
+    classified as ``category == "mcp discovery"`` — NOT ``category == "mcp"``
+    — and therefore do NOT flip ``mcp_active`` to True.
+    """
+    for name in bound_tool_names:
+        try:
+            if resolve_tool_source(name).category == target:
+                return True
+        except ToolSourceUnknownError:
+            continue
+    return False
 
 
 def _format_attachments_for_context(state: dict) -> str | None:
@@ -131,10 +139,10 @@ def build_render_context(
         bound_tool_names=bound_tool_names,
         conversation_summaries=summaries,
         has_file_view="file_view" in bound_tool_names,
-        has_memory_tools=bool(_MEMORY_TOOL_NAMES & bound_tool_names),
+        has_memory_tools=_has_category(bound_tool_names, "memory"),
         has_vision=getattr(agent_config, "supports_vision", True),
         has_pdf=getattr(agent_config, "supports_pdf_input", True),
         tool_categories=_categorize_tools(bound_tool_names),
-        mcp_active=any(n.startswith("mcp_") for n in bound_tool_names),
-        a2a_active=bool(_A2A_TOOL_NAMES & bound_tool_names),
+        mcp_active=_has_category(bound_tool_names, "mcp"),
+        a2a_active=_has_category(bound_tool_names, "a2a"),
     )

@@ -34,6 +34,7 @@ from app.domain.models.event import (
 from app.domain.models.tool_result import ToolResult
 from app.domain.services.json_envelope import unwrap_message_envelope
 from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
+from app.domain.services.tools.tool_source_resolver import resolve_tool_source
 
 from .message_utils import truncate_tool_content
 from .state import ReactGraphState
@@ -132,33 +133,6 @@ def _extract_shell_images(result_str: str) -> tuple[str, list[dict]]:
     return "".join(cleaned_parts), image_blocks
 
 
-# Tool name → category mapping (mirrors agent_task_runner._classify_tool_name)
-_TOOL_CATEGORY_PREFIXES = {
-    "browser_": "browser",
-    "shell_": "shell",
-    "file_": "file",
-    "search_": "search",
-    "message_": "message",
-}
-_KNOWN_CATEGORIES = frozenset(
-    {"browser", "shell", "file", "search", "message", "mcp", "a2a", "skill"}
-)
-
-
-def _classify_tool_name(tool_name: str) -> str:
-    """Extract tool category from LangChain tool name.
-
-    e.g., "browser_navigate" → "browser", "shell_execute" → "shell".
-    Keeps names like "mcp", "browser" as-is if already a category.
-    """
-    if tool_name in _KNOWN_CATEGORIES:
-        return tool_name
-    for prefix, category in _TOOL_CATEGORY_PREFIXES.items():
-        if tool_name.startswith(prefix):
-            return category
-    return tool_name
-
-
 def build_react_graph(
     llm: BaseChatModel,
     tools: list[BaseTool],
@@ -237,7 +211,7 @@ def build_react_graph(
                 new_events.append(
                     ToolEvent(
                         tool_call_id=tc["id"],
-                        tool_name=_classify_tool_name(func_name),
+                        tool_name=resolve_tool_source(func_name).category,
                         function_name=func_name,
                         function_args=tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"]),
                         status=ToolEventStatus.CALLING,
@@ -385,7 +359,7 @@ def build_react_graph(
                     tool_success = False
                     new_messages.append(ToolMessage(content=f"[TOOL_ERROR] {result_str}", tool_call_id=call_id, name=tool_name))
                     new_events.append(ToolEvent(
-                        tool_call_id=call_id, tool_name=_classify_tool_name(tool_name),
+                        tool_call_id=call_id, tool_name=resolve_tool_source(tool_name).category,
                         function_name=tool_name, function_args=args,
                         function_result=ToolResult(success=False, message=result_str),
                         status=ToolEventStatus.CALLED,
@@ -600,7 +574,7 @@ def build_react_graph(
             new_events.append(
                 ToolEvent(
                     tool_call_id=call_id,
-                    tool_name=_classify_tool_name(tool_name),
+                    tool_name=resolve_tool_source(tool_name).category,
                     function_name=tool_name,
                     function_args=args,
                     function_result=ToolResult(success=tool_success, message=result_str),

@@ -13,6 +13,10 @@ from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool
 
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,22 +105,25 @@ def create_mcp_discovery_tools(
             "Use `list_mcp_tools()` to see available tools."
         )
 
-    return [
-        StructuredTool.from_function(
-            coroutine=_list_mcp_tools,
-            name="list_mcp_tools",
-            description=(
-                "列出可用的 MCP 工具。不传参数返回所有服务器工具概览；"
-                "传入服务器名前缀返回该服务器的工具详情。"
-            ),
+    list_mcp_tools = StructuredTool.from_function(
+        coroutine=_list_mcp_tools,
+        name="list_mcp_tools",
+        description=(
+            "列出可用的 MCP 工具。不传参数返回所有服务器工具概览；"
+            "传入服务器名前缀返回该服务器的工具详情。"
         ),
-        StructuredTool.from_function(
-            coroutine=_get_mcp_tool,
-            name="get_mcp_tool",
-            description=(
-                "获取指定 MCP 工具的完整参数定义并激活。"
-                "激活后该工具将在下一个 plan step 中可直接调用。"
-                "传入工具全名（如 'mcp_amap-maps_maps_weather'）。"
-            ),
+    )
+    get_mcp_tool = StructuredTool.from_function(
+        coroutine=_get_mcp_tool,
+        name="get_mcp_tool",
+        description=(
+            "获取指定 MCP 工具的完整参数定义并激活。"
+            "激活后该工具将在下一个 plan step 中可直接调用。"
+            "传入工具全名（如 'mcp_amap-maps_maps_weather'）。"
         ),
-    ]
+    )
+
+    tools = [list_mcp_tools, get_mcp_tool]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="mcp", category="mcp discovery")
+    return tools

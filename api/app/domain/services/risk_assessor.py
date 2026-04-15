@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from app.domain.services.tools.tool_source_resolver import (
+    ToolSourceUnknownError,
+    resolve_tool_source,
+)
+
 
 class RiskLevel(IntEnum):
     """Ordered risk levels for tool operations.
@@ -309,7 +314,20 @@ class RiskAssessor:
             A frozen RiskAssessment capturing all risk-related metadata.
         """
         # --- Static level --------------------------------------------------
-        if tool_name.startswith("mcp__"):
+        # R1 CS1: use resolve_tool_source(...).category == "mcp" instead of
+        # the historical tool_name.startswith("mcp__") check (double underscore
+        # never matched Actus' single-underscore mcp_{server}_{tool} naming).
+        # Use category (NOT source) so identity-only discovery meta-tools
+        # (list_mcp_tools / get_mcp_tool, category="mcp discovery") stay at
+        # NONE risk instead of escalating to MEDIUM.
+        try:
+            is_mcp_wrapper = resolve_tool_source(tool_name).category == "mcp"
+        except ToolSourceUnknownError:
+            # Defensive: assess() runs on every tool invocation. If a rogue
+            # caller passes an unknown name, fall through to _STATIC_RISK
+            # instead of crashing the step.
+            is_mcp_wrapper = False
+        if is_mcp_wrapper:
             static_level = RiskLevel.MEDIUM
         else:
             static_level = _STATIC_RISK.get(tool_name, RiskLevel.NONE)

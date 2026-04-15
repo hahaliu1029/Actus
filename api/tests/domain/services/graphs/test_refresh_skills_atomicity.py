@@ -32,6 +32,21 @@ from app.domain.services.graphs.step_metadata import (
     RefreshedSkillsResult,
     StepMetadata,
 )
+from app.domain.services.tools.tool_source_resolver import resolve_tool_source
+
+
+def _fake_tool(name: str) -> SimpleNamespace:
+    """Build a stub tool with _actus_source metadata populated.
+
+    R1.16: ``agent_task_runner._build_step_react_graph`` now filters
+    ``lc_tools`` via ``resolve_tool_source_from_tool(t).category == 'skill'``.
+    Real production tools always carry this metadata (set by factory calls to
+    ``annotate_and_register_tool_source``), so test stubs must mirror it.
+    """
+    return SimpleNamespace(
+        name=name,
+        metadata={"_actus_source": resolve_tool_source(name)},
+    )
 
 
 pytestmark = pytest.mark.anyio
@@ -192,8 +207,8 @@ def _make_runner(monkeypatch: pytest.MonkeyPatch) -> AgentTaskRunner:
         runner,
         "_build_lc_tools_for_step",
         lambda: [
-            SimpleNamespace(name="shell_execute"),
-            SimpleNamespace(name="file_read"),
+            _fake_tool("shell_execute"),
+            _fake_tool("file_read"),
         ],
     )
     # Stub build_react_graph so we don't need real LLM/tools plumbing
@@ -577,9 +592,21 @@ async def test_mcp_activation_survives_refresh_failure(
     """
     runner = _make_runner(monkeypatch)
 
+    from app.domain.services.tools.tool_source_resolver import ToolSource
+
     class _FakeLCTool:
-        def __init__(self, name: str) -> None:
+        def __init__(self, name: str, *, source: str, category: str) -> None:
             self.name = name
+            # R1.16: _build_step_react_graph filters by canonical category via
+            # resolve_tool_source_from_tool → tool.metadata["_actus_source"].
+            # Since these stub names are deliberately non-canonical (to isolate
+            # the MCP activation behavior change under test), we bake the
+            # ToolSource directly rather than going through the registry.
+            self.metadata = {
+                "_actus_source": ToolSource(
+                    source=source, category=category, canonical_name=name,
+                ),
+            }
 
     # Override the default _build_lc_tools_for_step stub so that it actually
     # reflects _activated_mcp_tools (instead of the fixture's fixed native
@@ -587,11 +614,11 @@ async def test_mcp_activation_survives_refresh_failure(
     # behavior change.
     def dynamic_build_lc_tools_for_step() -> list[Any]:
         tools: list[Any] = [
-            _FakeLCTool("native_shell"),
-            _FakeLCTool("native_file_read"),
+            _FakeLCTool("native_shell", source="native", category="shell"),
+            _FakeLCTool("native_file_read", source="native", category="file"),
         ]
         for mcp_name in sorted(runner._activated_mcp_tools):
-            tools.append(_FakeLCTool(mcp_name))
+            tools.append(_FakeLCTool(mcp_name, source="mcp", category="mcp"))
         return tools
 
     monkeypatch.setattr(
@@ -783,8 +810,8 @@ async def test_phase3_failure_rollback_restores_skill_tool_internal_state(
         frozenset(),
     )
     runner._lc_tools_cache[cache_key_step1] = [
-        SimpleNamespace(name="shell_execute"),
-        SimpleNamespace(name="file_read"),
+        _fake_tool("shell_execute"),
+        _fake_tool("file_read"),
     ]
 
     # Sanity pre-check: SkillTool internally loaded skill_1

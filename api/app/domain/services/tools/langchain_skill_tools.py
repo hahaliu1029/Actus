@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 from langchain_core.tools import StructuredTool, tool as lc_tool
 
 from app.domain.services.tools.base import BaseTool
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
 
 if TYPE_CHECKING:
     from app.domain.models.skill import Skill
@@ -82,6 +85,8 @@ def create_skill_langchain_tools(
         tools.append(generate_skill)
         tools.append(install_skill)
 
+    for t in tools:
+        annotate_and_register_tool_source(t, source="skill", category="skill creator")
     return tools
 
 
@@ -188,7 +193,7 @@ def create_skill_guide_tool(
         available_str = ", ".join(available) if available else "(none)"
         return f"Skill '{skill_slug}' not found. Available skills: {available_str}"
 
-    return StructuredTool.from_function(
+    get_skill_guide = StructuredTool.from_function(
         coroutine=_get_skill_guide,
         name="get_skill_guide",
         description=(
@@ -197,3 +202,5 @@ def create_skill_guide_tool(
             "传入 skill 的 slug（括号中的标识符，如 'xlsx'、'frontend-design'）。"
         ),
     )
+    annotate_and_register_tool_source(get_skill_guide, source="skill", category="skill guide")
+    return get_skill_guide

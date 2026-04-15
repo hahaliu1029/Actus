@@ -82,6 +82,9 @@ from app.domain.services.tools.create_skill import CreateSkillTool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
 from app.domain.services.tools.skill_bundle_sync import SkillBundleSyncManager
+from app.domain.services.tools.tool_source_resolver import (
+    resolve_tool_source_from_tool,
+)
 from app.infrastructure.repositories.db_user_tool_preference_repository import (
     DBUserToolPreferenceRepository,
 )
@@ -1779,8 +1782,14 @@ class AgentTaskRunner(TaskRunner):
             # it too.
             stable_bound_tool_names = fresh_bound_tool_names
 
+            # R1: filter by canonical category — excludes "skill creator" /
+            # "skill guide" subcategories, matching pre-R1 behavior where the
+            # "skill_" prefix check only caught skill_{slug}_{tool} dynamic
+            # wrappers and not brainstorm_skill / generate_skill / install_skill
+            # / get_skill_guide (their names do not start with "skill_").
             dynamic_tool_names = [
-                t.name for t in lc_tools if t.name.startswith("skill_")
+                t.name for t in lc_tools
+                if resolve_tool_source_from_tool(t).category == "skill"
             ]
             logger.info(
                 "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
@@ -2059,39 +2068,14 @@ class AgentTaskRunner(TaskRunner):
         """基于用户偏好过滤 Skill 列表。"""
         return [skill for skill in skills if preference_map.get(skill.id, True)]
 
-    def _classify_tool_name(self, tool_name: str) -> str:
-        """将工具名映射为类别（browser/shell/file/search/mcp/a2a/skill）。
-
-        兼容旧名称（browser/shell/file/search）和新 LangChain 名称（browser_view/shell_execute 等）。
-        """
-        _TOOL_CATEGORY_PREFIXES = {
-            "browser_": "browser",
-            "shell_": "shell",
-            "file_": "file",
-            "search_": "search",
-        }
-        for prefix, category in _TOOL_CATEGORY_PREFIXES.items():
-            if tool_name.startswith(prefix):
-                return category
-        # 保留旧名称兼容（非 LangChain 路径）
-        if tool_name in ("browser", "shell", "file", "search", "mcp", "a2a", "skill"):
-            return tool_name
-        # Skill creation 工具
-        if tool_name in ("generate_skill", "install_skill", "brainstorm_skill"):
-            return "skill_creation"
-        # 检查 MCP 工具
-        if self._mcp_tool:
-            mcp_names = {s.get("function", {}).get("name", "") for s in self._mcp_tool.get_tools()}
-            if tool_name in mcp_names:
-                return "mcp"
-        return "unknown"
-
     async def _handle_tool_event(self, event: ToolEvent) -> None:
         """额外处理工具消息，使其前端交互更友好"""
         try:
             # 1.如果事件状态为已调用则执行以下代码
             if event.status == ToolEventStatus.CALLED:
-                category = self._classify_tool_name(event.tool_name)
+                # R1: react_graph 已将 ToolEvent.tool_name 写为 canonical category
+                # （见 graphs/react_graph.py 中对 resolve_tool_source(...).category 的调用），此处直接消费。
+                category = event.tool_name
                 logger.debug("处理工具事件: tool_name=%s, function=%s, category=%s", event.tool_name, event.function_name, category)
                 # 2.工具为浏览器则补全工具浏览器工具内容
                 if category == "browser":
@@ -2248,7 +2232,7 @@ class AgentTaskRunner(TaskRunner):
                     )
                     if skill_exec_dir:
                         await self._sync_generated_files(skill_exec_dir)
-                elif category == "skill_creation":
+                elif category == "skill creator":
                     if event.function_result and event.function_result.data is not None:
                         event.tool_content = SkillToolContent(
                             skill_result=event.function_result.data

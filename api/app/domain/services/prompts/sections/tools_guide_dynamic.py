@@ -21,37 +21,11 @@ from app.domain.services.prompts.section import (
     Section,
     SectionOutput,
 )
-
-
-# Map tool name prefix → category label shown in the summary.
-# Order matters: keys are checked in declaration order, first match wins.
-#
-# Naming invariant (enforced by convention, not code):
-# - Native sandbox tools use clean prefixes: shell_*, file_*, browser_*,
-#   message_*, search_*, memory_*.
-# - MCP tools are ALWAYS `mcp_*` (registry layer prefixes them).
-# - Skill tools are ALWAYS `skill_*` (dynamic skill tool factory prefixes them).
-# - A2A and skill-creator tools have bespoke names and live in the standalone
-#   frozensets above.
-# If a future MCP tool is registered with a non-`mcp_` prefix (e.g. `search_brave`),
-# it will be mis-categorized here. New tool namespaces must either follow the
-# prefix convention or be added to a bespoke frozenset.
-_PREFIX_TO_CATEGORY = (
-    ("shell_", "shell"),
-    ("file_", "file"),
-    ("browser_", "browser"),
-    ("message_", "message"),
-    ("search_", "search"),
-    ("memory_", "memory"),
-    ("mcp_", "mcp"),
-    ("skill_", "skill"),
+from app.domain.services.tools.tool_source_resolver import (
+    ToolSourceUnknownError,
+    resolve_tool_source,
 )
 
-# Standalone tools that don't follow a clean prefix convention.
-_A2A_TOOLS = frozenset({"get_remote_agent_cards", "call_remote_agent"})
-_SKILL_CREATOR_TOOLS = frozenset({"brainstorm_skill", "generate_skill", "install_skill"})
-_MCP_DISCOVERY_TOOLS = frozenset({"list_mcp_tools", "get_mcp_tool"})
-_SKILL_GUIDE_TOOLS = frozenset({"get_skill_guide"})
 
 # Display order for category groups (categories not in this list are appended at the end)
 _DISPLAY_ORDER: tuple[str, ...] = (
@@ -70,29 +44,26 @@ _DISPLAY_ORDER: tuple[str, ...] = (
 )
 
 
-def _categorize(tool_name: str) -> str:
-    """Return the category label for a tool name."""
-    if tool_name in _A2A_TOOLS:
-        return "a2a"
-    if tool_name in _SKILL_CREATOR_TOOLS:
-        return "skill creator"
-    if tool_name in _SKILL_GUIDE_TOOLS:
-        return "skill guide"
-    if tool_name in _MCP_DISCOVERY_TOOLS:
-        return "mcp discovery"
-    for prefix, category in _PREFIX_TO_CATEGORY:
-        if tool_name.startswith(prefix):
-            return category
-    return "other"
+def _categorize(tool_name: str) -> str | None:
+    """Return the category label for a tool name via the ToolSource resolver."""
+    try:
+        return resolve_tool_source(tool_name).category
+    except ToolSourceUnknownError:
+        return None
 
 
 def _group_tools_by_category(
     bound_tool_names: frozenset[str],
 ) -> dict[str, list[str]]:
-    """Group bound tool names into category buckets, sorted within each group."""
+    """Group bound tool names into category buckets, sorted within each group.
+
+    Tools whose name cannot be resolved by the ToolSource resolver (i.e.
+    ``_categorize`` returns ``None``) are bucketed under ``"other"`` so the
+    summary surfaces them instead of silently swallowing them.
+    """
     groups: dict[str, list[str]] = {}
     for name in sorted(bound_tool_names):
-        category = _categorize(name)
+        category = _categorize(name) or "other"
         groups.setdefault(category, []).append(name)
     return groups
 

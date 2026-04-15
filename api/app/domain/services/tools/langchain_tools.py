@@ -18,6 +18,9 @@ from app.domain.external.browser import Browser
 from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
 
 
 def _unwrap(result: object) -> str:
@@ -81,7 +84,10 @@ def _make_message_tools() -> list[StructuredTool]:
         # This is the fallback return value.
         return "WAITING_FOR_USER"
 
-    return [message_notify_user, message_ask_user]
+    tools = [message_notify_user, message_ask_user]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="message")
+    return tools
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +154,10 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
         result = await sandbox.list_files(dir_path)
         return _unwrap(result)
 
-    return [file_read, file_write, file_str_replace, file_find_in_content, file_find_by_name, file_list]
+    tools = [file_read, file_write, file_str_replace, file_find_in_content, file_find_by_name, file_list]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="file")
+    return tools
 
 
 # --------------------------------------------------------------------------- #
@@ -276,7 +285,10 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
         result = await sandbox.kill_process(session_id=session_id)
         return _unwrap(result)
 
-    return [shell_execute, shell_read_output, shell_wait_process, shell_write_input, shell_kill_process]
+    tools = [shell_execute, shell_read_output, shell_wait_process, shell_write_input, shell_kill_process]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="shell")
+    return tools
 
 
 # --------------------------------------------------------------------------- #
@@ -371,12 +383,15 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         result = await browser.restart(url=url)
         return _unwrap(result)
 
-    return [
+    tools = [
         browser_view, browser_navigate, browser_click, browser_input,
         browser_move_mouse, browser_press_key, browser_select_option,
         browser_scroll_up, browser_scroll_down, browser_console_exec,
         browser_console_view, browser_restart,
     ]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="browser")
+    return tools
 
 
 # --------------------------------------------------------------------------- #
@@ -393,7 +408,10 @@ def _make_search_tools(search_engine: SearchEngine) -> list[StructuredTool]:
         result = await search_engine.invoke(query, date_range=date_range)
         return _unwrap(result)
 
-    return [search_web]
+    tools = [search_web]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="search")
+    return tools
 
 
 # --------------------------------------------------------------------------- #
@@ -474,7 +492,10 @@ def _make_file_view_tools(
             supports_pdf_input=supports_pdf_input,
         )
 
-    return [file_view]
+    tools = [file_view]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="native", category="file")
+    return tools
 
 
 # --------------------------------------------------------------------------- #

@@ -11,6 +11,9 @@ import json
 from langchain_core.tools import StructuredTool, tool as lc_tool
 
 from app.domain.services.tools.a2a import A2ATool
+from app.domain.services.tools.tool_source_resolver import (
+    annotate_and_register_tool_source,
+)
 
 
 def create_a2a_langchain_tools(a2a_tool: A2ATool) -> list[StructuredTool]:
@@ -45,4 +48,7 @@ def create_a2a_langchain_tools(a2a_tool: A2ATool) -> list[StructuredTool]:
             return result.message
         return str(result)
 
-    return [get_remote_agent_cards, call_remote_agent]
+    tools = [get_remote_agent_cards, call_remote_agent]
+    for t in tools:
+        annotate_and_register_tool_source(t, source="a2a", category="a2a")
+    return tools

@@ -161,5 +161,26 @@ class TestRiskAssessor:
         assert result1.arg_digest == result2.arg_digest
 
     def test_mcp_tool_defaults_to_medium(self) -> None:
-        result = self.assessor.assess("mcp__server__tool", {"arg": "value"})
+        """R1 CS1: MCP wrapper tools (category == 'mcp') reach MEDIUM.
+
+        Pre-R1 this test asserted against the broken `startswith('mcp__')`
+        (double underscore) check, which never matched Actus' actual
+        `mcp_{server}_{tool}` single-underscore naming. Updated to register
+        a realistic single-underscore wrapper via the factory helper so the
+        assertion is meaningful under R1 resolve_tool_source() semantics.
+        """
+        from app.domain.services.tools.tool_source_resolver import (
+            annotate_and_register_tool_source,
+        )
+        from langchain_core.tools import StructuredTool
+
+        async def _noop(**kwargs):
+            return ""
+
+        tool = StructuredTool.from_function(
+            coroutine=_noop, name="mcp_server_tool", description="fx",
+        )
+        annotate_and_register_tool_source(tool, source="mcp", category="mcp")
+
+        result = self.assessor.assess("mcp_server_tool", {"arg": "value"})
         assert result.static_level == RiskLevel.MEDIUM
