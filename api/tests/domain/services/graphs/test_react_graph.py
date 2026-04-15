@@ -228,6 +228,99 @@ class TestBuildReactGraph:
         tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
         assert any(m.status == "error" for m in tool_msgs)
 
+    async def test_unknown_tool_sentinel_category_not_shell(self):
+        """LLM-hallucinated tool name must NOT be enriched as a shell tool.
+
+        The dispatcher falls through to a sentinel ``ToolSource`` when
+        ``resolve_tool_source()`` raises ``ToolSourceUnknownError``. If that
+        sentinel used ``category="shell"`` (the historical fallback bucket),
+        ``AgentTaskRunner._handle_tool_event`` would match the ``shell``
+        branch at ``agent_task_runner.py:2108`` and call
+        ``read_shell_output(session_id="default")`` on the sandbox — leaking
+        the default shell session's console as the tool result for a
+        hallucinated tool name. ``category`` on the sentinel must be an
+        unenriched value (``"unknown"``) so ``tool_content`` stays ``None``
+        and the raw ``Error: Unknown tool 'xxx'`` message surfaces instead.
+        """
+        from langchain_core.messages import AIMessage
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        @lc_tool
+        async def real_tool(x: str) -> str:
+            """Placeholder real tool."""
+            return "ok"
+
+        call_count = 0
+
+        async def mock_ainvoke(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "c_ghost",
+                            "name": "hallucinated_tool",
+                            "args": {"foo": "bar"},
+                        }
+                    ],
+                )
+            return AIMessage(
+                content='{"success": true, "result": "done", "attachments": []}'
+            )
+
+        adapter = AsyncMock()
+        adapter.ainvoke = mock_ainvoke
+        adapter.bind_tools = MagicMock(return_value=adapter)
+
+        graph = build_react_graph(adapter, [real_tool])
+        result = await graph.ainvoke(
+            {
+                "messages": [{"role": "user", "content": "use the ghost tool"}],
+                "step_description": "ghost",
+                "original_request": "ghost",
+                "language": "en",
+                "attachments": [],
+                "image_content_blocks": [],
+                "events": [],
+                "should_interrupt": False,
+                "soft_hint_sent": False,
+                "attempt_count": 0,
+                "failure_count": 0,
+            }
+        )
+
+        unknown_events = [
+            e
+            for e in result["events"]
+            if isinstance(e, ToolEvent)
+            and e.function_name == "hallucinated_tool"
+            and e.function_result is not None
+        ]
+        assert unknown_events, "Expected a ToolEvent for the unknown tool call"
+        evt = unknown_events[0]
+        # The R1 convention writes tool_source.category into
+        # ToolEvent.tool_name; this must NOT be one of the handled
+        # enrichment categories in AgentTaskRunner._handle_tool_event.
+        assert evt.tool_name not in {
+            "shell",
+            "browser",
+            "file",
+            "search",
+            "mcp",
+            "a2a",
+            "skill",
+            "skill creator",
+        }, (
+            f"Unknown-tool sentinel category {evt.tool_name!r} collides with "
+            f"an AgentTaskRunner enrichment branch — will leak wrong content"
+        )
+        assert evt.tool_name == "unknown"
+        assert evt.function_result.success is False
+        assert "Unknown tool" in evt.function_result.message
+
 
 class TestToolNodeTruncation:
     """Verify Tier 1 truncation: tool results > tool_result_max_chars are truncated."""

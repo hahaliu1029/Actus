@@ -51,12 +51,30 @@ class TestToolSourceModel:
                 }
             )
 
-    def test_known_categories_has_12_values(self):
-        assert len(KNOWN_CATEGORIES) == 12
+    def test_known_categories_has_13_values(self):
+        """12 canonical categories + 1 ``unknown`` sentinel (R2 CS2)."""
+        assert len(KNOWN_CATEGORIES) == 13
         # Spot-check canonical values from spec
         assert "shell" in KNOWN_CATEGORIES
         assert "skill creator" in KNOWN_CATEGORIES  # with space
         assert "mcp discovery" in KNOWN_CATEGORIES
+        # R2 CS2: "unknown" is a sentinel category downstream emitters
+        # construct for LLM-hallucinated tool names. The resolver itself
+        # still NEVER returns it — see ToolSourceUnknownError docstring.
+        assert "unknown" in KNOWN_CATEGORIES
+
+    def test_unknown_category_does_not_warn(self, caplog):
+        """Constructing ``ToolSource(category='unknown', ...)`` is a
+        legitimate sentinel path (see ``react_graph`` unknown-tool
+        branch). It must not emit an ``Unknown category`` warning each
+        time an LLM hallucinates a tool name."""
+        with caplog.at_level("WARNING"):
+            ToolSource(
+                source="native",
+                category="unknown",
+                canonical_name="hallucinated_ghost",
+            )
+        assert "Unknown category" not in caplog.text
 
 
 class TestToolSourceUnknownError:
@@ -85,6 +103,16 @@ class TestBootstrap:
         for name, (source, category) in _CANONICAL_TOOL_IDENTITIES.items():
             assert category in KNOWN_CATEGORIES, (
                 f"bootstrap name {name!r} category {category!r} not in KNOWN_CATEGORIES"
+            )
+
+    def test_canonical_identities_never_use_unknown_sentinel(self):
+        """R2 CS2: ``unknown`` is a downstream-emitter-only sentinel. No
+        real tool is ever classified as ``unknown`` — if the bootstrap
+        ever seeds one, that's a contract bug."""
+        for name, (_, category) in _CANONICAL_TOOL_IDENTITIES.items():
+            assert category != "unknown", (
+                f"bootstrap name {name!r} was seeded with the unknown "
+                f"sentinel — only react_graph's error emitters may use it"
             )
 
     def test_canonical_identities_covers_known_native_names(self):

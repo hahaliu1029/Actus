@@ -5,7 +5,7 @@ for full design rationale.
 
 This module owns:
 - ToolSource Pydantic model (frozen)
-- KNOWN_CATEGORIES (12 canonical categories)
+- KNOWN_CATEGORIES (12 canonical categories + 1 ``unknown`` sentinel = 13)
 - _CANONICAL_TOOL_IDENTITIES (37 static identities, seeded at module import)
 - _REGISTRY (process-wide name -> ToolSource map)
 - annotate_and_register_tool_source helper (factory single entry point)
@@ -32,8 +32,26 @@ KNOWN_CATEGORIES: frozenset[str] = frozenset({
     "skill", "skill creator", "skill guide",
     "mcp", "mcp discovery",
     "a2a",
+    # R2 CS2: sentinel category for LLM-hallucinated tool names and for
+    # dynamically-discovered MCP/Skill tools that haven't flushed a
+    # canonical identity yet. ``resolve_tool_source`` NEVER returns a
+    # ``ToolSource`` with this category — it still fails closed with
+    # ``ToolSourceUnknownError``. Downstream error-event emitters
+    # (react_graph ``tool_node`` unknown-tool branch, react_graph
+    # ``llm_node`` CALLING-event fallback) may construct a
+    # ``ToolSource(category="unknown", ...)`` so the rest of the
+    # pipeline — ``_translate_outcome`` → ``ToolArtifact`` →
+    # ``_handle_tool_event`` — can route the error through the normal
+    # typed path. ``unknown`` is deliberately listed under
+    # ``IDENTITY_ONLY_CATEGORIES`` in
+    # ``tests/domain/services/test_agent_task_runner_enrichment_contract.py``
+    # so no ``_handle_tool_event`` branch ever reads it, keeping
+    # hallucinated tool names from leaking shell / browser / file
+    # side effects.
+    "unknown",
 })
-"""The 12 canonical category values from tools_guide_dynamic.py _DISPLAY_ORDER.
+"""The 12 canonical category values from tools_guide_dynamic.py _DISPLAY_ORDER,
+plus the ``"unknown"`` sentinel (13 total).
 
 Note the multi-word values use SPACE separators ("skill creator", not
 "skill_creation"). R1 aligns agent_task_runner to this canonical form.
@@ -82,9 +100,16 @@ class ToolSource(BaseModel):
 class ToolSourceUnknownError(Exception):
     """Raised when resolve_tool_source cannot identify a tool name.
 
-    Fail-closed contract: no 'unknown' sentinel ToolSource, no native fallback.
-    Raised when the name is neither in _REGISTRY nor matched by the migration
-    heuristic (mcp_/skill_ prefix).
+    Fail-closed contract for the RESOLVER: ``resolve_tool_source`` never
+    silently returns a sentinel and never falls back to ``native``. Raised
+    when the name is neither in ``_REGISTRY`` nor matched by the migration
+    heuristic (``mcp_``/``skill_`` prefix).
+
+    Downstream error emitters (e.g. ``react_graph`` dispatching an
+    unknown-tool error event) may still construct a
+    ``ToolSource(category="unknown", ...)`` on their own — see the
+    ``"unknown"`` entry in ``KNOWN_CATEGORIES`` — but that is a separate
+    concern from the resolver's lookup contract.
     """
 
 

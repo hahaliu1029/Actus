@@ -45,7 +45,6 @@ from app.domain.models.tool_result import (
     ImageUrlPayload,
     MultimodalPayload,
     Passthrough,
-    TextBlock,
     ToolArtifact,
     ToolOutcome,
     TOOL_OUTCOME_ADAPTER,
@@ -602,7 +601,7 @@ def _too_large_outcome(tool_name: str, byte_len: int, max_bytes: int) -> AllowEr
     )
 
 
-def _legacy_raw_to_outcome(tool_name: str, raw: Any) -> ToolOutcome:
+def _legacy_raw_to_outcome(raw: Any) -> ToolOutcome:
     """Coerce a pre-R2 wrapper return value (``response_format='content'``)
     into a typed ``ToolOutcome``.
 
@@ -712,7 +711,7 @@ async def _invoke_wrapper(
                 retryable=False,
             )
 
-        outcome = _legacy_raw_to_outcome(tool.name, raw)
+        outcome = _legacy_raw_to_outcome(raw)
         if isinstance(outcome.content, str) and len(outcome.content) > max_bytes:
             return _too_large_outcome(tool.name, len(outcome.content), max_bytes)
         return outcome
@@ -892,14 +891,27 @@ def build_react_graph(
 
         new_events = []
 
-        # Emit ToolEvent(CALLING) for each tool call
+        # Emit ToolEvent(CALLING) for each tool call.
+        #
+        # ``resolve_tool_source`` raises on LLM-hallucinated names and on
+        # dynamically-registered MCP/Skill tools that haven't flushed
+        # their canonical identity yet. Falling through to the
+        # ``unknown`` sentinel keeps the CALLING event path safe — and
+        # more importantly prevents the fallback from using ``shell``
+        # (which would make ``AgentTaskRunner._handle_tool_event`` read
+        # the default shell session's console as the enrichment payload;
+        # see the companion fix in ``tool_node``).
         if response.tool_calls:
             for tc in response.tool_calls:
                 func_name = tc["name"]
+                try:
+                    _calling_category = resolve_tool_source(func_name).category
+                except ToolSourceUnknownError:
+                    _calling_category = "unknown"
                 new_events.append(
                     ToolEvent(
                         tool_call_id=tc["id"],
-                        tool_name=resolve_tool_source(func_name).category,
+                        tool_name=_calling_category,
                         function_name=func_name,
                         function_args=tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"]),
                         status=ToolEventStatus.CALLING,
@@ -1154,15 +1166,26 @@ def build_react_graph(
 
             # Resolve the tool's ``ToolSource`` once — every downstream
             # branch (block, unknown, deny, execute) needs it for
-            # ``_translate_outcome``. Fall through to a sentinel native/
-            # unknown source if R1 has never seen this name (e.g. a
-            # dynamically-discovered MCP tool without a factory call).
+            # ``_translate_outcome``. Fall through to the ``"unknown"``
+            # sentinel ``ToolSource`` if R1 has never seen this name
+            # (e.g. an LLM-hallucinated tool, or a dynamically-discovered
+            # MCP tool whose factory hasn't registered a canonical
+            # identity yet).
+            #
+            # ``"unknown"`` is a first-class category in
+            # ``KNOWN_CATEGORIES`` (R2 CS2 addition) and lives under
+            # ``IDENTITY_ONLY_CATEGORIES`` in
+            # ``test_agent_task_runner_enrichment_contract.py``. Because
+            # no ``_handle_tool_event`` branch matches ``"unknown"``,
+            # ``tool_content`` stays ``None`` and the raw
+            # ``Error: Unknown tool 'xxx'`` message surfaces to the UI —
+            # no shell console leak, no file sync side effects.
             try:
                 tool_source = resolve_tool_source(tool_name)
             except ToolSourceUnknownError:
                 tool_source = ToolSource(
                     source="native",
-                    category="shell",  # fallback bucket — nothing reads it
+                    category="unknown",
                     canonical_name=tool_name,
                 )
 

@@ -19,6 +19,11 @@ ENRICHABLE_CATEGORIES: frozenset[str] = frozenset({
 
 IDENTITY_ONLY_CATEGORIES: frozenset[str] = frozenset({
     "message", "memory", "mcp discovery", "skill guide",
+    # R2 CS2: sentinel for LLM-hallucinated tool names. Listed here so
+    # the partition invariant keeps holding — no _handle_tool_event
+    # branch matches "unknown", so the raw error message surfaces
+    # instead of triggering shell / browser / file side effects.
+    "unknown",
 })
 """Categories that exist in the contract but intentionally skip enrichment.
 
