@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool
 
+from app.domain.models.tool_result import AllowSuccess, ToolOutcome
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
@@ -32,12 +33,13 @@ def create_mcp_discovery_tools(
     activated_tools_ref : callable returning the mutable activated tools set
     """
 
-    async def _list_mcp_tools(server_name: str = "") -> str:
+    async def _list_mcp_tools(server_name: str = "") -> tuple[str, ToolOutcome]:
         """列出可用的 MCP 工具。不传参数返回所有概览；传入服务器名返回该服务器详情。"""
         mcp = mcp_tool_ref()
         all_tools = mcp.get_tools()
         if not all_tools:
-            return "No MCP tools available."
+            outcome = AllowSuccess(content="No MCP tools available.")
+            return outcome.content, outcome
 
         lines = ["## Available MCP Tools\n"]
         for schema in all_tools:
@@ -54,15 +56,19 @@ def create_mcp_discovery_tools(
             lines.append(f"- **{name}**: {desc}")
 
         if len(lines) == 1:
-            return f"No MCP tools found for server '{server_name}'."
+            content = f"No MCP tools found for server '{server_name}'."
+            outcome = AllowSuccess(content=content)
+            return outcome.content, outcome
 
         lines.append(
             "\nUse `get_mcp_tool(tool_name)` to get full parameter details "
             "and activate a tool."
         )
-        return "\n".join(lines)
+        content = "\n".join(lines)
+        outcome = AllowSuccess(content=content)
+        return outcome.content, outcome
 
-    async def _get_mcp_tool(tool_name: str) -> str:
+    async def _get_mcp_tool(tool_name: str) -> tuple[str, ToolOutcome]:
         """获取 MCP 工具完整参数定义并激活。激活后该工具将在下一个 plan step 可直接调用。"""
         mcp = mcp_tool_ref()
         activated = activated_tools_ref()
@@ -98,12 +104,16 @@ def create_mcp_discovery_tools(
                     f"Tool `{tool_name}` has been activated and will be available "
                     "for direct calling in the **next plan step**."
                 )
-                return "\n".join(lines)
+                content = "\n".join(lines)
+                outcome = AllowSuccess(content=content, data=schema if isinstance(schema, dict) else None)
+                return outcome.content, outcome
 
-        return (
+        content = (
             f"MCP tool '{tool_name}' not found. "
             "Use `list_mcp_tools()` to see available tools."
         )
+        outcome = AllowSuccess(content=content)
+        return outcome.content, outcome
 
     list_mcp_tools = StructuredTool.from_function(
         coroutine=_list_mcp_tools,
@@ -112,6 +122,7 @@ def create_mcp_discovery_tools(
             "列出可用的 MCP 工具。不传参数返回所有服务器工具概览；"
             "传入服务器名前缀返回该服务器的工具详情。"
         ),
+        response_format="content_and_artifact",
     )
     get_mcp_tool = StructuredTool.from_function(
         coroutine=_get_mcp_tool,
@@ -121,6 +132,7 @@ def create_mcp_discovery_tools(
             "激活后该工具将在下一个 plan step 中可直接调用。"
             "传入工具全名（如 'mcp_amap-maps_maps_weather'）。"
         ),
+        response_format="content_and_artifact",
     )
 
     tools = [list_mcp_tools, get_mcp_tool]

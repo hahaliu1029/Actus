@@ -12,7 +12,14 @@ from typing import Any, Dict, List, Optional
 
 from app.domain.external.sandbox import Sandbox
 from app.domain.models.skill import Skill, SkillRuntimeType
-from app.domain.models.tool_result import ToolResult
+from app.domain.models.tool_result import (
+    AllowError,
+    AllowSuccess,
+    Asked,
+    DecisionReason,
+    ToolOutcome,
+    ToolResult,
+)
 from core.config import get_settings
 
 from .a2a import A2ATool
@@ -151,10 +158,63 @@ class SkillTool(BaseTool):
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_bindings
 
-    async def invoke(self, tool_name: str, **kwargs) -> ToolResult:
+    def _evaluate_risk_enforce(
+        self,
+        *,
+        skill: Skill,
+        tool_name: str,
+        risk_level: str,
+    ) -> Asked | None:
+        if self._risk_mode != "enforce_confirmation":
+            return None
+        if risk_level != "high":
+            return None
+        return Asked(
+            content=f"Skill '{tool_name}' 标记为高风险，需要用户确认后执行",
+            reason=DecisionReason(
+                type="risk_enforce",
+                code=f"skill_{skill.id}_risk_high",
+                message="risk_mode=enforce_confirmation, risk_level=high",
+            ),
+        )
+
+    @staticmethod
+    def _tool_result_to_outcome(result: ToolResult) -> ToolOutcome:
+        if result.success:
+            content = result.message or ""
+            if isinstance(result.data, str):
+                content = result.data
+            elif isinstance(result.data, dict):
+                output = result.data.get("output")
+                if isinstance(output, str):
+                    content = output
+                elif content == "":
+                    content = json.dumps(result.data, ensure_ascii=False)
+            return AllowSuccess(
+                content=content,
+                data=result.data if isinstance(result.data, dict) else None,
+            )
+        message = result.message or "skill tool failed"
+        return AllowError(
+            content=message,
+            reason=DecisionReason(
+                type="exception",
+                code="skill_runtime_error",
+                message=message,
+            ),
+        )
+
+    async def invoke(self, tool_name: str, **kwargs) -> ToolOutcome:
         binding = self._tool_bindings.get(tool_name)
         if not binding:
-            return ToolResult(success=False, message=f"Skill工具[{tool_name}]不存在")
+            return AllowError(
+                content=f"Skill工具[{tool_name}]不存在",
+                reason=DecisionReason(
+                    type="exception",
+                    code="skill_tool_not_found",
+                    message=f"Skill工具[{tool_name}]不存在",
+                ),
+            )
 
         skill: Skill = binding["skill"]
         runtime_type: SkillRuntimeType = binding["runtime_type"]
@@ -162,26 +222,32 @@ class SkillTool(BaseTool):
         policy = self._get_tool_policy(skill, manifest_tool)
         risk_level = str(policy.get("risk_level") or "low").strip().lower()
 
-        if self._risk_mode == "enforce_confirmation" and risk_level == "high":
-            return ToolResult(
-                success=False,
-                message="APPROVAL_REQUIRED",
-                data={
-                    "approval_required": True,
-                    "skill_id": skill.id,
-                    "tool_name": tool_name,
-                    "risk_level": risk_level,
-                },
-            )
+        ask = self._evaluate_risk_enforce(
+            skill=skill,
+            tool_name=tool_name,
+            risk_level=risk_level,
+        )
+        if ask is not None:
+            return ask
 
         if runtime_type == SkillRuntimeType.NATIVE:
-            return await self._invoke_native(skill, manifest_tool, kwargs)
+            result = await self._invoke_native(skill, manifest_tool, kwargs)
+            return self._tool_result_to_outcome(result)
         if runtime_type == SkillRuntimeType.MCP:
-            return await self._invoke_mcp(manifest_tool, kwargs)
+            result = await self._invoke_mcp(manifest_tool, kwargs)
+            return self._tool_result_to_outcome(result)
         if runtime_type == SkillRuntimeType.A2A:
-            return await self._invoke_a2a(manifest_tool, kwargs)
+            result = await self._invoke_a2a(manifest_tool, kwargs)
+            return self._tool_result_to_outcome(result)
 
-        return ToolResult(success=False, message=f"暂不支持的Skill运行时: {runtime_type}")
+        return AllowError(
+            content=f"暂不支持的Skill运行时: {runtime_type}",
+            reason=DecisionReason(
+                type="exception",
+                code="unsupported_skill_runtime",
+                message=str(runtime_type),
+            ),
+        )
 
     async def cleanup(self) -> None:
         """清空 SkillTool 内部状态（对称于 initialize 的原子性契约 #27）。

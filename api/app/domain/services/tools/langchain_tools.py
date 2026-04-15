@@ -9,8 +9,10 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import shlex
-from typing import List, Literal, Optional, Union
+from typing import Any, Awaitable, List, Literal, Optional, Union
 
 from langchain_core.tools import StructuredTool, tool as lc_tool
 
@@ -18,23 +20,24 @@ from app.domain.external.browser import Browser
 from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
+from app.domain.models.tool_result import (
+    AllowError,
+    AllowSuccess,
+    DecisionReason,
+    FileBlock,
+    ImageUrlBlock,
+    Passthrough,
+    TextBlock,
+    ToolOutcome,
+    MultimodalPayload,
+)
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
 
 
-def _unwrap(result: object) -> str:
-    """Extract business payload from a ToolResult, raising on failure.
-
-    ToolResult has {success, message, data}. The model should see `data`
-    (the actual tool output), not the Pydantic repr of the wrapper.
-
-    If ``result`` has ``success=False``, raise so that the caller (ToolNode or
-    react_graph tool_node) can handle the error structurally rather than relying
-    on string pattern matching.
-    """
-    if hasattr(result, "success") and not result.success:
-        raise RuntimeError(getattr(result, "message", None) or str(result))
+def _coerce_result_content(result: object) -> str:
+    """Extract the human-readable payload from a legacy ToolResult-like object."""
     # Extract .data (the actual payload); fall back to .message then str()
     if hasattr(result, "data") and result.data is not None:
         data = result.data
@@ -47,12 +50,87 @@ def _unwrap(result: object) -> str:
                 # LLM and hide empty-output success cases.
                 output = data["output"]
                 return output if isinstance(output, str) else ("" if output is None else str(output))
-            import json
             return json.dumps(data, ensure_ascii=False)
         return str(data)
     if hasattr(result, "message") and result.message:
         return result.message
     return str(result)
+
+
+def _wrap_result_outcome(
+    result: object | None,
+    *,
+    failure_code: str = "native_tool_error",
+    default_success_message: str = "",
+) -> ToolOutcome:
+    """Convert legacy ToolResult-like objects into typed ToolOutcome."""
+    if result is None:
+        return AllowSuccess(content=default_success_message)
+
+    if hasattr(result, "success") and not result.success:
+        message = getattr(result, "message", None) or str(result)
+        return AllowError(
+            content=message,
+            reason=DecisionReason(
+                type="exception",
+                code=failure_code,
+                message=message,
+            ),
+            retryable=False,
+        )
+
+    content = _coerce_result_content(result) or default_success_message
+    data = result.data if hasattr(result, "data") and isinstance(result.data, dict) else None
+    return AllowSuccess(content=content, data=data)
+
+
+def _exception_outcome(tool_name: str, exc: Exception) -> AllowError:
+    reason_type = "timeout" if isinstance(exc, asyncio.TimeoutError) else "exception"
+    return AllowError(
+        content=f"{tool_name} 异常: {exc}",
+        reason=DecisionReason(
+            type=reason_type,
+            code=(
+                f"{tool_name}_timeout"
+                if isinstance(exc, asyncio.TimeoutError)
+                else type(exc).__name__
+            ),
+            message=str(exc),
+        ),
+        retryable=isinstance(exc, asyncio.TimeoutError),
+    )
+
+
+async def _invoke_result_tool(
+    tool_name: str,
+    call: Awaitable[object | None],
+    *,
+    failure_code: str = "native_tool_error",
+    default_success_message: str = "",
+) -> tuple[str, ToolOutcome]:
+    try:
+        result = await call
+    except Exception as exc:  # pragma: no cover - behavior verified via callers
+        outcome = _exception_outcome(tool_name, exc)
+        return outcome.content, outcome
+
+    outcome = _wrap_result_outcome(
+        result,
+        failure_code=failure_code,
+        default_success_message=default_success_message,
+    )
+    return outcome.content, outcome
+
+
+def _multimodal_block_from_dict(block: dict[str, Any]):
+    block_type = block.get("type")
+    if block_type == "image_url":
+        return ImageUrlBlock.model_validate(block)
+    if block_type == "file":
+        return FileBlock.model_validate(block)
+    if block_type == "text":
+        return TextBlock.model_validate(block)
+    raise ValueError(f"Unsupported multimodal block type: {block_type!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -63,26 +141,29 @@ def _unwrap(result: object) -> str:
 def _make_message_tools() -> list[StructuredTool]:
     """Create message tools (no external dependency needed)."""
 
-    @lc_tool
-    async def message_notify_user(text: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def message_notify_user(text: str) -> tuple[str, ToolOutcome]:
         """Send a notification to the user without waiting for a reply. Use for progress updates, confirmations, or status reports."""
-        return "Continue"
+        outcome = AllowSuccess(content="Continue")
+        return outcome.content, outcome
 
-    @lc_tool
+    @lc_tool(response_format="content_and_artifact")
     async def message_ask_user(
         text: str,
         attachments: Optional[Union[str, List[str]]] = None,
         suggest_user_takeover: Optional[Literal["none", "shell", "browser"]] = None,
-    ) -> str:
+    ) -> tuple[str, ToolOutcome]:
         """Ask the user a question and wait for their reply. Use for clarification, confirmation, or requesting input.
 
         NOTE: The system may return SOFT_HINT if it determines the agent should
         try to solve autonomously first. Only call again if user input is truly
         required.
         """
+        del attachments, suggest_user_takeover
         # Actual SOFT_HINT / interrupt logic is handled by react_graph's tool_node.
         # This is the fallback return value.
-        return "WAITING_FOR_USER"
+        outcome = AllowSuccess(content="WAITING_FOR_USER")
+        return outcome.content, outcome
 
     tools = [message_notify_user, message_ask_user]
     for t in tools:
@@ -98,19 +179,28 @@ def _make_message_tools() -> list[StructuredTool]:
 def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
     """Create file tools that delegate to sandbox."""
 
-    @lc_tool
+    @lc_tool(response_format="content_and_artifact")
     async def file_read(
         filepath: str,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         sudo: bool = False,
         max_length: int = 2000,
-    ) -> str:
+    ) -> tuple[str, ToolOutcome]:
         """Read file content from the sandbox filesystem."""
-        result = await sandbox.read_file(filepath, start_line=start_line, end_line=end_line, sudo=sudo, max_length=max_length)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "file_read",
+            sandbox.read_file(
+                filepath,
+                start_line=start_line,
+                end_line=end_line,
+                sudo=sudo,
+                max_length=max_length,
+            ),
+            failure_code="sandbox_file_read_error",
+        )
 
-    @lc_tool
+    @lc_tool(response_format="content_and_artifact")
     async def file_write(
         filepath: str,
         content: str,
@@ -118,41 +208,68 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
         leading_newline: bool = False,
         trailing_newline: bool = False,
         sudo: bool = False,
-    ) -> str:
+    ) -> tuple[str, ToolOutcome]:
         """Write content to a file in the sandbox filesystem."""
-        result = await sandbox.write_file(
-            filepath, content, append=append,
-            leading_newline=leading_newline, trailing_newline=trailing_newline, sudo=sudo,
+        return await _invoke_result_tool(
+            "file_write",
+            sandbox.write_file(
+                filepath,
+                content,
+                append=append,
+                leading_newline=leading_newline,
+                trailing_newline=trailing_newline,
+                sudo=sudo,
+            ),
+            failure_code="sandbox_file_write_error",
+            default_success_message="File written successfully",
         )
-        return _unwrap(result) if result else "File written successfully"
 
     file_write.metadata = {"risk_level": "medium"}
 
-    @lc_tool
-    async def file_str_replace(filepath: str, old_str: str, new_str: str, sudo: bool = False) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def file_str_replace(
+        filepath: str, old_str: str, new_str: str, sudo: bool = False
+    ) -> tuple[str, ToolOutcome]:
         """Replace a string in a file."""
-        result = await sandbox.replace_in_file(filepath, old_str, new_str, sudo=sudo)
-        return _unwrap(result) if result else "Replacement done"
+        return await _invoke_result_tool(
+            "file_str_replace",
+            sandbox.replace_in_file(filepath, old_str, new_str, sudo=sudo),
+            failure_code="sandbox_file_replace_error",
+            default_success_message="Replacement done",
+        )
 
     file_str_replace.metadata = {"risk_level": "medium"}
 
-    @lc_tool
-    async def file_find_in_content(filepath: str, regex: str, sudo: bool = False) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def file_find_in_content(
+        filepath: str, regex: str, sudo: bool = False
+    ) -> tuple[str, ToolOutcome]:
         """Search file content using regex."""
-        result = await sandbox.search_in_file(filepath, regex, sudo=sudo)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "file_find_in_content",
+            sandbox.search_in_file(filepath, regex, sudo=sudo),
+            failure_code="sandbox_file_search_error",
+        )
 
-    @lc_tool
-    async def file_find_by_name(dir_path: str, glob_pattern: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def file_find_by_name(
+        dir_path: str, glob_pattern: str
+    ) -> tuple[str, ToolOutcome]:
         """Find files by name pattern."""
-        result = await sandbox.find_files(dir_path, glob_pattern)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "file_find_by_name",
+            sandbox.find_files(dir_path, glob_pattern),
+            failure_code="sandbox_file_find_error",
+        )
 
-    @lc_tool
-    async def file_list(dir_path: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def file_list(dir_path: str) -> tuple[str, ToolOutcome]:
         """List directory contents."""
-        result = await sandbox.list_files(dir_path)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "file_list",
+            sandbox.list_files(dir_path),
+            failure_code="sandbox_file_list_error",
+        )
 
     tools = [file_read, file_write, file_str_replace, file_find_in_content, file_find_by_name, file_list]
     for t in tools:
@@ -174,13 +291,13 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
     # cause a ReadTimeout that would orphan the background command.
     _MAX_WAIT_SECONDS = 580
 
-    @lc_tool
+    @lc_tool(response_format="content_and_artifact")
     async def shell_execute(
         command: str,
         session_id: str = "default",
         exec_dir: str = "",
         wait_seconds: Optional[int] = None,
-    ) -> str:
+    ) -> tuple[str, ToolOutcome]:
         """Execute a shell command in the sandbox.
 
         The sandbox synchronously waits up to ``wait_seconds`` (default 5s) for
@@ -200,20 +317,26 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
         if wait_seconds is not None and wait_seconds > 0:
             clamped_wait = min(wait_seconds, _MAX_WAIT_SECONDS)
 
-        result = await sandbox.exec_command(
-            session_id=session_id,
-            exec_dir=exec_dir,
-            command=command,
-            wait_seconds=clamped_wait,
-        )
+        try:
+            result = await sandbox.exec_command(
+                session_id=session_id,
+                exec_dir=exec_dir,
+                command=command,
+                wait_seconds=clamped_wait,
+            )
+        except Exception as exc:
+            outcome = _exception_outcome("shell_execute", exc)
+            return outcome.content, outcome
         if hasattr(result, "success") and not result.success:
-            raise RuntimeError(getattr(result, "message", None) or str(result))
+            outcome = _wrap_result_outcome(result, failure_code="sandbox_shell_error")
+            return outcome.content, outcome
 
         data = getattr(result, "data", None)
         # Legacy / mocked sandbox that doesn't return structured data — fall
         # through to the generic unwrap path.
         if not isinstance(data, dict):
-            return _unwrap(result)
+            outcome = _wrap_result_outcome(result, failure_code="sandbox_shell_error")
+            return outcome.content, outcome
 
         status = data.get("status")
         output = data.get("output")
@@ -237,7 +360,7 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
             except Exception:
                 # Best-effort: the LLM can still call shell_read_output explicitly.
                 pass
-            return (
+            content = (
                 f"[shell_execute] Command is still running on session '{session_id}' "
                 f"after the {effective_wait}s sync wait window. The process keeps running "
                 f"in the background.\n"
@@ -247,43 +370,82 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
                 f"you can also re-invoke shell_execute with a larger wait_seconds."
                 f"{partial_text}"
             )
+            outcome = AllowSuccess(content=content, data=data)
+            return outcome.content, outcome
 
         # status == "completed" (or unknown/legacy) — surface output + returncode.
         if output:
             if returncode is not None and returncode != 0:
-                return f"{output}\n[shell_execute] exit code: {returncode}"
-            return output
+                content = f"{output}\n[shell_execute] exit code: {returncode}"
+            else:
+                content = output
+            outcome = AllowSuccess(content=content, data=data)
+            return outcome.content, outcome
         if returncode == 0:
-            return "[shell_execute] Command completed successfully with no output (exit code 0)."
+            content = "[shell_execute] Command completed successfully with no output (exit code 0)."
+            outcome = AllowSuccess(content=content, data=data)
+            return outcome.content, outcome
         if returncode is not None:
-            return f"[shell_execute] Command completed with no output (exit code {returncode})."
-        return "[shell_execute] Command completed with no output."
+            content = f"[shell_execute] Command completed with no output (exit code {returncode})."
+            outcome = AllowSuccess(content=content, data=data)
+            return outcome.content, outcome
+        outcome = AllowSuccess(
+            content="[shell_execute] Command completed with no output.",
+            data=data,
+        )
+        return outcome.content, outcome
 
     shell_execute.metadata = {"risk_level": "high"}
 
-    @lc_tool
-    async def shell_read_output(session_id: str = "default") -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def shell_read_output(
+        session_id: str = "default",
+    ) -> tuple[str, ToolOutcome]:
         """Read the latest output from a shell session."""
-        result = await sandbox.read_shell_output(session_id=session_id)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "shell_read_output",
+            sandbox.read_shell_output(session_id=session_id),
+            failure_code="sandbox_shell_read_error",
+        )
 
-    @lc_tool
-    async def shell_wait_process(session_id: str = "default", seconds: int = 5) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def shell_wait_process(
+        session_id: str = "default", seconds: int = 5
+    ) -> tuple[str, ToolOutcome]:
         """Wait for a running process to produce output."""
-        result = await sandbox.wait_process(session_id=session_id, seconds=seconds)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "shell_wait_process",
+            sandbox.wait_process(session_id=session_id, seconds=seconds),
+            failure_code="sandbox_wait_process_error",
+        )
 
-    @lc_tool
-    async def shell_write_input(input_text: str, session_id: str = "default", press_enter: bool = True) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def shell_write_input(
+        input_text: str,
+        session_id: str = "default",
+        press_enter: bool = True,
+    ) -> tuple[str, ToolOutcome]:
         """Write input to a running shell process."""
-        result = await sandbox.write_shell_input(session_id=session_id, input_text=input_text, press_enter=press_enter)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "shell_write_input",
+            sandbox.write_shell_input(
+                session_id=session_id,
+                input_text=input_text,
+                press_enter=press_enter,
+            ),
+            failure_code="sandbox_shell_input_error",
+        )
 
-    @lc_tool
-    async def shell_kill_process(session_id: str = "default") -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def shell_kill_process(
+        session_id: str = "default",
+    ) -> tuple[str, ToolOutcome]:
         """Kill a running process in a shell session."""
-        result = await sandbox.kill_process(session_id=session_id)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "shell_kill_process",
+            sandbox.kill_process(session_id=session_id),
+            failure_code="sandbox_shell_kill_error",
+        )
 
     tools = [shell_execute, shell_read_output, shell_wait_process, shell_write_input, shell_kill_process]
     for t in tools:
@@ -299,89 +461,145 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
 def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     """Create browser tools that delegate to Browser."""
 
-    @lc_tool
-    async def browser_view() -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_view() -> tuple[str, ToolOutcome]:
         """Get a snapshot of the current browser page content and screenshot."""
-        result = await browser.view_page()
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_view",
+            browser.view_page(),
+            failure_code="browser_view_error",
+        )
 
-    @lc_tool
-    async def browser_navigate(url: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_navigate(url: str) -> tuple[str, ToolOutcome]:
         """Navigate the browser to a URL."""
-        result = await browser.navigate(url)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_navigate",
+            browser.navigate(url),
+            failure_code="browser_navigate_error",
+        )
 
-    @lc_tool
+    @lc_tool(response_format="content_and_artifact")
     async def browser_click(
         index: Optional[int] = None,
         coordinate_x: Optional[float] = None,
         coordinate_y: Optional[float] = None,
-    ) -> str:
+    ) -> tuple[str, ToolOutcome]:
         """Click an element on the page by index or coordinates."""
-        result = await browser.click(index=index, coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_click",
+            browser.click(
+                index=index,
+                coordinate_x=coordinate_x,
+                coordinate_y=coordinate_y,
+            ),
+            failure_code="browser_click_error",
+        )
 
-    @lc_tool
+    @lc_tool(response_format="content_and_artifact")
     async def browser_input(
         text: str,
         press_enter: bool = True,
         index: Optional[int] = None,
         coordinate_x: Optional[float] = None,
         coordinate_y: Optional[float] = None,
-    ) -> str:
+    ) -> tuple[str, ToolOutcome]:
         """Type text into an input field."""
-        result = await browser.input(text, press_enter=press_enter, index=index, coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_input",
+            browser.input(
+                text,
+                press_enter=press_enter,
+                index=index,
+                coordinate_x=coordinate_x,
+                coordinate_y=coordinate_y,
+            ),
+            failure_code="browser_input_error",
+        )
 
-    @lc_tool
-    async def browser_move_mouse(coordinate_x: float, coordinate_y: float) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_move_mouse(
+        coordinate_x: float, coordinate_y: float
+    ) -> tuple[str, ToolOutcome]:
         """Move the mouse cursor to specific coordinates."""
-        result = await browser.move_mouse(coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_move_mouse",
+            browser.move_mouse(coordinate_x=coordinate_x, coordinate_y=coordinate_y),
+            failure_code="browser_move_mouse_error",
+        )
 
-    @lc_tool
-    async def browser_press_key(key: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_press_key(key: str) -> tuple[str, ToolOutcome]:
         """Press a keyboard key."""
-        result = await browser.press_key(key)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_press_key",
+            browser.press_key(key),
+            failure_code="browser_press_key_error",
+        )
 
-    @lc_tool
-    async def browser_select_option(index: int, option: int) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_select_option(
+        index: int, option: int
+    ) -> tuple[str, ToolOutcome]:
         """Select an option from a dropdown."""
-        result = await browser.select_option(index=index, option=option)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_select_option",
+            browser.select_option(index=index, option=option),
+            failure_code="browser_select_option_error",
+        )
 
-    @lc_tool
-    async def browser_scroll_up(to_top: bool = False) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_scroll_up(to_top: bool = False) -> tuple[str, ToolOutcome]:
         """Scroll the page up."""
-        result = await browser.scroll_up(to_top=to_top)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_scroll_up",
+            browser.scroll_up(to_top=to_top),
+            failure_code="browser_scroll_up_error",
+        )
 
-    @lc_tool
-    async def browser_scroll_down(to_bottom: bool = False) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_scroll_down(
+        to_bottom: bool = False
+    ) -> tuple[str, ToolOutcome]:
         """Scroll the page down."""
-        result = await browser.scroll_down(to_down=to_bottom)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_scroll_down",
+            browser.scroll_down(to_down=to_bottom),
+            failure_code="browser_scroll_down_error",
+        )
 
-    @lc_tool
-    async def browser_console_exec(javascript: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_console_exec(
+        javascript: str,
+    ) -> tuple[str, ToolOutcome]:
         """Execute JavaScript in the browser console."""
-        result = await browser.console_exec(javascript)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_console_exec",
+            browser.console_exec(javascript),
+            failure_code="browser_console_exec_error",
+        )
 
     browser_console_exec.metadata = {"risk_level": "high"}
 
-    @lc_tool
-    async def browser_console_view(max_lines: int = 50) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_console_view(
+        max_lines: int = 50,
+    ) -> tuple[str, ToolOutcome]:
         """View the browser console output."""
-        result = await browser.console_view(max_lines=max_lines)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_console_view",
+            browser.console_view(max_lines=max_lines),
+            failure_code="browser_console_view_error",
+        )
 
-    @lc_tool
-    async def browser_restart(url: str = "") -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def browser_restart(url: str = "") -> tuple[str, ToolOutcome]:
         """Restart the browser, optionally navigating to a URL."""
-        result = await browser.restart(url=url)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "browser_restart",
+            browser.restart(url=url),
+            failure_code="browser_restart_error",
+        )
 
     tools = [
         browser_view, browser_navigate, browser_click, browser_input,
@@ -402,11 +620,16 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
 def _make_search_tools(search_engine: SearchEngine) -> list[StructuredTool]:
     """Create search tools."""
 
-    @lc_tool
-    async def search_web(query: str, date_range: Optional[str] = None) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def search_web(
+        query: str, date_range: Optional[str] = None
+    ) -> tuple[str, ToolOutcome]:
         """Search the web for information."""
-        result = await search_engine.invoke(query, date_range=date_range)
-        return _unwrap(result)
+        return await _invoke_result_tool(
+            "search_web",
+            search_engine.invoke(query, date_range=date_range),
+            failure_code="search_web_error",
+        )
 
     tools = [search_web]
     for t in tools:
@@ -438,20 +661,32 @@ def _make_file_view_tools(
 ) -> list[StructuredTool]:
     """Create file_view tool for multimodal file understanding."""
 
-    @lc_tool
-    async def file_view(filepath: str) -> FileProcessResult | str:
+    @lc_tool(response_format="content_and_artifact")
+    async def file_view(filepath: str) -> tuple[str, ToolOutcome]:
         """View and understand a file's content. Use this for images, PDFs,
         audio, and video files instead of file_read.
         Returns the file content in a format the model can understand."""
 
         # 1. Detect MIME type (sandbox `file` command + extension fallback)
-        mime_result = await sandbox.exec_command(
-            "default", "", f"file --mime-type -b {shlex.quote(filepath)}"
-        )
+        try:
+            mime_result = await sandbox.exec_command(
+                "default", "", f"file --mime-type -b {shlex.quote(filepath)}"
+            )
+        except Exception as exc:
+            outcome = _exception_outcome("file_view", exc)
+            return outcome.content, outcome
 
         # Check for execution failure (path not found, permission denied, etc.)
         if hasattr(mime_result, "success") and not mime_result.success:
-            raise RuntimeError(f"Cannot access file: {mime_result}")
+            outcome = AllowError(
+                content=f"Cannot access file: {mime_result}",
+                reason=DecisionReason(
+                    type="exception",
+                    code="file_view_access_error",
+                    message=str(mime_result),
+                ),
+            )
+            return outcome.content, outcome
 
         # Extract the actual command output from ToolResult.data
         # ToolResult.data is a dict with keys: returncode, output, etc.
@@ -466,9 +701,15 @@ def _make_file_view_tools(
                 pass
             else:
                 # Real command error (file not found, permission denied, etc.)
-                raise RuntimeError(
-                    f"Cannot detect file type: {output.strip() or mime_result}"
+                outcome = AllowError(
+                    content=f"Cannot detect file type: {output.strip() or mime_result}",
+                    reason=DecisionReason(
+                        type="exception",
+                        code="file_view_mime_detect_error",
+                        message=output.strip() or str(mime_result),
+                    ),
                 )
+                return outcome.content, outcome
         else:
             mime_type = str(mime_result).strip()
 
@@ -480,17 +721,44 @@ def _make_file_view_tools(
         # 2. Find processor
         processor = processor_lookup.get_processor(mime_type)
         if processor is None:
-            return f"Unsupported file type: {mime_type}. Use file_read for text files."
+            outcome = AllowSuccess(
+                content=f"Unsupported file type: {mime_type}. Use file_read for text files."
+            )
+            return outcome.content, outcome
 
         # 3. Process file — tool_node splits: text → ToolMessage, image_blocks → HumanMessage
         filename = filepath.rsplit("/", 1)[-1]
-        return await processor.process(
-            sandbox_path=filepath,
-            filename=filename,
-            mime_type=mime_type,
-            supports_vision=supports_vision,
-            supports_pdf_input=supports_pdf_input,
-        )
+        try:
+            result = await processor.process(
+                sandbox_path=filepath,
+                filename=filename,
+                mime_type=mime_type,
+                supports_vision=supports_vision,
+                supports_pdf_input=supports_pdf_input,
+            )
+        except Exception as exc:
+            outcome = _exception_outcome("file_view", exc)
+            return outcome.content, outcome
+
+        typed_blocks = [
+            _multimodal_block_from_dict(block)
+            for block in (*result.image_blocks, *result.document_blocks)
+        ]
+        if typed_blocks:
+            image_count = sum(
+                1 for block in typed_blocks if isinstance(block, ImageUrlBlock)
+            )
+            summary = result.text or (
+                f"[file_view: file_view — {image_count} image(s) loaded]"
+            )
+            outcome = Passthrough(
+                content=summary,
+                data=MultimodalPayload(blocks=typed_blocks),
+            )
+            return outcome.content, outcome
+
+        outcome = AllowSuccess(content=result.text or "")
+        return outcome.content, outcome
 
     tools = [file_view]
     for t in tools:

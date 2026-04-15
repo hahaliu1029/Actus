@@ -1,12 +1,9 @@
-"""Tests for R2 PR-B Commit 1 tool_node helpers.
+"""Tests for R2 PR-B Commit 2 tool_node helpers.
 
 Covers:
-- ``_legacy_wrapper_to_outcome`` (Task 9) — temporary bridge between the
-  pre-R2 wrapper calling convention (``tool.ainvoke(args) → str`` or raise)
-  and the new ``ToolOutcome`` discriminated union.
-
-Later tasks (10, 11, 12) append tests for ``_run_policy_chain``,
-``_invoke_wrapper``, and ``_translate_outcome`` respectively.
+- ``_run_policy_chain``
+- ``_invoke_wrapper``
+- ``_translate_outcome``
 
 NOTE: Project convention — no pytest-asyncio. Async tests wrap coroutines in
 ``_run()`` which delegates to ``asyncio.run()`` (mirrors the pattern in
@@ -17,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
-from langchain_core.tools import ToolException
+from langchain_core.tools import tool as lc_tool
 
 from langchain_core.messages import HumanMessage, ToolMessage
 
@@ -37,7 +34,6 @@ from app.domain.models.tool_result import (
 from app.domain.services.graphs.react_graph import (
     _invoke_wrapper,
     _is_shell_category,
-    _legacy_wrapper_to_outcome,
     _run_policy_chain,
     _SessionContext,
     _translate_outcome,
@@ -50,75 +46,24 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-class TestLegacyWrapperBridge:
-    def _make_mock_tool(self, *, name: str, **ainvoke_kwargs) -> AsyncMock:
-        tool = AsyncMock()
-        tool.name = name
-        tool.ainvoke = AsyncMock(**ainvoke_kwargs)
-        return tool
+class TestInvokeWrapperContentAndArtifact:
+    def test_uses_tool_call_shape_and_reads_typed_artifact(self):
+        """Commit 2a: _invoke_wrapper must pass ToolCall dict and read artifact."""
 
-    def test_wraps_successful_string_return(self):
-        """Legacy wrapper returns a plain string → AllowSuccess with content."""
-        tool = self._make_mock_tool(name="fake_tool", return_value="tool output text")
+        @lc_tool(response_format="content_and_artifact")
+        async def fake_tool(x: str) -> tuple[str, AllowSuccess]:
+            """Fake tool for testing wrapper invocation shape."""
+            outcome = AllowSuccess(content=f"got {x}", data={"echo": x})
+            return outcome.content, outcome
 
-        outcome = _run(_legacy_wrapper_to_outcome(tool, {"arg": "val"}))
+        tc = _make_tool_call("tc-artifact", "fake_tool", {"x": "hello"})
+        src = _make_mcp_source()
 
-        assert isinstance(outcome, AllowSuccess)
-        assert outcome.content == "tool output text"
-
-    def test_wraps_runtime_error(self):
-        """RuntimeError → AllowError(reason.type='exception', retryable=False)."""
-        tool = self._make_mock_tool(
-            name="fake_mcp", side_effect=RuntimeError("MCP connect failed")
-        )
-
-        outcome = _run(_legacy_wrapper_to_outcome(tool, {}))
-
-        assert isinstance(outcome, AllowError)
-        assert outcome.reason.type == "exception"
-        assert outcome.reason.code == "RuntimeError"
-        assert "MCP connect failed" in outcome.content
-        assert outcome.retryable is False
-
-    def test_wraps_tool_exception(self):
-        """ToolException (Skill path) → AllowError(exception, code='ToolException')."""
-        tool = self._make_mock_tool(
-            name="skill_xyz", side_effect=ToolException("Skill rejected args")
-        )
-
-        outcome = _run(_legacy_wrapper_to_outcome(tool, {}))
-
-        assert isinstance(outcome, AllowError)
-        assert outcome.reason.type == "exception"
-        assert outcome.reason.code == "ToolException"
-
-    def test_wraps_timeout_error(self):
-        """asyncio.TimeoutError → reason.type='timeout', retryable=True."""
-        tool = self._make_mock_tool(
-            name="slow_tool", side_effect=asyncio.TimeoutError("wrapper timeout")
-        )
-
-        outcome = _run(_legacy_wrapper_to_outcome(tool, {}))
-
-        assert isinstance(outcome, AllowError)
-        assert outcome.reason.type == "timeout"
-        assert outcome.reason.code == "legacy_bridge_timeout"
-        assert outcome.retryable is True
-
-    def test_coerces_non_string_result_via_str(self):
-        """Non-str return value (e.g. dict) → content is str(result).
-
-        Locks in the fallback path so bridge-window wrappers returning dicts
-        don't silently crash.
-        """
-        tool = self._make_mock_tool(
-            name="shape_mismatch_tool", return_value={"key": "value"}
-        )
-
-        outcome = _run(_legacy_wrapper_to_outcome(tool, {}))
+        outcome = _run(_invoke_wrapper(fake_tool, tc, src))
 
         assert isinstance(outcome, AllowSuccess)
-        assert outcome.content == "{'key': 'value'}"
+        assert outcome.content == "got hello"
+        assert outcome.data == {"echo": "hello"}
 
 
 def _make_native_shell_source() -> ToolSource:
@@ -333,14 +278,10 @@ class TestRunPolicyChainShortCircuits:
         assert p2_called is False, "SmartApprove must not run after policy_allow"
 
 
-class TestInvokeWrapperCommit1:
-    """Layer 2 (_invoke_wrapper) — Commit 1 delegates to legacy bridge.
+class TestInvokeWrapperCommit2:
+    """Layer 2 (_invoke_wrapper) — Commit 2a reads ToolMessage.artifact."""
 
-    Commit 2a (Task 21) will replace this with a real ``ainvoke(ToolCall)``
-    call that reads ``tool_msg.artifact`` directly.
-    """
-
-    def test_delegates_to_legacy_bridge_on_success(self):
+    def test_plain_string_return_is_rejected_as_wrong_shape(self):
         tool = AsyncMock()
         tool.ainvoke = AsyncMock(return_value="hello")
         tool.name = "fake"
@@ -349,11 +290,11 @@ class TestInvokeWrapperCommit1:
 
         outcome = _run(_invoke_wrapper(tool, tc, source))
 
-        assert isinstance(outcome, AllowSuccess)
-        assert outcome.content == "hello"
-        tool.ainvoke.assert_awaited_once_with({"arg": 1})
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.type == "exception"
+        assert outcome.reason.code == "wrong_ainvoke_shape"
 
-    def test_delegates_to_legacy_bridge_on_exception(self):
+    def test_returns_allow_error_on_exception(self):
         tool = AsyncMock()
         tool.ainvoke = AsyncMock(side_effect=RuntimeError("boom"))
         tool.name = "fake"
@@ -366,20 +307,16 @@ class TestInvokeWrapperCommit1:
         assert outcome.reason.type == "exception"
         assert outcome.reason.code == "RuntimeError"
 
-    def test_signature_accepts_tool_source_without_using_it(self):
-        """tool_source is accepted now (Commit 2a will start consuming it).
+    def test_tool_source_argument_still_does_not_affect_success_path(self):
+        @lc_tool(response_format="content_and_artifact")
+        async def fake_tool(x: str) -> tuple[str, AllowSuccess]:
+            """Fake tool for source-agnostic wrapper tests."""
+            outcome = AllowSuccess(content=f"ok:{x}")
+            return outcome.content, outcome
 
-        This locks in the stable signature so Commit 2a swaps the body
-        without a call-site change.
-        """
-        tool = AsyncMock()
-        tool.ainvoke = AsyncMock(return_value="x")
-        tool.name = "fake"
-        tc = _make_tool_call("c3", "fake")
-
-        # Either source type works — confirms the arg is currently unused
+        tc = _make_tool_call("c3", "fake_tool", {"x": "v"})
         for source in (_make_mcp_source(), _make_native_shell_source()):
-            outcome = _run(_invoke_wrapper(tool, tc, source))
+            outcome = _run(_invoke_wrapper(fake_tool, tc, source))
             assert isinstance(outcome, AllowSuccess)
 
 

@@ -48,6 +48,7 @@ from app.domain.models.tool_result import (
     TextBlock,
     ToolArtifact,
     ToolOutcome,
+    TOOL_OUTCOME_ADAPTER,
     ToolResult,
 )
 from app.domain.services.json_envelope import unwrap_message_envelope
@@ -515,58 +516,36 @@ async def _invoke_wrapper(
     tool_call: ToolCall,
     tool_source: ToolSource,
 ) -> ToolOutcome:
-    """Layer 2: invoke wrapper, return typed ``ToolOutcome``.
+    """Layer 2: invoke wrapper via ``content_and_artifact`` and return typed outcome.
 
-    **Commit 1 version** (this function): delegates to
-    ``_legacy_wrapper_to_outcome`` because wrappers have not yet been
-    migrated to ``@tool(response_format="content_and_artifact")``.
-
-    **Commit 2a version** (Task 21): will call
-    ``tool.ainvoke(tool_call)`` on the raw ``ToolCall`` dict so LangChain
-    hands us back a ``ToolMessage`` whose ``.artifact`` is the typed
-    ``ToolOutcome`` produced by the wrapper. At that point the legacy
-    bridge is deleted.
-
-    ``tool_source`` is accepted in the signature now (not used yet) so the
-    Commit 2a migration can read tool identity without a signature change.
+    NOTE: langchain-core 1.2.17 only returns ``ToolMessage`` when ``ainvoke()``
+    receives a full ToolCall dict (``{"args", "id", "name", "type"}``). Passing
+    only the plain args dict returns raw content and loses the artifact.
     """
-    del tool_source  # Commit 1 stub: identity not consulted yet
-    return await _legacy_wrapper_to_outcome(tool, tool_call["args"])
-
-
-async def _legacy_wrapper_to_outcome(
-    tool: BaseTool,
-    args: dict,
-) -> ToolOutcome:
-    """TEMPORARY bridge for PR-B Commit 1 (Chunk 2).
-
-    Wraps the pre-R2 wrapper calling convention (``tool.ainvoke(args) → str``
-    or raise) into a ``ToolOutcome`` so Layer 2 (_invoke_wrapper) can consume
-    it uniformly while the wrapper migration is still pending.
-
-    This function is DELETED in PR-B Commit 2a (Task 21) once every wrapper
-    has been migrated to ``@tool(response_format="content_and_artifact")``
-    and returns ``(content, artifact)`` tuples directly.
-
-    NOTE: This bridge does not read multimodal_blocks; Passthrough variant is
-    not producible via this bridge. ``file_view`` tests relying on Passthrough
-    must wait until Commit 2a.
-    """
+    del tool_source
     try:
-        result = await tool.ainvoke(args)
+        tool_msg = await tool.ainvoke(
+            {
+                "args": tool_call["args"],
+                "id": tool_call["id"],
+                "name": tool_call["name"],
+                "type": "tool_call",
+            }
+        )
     except asyncio.TimeoutError as exc:
         return AllowError(
-            content=f"工具 '{tool.name}' 执行超时 (legacy bridge): {exc}",
+            content=f"工具 '{tool.name}' 执行超时: {exc}",
             reason=DecisionReason(
                 type="timeout",
-                code="legacy_bridge_timeout",
+                code="wrapper_ainvoke_timeout",
                 message=str(exc),
             ),
             retryable=True,
         )
     except Exception as exc:
+        logger.exception("Unexpected wrapper exception for %s", tool.name)
         return AllowError(
-            content=f"工具 '{tool.name}' 内部异常 (legacy bridge): {exc}",
+            content=f"工具 '{tool.name}' 内部异常: {exc}",
             reason=DecisionReason(
                 type="exception",
                 code=type(exc).__name__,
@@ -575,8 +554,49 @@ async def _legacy_wrapper_to_outcome(
             retryable=False,
         )
 
-    content_str = result if isinstance(result, str) else str(result)
-    return AllowSuccess(content=content_str)
+    if not isinstance(tool_msg, ToolMessage):
+        return AllowError(
+            content=f"工具 '{tool.name}' 返回非 ToolMessage 类型: {type(tool_msg).__name__}",
+            reason=DecisionReason(
+                type="exception",
+                code="wrong_ainvoke_shape",
+                message=(
+                    "Expected ToolMessage from tool.ainvoke(ToolCall dict); "
+                    f"got {type(tool_msg).__name__}"
+                ),
+            ),
+            retryable=False,
+        )
+
+    if isinstance(tool_msg.content, str) and len(tool_msg.content) > _MAX_WRAPPER_OUTPUT_BYTES:
+        return AllowError(
+            content=(
+                f"工具 '{tool.name}' 输出超长 "
+                f"({len(tool_msg.content)} bytes > {_MAX_WRAPPER_OUTPUT_BYTES})"
+            ),
+            reason=DecisionReason(
+                type="exception",
+                code="wrapper_output_too_large",
+                message=f"{len(tool_msg.content)} bytes",
+            ),
+            retryable=False,
+        )
+
+    try:
+        return TOOL_OUTCOME_ADAPTER.validate_python(tool_msg.artifact)
+    except Exception as exc:
+        return AllowError(
+            content=(
+                f"工具 '{tool.name}' artifact 非 ToolOutcome variant: "
+                f"{type(tool_msg.artifact).__name__}"
+            ),
+            reason=DecisionReason(
+                type="exception",
+                code="invalid_tool_outcome_artifact",
+                message=str(exc),
+            ),
+            retryable=False,
+        )
 
 
 def build_react_graph(

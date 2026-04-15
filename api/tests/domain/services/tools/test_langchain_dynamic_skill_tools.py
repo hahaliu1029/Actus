@@ -3,9 +3,9 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from langchain_core.tools import StructuredTool, ToolException
+from langchain_core.tools import StructuredTool
 
-from app.domain.models.tool_result import ToolResult
+from app.domain.models.tool_result import AllowError, AllowSuccess, DecisionReason
 
 pytestmark = pytest.mark.anyio
 
@@ -105,7 +105,7 @@ class TestMultipleToolsIndependentClosures:
             required=["y"],
         )
         mock = _make_skill_tool_mock([schema_a, schema_b])
-        mock.invoke.return_value = ToolResult(success=True, message="ok", data=None)
+        mock.invoke.return_value = AllowSuccess(content="ok")
 
         tools = create_dynamic_skill_langchain_tools(mock)
         assert len(tools) == 2
@@ -136,21 +136,18 @@ class TestInvokeDelegatesToSkillTool:
             required=["code"],
         )
         mock = _make_skill_tool_mock([schema])
-        mock.invoke.return_value = ToolResult(
-            success=True, message="executed", data={"output": "42"}
+        mock.invoke.return_value = AllowSuccess(
+            content="executed", data={"output": "42"}
         )
 
         tools = create_dynamic_skill_langchain_tools(mock)
         result = await tools[0].ainvoke({"code": "print(42)"})
 
         mock.invoke.assert_awaited_once_with("skill_test_run", code="print(42)")
-        # Result should be JSON string from model_dump_json
-        assert "executed" in result
-        assert "42" in result
+        assert result == "executed"
 
-
-class TestFailedInvokeRaisesToolException:
-    async def test_failed_invoke_raises_tool_exception(self):
+class TestFailedInvokeReturnsAllowErrorContent:
+    async def test_failed_invoke_returns_error_content(self):
         from app.domain.services.tools.langchain_dynamic_skill_tools import (
             create_dynamic_skill_langchain_tools,
         )
@@ -162,13 +159,18 @@ class TestFailedInvokeRaisesToolException:
             required=["q"],
         )
         mock = _make_skill_tool_mock([schema])
-        mock.invoke.return_value = ToolResult(
-            success=False, message="Something went wrong"
+        mock.invoke.return_value = AllowError(
+            content="Something went wrong",
+            reason=DecisionReason(
+                type="exception",
+                code="skill_runtime_error",
+                message="Something went wrong",
+            ),
         )
 
         tools = create_dynamic_skill_langchain_tools(mock)
-        with pytest.raises(ToolException, match="Something went wrong"):
-            await tools[0].ainvoke({"q": "test"})
+        result = await tools[0].ainvoke({"q": "test"})
+        assert result == "Something went wrong"
 
 
 class TestOptionalParamsDefaultNone:
@@ -187,7 +189,7 @@ class TestOptionalParamsDefaultNone:
             required=["query"],  # 'limit' is optional
         )
         mock = _make_skill_tool_mock([schema])
-        mock.invoke.return_value = ToolResult(success=True, message="ok")
+        mock.invoke.return_value = AllowSuccess(content="ok")
 
         tools = create_dynamic_skill_langchain_tools(mock)
 

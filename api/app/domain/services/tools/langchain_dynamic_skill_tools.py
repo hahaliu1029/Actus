@@ -18,9 +18,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
-from langchain_core.tools import StructuredTool, ToolException
+from langchain_core.tools import StructuredTool
 from pydantic import Field, create_model
 
+from app.domain.models.tool_result import ToolOutcome
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
@@ -48,11 +49,9 @@ def _make_skill_invoke(skill_tool: "SkillTool", tool_name: str):
     when creating callables inside a ``for`` loop.
     """
 
-    async def _invoke(**kwargs: Any) -> str:
-        result = await skill_tool.invoke(tool_name, **kwargs)
-        if not result.success:
-            raise ToolException(result.message or f"Tool '{tool_name}' failed")
-        return result.model_dump_json()
+    async def _invoke(**kwargs: Any) -> tuple[str, ToolOutcome]:
+        outcome = await skill_tool.invoke(tool_name, **kwargs)
+        return outcome.content, outcome
 
     return _invoke
 
@@ -113,6 +112,7 @@ def create_dynamic_skill_langchain_tools(
                 name=name,
                 description=description,
                 args_schema=args_model,
+                response_format="content_and_artifact",
             )
             tools.append(lc_tool)
 

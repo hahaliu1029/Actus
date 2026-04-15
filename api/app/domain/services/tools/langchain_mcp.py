@@ -16,6 +16,7 @@ from typing import Any, Literal, Optional, Union
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
 
+from app.domain.models.tool_result import AllowError, AllowSuccess, DecisionReason, ToolOutcome
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
@@ -163,7 +164,7 @@ def _make_mcp_coroutine(
 ):
     """为每个 MCP tool 创建独立的协程，通过闭包绑定 tool_name。"""
 
-    async def _invoke(**kwargs: Any) -> str:
+    async def _invoke(**kwargs: Any) -> tuple[str, ToolOutcome]:
         # Resolve sandbox paths → presigned URLs before calling MCP server
         if url_map_ref is not None:
             try:
@@ -174,17 +175,69 @@ def _make_mcp_coroutine(
             except Exception:
                 pass  # Don't break tool call if resolution fails
 
-        result = await mcp_tool.invoke(tool_name, **kwargs)
-        # Raise on failure so the caller detects errors structurally
+        try:
+            result = await mcp_tool.invoke(tool_name, **kwargs)
+        except TimeoutError as exc:
+            outcome = AllowError(
+                content=f"MCP 工具 '{tool_name}' 超时: {exc}",
+                reason=DecisionReason(
+                    type="timeout",
+                    code="mcp_client_timeout",
+                    message=str(exc),
+                ),
+                retryable=True,
+            )
+            return outcome.content, outcome
+        except (ConnectionError, OSError) as exc:
+            outcome = AllowError(
+                content=f"MCP 连接失败: {exc}",
+                reason=DecisionReason(
+                    type="exception",
+                    code=type(exc).__name__,
+                    message=str(exc),
+                ),
+                retryable=True,
+            )
+            return outcome.content, outcome
+        except Exception as exc:
+            outcome = AllowError(
+                content=f"MCP 工具 '{tool_name}' 内部异常: {exc}",
+                reason=DecisionReason(
+                    type="exception",
+                    code=type(exc).__name__,
+                    message=str(exc),
+                ),
+            )
+            return outcome.content, outcome
+
         if hasattr(result, "success") and not result.success:
-            raise RuntimeError(getattr(result, "message", None) or str(result))
+            message = getattr(result, "message", None) or "MCP 工具执行失败"
+            outcome = AllowError(
+                content=message,
+                reason=DecisionReason(
+                    type="exception",
+                    code="mcp_tool_error",
+                    message=message,
+                ),
+            )
+            return outcome.content, outcome
+
         if hasattr(result, "message") and result.message:
-            return result.message
-        if hasattr(result, "data") and result.data:
-            # Return string data as-is; only JSON-encode non-string data
-            # (dicts, lists) to avoid double-encoding strings with json.dumps
-            return result.data if isinstance(result.data, str) else json.dumps(result.data)
-        return str(result)
+            content = result.message
+        elif hasattr(result, "data") and result.data is not None:
+            content = (
+                result.data
+                if isinstance(result.data, str)
+                else json.dumps(result.data, ensure_ascii=False)
+            )
+        else:
+            content = str(result)
+
+        outcome = AllowSuccess(
+            content=content,
+            data=result.data if hasattr(result, "data") and isinstance(result.data, dict) else None,
+        )
+        return outcome.content, outcome
 
     return _invoke
 
@@ -231,6 +284,7 @@ def create_mcp_langchain_tools(
                 name=name,
                 description=description,
                 args_schema=args_schema,
+                response_format="content_and_artifact",
             )
             tools.append(tool)
         except Exception:

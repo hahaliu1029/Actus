@@ -6,7 +6,7 @@ import copy
 import pytest
 
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
-from app.domain.models.tool_result import ToolResult
+from app.domain.models.tool_result import AllowError, AllowSuccess, Asked, ToolResult
 from app.domain.services.tools.skill import SkillTool
 
 pytestmark = pytest.mark.anyio
@@ -215,7 +215,7 @@ async def test_native_skill_executes_entry_command() -> None:
 
     result = await skill_tool.invoke("skill_demo_native_run_demo", target="hello")
 
-    assert result.success is True
+    assert isinstance(result, AllowSuccess)
     assert sandbox.calls
     _, _, command = sandbox.calls[0]
     assert "echo demo" in command
@@ -240,7 +240,7 @@ async def test_native_defaults_exec_dir_to_skill_directory_when_missing() -> Non
     function_name = skill_tool.get_tools()[0]["function"]["name"]
     result = await skill_tool.invoke(function_name, topic="deck")
 
-    assert result.success is True
+    assert isinstance(result, AllowSuccess)
     assert sandbox.calls
     _, exec_dir, _ = sandbox.calls[0]
     assert exec_dir == "/home/ubuntu/workspace/.skills/pptx--1234abcd"
@@ -276,7 +276,7 @@ async def test_native_waits_for_sync_before_execute() -> None:
     gate.set()
     result = await invoke_task
 
-    assert result.success is True
+    assert isinstance(result, AllowSuccess)
     assert sync_manager.calls == ["pptx--1234abcd"]
     assert sandbox.calls
 
@@ -301,8 +301,8 @@ async def test_native_returns_error_when_sync_failed() -> None:
     function_name = skill_tool.get_tools()[0]["function"]["name"]
     result = await skill_tool.invoke(function_name, topic="deck")
 
-    assert result.success is False
-    assert "同步失败" in (result.message or "")
+    assert isinstance(result, AllowError)
+    assert "同步失败" in result.content
     assert not sandbox.calls
 
 
@@ -328,7 +328,7 @@ async def test_native_explicit_exec_dir_not_overridden() -> None:
     function_name = skill_tool.get_tools()[0]["function"]["name"]
     result = await skill_tool.invoke(function_name, topic="deck")
 
-    assert result.success is True
+    assert isinstance(result, AllowSuccess)
     assert sandbox.calls
     _, exec_dir, _ = sandbox.calls[0]
     assert exec_dir == "/tmp/custom-skill-dir"
@@ -365,7 +365,7 @@ async def test_mcp_skill_delegates_to_mcp_tool() -> None:
     await skill_tool.initialize([skill])
     result = await skill_tool.invoke("skill_demo_mcp_route", query="q")
 
-    assert result.success is True
+    assert isinstance(result, AllowSuccess)
     assert mcp_tool.called == ("mcp_demo_route", {"query": "q"})
 
 
@@ -400,8 +400,56 @@ async def test_a2a_skill_delegates_to_a2a_tool() -> None:
     await skill_tool.initialize([skill])
     result = await skill_tool.invoke("skill_demo_a2a_delegate", query="hello")
 
-    assert result.success is True
+    assert isinstance(result, AllowSuccess)
     assert a2a_tool.called == ("agent-1", "hello")
+
+
+async def test_skill_risk_enforce_high_risk_returns_asked() -> None:
+    skill_tool = SkillTool(
+        sandbox=_FakeSandbox(),
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        risk_mode="enforce_confirmation",
+    )
+    skill = _build_native_skill()
+    skill.manifest["tools"][0]["policy"] = {"risk_level": "high"}
+
+    await skill_tool.initialize([skill])
+    result = await skill_tool.invoke("skill_demo_native_run_demo", target="hello")
+
+    assert isinstance(result, Asked)
+    assert result.reason.type == "risk_enforce"
+
+
+async def test_skill_risk_enforce_off_returns_success() -> None:
+    skill_tool = SkillTool(
+        sandbox=_FakeSandbox(),
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        risk_mode="off",
+    )
+    skill = _build_native_skill()
+
+    await skill_tool.initialize([skill])
+    result = await skill_tool.invoke("skill_demo_native_run_demo", target="hello")
+
+    assert isinstance(result, AllowSuccess)
+
+
+async def test_skill_risk_enforce_low_risk_returns_success() -> None:
+    skill_tool = SkillTool(
+        sandbox=_FakeSandbox(),
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        risk_mode="enforce_confirmation",
+    )
+    skill = _build_native_skill()
+    skill.manifest["tools"][0]["policy"] = {"risk_level": "low"}
+
+    await skill_tool.initialize([skill])
+    result = await skill_tool.invoke("skill_demo_native_run_demo", target="hello")
+
+    assert isinstance(result, AllowSuccess)
 
 
 async def test_skill_tool_normalizes_and_shortens_function_name() -> None:

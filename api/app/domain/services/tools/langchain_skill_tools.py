@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from langchain_core.tools import StructuredTool, tool as lc_tool
 
+from app.domain.models.tool_result import AllowError, AllowSuccess, DecisionReason, ToolOutcome
 from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
@@ -33,6 +34,22 @@ if TYPE_CHECKING:
     from app.domain.models.skill import Skill
 
 logger = logging.getLogger(__name__)
+
+
+def _legacy_tool_result_to_outcome(result) -> ToolOutcome:
+    if hasattr(result, "success") and not result.success:
+        message = getattr(result, "message", None) or str(result)
+        return AllowError(
+            content=message,
+            reason=DecisionReason(
+                type="exception",
+                code="skill_creator_error",
+                message=message,
+            ),
+        )
+    content = result.model_dump_json() if hasattr(result, "model_dump_json") else str(result)
+    data = result.data if hasattr(result, "data") and isinstance(result.data, dict) else None
+    return AllowSuccess(content=content, data=data)
 
 
 def create_skill_langchain_tools(
@@ -47,24 +64,25 @@ def create_skill_langchain_tools(
 
     if brainstorm_skill_tool is not None:
 
-        @lc_tool
-        async def brainstorm_skill(description: str) -> str:
+        @lc_tool(response_format="content_and_artifact")
+        async def brainstorm_skill(description: str) -> tuple[str, ToolOutcome]:
             """根据需求描述生成 Skill 蓝图预览（名称、工具列表、参数、依赖），供用户确认后再正式创建。"""
             result = await brainstorm_skill_tool.invoke(
                 "brainstorm_skill", description=description,
             )
-            return result.model_dump_json()
+            outcome = _legacy_tool_result_to_outcome(result)
+            return outcome.content, outcome
 
         tools.append(brainstorm_skill)
 
     if create_skill_tool is not None:
 
-        @lc_tool
+        @lc_tool(response_format="content_and_artifact")
         async def generate_skill(
             description: str,
             blueprint: Optional[dict] = None,
             blueprint_json: Optional[str] = "",
-        ) -> str:
+        ) -> tuple[str, ToolOutcome]:
             """生成 Skill 代码并在沙箱验证。返回生成结果和验证状态，不自动安装。用户确认后再调用 install_skill 完成安装。"""
             kwargs: dict = {"description": description}
             if blueprint is not None:
@@ -72,15 +90,17 @@ def create_skill_langchain_tools(
             if blueprint_json:
                 kwargs["blueprint_json"] = blueprint_json
             result = await create_skill_tool.invoke("generate_skill", **kwargs)
-            return result.model_dump_json()
+            outcome = _legacy_tool_result_to_outcome(result)
+            return outcome.content, outcome
 
-        @lc_tool
-        async def install_skill(skill_data: str) -> str:
+        @lc_tool(response_format="content_and_artifact")
+        async def install_skill(skill_data: str) -> tuple[str, ToolOutcome]:
             """安装已生成并验证通过的 Skill。传入 generate_skill 返回的 data.skill_data JSON 字符串。"""
             result = await create_skill_tool.invoke(
                 "install_skill", skill_data=skill_data,
             )
-            return result.model_dump_json()
+            outcome = _legacy_tool_result_to_outcome(result)
+            return outcome.content, outcome
 
         tools.append(generate_skill)
         tools.append(install_skill)
@@ -175,23 +195,29 @@ def create_skill_guide_tool(
         base = f"# {skill.name}\n\n{guide}"
         return f"{base}\n\n{resources}" if resources else base
 
-    async def _get_skill_guide(skill_slug: str) -> str:
+    async def _get_skill_guide(skill_slug: str) -> tuple[str, ToolOutcome]:
         pool = skill_pool_ref()
         slug_lower = skill_slug.strip().lower()
         for skill in pool:
             if (skill.slug or "").lower() == slug_lower:
                 guide = _extract_guide_body(skill)
                 logger.info("[SkillGuide] Loaded guide for '%s' (%d chars)", skill.slug, len(guide))
-                return _format_result(skill, guide)
+                content = _format_result(skill, guide)
+                outcome = AllowSuccess(content=content)
+                return outcome.content, outcome
         # Fallback: match by name
         for skill in pool:
             if (skill.name or "").lower() == slug_lower:
                 guide = _extract_guide_body(skill)
                 logger.info("[SkillGuide] Loaded guide for '%s' (by name, %d chars)", skill.name, len(guide))
-                return _format_result(skill, guide)
+                content = _format_result(skill, guide)
+                outcome = AllowSuccess(content=content)
+                return outcome.content, outcome
         available = [s.slug for s in pool if s.slug]
         available_str = ", ".join(available) if available else "(none)"
-        return f"Skill '{skill_slug}' not found. Available skills: {available_str}"
+        content = f"Skill '{skill_slug}' not found. Available skills: {available_str}"
+        outcome = AllowSuccess(content=content)
+        return outcome.content, outcome
 
     get_skill_guide = StructuredTool.from_function(
         coroutine=_get_skill_guide,
@@ -201,6 +227,7 @@ def create_skill_guide_tool(
             "当 Active Skills 中的简短描述不够用时，调用此工具获取详细的操作步骤、代码示例和最佳实践。"
             "传入 skill 的 slug（括号中的标识符，如 'xlsx'、'frontend-design'）。"
         ),
+        response_format="content_and_artifact",
     )
     annotate_and_register_tool_source(get_skill_guide, source="skill", category="skill guide")
     return get_skill_guide

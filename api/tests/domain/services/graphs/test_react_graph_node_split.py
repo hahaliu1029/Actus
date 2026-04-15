@@ -35,6 +35,7 @@ from langchain_core.tools import tool as langchain_tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+from app.domain.models.tool_result import AllowSuccess
 from app.domain.services.risk_assessor import (
     RiskAssessment,
     RiskAssessor,
@@ -120,10 +121,12 @@ def _make_mock_llm(tool_calls_batch: list[dict], done_content: str = "done"):
 
 
 def _make_write_tool(name: str, spy: _Spy):
-    @langchain_tool
-    async def _write(message: str) -> str:
+    @langchain_tool(response_format="content_and_artifact")
+    async def _write(message: str):
         """A non-risky write tool that records side effects."""
-        return spy(message=message)
+        content = spy(message=message)
+        outcome = AllowSuccess(content=content)
+        return outcome.content, outcome
 
     _write.name = name
     annotate_and_register_tool_source(_write, source="native", category="message")
@@ -131,10 +134,12 @@ def _make_write_tool(name: str, spy: _Spy):
 
 
 def _make_risk_tool(name: str, spy: _Spy):
-    @langchain_tool
-    async def _risk(action: str) -> str:
+    @langchain_tool(response_format="content_and_artifact")
+    async def _risk(action: str):
         """A risky tool that should trigger interrupt_helper."""
-        return spy(action=action)
+        content = spy(action=action)
+        outcome = AllowSuccess(content=content)
+        return outcome.content, outcome
 
     _risk.name = name
     _risk.metadata = {"risk_level": "high"}

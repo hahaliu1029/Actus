@@ -215,7 +215,7 @@ class TestShellExecuteStatusHandling:
         result = await shell.ainvoke({"command": "echo hello"})
         assert result == "hello"
 
-    async def test_sandbox_failure_raises_runtime_error(self, mock_browser, mock_search_engine):
+    async def test_sandbox_failure_returns_error_content(self, mock_browser, mock_search_engine):
         sandbox = AsyncMock()
         sandbox.exec_command = AsyncMock(
             return_value=ToolResult(success=False, message="sandbox unreachable", data=None)
@@ -224,8 +224,8 @@ class TestShellExecuteStatusHandling:
         tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
-        with pytest.raises(RuntimeError, match="sandbox unreachable"):
-            await shell.ainvoke({"command": "ls"})
+        result = await shell.ainvoke({"command": "ls"})
+        assert result == "sandbox unreachable"
 
     async def test_wait_seconds_is_clamped_to_max(self, mock_browser, mock_search_engine):
         sandbox = AsyncMock()

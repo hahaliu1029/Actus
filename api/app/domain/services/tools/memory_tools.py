@@ -7,6 +7,7 @@ from langchain_core.tools import BaseTool, tool as lc_tool
 from pydantic import BaseModel, Field
 
 from app.domain.external.embedding_provider import EmbeddingUnavailableError
+from app.domain.models.tool_result import AllowSuccess, ToolOutcome
 from app.domain.services.memory_ranker import rank_memory_results
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
@@ -37,16 +38,18 @@ def create_memory_tools(
     """Create memory search and get tools with closed-over dependencies."""
     CANDIDATE_MULTIPLIER = 3
 
-    @lc_tool(args_schema=MemorySearchInput)
-    async def memory_search(query: str, max_results: int = 5) -> str:
+    @lc_tool(args_schema=MemorySearchInput, response_format="content_and_artifact")
+    async def memory_search(query: str, max_results: int = 5) -> tuple[str, ToolOutcome]:
         """搜索历史记忆。当需要回忆之前的对话、查找历史上下文时使用。"""
         try:
             vectors = await embedding_provider.embed([query])
             embedding = vectors[0]
         except EmbeddingUnavailableError as e:
-            return f"记忆检索暂不可用（embedding 服务异常: {e}）"
+            outcome = AllowSuccess(content=f"记忆检索暂不可用（embedding 服务异常: {e}）")
+            return outcome.content, outcome
         except Exception as e:
-            return f"记忆检索失败（{type(e).__name__}: {e}）"
+            outcome = AllowSuccess(content=f"记忆检索失败（{type(e).__name__}: {e}）")
+            return outcome.content, outcome
 
         async with session_factory() as session:
             repo = repo_factory(session)
@@ -57,7 +60,8 @@ def create_memory_tools(
             )
 
         if not chunks:
-            return "未找到相关记忆。"
+            outcome = AllowSuccess(content="未找到相关记忆。")
+            return outcome.content, outcome
 
         chunks = rank_memory_results(
             chunks,
@@ -68,28 +72,28 @@ def create_memory_tools(
         )
 
         if not chunks:
-            return "未找到相关记忆。"
+            outcome = AllowSuccess(content="未找到相关记忆。")
+            return outcome.content, outcome
 
         lines = []
         for i, c in enumerate(chunks, 1):
             preview = c.content[:500] + ("..." if len(c.content) > 500 else "")
             lines.append(f"[{i}] (id: {c.id}, source: {c.source})\n{preview}")
-        return "\n\n".join(lines)
+        outcome = AllowSuccess(content="\n\n".join(lines))
+        return outcome.content, outcome
 
-    @lc_tool
-    async def memory_get(chunk_id: str) -> str:
+    @lc_tool(response_format="content_and_artifact")
+    async def memory_get(chunk_id: str) -> tuple[str, ToolOutcome]:
         """读取记忆片段完整内容。在 memory_search 后用 ID 获取完整文本。"""
         async with session_factory() as session:
             repo = repo_factory(session)
             chunk = await repo.get_by_id(chunk_id, user_id=user_id)
 
         if not chunk:
-            return f"记忆片段 {chunk_id} 不存在。"
-        return chunk.content
-
-    # Optional safety net (main error handling is in react_graph.py tool_node)
-    memory_search.handle_tool_error = True
-    memory_get.handle_tool_error = True
+            outcome = AllowSuccess(content=f"记忆片段 {chunk_id} 不存在。")
+            return outcome.content, outcome
+        outcome = AllowSuccess(content=chunk.content)
+        return outcome.content, outcome
 
     tools = [memory_search, memory_get]
     for t in tools:
