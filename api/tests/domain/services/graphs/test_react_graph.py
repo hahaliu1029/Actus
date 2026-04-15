@@ -104,8 +104,15 @@ class TestBuildReactGraph:
         assert len(tool_events) >= 1
 
     async def test_tool_failure_marks_error(self):
-        """When a tool raises an exception, the tool message should be prefixed
-        with [TOOL_ERROR] and the ToolEvent should have success=False."""
+        """When a tool raises an exception, ToolMessage.status='error' and
+        ToolEvent should have success=False.
+
+        R2 CS2: Layer 3 sets ``ToolMessage.status="error"`` instead of
+        prepending ``[TOOL_ERROR]`` text. The LLM adapter (Chunk 4 / Task
+        33) injects the typed ``[TOOL_FAILED: exception]`` prefix at
+        serialization time based on status + artifact. During the Commit
+        1 window the ToolMessage content has no prefix at all.
+        """
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
         from app.domain.services.graphs.react_graph import build_react_graph
@@ -161,14 +168,14 @@ class TestBuildReactGraph:
         assert any(not e.function_result.success for e in called_events), \
             "Expected at least one CALLED ToolEvent with success=False"
 
-        # Verify tool message is prefixed with [TOOL_ERROR]
+        # R2 CS2: ToolMessage.status is 'error' (was "[TOOL_ERROR]" prefix pre-R2)
         tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
-        assert any("[TOOL_ERROR]" in m.content for m in tool_msgs), \
-            "Expected tool message to contain [TOOL_ERROR] prefix"
+        assert any(m.status == "error" for m in tool_msgs), \
+            "Expected tool message to have status='error' (R2 CS2)"
 
     async def test_tool_result_success_false_detected(self):
-        """When a tool raises an exception (from _unwrap on ToolResult.success=False),
-        the system should detect it and mark the ToolEvent accordingly."""
+        """When a tool raises an exception, the system should mark the ToolEvent
+        accordingly and the ToolMessage.status='error' (R2 CS2)."""
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
         from app.domain.services.graphs.react_graph import build_react_graph
@@ -217,9 +224,9 @@ class TestBuildReactGraph:
         ]
         assert any(not e.function_result.success for e in called_events)
 
-        # Tool message should be prefixed with [TOOL_ERROR]
+        # R2 CS2: ToolMessage.status is 'error' (was "[TOOL_ERROR]" prefix pre-R2)
         tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
-        assert any("[TOOL_ERROR]" in m.content for m in tool_msgs)
+        assert any(m.status == "error" for m in tool_msgs)
 
 
 class TestToolNodeTruncation:

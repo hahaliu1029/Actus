@@ -9,18 +9,20 @@ Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.3-4
 
 from __future__ import annotations
 
+import asyncio
 import base64 as _b64
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, Literal, NamedTuple, TYPE_CHECKING
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages.tool import ToolCall
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import RetryPolicy, interrupt
+from langgraph.types import Command, RetryPolicy, interrupt
 
 from app.application.errors.exceptions import ServerRequestsError
 from app.domain.external.file_processor import FileProcessResult
@@ -31,10 +33,26 @@ from app.domain.models.event import (
     ToolEvent,
     ToolEventStatus,
 )
-from app.domain.models.tool_result import ToolResult
+from app.domain.models.tool_result import (
+    AllowError,
+    AllowSuccess,
+    Asked,
+    DecisionReason,
+    Denied,
+    FileBlock,
+    FilePayload,
+    ImageUrlBlock,
+    ImageUrlPayload,
+    MultimodalPayload,
+    Passthrough,
+    TextBlock,
+    ToolArtifact,
+    ToolOutcome,
+    ToolResult,
+)
 from app.domain.services.json_envelope import unwrap_message_envelope
 from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
-from app.domain.services.tools.tool_source_resolver import resolve_tool_source
+from app.domain.services.tools.tool_source_resolver import ToolSource, resolve_tool_source
 
 from .message_utils import truncate_tool_content
 from .state import ReactGraphState
@@ -133,12 +151,441 @@ def _extract_shell_images(result_str: str) -> tuple[str, list[dict]]:
     return "".join(cleaned_parts), image_blocks
 
 
+# ============================================================
+# R2 CS2 PR-B Commit 1 — tool_node helpers (Layer 1 / 2 / 3)
+# ============================================================
+#
+# Layer 1 dependency slots are Commit 1 stubs. Task 13 (tool_node dispatcher
+# rewrite) wires the real services from ``configurable`` (approval_cache,
+# summary_llm) into the policy chain. Task 44 replaces the timeout constants
+# with injected ``ToolRuntimeConfig`` values.
+
+_SMART_APPROVE_TIMEOUT_SECONDS = 15
+_MAX_WRAPPER_OUTPUT_BYTES = 1 << 20  # 1 MiB
+
+
+class _SessionContext(NamedTuple):
+    """Lightweight per-invocation context passed into Layer 1/2/3 helpers.
+
+    Constructed by the tool_node dispatcher from ``configurable``. Kept
+    narrow on purpose: only fields actually needed by policy stages live
+    here, so the helpers stay easy to test in isolation.
+    """
+
+    session_id: str
+    user_id: str
+
+
+def _is_shell_category(tool_source: ToolSource) -> bool:
+    """Stage S applies only to native shell tools.
+
+    N1 may extend this to include ``native skill shell`` once skill tools
+    that shell out are covered. For Commit 1 only native shell qualifies.
+    """
+    return tool_source.source == "native" and tool_source.category == "shell"
+
+
+def _smart_approve_applies(tool_source: ToolSource, tool_call: ToolCall) -> bool:
+    """Whether Stage P.2 (SmartApprove) should run for this tool.
+
+    Commit 1 stub always returns True so the happy-path test exercises
+    the full S → P.1 → P.2 → None chain. Task 13 replaces this with the
+    real risk-level check (mirrors the existing ``risk_level`` metadata
+    gate at react_graph.py:443-448).
+    """
+    return True
+
+
+async def _stage_s_ast_validate(
+    tool_call: ToolCall,
+) -> ToolOutcome | None:
+    """Stage S: shell AST validator.
+
+    Commit 1 stub returns None (allow). N1 will replace with real
+    ``shell_ast_validator.validate(tool_call.args)`` call that produces
+    a ``Denied(reason=ast_validator)`` on unsafe patterns.
+    """
+    return None
+
+
+async def _stage_p1_approval_cache_check(
+    session_ctx: _SessionContext,
+    tool_call: ToolCall,
+) -> ToolOutcome | Literal["policy_allow"] | None:
+    """Stage P.1: ApprovalCache (Redis).
+
+    Commit 1 stub returns None (no cached decision). Task 13 replaces
+    with ``configurable['approval_cache'].check(...)``.
+
+    Returns:
+      - ``Denied | Asked`` — user has already decided, short-circuit
+      - ``"policy_allow"`` — user pre-allowed, skip SmartApprove
+      - ``None`` — no cached decision, continue chain
+    """
+    return None
+
+
+async def _stage_p2_smart_approve(
+    tool_call: ToolCall,
+    session_ctx: _SessionContext,
+) -> ToolOutcome | None:
+    """Stage P.2: SmartApprove LLM evaluation.
+
+    Commit 1 stub returns None. Task 13 replaces with
+    ``SmartApprove(llm=configurable['summary_llm']).evaluate(...)``.
+    """
+    return None
+
+
+async def _run_policy_chain(
+    tool_call: ToolCall,
+    tool: BaseTool,
+    tool_source: ToolSource,
+    session_ctx: _SessionContext,
+) -> ToolOutcome | None:
+    """Stage-based Layer 1 policy evaluation.
+
+    Returns None iff all stages allow (wrapper should run). Otherwise
+    returns a ``Denied`` / ``Asked`` / ``AllowError`` that short-circuits
+    Layer 2.
+
+    Stage-level exception handling:
+    - **Stage S crash → AllowError (fail-closed)**. Shell AST is a safety
+      gate; crashing it must NOT fall through to wrapper execution.
+    - **Stage P.1 crash (e.g., Redis down) → fail-open**. Redis outages
+      shouldn't block every tool call. Log + continue.
+    - **Stage P.2 timeout/crash → fail-open**. SmartApprove is optional
+      reinforcement; its failure mustn't hold up the happy path.
+
+    Layer 1 only produces ``Denied/Asked/AllowError``; ``AllowSuccess``
+    and ``Passthrough`` come from Layer 2 (wrapper).
+    """
+    # Stage S: Safety (shell AST validator, native shell only)
+    if _is_shell_category(tool_source):
+        try:
+            ast_outcome = await _stage_s_ast_validate(tool_call)
+        except Exception as exc:
+            logger.exception("Stage S AST validator crashed for %s", tool_call["name"])
+            return AllowError(
+                content=f"AST validator 内部异常: {exc}",
+                reason=DecisionReason(
+                    type="exception",
+                    code="layer1_ast_crash",
+                    message=str(exc),
+                ),
+                retryable=False,
+            )
+        if ast_outcome is not None:
+            return ast_outcome
+
+    # Stage P.1: ApprovalCache (Redis)
+    try:
+        cached = await _stage_p1_approval_cache_check(session_ctx, tool_call)
+    except Exception:
+        logger.exception(
+            "Stage P.1 ApprovalCache crashed for %s (fail-open)", tool_call["name"]
+        )
+        cached = None
+    if isinstance(cached, (Denied, Asked)):
+        return cached
+    if cached == "policy_allow":
+        return None  # User pre-allowed, skip Stage P.2
+
+    # Stage P.2: SmartApprove (LLM)
+    if _smart_approve_applies(tool_source, tool_call):
+        try:
+            smart = await asyncio.wait_for(
+                _stage_p2_smart_approve(tool_call, session_ctx),
+                timeout=_SMART_APPROVE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Stage P.2 SmartApprove timeout for %s (fail-open)", tool_call["name"]
+            )
+            smart = None
+        except Exception:
+            logger.exception(
+                "Stage P.2 SmartApprove crashed for %s (fail-open)", tool_call["name"]
+            )
+            smart = None
+        if isinstance(smart, (Denied, Asked)):
+            return smart
+
+    return None
+
+
+GuideInjector = Callable[[str], str | None]
+
+
+def _session_ctx_from(config: RunnableConfig | None) -> _SessionContext:
+    """Build a ``_SessionContext`` from the LangGraph ``RunnableConfig``.
+
+    Reads ``session_id`` / ``user_id`` from ``config['configurable']`` — the
+    same slots the existing react_graph code uses at
+    ``react_graph.py:451-452`` and ``agent_service.py``. Defaults to empty
+    strings when absent, matching pre-R2 behavior.
+    """
+    configurable = (config or {}).get("configurable", {}) if config else {}
+    return _SessionContext(
+        session_id=configurable.get("session_id") or "",
+        user_id=configurable.get("user_id") or "",
+    )
+
+
+def _interrupt_helper_early_return(
+    state: ReactGraphState,
+) -> Command[Literal["tool_node"]] | None:
+    """Defensive pre-check for ``interrupt_helper``.
+
+    Returns a ``Command(goto="tool_node", update={})`` if the node was
+    routed to without valid ``pending_ask_*`` state (should not happen
+    in normal flow), otherwise ``None`` to let the caller proceed to
+    the real ``interrupt()`` handshake.
+
+    Extracted as a module-level helper so the defensive branch can be
+    unit tested without driving the full graph — ``interrupt_helper``
+    itself is a closure inside ``build_react_graph`` and can only be
+    reached via a compiled graph.
+    """
+    pending_id = state.get("pending_ask_tool_call_id")
+    pending_artifact_dict = state.get("pending_ask_artifact")
+    if pending_id is None or pending_artifact_dict is None:
+        return Command(goto="tool_node", update={})
+    return None
+
+
+async def _translate_outcome(
+    outcome: ToolOutcome,
+    tool_call: ToolCall,
+    tool_source: ToolSource,
+    session_ctx: _SessionContext,
+    *,
+    tool_result_max_chars: int,
+    guide_injector: GuideInjector | None,
+) -> tuple[ToolMessage | None, list[HumanMessage], list[Any]]:
+    """Layer 3: convert ``ToolOutcome`` → ``ToolMessage`` + deferred ``HumanMessage`` list + events.
+
+    Returns ``(tool_msg, deferred_human_msgs, events)``:
+    - ``tool_msg`` is ``None`` **iff** the outcome is ``Asked`` (interrupt
+      path — the ``tool_node`` dispatcher should ``goto interrupt_helper``
+      and emit no ToolMessage yet).
+    - ``deferred_human_msgs`` is non-empty **only** on ``Passthrough`` —
+      multimodal content blocks must be re-emitted as a separate
+      ``HumanMessage`` because ``ToolMessage.artifact`` is a graph-side
+      side-channel that the LLM cannot read. The shape strictly matches
+      the existing ``react_graph.py:559-571`` deferred HumanMessage
+      pattern (I-4.4c) so downstream consumers
+      (``test_file_view_integration.py``, ``message_utils``,
+      ``main_graph._compact_messages``) keep working.
+    - ``events`` is the domain event list to emit via the bridge.
+
+    **NOT done in Layer 3**: ``[TOOL_FAILED] / [TOOL_DENIED]`` error-prefix
+    injection. That is the LLM adapter's job (Task 33/34, Commit 2b) and
+    lives in ``ActusChatModel._messages_for_api()`` /
+    ``ActusResponsesModel._messages_for_api()``. Layer 3 only sets
+    ``ToolMessage.status`` correctly and records the typed artifact.
+    """
+    del session_ctx  # accepted in signature for consistency; not used yet
+    artifact = ToolArtifact(
+        tool_call_id=tool_call["id"],
+        tool_name=tool_call["name"],
+        tool_source=tool_source,
+        outcome=outcome,
+    )
+    artifact_json = artifact.model_dump(mode="json", by_alias=True)
+    events: list[Any] = []
+    deferred: list[HumanMessage] = []
+
+    # Asked: interrupt path — no ToolMessage, caller routes to interrupt_helper.
+    #
+    # **_translate_outcome does NOT emit ToolConfirmationEvent** — that is
+    # the dispatcher's job. Rationale:
+    # - ``Asked.reason.type`` is a SOURCE taxonomy
+    #   (approval_policy / smart_approve / risk_enforce / ast_validator),
+    #   not a severity scale.
+    # - ``ToolConfirmationEvent.risk_level`` is a SEVERITY scale
+    #   (``high`` / ``medium`` / ``low``), and the existing legacy risk
+    #   gate at ``tool_node`` line ~933 populates it from
+    #   ``assessment.final_level.name.lower()`` alongside
+    #   ``matched_patterns`` and ``suggested_alternative``.
+    # - Frontend confirmation card styling and audit persistence depend on
+    #   the severity axis + patterns + alternative, none of which live on
+    #   ``Asked`` / ``ToolArtifact``.
+    #
+    # If ``_translate_outcome`` constructed the event itself, every future
+    # caller would have to hand-patch ``risk_level`` / ``matched_patterns``
+    # / ``suggested_alternative`` back in. Instead, return an empty event
+    # list on Asked and let the dispatcher emit the confirmation event
+    # with its own ``RiskAssessment`` (legacy gate) or its own
+    # Layer-1-specific context (Task 21 / Commit 2a).
+    if isinstance(outcome, Asked):
+        return None, deferred, events
+
+    # All other variants construct a ToolMessage. Step 1: content + guide.
+    final_content = outcome.content
+    success_variant = isinstance(outcome, (AllowSuccess, Passthrough))
+    if success_variant and guide_injector is not None:
+        guide = guide_injector(tool_call["name"])
+        if guide:
+            final_content = f"{final_content}\n\n---\n[Skill Guide]\n{guide}"
+
+    # Step 2: truncate (guide injected BEFORE truncation matches existing
+    # react_graph.py:794-799 order — I-4.4a / I-4.4b ordering invariant).
+    final_content = truncate_tool_content(final_content, tool_result_max_chars)
+
+    # Step 3: Variant → lc_status (side-channel to LLM adapter prefix logic)
+    lc_status: Literal["success", "error"]
+    if isinstance(outcome, (AllowSuccess, Passthrough)):
+        lc_status = "success"
+    elif isinstance(outcome, (AllowError, Denied)):
+        lc_status = "error"
+    else:
+        raise AssertionError(f"Unreachable ToolOutcome variant: {type(outcome).__name__}")
+
+    msg = ToolMessage(
+        content=final_content,
+        artifact=artifact_json,
+        status=lc_status,
+        tool_call_id=tool_call["id"],
+        name=tool_call["name"],
+    )
+    # R1/R2 convention: ToolEvent.tool_name stores the canonical CATEGORY
+    # (browser / search / shell / file / ...), NOT the literal tool name.
+    # AgentTaskRunner._handle_tool_event (agent_task_runner.py:2078) branches
+    # on event.tool_name to enrich browser screenshots / search results /
+    # etc., so emitting the actual tool_call name here would silently break
+    # the enrichment path. The literal tool name lives in function_name.
+    #
+    # ``function_result`` MUST be populated even on the Denied / AllowError
+    # paths — ``AgentTaskRunner._handle_tool_event`` reads
+    # ``event.function_result.message`` / ``.success`` / ``.data`` to enrich
+    # search / mcp / a2a / skill / file tool content. Without it, denied or
+    # timed-out tools surface on the frontend as "(MCP工具无可用结果)" /
+    # "(Skill工具无可用结果)" placeholders instead of the real rejection
+    # reason. Message uses ``final_content`` (already truncated + guide
+    # injected for success paths, already the Denied/AllowError text for
+    # failure paths).
+    _fn_result_success = isinstance(outcome, (AllowSuccess, Passthrough))
+    events.append(
+        ToolEvent(
+            tool_call_id=tool_call["id"],
+            tool_name=tool_source.category,
+            function_name=tool_call["name"],
+            function_args=tool_call["args"],
+            function_result=ToolResult(
+                success=_fn_result_success,
+                message=final_content,
+            ),
+            status=ToolEventStatus.CALLED,
+        )
+    )
+
+    # Step 4: Passthrough → emit deferred HumanMessage so LLM "sees"
+    # multimodal content. Strict 1:1 reuse of react_graph.py:810-823
+    # existing structure and text so downstream test_file_view_integration.py
+    # exact-match assertions still pass.
+    if isinstance(outcome, Passthrough):
+        blocks_capped = outcome.data.blocks[:_MAX_FILE_VIEW_IMAGES]
+        omitted = len(outcome.data.blocks) - len(blocks_capped)
+        human_content: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"[file_view: {tool_call['name']} — "
+                    f"{len(blocks_capped)} image(s) loaded]"
+                ),
+            }
+        ]
+        for block in blocks_capped:
+            human_content.append(block.model_dump(by_alias=True))
+        if omitted > 0:
+            human_content.append(
+                {
+                    "type": "text",
+                    "text": f"[... {omitted} more images omitted]",
+                }
+            )
+        deferred.append(HumanMessage(content=human_content))
+
+    return msg, deferred, events
+
+
+async def _invoke_wrapper(
+    tool: BaseTool,
+    tool_call: ToolCall,
+    tool_source: ToolSource,
+) -> ToolOutcome:
+    """Layer 2: invoke wrapper, return typed ``ToolOutcome``.
+
+    **Commit 1 version** (this function): delegates to
+    ``_legacy_wrapper_to_outcome`` because wrappers have not yet been
+    migrated to ``@tool(response_format="content_and_artifact")``.
+
+    **Commit 2a version** (Task 21): will call
+    ``tool.ainvoke(tool_call)`` on the raw ``ToolCall`` dict so LangChain
+    hands us back a ``ToolMessage`` whose ``.artifact`` is the typed
+    ``ToolOutcome`` produced by the wrapper. At that point the legacy
+    bridge is deleted.
+
+    ``tool_source`` is accepted in the signature now (not used yet) so the
+    Commit 2a migration can read tool identity without a signature change.
+    """
+    del tool_source  # Commit 1 stub: identity not consulted yet
+    return await _legacy_wrapper_to_outcome(tool, tool_call["args"])
+
+
+async def _legacy_wrapper_to_outcome(
+    tool: BaseTool,
+    args: dict,
+) -> ToolOutcome:
+    """TEMPORARY bridge for PR-B Commit 1 (Chunk 2).
+
+    Wraps the pre-R2 wrapper calling convention (``tool.ainvoke(args) → str``
+    or raise) into a ``ToolOutcome`` so Layer 2 (_invoke_wrapper) can consume
+    it uniformly while the wrapper migration is still pending.
+
+    This function is DELETED in PR-B Commit 2a (Task 21) once every wrapper
+    has been migrated to ``@tool(response_format="content_and_artifact")``
+    and returns ``(content, artifact)`` tuples directly.
+
+    NOTE: This bridge does not read multimodal_blocks; Passthrough variant is
+    not producible via this bridge. ``file_view`` tests relying on Passthrough
+    must wait until Commit 2a.
+    """
+    try:
+        result = await tool.ainvoke(args)
+    except asyncio.TimeoutError as exc:
+        return AllowError(
+            content=f"工具 '{tool.name}' 执行超时 (legacy bridge): {exc}",
+            reason=DecisionReason(
+                type="timeout",
+                code="legacy_bridge_timeout",
+                message=str(exc),
+            ),
+            retryable=True,
+        )
+    except Exception as exc:
+        return AllowError(
+            content=f"工具 '{tool.name}' 内部异常 (legacy bridge): {exc}",
+            reason=DecisionReason(
+                type="exception",
+                code=type(exc).__name__,
+                message=str(exc),
+            ),
+            retryable=False,
+        )
+
+    content_str = result if isinstance(result, str) else str(result)
+    return AllowSuccess(content=content_str)
+
+
 def build_react_graph(
     llm: BaseChatModel,
     tools: list[BaseTool],
     agent_config: AgentConfig | None = None,
     tool_result_max_chars: int = 8000,
     assembler: ContextAssembler | None = None,
+    checkpointer: Any = None,
 ) -> CompiledStateGraph:
     """Build and compile the inner ReAct loop graph.
 
@@ -147,6 +594,11 @@ def build_react_graph(
     llm : LangChain BaseChatModel — must support bind_tools.
     tools : List of LangChain tools.
     agent_config : Optional AgentConfig for iteration limits etc.
+    checkpointer : Optional LangGraph checkpointer (e.g. ``InMemorySaver``
+        for tests, ``AsyncPostgresSaver`` for production). When provided,
+        the graph supports ``interrupt()`` resume via
+        ``Command(resume=...)``. R2 Day-4 hard gate tests rely on
+        ``InMemorySaver`` to drive the interrupt_helper handshake.
     """
     # Build tool lookup
     tool_map: dict[str, BaseTool] = {t.name: t for t in tools}
@@ -242,22 +694,54 @@ def build_react_graph(
     # Shared risk assessor instance (stateless, safe to reuse)
     _risk_assessor = RiskAssessor()
 
-    async def tool_node(state: ReactGraphState, config: RunnableConfig) -> dict:
-        """Execute tool calls from the last assistant message.
+    async def tool_node(
+        state: ReactGraphState, config: RunnableConfig
+    ) -> Command[Literal["pre_llm_node", "interrupt_helper", "__end__"]]:
+        """R2 CS2 dispatcher (Commit 1) — executes tool calls from the last AIMessage.
 
-        Special handling for ``message_ask_user``:
-        - If ``suggest_user_takeover`` is "browser"/"shell" → set should_interrupt
-          (handled by confirmation_check, but also guard here).
-        - Otherwise, first call returns SOFT_HINT (agent should try to solve
-          autonomously). If a SOFT_HINT was already returned in this step
-          and the LLM calls again, it truly needs user input → interrupt.
+        ## Prefix-closure exactly-once (I-4.1)
 
-        Risk assessment gate for tools with ``risk_level`` metadata (high/medium):
-        - Runs RiskAssessor to evaluate dynamic risk.
-        - If final_level >= MEDIUM, emits ToolConfirmationEvent and calls
-          ``interrupt()`` to pause the graph until the user responds.
-        - Approved calls proceed to normal execution; denied/timed-out calls
-          return an error string without executing.
+        Every entry reads ``state.completed_tool_call_prefix`` and skips
+        tool_calls whose ``id`` is already in that set. After a successful batch
+        the prefix is reset to ``[]``. When the dispatcher routes to
+        ``interrupt_helper`` for an ``Asked`` outcome, it writes the
+        already-executed ids into ``completed_tool_call_prefix`` so the
+        post-resume replay only runs the pending + remaining tool_calls.
+
+        ## Pre-approved bypass (I-4.2 approve path)
+
+        Tool call ids in ``state.approved_tool_call_ids`` — populated by
+        ``interrupt_helper`` on the ``approve`` resume path — skip the
+        per-tool risk assessment gate on replay and execute directly. This is
+        the approve-resume bridge; ``ApprovalCache`` write is post-resume in
+        ``agent_service._resume_tool_confirmation``, so the dispatcher cannot
+        rely on the cache alone for the replay and needs this state flag.
+
+        ## Special handling for ``message_ask_user``
+
+        - ``suggest_user_takeover`` in {"browser", "shell"} → set
+          ``should_interrupt`` and short-circuit.
+        - Otherwise, first call returns ``SOFT_HINT`` (the agent should try
+          autonomously first); second call → truly needs user input, set
+          ``should_interrupt``.
+
+        ## Risk assessment gate (Commit 1 transitional)
+
+        For tools with ``risk_level`` in {"high", "medium"} the dispatcher
+        runs ``RiskAssessor``. When the assessment resolves to Asked, the
+        function **returns** ``Command(goto="interrupt_helper", update=...)``
+        after writing the ``pending_ask_*`` state fields. The dispatcher
+        itself **never** calls ``interrupt()``; that contract belongs
+        exclusively to ``interrupt_helper`` (CS2.13 invariant). Commit 2a
+        (Task 21) will replace this gate with the full Layer 1/2/3 pipeline
+        via ``_run_policy_chain`` / ``_invoke_wrapper`` / ``_translate_outcome``.
+
+        ## Return type
+
+        Always returns ``Command`` — either ``Command(goto="pre_llm_node",
+        update=...)`` on the happy path or ``Command(goto="interrupt_helper",
+        update=...)`` when a tool call reaches an Asked outcome. This
+        replaces the dict return + ``route_after_tool`` conditional edge.
         """
         import time as _time
         configurable = (config or {}).get("configurable", {}) if config else {}
@@ -270,20 +754,41 @@ def build_react_graph(
         # D5: Cooperative termination — set should_interrupt for routing
         _control = configurable.get("execution_control")
         if _control and _control.should_terminate:
-            return {
-                "should_interrupt": True,
-                "messages": [],
-                "events": [],
-            }
+            return Command(
+                goto=END,
+                update={
+                    "should_interrupt": True,
+                    "messages": [],
+                    "events": [],
+                },
+            )
 
         messages = state["messages"]
-        last_msg = messages[-1]
 
-        # AIMessage.tool_calls is a list of dicts with id/name/args
-        tool_calls = last_msg.tool_calls if isinstance(last_msg, AIMessage) else []
+        # R2 CS2 (I-4.1): find the AIMessage carrying the active tool_calls
+        # batch. On the happy path ``state.messages[-1]`` is that AIMessage.
+        # But on a replay following an ``interrupt_helper`` resume, the most
+        # recent message is a ``ToolMessage`` written in the first pass —
+        # the triggering AIMessage is further back. Search backward until
+        # we hit an AIMessage with tool_calls (or fall through to an empty
+        # batch if none is found, which triggers the happy-path return).
+        tool_calls: list[dict] = []
+        for _msg in reversed(messages):
+            if isinstance(_msg, AIMessage) and _msg.tool_calls:
+                tool_calls = _msg.tool_calls
+                break
 
         # Check if a SOFT_HINT was already returned in this step
         has_prior_soft_hint = state.get("soft_hint_sent", False)
+
+        # R2 CS2: prefix-closure + pre-approved bypass sets (I-4.1 / I-4.2)
+        already_done: set[str] = set(
+            state.get("completed_tool_call_prefix", []) or []
+        )
+        pre_approved: set[str] = set(
+            state.get("approved_tool_call_ids", []) or []
+        )
+        new_completed_ids: list[str] = []
 
         new_messages = []
         new_events = []
@@ -333,6 +838,16 @@ def build_react_graph(
             call_id = tc["id"]
             _tool_start = _time.monotonic()
 
+            # R2 CS2 (I-4.1): skip tool_calls already executed in a prior
+            # dispatcher entry — LangGraph replays the node on resume after
+            # every interrupt, and the prefix must not re-run.
+            if call_id in already_done:
+                continue
+
+            # R2 CS2 (I-4.2): pre-approved tool_calls bypass the risk gate
+            # entirely on the replay following an approve resume.
+            _bypass_risk_gate = call_id in pre_approved
+
             # ---- message_ask_user: SOFT_HINT gating ---- #
             tool_success = True
             multimodal_blocks: list[dict] = []
@@ -380,7 +895,15 @@ def build_react_graph(
                     # Check tool risk_level metadata for confirmation gating
                     risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
                     _tc_enabled = configurable.get("tool_confirmation_enabled", True)
-                    if _tc_enabled and risk_level_meta and risk_level_meta in ("high", "medium"):
+                    # R2 CS2 (I-4.2): bypass the risk gate entirely for
+                    # tool_calls that interrupt_helper has already marked
+                    # as pre-approved on the replay path.
+                    if (
+                        not _bypass_risk_gate
+                        and _tc_enabled
+                        and risk_level_meta
+                        and risk_level_meta in ("high", "medium")
+                    ):
                         assessment = _risk_assessor.assess(tool_name, args)
 
                         if assessment.final_level >= RiskLevel.MEDIUM:
@@ -455,7 +978,12 @@ def build_react_graph(
                                         # else: "escalate" — fall through to interrupt path below
 
                                 if not _sa_resolved:
-                                    # Emit confirmation event via event_queue
+                                    # R2 CS2 (I-4.1 / CS2.13): instead of
+                                    # calling interrupt() inline, route to
+                                    # the dedicated interrupt_helper node
+                                    # with the pending ask state written
+                                    # atomically. interrupt_helper is the
+                                    # ONLY node allowed to call interrupt().
                                     _timeout_seconds = configurable.get(
                                         "tool_confirmation_timeout_seconds", 300
                                     )
@@ -476,7 +1004,6 @@ def build_react_graph(
                                     # resume path (_resume_tool_confirmation) can
                                     # read it back after the graph is interrupted.
                                     if confirmation_manager:
-                                        import time as _time
                                         from app.domain.services.confirmation_manager import ConfirmationDetail
                                         _detail = ConfirmationDetail(
                                             session_id=_session_id,
@@ -493,24 +1020,64 @@ def build_react_graph(
                                         )
                                         await confirmation_manager.store(_detail)
 
-                                    # Interrupt — graph pauses here, resumes with user response
-                                    user_response = interrupt({
-                                        "type": "tool_confirmation",
-                                        "tool_call_id": call_id,
-                                    })
+                                    # Build typed Asked outcome + ToolArtifact
+                                    # for the pending_ask_* state fields. The
+                                    # pending artifact carries enough context
+                                    # for the interrupt_helper to recognize
+                                    # which tool_call is awaiting approval.
+                                    _pending_source = resolve_tool_source(tool_name)
+                                    _pending_outcome = Asked(
+                                        content="等待用户确认工具执行",
+                                        reason=DecisionReason(
+                                            type="risk_enforce",
+                                            code=assessment.final_level.name.lower(),
+                                            message=assessment.risk_reason or "",
+                                        ),
+                                    )
+                                    _pending_artifact = ToolArtifact(
+                                        tool_call_id=call_id,
+                                        tool_name=tool_name,
+                                        tool_source=_pending_source,
+                                        outcome=_pending_outcome,
+                                    )
 
-                                    action = user_response.get("action", "deny") if isinstance(user_response, dict) else "deny"
-                                    if action == "approve":
-                                        logger.info("tool_confirmation: user approved tool '%s'", tool_name)
-                                        result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
-                                    elif action == "timeout_fallback":
-                                        result_str = "操作因超时被跳过。请尝试安全替代方案，或告知用户。"
-                                        tool_success = False
-                                        logger.info("tool_confirmation: timeout for tool '%s'", tool_name)
-                                    else:
-                                        result_str = "用户拒绝了此操作"
-                                        tool_success = False
-                                        logger.info("tool_confirmation: user denied tool '%s'", tool_name)
+                                    # NOTE: confirmation_event is pushed to
+                                    # event_queue above (live stream only).
+                                    # Legacy convention: ConfirmationEvents
+                                    # are urgent-live, NOT state-persisted —
+                                    # see event_bridge.py:103-107, a node
+                                    # must pick ONE path (queue or state),
+                                    # not both, or the bridge double-emits.
+                                    _update = {
+                                        "messages": (
+                                            new_messages
+                                            + deferred_human_messages
+                                            + deferred_document_messages
+                                        ),
+                                        "events": new_events,
+                                        "attempt_count": state["attempt_count"] + 1,
+                                        "failure_count": state["failure_count"] + new_failures,
+                                        "completed_tool_call_prefix": (
+                                            list(already_done) + new_completed_ids
+                                        ),
+                                        "pending_ask_outcome": _pending_outcome.model_dump(
+                                            mode="json"
+                                        ),
+                                        "pending_ask_tool_call_id": call_id,
+                                        "pending_ask_artifact": _pending_artifact.model_dump(
+                                            mode="json", by_alias=True
+                                        ),
+                                        # R2 CS2: persist original args so
+                                        # interrupt_helper can feed them to
+                                        # _translate_outcome on deny — avoids
+                                        # dropping function_args on the
+                                        # audit path.
+                                        "pending_ask_tool_args": dict(args),
+                                    }
+                                    return Command(
+                                        goto="interrupt_helper",
+                                        update=_update,
+                                    )
                         else:
                             # Assessment resolved to none/low risk — execute directly
                             result_str, tool_success, multimodal_blocks = await _run_tool(tool_fn, tool_name, args)
@@ -536,8 +1103,14 @@ def build_react_graph(
                 new_failures += 1
                 multimodal_blocks = []
 
-            # Prefix error messages so the LLM can clearly identify failures
-            content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
+            # R2 CS2 (CS2.14): no longer prefix '[TOOL_ERROR]' here — the
+            # LLM adapter (_messages_for_api in ActusChatModel /
+            # ActusResponsesModel, Task 33/34) injects the prefix on the
+            # serialization boundary based on ToolMessage.status + artifact.
+            # Commit 1 runs in the 4-day window between this removal and
+            # the adapter landing; R2 accepts the temporary no-prefix state
+            # (documented in plan §Rollout Commit 1).
+            content = result_str
 
             # Phase 2: 首次调用 Tier 1 skill 时注入 guide
             if tool_success and guide_injector:
@@ -553,6 +1126,7 @@ def build_react_graph(
                 content=content,
                 tool_call_id=call_id,
                 name=tool_name,
+                status="success" if tool_success else "error",
             ))
 
             # Collect deferred HumanMessage for file_view multimodal results
@@ -582,25 +1156,46 @@ def build_react_graph(
                 )
             )
 
+            # R2 CS2 (I-4.1): mark this tool_call_id as completed for the
+            # in-batch prefix. On the happy-path return the full prefix
+            # will be reset to [] so future batches start clean.
+            new_completed_ids.append(call_id)
+
         # Append deferred HumanMessages AFTER all ToolMessages.
         # Preserves AIMessage → ToolMessage* pairing for group_messages().
         new_messages.extend(deferred_human_messages)
         new_messages.extend(deferred_document_messages)
 
-        result: dict = {
+        # R2 CS2 happy path: the whole batch completed without hitting an
+        # Asked outcome. Reset prefix + pre-approved set + pending state
+        # and hand control back to pre_llm_node for the next LLM turn.
+        update: dict[str, Any] = {
             "messages": new_messages,
             "events": new_events,
             "attempt_count": state["attempt_count"] + 1,
             "failure_count": state["failure_count"] + new_failures,
+            "completed_tool_call_prefix": [],
+            "approved_tool_call_ids": [],
+            "pending_ask_outcome": None,
+            "pending_ask_tool_call_id": None,
+            "pending_ask_artifact": None,
+            "pending_ask_tool_args": None,
         }
         if should_interrupt:
-            result["should_interrupt"] = True
+            update["should_interrupt"] = True
         if not has_prior_soft_hint and any(
             m.content == "SOFT_HINT" and m.name == "message_ask_user"
             for m in new_messages
         ):
-            result["soft_hint_sent"] = True
-        return result
+            update["soft_hint_sent"] = True
+
+        # R2 CS2: tool_node routes itself via Command; no conditional edge.
+        goto: str = (
+            END
+            if should_interrupt or update.get("attempt_count", 0) >= MAX_ITERATIONS
+            else "pre_llm_node"
+        )
+        return Command(goto=goto, update=update)
 
     # ---- Routing ------------------------------------------------------- #
 
@@ -619,13 +1214,154 @@ def build_react_graph(
 
         return END
 
-    def route_after_tool(state: ReactGraphState) -> str:
-        """Route after tool execution: back to LLM."""
-        if state.get("should_interrupt"):
-            return END
-        if state.get("attempt_count", 0) >= MAX_ITERATIONS:
-            return END
-        return "pre_llm_node"
+    async def interrupt_helper(
+        state: ReactGraphState, config: RunnableConfig
+    ) -> Command[Literal["tool_node"]]:
+        """R2 CS2 — the only node allowed to call ``interrupt()``.
+
+        Receives control from ``tool_node`` whenever a tool_call reaches an
+        ``Asked`` outcome (Layer 1 policy chain or Layer 2 wrapper). Reads
+        the ``pending_ask_*`` state written by ``tool_node``, calls
+        ``interrupt(...)`` to pause the graph, and on resume dispatches:
+
+        - ``approve`` → add ``pending_id`` to ``approved_tool_call_ids`` and
+          return to ``tool_node``. On the replay, ``tool_node`` sees the id
+          in its pre-approved set and skips the risk gate entirely.
+        - ``deny`` / ``timeout_fallback`` → construct a typed ``Denied``
+          outcome, translate it into a ``ToolMessage`` via
+          ``_translate_outcome``, mark the id as completed in the prefix,
+          and return to ``tool_node`` so the next tool_call in the batch
+          can proceed.
+
+        **CS2.13 invariant**: this function must NOT read
+        ``state.messages[-1].tool_calls``, must NOT call
+        ``_invoke_wrapper`` / ``_run_policy_chain``, and must NOT execute
+        wrappers. Its sole job is the interrupt handshake and routing.
+        """
+        _early = _interrupt_helper_early_return(state)
+        if _early is not None:
+            return _early
+        pending_id = state["pending_ask_tool_call_id"]
+        pending_artifact_dict = state["pending_ask_artifact"]
+        assert pending_id is not None  # narrowed by _interrupt_helper_early_return
+        assert pending_artifact_dict is not None
+
+        # interrupt() here. On the first invocation LangGraph raises
+        # GraphInterrupt, the client surfaces the confirmation card, the
+        # user sends a resume command, and LangGraph replays the node —
+        # the second invocation of interrupt() returns the resume value
+        # without raising. The body must be idempotent across replays.
+        user_response = interrupt(
+            {
+                "type": "tool_confirmation",
+                "tool_call_id": pending_id,
+                "ask": state.get("pending_ask_outcome"),
+                "artifact": pending_artifact_dict,
+                "completed_prefix": state.get(
+                    "completed_tool_call_prefix", []
+                ),
+            }
+        )
+
+        action = (
+            user_response.get("action", "deny")
+            if isinstance(user_response, dict)
+            else "deny"
+        )
+
+        if action == "approve":
+            logger.info(
+                "interrupt_helper: user approved tool_call %s", pending_id
+            )
+            return Command(
+                goto="tool_node",
+                update={
+                    "approved_tool_call_ids": (
+                        list(state.get("approved_tool_call_ids", []) or [])
+                        + [pending_id]
+                    ),
+                    "pending_ask_outcome": None,
+                    "pending_ask_tool_call_id": None,
+                    "pending_ask_artifact": None,
+                    "pending_ask_tool_args": None,
+                },
+            )
+
+        # deny / timeout_fallback: synthesize a Denied outcome via Layer 3,
+        # emit the ToolMessage, and mark the id completed so the batch
+        # moves on to the next tool_call on replay.
+        deny_reason_code = action  # "deny" | "timeout_fallback"
+        tool_name = pending_artifact_dict["tool_name"]
+        tool_source_dict = pending_artifact_dict["tool_source"]
+        # R2 CS2: use the original args persisted by tool_node when the
+        # Asked was raised (pending_ask_tool_args). Fallback to empty dict
+        # only if the state carries no args (older checkpoint).
+        pending_args = state.get("pending_ask_tool_args") or {}
+        logger.info(
+            "interrupt_helper: user %s tool_call %s (tool=%s)",
+            action,
+            pending_id,
+            tool_name,
+        )
+
+        denied_outcome = Denied(
+            content=(
+                "用户拒绝了此操作"
+                if action == "deny"
+                else "操作因超时被跳过"
+            ),
+            reason=DecisionReason(
+                type="approval_policy",
+                code=deny_reason_code,
+                message=f"interrupt_helper action={action}",
+            ),
+        )
+        tool_source_obj = ToolSource.model_validate(tool_source_dict)
+        fake_tool_call: ToolCall = {
+            "id": pending_id,
+            "name": tool_name,
+            "args": dict(pending_args),
+            "type": "tool_call",
+        }
+        configurable = (config or {}).get("configurable", {}) if config else {}
+        tool_result_max_chars = configurable.get("tool_result_max_chars", 8000)
+        guide_injector = configurable.get("skill_guide_injector")
+
+        msg, deferred, deny_events = await _translate_outcome(
+            denied_outcome,
+            fake_tool_call,
+            tool_source_obj,
+            _session_ctx_from(config),
+            tool_result_max_chars=tool_result_max_chars,
+            guide_injector=guide_injector,
+        )
+
+        # NOTE: deny_events are regular ToolEvents (not ToolConfirmationEvents).
+        # Per the event_bridge.py:103-107 contract, regular events travel
+        # through the state-update path and the bridge forwards them to
+        # the SSE queue automatically. Pushing them to event_queue here as
+        # well would cause double-emission. Only urgent live events
+        # (ToolConfirmationEvent in tool_node) use event_queue.put().
+        new_messages: list = []
+        if msg is not None:
+            new_messages.append(msg)
+        new_messages.extend(deferred)
+
+        return Command(
+            goto="tool_node",
+            update={
+                "messages": new_messages,
+                "events": deny_events,
+                "completed_tool_call_prefix": (
+                    list(state.get("completed_tool_call_prefix", []) or [])
+                    + [pending_id]
+                ),
+                "pending_ask_outcome": None,
+                "pending_ask_tool_call_id": None,
+                "pending_ask_artifact": None,
+                "pending_ask_tool_args": None,
+            },
+        )
 
     # ---- Build Graph --------------------------------------------------- #
 
@@ -642,10 +1378,14 @@ def build_react_graph(
     g.add_node("pre_llm_node", pre_llm_node)
     g.add_node("llm_node", llm_node, retry_policy=llm_retry)
     g.add_node("tool_node", tool_node)
+    # R2 CS2: interrupt_helper is the only node that calls interrupt().
+    # Registered so tool_node's Command(goto="interrupt_helper") resolves.
+    g.add_node("interrupt_helper", interrupt_helper)
 
     g.add_edge(START, "pre_llm_node")
     g.add_edge("pre_llm_node", "llm_node")
     g.add_conditional_edges("llm_node", route_after_llm)
-    g.add_conditional_edges("tool_node", route_after_tool)
+    # tool_node routes itself via Command(goto=...); interrupt_helper too.
+    # No conditional edge needed — replaces the former route_after_tool.
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)

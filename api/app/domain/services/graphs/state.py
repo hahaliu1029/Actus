@@ -96,3 +96,30 @@ class ReactGraphState(TypedDict):
     # Gating counters (for message_ask_user soft-hint throttling)
     attempt_count: int
     failure_count: int
+
+    # R2 CS2: 前缀闭合 exactly-once 机制
+    # tool_node 每次 replay 时跳过这些 ids (prefix-closure). 正常 batch 结束时清空.
+    # NotRequired 以兼容没有写这些字段的旧调用点 (invocation payload / checkpoint).
+    completed_tool_call_prefix: NotRequired[list[str]]
+
+    # R2 CS2: interrupt_helper → tool_node 的 "pre-approved" 桥接.
+    # approve 路径下 interrupt_helper 把 pending_id 写进这个 list.
+    # tool_node replay 时看到 tc.id 在这个 list 里, 直接 bypass Layer 1
+    # policy chain 到 Layer 2. 使用完后清空.
+    # 理由: _resume_tool_confirmation 的 ApprovalCache 写是 post-resume 顺序
+    # (agent_service.py:313-395), tool_node replay 时 cache 还没写,
+    # 必须靠 state flag 直接 bypass.
+    approved_tool_call_ids: NotRequired[list[str]]
+
+    # R2 CS2: Asked 路径的 pending 状态, 给 interrupt_helper 节点消费.
+    # pending_ask_outcome: Asked.model_dump(mode="json") — Layer 3 写入.
+    # pending_ask_tool_call_id: 待审批的 tool_call_id.
+    # pending_ask_artifact: ToolArtifact.model_dump(mode="json", by_alias=True).
+    # pending_ask_tool_args: 原始 tool_call.args — 审计路径需要, 但 ToolArtifact
+    #   schema 不存 args (那是 call 壳的一部分不是 outcome), 所以单独存一份.
+    #   deny/timeout_fallback 路径下 interrupt_helper 读回去交给 _translate_outcome,
+    #   让产出的 ToolEvent.function_args 反映用户真实拒绝的调用参数, 不再丢.
+    pending_ask_outcome: NotRequired[dict | None]
+    pending_ask_tool_call_id: NotRequired[str | None]
+    pending_ask_artifact: NotRequired[dict | None]
+    pending_ask_tool_args: NotRequired[dict | None]
