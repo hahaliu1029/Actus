@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "m_sa",
+  "tool_name": "mcp_slack_post",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_slack_post"
+  },
+  "outcome": {
+    "variant": "asked",
+    "content": "SmartApprove flagged cross-channel post for review",
+    "reason": {
+      "type": "smart_approve",
+      "code": "llm_cross_channel",
+      "message": ""
+    }
+  }
+}

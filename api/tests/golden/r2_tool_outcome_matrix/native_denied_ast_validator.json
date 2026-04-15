@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "n_ast",
+  "tool_name": "shell_execute",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "outcome": {
+    "variant": "denied",
+    "content": "AST validator blocked: rm -rf pattern detected",
+    "reason": {
+      "type": "ast_validator",
+      "code": "dangerous_rm_pattern",
+      "message": ""
+    }
+  }
+}

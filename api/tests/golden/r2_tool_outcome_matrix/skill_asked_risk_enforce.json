@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "s_re",
+  "tool_name": "skill_example",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_example"
+  },
+  "outcome": {
+    "variant": "asked",
+    "content": "Skill 'skill_example' marked high risk — awaiting user confirmation",
+    "reason": {
+      "type": "risk_enforce",
+      "code": "skill_example_risk_high",
+      "message": ""
+    }
+  }
+}

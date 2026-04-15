@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "n_dp",
+  "tool_name": "shell_execute",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "outcome": {
+    "variant": "denied",
+    "content": "Denied by user approval policy",
+    "reason": {
+      "type": "approval_policy",
+      "code": "always_deny",
+      "message": ""
+    }
+  }
+}

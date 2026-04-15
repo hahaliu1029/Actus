@@ -243,6 +243,8 @@ async def _run_policy_chain(
     tool: BaseTool,
     tool_source: ToolSource,
     session_ctx: _SessionContext,
+    *,
+    smart_approve_timeout_seconds: int | None = None,
 ) -> ToolOutcome | None:
     """Stage-based Layer 1 policy evaluation.
 
@@ -260,7 +262,19 @@ async def _run_policy_chain(
 
     Layer 1 only produces ``Denied/Asked/AllowError``; ``AllowSuccess``
     and ``Passthrough`` come from Layer 2 (wrapper).
+
+    ``smart_approve_timeout_seconds`` comes from
+    ``AppConfig.tool_runtime.smart_approve_timeout_seconds`` via
+    ``build_react_graph(tool_runtime_config=...)``. ``None`` falls back to
+    the module constant ``_SMART_APPROVE_TIMEOUT_SECONDS`` so legacy
+    callers and existing tests keep working without plumbing the config
+    through.
     """
+    p2_timeout = (
+        smart_approve_timeout_seconds
+        if smart_approve_timeout_seconds is not None
+        else _SMART_APPROVE_TIMEOUT_SECONDS
+    )
     # Stage S: Safety (shell AST validator, native shell only)
     if _is_shell_category(tool_source):
         try:
@@ -297,7 +311,7 @@ async def _run_policy_chain(
         try:
             smart = await asyncio.wait_for(
                 _stage_p2_smart_approve(tool_call, session_ctx),
-                timeout=_SMART_APPROVE_TIMEOUT_SECONDS,
+                timeout=p2_timeout,
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -515,13 +529,26 @@ async def _invoke_wrapper(
     tool: BaseTool,
     tool_call: ToolCall,
     tool_source: ToolSource,
+    *,
+    max_wrapper_output_bytes: int | None = None,
 ) -> ToolOutcome:
     """Layer 2: invoke wrapper via ``content_and_artifact`` and return typed outcome.
 
     NOTE: langchain-core 1.2.17 only returns ``ToolMessage`` when ``ainvoke()``
     receives a full ToolCall dict (``{"args", "id", "name", "type"}``). Passing
     only the plain args dict returns raw content and loses the artifact.
+
+    ``max_wrapper_output_bytes`` comes from
+    ``AppConfig.tool_runtime.max_wrapper_output_bytes`` via
+    ``build_react_graph(tool_runtime_config=...)``. ``None`` falls back
+    to the module constant ``_MAX_WRAPPER_OUTPUT_BYTES`` so legacy
+    callers work unchanged.
     """
+    max_bytes = (
+        max_wrapper_output_bytes
+        if max_wrapper_output_bytes is not None
+        else _MAX_WRAPPER_OUTPUT_BYTES
+    )
     del tool_source
     try:
         tool_msg = await tool.ainvoke(
@@ -568,11 +595,11 @@ async def _invoke_wrapper(
             retryable=False,
         )
 
-    if isinstance(tool_msg.content, str) and len(tool_msg.content) > _MAX_WRAPPER_OUTPUT_BYTES:
+    if isinstance(tool_msg.content, str) and len(tool_msg.content) > max_bytes:
         return AllowError(
             content=(
                 f"工具 '{tool.name}' 输出超长 "
-                f"({len(tool_msg.content)} bytes > {_MAX_WRAPPER_OUTPUT_BYTES})"
+                f"({len(tool_msg.content)} bytes > {max_bytes})"
             ),
             reason=DecisionReason(
                 type="exception",
@@ -606,6 +633,7 @@ def build_react_graph(
     tool_result_max_chars: int = 8000,
     assembler: ContextAssembler | None = None,
     checkpointer: Any = None,
+    tool_runtime_config: "ToolRuntimeConfig | None" = None,
 ) -> CompiledStateGraph:
     """Build and compile the inner ReAct loop graph.
 
@@ -619,7 +647,26 @@ def build_react_graph(
         the graph supports ``interrupt()`` resume via
         ``Command(resume=...)``. R2 Day-4 hard gate tests rely on
         ``InMemorySaver`` to drive the interrupt_helper handshake.
+    tool_runtime_config : R2 CS2 — ``AppConfig.tool_runtime`` plumbed in.
+        Sets the SmartApprove timeout + wrapper output byte cap used by
+        Layer 1 ``_run_policy_chain`` and Layer 2 ``_invoke_wrapper``.
+        Defaults to ``ToolRuntimeConfig()`` (1 MiB wrapper cap, 15s
+        SmartApprove timeout). The values are captured in the closure
+        so every future call site that wires ``_run_policy_chain`` /
+        ``_invoke_wrapper`` into the dispatcher can read them via
+        ``_tool_runtime_cfg`` without re-plumbing ``build_react_graph``.
     """
+    # R2 CS2: captured in closure so the dispatcher and helpers read
+    # the same config instance regardless of call path. Deferred import
+    # keeps ``react_graph.py`` from pulling the full app_config module
+    # chain at import time.
+    if tool_runtime_config is None:
+        from app.domain.models.app_config import ToolRuntimeConfig as _TRC
+
+        _tool_runtime_cfg = _TRC()
+    else:
+        _tool_runtime_cfg = tool_runtime_config
+
     # Build tool lookup
     tool_map: dict[str, BaseTool] = {t.name: t for t in tools}
 

@@ -1,0 +1,20 @@
+{
+  "tool_call_id": "a_err",
+  "tool_name": "call_remote_agent",
+  "tool_source": {
+    "source": "a2a",
+    "category": "a2a",
+    "canonical_name": "call_remote_agent"
+  },
+  "outcome": {
+    "variant": "allow_error",
+    "content": "Remote agent returned error: internal failure",
+    "reason": {
+      "type": "exception",
+      "code": "a2a_remote_error",
+      "message": ""
+    },
+    "retryable": false,
+    "data": null
+  }
+}

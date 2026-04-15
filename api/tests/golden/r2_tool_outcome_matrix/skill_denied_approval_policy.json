@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "s_dp",
+  "tool_name": "skill_example",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_example"
+  },
+  "outcome": {
+    "variant": "denied",
+    "content": "Skill denied",
+    "reason": {
+      "type": "approval_policy",
+      "code": "user_deny",
+      "message": ""
+    }
+  }
+}

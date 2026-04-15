@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "a_dp",
+  "tool_name": "call_remote_agent",
+  "tool_source": {
+    "source": "a2a",
+    "category": "a2a",
+    "canonical_name": "call_remote_agent"
+  },
+  "outcome": {
+    "variant": "denied",
+    "content": "A2A call denied by policy",
+    "reason": {
+      "type": "approval_policy",
+      "code": "deny_cross_agent",
+      "message": ""
+    }
+  }
+}

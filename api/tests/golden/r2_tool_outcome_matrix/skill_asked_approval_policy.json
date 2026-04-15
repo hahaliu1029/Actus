@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "s_ap",
+  "tool_name": "skill_example",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_example"
+  },
+  "outcome": {
+    "variant": "asked",
+    "content": "Pending user confirmation",
+    "reason": {
+      "type": "approval_policy",
+      "code": "pending_user_decision",
+      "message": ""
+    }
+  }
+}

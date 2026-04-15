@@ -1,0 +1,20 @@
+{
+  "tool_call_id": "n_err",
+  "tool_name": "shell_execute",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "outcome": {
+    "variant": "allow_error",
+    "content": "Permission denied",
+    "reason": {
+      "type": "exception",
+      "code": "PermissionError",
+      "message": ""
+    },
+    "retryable": false,
+    "data": null
+  }
+}

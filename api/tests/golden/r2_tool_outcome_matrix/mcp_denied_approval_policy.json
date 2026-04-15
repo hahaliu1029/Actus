@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "m_dp",
+  "tool_name": "mcp_slack_post",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_slack_post"
+  },
+  "outcome": {
+    "variant": "denied",
+    "content": "User denied MCP tool",
+    "reason": {
+      "type": "approval_policy",
+      "code": "session_deny",
+      "message": ""
+    }
+  }
+}

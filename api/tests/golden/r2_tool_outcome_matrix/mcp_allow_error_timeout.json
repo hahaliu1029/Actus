@@ -1,0 +1,20 @@
+{
+  "tool_call_id": "m_to",
+  "tool_name": "mcp_slack_post",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_slack_post"
+  },
+  "outcome": {
+    "variant": "allow_error",
+    "content": "MCP call timeout",
+    "reason": {
+      "type": "timeout",
+      "code": "mcp_client_timeout",
+      "message": ""
+    },
+    "retryable": true,
+    "data": null
+  }
+}

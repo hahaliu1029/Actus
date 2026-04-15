@@ -1,0 +1,16 @@
+{
+  "tool_call_id": "s_ok",
+  "tool_name": "skill_example",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_example"
+  },
+  "outcome": {
+    "variant": "allow_success",
+    "content": "Skill ran successfully",
+    "data": {
+      "output": "value"
+    }
+  }
+}

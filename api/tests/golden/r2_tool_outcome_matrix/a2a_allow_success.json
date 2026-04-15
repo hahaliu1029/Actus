@@ -1,0 +1,14 @@
+{
+  "tool_call_id": "a_ok",
+  "tool_name": "call_remote_agent",
+  "tool_source": {
+    "source": "a2a",
+    "category": "a2a",
+    "canonical_name": "call_remote_agent"
+  },
+  "outcome": {
+    "variant": "allow_success",
+    "content": "Remote agent responded: task completed",
+    "data": null
+  }
+}

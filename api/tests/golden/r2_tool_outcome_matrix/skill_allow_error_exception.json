@@ -1,0 +1,20 @@
+{
+  "tool_call_id": "s_err",
+  "tool_name": "skill_example",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_example"
+  },
+  "outcome": {
+    "variant": "allow_error",
+    "content": "Skill script failed: NameError",
+    "reason": {
+      "type": "exception",
+      "code": "skill_runtime_error",
+      "message": ""
+    },
+    "retryable": false,
+    "data": null
+  }
+}

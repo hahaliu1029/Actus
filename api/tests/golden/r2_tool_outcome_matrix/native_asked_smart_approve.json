@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "n_sa",
+  "tool_name": "shell_execute",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "outcome": {
+    "variant": "asked",
+    "content": "SmartApprove flagged this command for review",
+    "reason": {
+      "type": "smart_approve",
+      "code": "llm_flagged_high_risk",
+      "message": ""
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "tool_call_id": "a_sa",
+  "tool_name": "call_remote_agent",
+  "tool_source": {
+    "source": "a2a",
+    "category": "a2a",
+    "canonical_name": "call_remote_agent"
+  },
+  "outcome": {
+    "variant": "asked",
+    "content": "SmartApprove requires confirmation for A2A delegation",
+    "reason": {
+      "type": "smart_approve",
+      "code": "llm_delegation_risk",
+      "message": ""
+    }
+  }
+}

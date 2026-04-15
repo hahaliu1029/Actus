@@ -1,0 +1,20 @@
+{
+  "tool_call_id": "n_to",
+  "tool_name": "shell_execute",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "outcome": {
+    "variant": "allow_error",
+    "content": "Command timeout",
+    "reason": {
+      "type": "timeout",
+      "code": "sandbox_shell_timeout",
+      "message": ""
+    },
+    "retryable": true,
+    "data": null
+  }
+}

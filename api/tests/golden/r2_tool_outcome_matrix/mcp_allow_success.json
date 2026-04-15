@@ -1,0 +1,16 @@
+{
+  "tool_call_id": "m_ok",
+  "tool_name": "mcp_slack_post",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_slack_post"
+  },
+  "outcome": {
+    "variant": "allow_success",
+    "content": "message sent",
+    "data": {
+      "message_id": "m123"
+    }
+  }
+}

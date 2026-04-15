@@ -374,6 +374,43 @@ class FileUnderstandingConfig(BaseModel):
     video: VideoProcessorConfig = VideoProcessorConfig()
 
 
+class ToolRuntimeConfig(BaseModel):
+    """R2 CS2 tool runtime limits.
+
+    Plumbed from ``config.yaml → AppConfig → react_graph.build_react_graph
+    → configurable`` so Layer 1 (``_run_policy_chain``) and Layer 2
+    (``_invoke_wrapper``) can read the values at runtime instead of
+    depending on the module-level ``_SMART_APPROVE_TIMEOUT_SECONDS`` /
+    ``_MAX_WRAPPER_OUTPUT_BYTES`` constants.
+
+    Defaults match the original module constants so zero-config
+    deployments preserve existing behavior.
+    """
+
+    max_wrapper_output_bytes: int = Field(
+        default=1 << 20,  # 1 MiB
+        ge=1024,
+        description=(
+            "Layer 2 wrapper output length guard (bytes). Wrapper content "
+            "larger than this is converted to AllowError("
+            "wrapper_output_too_large) before reaching the LLM, preventing "
+            "memory spikes from runaway shell output or large blobs."
+        ),
+    )
+    smart_approve_timeout_seconds: int = Field(
+        default=15,
+        ge=1,
+        le=300,
+        description=(
+            "Layer 1 Stage P.2 SmartApprove LLM call timeout (seconds). "
+            "Timeout is fail-open — the policy chain proceeds as if "
+            "SmartApprove said allow, so a hanging LLM doesn't block "
+            "every tool call. Tune down for faster fail-open or up to "
+            "give the model more headroom."
+        ),
+    )
+
+
 class AppConfig(BaseModel):
     """应用配置信息，包含Agent配置、LLM提供商配置、MCP配置、A2A配置"""
 
@@ -383,6 +420,8 @@ class AppConfig(BaseModel):
     a2a_config: A2AConfig  # A2A服务配置
     skill_risk_policy: SkillRiskPolicy = SkillRiskPolicy()
     file_understanding: FileUnderstandingConfig = FileUnderstandingConfig()
+    # R2 CS2: Layer 1/2 runtime limits (defaults preserve pre-R2 constants)
+    tool_runtime: ToolRuntimeConfig = Field(default_factory=ToolRuntimeConfig)
 
     # Pydantic配置，允许传递额外的字段初始化
     model_config = ConfigDict(extra="allow")
