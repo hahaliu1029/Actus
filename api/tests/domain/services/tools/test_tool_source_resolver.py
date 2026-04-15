@@ -38,6 +38,19 @@ class TestToolSourceModel:
             ToolSource(source="native", category="made_up", canonical_name="x")
         assert "Unknown category" in caplog.text
 
+    def test_tool_source_rejects_unknown_field(self):
+        """extra='forbid' seals the contract surface so nested payloads
+        (e.g. R2 ToolArtifact.tool_source) fail loudly on schema drift."""
+        with pytest.raises(ValidationError):
+            ToolSource.model_validate(
+                {
+                    "source": "native",
+                    "category": "shell",
+                    "canonical_name": "shell_execute",
+                    "unexpected_nested": 1,
+                }
+            )
+
     def test_known_categories_has_12_values(self):
         assert len(KNOWN_CATEGORIES) == 12
         # Spot-check canonical values from spec

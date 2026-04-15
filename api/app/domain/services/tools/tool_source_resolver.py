@@ -51,11 +51,15 @@ class ToolSource(BaseModel):
     that is the availability concern handled by bound_tool_names set checks.
 
     Frozen via ConfigDict so instances cannot mutate after construction.
+    `extra="forbid"` seals the contract surface so producer/checkpointer drift
+    on nested tool_source payloads (e.g. when embedded inside R2 ToolArtifact)
+    fails loudly instead of being silently laundered by Pydantic's default
+    ignore behavior.
     Pydantic-based (not dataclass) so R4 can embed ToolSource directly into
     ToolEvent (BaseModel) with zero serialization friction.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     source: Literal["native", "mcp", "a2a", "skill"]
     category: str
