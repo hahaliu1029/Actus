@@ -522,6 +522,17 @@ export type FinishingEvent = {
   [key: string]: unknown;
 };
 
+export type SandboxStateChangedEvent = {
+  event_id?: string;
+  created_at?: number;
+  session_id?: string;
+  old_state?: string;
+  new_state: string;
+  generation?: number | null;
+  reason?: string | null;
+  [key: string]: unknown;
+};
+
 export type SSEEventType =
   | "message"
   | "title"
@@ -532,6 +543,8 @@ export type SSEEventType =
   | "wait"
   | "tool_confirmation"
   | "finishing"
+  | "health"
+  | "sandbox_state_changed"
   | "done"
   | "error"
   | "sessions";
@@ -561,6 +574,7 @@ export type SSEEventData =
   | { type: "tool_confirmation"; event_id?: string; created_at?: number; data: ToolConfirmationEventData }
   | { type: "finishing"; data: FinishingEvent }
   | { type: "health"; data: HealthEvent }
+  | { type: "sandbox_state_changed"; data: SandboxStateChangedEvent }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
   | { type: "sessions"; data: ListSessionResponse };

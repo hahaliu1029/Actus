@@ -812,5 +812,36 @@ describe("session-store", () => {
       expect(healthEvent).toBeDefined();
       expect(healthEvent?.data?.status).toBe("degraded");
     });
+
+    it("sandbox_state_changed 事件在 destroyed 时保持 timed_out 语义", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "health",
+          data: {
+            event_id: "evt-term",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "terminated",
+            reason: "执行已超时终止",
+            action: "terminated",
+          },
+        });
+        onEvent({
+          type: "sandbox_state_changed",
+          data: {
+            event_id: "evt-destroyed",
+            created_at: Math.floor(Date.now() / 1000),
+            old_state: "destroying",
+            new_state: "destroyed",
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-destroyed", { message: "hi" });
+
+      const current = useSessionStore.getState().currentSession;
+      expect(current?.status).toBe("timed_out");
+      expect(current?.events?.some((e) => e.event === "sandbox_state_changed")).toBe(true);
+    });
   });
 });
