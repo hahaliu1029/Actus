@@ -23,7 +23,7 @@ from app.application.services.continuation_intent_classifier import (
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import Sandbox, SandboxHandle
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
 from app.domain.models.app_config import (
@@ -188,7 +188,7 @@ class AgentTaskRunner(TaskRunner):
         # file_repository: FileRepository,  # 文件数据仓库
         browser: Browser,  # 浏览器
         search_engine: SearchEngine,  # 搜索引擎
-        sandbox: Sandbox,  # 沙箱
+        sandbox: SandboxHandle | Sandbox,  # 沙箱（优先 SandboxHandle）
         skill_creator_service=None,  # skill创建服务
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
@@ -205,8 +205,10 @@ class AgentTaskRunner(TaskRunner):
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
         initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
         tool_runtime: ToolRuntimeConfig | None = None,  # R2 CS2: wrapper cap + smart-approve timeout
+        on_session_complete=None,  # Callback: async (session_id) -> None, called after COMPLETED/TIMED_OUT
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        self._on_session_complete = on_session_complete
         self._approval_cache = approval_cache
         self._confirmation_manager = confirmation_manager
         self._memory_flusher = memory_flusher
@@ -2502,6 +2504,24 @@ class AgentTaskRunner(TaskRunner):
                 pass
             raise
 
+    async def _set_terminal_status(self, status: SessionStatus) -> None:
+        """Set session to a terminal status and fire the on_session_complete callback.
+
+        Consolidates the COMPLETED/TIMED_OUT write + lifecycle suspend notification
+        so all completion paths (invoke, resume, CancelledError, Exception) go through
+        one place.
+        """
+        async with self._uow:
+            await self._uow.session.update_status(self._session_id, status)
+        if self._on_session_complete is not None:
+            try:
+                await self._on_session_complete(self._session_id)
+            except Exception:
+                logger.debug(
+                    "on_session_complete callback failed for session %s",
+                    self._session_id,
+                )
+
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
 
@@ -2770,15 +2790,9 @@ class AgentTaskRunner(TaskRunner):
                         action="terminated",
                         metrics=self._snapshot_metrics(),
                     ))
-                    async with self._uow:
-                        await self._uow.session.update_status(
-                            self._session_id, SessionStatus.TIMED_OUT
-                        )
+                    await self._set_terminal_status(SessionStatus.TIMED_OUT)
                 else:
-                    async with self._uow:
-                        await self._uow.session.update_status(
-                            self._session_id, SessionStatus.COMPLETED
-                        )
+                    await self._set_terminal_status(SessionStatus.COMPLETED)
 
             except asyncio.CancelledError:
                 cancel_reason = getattr(task, "cancel_reason", "stop")
@@ -2791,10 +2805,7 @@ class AgentTaskRunner(TaskRunner):
                     raise
 
                 await self._put_and_add_event(task, DoneEvent())
-                async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, SessionStatus.COMPLETED
-                    )
+                await self._set_terminal_status(SessionStatus.COMPLETED)
                 raise
 
             except Exception as e:
@@ -2802,10 +2813,7 @@ class AgentTaskRunner(TaskRunner):
                 await self._put_and_add_event(
                     task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
                 )
-                async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, SessionStatus.COMPLETED
-                    )
+                await self._set_terminal_status(SessionStatus.COMPLETED)
         finally:
             # 17.在同一个asyncio Task上下文中清理MCP/A2A工具资源
             # 这是关键：streamablehttp_client内部使用anyio.create_task_group()，
@@ -2851,26 +2859,17 @@ class AgentTaskRunner(TaskRunner):
                 except Exception as e:
                     logger.error("resume 后处理失败 (postprocess_incomplete): %s", e)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
-                    async with self._uow:
-                        await self._uow.session.update_status(
-                            self._session_id, SessionStatus.COMPLETED
-                        )
+                    await self._set_terminal_status(SessionStatus.COMPLETED)
                     return
 
                 if not cancelled:
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                     _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
-                    async with self._uow:
-                        await self._uow.session.update_status(
-                            self._session_id, _final_status
-                        )
+                    await self._set_terminal_status(_final_status)
             else:
                 await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                 _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
-                async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, _final_status
-                    )
+                await self._set_terminal_status(_final_status)
 
         except Exception as e:
             logger.exception(f"AgentTaskRunner.resume 运行出错: {str(e)}")
@@ -2879,15 +2878,19 @@ class AgentTaskRunner(TaskRunner):
             )
 
     async def destroy(self) -> None:
-        """销毁任务运行器并释放资源（best-effort：每步独立 try/except，确保后续清理不被跳过）"""
+        """销毁任务运行器并释放资源（best-effort：每步独立 try/except，确保后续清理不被跳过）
+
+        Note: sandbox lifecycle is managed by SandboxLifecycleService (I3).
+        This method only releases the handle and cleans up tools/flow.
+        """
         logger.info("开始清除销毁AgentTaskRunner资源")
         try:
-            # 1.清除沙箱
-            if self._sandbox:
-                logger.info("销毁AgentTaskRunner中的沙箱环境")
-                await self._sandbox.destroy()
+            # 1. Release sandbox handle (lifecycle service owns actual destruction)
+            if self._sandbox and hasattr(self._sandbox, "release"):
+                logger.info("释放 AgentTaskRunner 的沙箱 handle")
+                self._sandbox.release()
         except Exception as exc:
-            logger.warning("sandbox.destroy() 失败（继续清理）: %s", exc)
+            logger.warning("sandbox.release() 失败（继续清理）: %s", exc)
 
         try:
             # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）

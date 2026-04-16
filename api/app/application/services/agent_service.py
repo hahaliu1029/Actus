@@ -95,12 +95,14 @@ class AgentService:
         memory_session_factory=None,
         memory_repo_factory=None,
         event_recovery=None,
+        sandbox_lifecycle_service=None,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
         self._uow_factory = uow_factory
         self._sandbox_cls = sandbox_cls
         self._task_cls = task_cls
+        self._sandbox_lifecycle_service = sandbox_lifecycle_service
         self._search_engine = search_engine
         self._file_storage = file_storage
         self._redis_client = redis_client
@@ -145,19 +147,38 @@ class AgentService:
         """根据传递的会话创建一个新任务"""
         snap = self._config_snapshot  # local capture — immune to concurrent refresh
 
-        # 1.获取沙箱实例
-        sandbox = None
-        sandbox_id = session.sandbox_id
-        if sandbox_id:
-            sandbox = await self._sandbox_cls.get(sandbox_id)
+        # 1. 通过 lifecycle service 获取或创建沙箱 handle（I5: 禁止隐式复活）
+        from app.domain.errors.sandbox_lifecycle import (
+            SessionFinalizedError,
+            SessionSuspendedError,
+            SessionUnboundError,
+        )
 
-        # 2.判断是否能获取到沙箱(如果没有则创建)
-        if not sandbox:
-            # 3.沙箱不存在则创建一个新的(有可能被释放了)
-            sandbox = await self._sandbox_cls.create()
-            session.sandbox_id = sandbox.id
-            async with self._uow_factory() as uow:
-                await uow.session.save(session)
+        if self._sandbox_lifecycle_service:
+            try:
+                sandbox = await self._sandbox_lifecycle_service.acquire(session.id)
+            except SessionUnboundError:
+                sandbox = await self._sandbox_lifecycle_service.bind_new(session.id)
+            except SessionSuspendedError:
+                # I2 + §6: SUSPENDED → ACTIVE 必须显式 resume()，_create_task 不隐式 unsuspend。
+                # Caller（chat 的 reopen 分支、resume_tool_confirmation 等）负责判断是否 resume。
+                raise
+            except SessionFinalizedError:
+                raise RuntimeError(f"会话[{session.id}]的沙箱已终止，无法创建任务")
+        else:
+            # Fallback for tests without lifecycle service
+            _sandbox = None
+            binding_id = session.sandbox_binding.id
+            if binding_id:
+                _sandbox = await self._sandbox_cls.get(binding_id)
+            if not _sandbox:
+                _sandbox = await self._sandbox_cls.create()
+                session.sandbox_binding = session.sandbox_binding.model_copy(
+                    update={"id": _sandbox.id}
+                )
+                async with self._uow_factory() as uow:
+                    await uow.session.save(session)
+            sandbox = _sandbox
 
         # 4.从沙箱中获取浏览器实例
         browser = await sandbox.get_browser()
@@ -246,6 +267,7 @@ class AgentService:
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
+            on_session_complete=self._on_task_runner_complete,
         )
 
         # 6.创建任务Task并更新会话中的信息
@@ -255,6 +277,22 @@ class AgentService:
             await uow.session.save(session)
 
         return task
+
+    async def _on_task_runner_complete(self, session_id: str) -> None:
+        """Callback from AgentTaskRunner._set_terminal_status.
+
+        Called after task_runner writes COMPLETED/TIMED_OUT. Transitions sandbox
+        binding to SUSPENDED (I2) — covers ALL completion paths including
+        _resume_tool_confirmation, confirmation_sweep, and _resume_task_with_handoff.
+        """
+        if self._sandbox_lifecycle_service:
+            try:
+                await self._sandbox_lifecycle_service.suspend(session_id)
+            except Exception:
+                logger.debug(
+                    "on_task_runner_complete: suspend for session %s skipped",
+                    session_id,
+                )
 
     async def _safe_update_unread_count(self, session_id: str) -> None:
         """在独立的后台任务中安全地更新未读消息计数
@@ -618,6 +656,16 @@ class AgentService:
                             session_id,
                         )
                     # 5.不在运行中需要创建一个新的task并启动
+                    # I2: COMPLETED/TIMED_OUT 会话的 sandbox binding 为 SUSPENDED，
+                    # chat() 是用户显式发消息，视为明确的 resume 意图。
+                    if (
+                        self._sandbox_lifecycle_service
+                        and session.status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT)
+                    ):
+                        try:
+                            await self._sandbox_lifecycle_service.resume(session.id)
+                        except Exception:
+                            pass  # acquire inside _create_task will handle the actual state
                     task = await self._create_task(session)
                     if not task:
                         logger.error(f"会话[{session_id}]创建任务失败")
@@ -666,6 +714,12 @@ class AgentService:
                     await uow.session.update_status(
                         session_id, SessionStatus.COMPLETED
                     )
+                # Sync sandbox binding: ACTIVE → SUSPENDED (same as normal completion)
+                if self._sandbox_lifecycle_service:
+                    try:
+                        await self._sandbox_lifecycle_service.suspend(session_id)
+                    except Exception:
+                        logger.debug("status-reconcile suspend for %s skipped", session_id)
                 session = session.model_copy(update={"status": SessionStatus.COMPLETED})
 
             # 11.记录日志展示会话已启动
@@ -711,6 +765,7 @@ class AgentService:
                     break
 
             # 17.循环外面表示这次任务AI端的已结束
+            # (suspend 由 task_runner._set_terminal_status → _on_task_runner_complete 统一处理)
             logger.info(f"会话[{session_id}]本轮运行结束")
         except BadRequestError:
             raise
@@ -743,7 +798,11 @@ class AgentService:
     async def stop_session(
         self, session_id: str, user_id: str, is_admin: bool = False
     ) -> None:
-        """根据传递的会话id停止指定会话"""
+        """根据传递的会话id停止指定会话
+
+        I2: stop ≠ destroy. Transitions sandbox binding to SUSPENDED.
+        Container stays alive for potential resume.
+        """
         # 1.查找会话是否存在
         session = await self._get_accessible_session(session_id, user_id, is_admin)
 
@@ -755,6 +814,17 @@ class AgentService:
         # 3.更新会话任务状态
         async with self._uow_factory() as uow:
             await uow.session.update_status(session_id, SessionStatus.COMPLETED)
+
+        # 4. Suspend sandbox binding (I2: ACTIVE → SUSPENDED, container stays alive)
+        if self._sandbox_lifecycle_service:
+            try:
+                await self._sandbox_lifecycle_service.suspend(session_id)
+            except Exception:
+                logger.warning(
+                    "Failed to suspend sandbox for session %s",
+                    session_id,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _get_latest_control_event(session: Session) -> Optional[ControlEvent]:
@@ -1720,6 +1790,15 @@ end
                 SessionStatus.TIMED_OUT,
             ):
                 raise BadRequestError("当前状态不支持恢复接管")
+
+            # I2: reopen_takeover 要求 binding.state ∈ {ACTIVE, SUSPENDED}
+            # DESTROYING/DESTROYED 的会话不可恢复
+            from app.domain.models.session import SandboxBindingState
+            if session.sandbox_binding.state in (
+                SandboxBindingState.DESTROYING,
+                SandboxBindingState.DESTROYED,
+            ):
+                raise BadRequestError("沙箱已终止，无法恢复接管")
             if not session.completed_at:
                 raise BadRequestError("REOPEN_WINDOW_EXPIRED")
             # 与领域模型 / ORM 保持一致，使用 datetime.now()（naive local time）

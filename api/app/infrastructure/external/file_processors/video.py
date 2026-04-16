@@ -9,7 +9,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from app.domain.external.file_processor import FileProcessResult
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def _estimate_frame_timestamp(
 class VideoFileProcessor:
     def __init__(
         self,
-        sandbox: Sandbox,
+        sandbox: SandboxHandle,
         file_uploader: FileUploader,
         audio_processor: Any | None,  # AudioFileProcessor or None
         video_config: Any,  # VideoProcessorConfig

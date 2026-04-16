@@ -10,7 +10,7 @@ import shlex
 import uuid
 from typing import Any, Dict, List, Optional
 
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.domain.models.skill import Skill, SkillRuntimeType
 from app.domain.models.tool_result import (
     AllowError,
@@ -38,7 +38,7 @@ class SkillTool(BaseTool):
 
     def __init__(
         self,
-        sandbox: Sandbox,
+        sandbox: SandboxHandle,
         mcp_tool: MCPTool,
         a2a_tool: A2ATool,
         risk_mode: str = "off",

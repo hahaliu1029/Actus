@@ -12,13 +12,13 @@ import asyncio
 import logging
 from typing import Optional
 
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 
 logger = logging.getLogger(__name__)
 
 
 async def exec_and_wait(
-    sandbox: Sandbox,
+    sandbox: SandboxHandle,
     command: str,
     *,
     session_id: str | None = None,

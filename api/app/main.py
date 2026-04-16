@@ -171,7 +171,26 @@ async def lifespan(app: FastAPI):
         app.state.flush_service = flush_service
         logger.info("MemoryFlushService 初始化完成")
 
-        # 8. 创建 AgentService 单例 (D2)
+        # 8. 初始化 SandboxLifecycleService 单例（同 checkpointer_pool 模式，eng review #9）
+        from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
+        from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
+        from app.infrastructure.storage.postgres import get_uow
+        SandboxLifecycleService.check_single_worker_argv()
+        sandbox_lifecycle_service = SandboxLifecycleService(
+            sandbox_cls=DockerSandbox,
+            uow_factory=get_uow,
+        )
+        app.state.sandbox_lifecycle_service = sandbox_lifecycle_service
+        logger.info(
+            "SandboxLifecycleService 单例初始化完成 "
+            "(Actus sandbox lifecycle running in SINGLE-WORKER mode)"
+        )
+
+        # 9. Reconcile orphans BEFORE confirmation sweep (eng review #12)
+        await sandbox_lifecycle_service.reconcile_orphans()
+        logger.info("Sandbox orphan reconciliation 完成")
+
+        # 10. 创建 AgentService 单例 (D2)
         from app.interfaces.service_dependencies import _build_agent_service
         app.state.agent_service = _build_agent_service(
             minio_store=minio_client,
@@ -179,10 +198,11 @@ async def lifespan(app: FastAPI):
             checkpointer_pool=checkpointer_pool.pool,
             flush_service=flush_service,
             memory_embedding_provider=app.state.memory_embedding_provider,
+            sandbox_lifecycle_service=sandbox_lifecycle_service,
         )
         logger.info("AgentService 单例初始化完成")
 
-        # 9. 启动 Confirmation Sweep 后台任务（扫描超时的危险工具确认）
+        # 11. 启动 Confirmation Sweep 后台任务（扫描超时的危险工具确认）
         app.state.agent_service.start_sweep_task()
         logger.info("Confirmation sweep task 已启动")
 
@@ -225,6 +245,17 @@ async def lifespan(app: FastAPI):
             logger.warning("Agent服务关闭超时, 强制关闭, 部分任务将被释放")
         except Exception as e:
             logger.error(f"Agent服务关闭期间出现错误: {str(e)}")
+
+        # 关闭 SandboxLifecycleService（在 AgentService 之后——agent 可能持有 handle）
+        lifecycle_svc = getattr(app.state, "sandbox_lifecycle_service", None)
+        if lifecycle_svc:
+            try:
+                await asyncio.wait_for(lifecycle_svc.shutdown(), timeout=15.0)
+                logger.info("SandboxLifecycleService 关闭成功")
+            except asyncio.TimeoutError:
+                logger.warning("SandboxLifecycleService 关闭超时")
+            except Exception as e:
+                logger.warning(f"SandboxLifecycleService 关闭时出错: {e}")
 
         # 关闭 MemoryFlushService（等待后台 flush 任务完成）
         flush_service = getattr(app.state, "flush_service", None)

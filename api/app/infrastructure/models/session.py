@@ -14,7 +14,12 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from ...domain.models.session import Session
+from ...domain.models.session import (
+    DestroyReason,
+    SandboxBinding,
+    SandboxBindingState,
+    Session,
+)
 from .base import Base
 
 
@@ -31,6 +36,26 @@ class SessionModel(Base):
         default=lambda: str(uuid.uuid4()),
     )  # 会话id
     sandbox_id: Mapped[str] = mapped_column(String(255), nullable=True)  # 沙箱id
+    # ── Sandbox binding columns (lifecycle state machine, I8) ──
+    sandbox_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'unbound'::character varying"),
+    )
+    sandbox_generation: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    sandbox_created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    sandbox_destroyed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    sandbox_destroy_reason: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
     task_id: Mapped[str] = mapped_column(String(255), nullable=True)  # 任务id
     title: Mapped[str] = mapped_column(
         String(255),
@@ -93,14 +118,51 @@ class SessionModel(Base):
         server_default=text("CURRENT_TIMESTAMP(0)"),
     )  # 创建时间
 
+    # ── Sandbox binding reconstruction for to_domain() ──
+
+    @property
+    def sandbox_binding(self) -> SandboxBinding:
+        """Reconstruct domain SandboxBinding from flat ORM columns."""
+        return SandboxBinding(
+            id=self.sandbox_id,
+            state=SandboxBindingState(self.sandbox_state),
+            generation=self.sandbox_generation,
+            created_at=self.sandbox_created_at,
+            destroyed_at=self.sandbox_destroyed_at,
+            destroy_reason=(
+                DestroyReason(self.sandbox_destroy_reason)
+                if self.sandbox_destroy_reason
+                else None
+            ),
+        )
+
+    def _apply_sandbox_binding(self, binding: SandboxBinding) -> None:
+        """Flatten SandboxBinding into ORM columns."""
+        self.sandbox_id = binding.id
+        self.sandbox_state = binding.state.value
+        self.sandbox_generation = binding.generation
+        self.sandbox_created_at = binding.created_at
+        self.sandbox_destroyed_at = binding.destroyed_at
+        self.sandbox_destroy_reason = (
+            binding.destroy_reason.value if binding.destroy_reason else None
+        )
+
     @classmethod
     def from_domain(cls, session: Session) -> "SessionModel":
         """从会话领域模型构建ORM模型"""
-        return cls(
+        # Exclude sandbox_binding (nested) — we flatten it into ORM columns
+        model = cls(
             # 1.基础字段: 使用BaseModel提供的python字典转换格式
             **session.model_dump(
                 mode="python",
-                exclude={"memories", "files", "events", "updated_at", "created_at"},
+                exclude={
+                    "memories",
+                    "files",
+                    "events",
+                    "updated_at",
+                    "created_at",
+                    "sandbox_binding",
+                },
             ),
             # 2.复杂字段: 使用BaseModel提供的json字典转换格式
             **session.model_dump(
@@ -108,6 +170,8 @@ class SessionModel(Base):
                 include={"memories", "files", "events"},
             ),
         )
+        model._apply_sandbox_binding(session.sandbox_binding)
+        return model
 
     def to_domain(self) -> Session:
         """将会话ORM模型转换成领域模型"""
@@ -123,7 +187,14 @@ class SessionModel(Base):
         # 1.基础字段: Python模式
         base_data = session.model_dump(
             mode="python",
-            exclude={"memories", "files", "events", "updated_at", "created_at"},
+            exclude={
+                "memories",
+                "files",
+                "events",
+                "updated_at",
+                "created_at",
+                "sandbox_binding",
+            },
         )
 
         # 2.复杂字段: JSON模式（排除 memories，由专用方法管理）
@@ -135,3 +206,6 @@ class SessionModel(Base):
         # 3.合并更新
         for field, value in {**base_data, **json_data}.items():
             setattr(self, field, value)
+
+        # 4. Sandbox binding: flatten into ORM columns
+        self._apply_sandbox_binding(session.sandbox_binding)

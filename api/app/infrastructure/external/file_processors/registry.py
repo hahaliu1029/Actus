@@ -4,7 +4,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from app.domain.external.file_processor import FileProcessor
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.infrastructure.external.file_processors.image import ImageFileProcessor
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ class FileProcessorRegistry:
 
     def __init__(
         self,
-        sandbox: Sandbox,
+        sandbox: SandboxHandle,
         file_uploader: FileUploader,
         vision_model: Any | None = None,
         audio_config: Any | None = None,

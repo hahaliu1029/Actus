@@ -18,7 +18,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.domain.external.browser import Browser
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.domain.external.search import SearchEngine
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.context_overflow_config import ContextOverflowConfig
@@ -75,7 +75,7 @@ class PlannerReActFlow(BaseFlow):
         agent_config: AgentConfig,
         session_id: str,
         browser: Browser,
-        sandbox: Sandbox,
+        sandbox: SandboxHandle,
         search_engine: SearchEngine,
         mcp_tool: MCPTool,
         a2a_tool: A2ATool,

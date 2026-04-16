@@ -577,20 +577,9 @@ async def download_sandbox_file(
     import mimetypes
     import os
 
-    async with session_service._uow:
-        session = await session_service._get_accessible_session(
-            session_id, current_user.id, current_user.is_admin()
-        )
-
-    if not session.sandbox_id:
-        raise NotFoundError("当前会话无沙箱环境")
-
-    from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
-    sandbox = await DockerSandbox.get(session.sandbox_id)
-    if not sandbox:
-        raise NotFoundError("当前会话沙箱不存在或已销毁")
-
-    file_data = await sandbox.download_file(filepath)
+    file_data = await session_service.download_file(
+        session_id, filepath, current_user.id, current_user.is_admin()
+    )
     filename = os.path.basename(filepath)
     content_type, _ = mimetypes.guess_type(filename)
 
@@ -758,6 +747,12 @@ async def takeover_shell_websocket(
                 await asyncio.sleep(guard_interval)
 
         sandbox_shell_ws_url = str(getattr(sandbox, "shell_ws_url", "") or "").strip()
+
+        # Get lifecycle registry for WS holder registration (P2 quiesce barrier)
+        _lifecycle_svc = getattr(
+            getattr(session_service, "_lifecycle", None), "registry", None
+        ) if hasattr(session_service, "_lifecycle") and session_service._lifecycle else None
+
         if sandbox_shell_ws_url:
             target_url = (
                 f"{sandbox_shell_ws_url}?session_id={quote(shell_session_id, safe='')}"
@@ -800,10 +795,28 @@ async def takeover_shell_websocket(
                     asyncio.create_task(forward_from_sandbox()),
                     asyncio.create_task(lease_guard()),
                 ]
-                done, pending = await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+
+                # Register WS holder for quiesce barrier (I6/P2)
+                ws_holder = None
+                if _lifecycle_svc is not None:
+                    from app.interfaces.endpoints._ws_holders import TakeoverShellWebSocketHolder
+                    ws_holder = TakeoverShellWebSocketHolder(
+                        session_id=session_id,
+                        client_ws=websocket,
+                        sandbox_ws=sandbox_ws,
+                        tasks=tasks,
+                        closed_event=closed,
+                    )
+                    _lifecycle_svc.register_ws_holder(session_id, ws_holder)
+
+                try:
+                    done, pending = await asyncio.wait(
+                        tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if ws_holder is not None and _lifecycle_svc is not None:
+                        _lifecycle_svc.release_ws_holder(session_id, ws_holder)
         else:
             logger.warning("沙箱不支持shell_ws_url，降级为HTTP轮询转发")
 
@@ -930,10 +943,28 @@ async def takeover_shell_websocket(
                 asyncio.create_task(forward_from_sandbox_via_http()),
                 asyncio.create_task(lease_guard()),
             ]
-            done, pending = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+
+            # Register HTTP-fallback WS holder for quiesce barrier (I6/P2)
+            http_ws_holder = None
+            if _lifecycle_svc is not None:
+                from app.interfaces.endpoints._ws_holders import TakeoverShellWebSocketHolder
+                http_ws_holder = TakeoverShellWebSocketHolder(
+                    session_id=session_id,
+                    client_ws=websocket,
+                    sandbox_ws=None,  # No upstream WS in HTTP fallback mode
+                    tasks=tasks,
+                    closed_event=closed,
+                )
+                _lifecycle_svc.register_ws_holder(session_id, http_ws_holder)
+
+            try:
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if http_ws_holder is not None and _lifecycle_svc is not None:
+                    _lifecycle_svc.release_ws_holder(session_id, http_ws_holder)
 
         closed.set()
         for task in pending:
@@ -1059,13 +1090,33 @@ async def vnc_websocket(
             # 7.并行运行两个任务
             forward_task1 = asyncio.create_task(forward_to_sandbox())
             forward_task2 = asyncio.create_task(forward_from_sandbox())
+            vnc_tasks = [forward_task1, forward_task2]
 
-            # 8.等待任意任务结束意味WebSocket连接终端
-            done, pending = await asyncio.wait(
-                [forward_task1, forward_task2],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            logger.info("WebSocket连接已关闭")
+            # Register VNC WS holder for quiesce barrier (I6/P2)
+            vnc_holder = None
+            _vnc_lifecycle_svc = getattr(
+                getattr(session_service, "_lifecycle", None), "registry", None
+            ) if hasattr(session_service, "_lifecycle") and session_service._lifecycle else None
+            if _vnc_lifecycle_svc is not None:
+                from app.interfaces.endpoints._ws_holders import VncWebSocketHolder
+                vnc_holder = VncWebSocketHolder(
+                    session_id=session_id,
+                    client_ws=websocket,
+                    sandbox_ws=sandbox_ws,
+                    tasks=vnc_tasks,
+                )
+                _vnc_lifecycle_svc.register_ws_holder(session_id, vnc_holder)
+
+            try:
+                # 8.等待任意任务结束意味WebSocket连接终端
+                done, pending = await asyncio.wait(
+                    vnc_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                logger.info("WebSocket连接已关闭")
+            finally:
+                if vnc_holder is not None and _vnc_lifecycle_svc is not None:
+                    _vnc_lifecycle_svc.release_ws_holder(session_id, vnc_holder)
 
             # 9.如果任一任务完成则取消其他任务(关闭全部链接)
             for task in pending:

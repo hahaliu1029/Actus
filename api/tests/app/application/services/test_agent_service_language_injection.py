@@ -85,6 +85,7 @@ def skeletal_service_with_captured_runner(monkeypatch):
     # side paths — all are guarded on config being populated.
     svc._redis_client = None
     svc._confirmation_manager = None
+    svc._sandbox_lifecycle_service = None  # PR1: lifecycle service not needed for this test
 
     # --- config snapshot (file_understanding_config=None skips the whole
     # file_processor_lookup branch) ---

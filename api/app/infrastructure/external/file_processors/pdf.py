@@ -11,7 +11,7 @@ import uuid
 from typing import Awaitable, Callable
 
 from app.domain.external.file_processor import FileProcessResult
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def _is_complex_page(page_markdown: str) -> bool:
 
 
 class PdfFileProcessor:
-    def __init__(self, sandbox: Sandbox, file_uploader: FileUploader) -> None:
+    def __init__(self, sandbox: SandboxHandle, file_uploader: FileUploader) -> None:
         self._sandbox = sandbox
         self._file_uploader = file_uploader
 

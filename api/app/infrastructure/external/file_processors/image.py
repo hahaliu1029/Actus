@@ -7,7 +7,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from app.domain.external.file_processor import FileProcessResult
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.infrastructure.external.llm.message_sanitizer import MAX_IMAGE_BYTES
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ class ImageFileProcessor:
 
     def __init__(
         self,
-        sandbox: Sandbox,
+        sandbox: SandboxHandle,
         file_uploader: FileUploader,
         vision_model: Any | None = None,
     ) -> None:

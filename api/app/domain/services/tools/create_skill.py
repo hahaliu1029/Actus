@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.domain.models.skill_creator import (
     SkillBlueprint,
     SkillCreationProgress,
@@ -23,7 +23,7 @@ class CreateSkillTool(BaseTool):
 
     name: str = "skill_creator"
 
-    def __init__(self, skill_creator_service, sandbox: Sandbox, user_id: str = "") -> None:
+    def __init__(self, skill_creator_service, sandbox: SandboxHandle, user_id: str = "") -> None:
         super().__init__()
         self._creator = skill_creator_service
         self._sandbox = sandbox

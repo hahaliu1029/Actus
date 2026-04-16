@@ -18,7 +18,7 @@ from langchain_core.tools import StructuredTool, tool as lc_tool
 
 from app.domain.external.browser import Browser
 from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.domain.external.search import SearchEngine
 from app.domain.models.tool_result import (
     AllowError,
@@ -176,7 +176,7 @@ def _make_message_tools() -> list[StructuredTool]:
 # --------------------------------------------------------------------------- #
 
 
-def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
+def _make_file_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
     """Create file tools that delegate to sandbox."""
 
     @lc_tool(response_format="content_and_artifact")
@@ -282,7 +282,7 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
 # --------------------------------------------------------------------------- #
 
 
-def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
+def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
     """Create shell tools that delegate to sandbox."""
 
     _DEFAULT_WAIT_SECONDS = 5  # Matches sandbox service default, kept in sync intentionally.
@@ -654,7 +654,7 @@ _EXT_MIME_MAP = {
 
 
 def _make_file_view_tools(
-    sandbox: Sandbox,
+    sandbox: SandboxHandle,
     processor_lookup: FileProcessorLookup,
     supports_vision: bool,
     supports_pdf_input: bool = False,
@@ -772,7 +772,7 @@ def _make_file_view_tools(
 
 
 def create_native_tools(
-    sandbox: Sandbox,
+    sandbox: SandboxHandle,
     browser: Browser,
     search_engine: SearchEngine,
     processor_lookup: FileProcessorLookup | None = None,

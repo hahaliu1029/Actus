@@ -1,0 +1,115 @@
+"""Sandbox lifecycle domain errors.
+
+These are domain-level exceptions raised by SandboxLifecycleService when
+callers attempt operations on sessions whose sandbox binding state doesn't
+permit them. The interfaces layer catches these and maps to HTTP responses.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+
+class SandboxLifecycleError(Exception):
+    """Base class for sandbox lifecycle errors."""
+
+
+class SessionUnboundError(SandboxLifecycleError):
+    """Session has no sandbox bound (binding.state == UNBOUND).
+
+    Caller should use ``bind_new()`` to create a new sandbox.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id} has no sandbox bound; call bind_new() first"
+        )
+
+
+class SessionCreatingError(SandboxLifecycleError):
+    """Sandbox is being created (binding.state == CREATING).
+
+    Caller should wait for creation to complete.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id} sandbox is being created; wait for completion"
+        )
+
+
+class SessionSuspendedError(SandboxLifecycleError):
+    """Session sandbox is suspended (binding.state == SUSPENDED).
+
+    Caller should call ``resume()`` to reactivate, or reject the request.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id} sandbox is suspended; call resume() to reactivate"
+        )
+
+
+class SessionDestroyingError(SandboxLifecycleError):
+    """Session sandbox is being destroyed (binding.state == DESTROYING).
+
+    Treat as terminal — sandbox is not recoverable.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id} sandbox is being destroyed; not recoverable"
+        )
+
+
+class SessionFinalizedError(SandboxLifecycleError):
+    """Session sandbox has been destroyed (binding.state == DESTROYED, terminal).
+
+    The sandbox is permanently gone. Caller should direct the user to start a
+    new session.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        destroyed_at: Optional[datetime] = None,
+        detail: Optional[str] = None,
+    ) -> None:
+        self.session_id = session_id
+        self.destroyed_at = destroyed_at
+        self.detail = detail
+        parts = [f"Session {session_id} sandbox is permanently destroyed"]
+        if destroyed_at:
+            parts.append(f"at {destroyed_at.isoformat()}")
+        if detail:
+            parts.append(f"({detail})")
+        super().__init__("; ".join(parts))
+
+
+class SandboxPoisonedError(SandboxLifecycleError):
+    """SandboxHandle generation mismatch — handle is stale.
+
+    Raised when a holder's handle generation doesn't match the current
+    registry generation. This means the sandbox was destroyed or
+    re-created since the handle was acquired.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        expected_generation: int,
+        actual_generation: int,
+    ) -> None:
+        self.session_id = session_id
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        super().__init__(
+            f"SandboxHandle for session {session_id} is stale: "
+            f"handle generation={expected_generation}, "
+            f"current generation={actual_generation}"
+        )

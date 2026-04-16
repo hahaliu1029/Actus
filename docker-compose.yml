@@ -54,6 +54,10 @@ services:
         PYTHON_PACKAGE_INDEX_URL: ${PYTHON_PACKAGE_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     image: actus-api:latest
     restart: unless-stopped
+    # ⚠️ Sandbox lifecycle 要求单 worker 部署（spec §8.6 / §12 Q5）
+    # 多 worker 需先完成跨进程协调 spec，不得直接 scale
+    deploy:
+      replicas: 1
     depends_on:
       sandbox-image:
         condition: service_completed_successfully
@@ -65,6 +69,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       CONTAINER_TIMEZONE: ${TZ:-Asia/Shanghai}
       PYTHONUNBUFFERED: "1"
+      WEB_CONCURRENCY: "1"  # Sandbox lifecycle 要求单 worker，见 CONTRIBUTING.md
       ENV: ${ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       APP_CONFIG_FILEPATH: /app/data/config.yaml

@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .event import Event, PlanEvent
 from .file import File
@@ -24,11 +24,66 @@ class SessionStatus(str, Enum):
     TIMED_OUT = "timed_out"  # watchdog 超时终止
 
 
+# ── Sandbox Binding (K8s-style terminal-state-aware lifecycle) ────────── #
+
+
+class SandboxBindingState(str, Enum):
+    """沙箱绑定状态。
+
+    状态机见 docs/superpowers/specs/2026-04-15-sandbox-lifecycle-design.md §6。
+    DESTROYED 是 terminal immutable（I1）。
+    """
+
+    UNBOUND = "unbound"  # 未绑定沙箱
+    CREATING = "creating"  # 沙箱创建中
+    ACTIVE = "active"  # 活跃
+    SUSPENDED = "suspended"  # 已挂起（容器不销毁，可 resume）
+    DESTROYING = "destroying"  # 销毁中（两阶段 quiesce barrier）
+    DESTROYED = "destroyed"  # 已销毁（terminal，不可逆）
+
+
+class DestroyReason(str, Enum):
+    """沙箱销毁原因。"""
+
+    SESSION_DELETE = "session_delete"  # 用户主动删除会话
+    WATCHDOG_TIMEOUT = "watchdog_timeout"  # 超时销毁
+    RECONCILE_ORPHAN = "reconcile_orphan"  # 容器被外部 kill，reconcile 标记
+
+
+class SandboxBinding(BaseModel):
+    """Terminal-state-aware sandbox binding.
+
+    frozen 保证任何修改必须经由 SandboxLifecycleService 产生新实例
+    （service 单写者，I3）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: Optional[str] = None
+    state: SandboxBindingState = SandboxBindingState.UNBOUND
+    generation: int = 0
+    created_at: Optional[datetime] = None
+    destroyed_at: Optional[datetime] = None
+    destroy_reason: Optional[DestroyReason] = None
+
+    def is_terminal(self) -> bool:
+        return self.state == SandboxBindingState.DESTROYED
+
+    def is_suspended(self) -> bool:
+        return self.state == SandboxBindingState.SUSPENDED
+
+    def can_acquire(self) -> bool:
+        return self.state == SandboxBindingState.ACTIVE
+
+
 class Session(BaseModel):
     """会话领域模型"""
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 会话id
-    sandbox_id: Optional[str] = None  # 沙箱id
+    sandbox_id: Optional[str] = None  # 沙箱id（仅 infrastructure ORM 兼容层使用）
+    sandbox_binding: SandboxBinding = Field(
+        default_factory=SandboxBinding
+    )  # 沙箱绑定（领域层唯一访问点，I8）
     task_id: Optional[str] = None  # 任务id
     title: str = ""  # 标题
     unread_message_count: int = 0  # 未读消息数

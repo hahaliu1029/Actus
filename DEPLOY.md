@@ -175,6 +175,7 @@ docker compose --profile tunnel up -d tunnel
 
 ## 11. 常见注意事项
 
+- **⚠️ API 服务必须单实例部署。** Sandbox 生命周期管理依赖进程内锁，多 worker/多实例会导致状态竞争。不要修改 `docker-compose.yml` 中 `api` 的 `deploy.replicas`，不要在 uvicorn 命令中加 `--workers`，不要 `docker compose up --scale api=N`。多实例需求请参考 `CONTRIBUTING.md` 中 "Sandbox Lifecycle 不变式" 章节。
 - 前端 API 地址变化后，需要重新构建 `ui-app`
 - `api` 通过挂载的 Docker Socket 动态创建会话沙箱
 - 沙箱镜像本身不常驻；真正执行任务的是 API 运行时按需创建的临时容器

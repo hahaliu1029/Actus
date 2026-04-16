@@ -5,7 +5,11 @@ from app.domain.models.tool_result import ToolResult
 
 
 class Sandbox(Protocol):
-    """沙箱服务扩展协议，包含文件工具协议、Shell工具协议以及沙箱本身的扩展"""
+    """沙箱底层服务协议（Docker/本地/云沙箱适配面）。
+
+    外部代码不应直接持有此类型——应通过 SandboxHandle 访问。
+    只有 SandboxLifecycleService / SandboxRegistry / DockerSandbox 内部使用。
+    """
 
     async def exec_command(
         self,
@@ -115,7 +119,7 @@ class Sandbox(Protocol):
         self,
         file_data: BinaryIO,
         filepath: str,
-        filename: str = None,
+        filename: Optional[str] = None,
     ) -> ToolResult:
         """根据文件源数据+路径+文件名将文件上传到沙箱中"""
         ...
@@ -165,3 +169,115 @@ class Sandbox(Protocol):
     async def get(cls, id: str) -> Optional[Self]:
         """类方法，根据传递的id获取沙箱实例"""
         ...
+
+
+class SandboxHandle(Protocol):
+    """Lifecycle-aware sandbox wrapper（I7）。
+
+    Holder 持有此类型而非 Sandbox。所有 async method 在调用前校验
+    generation，stale 立即 raise SandboxPoisonedError。
+    支持 async context manager 自动释放。
+
+    NOT @runtime_checkable — __getattr__ 代理下 isinstance 检查无意义。
+    Caller 变量始终注解为 SandboxHandle（Protocol），不 import SandboxHandleImpl。
+    """
+
+    # ── Properties (cached at acquire time, no generation check) ──
+
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def cdp_url(self) -> str: ...
+
+    @property
+    def shell_ws_url(self) -> str: ...
+
+    @property
+    def vnc_url(self) -> str: ...
+
+    @property
+    def generation(self) -> int: ...
+
+    # ── Forwarded async methods (all check generation before dispatch) ──
+
+    async def exec_command(
+        self,
+        session_id: str,
+        exec_dir: str,
+        command: str,
+        wait_seconds: Optional[int] = None,
+    ) -> ToolResult: ...
+
+    async def read_shell_output(
+        self, session_id: str, console: bool = False
+    ) -> ToolResult: ...
+
+    async def wait_process(
+        self, session_id: str, seconds: Optional[int] = None
+    ) -> ToolResult: ...
+
+    async def write_shell_input(
+        self, session_id: str, input_text: str, press_enter: bool = True
+    ) -> ToolResult: ...
+
+    async def resize_shell_session(
+        self, session_id: str, cols: int, rows: int
+    ) -> ToolResult: ...
+
+    async def kill_process(self, session_id: str) -> ToolResult: ...
+
+    async def write_file(
+        self,
+        filepath: str,
+        content: str,
+        append: bool = False,
+        leading_newline: bool = False,
+        trailing_newline: bool = False,
+        sudo: bool = False,
+    ) -> ToolResult: ...
+
+    async def read_file(
+        self,
+        filepath: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        sudo: bool = False,
+        max_length: int = 10000,
+    ) -> ToolResult: ...
+
+    async def check_file_exists(self, filepath: str) -> ToolResult: ...
+
+    async def delete_file(self, filepath: str) -> ToolResult: ...
+
+    async def list_files(self, dir_path: str) -> ToolResult: ...
+
+    async def replace_in_file(
+        self, filepath: str, old_str: str, new_str: str, sudo: bool = False
+    ) -> ToolResult: ...
+
+    async def search_in_file(
+        self, filepath: str, regex: str, sudo: bool = False
+    ) -> ToolResult: ...
+
+    async def find_files(self, dir_path: str, glob_pattern: str) -> ToolResult: ...
+
+    async def upload_file(
+        self, file_data: BinaryIO, filepath: str, filename: Optional[str] = None
+    ) -> ToolResult: ...
+
+    async def download_file(self, filepath: str) -> BinaryIO: ...
+
+    async def ensure_sandbox(self) -> None: ...
+
+    async def get_browser(self) -> Browser: ...
+
+    # ── Lifecycle ──
+
+    def release(self) -> None:
+        """Release this handle. Removes from registry's open-handle set. Idempotent."""
+        ...
+
+    async def __aenter__(self) -> "SandboxHandle": ...
+
+    async def __aexit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None: ...

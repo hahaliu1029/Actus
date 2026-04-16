@@ -8,7 +8,7 @@ import shlex
 import uuid
 
 from app.domain.external.file_processor import FileProcessResult
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.domain.models.app_config import AudioProcessorConfig
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ print(json.dumps({"language": info.language, "segments": output}, ensure_ascii=F
 
 
 class AudioFileProcessor:
-    def __init__(self, sandbox: Sandbox, config: AudioProcessorConfig) -> None:
+    def __init__(self, sandbox: SandboxHandle, config: AudioProcessorConfig) -> None:
         self._sandbox = sandbox
         self._config = config
 

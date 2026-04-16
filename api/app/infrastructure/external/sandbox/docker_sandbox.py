@@ -58,7 +58,15 @@ class DockerSandbox(Sandbox):
     @classmethod
     @alru_cache(maxsize=128, typed=True)
     async def _resolve_hostname_to_ip(cls, hostname: str) -> Optional[str]:
-        """将docker容器主机/地址转换成ipv4格式数据"""
+        """将docker容器主机/地址转换成ipv4格式数据
+
+        Note: @alru_cache is intentional and permanent for process lifetime.
+        DNS resolution for sandbox_address rarely changes. If the sandbox
+        address changes (e.g., container restart with new IP), a process
+        restart is required to clear the cache. async_lru does not support
+        TTL; consider switching to a TTL-capable cache if DNS volatility
+        becomes an issue.
+        """
         try:
             # 1.首先解析传递的hostname是不是ip
             try:
@@ -229,9 +237,12 @@ class DockerSandbox(Sandbox):
             return False
 
     @classmethod
-    @alru_cache(maxsize=128, typed=True)
     async def get(cls, id: str) -> Optional[Self]:
-        """根据传递的id获取沙箱实例"""
+        """根据传递的id获取沙箱实例
+
+        Note: @alru_cache removed per I4 — caching correctness hazard.
+        Replaced by SandboxRegistry state-indexed lookup.
+        """
         # 1.先获取系统配置并判断是否直连沙箱
         settings = get_settings()
         if settings.sandbox_address:

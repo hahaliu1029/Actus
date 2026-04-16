@@ -121,11 +121,12 @@ def get_file_service(
 
 
 # @lru_cache()
-def get_session_service() -> SessionService:
+def get_session_service(request: Request) -> SessionService:
+    lifecycle_service = getattr(request.app.state, "sandbox_lifecycle_service", None)
     return SessionService(
         uow_factory=get_uow,
-        sandbox_cls=DockerSandbox,
         task_cls=RedisStreamTask,
+        sandbox_lifecycle_service=lifecycle_service,
     )
 
 
@@ -353,6 +354,7 @@ def _build_agent_service(
     checkpointer_pool: AsyncConnectionPool,
     flush_service: object | None,
     memory_embedding_provider: object | None,
+    sandbox_lifecycle_service: object | None = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
@@ -376,6 +378,7 @@ def _build_agent_service(
         memory_session_factory=get_postgres().session_factory,
         memory_repo_factory=DBMemoryChunkRepository,
         event_recovery=RedisEventRecovery(),
+        sandbox_lifecycle_service=sandbox_lifecycle_service,
     )
     _last_refresh_generation = _config_generation
     return agent_svc
@@ -406,6 +409,11 @@ def get_flush_service(request: Request):
 def get_memory_embedding_provider(request: Request):
     """Extract memory embedding provider from app state (C4 构建)."""
     return getattr(request.app.state, "memory_embedding_provider", None)
+
+
+def get_sandbox_lifecycle_service(request: Request):
+    """Extract SandboxLifecycleService from app state (may be None)."""
+    return getattr(request.app.state, "sandbox_lifecycle_service", None)
 
 
 def get_agent_service(request: Request) -> AgentService:

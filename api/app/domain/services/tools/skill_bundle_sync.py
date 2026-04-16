@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from app.domain.external.sandbox import Sandbox
+from app.domain.external.sandbox import SandboxHandle
 from app.domain.models.skill import Skill, SkillRuntimeType
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ class SkillBundleSyncManager:
 
     def __init__(
         self,
-        sandbox: Sandbox,
+        sandbox: SandboxHandle,
         skills_root_dir: str | Path,
         sandbox_skill_root: str,
         background_concurrency: int = DEFAULT_BACKGROUND_CONCURRENCY,

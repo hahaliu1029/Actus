@@ -144,6 +144,32 @@ executor_node 在默认生产路径下**局部**消费 `StepMetadata.skill_conte
 **不**走 state。如果它也写回 state，两个数据源会竞争写入，updater 的值会
 在下一 loop 被 executor 覆盖。
 
+## Sandbox Lifecycle 不变式（单 Worker 部署契约）
+
+Actus 的沙箱生命周期由 `SandboxLifecycleService` 管理，采用 K8s 风格的
+terminal-state 状态机（详见 `docs/superpowers/specs/2026-04-15-sandbox-lifecycle-design.md`）。
+
+### 单 Worker 硬约束
+
+**当前 sandbox lifecycle 仅支持单 worker 部署。** 状态转换通过进程内
+`asyncio.Lock` 串行化，跨 worker 会产生真实 race condition。
+
+部署要求：
+- `docker-compose.yml` 中 api 服务必须保持 `deploy.replicas: 1`
+- uvicorn 启动参数不得传 `--workers N`（N > 1）
+- `docker compose up --scale api=N`（N > 1）禁止使用
+- 运行时防护：`WEB_CONCURRENCY` 环境变量必须为 `"1"`（或不设置）
+
+多 worker 部署需要同时推进 §12 Q5 的跨进程协调 spec（Postgres advisory lock + Redis pub/sub invalidation），不得只扩 worker 不扩协调。
+
+### CI gates
+
+| Gate | 文件 | 保护的不变式 |
+|------|------|-------------|
+| Gate 1 | `tests/domain/test_no_raw_sandbox_references.py` | I3: 所有 sandbox 访问走 lifecycle service |
+| Gate 2 | `tests/domain/test_no_session_sandbox_id_access.py` | I8: domain/application 层走 `sandbox_binding.*` |
+| Gate 3 | `tests/domain/test_no_raw_sandbox_attribute_access.py` | I7: 不绕过 SandboxHandle generation 检查 |
+
 ## 前端开发
 
 ```bash
