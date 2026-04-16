@@ -385,6 +385,27 @@ describe("session-ui", () => {
       expect(result[0]?.filename).toBe("report.pdf");
       expect(result[0]?.size).toBe(2048);
     });
+
+    it("附件 id 不匹配时仍可按 filepath 回填会话文件详情", () => {
+      const files = [
+        {
+          id: "f-3",
+          filename: "final-report.pdf",
+          filepath: "/tmp/final-report.pdf",
+          key: "k3",
+          extension: "pdf",
+          mime_type: "application/pdf",
+          size: 4096,
+        },
+      ];
+
+      const result = normalizeMessageAttachments(
+        [{ id: "temp-id", filename: "final-report.pdf", filepath: "/tmp/final-report.pdf" }],
+        files
+      );
+
+      expect(result[0]).toEqual(files[0]);
+    });
   });
 
   describe("workbench timeline helpers", () => {

@@ -12,6 +12,8 @@ from typing import Literal
 
 from app.domain.external.sandbox import SandboxHandle
 from app.domain.models.skill import Skill, SkillRuntimeType
+from app.domain.services.skills_guard import SkillsGuard, ScanReport
+from app.domain.services.trust_matrix import scan_skill_source, get_install_decision
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +236,48 @@ class SkillBundleSyncManager:
         if not bundle_dir.exists() or not bundle_dir.is_dir():
             raise RuntimeError(f"Skill[{skill.id}] bundle目录不存在: {bundle_dir}")
 
+        # --- R3: Security scan gate ---
+        # Scan skill root dir (includes manifest.json + SKILL.md + bundle/)
+        # for consistency with install-time and startup scan paths.
+        _skill_root_dir = self._skills_root_dir / skill.id
+        new_hash = SkillsGuard.compute_content_hash(_skill_root_dir)
+        old_hash = (skill.scan_report or {}).get("content_hash")
+
+        if new_hash != old_hash:
+            # Check if this hash was force-approved at install time
+            _force_hash = getattr(skill, "force_approved_hash", None)
+            if _force_hash and _force_hash == new_hash:
+                logger.info(
+                    "Bundle sync: skill %s hash matches force_approved_hash, skipping gate",
+                    skill.id,
+                )
+            else:
+                report = scan_skill_source(skill.runtime_type, _skill_root_dir)
+                decision = get_install_decision(skill.trust_origin, report.verdict)
+
+                if decision == "block":
+                    logger.error(
+                        "Bundle sync blocked for skill %s: verdict=%s, findings=%s",
+                        skill.id,
+                        report.verdict,
+                        [f.pattern_id for f in report.findings[:5]],
+                    )
+                    self._write_last_rejected_sync(skill, report)
+                    return None  # Skip sync, old version continues serving
+
+                if decision == "warn":
+                    logger.warning(
+                        "Bundle sync warning for skill %s: verdict=%s",
+                        skill.id,
+                        report.verdict,
+                    )
+
+                # allow or warn: update scan_report on the skill object AND persist to disk
+                # so subsequent sessions see the new risk level immediately.
+                skill.scan_report = report.to_dict()
+                self._persist_scan_report(skill, report)
+        # --- End R3 scan gate ---
+
         files = sorted(path for path in bundle_dir.rglob("*") if path.is_file())
         if not files:
             raise RuntimeError(f"Skill[{skill.id}] bundle为空，无法同步")
@@ -270,6 +314,45 @@ class SkillBundleSyncManager:
                 f"写入同步标记失败: {marker_result.message or 'unknown error'}"
             )
         return sandbox_skill_dir
+
+    def _write_last_rejected_sync(self, skill: Skill, report: ScanReport) -> None:
+        """Write rejected sync info to meta.json without changing scan_report."""
+        meta_path = self._skills_root_dir / skill.id / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            return
+        meta["last_rejected_sync"] = {
+            "verdict": report.verdict,
+            "findings": [
+                {
+                    "pattern_id": f.pattern_id,
+                    "category": f.category,
+                    "severity": f.severity,
+                    "file": f.file,
+                    "line": f.line,
+                    "match": f.match,
+                }
+                for f in report.findings
+            ],
+            "content_hash": report.content_hash,
+            "rejected_at": report.scanned_at.isoformat(),
+        }
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _persist_scan_report(self, skill: Skill, report: ScanReport) -> None:
+        """Persist updated scan_report to meta.json after allow/warn rescan."""
+        meta_path = self._skills_root_dir / skill.id / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            return
+        meta["scan_report"] = report.to_dict()
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     async def _read_marker_version(self, marker_path: str) -> str:
         exists_result = await self._sandbox.check_file_exists(marker_path)

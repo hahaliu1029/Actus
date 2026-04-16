@@ -53,6 +53,16 @@ class SkillModel(Base):
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP(0)"),
     )
+    # R3: risk metadata
+    trust_origin: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("'user_installed'"),
+    )
+    scan_report: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True, server_default=text("NULL"),
+    )
+    force_approved_hash: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, server_default=text("NULL"),
+    )
 
     @classmethod
     def from_domain(cls, skill: Skill) -> "SkillModel":
@@ -71,6 +81,9 @@ class SkillModel(Base):
             installed_by=skill.installed_by,
             created_at=skill.created_at,
             updated_at=skill.updated_at,
+            trust_origin=skill.trust_origin,
+            scan_report=skill.scan_report,
+            force_approved_hash=skill.force_approved_hash,
         )
 
     def to_domain(self) -> Skill:
@@ -89,6 +102,9 @@ class SkillModel(Base):
             installed_by=self.installed_by,
             created_at=self.created_at,
             updated_at=self.updated_at,
+            trust_origin=self.trust_origin,
+            scan_report=self.scan_report,
+            force_approved_hash=self.force_approved_hash,
         )
 
     def update_from_domain(self, skill: Skill) -> None:
@@ -103,4 +119,7 @@ class SkillModel(Base):
         self.manifest = skill.manifest
         self.enabled = skill.enabled
         self.installed_by = skill.installed_by
+        self.trust_origin = skill.trust_origin
+        self.scan_report = skill.scan_report
+        self.force_approved_hash = skill.force_approved_hash
         self.updated_at = datetime.now()

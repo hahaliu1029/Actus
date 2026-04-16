@@ -889,6 +889,7 @@ class PlannerReActFlow(BaseFlow):
                 "has_file_view": self._file_processor_lookup is not None,
                 "has_memory_tools": self._has_memory_tools,
                 "approval_cache": self._approval_cache,
+                "skill_tool": self._skill_tool,  # R3: for pre-Stage-P risk refresh
                 "confirmation_manager": self._confirmation_manager,
                 "user_id": self._user_id,
                 "session_id": self._session_id,

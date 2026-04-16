@@ -232,6 +232,42 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Failed to clean stale FINISHING sessions: %s", e)
 
+        # R3: Background scan for existing skills missing scan_report
+        # Must start BEFORE yield (startup phase). After yield is shutdown.
+        async def _background_skill_scan():
+            """Startup background scan for existing skills (30s timeout)"""
+            try:
+                from pathlib import Path as _Path
+                from app.domain.services.trust_matrix import scan_skill_source
+                from app.domain.services.skills_guard import SkillsGuard
+                from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
+
+                repo = FileSkillRepository(settings.skills_root_dir)
+                skills_root = _Path(settings.skills_root_dir)
+                skills = await repo.list()
+                scanned = 0
+                for skill in skills:
+                    skill_dir = skills_root / skill.id
+                    if skill.scan_report and skill.scan_report.get("content_hash"):
+                        current_hash = SkillsGuard.compute_content_hash(skill_dir)
+                        if current_hash == skill.scan_report["content_hash"]:
+                            continue
+                    report = scan_skill_source(skill.runtime_type, skill_dir)
+                    skill.scan_report = report.to_dict()
+                    if not skill.trust_origin or skill.trust_origin == "":
+                        skill.trust_origin = "user_installed"
+                    await repo.upsert(skill)
+                    scanned += 1
+                logger.info("R3 startup scan complete: %d skills scanned", scanned)
+            except asyncio.TimeoutError:
+                logger.warning("R3 startup scan timed out (30s), remaining skills keep dangerous default")
+            except Exception:
+                logger.exception("R3 startup scan failed (non-fatal)")
+
+        app.state._r3_scan_task = asyncio.create_task(
+            asyncio.wait_for(_background_skill_scan(), timeout=30.0)
+        )
+
         # lifespan分界点
         yield
     finally:

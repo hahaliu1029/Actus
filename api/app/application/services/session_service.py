@@ -118,7 +118,12 @@ class SessionService:
         except Exception as e:
             logger.warning(f"清理会话任务[{task_id}]失败: {e}")
 
-    async def _acquire_sandbox(self, session_id: str) -> SandboxHandle:
+    async def _acquire_sandbox(
+        self,
+        session_id: str,
+        *,
+        resume_if_suspended: bool = False,
+    ) -> SandboxHandle:
         """Acquire a sandbox handle for a session via lifecycle service.
 
         Raises NotFoundError/ServerRequestsError with user-friendly message
@@ -130,7 +135,11 @@ class SessionService:
             return await self._lifecycle.acquire(session_id)
         except SessionUnboundError:
             raise NotFoundError("当前会话无沙箱环境")
-        except (SessionFinalizedError, SessionSuspendedError):
+        except SessionSuspendedError:
+            if resume_if_suspended:
+                return await self._lifecycle.resume(session_id)
+            raise NotFoundError("当前会话沙箱不存在或已销毁")
+        except SessionFinalizedError:
             raise NotFoundError("当前会话沙箱不存在或已销毁")
         except SandboxLifecycleError:
             # Catch-all for SessionCreatingError, SessionDestroyingError, etc.
@@ -149,7 +158,7 @@ class SessionService:
         async with self._uow:
             await self._get_accessible_session(session_id, user_id, is_admin)
 
-        handle = await self._acquire_sandbox(session_id)
+        handle = await self._acquire_sandbox(session_id, resume_if_suspended=True)
         return await handle.download_file(filepath)
 
     async def get_session(
@@ -191,7 +200,7 @@ class SessionService:
             await self._get_accessible_session(session_id, user_id, is_admin)
 
         # 2.通过 lifecycle service 获取沙箱 handle
-        handle = await self._acquire_sandbox(session_id)
+        handle = await self._acquire_sandbox(session_id, resume_if_suspended=True)
 
         # 3.调用沙箱读取文件内容
         result = await handle.read_file(filepath)

@@ -128,6 +128,10 @@ function getPathTail(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+function shouldUseSandboxFile(file: FileInfo): boolean {
+  return !file.key && Boolean(file.filepath);
+}
+
 function toSearchThumbnail(url: string, width: number): string {
   return `https://s.wordpress.com/mshots/v1/${encodeURIComponent(url)}?w=${width}`;
 }
@@ -1019,7 +1023,9 @@ export default function SessionPage() {
         }
 
         if (nextKind === "image" || nextKind === "pdf") {
-          const blob = await downloadFile(file.id);
+          const blob = shouldUseSandboxFile(file)
+            ? await downloadSandboxFile(sessionId, file.filepath)
+            : await downloadFile(file.id);
           const url = URL.createObjectURL(blob);
           setPreviewBlobUrl(url);
           return;
@@ -1032,7 +1038,7 @@ export default function SessionPage() {
 
       setPreviewLoading(false);
     },
-    [downloadFile, previewBlobUrl, resetPreviewState, sessionId]
+    [downloadFile, downloadSandboxFile, previewBlobUrl, resetPreviewState, sessionId]
   );
 
   const openFilePathPreview = useCallback(
@@ -1097,10 +1103,12 @@ export default function SessionPage() {
 
   const handleFileDownload = useCallback(
     async (file: FileInfo) => {
+      const useSandboxFile = shouldUseSandboxFile(file);
+      const sourceRef = useSandboxFile ? file.filepath : file.id;
       // Dedup: skip if active transfer exists for this file
       const existingTasks = useTransferStore.getState().tasks;
       const hasActive = Object.values(existingTasks).some(
-        (t) => t.sourceRef === file.id && (t.status === "pending" || t.status === "transferring")
+        (t) => t.sourceRef === sourceRef && (t.status === "pending" || t.status === "transferring")
       );
       if (hasActive) return;
 
@@ -1108,14 +1116,21 @@ export default function SessionPage() {
         type: "download",
         filename: file.filename,
         totalBytes: file.size,
-        sourceRef: file.id,
+        sourceRef,
       });
 
       try {
-        const blob = await downloadFile(file.id, {
-          signal,
-          onProgress: (loaded: number, total: number) => updateTransferProgress(taskId, loaded, total),
-        });
+        const blob = useSandboxFile
+          ? await downloadSandboxFile(sessionId!, file.filepath, {
+              signal,
+              onProgress: (loaded: number, total: number) =>
+                updateTransferProgress(taskId, loaded, total),
+            })
+          : await downloadFile(file.id, {
+              signal,
+              onProgress: (loaded: number, total: number) =>
+                updateTransferProgress(taskId, loaded, total),
+            });
 
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -1133,7 +1148,7 @@ export default function SessionPage() {
         failTransferTask(taskId, error instanceof Error ? error.message : "下载失败");
       }
     },
-    [addTransferTask, completeTransferTask, downloadFile, failTransferTask, updateTransferProgress]
+    [addTransferTask, completeTransferTask, downloadFile, downloadSandboxFile, failTransferTask, sessionId, updateTransferProgress]
   );
 
   const handleSandboxDownload = useCallback(

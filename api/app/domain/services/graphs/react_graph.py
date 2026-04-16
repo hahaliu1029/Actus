@@ -1241,11 +1241,162 @@ def build_react_graph(
             _tc_enabled = configurable.get("tool_confirmation_enabled", True)
             _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
 
+            # R3: Pre-Stage-P risk refresh for skill tools.
+            # If the bundle changed since init, rescan and use the fresh risk level
+            # so approval decisions are never based on stale metadata.
+            if (
+                tool_source
+                and tool_source.source == "skill"
+                and _tc_enabled
+            ):
+                _r3_skill_tool = configurable.get("skill_tool")
+                if _r3_skill_tool:
+                    _refreshed_risk = _r3_skill_tool.refresh_risk_if_stale(tool_name)
+                    if _refreshed_risk:
+                        risk_level_meta = _refreshed_risk
+                        # Also update tool_fn.metadata so the rest of the pipeline sees it
+                        _meta = getattr(tool_fn, "metadata", None) or {}
+                        _meta["risk_level"] = _refreshed_risk
+                        tool_fn.metadata = _meta
+
+            # ========== R3: Skill Stage P branch ==========
+            if (
+                not _bypass_risk_gate
+                and _tc_enabled
+                and tool_source
+                and tool_source.source == "skill"
+                and risk_level_meta
+                and risk_level_meta in ("high", "medium")
+            ):
+                from app.domain.services.skill_risk_assessor import SkillRiskAssessor
+                from app.domain.models.skill import SkillRuntimeType
+
+                _skill_meta = getattr(tool_fn, "metadata", None) or {}
+                _skill_risk_level = RiskLevel[risk_level_meta.upper()]
+                _skill_assessor = SkillRiskAssessor()
+                assessment = _skill_assessor.assess(
+                    tool_name=tool_name,
+                    tool_args=args,
+                    risk_level=_skill_risk_level,
+                    runtime_type=SkillRuntimeType(
+                        _skill_meta.get("runtime_type", "native")
+                    ),
+                    trust_origin=_skill_meta.get("trust_origin", "user_installed"),
+                )
+
+                # P.1: ApprovalCache
+                cache_decision = "no_match"
+                approval_cache = configurable.get("approval_cache")
+                _user_id = configurable.get("user_id") or ""
+                _session_id = configurable.get("session_id") or ""
+                if approval_cache and _user_id and _session_id:
+                    try:
+                        cache_decision = await approval_cache.check(
+                            user_id=_user_id,
+                            session_id=_session_id,
+                            tool_name=tool_name,
+                            arg_digest=assessment.arg_digest,
+                            primary_arg=assessment.primary_arg,
+                            dir_arg=assessment.dir_arg,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Stage P.1 ApprovalCache crashed for skill %s (fail-open)",
+                            tool_name,
+                        )
+                        cache_decision = "no_match"
+
+                if cache_decision == "allow":
+                    pass  # fall through to execution
+
+                elif cache_decision == "deny":
+                    _denied = Denied(
+                        content=f"Skill '{tool_name}' 被审批策略拒绝",
+                        reason=DecisionReason(
+                            type="approval_policy",
+                            code="cache_deny",
+                            message=f"risk_level={risk_level_meta}",
+                        ),
+                    )
+                    await _finalize_outcome(tc, args, tool_source, _denied, _tool_start)
+                    continue
+
+                else:
+                    # P.3: risk_enforce backstop (>= MEDIUM → user confirmation)
+                    _timeout_seconds = configurable.get(
+                        "tool_confirmation_timeout_seconds", 300
+                    )
+                    confirmation_event = ToolConfirmationEvent(
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        tool_args=args,
+                        risk_level=assessment.final_level.name.lower(),
+                        risk_reason=assessment.risk_reason,
+                        matched_patterns=assessment.matched_patterns,
+                        suggested_alternative=assessment.suggested_alternative,
+                        timeout_seconds=_timeout_seconds,
+                    )
+                    if event_queue:
+                        await event_queue.put(confirmation_event)
+
+                    if confirmation_manager:
+                        from app.domain.services.confirmation_manager import (
+                            ConfirmationDetail,
+                        )
+                        _detail = ConfirmationDetail(
+                            session_id=_session_id,
+                            tool_call_id=call_id,
+                            user_id=_user_id,
+                            tool_name=tool_name,
+                            tool_args=args,
+                            risk_level=assessment.final_level.name.lower(),
+                            arg_digest=assessment.arg_digest,
+                            primary_arg=assessment.primary_arg,
+                            dir_arg=assessment.dir_arg,
+                            matched_patterns=assessment.matched_patterns,
+                            deadline_ts=_time.time() + confirmation_event.timeout_seconds,
+                        )
+                        await confirmation_manager.store(_detail)
+
+                    _pending_outcome = Asked(
+                        content="等待用户确认 Skill 工具执行",
+                        reason=DecisionReason(
+                            type="risk_enforce",
+                            code=assessment.final_level.name.lower(),
+                            message=assessment.risk_reason or "",
+                        ),
+                    )
+                    _pending_artifact = ToolArtifact(
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        tool_source=tool_source,
+                        outcome=_pending_outcome,
+                    )
+                    _update = {
+                        "messages": new_messages + new_deferred_human,
+                        "events": new_events,
+                        "attempt_count": state["attempt_count"] + 1,
+                        "failure_count": state["failure_count"] + new_failures,
+                        "completed_tool_call_prefix": (
+                            list(already_done) + new_completed_ids
+                        ),
+                        "pending_ask_outcome": _pending_outcome.model_dump(mode="json"),
+                        "pending_ask_tool_call_id": call_id,
+                        "pending_ask_artifact": _pending_artifact.model_dump(
+                            mode="json", by_alias=True
+                        ),
+                        "pending_ask_tool_args": dict(args),
+                    }
+                    return Command(goto="interrupt_helper", update=_update)
+
+            # ========== End R3 Skill Stage P ==========
+            # Original native tool gate — skip for skill tools (handled above)
             if (
                 not _bypass_risk_gate
                 and _tc_enabled
                 and risk_level_meta
                 and risk_level_meta in ("high", "medium")
+                and (not tool_source or tool_source.source != "skill")
             ):
                 assessment = _risk_assessor.assess(tool_name, args)
 

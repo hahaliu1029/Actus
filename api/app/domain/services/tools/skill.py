@@ -134,6 +134,10 @@ class SkillTool(BaseTool):
                     "skill": skill,
                     "runtime_type": runtime_type,
                     "manifest_tool": manifest_tool,
+                    # R3: risk data for langchain_dynamic_skill_tools metadata injection
+                    "final_risk": self._compute_final_risk(skill),
+                    "trust_origin": skill.trust_origin,
+                    "scan_verdict": (skill.scan_report or {}).get("verdict", "safe"),
                 }
 
         # Batch atomic assignment. No `await` between these five lines, so
@@ -158,25 +162,70 @@ class SkillTool(BaseTool):
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_bindings
 
-    def _evaluate_risk_enforce(
-        self,
-        *,
-        skill: Skill,
-        tool_name: str,
-        risk_level: str,
-    ) -> Asked | None:
-        if self._risk_mode != "enforce_confirmation":
+    def refresh_risk_if_stale(self, tool_name: str) -> str | None:
+        """Check if the skill's content has changed since init and rescan if needed.
+
+        Returns the updated risk_level string (e.g. "high", "medium", "low") if
+        the risk changed, or None if still fresh. Call this BEFORE Stage P so
+        approval decisions use the latest risk, not a stale snapshot.
+        """
+        binding = self._tool_bindings.get(tool_name)
+        if not binding:
             return None
-        if risk_level != "high":
+        skill: Skill = binding["skill"]
+        cached_hash = (skill.scan_report or {}).get("content_hash")
+        if not cached_hash:
+            # No content_hash = never scanned. Return "high" to force Stage P
+            # (consistent with _compute_final_risk's "missing = dangerous" rule).
+            # The actual scan will happen via startup backfill or on next init.
+            return "high"
+
+        # Need filesystem access through bundle sync manager
+        if not self._bundle_sync_manager:
             return None
-        return Asked(
-            content=f"Skill '{tool_name}' 标记为高风险，需要用户确认后执行",
-            reason=DecisionReason(
-                type="risk_enforce",
-                code=f"skill_{skill.id}_risk_high",
-                message="risk_mode=enforce_confirmation, risk_level=high",
-            ),
+        skills_root = getattr(self._bundle_sync_manager, "_skills_root_dir", None)
+        if not skills_root:
+            return None
+
+        from app.domain.services.skills_guard import SkillsGuard
+        skill_dir = skills_root / skill.id
+        if not skill_dir.exists():
+            return None
+
+        current_hash = SkillsGuard.compute_content_hash(skill_dir)
+        if current_hash == cached_hash:
+            return None  # fresh, no change
+
+        # Content changed — rescan and update binding
+        from app.domain.services.trust_matrix import scan_skill_source
+        report = scan_skill_source(skill.runtime_type, skill_dir)
+        skill.scan_report = report.to_dict()
+        new_risk = self._compute_final_risk(skill)
+
+        # Update binding in-place so subsequent calls in this step use new risk
+        binding["final_risk"] = new_risk
+        binding["scan_verdict"] = report.verdict
+        logger.warning(
+            "R3: skill %s risk refreshed mid-session: %s → %s (hash changed)",
+            skill.id, binding.get("final_risk"), new_risk,
         )
+        return new_risk
+
+    @staticmethod
+    def _compute_final_risk(skill: Skill) -> str:
+        from app.domain.services.trust_matrix import compute_base_floor, compute_final_risk
+        base = compute_base_floor(skill.runtime_type, skill.trust_origin)
+        manifest_risk = None
+        if isinstance(skill.manifest, dict):
+            policy = skill.manifest.get("policy", {})
+            if isinstance(policy, dict):
+                manifest_risk = policy.get("risk_level")
+        # Missing scan_report = not yet scanned = treat as dangerous (fail-closed).
+        # This ensures unscanned legacy skills enter Stage P until backfill completes.
+        scan_verdict = (skill.scan_report or {}).get("verdict")
+        if skill.scan_report is None:
+            scan_verdict = "dangerous"
+        return compute_final_risk(base, scan_verdict, manifest_risk).name.lower()
 
     @staticmethod
     def _tool_result_to_outcome(result: ToolResult) -> ToolOutcome:
@@ -219,16 +268,6 @@ class SkillTool(BaseTool):
         skill: Skill = binding["skill"]
         runtime_type: SkillRuntimeType = binding["runtime_type"]
         manifest_tool: dict[str, Any] = binding["manifest_tool"]
-        policy = self._get_tool_policy(skill, manifest_tool)
-        risk_level = str(policy.get("risk_level") or "low").strip().lower()
-
-        ask = self._evaluate_risk_enforce(
-            skill=skill,
-            tool_name=tool_name,
-            risk_level=risk_level,
-        )
-        if ask is not None:
-            return ask
 
         if runtime_type == SkillRuntimeType.NATIVE:
             result = await self._invoke_native(skill, manifest_tool, kwargs)

@@ -137,6 +137,14 @@ describe("SessionPage", () => {
       configurable: true,
       value: vi.fn(),
     });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:preview"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
 
     sessionStoreState.currentSession = {
       session_id: "s-b",
@@ -154,6 +162,48 @@ describe("SessionPage", () => {
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;
     markdownRendererMock.mockClear();
+  });
+
+  it("历史附件缺少正式文件记录时，预览应回退到沙箱文件下载", async () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "completed",
+      events: [
+        {
+          event: "message",
+          data: {
+            event_id: "evt-msg-1",
+            role: "assistant",
+            message: "这是生成的 PDF。",
+            created_at: 1_700_000_000,
+            attachments: [
+              {
+                id: "temp-file-id",
+                filename: "final-report.pdf",
+                filepath: "/home/ubuntu/final-report.pdf",
+                extension: "pdf",
+                mime_type: "",
+                key: "",
+                size: 0,
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    render(<SessionPage />);
+
+    screen.getByRole("button", { name: /final-report\.pdf/i }).click();
+
+    await waitFor(() => {
+      expect(sessionStoreState.downloadSandboxFile).toHaveBeenCalledWith(
+        "s-b",
+        "/home/ubuntu/final-report.pdf"
+      );
+    });
+    expect(sessionStoreState.downloadFile).not.toHaveBeenCalled();
   });
 
   it("全局流式属于其他会话时，不应显示当前会话执行中", () => {

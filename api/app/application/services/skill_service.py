@@ -1,6 +1,9 @@
 """Skill 服务"""
 
+import json
+import logging
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,8 @@ from app.domain.models.skill import (
 )
 from app.domain.repositories.skill_repository import SkillRepository
 import yaml
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BLOCKED_NATIVE_COMMAND_PATTERNS = (
     r"\brm\s+-rf\b",
@@ -63,6 +68,9 @@ class SkillService:
         manifest: dict,
         skill_md: str,
         installed_by: str,
+        *,
+        trust_origin: str = "user_installed",
+        force: bool = False,
     ) -> Skill:
         if source_type not in {SkillSourceType.LOCAL, SkillSourceType.GITHUB}:
             raise ValidationError(msg="source_type 仅支持 local 或 github")
@@ -144,7 +152,108 @@ class SkillService:
 
         skill = Skill(**skill_payload)
 
-        return await self.skill_repository.upsert(skill)
+        # ========== R3: Install-time scan gate ==========
+        from app.domain.services.trust_matrix import (
+            compute_base_floor,
+            compute_final_risk,
+            get_install_decision,
+            scan_skill_source,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="skill_scan_") as _scan_dir:
+            _scan_path = Path(_scan_dir)
+            if bundle_files:
+                for _rel_path, _bf in bundle_files.items():
+                    _target = _scan_path / _rel_path
+                    _target.parent.mkdir(parents=True, exist_ok=True)
+                    _content = _bf.content if hasattr(_bf, "content") else _bf
+                    _target.write_bytes(
+                        _content if isinstance(_content, bytes)
+                        else str(_content).encode("utf-8")
+                    )
+            if effective_skill_md:
+                (_scan_path / "SKILL.md").write_text(effective_skill_md, encoding="utf-8")
+            if normalized_manifest:
+                (_scan_path / "manifest.json").write_text(
+                    json.dumps(normalized_manifest, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+            _scan_report = scan_skill_source(skill.runtime_type, _scan_path)
+
+        _decision = get_install_decision(trust_origin, _scan_report.verdict)
+
+        if _decision == "block" and not force:
+            raise ValidationError(
+                msg=f"Skill 安全扫描未通过 (verdict={_scan_report.verdict})",
+                data={
+                    "installed": False,
+                    "verdict": _scan_report.verdict,
+                    "findings": [
+                        {"pattern_id": f.pattern_id, "category": f.category,
+                         "severity": f.severity, "file": f.file,
+                         "line": f.line, "match": f.match}
+                        for f in _scan_report.findings[:20]
+                    ],
+                    "final_risk": compute_final_risk(
+                        compute_base_floor(skill.runtime_type, trust_origin),
+                        _scan_report.verdict, None,
+                    ).name.lower(),
+                    "trust_origin": trust_origin,
+                },
+            )
+
+        if force and _scan_report.verdict == "dangerous":
+            logger.warning(
+                "force_install: user=%s skill=%s verdict=%s findings=%s",
+                installed_by, skill.id, _scan_report.verdict,
+                [f.pattern_id for f in _scan_report.findings[:10]],
+            )
+
+        _base = compute_base_floor(skill.runtime_type, trust_origin)
+        _manifest_risk = (
+            (normalized_manifest or {}).get("policy", {}).get("risk_level")
+            if isinstance(normalized_manifest, dict) else None
+        )
+        _final_risk = compute_final_risk(_base, _scan_report.verdict, _manifest_risk)
+
+        # force + dangerous → final_risk must be HIGH (spec invariant)
+        if force and _scan_report.verdict == "dangerous":
+            from app.domain.services.risk_assessor import RiskLevel
+            assert _final_risk == RiskLevel.HIGH, (
+                f"force+dangerous invariant violated: {_final_risk}"
+            )
+
+        skill.trust_origin = trust_origin
+        skill.scan_report = _scan_report.to_dict()
+        # ========== End R3 gate ==========
+
+        result = await self.skill_repository.upsert(skill)
+
+        # R3: Recompute content_hash on actual disk layout for consistency.
+        # Install scans a tmpdir (flat), but repo writes bundle/ subdirectory.
+        # compute_content_hash excludes meta.json/bundle_index.json to avoid
+        # self-referential hash, so this is safe to do after upsert.
+        try:
+            from app.domain.services.skills_guard import SkillsGuard
+            _get_dir = getattr(self.skill_repository, "get_skill_dir", None)
+            _actual_dir = _get_dir(result.id) if _get_dir else None
+            if _actual_dir and _actual_dir.exists():
+                _actual_hash = SkillsGuard.compute_content_hash(_actual_dir)
+                _stored = dict(result.scan_report or {})
+                _stored["content_hash"] = _actual_hash
+                result.scan_report = _stored
+
+                # force + dangerous: persist force_approved_hash as its own
+                # Skill field so it survives any scan_report overwrite.
+                if force and _scan_report.verdict == "dangerous":
+                    result.force_approved_hash = _actual_hash
+
+                await self.skill_repository.upsert(result)
+        except Exception:
+            logger.warning("R3: failed to recompute content_hash post-upsert", exc_info=True)
+
+        return result
 
     async def set_skill_enabled(self, skill_id: str, enabled: bool) -> Skill:
         skill = await self.skill_repository.get_by_id(skill_id)

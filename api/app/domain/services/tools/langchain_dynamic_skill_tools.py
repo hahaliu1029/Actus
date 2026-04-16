@@ -126,4 +126,17 @@ def create_dynamic_skill_langchain_tools(
     for tool in tools:
         annotate_and_register_tool_source(tool, source="skill", category="skill")
 
+    # R3: Inject risk metadata from skill_tool bindings
+    for tool in tools:
+        name = tool.name
+        binding = skill_tool._tool_bindings.get(name, {})
+        _rt = binding.get("runtime_type")
+        tool.metadata = {
+            **(tool.metadata or {}),
+            "risk_level": binding.get("final_risk", "low"),
+            "runtime_type": _rt.value if hasattr(_rt, "value") else str(_rt or "native"),
+            "trust_origin": binding.get("trust_origin", "user_installed"),
+            "scan_verdict": binding.get("scan_verdict", "safe"),
+        }
+
     return tools

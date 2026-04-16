@@ -404,7 +404,10 @@ async def test_a2a_skill_delegates_to_a2a_tool() -> None:
     assert a2a_tool.called == ("agent-1", "hello")
 
 
-async def test_skill_risk_enforce_high_risk_returns_asked() -> None:
+async def test_skill_invoke_high_risk_manifest_executes_directly() -> None:
+    # R3: _evaluate_risk_enforce has been removed from SkillTool.invoke().
+    # Risk enforcement is now handled by the Stage P branch in react_graph.tool_node.
+    # SkillTool.invoke() always executes the tool regardless of risk_level.
     skill_tool = SkillTool(
         sandbox=_FakeSandbox(),
         mcp_tool=_FakeMCPTool(),
@@ -417,8 +420,8 @@ async def test_skill_risk_enforce_high_risk_returns_asked() -> None:
     await skill_tool.initialize([skill])
     result = await skill_tool.invoke("skill_demo_native_run_demo", target="hello")
 
-    assert isinstance(result, Asked)
-    assert result.reason.type == "risk_enforce"
+    # invoke() now falls through to execution; Asked is no longer returned here
+    assert isinstance(result, AllowSuccess)
 
 
 async def test_skill_risk_enforce_off_returns_success() -> None:

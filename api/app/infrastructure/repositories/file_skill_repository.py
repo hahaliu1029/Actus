@@ -43,6 +43,10 @@ class FileSkillRepository(SkillRepository):
     async def delete(self, skill_id: str) -> bool:
         return await asyncio.to_thread(self._delete_sync, skill_id)
 
+    def get_skill_dir(self, skill_id: str) -> Path:
+        """Public accessor for the skill's filesystem directory."""
+        return self._skill_dir(skill_id)
+
     def _ensure_root(self) -> None:
         self._root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +104,9 @@ class FileSkillRepository(SkillRepository):
             installed_by=meta.get("installed_by"),
             created_at=self._parse_datetime(meta.get("created_at")),
             updated_at=self._parse_datetime(meta.get("updated_at")),
+            trust_origin=meta.get("trust_origin", "user_installed"),
+            scan_report=meta.get("scan_report"),
+            force_approved_hash=meta.get("force_approved_hash"),
         )
 
     def _upsert_sync(self, skill: Skill) -> None:
@@ -124,8 +131,22 @@ class FileSkillRepository(SkillRepository):
             "installed_by": skill.installed_by,
             "created_at": skill.created_at.isoformat(),
             "updated_at": skill.updated_at.isoformat(),
+            "trust_origin": skill.trust_origin,
+            "scan_report": skill.scan_report,
+            "force_approved_hash": skill.force_approved_hash,
         }
-        (skill_dir / "meta.json").write_text(
+
+        # R3: Preserve last_rejected_sync if it exists in current meta.json
+        meta_path = skill_dir / "meta.json"
+        if meta_path.exists():
+            try:
+                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if "last_rejected_sync" in existing_meta:
+                    meta_payload["last_rejected_sync"] = existing_meta["last_rejected_sync"]
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        meta_path.write_text(
             json.dumps(meta_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

@@ -155,4 +155,43 @@ describe("fileTransferClient", () => {
       }
     });
   });
+
+  describe("response interceptor: error message normalization", () => {
+    it("extracts msg from blob json error payload", async () => {
+      const payload = JSON.stringify({
+        code: 404,
+        msg: "当前会话沙箱不存在或已销毁",
+        data: {},
+      });
+      const errorBlob = new Blob([payload], { type: "application/json" });
+      Object.defineProperty(errorBlob, "text", {
+        value: vi.fn(async () => payload),
+      });
+
+      const originalAdapter = fileTransferClient.defaults.adapter;
+      fileTransferClient.defaults.adapter = (config) => {
+        return Promise.reject({
+          config,
+          response: {
+            status: 404,
+            data: errorBlob,
+          },
+          isAxiosError: true,
+          message: "Request failed with status code 404",
+        });
+      };
+
+      try {
+        await expect(fileTransferClient.get("/sessions/s1/file/download")).rejects.toMatchObject(
+          {
+            message: "当前会话沙箱不存在或已销毁",
+            code: 404,
+            httpStatus: 404,
+          }
+        );
+      } finally {
+        fileTransferClient.defaults.adapter = originalAdapter;
+      }
+    });
+  });
 });

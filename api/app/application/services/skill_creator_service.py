@@ -1159,5 +1159,6 @@ class SkillCreatorService:
                 manifest=files.manifest,
                 skill_md=files.skill_md,
                 installed_by=installed_by,
+                trust_origin="agent_created",
             )
 

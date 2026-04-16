@@ -303,6 +303,48 @@ function fallbackAttachmentById(id: string): FileInfo {
   };
 }
 
+function getPathTail(path: string): string {
+  const normalized = path.split("?")[0]?.split("#")[0] || path;
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+function findMatchingSessionFile(
+  attachment: FileInfo,
+  sessionFiles: FileInfo[]
+): FileInfo | null {
+  const byId = sessionFiles.find((file) => file.id === attachment.id);
+  if (byId) {
+    return byId;
+  }
+
+  if (attachment.filepath) {
+    const byPath = sessionFiles.find((file) => file.filepath === attachment.filepath);
+    if (byPath) {
+      return byPath;
+    }
+  }
+
+  if (attachment.filename) {
+    const byFilename = sessionFiles.find((file) => file.filename === attachment.filename);
+    if (byFilename) {
+      return byFilename;
+    }
+  }
+
+  if (attachment.filepath) {
+    const attachmentTail = getPathTail(attachment.filepath);
+    const byPathTail = sessionFiles.find(
+      (file) => getPathTail(file.filepath) === attachmentTail
+    );
+    if (byPathTail) {
+      return byPathTail;
+    }
+  }
+
+  return null;
+}
+
 export function normalizeMessageAttachments(
   rawAttachments: unknown,
   sessionFiles: FileInfo[]
@@ -324,18 +366,23 @@ export function normalizeMessageAttachments(
       if (!normalized) {
         return null;
       }
-      const matched = fileMap.get(normalized.id);
+      const matched = findMatchingSessionFile(normalized, sessionFiles);
       if (!matched) {
         return normalized.filename ? normalized : fallbackAttachmentById(normalized.id);
       }
       return {
-        ...matched,
         ...normalized,
+        ...matched,
+        id: matched.id,
         filename: normalized.filename || matched.filename,
         filepath: normalized.filepath || matched.filepath,
         key: normalized.key || matched.key,
         extension: normalized.extension || matched.extension,
-        mime_type: normalized.mime_type || matched.mime_type,
+        mime_type:
+          normalized.mime_type &&
+          normalized.mime_type !== "application/octet-stream"
+            ? normalized.mime_type
+            : matched.mime_type,
         size: normalized.size > 0 ? normalized.size : matched.size,
       };
     })

@@ -94,22 +94,45 @@ async def list_skills(admin_user: AdminUser) -> Response[SkillListResponse]:
 
 @router.post(
     path="/install",
-    response_model=Response[dict | None],
+    response_model=Response[dict],
     summary="安装 Skill（v2）",
 )
 async def install_skill(
     request: SkillInstallRequest,
     admin_user: AdminUser,
-) -> Response[dict | None]:
+    force: bool = Query(False, description="强制安装 dangerous skill"),
+) -> Response[dict]:
     service = _build_skill_service()
-    await service.install_skill(
+    skill = await service.install_skill(
         source_type=request.source_type,
         source_ref=request.source_ref,
         manifest=request.manifest,
         skill_md=request.skill_md,
         installed_by=admin_user.id,
+        trust_origin="user_installed",
+        force=force,
     )
-    return Response.success(msg="Skill 安装成功")
+
+    scan_report = skill.scan_report or {}
+    from app.domain.services.trust_matrix import compute_base_floor, compute_final_risk
+    _base = compute_base_floor(skill.runtime_type, skill.trust_origin)
+    _manifest_risk = (
+        (skill.manifest or {}).get("policy", {}).get("risk_level")
+        if isinstance(skill.manifest, dict) else None
+    )
+    _final = compute_final_risk(
+        _base, scan_report.get("verdict"), _manifest_risk
+    )
+
+    return Response.success(data={
+        "installed": True,
+        "skill_id": skill.id,
+        "verdict": scan_report.get("verdict", "safe"),
+        "findings": scan_report.get("findings", [])[:20],
+        "forced": force and scan_report.get("verdict") == "dangerous",
+        "final_risk": _final.name.lower(),
+        "trust_origin": skill.trust_origin,
+    })
 
 
 @router.post(

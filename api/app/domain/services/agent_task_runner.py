@@ -291,6 +291,7 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_selected_skills: list[Skill] = []
         self._current_message_text: str = ""
         self._last_initialized_skill_ids: tuple[str, ...] = ()
+        self._last_skill_risk_fp: tuple[str, ...] = ()  # R3: risk fingerprint for re-init detection
         # #27 hotfix: parallel to _last_initialized_skill_ids, this holds the
         # actual Skill objects that were last passed to SkillTool.initialize.
         # Required by _build_step_react_graph's outer rollback path so it can
@@ -1751,6 +1752,7 @@ class AgentTaskRunner(TaskRunner):
         snapshot_skill_ids = self._last_skill_ids
         snapshot_bound_tool_names = self._last_bound_tool_names
         snapshot_initialized_skill_ids = self._last_initialized_skill_ids
+        snapshot_risk_fp = self._last_skill_risk_fp
         # #27 hotfix: snapshot the Skill object list too. The 4 _last_* field
         # rollback alone is not enough — SkillTool internal state was already
         # mutated by Phase 1's _initialize_skill_tool_if_needed and stays on
@@ -1840,6 +1842,7 @@ class AgentTaskRunner(TaskRunner):
             self._last_skill_ids = snapshot_skill_ids
             self._last_bound_tool_names = snapshot_bound_tool_names
             self._last_initialized_skill_ids = snapshot_initialized_skill_ids
+            self._last_skill_risk_fp = snapshot_risk_fp
             self._last_initialized_skills = snapshot_initialized_skills
             # #27 hotfix: SkillTool internal state was already mutated by
             # Phase 1's _initialize_skill_tool_if_needed before Phase 2 or
@@ -1870,10 +1873,31 @@ class AgentTaskRunner(TaskRunner):
             self._lc_tools_cache.clear()
             raise
 
+    @staticmethod
+    def _skill_risk_fingerprint(skills: list["Skill"]) -> tuple[str, ...]:
+        """Cache key that includes id + risk-relevant metadata.
+
+        If scan_report or trust_origin changes (e.g. bundle sync rescan
+        or startup backfill), the fingerprint changes and forces re-init
+        so StructuredTool.metadata.risk_level picks up the new value.
+        """
+        parts: list[str] = []
+        for s in skills:
+            sr = s.scan_report or {}
+            parts.append(
+                f"{s.id}:{s.trust_origin}:{sr.get('content_hash', '')}:{sr.get('verdict', '')}"
+            )
+        return tuple(parts)
+
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
-        """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。"""
+        """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。
+
+        R3: also checks risk fingerprint (trust_origin + scan verdict + hash)
+        so risk changes mid-session force re-init of StructuredTool metadata.
+        """
         skill_ids = tuple(skill.id for skill in skills)
-        if skill_ids == self._last_initialized_skill_ids:
+        risk_fp = self._skill_risk_fingerprint(skills)
+        if skill_ids == self._last_initialized_skill_ids and risk_fp == self._last_skill_risk_fp:
             logger.debug(
                 "[ProgressiveSkillLoad] SkillTool 未变化，跳过重新初始化 (skills=%d)",
                 len(skills),
@@ -1882,6 +1906,7 @@ class AgentTaskRunner(TaskRunner):
         prev_ids = self._last_initialized_skill_ids
         await self._skill_tool.initialize(skills)
         self._last_initialized_skill_ids = skill_ids
+        self._last_skill_risk_fp = risk_fp
         # #27 hotfix: keep object list in sync so outer rollback can restore.
         self._last_initialized_skills = list(skills)
         logger.info(
@@ -2130,8 +2155,12 @@ class AgentTaskRunner(TaskRunner):
                             "content", ""
                         )
                         event.tool_content = FileToolContent(content=file_content)
-                        # 写操作同步到对象存储
-                        if event.function_name in ("file_write", "file_str_replace"):
+                        # 写操作和显式文件查看都需要把沙箱文件同步到会话文件列表
+                        if event.function_name in (
+                            "file_write",
+                            "file_str_replace",
+                            "file_view",
+                        ):
                             await self._sync_file_to_storage(filepath)
                     else:
                         event.tool_content = FileToolContent(content="(No Content)")
@@ -2556,6 +2585,7 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_selected_skills = []
         self._current_message_text = ""
         self._last_initialized_skill_ids = ()
+        self._last_skill_risk_fp = ()
         self._last_initialized_skills = []
 
     async def invoke(self, task: Task) -> None:

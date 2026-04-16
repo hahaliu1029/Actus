@@ -70,6 +70,9 @@ class Skill(BaseModel):
     installed_by: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+    trust_origin: str = "user_installed"        # builtin / user_installed / agent_created
+    scan_report: Optional[Dict[str, Any]] = None  # ScanReport dict, None = not yet scanned
+    force_approved_hash: Optional[str] = None     # content_hash at force-install time, survives rescan
 
     model_config = ConfigDict(from_attributes=True)
 

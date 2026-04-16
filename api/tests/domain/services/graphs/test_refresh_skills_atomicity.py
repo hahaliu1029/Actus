@@ -226,6 +226,10 @@ def _seed_pre_call_state(runner: AgentTaskRunner) -> dict[str, Any]:
     runner._last_skill_ids = ("prev_skill_1",)
     runner._last_bound_tool_names = frozenset({"shell_execute", "skill_prev"})
     runner._last_initialized_skill_ids = ("prev_skill_1",)
+    # R3: seed risk fingerprint so fast-path check matches
+    runner._last_skill_risk_fp = AgentTaskRunner._skill_risk_fingerprint(
+        [_build_skill("prev_skill_1")]
+    )
     return {
         "skill_context": runner._last_skill_context,
         "skill_ids": runner._last_skill_ids,
