@@ -4,7 +4,6 @@ This module preserves the same public interface (constructor, invoke, done)
 so that AgentTaskRunner requires minimal changes.
 """
 
-import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional, Sequence
@@ -34,7 +33,7 @@ from app.domain.models.event import (
 )
 from app.domain.models.llm_responses import ConversationSummaryResponse, PlanResponse, StepDef
 from app.domain.models.memory import Memory
-from app.domain.models.memory_chunk import FlushBatch, RawChunk
+from app.domain.models.memory_chunk import FlushBatch, RawChunk, memory_content_hash
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
@@ -1393,7 +1392,7 @@ class PlannerReActFlow(BaseFlow):
             for part in parts:
                 if not part.strip():
                     continue
-                content_hash = hashlib.sha256(part.encode("utf-8")).hexdigest()
+                content_hash = memory_content_hash(part)
                 meta: dict[str, Any] = {
                     "turn_index": group["turn_index"],
                     "message_types": sorted(group["message_types"]),

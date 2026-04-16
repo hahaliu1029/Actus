@@ -4,6 +4,7 @@ import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 
 import { configApi } from "@/lib/api/config";
+import { memoryApi } from "@/lib/api/memory";
 import { userToolsApi } from "@/lib/api/user-tools";
 import type {
   A2AServersData,
@@ -14,12 +15,29 @@ import type {
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  MemoryItem,
+  MemoryListParams,
   SkillRiskPolicy,
   SkillListData,
   ToolWithPreference,
 } from "@/lib/api/types";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
+
+/**
+ * 记忆变更已经在后端生效，但随后的列表刷新失败时抛出的错误。
+ * 调用方应把它视为"危险操作已完成"——关闭弹窗/清空选择，但不需要让用户重试变更；
+ * 列表区域会通过 memoryLoadError + toast 呈现刷新失败本身。
+ * 和普通的 mutation 失败区分开，避免出现"既提示成功又让弹窗停在失败态"的混乱。
+ */
+export class MemoryRefreshAfterMutationError extends Error {
+  readonly refreshCause: unknown;
+  constructor(refreshCause: unknown) {
+    super("记忆变更已生效，但列表刷新失败");
+    this.name = "MemoryRefreshAfterMutationError";
+    this.refreshCause = refreshCause;
+  }
+}
 
 type SettingsState = {
   llmConfig: LLMConfig | null;
@@ -36,6 +54,15 @@ type SettingsState = {
   isInstallingSkill: boolean;
   isSkillRiskPolicyLoading: boolean;
   isSkillRiskPolicyUpdating: boolean;
+  // Memory management
+  memories: MemoryItem[];
+  memoryTotal: number;
+  memoryPage: number;
+  memoryPageSize: number;
+  memoryHasNext: boolean;
+  isMemoryLoading: boolean;
+  memoryFilters: MemoryListParams;
+  memoryLoadError: string | null;
 };
 
 type SettingsActions = {
@@ -58,6 +85,15 @@ type SettingsActions = {
   setSkillEnabled: (skillId: string, enabled: boolean) => Promise<void>;
   setSkillToolEnabled: (skillId: string, enabled: boolean) => Promise<void>;
   updateFileUnderstandingConfig: (config: FileUnderstandingConfig) => Promise<void>;
+  loadMemories: (
+    params?: MemoryListParams,
+    options?: { replaceFilters?: boolean },
+  ) => Promise<void>;
+  deleteMemory: (id: string) => Promise<void>;
+  bulkDeleteMemories: (ids: string[]) => Promise<void>;
+  deleteAllMemories: () => Promise<void>;
+  // 注：记忆内容的编辑由 detail drawer 直接调用 memoryApi.updateContent
+  // 以便内联展示 409 冲突；store 不再维护第二套更新路径，避免双路径漂移。
 };
 
 type SettingsStore = SettingsState & SettingsActions;
@@ -77,6 +113,14 @@ const initialState: SettingsState = {
   isInstallingSkill: false,
   isSkillRiskPolicyLoading: false,
   isSkillRiskPolicyUpdating: false,
+  memories: [],
+  memoryTotal: 0,
+  memoryPage: 1,
+  memoryPageSize: 20,
+  memoryHasNext: false,
+  isMemoryLoading: false,
+  memoryFilters: {},
+  memoryLoadError: null,
 };
 
 function mergeOptimisticMCPServers(
@@ -418,6 +462,99 @@ export const useSettingsStore = create<SettingsStore>()(
         reportSuccess("文件理解配置已保存");
       } catch (error) {
         reportError(error, "更新文件理解配置失败");
+      }
+    },
+
+    loadMemories: async (params = {}, options = {}) => {
+      // replaceFilters=true 时以 params 为全新 filter；默认合并，用于只改 page 等局部字段。
+      // 切换 tab / 初次加载应传 replaceFilters=true，避免上次会话残留跨次注入。
+      const filters = options.replaceFilters
+        ? { ...params }
+        : { ...get().memoryFilters, ...params };
+      set({
+        isMemoryLoading: true,
+        memoryFilters: filters,
+        memoryLoadError: null,
+      });
+      try {
+        const data = await memoryApi.list(filters);
+        set({
+          memories: data.items,
+          memoryTotal: data.total,
+          memoryPage: data.page,
+          memoryPageSize: data.page_size,
+          memoryHasNext: data.has_next,
+          memoryLoadError: null,
+        });
+      } catch (error) {
+        // 始终 rethrow：调用方（例如 mutation 的 refresh 阶段）需要感知刷新
+        // 失败，避免把"mutation 成功 + 刷新失败"当成完全成功。不关心的调用方
+        // （useEffect / 分页按钮等）用 .catch(() => {}) 主动丢弃即可；
+        // memoryLoadError + toast 已经把错误呈现给用户。
+        const message =
+          error instanceof Error ? error.message : "加载长期记忆失败";
+        reportError(error, "加载长期记忆失败");
+        set({ memoryLoadError: message });
+        throw error;
+      } finally {
+        set({ isMemoryLoading: false });
+      }
+    },
+
+    // 写操作三阶段结构：
+    //   1) mutation：失败 reportError + rethrow（普通 Error）
+    //   2) mutation 成功 → reportSuccess
+    //   3) refresh：失败抛 MemoryRefreshAfterMutationError（内部 loadMemories 已 reportError）
+    //
+    // 调用方 try/catch 语义：
+    //   - 走到 `try` 末尾 = mutation + refresh 都成功 → 关闭弹窗 + 清空选择
+    //   - catch MemoryRefreshAfterMutationError → mutation 已生效 → 同样关闭弹窗 + 清空选择，
+    //       列表区域通过 memoryLoadError 显示刷新失败
+    //   - catch 其它 → mutation 失败 → 保留 UI 让用户重试
+    // 避免"先弹成功 toast 后又停在失败弹窗"的混乱状态。
+    deleteMemory: async (id) => {
+      try {
+        await memoryApi.deleteOne(id);
+      } catch (error) {
+        reportError(error, "删除记忆失败");
+        throw error;
+      }
+      reportSuccess("记忆已删除");
+      try {
+        // 删除后回到第 1 页，避免用户停在可能已空的当前页
+        await get().loadMemories({ page: 1 });
+      } catch (refreshError) {
+        throw new MemoryRefreshAfterMutationError(refreshError);
+      }
+    },
+
+    bulkDeleteMemories: async (ids) => {
+      try {
+        await memoryApi.bulkDelete(ids);
+      } catch (error) {
+        reportError(error, "批量删除记忆失败");
+        throw error;
+      }
+      reportSuccess("记忆已批量删除");
+      try {
+        await get().loadMemories({ page: 1 });
+      } catch (refreshError) {
+        throw new MemoryRefreshAfterMutationError(refreshError);
+      }
+    },
+
+    deleteAllMemories: async () => {
+      try {
+        await memoryApi.deleteAll();
+      } catch (error) {
+        reportError(error, "清空记忆失败");
+        throw error;
+      }
+      reportSuccess("所有记忆已清空");
+      try {
+        await get().loadMemories({ page: 1 });
+      } catch (refreshError) {
+        throw new MemoryRefreshAfterMutationError(refreshError);
       }
     },
   }))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -46,3 +47,12 @@ class MemoryChunk:
     updated_at: datetime
     session_id: str | None = None
     embedding: tuple[float, ...] | None = None
+
+
+def memory_content_hash(content: str) -> str:
+    """memory_chunks 表的 content_hash 统一计算函数。
+
+    使用全量 SHA256，与 planner_react.py 写入路径保持一致。
+    新增 memory_chunks.content_hash 读写路径时请复用此函数，避免算法漂移。
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()

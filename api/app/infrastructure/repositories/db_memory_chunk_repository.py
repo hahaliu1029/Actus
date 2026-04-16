@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+from collections import Counter
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import Select, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,8 +14,14 @@ from app.domain.models.memory_chunk import MemoryChunk
 from app.domain.repositories.memory_chunk_repository import MemoryChunkRepository
 from app.infrastructure.models.memory_chunk_orm import MemoryChunkModel
 
-if TYPE_CHECKING:
-    from typing import Any
+def _escape_ilike(query: str) -> str:
+    """Escape SQL LIKE wildcards (``%``/``_``) in user input.
+
+    必须与 ``.ilike(pattern, escape="\\")`` 配对使用；否则 ``%``/``_`` 仍会被
+    Postgres 解析为通配符，导致过滤条件失效（例如 ``file_name`` 会匹配
+    ``filename``）。
+    """
+    return query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 
 class DBMemoryChunkRepository(MemoryChunkRepository):
@@ -76,6 +84,166 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         result = await self.db_session.execute(stmt)
         row = result.scalar_one_or_none()
         return self._to_domain(row) if row else None
+
+    async def list_by_user(
+        self,
+        user_id: str,
+        *,
+        query: str | None = None,
+        source: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> list[MemoryChunk]:
+        stmt = select(MemoryChunkModel).where(MemoryChunkModel.user_id == user_id)
+        stmt = self._apply_filters(
+            stmt,
+            query=query,
+            source=source,
+            created_from=created_from,
+            created_to=created_to,
+            updated_from=updated_from,
+            updated_to=updated_to,
+        )
+        # id DESC 作为 updated_at 并列时的确定性 tie-breaker：
+        # MemoryFlushService 会给同一 batch 复用同一 now()，并列行非常常见；
+        # 没有 tie-breaker 时 offset 分页在并列行上不保证稳定顺序，跨页可能重复/漏项。
+        stmt = (
+            stmt.order_by(
+                MemoryChunkModel.updated_at.desc(),
+                MemoryChunkModel.id.desc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await self.db_session.execute(stmt)
+        return [self._to_domain(row) for row in result.scalars().all()]
+
+    async def count_by_user(
+        self,
+        user_id: str,
+        *,
+        query: str | None = None,
+        source: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(MemoryChunkModel).where(
+            MemoryChunkModel.user_id == user_id
+        )
+        stmt = self._apply_filters(
+            stmt,
+            query=query,
+            source=source,
+            created_from=created_from,
+            created_to=created_to,
+            updated_from=updated_from,
+            updated_to=updated_to,
+        )
+        result = await self.db_session.execute(stmt)
+        return int(result.scalar_one())
+
+    async def update_content(
+        self,
+        *,
+        chunk_id: str,
+        user_id: str,
+        content: str,
+        content_hash: str,
+        embedding: tuple[float, ...] | None,
+    ) -> MemoryChunk | None:
+        # updated_at 走数据库 now() —— `update().values()` 绕过 ORM 脏标记，
+        # onupdate=datetime.now 不会触发；使用服务端时间消除多 pod 时钟漂移。
+        stmt = (
+            update(MemoryChunkModel)
+            .where(
+                MemoryChunkModel.id == chunk_id,
+                MemoryChunkModel.user_id == user_id,
+            )
+            .values(
+                content=content,
+                content_hash=content_hash,
+                embedding=list(embedding) if embedding is not None else None,
+                updated_at=text("now()"),
+            )
+            .returning(MemoryChunkModel)
+        )
+        result = await self.db_session.execute(stmt)
+        row = result.scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
+    async def delete_by_ids(
+        self, *, user_id: str, ids: list[str]
+    ) -> list[MemoryChunk]:
+        """按 id 批量删除本用户的记忆，返回实际被删除的行（DELETE ... RETURNING）。
+
+        审计路径依赖"实际删除集"：把删除与快照合并到同一条 RETURNING 语句
+        避免 READ COMMITTED 下 SELECT → DELETE 两步之间的并发 TOCTOU。
+        """
+        if not ids:
+            return []
+        stmt = (
+            delete(MemoryChunkModel)
+            .where(
+                MemoryChunkModel.user_id == user_id,
+                MemoryChunkModel.id.in_(ids),
+            )
+            .returning(MemoryChunkModel)
+        )
+        result = await self.db_session.execute(stmt)
+        return [self._to_domain(row) for row in result.scalars().all()]
+
+    async def delete_all_by_user(self, *, user_id: str) -> dict[str, int]:
+        """删除本用户所有记忆，返回实际被删除行按 source 分组的数量。
+
+        使用 ``DELETE ... RETURNING source`` + 应用层 Counter 聚合，确保
+        "实际删除"和"source 分布"来自同一条语句，避免多次查询的竞态不一致。
+        返回单个 source 字符串（~10 字符），即便 10 万条记忆也只占 ~1MB 内存。
+        """
+        stmt = (
+            delete(MemoryChunkModel)
+            .where(MemoryChunkModel.user_id == user_id)
+            .returning(MemoryChunkModel.source)
+        )
+        result = await self.db_session.execute(stmt)
+        sources = list(result.scalars().all())
+        return dict(Counter(sources))
+
+    # ---- Filter helper ----
+
+    @staticmethod
+    def _apply_filters(
+        stmt: Select[Any],
+        *,
+        query: str | None,
+        source: str | None,
+        created_from: datetime | None,
+        created_to: datetime | None,
+        updated_from: datetime | None,
+        updated_to: datetime | None,
+    ) -> Select[Any]:
+        """共享的过滤条件装配，list_by_user / count_by_user 复用。"""
+        if query is not None and query != "":
+            escaped = _escape_ilike(query)
+            stmt = stmt.where(
+                MemoryChunkModel.content.ilike(f"%{escaped}%", escape="\\")
+            )
+        if source is not None:
+            stmt = stmt.where(MemoryChunkModel.source == source)
+        if created_from is not None:
+            stmt = stmt.where(MemoryChunkModel.created_at >= created_from)
+        if created_to is not None:
+            stmt = stmt.where(MemoryChunkModel.created_at <= created_to)
+        if updated_from is not None:
+            stmt = stmt.where(MemoryChunkModel.updated_at >= updated_from)
+        if updated_to is not None:
+            stmt = stmt.where(MemoryChunkModel.updated_at <= updated_to)
+        return stmt
 
     # ---- Conversion helpers ----
 

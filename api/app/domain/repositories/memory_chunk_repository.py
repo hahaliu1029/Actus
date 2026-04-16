@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -50,4 +51,70 @@ class MemoryChunkRepository(Protocol):
 
     async def get_by_id(self, chunk_id: str, user_id: str) -> MemoryChunk | None:
         """按 ID + user_id 精确读取。不存在或越权均返回 None。"""
+        ...
+
+    async def list_by_user(
+        self,
+        user_id: str,
+        *,
+        query: str | None = None,
+        source: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> list[MemoryChunk]:
+        """按过滤条件返回当前用户记忆的分页列表，按 updated_at DESC 排序。"""
+        ...
+
+    async def count_by_user(
+        self,
+        user_id: str,
+        *,
+        query: str | None = None,
+        source: str | None = None,
+        created_from: datetime | None = None,
+        created_to: datetime | None = None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+    ) -> int:
+        """相同过滤条件的总条数，用于分页。"""
+        ...
+
+    async def update_content(
+        self,
+        *,
+        chunk_id: str,
+        user_id: str,
+        content: str,
+        content_hash: str,
+        embedding: tuple[float, ...] | None,
+    ) -> MemoryChunk | None:
+        """编辑记忆内容。写入 content + content_hash + embedding，更新 updated_at。
+
+        chunk_id 不存在或非该用户 → 返回 None。
+        content_hash 冲突 (uq_memory_user_hash) → 抛 sqlalchemy.exc.IntegrityError。
+        """
+        ...
+
+    async def delete_by_ids(
+        self, *, user_id: str, ids: list[str]
+    ) -> list[MemoryChunk]:
+        """按 id 批量删除当前用户的记忆，返回实际被删除的行（DELETE ... RETURNING）。
+
+        审计路径依赖"实际删除集"而非"请求集 ∩ 所有权集"——把删除与审计快照合并到
+        同一条语句可避免 TOCTOU（READ COMMITTED 下两步之间的并发删除会让审计失真）。
+        调用方如只需数量，取 ``len(result)``。
+        """
+        ...
+
+    async def delete_all_by_user(self, *, user_id: str) -> dict[str, int]:
+        """删除当前用户全部记忆，返回实际被删除行按 source 分组的数量。
+
+        使用 DELETE ... RETURNING source：确保"实际删除集"和"source 分布"
+        出自同一条语句，避免 READ COMMITTED 下多次查询的竞态不一致。
+        调用方取总数用 ``sum(result.values())``。
+        """
         ...

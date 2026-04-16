@@ -627,3 +627,42 @@ export type UserListResponse = {
 export type UserStatusUpdateRequest = {
   status: UserStatus;
 };
+
+// ==================== Memory Management ====================
+
+export interface MemoryItem {
+  id: string;
+  content: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+  session_id: string | null;
+}
+
+export interface MemoryDetail extends MemoryItem {
+  content_hash: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface MemoryListResponse {
+  items: MemoryItem[];
+  total: number;
+  page: number;
+  page_size: number;
+  has_next: boolean;
+}
+
+export interface MemoryListParams {
+  query?: string;
+  source?: string;
+  created_from?: string;
+  created_to?: string;
+  updated_from?: string;
+  updated_to?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface DeleteCountResponse {
+  deleted_count: number;
+}

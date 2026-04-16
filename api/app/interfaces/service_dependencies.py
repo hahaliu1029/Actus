@@ -8,6 +8,7 @@ from typing import Any
 from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
 from app.application.services.file_service import FileService
+from app.application.services.memory_management_service import MemoryManagementService
 from app.application.services.session_service import SessionService
 from app.application.services.skill_creator_service import SkillCreatorService
 from app.application.services.skill_export_service import SkillExportService
@@ -444,3 +445,22 @@ def get_agent_service(request: HTTPConnection) -> AgentService:
 
 def get_skill_export_service() -> SkillExportService:
     return SkillExportService(skills_root_dir=settings.skills_root_dir)
+
+
+def get_memory_management_service(
+    request: Request,
+) -> MemoryManagementService:
+    """DI factory for :class:`MemoryManagementService`.
+
+    - ``memory_embedding_provider`` 在 main.py 启动 lifespan 中初始化并挂在
+      ``app.state``（可能是 CircuitBreaker 包装器，也可能是 DisabledEmbeddingProvider）。
+    - ``session_factory`` 来自 ``postgres_client.session_factory``，不是 ``app.state``。
+    - ``repo_factory`` 传类本身（``DBMemoryChunkRepository``），Service 内部会用
+      AsyncSession 实例化。
+    """
+    postgres_client = get_postgres()
+    return MemoryManagementService(
+        repo_factory=DBMemoryChunkRepository,
+        embedding_provider=request.app.state.memory_embedding_provider,
+        session_factory=postgres_client.session_factory,
+    )

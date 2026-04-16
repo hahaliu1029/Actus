@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   Bot,
+  Brain,
   Cog,
   Eye,
   Languages,
@@ -18,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { AdminUsersSetting } from "@/components/settings/admin-users-setting";
+import { MemoryManagement } from "@/components/settings/memory-management";
 import { SkillDetailDrawer } from "@/components/settings/skill-detail-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -45,6 +47,7 @@ const TABS = [
   { key: "a2a", title: "A2A Agent 配置", icon: LayoutGrid },
   { key: "mcp", title: "MCP 服务器", icon: Server },
   { key: "skill", title: "Skill 生态", icon: Puzzle },
+  { key: "memory", title: "记忆管理", icon: Brain },
   { key: "file", title: "文件理解", icon: Eye },
   { key: "admin", title: "用户管理", icon: Bot },
 ] as const;
@@ -1554,6 +1557,8 @@ export function ManusSettings() {
                   </div>
                 </div>
               ) : null}
+
+              {activeTab === "memory" && <MemoryManagement />}
 
               {activeTab === "file" ? (
                 <div className="space-y-4">
