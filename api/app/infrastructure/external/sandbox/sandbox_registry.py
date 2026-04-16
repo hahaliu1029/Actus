@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Protocol
 
 from app.domain.external.sandbox import Sandbox
 
@@ -51,6 +51,10 @@ class SandboxRegistry:
     """Service-internal registry. Only ``SandboxLifecycleService`` should
     call mutator methods (under per-session lock)."""
 
+    # Type alias for a callback that pushes an event into the live SSE stream
+    # and returns the stream message ID (used to unify IDs across Redis + PG).
+    LiveEventSink = Callable[[Any], Awaitable[Optional[str]]]
+
     def __init__(self) -> None:
         self._sandboxes: dict[str, Sandbox] = {}
         self._generations: dict[str, int] = {}
@@ -58,6 +62,7 @@ class SandboxRegistry:
         self._inflight_tasks: dict[str, set[asyncio.Task]] = {}  # type: ignore[type-arg]
         self._drain_events: dict[str, asyncio.Event] = {}
         self._ws_holders: dict[str, set[WebSocketHolder]] = {}
+        self._live_event_sinks: dict[str, SandboxRegistry.LiveEventSink] = {}
 
     # ── Core registry state mutations (O(1) in-memory, no IO) ──
 
@@ -78,6 +83,7 @@ class SandboxRegistry:
         self._inflight_tasks.pop(session_id, None)
         self._drain_events.pop(session_id, None)
         self._ws_holders.pop(session_id, None)
+        self._live_event_sinks.pop(session_id, None)
 
     # ── Lookup (hint, not authoritative — I9) ──
 
@@ -151,6 +157,29 @@ class SandboxRegistry:
         holders = self._ws_holders.get(session_id)
         if holders is not None:
             holders.discard(holder)
+
+    # ── Live SSE event sink (PR2 §10) ──
+
+    def register_live_event_sink(
+        self, session_id: str, sink: "SandboxRegistry.LiveEventSink"
+    ) -> None:
+        """Register a callback that pushes lifecycle events into the active SSE stream.
+
+        Called by AgentService when a task starts. The sink pushes serialized
+        events into ``task.output_stream`` so the live ``chat()`` SSE loop
+        can yield them to the frontend without waiting for PG recovery poll.
+        """
+        self._live_event_sinks[session_id] = sink
+
+    def release_live_event_sink(self, session_id: str) -> None:
+        """Release the live event sink. Idempotent."""
+        self._live_event_sinks.pop(session_id, None)
+
+    def get_live_event_sink(
+        self, session_id: str
+    ) -> Optional["SandboxRegistry.LiveEventSink"]:
+        """Return the active sink, or None if no task is streaming."""
+        return self._live_event_sinks.get(session_id)
 
     # ── Quiesce barrier primitives ──
     # Only called by SandboxLifecycleService.destroy() under per-session lock.

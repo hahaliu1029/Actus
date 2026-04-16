@@ -277,6 +277,17 @@ class ToolConfirmationEvent(BaseEvent):
     timeout_seconds: int
 
 
+class SandboxStateChangedEvent(BaseEvent):
+    """Sandbox 绑定状态变更事件（PR2 §10.1）"""
+
+    type: Literal["sandbox_state_changed"] = "sandbox_state_changed"
+    old_state: str  # SandboxBindingState.value
+    new_state: str  # SandboxBindingState.value
+    generation: int
+    sandbox_id: Optional[str] = None
+    reason: Optional[str] = None  # DestroyReason.value or free-text
+
+
 # 定义应用事件类型声明
 Event = Annotated[
     Union[
@@ -293,6 +304,7 @@ Event = Annotated[
         FinishingEvent,
         HealthEvent,
         ToolConfirmationEvent,
+        SandboxStateChangedEvent,
         DoneEvent,
     ],
     Field(discriminator="type"),

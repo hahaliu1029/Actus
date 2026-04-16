@@ -168,6 +168,17 @@ function resolveStatusFromEvent(
     // DEGRADED is informational — keep current status (running/finishing).
     return currentStatus;
   }
+  // PR2: Sandbox lifecycle state change — only terminal `destroyed` pins status.
+  // Preserve timed_out (same logic as done/error) so watchdog semantics aren't lost.
+  if (event.type === "sandbox_state_changed") {
+    const data = asRecord(event.data);
+    const newState = typeof data.new_state === "string" ? data.new_state : "";
+    if (newState === "destroyed") {
+      return currentStatus === "timed_out" ? "timed_out" : "completed";
+    }
+    // `destroying` is transient — keep current status until `destroyed` arrives
+    return currentStatus;
+  }
   if (event.type === "done" || event.type === "error") {
     // D5: Preserve timed_out (set by preceding health event) across done.
     if (currentStatus === "timed_out") {
@@ -449,7 +460,7 @@ export function pickMoreAdvancedStatus(
 
 const SIGNAL_EVENT_TYPES = new Set([
   "done", "error", "wait", "tool_confirmation",
-  "control", "health", "finishing",
+  "control", "health", "finishing", "sandbox_state_changed",
 ]);
 
 export function deriveStatusFromEvents(
@@ -963,7 +974,8 @@ export const useSessionStore = create<SessionStore>()(
             event.type === "error" ||
             event.type === "wait" ||
             event.type === "tool_confirmation" ||
-            event.type === "control"
+            event.type === "control" ||
+            event.type === "sandbox_state_changed"
           ) {
             sawTerminalEvent = true;
           }
@@ -1009,7 +1021,8 @@ export const useSessionStore = create<SessionStore>()(
               event.type === "error" ||
               event.type === "control" ||
               event.type === "finishing" ||
-              event.type === "health"
+              event.type === "health" ||
+              event.type === "sandbox_state_changed"
             ) {
               const isFinishing = event.type === "finishing";
               const isHealth = event.type === "health";

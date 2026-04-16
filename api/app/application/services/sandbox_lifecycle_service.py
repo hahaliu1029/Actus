@@ -27,6 +27,7 @@ from app.domain.errors.sandbox_lifecycle import (
     SessionUnboundError,
 )
 from app.domain.external.sandbox import Sandbox, SandboxHandle
+from app.domain.models.event import SandboxStateChangedEvent
 from app.domain.models.session import (
     DestroyReason,
     SandboxBinding,
@@ -104,6 +105,9 @@ class SandboxLifecycleService:
     ) -> SandboxBinding:
         """Persist a binding state transition via UoW.
 
+        Also emits a ``SandboxStateChangedEvent`` to the session event stream
+        so the frontend can react (PR2 §10.2).
+
         Returns the new SandboxBinding after commit.
         """
         async with self._uow_factory() as uow:
@@ -122,6 +126,58 @@ class SandboxLifecycleService:
             )
             session.sandbox_binding = new_binding
             await uow.session.save(session)
+
+            # Build SandboxStateChangedEvent (PR2 §10.2)
+            reason_str = (
+                new_binding.destroy_reason.value
+                if new_binding.destroy_reason is not None
+                else None
+            )
+            event = SandboxStateChangedEvent(
+                old_state=old_binding.state.value,
+                new_state=new_binding.state.value,
+                generation=new_binding.generation,
+                sandbox_id=new_binding.id,
+                reason=reason_str,
+            )
+
+            # Push to live SSE stream FIRST to obtain the Redis stream ID,
+            # then persist to PG with that same ID. This ensures the event
+            # has a single canonical ID across both channels so that
+            # get_events_since() dedup won't treat them as two events.
+            # Same pattern as agent_service._emit_control_event().
+            sink = self._registry.get_live_event_sink(session_id)
+            if sink is not None:
+                try:
+                    stream_id = await sink(event)
+                    if stream_id:
+                        event.id = stream_id
+                except Exception:
+                    logger.debug(
+                        "Failed to push lifecycle event to live SSE sink "
+                        "for session %s",
+                        session_id,
+                    )
+
+            await uow.session.add_event(session_id, event)
+
+            # Write audit log entry (PR2 §10.5)
+            await uow.sandbox_lifecycle_log.create(
+                session_id=session_id,
+                old_state=old_binding.state.value,
+                new_state=new_binding.state.value,
+                generation=new_binding.generation,
+                sandbox_id=new_binding.id,
+                reason=reason_str,
+            )
+
+        logger.info(
+            "sandbox binding transition session=%s %s→%s gen=%d",
+            session_id,
+            old_binding.state.value,
+            new_binding.state.value,
+            new_binding.generation,
+        )
         return new_binding
 
     # ── Public API ──

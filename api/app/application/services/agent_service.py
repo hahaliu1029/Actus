@@ -5,7 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import AsyncGenerator, Callable, Dict, List, Optional, Type
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Type
 
 from app.application.errors.exceptions import (
     BadRequestError,
@@ -276,6 +276,17 @@ class AgentService:
         async with self._uow_factory() as uow:
             await uow.session.save(session)
 
+        # PR2 §10: register a live event sink so lifecycle events reach the SSE
+        # stream in real-time (not just PG recovery poll).
+        # Returns the Redis stream message ID so the caller can unify IDs.
+        if self._sandbox_lifecycle_service:
+            async def _push_lifecycle_event(evt: Any) -> Optional[str]:
+                return await task.output_stream.put(evt.model_dump_json())
+
+            self._sandbox_lifecycle_service.registry.register_live_event_sink(
+                session.id, _push_lifecycle_event
+            )
+
         return task
 
     async def _on_task_runner_complete(self, session_id: str) -> None:
@@ -293,6 +304,12 @@ class AgentService:
                     "on_task_runner_complete: suspend for session %s skipped",
                     session_id,
                 )
+            # Release the live event sink AFTER suspend so the SUSPENDED event
+            # reaches the SSE stream. The subsequent DoneEvent from task_runner
+            # goes through task.output_stream directly — it doesn't need the sink.
+            self._sandbox_lifecycle_service.registry.release_live_event_sink(
+                session_id
+            )
 
     async def _safe_update_unread_count(self, session_id: str) -> None:
         """在独立的后台任务中安全地更新未读消息计数

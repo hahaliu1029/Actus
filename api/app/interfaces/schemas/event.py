@@ -11,6 +11,7 @@ from app.domain.models.event import (
     HealthEvent,
     HealthStatus,
     PlanEvent,
+    SandboxStateChangedEvent,
     StepEvent,
     ToolConfirmationEvent,
     ToolEvent,
@@ -374,6 +375,36 @@ class HealthSSEEvent(BaseSSEEvent):
         )
 
 
+class SandboxStateChangedEventData(BaseEventData):
+    """Sandbox 绑定状态变更事件数据"""
+
+    old_state: str
+    new_state: str
+    generation: int
+    sandbox_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class SandboxStateChangedSSEEvent(BaseSSEEvent):
+    """Sandbox 状态变更流式事件"""
+
+    event: Literal["sandbox_state_changed"] = "sandbox_state_changed"
+    data: SandboxStateChangedEventData
+
+    @classmethod
+    def from_event(cls, event: SandboxStateChangedEvent) -> Self:
+        return cls(
+            data=SandboxStateChangedEventData(
+                **BaseEventData.base_event_data(event),
+                old_state=event.old_state,
+                new_state=event.new_state,
+                generation=event.generation,
+                sandbox_id=event.sandbox_id,
+                reason=event.reason,
+            )
+        )
+
+
 # 定义Agent流式事件类型集合
 AgentSSEEvent = Union[
     CommonSSEEvent,
@@ -389,6 +420,7 @@ AgentSSEEvent = Union[
     ControlSSEEvent,
     HealthSSEEvent,
     ToolConfirmationSSEEvent,
+    SandboxStateChangedSSEEvent,
 ]
 
 

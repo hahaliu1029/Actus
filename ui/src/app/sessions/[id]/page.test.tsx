@@ -16,6 +16,8 @@ type SessionStoreState = {
   fetchSessionFiles: ReturnType<typeof vi.fn>;
   downloadFile: ReturnType<typeof vi.fn>;
   downloadSandboxFile: ReturnType<typeof vi.fn>;
+  recoverSession: ReturnType<typeof vi.fn>;
+  createSession: ReturnType<typeof vi.fn>;
   isLoadingCurrentSession: boolean;
   isChatting: boolean;
   chatSessionId: string | null;
@@ -29,6 +31,8 @@ const sessionStoreState: SessionStoreState = {
   fetchSessionFiles: vi.fn(async () => {}),
   downloadFile: vi.fn(async () => new Blob()),
   downloadSandboxFile: vi.fn(async () => new Blob()),
+  recoverSession: vi.fn(async () => {}),
+  createSession: vi.fn(async () => "new-session-id"),
   isLoadingCurrentSession: false,
   isChatting: false,
   chatSessionId: null,
@@ -39,6 +43,7 @@ const markdownRendererMock = vi.fn(({ content }: { content: string }) => (
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ id: "s-b" }),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn() }),
 }));
 
 vi.mock("@/components/chat-input", () => ({

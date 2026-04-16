@@ -105,6 +105,9 @@ class FakeUoW:
         self.session.get_by_id = AsyncMock(side_effect=self._get_by_id)
         self.session.save = AsyncMock(side_effect=self._save)
         self.session.get_all = AsyncMock(side_effect=self._get_all)
+        self.session.add_event = AsyncMock()
+        self.sandbox_lifecycle_log = MagicMock()
+        self.sandbox_lifecycle_log.create = AsyncMock()
 
     async def _get_by_id(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)

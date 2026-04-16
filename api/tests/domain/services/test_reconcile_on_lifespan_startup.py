@@ -48,6 +48,9 @@ class FakeUoW:
         self.session.get_by_id = AsyncMock(side_effect=lambda sid: self._sessions.get(sid))
         self.session.save = AsyncMock(side_effect=lambda s: self._sessions.__setitem__(s.id, s))
         self.session.get_all = AsyncMock(side_effect=lambda: list(self._sessions.values()))
+        self.session.add_event = AsyncMock()
+        self.sandbox_lifecycle_log = MagicMock()
+        self.sandbox_lifecycle_log.create = AsyncMock()
 
     async def __aenter__(self):
         return self

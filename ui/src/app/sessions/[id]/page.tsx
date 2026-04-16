@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import {
   AlertCircle,
   Bot,
@@ -141,6 +141,20 @@ function toDisplayImageUrl(url: string): string {
     return toImageProxyUrl(url);
   }
   return url;
+}
+
+function isSandboxDestroyed(events: SessionEvent[]): boolean {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.event !== "sandbox_state_changed") {
+      continue;
+    }
+    const newState = String(event.data.new_state || "");
+    if (newState === "destroyed") {
+      return true;
+    }
+  }
+  return false;
 }
 
 function deriveTakeoverMeta(events: SessionEvent[]): TakeoverMeta {
@@ -683,6 +697,8 @@ export default function SessionPage() {
   const params = useParams<{ id: string }>();
   const sessionId = params?.id;
 
+  const router = useRouter();
+  const createSession = useSessionStore((state) => state.createSession);
   const currentSession = useSessionStore((state) => state.currentSession);
   const currentSessionFiles = useSessionStore((state) => state.currentSessionFiles);
   const setActiveSession = useSessionStore((state) => state.setActiveSession);
@@ -783,6 +799,10 @@ export default function SessionPage() {
   const currentStatusMeta = useMemo(
     () => getSessionStatusMeta(visibleSession?.status || "pending"),
     [visibleSession?.status]
+  );
+  const sandboxDestroyed = useMemo(
+    () => isSandboxDestroyed(eventList),
+    [eventList]
   );
   const workbenchVisible = (!isMobile && desktopWorkbenchVisible) || (isMobile && mobileWorkbenchOpen);
   const isCurrentSessionStreaming = Boolean(sessionId) && isChatting && chatSessionId === sessionId;
@@ -1273,10 +1293,36 @@ export default function SessionPage() {
               onPreviewFile={handleTaskDockPreviewFile}
               onDownloadFile={handleTaskDockDownloadFile}
             />
-            <ChatInput
-              sessionId={sessionId}
-              skillConfirmationPendingAction={skillConfirmationPendingAction}
-            />
+            {sandboxDestroyed ? (
+              <div className="flex flex-col items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-5 text-center dark:border-red-500/30 dark:bg-red-500/10">
+                <XCircle size={24} className="text-red-500" />
+                <p className="text-sm font-medium text-red-700 dark:text-red-400">
+                  会话已终结
+                </p>
+                <p className="text-xs text-red-600/80 dark:text-red-400/70">
+                  该会话的运行环境已被销毁，无法继续交互。
+                </p>
+                <Button
+                  variant="outline"
+                  className="mt-1 rounded-xl border-red-200 text-red-700 hover:bg-red-100 dark:border-red-500/30 dark:text-red-400 dark:hover:bg-red-500/20"
+                  onClick={async () => {
+                    try {
+                      const newId = await createSession();
+                      router.push(`/sessions/${newId}`);
+                    } catch {
+                      setMessage({ type: "error", text: "创建新会话失败" });
+                    }
+                  }}
+                >
+                  开新会话
+                </Button>
+              </div>
+            ) : (
+              <ChatInput
+                sessionId={sessionId}
+                skillConfirmationPendingAction={skillConfirmationPendingAction}
+              />
+            )}
           </div>
         </main>
 
