@@ -3,6 +3,8 @@ import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import Depends, FastAPI, WebSocket
+from fastapi.testclient import TestClient
 
 from app.domain.models.app_config import (
     A2AConfig,
@@ -16,6 +18,7 @@ from app.domain.models.app_config import (
     VisionFallbackConfig,
 )
 from app.interfaces import service_dependencies
+from app.interfaces.service_dependencies import get_agent_service, get_session_service
 
 
 class _FakeAppConfigRepository:
@@ -44,6 +47,55 @@ class _FakeFileStorage:
 class _CapturedAgentService:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
+
+
+def test_get_session_service_supports_websocket_dependency() -> None:
+    app = FastAPI()
+    app.state.sandbox_lifecycle_service = MagicMock()
+    fake_service = MagicMock()
+
+    with patch.object(service_dependencies, "SessionService", return_value=fake_service):
+
+        @app.websocket("/ws")
+        async def ws_endpoint(
+            websocket: WebSocket,
+            session_service=Depends(get_session_service),
+        ) -> None:
+            await websocket.accept()
+            await websocket.send_text("ok" if session_service is fake_service else "bad")
+            await websocket.close()
+
+        client = TestClient(app)
+        try:
+            with client.websocket_connect("/ws") as websocket:
+                assert websocket.receive_text() == "ok"
+        finally:
+            client.close()
+
+
+def test_get_agent_service_supports_websocket_dependency(monkeypatch) -> None:
+    app = FastAPI()
+    app.state.agent_service = MagicMock()
+
+    monkeypatch.setattr(service_dependencies, "_load_app_config", lambda: None)
+    monkeypatch.setattr(service_dependencies, "_config_generation", 1)
+    monkeypatch.setattr(service_dependencies, "_last_refresh_generation", 1)
+
+    @app.websocket("/ws")
+    async def ws_endpoint(
+        websocket: WebSocket,
+        agent_service=Depends(get_agent_service),
+    ) -> None:
+        await websocket.accept()
+        await websocket.send_text("ok" if agent_service is app.state.agent_service else "bad")
+        await websocket.close()
+
+    client = TestClient(app)
+    try:
+        with client.websocket_connect("/ws") as websocket:
+            assert websocket.receive_text() == "ok"
+    finally:
+        client.close()
 
 
 def test_build_config_snapshot_builds_context_overflow_config_from_llm(monkeypatch) -> None:

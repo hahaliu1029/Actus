@@ -60,8 +60,10 @@ class _DummyOutputStream:
     def __init__(self, owner: "_DummyTask") -> None:
         self._owner = owner
         self.block_ms_calls: list[Optional[int]] = []
+        self.start_id_calls: list[Optional[str]] = []
 
     async def get(self, start_id: str = None, block_ms: int = None):
+        self.start_id_calls.append(start_id)
         self.block_ms_calls.append(block_ms)
         if block_ms == 0:
             await asyncio.sleep(1)
@@ -206,6 +208,53 @@ async def test_chat_with_message_yields_user_message_event_immediately(monkeypat
     assert first_event.type == "message"
     assert first_event.role == "user"
     assert first_event.message == "hello"
+
+
+async def test_chat_ignores_invalid_latest_event_id_for_output_stream(monkeypatch) -> None:
+    service = AgentService(
+        uow_factory=_uow_factory,
+        config_snapshot=_default_snapshot(),
+        sandbox_cls=object,
+        task_cls=_DummyTaskClass,
+        search_engine=object(),
+        file_storage=object(),
+    )
+    task = _DummyTask()
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return Session(id="session-1", user_id="user-1", status=SessionStatus.RUNNING)
+
+    async def fake_check_attachments_access(*args, **kwargs) -> None:
+        return None
+
+    async def fake_get_task(_session: Session):
+        return task
+
+    async def fake_safe_update_unread_count(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_check_attachments_access", fake_check_attachments_access)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+    monkeypatch.setattr(service, "_safe_update_unread_count", fake_safe_update_unread_count)
+
+    chat_gen = service.chat(
+        session_id="session-1",
+        user_id="user-1",
+        message="hello",
+        attachments=None,
+        latest_event_id="1",
+        timestamp=None,
+    )
+
+    first_event = await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)
+    assert first_event.type == "message"
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)
+
+    assert task.output_stream.start_id_calls
+    assert task.output_stream.start_id_calls[0] is None
 
 
 @pytest.mark.parametrize(

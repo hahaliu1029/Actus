@@ -52,6 +52,7 @@ from core.config import get_settings
 from fastapi import Depends, Request
 from psycopg_pool import AsyncConnectionPool
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import HTTPConnection
 
 # from functools import lru_cache
 
@@ -121,7 +122,7 @@ def get_file_service(
 
 
 # @lru_cache()
-def get_session_service(request: Request) -> SessionService:
+def get_session_service(request: HTTPConnection) -> SessionService:
     lifecycle_service = getattr(request.app.state, "sandbox_lifecycle_service", None)
     return SessionService(
         uow_factory=get_uow,
@@ -416,7 +417,7 @@ def get_sandbox_lifecycle_service(request: Request):
     return getattr(request.app.state, "sandbox_lifecycle_service", None)
 
 
-def get_agent_service(request: Request) -> AgentService:
+def get_agent_service(request: HTTPConnection) -> AgentService:
     """Return app.state singleton. Atomic refresh on config generation change."""
     global _last_refresh_generation
     agent_svc = request.app.state.agent_service

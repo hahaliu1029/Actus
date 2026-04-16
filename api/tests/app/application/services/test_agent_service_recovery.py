@@ -140,7 +140,7 @@ async def test_get_events_since_no_since_with_redis_supplements():
     assert result["events"][1].id == "redis-2"
     event_recovery.get_recent_events.assert_called_once_with(
         task_id="task-abc",
-        after_event_id="evt-1",
+        after_event_id=None,
     )
 
 
@@ -175,3 +175,67 @@ async def test_get_events_since_redis_supplements_pg():
     assert len(result["events"]) == 2
     assert result["events"][0].id == "evt-2"
     assert result["events"][1].id == "redis-3"
+    event_recovery.get_recent_events.assert_called_once_with(
+        task_id="task-abc",
+        after_event_id=None,
+    )
+
+
+async def test_get_events_since_prefers_last_valid_redis_stream_id():
+    """PG 增量中若存在合法 Redis stream id，应优先用它作为 recovery 起点。"""
+    from app.application.services.agent_service import AgentService
+
+    e1 = _make_event(event_id="evt-1")
+    e2 = _make_event(event_id="1713264000000-0", message="persisted via redis")
+    session = _make_session(events=[e1, e2], task_id="task-abc")
+
+    uow_mock = AsyncMock()
+    uow_mock.session.get_by_id = AsyncMock(return_value=session)
+    uow_factory = AsyncMock(return_value=uow_mock)
+    uow_factory.__aenter__ = AsyncMock(return_value=uow_mock)
+    uow_factory.__aexit__ = AsyncMock(return_value=False)
+
+    event_recovery = AsyncMock()
+    event_recovery.get_recent_events = AsyncMock(
+        return_value=EventRecoveryResult(events=[], has_more=False)
+    )
+
+    svc = AgentService.__new__(AgentService)
+    svc._uow_factory = lambda: uow_factory
+    svc._event_recovery = event_recovery
+
+    await svc.get_events_since("session-1", "evt-1", "user-1")
+
+    event_recovery.get_recent_events.assert_called_once_with(
+        task_id="task-abc",
+        after_event_id="1713264000000-0",
+    )
+
+
+async def test_get_events_since_invalid_since_id_does_not_reach_redis():
+    """显式 since_event_id 为无效值时，不能直接拿去做 Redis stream 游标。"""
+    from app.application.services.agent_service import AgentService
+
+    session = _make_session(events=[], task_id="task-abc")
+
+    uow_mock = AsyncMock()
+    uow_mock.session.get_by_id = AsyncMock(return_value=session)
+    uow_factory = AsyncMock(return_value=uow_mock)
+    uow_factory.__aenter__ = AsyncMock(return_value=uow_mock)
+    uow_factory.__aexit__ = AsyncMock(return_value=False)
+
+    event_recovery = AsyncMock()
+    event_recovery.get_recent_events = AsyncMock(
+        return_value=EventRecoveryResult(events=[], has_more=False)
+    )
+
+    svc = AgentService.__new__(AgentService)
+    svc._uow_factory = lambda: uow_factory
+    svc._event_recovery = event_recovery
+
+    await svc.get_events_since("session-1", "1", "user-1")
+
+    event_recovery.get_recent_events.assert_called_once_with(
+        task_id="task-abc",
+        after_event_id=None,
+    )

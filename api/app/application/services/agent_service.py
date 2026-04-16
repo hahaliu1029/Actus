@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ logger = logging.getLogger(__name__)
 OUTPUT_STREAM_POLL_BLOCK_MS = 1000
 TAKEOVER_CANCEL_TIMEOUT_SECONDS = 15
 TAKEOVER_LEASE_TTL_SECONDS = 15 * 60
+_REDIS_STREAM_ID_RE = re.compile(r"^\d+-\d+$")
 
 
 @dataclass(frozen=True)
@@ -274,7 +276,14 @@ class AgentService:
         task = self._task_cls.create(task_runner=task_runner)
         session.task_id = task.id
         async with self._uow_factory() as uow:
-            await uow.session.save(session)
+            if self._sandbox_lifecycle_service:
+                persisted_session = await uow.session.get_by_id(session.id)
+                if persisted_session is None:
+                    raise RuntimeError(f"会话[{session.id}]不存在，无法创建任务")
+                persisted_session.task_id = task.id
+                await uow.session.save(persisted_session)
+            else:
+                await uow.session.save(session)
 
         # PR2 §10: register a live event sink so lifecycle events reach the SSE
         # stream in real-time (not just PG recovery poll).
@@ -546,11 +555,16 @@ class AgentService:
             # 取 PG 增量中最后一个有 id 的事件作为 Redis 起始点
             redis_start_id = None
             for evt in reversed(pg_events):
-                if getattr(evt, "id", None):
-                    redis_start_id = evt.id
+                candidate_id = getattr(evt, "id", None)
+                if self._is_valid_redis_stream_id(candidate_id):
+                    redis_start_id = candidate_id
                     break
             if not redis_start_id:
-                redis_start_id = since_event_id  # 可能为 None
+                redis_start_id = (
+                    since_event_id
+                    if self._is_valid_redis_stream_id(since_event_id)
+                    else None
+                )
 
             try:
                 recovery_result = await self._event_recovery.get_recent_events(
@@ -583,6 +597,12 @@ class AgentService:
             "has_more": redis_has_more,
         }
 
+    @staticmethod
+    def _is_valid_redis_stream_id(event_id: object) -> bool:
+        if not isinstance(event_id, str):
+            return False
+        return bool(_REDIS_STREAM_ID_RE.match(event_id.strip()))
+
     async def _check_attachments_access(
         self, attachments: Optional[List[str]], user_id: str, is_admin: bool = False
     ) -> None:
@@ -611,6 +631,12 @@ class AgentService:
         timestamp: Optional[datetime] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的信息调用Agent服务发起对话请求"""
+        latest_event_id = (
+            latest_event_id
+            if self._is_valid_redis_stream_id(latest_event_id)
+            else None
+        )
+
         # 危险工具确认恢复路径：直接走 resume 流程，不走正常 chat 分支
         if tool_confirmation is not None:
             async for event in self._resume_tool_confirmation(
