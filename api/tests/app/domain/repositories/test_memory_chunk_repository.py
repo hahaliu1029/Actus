@@ -120,8 +120,29 @@ class TestMemoryChunkRepositoryProtocol:
         result = await repo.get_by_id("chunk-1", user_id=TEST_USER_ID_FIXED)
         assert result is None
 
-    def test_protocol_has_four_methods(self) -> None:
-        """MemoryChunkRepository 协议声明了 4 个方法。"""
-        methods = {"batch_insert_ignore", "search_by_vector", "delete_by_session", "get_by_id"}
-        for method in methods:
-            assert hasattr(MemoryChunkRepository, method)
+    def test_protocol_declares_expected_methods(self) -> None:
+        """MemoryChunkRepository 协议声明的全部方法（M1 PR-1 扩到 11）。
+
+        本测试 pin 住 Protocol 的方法清单——新增 / 移除方法时强制同步本断言，
+        顺带 review stub 是否需要补实现。``StubMemoryChunkRepository`` 是本
+        文件内的 minimal stub，**只覆盖测试用到的 4 个方法**，其余方法不在
+        stub 中；structural subtyping 下 stub 不作为 ``MemoryChunkRepository``
+        的类型注入使用，所以不影响其它测试。
+        """
+        expected = {
+            # C3/C4/C5 阶段的旧方法
+            "batch_insert_ignore",
+            "search_by_vector",
+            "delete_by_session",
+            "get_by_id",
+            "list_by_user",
+            "count_by_user",
+            "update_content",
+            "delete_by_ids",
+            "delete_all_by_user",
+            # M1 PR-1 新增
+            "find_pending_fs_sync",
+            "mark_fs_synced",
+        }
+        for method in expected:
+            assert hasattr(MemoryChunkRepository, method), method

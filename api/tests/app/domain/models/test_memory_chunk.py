@@ -206,6 +206,36 @@ class TestMemoryChunk:
 
     def test_different_source_types(self) -> None:
         """source 支持不同的字符串值。"""
-        for source in ("session_flush", "manual", "file"):
+        for source in ("session_flush", "manual", "memory_save"):
             chunk = self._make_chunk(source=source)
             assert chunk.source == source
+
+    # ── M1 PR-1 new fields ────────────────────────────────────────────────
+
+    def test_m1_fields_default_to_none_or_false(self) -> None:
+        """M1 PR-1 新增字段：category/auto_promoted_at/fs_synced/pinned 默认值。
+
+        未显式传入时按"legacy / 未同步 / 非 pinned"解读：
+        - category=None 表示历史行（M1 前写入的 session_flush）
+        - fs_synced=False 让 FsReconciler 首次启动时把真实落盘状态拾回
+        - pinned=False 永远安全——pinned=True 只对 user category 合法
+        """
+        chunk = self._make_chunk()
+        assert chunk.category is None
+        assert chunk.auto_promoted_at is None
+        assert chunk.fs_synced is False
+        assert chunk.pinned is False
+
+    def test_m1_fields_can_be_set(self) -> None:
+        """显式传入 M1 新字段。"""
+        promoted = datetime(2026, 4, 17, tzinfo=timezone.utc)
+        chunk = self._make_chunk(
+            category="user",
+            auto_promoted_at=promoted,
+            fs_synced=True,
+            pinned=True,
+        )
+        assert chunk.category == "user"
+        assert chunk.auto_promoted_at == promoted
+        assert chunk.fs_synced is True
+        assert chunk.pinned is True

@@ -4,7 +4,17 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, PrimaryKeyConstraint, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,6 +36,20 @@ class MemoryChunkModel(Base):
     __table_args__ = (
         PrimaryKeyConstraint("id", name="pk_memory_chunks"),
         UniqueConstraint("user_id", "content_hash", name="uq_memory_user_hash"),
+        # M1 PR-1 — migration m2_add_memory_category_and_audit 建的 CHECK
+        # 约束在 ORM 层也声明一份，保证 create_all() / test 建表时行为一致。
+        CheckConstraint(
+            "source IN ('session_flush', 'manual', 'memory_save')",
+            name="ck_memory_chunks_source_allowed",
+        ),
+        CheckConstraint(
+            "category IS NULL OR category IN ('user', 'rule', 'fact')",
+            name="ck_memory_chunks_category_allowed",
+        ),
+        CheckConstraint(
+            "pinned = false OR category = 'user'",
+            name="ck_memory_chunks_pinned_only_for_user",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -64,4 +88,21 @@ class MemoryChunkModel(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()"),
         onupdate=datetime.now,
+    )
+
+    # ── M1 PR-1 extension columns ─────────────────────────────────────────
+    # nullable on purpose：历史（M1 前）行留 NULL，不 backfill；新写入路径
+    # 必须显式赋值 user/rule/fact 之一（由 application layer 校验 + DB CHECK 拦底）
+    category: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 仅 gate auto-promote 的 memory 有值；手写 / memory_save 保持 NULL
+    auto_promoted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # 文件落盘状态。False = 待同步，FsReconciler 扫描时拾回。
+    fs_synced: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"),
+    )
+    # 仅 category='user' 允许 true，pinned 的 memory 不受 recency 截断
+    pinned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"),
     )

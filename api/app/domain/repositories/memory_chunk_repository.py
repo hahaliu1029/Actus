@@ -59,6 +59,7 @@ class MemoryChunkRepository(Protocol):
         *,
         query: str | None = None,
         source: str | None = None,
+        category: str | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
@@ -66,7 +67,11 @@ class MemoryChunkRepository(Protocol):
         offset: int = 0,
         limit: int = 20,
     ) -> list[MemoryChunk]:
-        """按过滤条件返回当前用户记忆的分页列表，按 updated_at DESC 排序。"""
+        """按过滤条件返回当前用户记忆的分页列表，按 updated_at DESC 排序。
+
+        ``category`` 为 None 时不过滤（等价 PR-1 前行为）；传入 ``user/rule/fact``
+        只返回对应类。legacy 行 ``category IS NULL`` 在任何非空 filter 下都不命中。
+        """
         ...
 
     async def count_by_user(
@@ -75,12 +80,41 @@ class MemoryChunkRepository(Protocol):
         *,
         query: str | None = None,
         source: str | None = None,
+        category: str | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
         updated_to: datetime | None = None,
     ) -> int:
         """相同过滤条件的总条数，用于分页。"""
+        ...
+
+    async def find_pending_fs_sync(
+        self,
+        *,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryChunk]:
+        """返回 ``fs_synced = false`` 的行，供 FsReconciler 拾回补写。
+
+        - 不传 ``user_id`` 返回全局待同步（启动扫描路径）
+        - 传 ``user_id`` 返回该用户（lazy per-user walk 路径）
+        - 按 ``updated_at ASC`` 排序，先处理旧的 pending 行
+        - 用 ``ix_memory_chunks_fs_synced_pending`` partial index 保证 O(pending)
+        """
+        ...
+
+    async def mark_fs_synced(
+        self, *, chunk_id: str, user_id: str, synced: bool = True
+    ) -> bool:
+        """将 chunk 的 fs_synced 标记为 ``synced``（双向）。
+
+        - ``synced=True``：FsMemoryWriter 写盘成功后调用，false → true
+        - ``synced=False``：update_memory_content / move_category 开启同步
+          窗口时调用，true → false，再由 FsReconciler 或下一次写盘收尾
+
+        返回是否真的命中一行（id + user_id 匹配）；不存在或越权返回 False。
+        """
         ...
 
     async def update_content(

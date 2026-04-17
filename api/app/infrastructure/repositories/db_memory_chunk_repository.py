@@ -91,6 +91,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         *,
         query: str | None = None,
         source: str | None = None,
+        category: str | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
@@ -103,6 +104,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             stmt,
             query=query,
             source=source,
+            category=category,
             created_from=created_from,
             created_to=created_to,
             updated_from=updated_from,
@@ -128,6 +130,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         *,
         query: str | None = None,
         source: str | None = None,
+        category: str | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
@@ -140,6 +143,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             stmt,
             query=query,
             source=source,
+            category=category,
             created_from=created_from,
             created_to=created_to,
             updated_from=updated_from,
@@ -147,6 +151,41 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         )
         result = await self.db_session.execute(stmt)
         return int(result.scalar_one())
+
+    async def find_pending_fs_sync(
+        self,
+        *,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryChunk]:
+        """返回 fs_synced=false 的行，按 updated_at ASC 排序（先补旧的）。"""
+        stmt = select(MemoryChunkModel).where(MemoryChunkModel.fs_synced.is_(False))
+        if user_id is not None:
+            stmt = stmt.where(MemoryChunkModel.user_id == user_id)
+        stmt = (
+            stmt.order_by(
+                MemoryChunkModel.updated_at.asc(),
+                MemoryChunkModel.id.asc(),
+            )
+            .limit(limit)
+        )
+        result = await self.db_session.execute(stmt)
+        return [self._to_domain(row) for row in result.scalars().all()]
+
+    async def mark_fs_synced(
+        self, *, chunk_id: str, user_id: str, synced: bool = True
+    ) -> bool:
+        """标记 chunk 的 fs_synced 字段。命中返回 True。"""
+        stmt = (
+            update(MemoryChunkModel)
+            .where(
+                MemoryChunkModel.id == chunk_id,
+                MemoryChunkModel.user_id == user_id,
+            )
+            .values(fs_synced=synced)
+        )
+        result = await self.db_session.execute(stmt)
+        return bool(result.rowcount)
 
     async def update_content(
         self,
@@ -222,6 +261,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         *,
         query: str | None,
         source: str | None,
+        category: str | None = None,
         created_from: datetime | None,
         created_to: datetime | None,
         updated_from: datetime | None,
@@ -235,6 +275,9 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             )
         if source is not None:
             stmt = stmt.where(MemoryChunkModel.source == source)
+        if category is not None:
+            # 显式传入类别 → 只返回该类；category IS NULL 的 legacy 行不命中
+            stmt = stmt.where(MemoryChunkModel.category == category)
         if created_from is not None:
             stmt = stmt.where(MemoryChunkModel.created_at >= created_from)
         if created_to is not None:
@@ -260,6 +303,10 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             metadata=copy.deepcopy(row.metadata_),
             created_at=row.created_at,
             updated_at=row.updated_at,
+            category=row.category,
+            auto_promoted_at=row.auto_promoted_at,
+            fs_synced=row.fs_synced,
+            pinned=row.pinned,
         )
 
     @staticmethod
@@ -275,4 +322,8 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             "metadata_": chunk.metadata,
             "created_at": chunk.created_at,
             "updated_at": chunk.updated_at,
+            "category": chunk.category,
+            "auto_promoted_at": chunk.auto_promoted_at,
+            "fs_synced": chunk.fs_synced,
+            "pinned": chunk.pinned,
         }

@@ -76,11 +76,11 @@ class TestListByUser:
     async def test_source_filter(self, repo, user_id, db_session):
         await repo.batch_insert_ignore([
             _make_chunk(user_id, "a", source="session_flush"),
-            _make_chunk(user_id, "b", source="file"),
+            _make_chunk(user_id, "b", source="memory_save"),
         ])
         await db_session.flush()
 
-        result = await repo.list_by_user(user_id, source="file")
+        result = await repo.list_by_user(user_id, source="memory_save")
         assert len(result) == 1
 
     async def test_pagination(self, repo, user_id, db_session):
@@ -227,12 +227,12 @@ class TestDeleteAllByUser:
         await repo.batch_insert_ignore([
             _make_chunk(user_id, "a", source="session_flush"),
             _make_chunk(user_id, "b", source="session_flush"),
-            _make_chunk(user_id, "c", source="file"),
+            _make_chunk(user_id, "c", source="memory_save"),
         ])
         await db_session.flush()
 
         deleted = await repo.delete_all_by_user(user_id=user_id)
-        assert deleted == {"session_flush": 2, "file": 1}
+        assert deleted == {"session_flush": 2, "memory_save": 1}
         # 总数即 sum(values)
         assert sum(deleted.values()) == 3
 
