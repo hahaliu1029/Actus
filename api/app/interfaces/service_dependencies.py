@@ -457,15 +457,35 @@ def get_memory_management_service(
     - ``session_factory`` 来自 ``postgres_client.session_factory``，不是 ``app.state``。
     - ``repo_factory`` 传类本身（``DBMemoryChunkRepository``），Service 内部会用
       AsyncSession 实例化。
+    - ``redis`` / ``user_daily_quota`` 是 PR-2 的 memory 写入配额；Redis 客户端
+      在 lifespan 里通过 ``get_redis()`` 单例初始化，此处只是拿引用。测试场景里
+      fake app.state 不会有 redis_client，用 getattr 兜底。
     """
+    from app.infrastructure.storage.redis import get_redis
+
     postgres_client = get_postgres()
     # file_store 在 PR-0 恒为 None（DB-only），PR-5A 由 lifespan 注入真实的
     # FsMemoryWriter。用 getattr 而非属性访问以兼容测试环境（fake app 可能
     # 未设置该属性）。
     file_store = getattr(request.app.state, "file_memory_store", None)
+
+    # Redis 未初始化（单测绕过 lifespan）→ 同时把 quota 置 None，
+    # 符合 MemoryManagementService "redis 和 quota 同传或同省略" 的契约，
+    # 否则会在 __init__ 里直接 ValueError 把请求打成 500。
+    redis_client = None
+    user_daily_quota: int | None = None
+    try:
+        redis_client = get_redis().client
+        user_daily_quota = settings.memory_user_daily_quota
+    except RuntimeError:
+        redis_client = None
+        user_daily_quota = None
+
     return MemoryManagementService(
         repo_factory=DBMemoryChunkRepository,
         embedding_provider=request.app.state.memory_embedding_provider,
         session_factory=postgres_client.session_factory,
         file_store=file_store,
+        redis=redis_client,
+        user_daily_quota=user_daily_quota,
     )

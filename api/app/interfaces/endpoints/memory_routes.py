@@ -17,7 +17,9 @@ from app.interfaces.dependencies import (
 from app.interfaces.schemas import Response
 from app.interfaces.schemas.memory_schemas import (
     BulkDeleteRequest,
+    CreateMemoryRequest,
     DeleteCountResponse,
+    MemoryCategory,
     MemoryDetail,
     MemoryItem,
     MemoryListResponse,
@@ -47,6 +49,10 @@ async def list_memories(
     service: "MemoryManagementService" = Depends(get_memory_management_service),
     query: str | None = Query(None, min_length=2, max_length=500),
     source: str | None = Query(None, max_length=64),
+    category: MemoryCategory | None = Query(
+        None,
+        description="按 memory 分类过滤：user / rule / fact；不传返回全部（含 legacy NULL）。非法值返回 422（与 POST 路径对齐）",
+    ),
     created_from: datetime | None = None,
     created_to: datetime | None = None,
     updated_from: datetime | None = None,
@@ -58,6 +64,7 @@ async def list_memories(
         current_user.id,
         query=query,
         source=source,
+        category=category,
         created_from=created_from,
         created_to=created_to,
         updated_from=updated_from,
@@ -74,6 +81,37 @@ async def list_memories(
             has_next=(page * page_size < total),
         )
     )
+
+
+@router.post(
+    path="",
+    response_model=Response[MemoryDetail],
+    summary="手动创建长期记忆",
+    description=(
+        "Manual 写入入口。source 强制为 'manual'；pinned=True 仅允许 category='user'。"
+        "受每日 user quota 限制，超限返回 429。"
+    ),
+    status_code=201,
+    dependencies=[Depends(rate_limit_write)],
+)
+async def create_memory(
+    body: CreateMemoryRequest,
+    current_user: CurrentUser,
+    service: "MemoryManagementService" = Depends(get_memory_management_service),
+) -> Response[MemoryDetail]:
+    try:
+        chunk = await service.create_memory(
+            current_user.id,
+            content=body.content,
+            category=body.category,
+            pinned=body.pinned,
+            source="manual",
+        )
+    except ValueError as exc:
+        # service 对空内容 / 非法分类抛 ValueError → 400
+        raise BadRequestError(str(exc)) from exc
+    # ConflictError / QuotaExceededError 由全局 exception handler 自动转 409 / 429
+    return Response.success(data=MemoryDetail(**_to_detail_dict(chunk)))
 
 
 @router.get(
@@ -172,6 +210,10 @@ def _to_item_dict(chunk: "MemoryChunk") -> dict:
         "created_at": chunk.created_at,
         "updated_at": chunk.updated_at,
         "session_id": chunk.session_id,
+        # M1 PR-1 扩展字段——列表用来显示 badge / filter
+        "category": chunk.category,
+        "pinned": chunk.pinned,
+        "auto_promoted_at": chunk.auto_promoted_at,
     }
 
 
@@ -179,4 +221,5 @@ def _to_detail_dict(chunk: "MemoryChunk") -> dict:
     d = _to_item_dict(chunk)
     d["content_hash"] = chunk.content_hash
     d["metadata"] = chunk.metadata
+    d["fs_synced"] = chunk.fs_synced
     return d

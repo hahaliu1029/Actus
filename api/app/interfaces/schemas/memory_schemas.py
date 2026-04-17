@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# M1 PR-1 category enum — DB CHECK 兜底，schema 用 Literal 在入口层也拦一道。
+MemoryCategory = Literal["user", "rule", "fact"]
 
 
 class MemoryItem(BaseModel):
@@ -17,6 +20,10 @@ class MemoryItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     session_id: str | None = None
+    # M1 PR-1 新增字段——列表也需要展示，让前端按 category 分 tab / 显示 pinned badge
+    category: str | None = None
+    pinned: bool = False
+    auto_promoted_at: datetime | None = None
 
 
 class MemoryDetail(MemoryItem):
@@ -24,6 +31,8 @@ class MemoryDetail(MemoryItem):
 
     content_hash: str
     metadata: dict[str, Any]
+    # fs_synced 只在详情里暴露：list 视图无需关心同步状态，详情 / 编辑时有用
+    fs_synced: bool = False
 
 
 class MemoryListResponse(BaseModel):
@@ -32,6 +41,24 @@ class MemoryListResponse(BaseModel):
     page: int
     page_size: int
     has_next: bool
+
+
+class CreateMemoryRequest(BaseModel):
+    """手动创建 memory 的入参。source 固定为 ``manual``，服务端不允许客户端覆写。
+
+    ``pinned=True`` 只有在 ``category='user'`` 时合法；DB 层也有 CHECK 兜底，
+    这里提前校验 → 返回 400 而非 500。
+    """
+
+    content: str = Field(..., min_length=1, max_length=50000)
+    category: MemoryCategory
+    pinned: bool = False
+
+    @model_validator(mode="after")
+    def _pinned_only_for_user_category(self) -> "CreateMemoryRequest":
+        if self.pinned and self.category != "user":
+            raise ValueError("pinned=True 仅允许在 category='user' 时使用")
+        return self
 
 
 class UpdateMemoryRequest(BaseModel):

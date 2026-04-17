@@ -564,3 +564,44 @@ def test_build_agent_service_passes_memory_deps(monkeypatch) -> None:
     assert service.kwargs["memory_embedding_provider"] is mock_provider
     assert service.kwargs["memory_session_factory"] is mock_session_factory
     assert service.kwargs["memory_repo_factory"] is DBMemoryChunkRepository
+
+
+# ── PR-2 regression: get_memory_management_service handles uninitialized Redis ──
+
+
+def test_get_memory_management_service_handles_uninitialized_redis(monkeypatch):
+    """Redis 未 init（lifespan 绕过 / 单测环境）→ factory 必须降级为
+    redis=None+quota=None 一起传，不能触发 MemoryManagementService 的
+    'both or neither' 校验抛 ValueError。
+    """
+    from app.interfaces.service_dependencies import get_memory_management_service
+    from app.application.services.memory_management_service import MemoryManagementService
+
+    class _FakeRedisSingleton:
+        @property
+        def client(self):
+            raise RuntimeError("Redis客户端未初始化")
+
+    class _FakePostgres:
+        session_factory = MagicMock()
+
+    monkeypatch.setattr(
+        "app.infrastructure.storage.redis.get_redis",
+        lambda: _FakeRedisSingleton(),
+    )
+    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: _FakePostgres())
+
+    request = MagicMock()
+    request.app.state.memory_embedding_provider = MagicMock()
+    # file_memory_store 属性不存在 → getattr 走 None fallback（PR-0 验证过）
+    delattr_safe = lambda obj, name: (
+        delattr(obj, name) if hasattr(obj, name) else None
+    )
+    delattr_safe(request.app.state, "file_memory_store")
+
+    svc = get_memory_management_service(request)
+
+    assert isinstance(svc, MemoryManagementService)
+    # 内部 redis 和 quota 都应被降级为 None（否则 __init__ 已 ValueError）
+    assert svc._redis is None
+    assert svc._user_daily_quota is None

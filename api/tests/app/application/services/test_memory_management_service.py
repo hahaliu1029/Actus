@@ -23,6 +23,34 @@ from tests.conftest import TEST_USER_ID_FIXED
 pytestmark = pytest.mark.anyio
 
 
+def _fake_quota_redis(
+    *, incr_result: int = 1, pipeline_raises: Exception | None = None
+) -> AsyncMock:
+    """造一个兼容 memory_quota pipeline 使用方式的 Redis AsyncMock。
+
+    memory_quota 使用 ``async with redis.pipeline(transaction=True) as pipe:
+        pipe.incr(...); pipe.expire(...); await pipe.execute()``。
+    同时保留 ``redis.decr`` 以供 refund 路径使用。
+    """
+    redis = AsyncMock()
+    pipe = MagicMock()
+    pipe.incr = MagicMock(return_value=pipe)
+    pipe.expire = MagicMock(return_value=pipe)
+    if pipeline_raises is not None:
+        pipe.execute = AsyncMock(side_effect=pipeline_raises)
+    else:
+        pipe.execute = AsyncMock(return_value=[incr_result, True])
+
+    @asynccontextmanager
+    async def pipeline_cm(transaction: bool = True):
+        yield pipe
+
+    redis.pipeline = pipeline_cm
+    redis.decr = AsyncMock(return_value=max(incr_result - 1, 0))
+    redis._pipe = pipe  # 暴露给测试做调用断言
+    return redis
+
+
 def _chunk(user_id: str = TEST_USER_ID_FIXED, content: str = "test") -> MemoryChunk:
     now = datetime.now(timezone.utc)
     return MemoryChunk(
@@ -308,3 +336,309 @@ class TestAuditWritten:
         assert len(audit_obj.old_snapshot["content"]) == 200
         assert len(audit_obj.new_snapshot["content"]) == 200
         mock_session.commit.assert_called_once()
+
+
+# ─── M1 PR-2: create_memory ──────────────────────────────────────────────────
+
+
+class TestCreateMemory:
+    """MemoryManagementService.create_memory —— manual/memory_save 写入入口。"""
+
+    async def test_happy_path_db_only_mode(
+        self, service, mock_repo, mock_session
+    ):
+        """file_store=None（PR-0 默认 / PR-5A 前）→ 只落 DB，fs_synced 保持 False。"""
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+
+        chunk = await service.create_memory(
+            TEST_USER_ID_FIXED,
+            content="user prefers dark mode",
+            category="user",
+        )
+
+        assert chunk.user_id == TEST_USER_ID_FIXED
+        assert chunk.category == "user"
+        assert chunk.source == "manual"
+        assert chunk.pinned is False
+        assert chunk.fs_synced is False  # DB-only 模式不翻 true
+        mock_repo.batch_insert_ignore.assert_awaited_once()
+        mock_session.commit.assert_called_once()
+
+    async def test_happy_path_with_noop_file_store_sets_fs_synced(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """注入 NoopFileMemoryStore（测试默认）→ write no-op 成功 → fs_synced=True。"""
+        from app.domain.external.file_memory_store import NoopFileMemoryStore
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=NoopFileMemoryStore(),
+        )
+
+        chunk = await svc.create_memory(
+            TEST_USER_ID_FIXED, content="hello", category="rule"
+        )
+        assert chunk.fs_synced is True
+        mock_repo.mark_fs_synced.assert_awaited_once()
+
+    async def test_empty_content_rejected(self, service):
+        with pytest.raises(ValueError, match="empty"):
+            await service.create_memory(TEST_USER_ID_FIXED, "  ", "user")
+
+    async def test_invalid_category_rejected(self, service):
+        with pytest.raises(ValueError, match="category"):
+            await service.create_memory(TEST_USER_ID_FIXED, "x", "nope")
+
+    async def test_invalid_source_rejected(self, service):
+        with pytest.raises(ValueError, match="source"):
+            await service.create_memory(
+                TEST_USER_ID_FIXED, "x", "user", source="legacy"
+            )
+
+    async def test_pinned_requires_user_category(self, service):
+        with pytest.raises(ValueError, match="pinned"):
+            await service.create_memory(
+                TEST_USER_ID_FIXED, "x", "rule", pinned=True
+            )
+
+    async def test_duplicate_content_hash_raises_conflict(
+        self, service, mock_repo
+    ):
+        """batch_insert_ignore 返回 0（ON CONFLICT）→ ConflictError。"""
+        from app.application.errors.exceptions import ConflictError
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=0)
+        with pytest.raises(ConflictError):
+            await service.create_memory(
+                TEST_USER_ID_FIXED, "duplicate", "user"
+            )
+
+    async def test_embedding_failure_degrades_to_cold_write(
+        self, service, mock_repo, mock_embed
+    ):
+        """embedding provider 故障 → 写 None embedding + 继续 INSERT。"""
+        from app.domain.external.embedding_provider import EmbeddingUnavailableError
+
+        mock_embed.embed = AsyncMock(side_effect=EmbeddingUnavailableError("circuit open"))
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+
+        chunk = await service.create_memory(
+            TEST_USER_ID_FIXED, "no embedding", "fact"
+        )
+        assert chunk.embedding is None
+        mock_repo.batch_insert_ignore.assert_awaited_once()
+
+    async def test_fs_write_failure_keeps_fs_synced_false(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """file_store.write 抛异常 → DB 不 rollback，fs_synced=False 留给 reconciler。"""
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        class _BoomStore:
+            async def write(self, **kwargs):
+                raise OSError("disk full")
+
+            async def delete(self, **kwargs):
+                pass
+
+            async def move_category(self, **kwargs):
+                pass
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=_BoomStore(),
+        )
+        chunk = await svc.create_memory(TEST_USER_ID_FIXED, "x", "fact")
+        assert chunk.fs_synced is False
+        # mark_fs_synced 不应被调用（写盘失败）
+        mock_repo.mark_fs_synced.assert_not_called()
+
+    async def test_quota_exceeded_blocks_write(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """Redis counter 超过 daily_cap → QuotaExceededError，DB 未落。"""
+        from app.application.errors.exceptions import QuotaExceededError
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        fake_redis = _fake_quota_redis(incr_result=501)
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            redis=fake_redis,
+            user_daily_quota=500,
+        )
+
+        with pytest.raises(QuotaExceededError) as exc_info:
+            await svc.create_memory(TEST_USER_ID_FIXED, "blocked", "user")
+
+        assert exc_info.value.status_code == 429
+        # DB 不应 hit
+        mock_repo.batch_insert_ignore.assert_not_called()
+
+    async def test_quota_fail_open_on_redis_error(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """pipeline 抛异常 → 配额检查 fail-open，写入继续。"""
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        fake_redis = _fake_quota_redis(pipeline_raises=Exception("redis down"))
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            redis=fake_redis,
+            user_daily_quota=500,
+        )
+
+        chunk = await svc.create_memory(TEST_USER_ID_FIXED, "ok", "rule")
+        assert chunk.id is not None
+        mock_repo.batch_insert_ignore.assert_awaited_once()
+
+    async def test_duplicate_refunds_quota(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """ConflictError 路径必须 DECR 已 INCR 的配额——防止 retry bomb 耗光配额。"""
+        from app.application.errors.exceptions import ConflictError
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        fake_redis = _fake_quota_redis(incr_result=3)
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=0)  # ON CONFLICT
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            redis=fake_redis,
+            user_daily_quota=500,
+        )
+
+        with pytest.raises(ConflictError):
+            await svc.create_memory(TEST_USER_ID_FIXED, "dup", "user")
+
+        fake_redis._pipe.incr.assert_called_once()  # quota pipeline 正常 INCR
+        fake_redis.decr.assert_awaited_once()  # 然后 refund
+
+    async def test_fail_open_then_duplicate_does_not_refund(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """fail-open pipeline（Redis 抛异常）+ 随后的 duplicate → **不**触发 DECR。
+
+        否则会对不存在的 key 做 DECR，Redis 恢复后当天计数持久为负值，用户
+        少算额度。本测试钉住 "quota_was_incremented 为 false 时跳过 refund"。
+        """
+        from app.application.errors.exceptions import ConflictError
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        fake_redis = _fake_quota_redis(pipeline_raises=Exception("redis down"))
+        # 如果被调用会暴露 bug
+        fake_redis.decr = AsyncMock(return_value=-1)
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=0)
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            redis=fake_redis,
+            user_daily_quota=500,
+        )
+
+        with pytest.raises(ConflictError):
+            await svc.create_memory(TEST_USER_ID_FIXED, "dup", "user")
+
+        fake_redis.decr.assert_not_called()
+
+    async def test_ctor_rejects_redis_without_quota(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """redis 和 user_daily_quota 必须同传或同不传——防 misconfig。"""
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        with pytest.raises(ValueError, match="redis"):
+            MemoryManagementService(
+                repo_factory=lambda s: mock_repo,
+                embedding_provider=mock_embed,
+                session_factory=fake_session_factory,
+                redis=AsyncMock(),
+                user_daily_quota=None,
+            )
+        with pytest.raises(ValueError, match="redis"):
+            MemoryManagementService(
+                repo_factory=lambda s: mock_repo,
+                embedding_provider=mock_embed,
+                session_factory=fake_session_factory,
+                redis=None,
+                user_daily_quota=500,
+            )
+
+    async def test_mark_fs_synced_failure_is_swallowed(
+        self, mock_repo, mock_embed
+    ):
+        """mark_fs_synced 抛异常不应把请求炸成 500——DB+文件已写成，
+        FsReconciler 后续会把 flag 翻对。"""
+        from app.domain.external.file_memory_store import NoopFileMemoryStore
+
+        # 两条独立的 mock_session——第一条（INSERT）成功，第二条（UPDATE）抛
+        insert_session = AsyncMock()
+        insert_session.commit = AsyncMock()
+        insert_session.rollback = AsyncMock()
+        mark_session = AsyncMock()
+        mark_session.commit = AsyncMock(side_effect=Exception("pool exhausted"))
+        mark_session.rollback = AsyncMock()
+        call_count = {"n": 0}
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            call_count["n"] += 1
+            yield insert_session if call_count["n"] == 1 else mark_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=NoopFileMemoryStore(),
+        )
+
+        # 不应传播异常——吞掉 + warning
+        chunk = await svc.create_memory(TEST_USER_ID_FIXED, "ok", "fact")
+        assert chunk.id is not None
+        # fs_synced 保持 False（DB 侧未翻）——reconciler 会补
+        assert chunk.fs_synced is False

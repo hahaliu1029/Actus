@@ -382,3 +382,152 @@ async def test_delete_all_returns_count(
     data = response.json()["data"]
     assert data["deleted_count"] == 7
     mock_service.delete_all_memories.assert_awaited_once_with(TEST_USER_ID_FIXED)
+
+
+# --- create_memory (PR-2) ---------------------------------------------------
+
+
+async def test_create_memory_returns_201(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """POST /v2/memories 成功 → 201 + MemoryDetail payload（含 M1 新字段）。"""
+    import dataclasses
+
+    created = _make_chunk(
+        chunk_id="mem-new",
+        user_id=TEST_USER_ID_FIXED,
+        content="user prefers dark mode",
+        source="manual",
+    )
+    created = dataclasses.replace(
+        created, category="user", pinned=True, fs_synced=True
+    )
+    mock_service.create_memory = AsyncMock(return_value=created)
+
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={"content": "user prefers dark mode", "category": "user", "pinned": True},
+    )
+
+    assert response.status_code == 201
+    data = response.json()["data"]
+    assert data["id"] == "mem-new"
+    assert data["category"] == "user"
+    assert data["pinned"] is True
+    assert data["fs_synced"] is True
+    mock_service.create_memory.assert_awaited_once()
+    kwargs = mock_service.create_memory.call_args.kwargs
+    assert kwargs["category"] == "user"
+    assert kwargs["pinned"] is True
+    assert kwargs["source"] == "manual"
+
+
+async def test_create_memory_pinned_rule_rejected_by_schema(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """pinned=True + category=rule → pydantic 422，不到 service。"""
+    # 显式把 create_memory attr 设上，保证 AsyncMock 可追踪其调用状态。
+    mock_service.create_memory = AsyncMock()
+
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={"content": "x", "category": "rule", "pinned": True},
+    )
+    assert response.status_code == 422
+    mock_service.create_memory.assert_not_called()
+
+
+async def test_create_memory_whitespace_only_content_400(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """单个空格通过 pydantic min_length=1，服务层 strip 后报 ValueError → 400。"""
+    mock_service.create_memory = AsyncMock(
+        side_effect=ValueError("content must not be empty")
+    )
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={"content": " ", "category": "user"},
+    )
+    assert response.status_code == 400
+
+
+async def test_create_memory_invalid_category_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """非枚举 category → 422（Literal 校验在 pydantic 层）。"""
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={"content": "x", "category": "nope"},
+    )
+    assert response.status_code == 422
+
+
+async def test_create_memory_quota_exceeded_maps_to_429(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """service 抛 QuotaExceededError → 全局 handler 转 429。"""
+    from app.application.errors.exceptions import QuotaExceededError
+
+    mock_service.create_memory = AsyncMock(
+        side_effect=QuotaExceededError(
+            msg="每日 memory 写入上限（500）已达到",
+            limit=500,
+            bucket="memory_user_daily",
+        )
+    )
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={"content": "hit cap", "category": "user"},
+    )
+    assert response.status_code == 429
+
+
+async def test_create_memory_conflict_maps_to_409(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """service 抛 ConflictError（同 hash 已存在）→ 409。"""
+    from app.application.errors.exceptions import ConflictError
+
+    mock_service.create_memory = AsyncMock(
+        side_effect=ConflictError("相同内容的长期记忆已存在")
+    )
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={"content": "dup", "category": "fact"},
+    )
+    assert response.status_code == 409
+
+
+async def test_list_memories_forwards_category_filter(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """?category=user → service.list_memories 收到 category="user"。"""
+    response = await _request(
+        client_app, "GET", "/api/v2/memories", params={"category": "user"}
+    )
+    assert response.status_code == 200
+    kwargs = mock_service.list_memories.call_args.kwargs
+    assert kwargs["category"] == "user"
+
+
+async def test_list_memories_invalid_category_returns_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """GET ?category=garbage → 422（与 POST path 的 Literal 校验对齐）。"""
+    response = await _request(
+        client_app, "GET", "/api/v2/memories", params={"category": "garbage"}
+    )
+    assert response.status_code == 422
+    mock_service.list_memories.assert_not_called()
