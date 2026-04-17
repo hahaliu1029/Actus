@@ -2,12 +2,18 @@
 
 用法：
 
-    python -m app.cli.memory_reconcile                  # 全库 reconcile_all_users
+    python -m app.cli.memory_reconcile                  # 全库 reconcile_all_users：
+                                                          先跑全局 pending scan，
+                                                          再对每个 user 做 fs-walk
     python -m app.cli.memory_reconcile --user-id <UID>  # 仅单用户 walk（force）
+    python -m app.cli.memory_reconcile --pending-only   # 只跑 scan_pending_fs_sync
 
 设计文档 L475-478：API lifespan 启动时只做 ``fs_synced=false`` 的快路径扫描，
 per-user fs-walk 走懒式（session 创建触发）。当 operator 怀疑数据视图不一致
 时用本 CLI 一次扫干净，不跟 API lifespan 耦合——CLI 独立连 DB，扫完就退。
+
+默认分支"真·全量"：两阶段依次跑——pending backlog → fs-walk。``--pending-only``
+只跑第一阶段（快），``--user-id`` 仅修单个用户（不触发全局 pending scan）。
 
 **连接生命周期：** 一次性任务，连接池开成 min=1/max=2 即可；跑完手动 close。
 不走 FastAPI lifespan，直接用 ``asyncpg`` 的 async engine。

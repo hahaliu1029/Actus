@@ -241,6 +241,61 @@ class TestWalkUserDirectoryOrphanFiles:
         assert stale.exists(), ".orphans 内文件应被完全忽略"
         assert result["orphan_files"] == 0
 
+    async def test_path_mismatch_after_failed_move_category(
+        self, tmp_path: Path
+    ) -> None:
+        """DB 里 chunk.category='rule'，但磁盘上的文件在 ``/user/<id>.md`` —— 说明
+        上次 ``move_category`` 写完新路径后删旧路径失败。reconciler 必须把旧路径文件
+        搬进 ``.orphans``，否则新旧两份永久残留，sandbox 读到的内容会分叉。"""
+        stale_chunk = _chunk(id_="moved-id", category="user")  # 文件内 frontmatter 仍写 user
+        stale_file = _write_memory_file(
+            tmp_path, _USER, "moved-id", "user", stale_chunk
+        )
+        # DB 里 category 已经迁到 rule（其他路径也写好了 rule/<id>.md，
+        # 模拟 move_category step 3 成功、step 4 删旧失败的遗留）。
+        db_chunk = _chunk(id_="moved-id", category="rule")
+
+        repo = AsyncMock()
+        repo.get_by_id.return_value = db_chunk
+        repo.list_by_user.return_value = []
+        repo.count_by_user.return_value = 0
+
+        writer = FsMemoryWriter(tmp_path, max_retries=1, base_backoff_seconds=0.0)
+        reconciler = _build_reconciler(repo, writer, tmp_path)
+        result = await reconciler.walk_user_directory(_USER)
+
+        assert not stale_file.exists(), "旧路径文件应被移走（category 不匹配）"
+        orphans_dir = tmp_path / _USER / ".orphans"
+        assert orphans_dir.exists()
+        moved = list(orphans_dir.rglob("moved-id.md"))
+        assert len(moved) == 1
+        assert result["orphan_files"] == 1
+
+    async def test_nested_nonstandard_path_quarantined(
+        self, tmp_path: Path
+    ) -> None:
+        """canonical 布局是 ``{user}/{category}/{id}.md`` 三层；更深层级的文件
+        不符合规范，一律当孤儿。"""
+        nested = tmp_path / _USER / "user" / "subdir" / "weird.md"
+        nested.parent.mkdir(parents=True)
+        fm = build_memory_frontmatter(_chunk(id_="weird", category="user"))
+        nested.write_text(
+            serialize_memory_file(fm, "content"), encoding="utf-8"
+        )
+
+        repo = AsyncMock()
+        # 就算 DB 里 id 存在，path 层级超过预期仍然孤儿化
+        repo.get_by_id.return_value = _chunk(id_="weird", category="user")
+        repo.list_by_user.return_value = []
+        repo.count_by_user.return_value = 0
+
+        writer = FsMemoryWriter(tmp_path, max_retries=1, base_backoff_seconds=0.0)
+        reconciler = _build_reconciler(repo, writer, tmp_path)
+        result = await reconciler.walk_user_directory(_USER)
+
+        assert not nested.exists()
+        assert result["orphan_files"] == 1
+
     async def test_symlink_in_user_dir_quarantined(self, tmp_path: Path) -> None:
         """symlink（design L655 Case C: 恶意预置到 user_id 下指向 /etc/passwd）必须搬
         走到 .orphans，防止 sandbox 透过 bind-mount 读到任意路径。"""
@@ -393,6 +448,34 @@ class TestWalkUserDirectoryIdempotence:
 
 
 class TestReconcileAllUsers:
+    async def test_also_runs_pending_scan(self, tmp_path: Path) -> None:
+        """默认 CLI (``reconcile_all_users``) 必须覆盖 ``fs_synced=false`` backlog，
+        不能只走 fs-walk —— 不然 ops 按帮助文案跑默认命令后 pending 一条没碰。
+        回归：P2 #2 之前 reconcile_all_users 只对每个 user 调 walk_user_directory
+        (force=True)，而 walk 的 DB→fs 路径显式 skip fs_synced=false。"""
+        pending_chunk = _chunk(id_="pending-1", fs_synced=False)
+        # 成功写盘后的 chunk（fs_synced=True）用于第二阶段 walk 的 get_by_id
+        synced_chunk = _chunk(id_="pending-1", fs_synced=True)
+        repo = AsyncMock()
+        repo.distinct_user_ids.return_value = [_USER]
+        repo.find_pending_fs_sync.return_value = [pending_chunk]
+        repo.mark_fs_synced.return_value = True
+        repo.get_by_id.return_value = synced_chunk
+        repo.list_by_user.return_value = []
+        repo.count_by_user.return_value = 0
+
+        writer = FsMemoryWriter(tmp_path, max_retries=1, base_backoff_seconds=0.0)
+        reconciler = _build_reconciler(repo, writer, tmp_path)
+        summary = await reconciler.reconcile_all_users()
+
+        # 关键断言：pending scan 被调用（find_pending_fs_sync at least once without user_id filter）
+        assert repo.find_pending_fs_sync.await_count >= 1
+        assert summary["pending"]["attempted"] == 1
+        assert summary["pending"]["succeeded"] == 1
+        # 文件已写盘并由 walk 认为合法（canonical 路径 + DB 有对应 chunk）
+        target = tmp_path / _USER / "user" / "pending-1.md"
+        assert target.exists()
+
     async def test_iterates_db_and_fs_union(self, tmp_path: Path) -> None:
         """DB 有 user A；fs 上有 user A 和 user B 的目录（B 被 nuclear delete 过，
         只剩 fs 残骸）。reconcile_all_users 应同时处理两个。"""

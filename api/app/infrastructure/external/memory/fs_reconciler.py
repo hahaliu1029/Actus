@@ -277,6 +277,24 @@ class FsReconciler:
             if chunk is None:
                 await self._move_to_orphans(entry, user_dir, bucket=orphan_bucket)
                 orphan_files += 1
+                continue
+
+            # Path-canonicality 检查：
+            #   canonical 布局 = ``{user_dir}/{category}/{memory_id}.md``
+            #   entry.parent = ``{user_dir}/{category}``，entry.parent.parent = user_dir
+            # 条件 1：层级不对（深/浅于 2 层）→ 孤儿
+            # 条件 2：entry 所在目录名 != chunk.category → move_category 半失败
+            #        残留的旧路径，搬走（旧 id/旧内容留在 .orphans 里供追溯）
+            try:
+                path_category = entry.parent.name
+                is_canonical_depth = entry.parent.parent == user_dir
+            except (OSError, ValueError):
+                is_canonical_depth = False
+                path_category = None
+
+            if not is_canonical_depth or chunk.category != path_category:
+                await self._move_to_orphans(entry, user_dir, bucket=orphan_bucket)
+                orphan_files += 1
 
         return orphan_files, orphan_symlinks
 
@@ -337,7 +355,18 @@ class FsReconciler:
     # ── CLI 全量 ────────────────────────────────────────────────────────
 
     async def reconcile_all_users(self) -> dict:
-        """CLI 入口：DB distinct user_ids ∪ fs listdir 并集，逐个 force-walk。"""
+        """CLI 入口 "真·全量"：
+        1. 先跑全局 ``scan_pending_fs_sync``（无 user_id filter）把所有
+           ``fs_synced=false`` backlog 扫一遍写回盘；
+        2. 再对 DB distinct user_ids ∪ fs listdir 并集逐个 force-walk
+           （孤儿扫描 + 重建 DB→fs 缺失文件）。
+
+        两步顺序有讲究：先补 pending（让 ``fs_synced`` flag 正确反映真实同步
+        状态），再做 fs-walk orphan 检测——不然 fs-walk 看到的"DB 有 fs 无
+        且 fs_synced=true"集合会和实际情况有偏差。
+        """
+        pending_summary = await self.scan_pending_fs_sync()
+
         async with self._open_repo() as (repo, _):
             db_users = await repo.distinct_user_ids()
 
@@ -357,6 +386,7 @@ class FsReconciler:
             per_user.append(summary)
 
         return {
+            "pending": pending_summary,
             "users_walked": len(all_users),
             "user_ids": all_users,
             "per_user": per_user,
