@@ -96,6 +96,8 @@ class AgentService:
         memory_embedding_provider=None,
         memory_session_factory=None,
         memory_repo_factory=None,
+        memory_write_service=None,  # PR-3: MemoryManagementService — for memory_save tool
+        memory_session_save_cap: int = 20,  # PR-3: per-session memory_save cap
         event_recovery=None,
         sandbox_lifecycle_service=None,
     ) -> None:
@@ -113,6 +115,8 @@ class AgentService:
         self._memory_embedding_provider = memory_embedding_provider
         self._memory_session_factory = memory_session_factory
         self._memory_repo_factory = memory_repo_factory
+        self._memory_write_service = memory_write_service
+        self._memory_session_save_cap = memory_session_save_cap
         self._event_recovery = event_recovery
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
@@ -267,6 +271,13 @@ class AgentService:
             memory_embedding_provider=self._memory_embedding_provider,
             memory_session_factory=self._memory_session_factory,
             memory_repo_factory=self._memory_repo_factory,
+            memory_write_service=self._memory_write_service,
+            memory_session_redis=(
+                self._redis_client.client
+                if self._redis_client and hasattr(self._redis_client, "client")
+                else None
+            ),
+            memory_session_save_cap=self._memory_session_save_cap,
             approval_cache=approval_cache,
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,

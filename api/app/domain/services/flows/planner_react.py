@@ -93,6 +93,9 @@ class PlannerReActFlow(BaseFlow):
         memory_embedding_provider=None,
         memory_session_factory=None,
         memory_repo_factory=None,
+        memory_write_service=None,  # PR-3: memory_save routes writes here
+        memory_session_redis=None,  # PR-3: per-session save counter
+        memory_session_save_cap: int = 20,  # PR-3
         approval_cache: Any = None,  # ApprovalCache | None
         confirmation_manager: Any = None,  # ConfirmationManager | None
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
@@ -208,6 +211,9 @@ class PlannerReActFlow(BaseFlow):
         self._memory_embedding_provider = memory_embedding_provider
         self._memory_session_factory = memory_session_factory
         self._memory_repo_factory = memory_repo_factory
+        self._memory_write_service = memory_write_service
+        self._memory_session_redis = memory_session_redis
+        self._memory_session_save_cap = memory_session_save_cap
         self._has_memory_tools = False  # set by _collect_all_tools
 
         # Dangerous tool approval cache (Task 17)
@@ -318,7 +324,7 @@ class PlannerReActFlow(BaseFlow):
         return tools
 
     def _collect_memory_tools(self) -> list:
-        """Create memory search/get tools if dependencies are available."""
+        """Create memory search/get (+save if fully wired) tools."""
         if not (self._memory_session_factory and self._memory_repo_factory):
             return []
         from app.domain.services.tools.memory_tools import create_memory_tools
@@ -327,6 +333,10 @@ class PlannerReActFlow(BaseFlow):
             session_factory=self._memory_session_factory,
             repo_factory=self._memory_repo_factory,
             user_id=self._user_id,
+            session_id=self._session_id,
+            memory_write_service=self._memory_write_service,
+            session_redis=self._memory_session_redis,
+            session_save_cap=self._memory_session_save_cap,
             half_life_days=self._memory_config.half_life_days,
             mmr_lambda=self._memory_config.mmr_lambda,
         )
@@ -344,7 +354,9 @@ class PlannerReActFlow(BaseFlow):
         tools.extend(self._collect_a2a_tools())
         tools.extend(self._collect_skill_creation_tools())
         tools.extend(self._collect_memory_tools())
-        self._has_memory_tools = any(t.name in ("memory_search", "memory_get") for t in tools)
+        self._has_memory_tools = any(
+            t.name in ("memory_search", "memory_get", "memory_save") for t in tools
+        )
         return tools
 
     # -- Graph construction ---------------------------------------------------

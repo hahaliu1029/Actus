@@ -76,6 +76,53 @@ class TestToolsGuideStable:
 
         assert tools_guide_stable_section.id in MINIMAL_MODE_ALLOWLIST
 
+    def test_memory_save_hint_gated_on_memory_save_bound(self) -> None:
+        """Only teach memory_save when it's actually in bound_tool_names.
+
+        Regression for the bug where ``has_memory_tools=True`` alone (which
+        covers memory_search/memory_get) would still emit the memory_save
+        guidance, sending the LLM into the unknown-tool path whenever save
+        wiring is partial (Redis down, session_id missing, etc.).
+        """
+        # has_memory_tools True but memory_save NOT bound → no save guidance
+        ctx = RenderContext(
+            lang="zh",
+            has_file_view=False,
+            has_memory_tools=True,
+            bound_tool_names=frozenset({"memory_search", "memory_get"}),
+        )
+        output = tools_guide_stable_section.render(ctx)
+        assert output.text is not None
+        assert "memory_search" in output.text
+        assert "memory_save" not in output.text
+        assert output.metadata["has_memory_save"] is False
+
+    def test_memory_save_hint_shown_when_save_bound(self) -> None:
+        ctx = RenderContext(
+            lang="zh",
+            has_file_view=False,
+            has_memory_tools=True,
+            bound_tool_names=frozenset(
+                {"memory_search", "memory_get", "memory_save"}
+            ),
+        )
+        output = tools_guide_stable_section.render(ctx)
+        assert output.text is not None
+        assert "memory_save" in output.text
+        assert output.metadata["has_memory_save"] is True
+
+    def test_memory_save_hint_gated_in_english(self) -> None:
+        ctx = RenderContext(
+            lang="en",
+            has_file_view=False,
+            has_memory_tools=True,
+            bound_tool_names=frozenset({"memory_search", "memory_get"}),
+        )
+        output = tools_guide_stable_section.render(ctx)
+        assert output.text is not None
+        assert "memory_search" in output.text
+        assert "memory_save" not in output.text
+
 
 # ---- tools_guide_dynamic ----------------------------------------------- #
 

@@ -148,9 +148,12 @@ _CANONICAL_TOOL_IDENTITIES: dict[str, tuple[Literal["native", "mcp", "a2a", "ski
     "message_ask_user": ("native", "message"),
     # native / search (1 tool, from langchain_tools.py:387+)
     "search_web": ("native", "search"),
-    # native / memory (2 tools, from memory_tools.py:26 create_memory_tools)
+    # native / memory (3 tools, from memory_tools.py create_memory_tools;
+    # memory_save is only bound when session/write-service/redis are wired —
+    # it's still a canonical identity, so bootstrap always seeds it).
     "memory_search": ("native", "memory"),
     "memory_get": ("native", "memory"),
+    "memory_save": ("native", "memory"),
     # a2a (2 tools, hardcoded in langchain_a2a.py:16-48)
     "get_remote_agent_cards": ("a2a", "a2a"),
     "call_remote_agent": ("a2a", "a2a"),
@@ -164,7 +167,7 @@ _CANONICAL_TOOL_IDENTITIES: dict[str, tuple[Literal["native", "mcp", "a2a", "ski
     # skill guide (1 tool, hardcoded in langchain_skill_tools.py:147+)
     "get_skill_guide": ("skill", "skill guide"),
 }
-# Total: 29 native + 2 a2a + 2 mcp discovery + 3 skill creator + 1 skill guide = 37
+# Total: 30 native + 2 a2a + 2 mcp discovery + 3 skill creator + 1 skill guide = 38
 
 
 # ---- Module-global registry -------------------------------------------- #

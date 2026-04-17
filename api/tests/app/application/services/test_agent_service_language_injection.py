@@ -80,6 +80,8 @@ def skeletal_service_with_captured_runner(monkeypatch):
     svc._memory_embedding_provider = MagicMock()
     svc._memory_session_factory = MagicMock()
     svc._memory_repo_factory = MagicMock()
+    svc._memory_write_service = None
+    svc._memory_session_save_cap = 20
 
     # Skip file_processor_lookup / approval_cache / confirmation_manager
     # side paths — all are guarded on config being populated.

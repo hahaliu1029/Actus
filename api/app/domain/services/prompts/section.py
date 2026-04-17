@@ -306,6 +306,7 @@ _FIXTURE_CTX = RenderContext(
             # Memory
             "memory_search",
             "memory_get",
+            "memory_save",
             # Skill tools — both standard and double-underscore edge case
             "skill_example_action",
             "skill_foo__bar_tool",

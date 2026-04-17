@@ -91,8 +91,10 @@ from app.domain.services.tools.tool_source_resolver import (
 
 
 class TestBootstrap:
-    def test_canonical_identities_has_37_entries(self):
-        assert len(_CANONICAL_TOOL_IDENTITIES) == 37
+    def test_canonical_identities_has_38_entries(self):
+        # 30 native (file 7 + shell 5 + browser 12 + message 2 + search 1 +
+        # memory 3) + 2 a2a + 2 mcp discovery + 3 skill creator + 1 skill guide
+        assert len(_CANONICAL_TOOL_IDENTITIES) == 38
 
     def test_canonical_identities_categories_subset_of_known(self):
         """Pin the invariant: every category in bootstrap is in KNOWN_CATEGORIES.

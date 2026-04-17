@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     memory_gate_daily_cap: int = Field(100, gt=0)
     # per-user 每日任意写入上限（含手动 + gate + 自动）。
     memory_user_daily_quota: int = Field(500, gt=0)
+    # per-session memory_save 工具硬上限——防止 Agent 在一次任务内频繁保存。
+    # 与 user_daily_quota 正交：前者防单 session flood，后者防跨 session 累积。
+    memory_session_save_cap: int = Field(20, gt=0)
 
     # 微信公众号配置
     wechat_app_id: str = ""

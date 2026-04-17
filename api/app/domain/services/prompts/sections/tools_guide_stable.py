@@ -40,7 +40,9 @@ _EN_FILE_VIEW = (
 # ---- memory tools hint -------------------------------------------------- #
 
 
-_ZH_MEMORY = (
+# Always-on portion: search/get guidance keyed on ``has_memory_tools`` flag
+# (true whenever any memory-category tool is bound).
+_ZH_MEMORY_BASE = (
     "## 记忆工具\n"
     "你可以使用 memory_search 搜索之前对话中的信息。"
     "当用户提到\"之前\"\"上次\"\"以前讨论过\"等暗示历史上下文时，"
@@ -49,7 +51,7 @@ _ZH_MEMORY = (
 )
 
 
-_EN_MEMORY = (
+_EN_MEMORY_BASE = (
     "## Memory Tools\n"
     "You can use memory_search to find information from previous conversations. "
     "When the user mentions \"previously\", \"last time\", \"we discussed before\", "
@@ -59,25 +61,52 @@ _EN_MEMORY = (
 )
 
 
+# Conditional portion: save guidance keyed on ``memory_save in bound_tool_names``.
+# ``create_memory_tools`` only adds ``memory_save`` when session_id + write_service
+# + session_redis are all wired; this gate mirrors that so we don't teach the LLM
+# a tool it cannot actually call (which would bounce through the unknown-tool path).
+_ZH_MEMORY_SAVE = (
+    "遇到**用户偏好 / 永久性规则 / 可复用事实**时，用 memory_save 记录："
+    "category=user 表示用户身份或偏好，rule 表示硬约束，fact 表示事实。"
+    "当前 session 最多保存 20 次，重复内容会被自动去重；"
+    "不要拿来存对话片段或临时笔记。"
+)
+
+
+_EN_MEMORY_SAVE = (
+    "When you encounter **user preferences / permanent rules / reusable facts**, "
+    "use memory_save to persist them: category=user for identity/preferences, "
+    "rule for hard constraints, fact for durable truths. The current session is "
+    "capped at 20 saves and duplicate content is auto-deduplicated; don't use "
+    "this for conversational snippets or throwaway notes."
+)
+
+
 # ---- render ------------------------------------------------------------- #
 
 
 def _render(ctx: RenderContext) -> SectionOutput:
     """Conditionally render file_view + memory tools hints.
 
-    - If neither flag is set → return ``SectionOutput(text=None)`` so the
-      assembler skips this section entirely.
-    - If only file_view → file_view hint only.
-    - If only memory_tools → memory tools hint only.
-    - If both → file_view hint, blank line, memory tools hint.
+    Memory section has two independent gates:
+      * ``has_memory_tools`` — any memory-category tool bound → search/get base.
+      * ``"memory_save" in bound_tool_names`` — only when the save tool is
+        actually bound (requires session_id + write_service + redis). Teaching
+        ``memory_save`` when it isn't bound would funnel the LLM into the
+        unknown-tool path.
     """
     parts: list[str] = []
 
     if ctx.has_file_view:
         parts.append(_EN_FILE_VIEW if ctx.lang == "en" else _ZH_FILE_VIEW)
 
+    has_memory_save = "memory_save" in ctx.bound_tool_names
     if ctx.has_memory_tools:
-        parts.append(_EN_MEMORY if ctx.lang == "en" else _ZH_MEMORY)
+        memory_text = _EN_MEMORY_BASE if ctx.lang == "en" else _ZH_MEMORY_BASE
+        if has_memory_save:
+            save_text = _EN_MEMORY_SAVE if ctx.lang == "en" else _ZH_MEMORY_SAVE
+            memory_text = memory_text + "\n\n" + save_text
+        parts.append(memory_text)
 
     if not parts:
         return SectionOutput(text=None)
@@ -87,6 +116,7 @@ def _render(ctx: RenderContext) -> SectionOutput:
         metadata={
             "has_file_view": ctx.has_file_view,
             "has_memory_tools": ctx.has_memory_tools,
+            "has_memory_save": has_memory_save,
         },
     )
 

@@ -356,12 +356,34 @@ def _build_agent_service(
     checkpointer_pool: AsyncConnectionPool,
     flush_service: object | None,
     memory_embedding_provider: object | None,
+    file_memory_store: object | None = None,
     sandbox_lifecycle_service: object | None = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
     app_config = _load_app_config()
     snapshot = _build_config_snapshot(app_config)
+
+    # Build a lifespan-scoped MemoryManagementService for the memory_save tool.
+    # The per-request get_memory_management_service() factory constructs a
+    # separate instance from app.state — both walk the same config/wiring so
+    # behavior is identical, this one just lives for the app's lifetime so
+    # AgentTaskRunner closures can keep a stable reference across session
+    # ticks without re-reading app.state in the hot path.
+    memory_redis_client = (
+        redis_client.client if redis_client and hasattr(redis_client, "client") else None
+    )
+    memory_write_service = MemoryManagementService(
+        repo_factory=DBMemoryChunkRepository,
+        embedding_provider=memory_embedding_provider,
+        session_factory=get_postgres().session_factory,
+        file_store=file_memory_store,
+        redis=memory_redis_client,
+        user_daily_quota=(
+            settings.memory_user_daily_quota if memory_redis_client is not None else None
+        ),
+    )
+
     agent_svc = AgentService(
         uow_factory=get_uow,
         config_snapshot=snapshot,
@@ -379,6 +401,8 @@ def _build_agent_service(
         memory_embedding_provider=memory_embedding_provider,
         memory_session_factory=get_postgres().session_factory,
         memory_repo_factory=DBMemoryChunkRepository,
+        memory_write_service=memory_write_service,
+        memory_session_save_cap=settings.memory_session_save_cap,
         event_recovery=RedisEventRecovery(),
         sandbox_lifecycle_service=sandbox_lifecycle_service,
     )

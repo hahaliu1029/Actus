@@ -201,6 +201,9 @@ class AgentTaskRunner(TaskRunner):
         memory_embedding_provider=None,  # C6: 记忆向量化 provider
         memory_session_factory=None,  # C6: 记忆 DB session 工厂
         memory_repo_factory=None,  # C6: 记忆仓库工厂
+        memory_write_service=None,  # PR-3: MemoryManagementService for memory_save tool
+        memory_session_redis=None,  # PR-3: Redis client for per-session save counter
+        memory_session_save_cap: int = 20,  # PR-3: per-session memory_save hard cap
         approval_cache=None,  # Task 17: ApprovalCache | None
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
         initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
@@ -215,6 +218,9 @@ class AgentTaskRunner(TaskRunner):
         self._memory_embedding_provider = memory_embedding_provider
         self._memory_session_factory = memory_session_factory
         self._memory_repo_factory = memory_repo_factory
+        self._memory_write_service = memory_write_service
+        self._memory_session_redis = memory_session_redis
+        self._memory_session_save_cap = memory_session_save_cap
         self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
         self._tool_runtime = tool_runtime or ToolRuntimeConfig()
@@ -396,6 +402,9 @@ class AgentTaskRunner(TaskRunner):
             memory_embedding_provider=self._memory_embedding_provider,
             memory_session_factory=self._memory_session_factory,
             memory_repo_factory=self._memory_repo_factory,
+            memory_write_service=self._memory_write_service,
+            memory_session_redis=self._memory_session_redis,
+            memory_session_save_cap=self._memory_session_save_cap,
             approval_cache=self._approval_cache,
             confirmation_manager=self._confirmation_manager,
             prompt_assembler=prompt_assembler,
@@ -1378,10 +1387,16 @@ class AgentTaskRunner(TaskRunner):
                 + ", ".join(a2a_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
 
-        # Memory tools（C6: memory_search + memory_get）
+        # Memory tools（C6: memory_search + memory_get；PR-3: +memory_save）
         # 直接从 runner 已知依赖判断（_build_available_tool_summary 在 flow.invoke 前执行）
         if self._memory_session_factory and self._memory_repo_factory:
-            lines.append("- memory: memory_search, memory_get")
+            memory_names = ["memory_search", "memory_get"]
+            if (
+                self._memory_write_service is not None
+                and self._memory_session_redis is not None
+            ):
+                memory_names.append("memory_save")
+            lines.append("- memory: " + ", ".join(memory_names))
 
         summary = "\n".join(lines).strip()
         if len(summary) > char_budget:
@@ -1676,6 +1691,10 @@ class AgentTaskRunner(TaskRunner):
                     session_factory=self._memory_session_factory,
                     repo_factory=self._memory_repo_factory,
                     user_id=self._user_id,
+                    session_id=self._session_id,
+                    memory_write_service=self._memory_write_service,
+                    session_redis=self._memory_session_redis,
+                    session_save_cap=self._memory_session_save_cap,
                     half_life_days=memory_config.half_life_days,
                     mmr_lambda=memory_config.mmr_lambda,
                 )

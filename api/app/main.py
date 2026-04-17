@@ -203,6 +203,7 @@ async def lifespan(app: FastAPI):
             checkpointer_pool=checkpointer_pool.pool,
             flush_service=flush_service,
             memory_embedding_provider=app.state.memory_embedding_provider,
+            file_memory_store=getattr(app.state, "file_memory_store", None),
             sandbox_lifecycle_service=sandbox_lifecycle_service,
         )
         logger.info("AgentService 单例初始化完成")
