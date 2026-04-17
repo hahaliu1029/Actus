@@ -180,6 +180,18 @@ async def lifespan(app: FastAPI):
         from app.infrastructure.external.memory import FsMemoryWriter, FsReconciler
 
         _memory_root = settings.memory_root_container
+        # EnsureUserMemoryDir lifespan hook（design P2）：lifespan 起手 mkdir -p
+        # 一次 memory_root_container，让 compose bind 未就位的 dev / CI 环境也
+        # 能跑起来；DockerSandbox mount + FsMemoryWriter 首次写都依赖这个根目录
+        # 存在。非 root api 容器只要父目录可写即可 mkdir 子路径（design L78）。
+        try:
+            Path(_memory_root).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "memory_root_container %s mkdir 失败（可能是只读挂载或权限问题）: %s",
+                _memory_root,
+                exc,
+            )
         app.state.file_memory_store = FsMemoryWriter(memory_root=_memory_root)
         logger.info(
             "FsMemoryWriter 初始化完成，memory_root=%s", _memory_root

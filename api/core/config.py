@@ -123,10 +123,12 @@ class Settings(BaseSettings):
     memory_root_host: str = Field("~/.actus/memory")
     memory_root_container: str = Field("/app/data/memory")
     sandbox_memory_mount_target: str = Field("/workspace/.memory")
-    # PR-0 默认关闭——只有当 docker-compose 已把 memory_root_host 正确 bind 到
-    # memory_root_container 时（PR-6），才应打开本开关实际挂载 memory 目录；
-    # 否则 Docker 会因为 bind source 不存在而拒绝启动 sandbox。
-    sandbox_memory_mount_enabled: bool = Field(False)
+    # M1 PR-6A 起默认 True：docker-compose.yml 已把 memory_root_host bind 到
+    # memory_root_container，首次 session 创建时 DockerSandbox._build_memory_mount
+    # 会在 api 容器内 mkdir 出 user 子目录，再把对应 host 路径只读挂进 sandbox。
+    # 若部署时 host 侧 MEMORY_ROOT_HOST 路径/权限未就绪，可临时置 False 让 agent
+    # 降级走 memory_search 路径（file_read 不可用）。
+    sandbox_memory_mount_enabled: bool = Field(True)
     actus_uid: int = Field(1000, ge=0)
     actus_gid: int = Field(1000, ge=0)
     # LLM 质量 gate：None 表示 gate 未启用（PR-0 默认关闭）。

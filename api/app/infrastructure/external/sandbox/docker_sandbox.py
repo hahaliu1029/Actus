@@ -258,15 +258,17 @@ class DockerSandbox(Sandbox):
         """构造 user memory 目录的 read-only bind mount。
 
         - ``user_id`` 为空 / 非白名单字符 → 返回 None
-        - ``sandbox_memory_mount_enabled=False``（PR-0 默认）→ 返回 None，
-          避免在 docker-compose bind 还没配好的环境里因为 source 不存在启动失败
+        - ``sandbox_memory_mount_enabled=False`` → 返回 None，适用于 host 侧
+          MEMORY_ROOT_HOST 路径未就绪的情形（临时降级，agent 退化为只走
+          memory_search；M1 PR-6A 起默认 True）
         - 挂载采用 M0 spike 约定：
             source = 宿主机侧 ``${memory_root_host}/{user_id}``
             target = sandbox 固定路径 ``sandbox_memory_mount_target``
                     （默认 ``/workspace/.memory``，agent 工具按此路径读取）
         - 启用后会先在 api 容器视图下 ``${memory_root_container}/{user_id}``
           mkdir 一次；需要 api 容器本身已经把该路径 bind 到 ``memory_root_host``
-          （PR-6 docker-compose），host 侧同时必须真实存在才会成功启动 sandbox
+          （PR-6A docker-compose.yml api service volume），host 侧同时必须
+          真实存在才会成功启动 sandbox
         """
         if not user_id:
             return None
@@ -278,9 +280,10 @@ class DockerSandbox(Sandbox):
             )
             return None
 
-        # PR-0 feature gate：默认 False，只有在 host bind 链路已经 ready 的
-        # 环境（PR-6 及之后）才会置 True。False 时直接返回 None，DockerSandbox
-        # 按旧行为启动，避免把"不存在的 host source"暴露给 Docker daemon。
+        # Feature gate：PR-0 引入默认 False，M1 PR-6A 起默认 True。``False``
+        # 时返回 None（DockerSandbox 按旧行为启动），部署者可在 host bind 尚未
+        # 就绪时临时降级到不挂载。getattr 仍用默认 False 兜底，防止 legacy
+        # settings dataclass / 单测 namespace 漏字段时崩溃。
         if not getattr(settings, "sandbox_memory_mount_enabled", False):
             return None
 

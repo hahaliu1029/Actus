@@ -116,10 +116,10 @@ def test_build_memory_mount_rejects_unsafe_user_id(tmp_path, bad_user_id) -> Non
 
 
 def test_build_memory_mount_returns_none_when_feature_gate_off(tmp_path) -> None:
-    """PR-0 默认 sandbox_memory_mount_enabled=False：即使 user_id 合法也不挂载。
+    """``sandbox_memory_mount_enabled=False`` 时即使 user_id 合法也不挂载。
 
-    这条是 PR-0 对外的硬约定——在 PR-6 把 host bind 配好之前，绝不让
-    Docker 看到一个可能不存在的 bind source。
+    PR-0 引入默认 False，M1 PR-6A 起默认翻为 True；本测试显式传 False 验证
+    降级路径——部署时 host 端 MEMORY_ROOT_HOST 未就绪时部署者可临时关闭。
     """
     settings = _mount_settings(tmp_path, enabled=False)
     user_id = str(uuid.uuid4())
