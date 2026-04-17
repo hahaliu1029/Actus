@@ -170,6 +170,40 @@ terminal-state 状态机（详见 `docs/superpowers/specs/2026-04-15-sandbox-lif
 | Gate 2 | `tests/domain/test_no_session_sandbox_id_access.py` | I8: domain/application 层走 `sandbox_binding.*` |
 | Gate 3 | `tests/domain/test_no_raw_sandbox_attribute_access.py` | I7: 不绕过 SandboxHandle generation 检查 |
 
+## Memory System 不变式（M1 Redesign，2026-04）
+
+Memory 是 **三视图一致** 的系统：DB（检索权威）、文件（sandbox 可见的事实源）、
+Prompt snapshot（session-scoped 注入）。三者的同步边界：
+
+- **DB-first 写入**：`MemoryManagementService.create_memory` 先 INSERT 再
+  `file_store.write`；任何写入路径必须先把 `fs_synced=false` 落地，由
+  writer 成功后回写 `fs_synced=true`，避免 "file 有 DB 无" 的逻辑不对称
+- **Canonical frontmatter 单源**：`infrastructure/external/memory/frontmatter.py`
+  里的 `build_memory_frontmatter` / `serialize_memory_file` 是应用层与
+  `FsReconciler` 重建孤儿 DB 行共用的序列化入口；不要在别处构造
+  frontmatter dict，会导致"写出 vs 重建"格式漂移
+- **`move_category` 原子性**：`file_store.move_category` 必须先写新路径再删旧路径；
+  step 3（旧路径删除）失败时保留旧文件，由 `FsReconciler._scan_fs_orphans`
+  的 path-canonicality 检查把 `chunk.category != entry.parent.name` 的残留
+  移入 `.orphans/`——**禁止**先 delete 后 write，会丢数据
+- **`executor_node` 只读快照**：Memory 注入 prompt 的那份数据是 session-scoped
+  快照，session 内后续写入的 memory 不反映到当前 prompt；要等下次 session
+  （与 B5 Two-Clock Architecture 同样的设计原则）
+- **fs 写入异常降级**：`file_store.write` OSError / SecurityError 被 writer 侧吞掉
+  并保持 `fs_synced=false`，由 lifespan 背景任务 `scan_pending_fs_sync`
+  重试；domain 不应该对这类错误做二次处理
+- **FsReconciler 仅 writer 可变 fs**：reconciler 自己不直接 os.write，所有
+  重建走 `FsMemoryWriter`——保证 symlink/path-traversal 防御链单一
+
+**首次部署 checklist**（`README.md` 同步要求）：
+```bash
+mkdir -p ${MEMORY_ROOT_HOST:-~/.actus/memory}     # host bind source 必须先存在
+# 如果用 ACTUS_UID 非 root 跑 api，先 chown 把所有权翻过去
+```
+
+运维路径：`python -m app.cli.memory_reconcile [--user-id UID]` 手动全库扫
+DB/fs 一致性（覆盖 pending backlog + per-user fs walk + orphan 隔离）。
+
 ## 前端开发
 
 ```bash

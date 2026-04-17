@@ -34,7 +34,7 @@ Actus 由三个核心运行时组成：
 - **多模态文件理解**：音频转录（Whisper API / 沙箱 faster-whisper）、PDF 解析（原生 / pymupdf4llm）、图片处理、视频关键帧提取 + 视觉模型分析
 - **上下文溢出治理**：两级渐进压缩（85% LLM 摘要 / 95% 硬截断）+ 同步三阶段裁剪，自动保护上下文窗口
 - **模块化提示词系统（B5）**：sections / bundles / reminders / assembler / budget 子模块组合，支持中英文 bundle 和按情境注入的 reminders
-- **Agent 记忆系统**：`memory_search` / `memory_get` 工具 + 检索流水线（cosine 相似度 → 时间衰减 → MMR 多样性重排）+ Embedding 熔断器
+- **Agent 记忆系统（M1 Memory Redesign 完成）**：三分类（`user` / `rule` / `fact`）+ `memory_search` / `memory_get` / `memory_save` 工具 + 检索流水线（cosine 相似度 → 时间衰减 → MMR 多样性重排）+ Embedding 熔断器；文件为事实源（host bind-mount 到 sandbox 只读）+ `FsReconciler` 后台修复 DB/fs 一致性；LLM 质量闸（独立 CircuitBreaker + per-user daily cap）+ 系统通知（gate paused / quota exceeded / fs failure）
 - **工具审批与确认系统**：用户级永久允许/拒绝规则（`always_allow` / `always_deny`，按 command/dir glob 匹配）+ 会话级允许缓存（仅对 approve 生效）+ Smart Approve 智能批准 + 显式确认（前端 approve 支持 once/session/always 三档，deny 为一次性），含风险评估和持久化审计日志
 - **会话事件恢复**：基于 Redis Stream 的 SSE 状态恢复，刷新或断线重连后从最后位点继续
 - **执行健康监控**：步骤级 watchdog + 执行指标采集 + 工具失败追踪 + 统一 JSON Envelope
@@ -104,10 +104,19 @@ cp .env.example .env
 # NEXT_PUBLIC_API_BASE_URL
 # 可选：如需覆盖默认 Python 包镜像，设置 PYTHON_PACKAGE_INDEX_URL
 
+# Memory 系统首次部署（Memory Redesign M1 起必做）：
+# host 端 memory 根目录必须存在，否则 docker compose up 会在 api 容器挂载阶段失败
+mkdir -p ~/.actus/memory
+# 如你在 .env 里启用了 ACTUS_UID 非 root 模式，请额外执行：
+# sudo chown -R ${ACTUS_UID:-1000}:${ACTUS_GID:-1000} ~/.actus/memory
+
 docker compose --env-file .env up -d --build
 
 # 可选：创建超级管理员
 docker compose exec api python scripts/create_super_admin.py
+
+# 可选：运维手动全库扫一次 memory 一致性（通常由 api lifespan + session hook 自动）
+# docker compose exec api python -m app.cli.memory_reconcile
 ```
 
 启动完成后访问：

@@ -198,14 +198,65 @@ class TestMemoryGateBreaker:
         assert 0 <= delta <= 61
 
 
+class _FakePipeline:
+    """MULTI/EXEC pipeline stub. Commands queued synchronously, ``execute()``
+    applies them atomically against the parent ``_FakeRedis._store``.
+
+    Atomicity model mirrors Redis: if ``execute()`` fails mid-way (simulated
+    by setting ``_fail_on_execute``), **no** queued command's side effect is
+    visible on the store. This is what makes INCRBY+EXPIRE atomic."""
+
+    def __init__(self, parent: "_FakeRedis") -> None:
+        self._parent = parent
+        self._ops: list[tuple[str, tuple]] = []
+
+    def incrby(self, key: str, amount: int) -> None:
+        self._ops.append(("incrby", (key, amount)))
+
+    def incr(self, key: str) -> None:
+        self._ops.append(("incrby", (key, 1)))
+
+    def expire(self, key: str, seconds: int) -> None:
+        self._ops.append(("expire", (key, seconds)))
+
+    async def execute(self) -> list:
+        if self._parent._fail_on_execute:
+            # Simulated pipeline failure: no command's effect is visible —
+            # 这正是 MULTI/EXEC 的承诺。测试 expire-fail 场景时把本 flag 开。
+            raise RuntimeError("simulated redis pipeline failure")
+        results: list = []
+        for op, args in self._ops:
+            if op == "incrby":
+                key, amount = args
+                self._parent._store[key] = self._parent._store.get(key, 0) + amount
+                results.append(self._parent._store[key])
+            elif op == "expire":
+                self._parent.expire_calls.append(args)
+                results.append(True)
+        self._ops.clear()
+        return results
+
+    async def __aenter__(self) -> "_FakePipeline":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._ops.clear()
+
+
 class _FakeRedis:
-    """Tiny async fake — enough for try_reserve/INCRBY+EXPIRE semantics."""
+    """Tiny async fake — enough for try_reserve INCRBY+EXPIRE pipeline semantics."""
 
     def __init__(self) -> None:
         self._store: dict[str, int] = {}
         self.expire_calls: list[tuple[str, int]] = []
+        self._fail_on_execute = False
+
+    def pipeline(self, transaction: bool = True) -> _FakePipeline:
+        return _FakePipeline(self)
 
     async def incrby(self, key: str, amount: int) -> int:
+        # Used for overflow rollback outside the pipeline (design-intended
+        # best-effort DECRBY). Not part of atomic INCRBY+EXPIRE block.
         self._store[key] = self._store.get(key, 0) + amount
         return self._store[key]
 
@@ -260,6 +311,31 @@ class TestMemoryGateDailyCap:
         cap = MemoryGateDailyCap(redis, cap=100)
         await cap.try_reserve("u1", 1)
         assert redis.expire_calls == [(cap._key("u1"), cap.TTL_SECONDS)]
+
+    async def test_pipeline_failure_does_not_leak_counter(self) -> None:
+        """回归：INCRBY + EXPIRE 必须原子。pipeline execute 抛异常时，
+        计数器不能被"半提交"成 incrby 已生效、expire 丢失的状态——那会造成
+        Redis 里永久无 TTL 的 key 跨天累加，逐步打成假 daily cap 限流。
+
+        Pre-fix: 两步分离，INCRBY 已生效而 EXPIRE 失败 → key 无 TTL 且计数累加。
+        Post-fix: pipeline(transaction=True) 把两条命令绑成 MULTI/EXEC，
+        EXEC 失败时 **两条命令都不生效**，store 保持干净。
+        """
+        redis = _FakeRedis()
+        redis._fail_on_execute = True
+        cap = MemoryGateDailyCap(redis, cap=100)
+
+        with pytest.raises(RuntimeError, match="pipeline failure"):
+            await cap.try_reserve("u1", 10)
+
+        # 关键断言：store 里不应该有该 key 的任何写入
+        key = cap._key("u1")
+        assert key not in redis._store, (
+            "INCRBY 的副作用不能在 pipeline 失败时泄漏；否则下次 try_reserve 读到"
+            "假累积值"
+        )
+        # TTL 也没设置
+        assert redis.expire_calls == []
 
     async def test_different_users_isolated(self) -> None:
         redis = _FakeRedis()

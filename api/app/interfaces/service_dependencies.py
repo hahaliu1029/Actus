@@ -400,6 +400,15 @@ def _build_agent_service(
     memory_redis_client = (
         redis_client.client if redis_client and hasattr(redis_client, "client") else None
     )
+    # Emitter 先建，MemoryManagementService + AgentService 共享同一 instance。
+    # DB-only 构造（无 Redis 依赖），gate-off 部署也能让 fs_permanent_failure
+    # 通知走 notification_routes 对外契约。
+    from app.application.services.memory_notification_emitter import (
+        DBMemoryNotificationEmitter,
+    )
+    memory_notification_emitter = DBMemoryNotificationEmitter(
+        session_factory=get_postgres().session_factory,
+    )
     memory_write_service = MemoryManagementService(
         repo_factory=DBMemoryChunkRepository,
         embedding_provider=memory_embedding_provider,
@@ -409,6 +418,11 @@ def _build_agent_service(
         user_daily_quota=(
             settings.memory_user_daily_quota if memory_redis_client is not None else None
         ),
+        # fs 写失败 → 发 fs_permanent_failure 通知（design §183 M1 contract）。
+        # 没有 emitter 时 _try_emit_fs_failure_notification 会 no-op，legacy
+        # 路径不受影响；但生产部署必须注入，否则 schema 宣称的 event_type
+        # 永不写入，等同于空承诺。
+        notification_emitter=memory_notification_emitter,
     )
 
     # M1 PR-4+8 gate: single in-process breaker shared across sessions (so
@@ -416,9 +430,6 @@ def _build_agent_service(
     # is a thin Redis wrapper (stateless). Both are None when Redis or
     # gate LLM aren't available, and PlannerReActFlow's gate path treats
     # None as legacy passthrough.
-    from app.application.services.memory_notification_emitter import (
-        DBMemoryNotificationEmitter,
-    )
     from app.domain.services.memory_gate import (
         MemoryGateBreaker,
         MemoryGateDailyCap,
@@ -447,10 +458,6 @@ def _build_agent_service(
     memory_gate_breaker, memory_gate_daily_cap = _build_memory_gate_deps(snapshot)
     # Notification emitter is always constructible (DB-only, no Redis
     # dep); gate-off deployments just never call it.
-    memory_notification_emitter = DBMemoryNotificationEmitter(
-        session_factory=get_postgres().session_factory,
-    )
-
     agent_svc = AgentService(
         uow_factory=get_uow,
         config_snapshot=snapshot,
@@ -576,6 +583,15 @@ def get_memory_management_service(
         redis_client = None
         user_daily_quota = None
 
+    # Emitter 每次 request 新建——构造是廉价的（只抓 session_factory 引用），
+    # 避免 app.state 共享引入的 lifespan 初始化耦合（测试若绕过 lifespan 构造
+    # app 时，app.state 可能没有 memory_notification_emitter 属性）。
+    from app.application.services.memory_notification_emitter import (
+        DBMemoryNotificationEmitter,
+    )
+    notification_emitter = DBMemoryNotificationEmitter(
+        session_factory=postgres_client.session_factory,
+    )
     return MemoryManagementService(
         repo_factory=DBMemoryChunkRepository,
         embedding_provider=request.app.state.memory_embedding_provider,
@@ -583,6 +599,7 @@ def get_memory_management_service(
         file_store=file_store,
         redis=redis_client,
         user_daily_quota=user_daily_quota,
+        notification_emitter=notification_emitter,
     )
 
 

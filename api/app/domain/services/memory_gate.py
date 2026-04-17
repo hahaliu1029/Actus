@@ -357,15 +357,23 @@ class MemoryGateDailyCap:
             used = _parse_counter(used_raw)
             return (used < self._cap, max(0, self._cap - used))
 
-        # INCRBY is atomic; if it pushes us over the cap, roll back with
-        # DECRBY so the counter stays at cap and subsequent reservations
-        # see "full" rather than "some quota stolen from a failed call".
-        new_total = await self._redis.incrby(key, amount)
-        await self._redis.expire(key, self.TTL_SECONDS)
+        # INCRBY + EXPIRE must be atomic. 2-step 下如果 EXPIRE 因瞬时网络/Redis
+        # 异常失败，计数器会永远无 TTL 累加，跨天假限流；调用方 _apply_llm_gate
+        # 又会吞 _evaluate_flush_gate 异常，泄漏永久化。MULTI/EXEC pipeline 把
+        # 两条命令在 server 端绑成原子块，要么都生效要么都对 client 不可见
+        # （整条 pipeline 失败时 Redis 不会应用其中任何一条），counter 不会
+        # 越过 TTL 边界。对齐 memory_quota / memory_session_limits 的模式。
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.incrby(key, amount)
+            pipe.expire(key, self.TTL_SECONDS)
+            results = await pipe.execute()
+        new_total = int(results[0])
         if new_total > self._cap:
             overflow = new_total - self._cap
             # 乐观回滚——另一个 worker 同期写 +m 不影响我们多退回 overflow，
             # 因为最终值不变（我们 +amount 后发现多了 overflow，再 -overflow）。
+            # 此时 key 已经有 TTL，单独 DECRBY 即使失败也只是计数偏高，
+            # 当天结束 TTL 到期自动归零，不会跨天泄漏。
             await self._redis.incrby(key, -overflow)
             return (False, 0)
         return (True, max(0, self._cap - new_total))

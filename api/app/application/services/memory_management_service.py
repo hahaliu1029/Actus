@@ -69,6 +69,9 @@ if TYPE_CHECKING:
 
     from app.domain.external.embedding_provider import EmbeddingProvider
     from app.domain.external.file_memory_store import FileMemoryStore
+    from app.domain.external.memory_notification_emitter import (
+        MemoryNotificationEmitter,
+    )
     from app.domain.repositories.memory_chunk_repository import MemoryChunkRepository
 
 logger = logging.getLogger(__name__)
@@ -86,6 +89,7 @@ class MemoryManagementService:
         file_store: "FileMemoryStore | None" = None,
         redis: "Redis | None" = None,
         user_daily_quota: int | None = None,
+        notification_emitter: "MemoryNotificationEmitter | None" = None,
     ) -> None:
         # ``file_store`` 在 PR-0 期间恒为 None（DB-only 模式），PR-5A 起由
         # lifespan 注入真实的 ``FsMemoryWriter``。None 时所有 CRUD 只落 DB，
@@ -104,6 +108,11 @@ class MemoryManagementService:
         self._file_store = file_store
         self._redis = redis
         self._user_daily_quota = user_daily_quota
+        # ``notification_emitter`` 可选：注入时 fs 写失败路径会发 ``fs_permanent_failure``
+        # 通知给用户（design §183 三种 M1 event_type 之一）；未注入时降级为
+        # 只写 audit_log，保持 legacy 路径可用，但对外契约里 ``fs_permanent_failure``
+        # 就等同于空承诺——生产部署必须通过 DI 注入真实 emitter。
+        self._notification_emitter = notification_emitter
 
     async def list_memories(
         self,
@@ -342,12 +351,28 @@ class MemoryManagementService:
                 exc,
                 exc_info=True,
             )
+            error_type = type(exc).__name__
+            error_msg = str(exc)[:500]
             await self._write_fs_failure_audit(
                 user_id=user_id,
                 chunk_id=chunk.id,
                 action=action,
-                error_type=type(exc).__name__,
-                error_msg=str(exc)[:500],
+                error_type=error_type,
+                error_msg=error_msg,
+            )
+            # fs_permanent_failure notification（design §183）——FsMemoryWriter
+            # 内部指数退避重试已经耗尽（max_retries 默认 5），这里把"尝试写失败"
+            # 事件暴露给用户通知托盘；FsReconciler 后续扫到 fs_synced=false
+            # 可能重试成功，此时通知相当于"已解决的告警"，用户托盘 UI 可按
+            # notification 创建时间折旧。schema 声明 fs_permanent_failure 是
+            # M1 已知 event_type，这条发射是对那个契约的兑现。
+            await self._try_emit_fs_failure_notification(
+                user_id=user_id,
+                chunk_id=chunk.id,
+                category=category,
+                action=action,
+                error_type=error_type,
+                error_msg=error_msg,
             )
             return False
 
@@ -414,6 +439,47 @@ class MemoryManagementService:
         except Exception:
             logger.warning(
                 "fs_write_failed audit 记录本身失败 chunk_id=%s",
+                chunk_id,
+                exc_info=True,
+            )
+
+    async def _try_emit_fs_failure_notification(
+        self,
+        *,
+        user_id: str,
+        chunk_id: str,
+        category: str,
+        action: str,
+        error_type: str,
+        error_msg: str,
+    ) -> None:
+        """Emit ``fs_permanent_failure`` notification (design §183 third M1 event_type).
+
+        Notification 是 advisory 的对用户通道，与 audit_log（运维可 grep）
+        正交。未注入 emitter 时 no-op——这种部署等同于没兑现 schema 里
+        列出的 ``fs_permanent_failure`` 契约，但 legacy 测试/CI 路径能跑。
+        Emitter 自身 swallow 内部异常，调用方不需要再加 try/except。
+        """
+        if self._notification_emitter is None:
+            return
+        # Defense-in-depth：即使 emitter 实现违反"内部 swallow"契约，service
+        # 也不能因为通知失败把 create/update 打成 500——用户实际内容已入库，
+        # 告诉不了用户只是丢一条推送，和 audit 一样最多记 warning。
+        try:
+            await self._notification_emitter.emit(
+                user_id=user_id,
+                event_type="fs_permanent_failure",
+                payload={
+                    "chunk_id": chunk_id,
+                    "category": category,
+                    "action": action,
+                    "error_type": error_type,
+                    "error_msg": error_msg,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "fs_permanent_failure 通知发射失败（emitter 违约或底层故障）chunk_id=%s",
                 chunk_id,
                 exc_info=True,
             )

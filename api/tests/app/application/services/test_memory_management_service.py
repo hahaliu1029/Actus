@@ -886,6 +886,107 @@ class TestCreateFsSync:
         assert audit.new_snapshot["error_type"] == "OSError"
         assert "disk full" in audit.new_snapshot["error_msg"]
 
+    async def test_fs_write_failure_emits_fs_permanent_failure_notification(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """FsMemoryWriter 重试耗尽 → MemoryNotificationEmitter.emit 被调用，
+        event_type='fs_permanent_failure'。
+
+        回归：schema / notification_schemas.py 把 fs_permanent_failure 列为
+        M1 已知 event_type，但 PR-5B 合入前 service 从不发射它——对外契约是
+        空承诺。这条测试锁住 emitter 被真正调用的路径。
+        """
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = _RecordingFileStore(write_fails=OSError("disk full"))
+
+        emitter = AsyncMock()
+        emitter.emit = AsyncMock()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+            notification_emitter=emitter,
+        )
+
+        await svc.create_memory(TEST_USER_ID_FIXED, "content", "fact")
+
+        emitter.emit.assert_awaited_once()
+        kwargs = emitter.emit.await_args.kwargs
+        assert kwargs["user_id"] == TEST_USER_ID_FIXED
+        assert kwargs["event_type"] == "fs_permanent_failure"
+        assert kwargs["payload"]["category"] == "fact"
+        assert kwargs["payload"]["action"] == "create"
+        assert kwargs["payload"]["error_type"] == "OSError"
+        assert "disk full" in kwargs["payload"]["error_msg"]
+        # chunk_id 必须带——用户托盘 UI / 运维诊断都依赖它定位具体条目
+        assert kwargs["payload"]["chunk_id"]
+
+    async def test_fs_write_failure_without_emitter_does_not_crash(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """Legacy/test 路径不传 emitter 时 fs 写失败应降级为只写 audit，
+        不抛也不 emit——保持 DB-only 部署可用。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = _RecordingFileStore(write_fails=OSError("disk full"))
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+            # notification_emitter 显式不传
+        )
+
+        chunk = await svc.create_memory(TEST_USER_ID_FIXED, "content", "user")
+        assert chunk.fs_synced is False  # audit 路径保留
+
+    async def test_emitter_failure_does_not_break_create(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """emitter.emit 抛异常（Redis 挂 / DB 挂）时 create_memory 仍然成功返回——
+        通知是 advisory，不能 fail 整条写入路径。DBMemoryNotificationEmitter
+        实现里 swallow 异常；这里用 AsyncMock 模拟一个会 raise 的 emitter
+        验证 service 层也是 contract-safe 的（ future emitter 实现若不 swallow
+        也不会把 create 拖垮）。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = _RecordingFileStore(write_fails=OSError("disk full"))
+
+        class _RaisingEmitter:
+            async def emit(self, **kwargs):
+                raise RuntimeError("emitter db down")
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+            notification_emitter=_RaisingEmitter(),
+        )
+
+        # service._try_emit_fs_failure_notification 内部加了 try/except 兜底，
+        # 即使 emitter 实现违反"内部 swallow"契约，create 也能正常返回。
+        # 通知丢了是 acceptable，写入路径不能被一条通知拖垮。
+        chunk = await svc.create_memory(TEST_USER_ID_FIXED, "content", "fact")
+        assert chunk.id
+        assert chunk.fs_synced is False  # fs 仍然失败
+
 
 class TestUpdateFsSync:
     async def test_update_calls_file_store_write_with_overwrite(
