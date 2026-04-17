@@ -356,3 +356,35 @@ class TestMarkFsSynced:
             chunk_id="chunk-1", user_id=TEST_USER_ID_FIXED, synced=False
         )
         assert hit is True
+
+
+class TestDistinctUserIds:
+    """distinct_user_ids: FsReconciler CLI 全量扫描入口（PR-5B）。"""
+
+    async def test_returns_unique_user_ids(self) -> None:
+        mock_scalars = MagicMock()
+        mock_scalars.all.return_value = [
+            TEST_USER_ID_FIXED,
+            TEST_OTHER_USER_ID_FIXED,
+        ]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value = mock_scalars
+        mock_session = AsyncMock()
+        mock_session.execute.return_value = mock_result
+
+        repo = DBMemoryChunkRepository(db_session=mock_session)
+        users = await repo.distinct_user_ids()
+
+        assert users == [TEST_USER_ID_FIXED, TEST_OTHER_USER_ID_FIXED]
+        mock_session.execute.assert_awaited_once()
+
+    async def test_empty_table_returns_empty_list(self) -> None:
+        mock_scalars = MagicMock()
+        mock_scalars.all.return_value = []
+        mock_result = MagicMock()
+        mock_result.scalars.return_value = mock_scalars
+        mock_session = AsyncMock()
+        mock_session.execute.return_value = mock_result
+
+        repo = DBMemoryChunkRepository(db_session=mock_session)
+        assert await repo.distinct_user_ids() == []

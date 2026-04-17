@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Callable, List, Optional, Type
 
@@ -24,6 +25,7 @@ from core.config import get_settings
 
 if TYPE_CHECKING:
     from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
+    from app.infrastructure.external.memory.fs_reconciler import FsReconciler
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +38,14 @@ class SessionService:
         uow_factory: Callable[[], IUnitOfWork],
         task_cls: Optional[Type[Task]] = None,
         sandbox_lifecycle_service: Optional["SandboxLifecycleService"] = None,
+        fs_reconciler: Optional["FsReconciler"] = None,
     ) -> None:
         """构造函数，完成会话服务初始化"""
         self._uow_factory = uow_factory
         self._uow = uow_factory()
         self._task_cls = task_cls
         self._lifecycle = sandbox_lifecycle_service
+        self._fs_reconciler = fs_reconciler
 
     async def create_session(self, user_id: str) -> Session:
         """创建一个空白的新任务会话"""
@@ -50,7 +54,37 @@ class SessionService:
         async with self._uow:
             await self._uow.session.save(session)
         logger.info(f"成功创建一个新任务会话: {session.id}")
+        # M1 PR-5B：fire-and-forget 触发 FsReconciler per-user walk。
+        # 第二次起 reconciler 内部 _walked_users 缓存会短路，但首次会扫一次
+        # user 目录清孤儿文件 / 重建缺失文件。walk 出错不能影响 session 创建——
+        # session 入库已完成，reconciler 只是补数据视图一致性。
+        if self._fs_reconciler is not None:
+            self._spawn_fs_reconciler_walk(user_id)
         return session
+
+    def _spawn_fs_reconciler_walk(self, user_id: str) -> None:
+        reconciler = self._fs_reconciler
+        if reconciler is None:
+            return
+
+        async def _walk_swallowing_errors() -> None:
+            try:
+                await reconciler.walk_user_directory(user_id)
+            except Exception:
+                # 不能让 walk 的异常冒泡到 event loop 未处理 handler；reconciler
+                # 只是对账，失败 log 了就接着干，不影响 session 生命周期。
+                logger.warning(
+                    "FsReconciler walk 失败（已吞） user=%s", user_id, exc_info=True
+                )
+
+        try:
+            asyncio.create_task(_walk_swallowing_errors())
+        except RuntimeError:
+            # no running loop（理论上 FastAPI 内不会发生；单测环境才可能）
+            logger.debug(
+                "FsReconciler walk 未能调度（无 event loop），忽略 user=%s",
+                user_id,
+            )
 
     async def get_all_sessions(
         self, user_id: str, is_admin: bool = False

@@ -241,6 +241,11 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         result = await self.db_session.execute(stmt)
         return [self._to_domain(row) for row in result.scalars().all()]
 
+    async def distinct_user_ids(self) -> list[str]:
+        stmt = select(MemoryChunkModel.user_id).distinct()
+        result = await self.db_session.execute(stmt)
+        return list(result.scalars().all())
+
     async def delete_all_by_user(self, *, user_id: str) -> list[MemoryChunk]:
         """删除本用户所有记忆，返回实际被删除的行（``DELETE ... RETURNING *``）。
 

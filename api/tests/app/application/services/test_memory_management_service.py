@@ -692,22 +692,22 @@ class TestDeriveTitle:
     """P2-1 回归：service 落盘的 frontmatter 必须含 canonical 声明的 title 字段。"""
 
     def test_derive_title_takes_first_line_stripped(self):
-        from app.application.services.memory_management_service import _derive_title
-        assert _derive_title("  Hello world  \ntrailing line") == "Hello world"
+        from app.infrastructure.external.memory.frontmatter import derive_title
+        assert derive_title("  Hello world  \ntrailing line") == "Hello world"
 
     def test_derive_title_empty_content_falls_back_to_untitled(self):
-        from app.application.services.memory_management_service import _derive_title
-        assert _derive_title("") == "untitled"
-        assert _derive_title("   \n\n  ") == "untitled"
+        from app.infrastructure.external.memory.frontmatter import derive_title
+        assert derive_title("") == "untitled"
+        assert derive_title("   \n\n  ") == "untitled"
 
     def test_derive_title_truncates_long_first_line_with_ellipsis(self):
-        from app.application.services.memory_management_service import (
-            _TITLE_MAX_LENGTH,
-            _derive_title,
+        from app.infrastructure.external.memory.frontmatter import (
+            TITLE_MAX_LENGTH,
+            derive_title,
         )
-        long_text = "A" * (_TITLE_MAX_LENGTH + 20)
-        out = _derive_title(long_text)
-        assert len(out) == _TITLE_MAX_LENGTH + 1  # 80 chars + "…"
+        long_text = "A" * (TITLE_MAX_LENGTH + 20)
+        out = derive_title(long_text)
+        assert len(out) == TITLE_MAX_LENGTH + 1  # 80 chars + "…"
         assert out.endswith("…")
 
     def test_build_frontmatter_includes_title(self):

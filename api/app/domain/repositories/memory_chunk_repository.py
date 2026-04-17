@@ -144,6 +144,15 @@ class MemoryChunkRepository(Protocol):
         """
         ...
 
+    async def distinct_user_ids(self) -> list[str]:
+        """返回所有写过 memory_chunks 的 user_id，用于 FsReconciler CLI 全量扫描。
+
+        不过滤 fs_synced —— reconcile_all_users 要兼顾孤儿 DB 行和孤儿 fs 行，
+        两侧都要走一遍。结果量级为 platform 总用户数，对单实例 <10k 用户可接受；
+        更大规模场景下 CLI 自己分页即可（post-M3）。
+        """
+        ...
+
     async def delete_all_by_user(self, *, user_id: str) -> list[MemoryChunk]:
         """删除当前用户全部记忆，返回实际被删除的行（``DELETE ... RETURNING``）。
 

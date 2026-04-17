@@ -27,9 +27,11 @@ from app.application.services.memory_quota import (
 )
 from app.domain.external.embedding_provider import EmbeddingUnavailableError
 from app.domain.models.memory_chunk import MemoryChunk, memory_content_hash
+from app.infrastructure.external.memory.frontmatter import (
+    build_memory_frontmatter,
+)
 
 _AUDIT_CONTENT_PREVIEW_LIMIT = 200
-_TITLE_MAX_LENGTH = 80
 _TAG_MAX_LENGTH = 64
 _TAGS_MAX_COUNT = 20
 # 允许的 manual / memory_save 写入路径枚举；DB CHECK 再兜一次
@@ -60,22 +62,6 @@ def _clean_tags(tags: list[str] | None) -> list[str]:
             break
     return out
 
-
-def _derive_title(content: str) -> str:
-    """M1 降级版 title：内容首行 strip + 截断。
-
-    设计 L66：``title`` = "一行摘要，用户可手写或 LLM 自动生成"。PR-5A 阶段
-    没有 UI 输入也没有 LLM summary，取内容首行做 best-effort 衍生——保证
-    frontmatter canonical 完整性，不让 service / writer 协议各说各话。
-    后续 PR（UI title 字段 / LLM gate）接回 LLM 版本时替换本函数即可。
-    """
-    first_line = content.split("\n", 1)[0].strip()
-    if not first_line:
-        return "untitled"
-    if len(first_line) <= _TITLE_MAX_LENGTH:
-        return first_line
-    # 带省略号提示截断，避免 operator 误把截断后文本当完整 summary
-    return first_line[:_TITLE_MAX_LENGTH].rstrip() + "…"
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -432,29 +418,10 @@ class MemoryManagementService:
                 exc_info=True,
             )
 
-    @staticmethod
-    def _build_frontmatter(chunk: MemoryChunk) -> dict:
-        """Memory frontmatter canonical set（设计文档 L63-73 / L424）。
-
-        字段必须覆盖 ``frontmatter.FRONTMATTER_KEYS`` 声明的 canonical 集，
-        否则 service 写出的文件和 writer 的 canonical 契约会漂移——canonical
-        声明 ``title`` 却永远不写，就是契约坏点。
-
-        ``title`` 的语义（设计 L66）："一行摘要，用户可手写或 LLM 自动生成"。
-        M1 没有 UI title 输入也没有 LLM auto-summary，降级为**内容首行衍生**：
-        strip + 截断到 80 字符，空内容兜底 ``"untitled"``。LLM 版本留到后续
-        PR（可在 PR-4+8 自动 flush gate 里一并接 title 生成）。
-        """
-        return {
-            "id": chunk.id,
-            "title": _derive_title(chunk.content),
-            "category": chunk.category,
-            "source": chunk.source,
-            "created_at": chunk.created_at.isoformat(),
-            "updated_at": chunk.updated_at.isoformat(),
-            "pinned": chunk.pinned,
-            "tags": chunk.metadata.get("tags", []),
-        }
+    # _build_frontmatter 已迁到 infrastructure/external/memory/frontmatter.py
+    # 共享（PR-5B）。FsReconciler 重建 orphan DB 行也用同一个 builder，避免
+    # "应用层写 vs reconciler 重建"格式漂移。这里保留别名仅为 stable import 路径。
+    _build_frontmatter = staticmethod(build_memory_frontmatter)
 
     async def get_memory(self, user_id: str, chunk_id: str) -> MemoryChunk | None:
         async with self._session_factory() as session:

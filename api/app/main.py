@@ -177,13 +177,36 @@ async def lifespan(app: FastAPI):
         # 在开发 / 单元测试环境下目录可能尚不存在（M0 spike 未跑或 config
         # 指向 ``~/.actus/memory`` 默认值），FsMemoryWriter 内部首次 write
         # 时会 mkdir -p 创建用户子目录，不依赖构造期目录存在。
-        from app.infrastructure.external.memory import FsMemoryWriter
+        from app.infrastructure.external.memory import FsMemoryWriter, FsReconciler
 
         _memory_root = settings.memory_root_container
         app.state.file_memory_store = FsMemoryWriter(memory_root=_memory_root)
         logger.info(
             "FsMemoryWriter 初始化完成，memory_root=%s", _memory_root
         )
+
+        # 7c. FsReconciler（PR-5B）—— 启动后台扫 fs_synced=false 的行做补写。
+        # 懒式 per-user walk 由 SessionService.create_session 触发（DI 侧注入）。
+        # 后台扫描以 best-effort 方式起：失败不拖垮 lifespan，日志里能看到
+        # 就行；ops 可手动 `python -m app.cli.memory_reconcile` 兜底。
+        fs_reconciler = FsReconciler(
+            session_factory=postgres_client.session_factory,
+            repo_factory=DBMemoryChunkRepository,
+            file_store=app.state.file_memory_store,
+            memory_root=_memory_root,
+        )
+        app.state.fs_reconciler = fs_reconciler
+
+        async def _background_fs_reconcile() -> None:
+            try:
+                await fs_reconciler.scan_pending_fs_sync()
+            except Exception:
+                logger.exception("FsReconciler 启动扫描失败（非致命，等下轮）")
+
+        app.state._fs_reconciler_task = asyncio.create_task(
+            _background_fs_reconcile()
+        )
+        logger.info("FsReconciler 初始化完成，后台扫描已触发")
 
         # 8. 初始化 SandboxLifecycleService 单例（同 checkpointer_pool 模式，eng review #9）
         from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
