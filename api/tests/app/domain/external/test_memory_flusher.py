@@ -8,6 +8,8 @@ import pytest
 from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.models.memory_chunk import FlushBatch, RawChunk
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 
 class StubMemoryFlusher:
     """满足 MemoryFlusher 协议的最小桩实现。"""
@@ -24,14 +26,14 @@ class TestMemoryFlusherProtocol:
         chunk = RawChunk(
             content="test",
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             source="react_graph",
             metadata={},
             content_hash="abc123",
         )
         return FlushBatch(
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=1,
             chunks=(chunk,),
@@ -58,14 +60,14 @@ class TestMemoryFlusherProtocol:
             chunk = RawChunk(
                 content=f"msg {i}",
                 session_id="sess-1",
-                user_id="user-1",
+                user_id=TEST_USER_ID_FIXED,
                 source="react_graph",
                 metadata={},
                 content_hash=f"hash{i}",
             )
             batch = FlushBatch(
                 session_id="sess-1",
-                user_id="user-1",
+                user_id=TEST_USER_ID_FIXED,
                 from_cursor=i,
                 target_cursor=i + 1,
                 chunks=(chunk,),

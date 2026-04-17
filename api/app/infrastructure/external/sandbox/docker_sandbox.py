@@ -1,11 +1,30 @@
 import asyncio
 import io
 import logging
+import re
 import socket
 import time
 import uuid
 from pathlib import Path
 from typing import BinaryIO, Optional, Self
+
+# UUID v4 / 结构化 id 白名单。user_id 会被直接拼进 bind mount 路径，
+# 必须限定为安全字符以防止 ``../`` / 绝对路径注入。
+_SAFE_USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """True iff ``path`` 规范化后严格位于 ``root`` 之内（含 root 本身）。"""
+    try:
+        resolved = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except OSError:
+        return False
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        return False
+    return True
 
 import docker
 import httpx
@@ -17,6 +36,7 @@ from async_lru import alru_cache
 from core.config import get_settings
 from docker.errors import APIError, NotFound
 from docker.models.resource import Model
+from docker.types import Mount
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +164,13 @@ class DockerSandbox(Sandbox):
             raise first_error
 
     @classmethod
-    def _create_task(cls) -> Self:
-        """创建沙箱容器的异步任务"""
+    def _create_task(cls, user_id: Optional[str] = None) -> Self:
+        """创建沙箱容器的异步任务。
+
+        ``user_id`` 为 M1 引入：传入时为 sandbox 注入 read-only bind mount，
+        ``${memory_root_host}/{user_id}`` → ``${memory_root_container}/{user_id}``。
+        见 docs/superpowers/specs/2026-04-17-m0-sandbox-memory-mount-spike.md。
+        """
         # 1.获取系统配置信息
         settings = get_settings()
 
@@ -180,6 +205,13 @@ class DockerSandbox(Sandbox):
             if settings.sandbox_network:
                 container_config["network"] = settings.sandbox_network
 
+            # 5b.M1 memory bind mount：user_id 传入时把用户私有 memory 目录
+            # 以 read-only 形式挂进 sandbox。api 容器通过 FsMemoryWriter 负责
+            # 写入（PR-5A），sandbox 只消费最新快照。
+            memory_mount = cls._build_memory_mount(settings, user_id)
+            if memory_mount is not None:
+                container_config["mounts"] = [memory_mount]
+
             # 6.调用docker客户端容器运行参数创建沙箱
             container = docker_client.containers.run(**container_config)
 
@@ -203,8 +235,12 @@ class DockerSandbox(Sandbox):
                 docker_client.close()
 
     @classmethod
-    async def create(cls) -> Self:
-        """类方法，创建沙箱容器"""
+    async def create(cls, user_id: Optional[str] = None) -> Self:
+        """类方法，创建沙箱容器。
+
+        ``user_id`` 为 M1 memory 系统引入。不传时容器按旧行为启动，
+        传入时通过 bind mount 挂载该用户的 memory 目录（只读）。
+        """
         # 1.获取系统配置信息
         settings = get_settings()
 
@@ -215,7 +251,75 @@ class DockerSandbox(Sandbox):
             return DockerSandbox(ip=ip)
 
         # 4.使用子线程创建一个容器后返回
-        return await asyncio.to_thread(cls._create_task)
+        return await asyncio.to_thread(cls._create_task, user_id)
+
+    @staticmethod
+    def _build_memory_mount(settings, user_id: Optional[str]) -> Optional[Mount]:
+        """构造 user memory 目录的 read-only bind mount。
+
+        - ``user_id`` 为空 / 非白名单字符 → 返回 None
+        - ``sandbox_memory_mount_enabled=False``（PR-0 默认）→ 返回 None，
+          避免在 docker-compose bind 还没配好的环境里因为 source 不存在启动失败
+        - 挂载采用 M0 spike 约定：
+            source = 宿主机侧 ``${memory_root_host}/{user_id}``
+            target = sandbox 固定路径 ``sandbox_memory_mount_target``
+                    （默认 ``/workspace/.memory``，agent 工具按此路径读取）
+        - 启用后会先在 api 容器视图下 ``${memory_root_container}/{user_id}``
+          mkdir 一次；需要 api 容器本身已经把该路径 bind 到 ``memory_root_host``
+          （PR-6 docker-compose），host 侧同时必须真实存在才会成功启动 sandbox
+        """
+        if not user_id:
+            return None
+
+        if not _SAFE_USER_ID_RE.fullmatch(user_id):
+            logger.warning(
+                "拒绝构造 memory bind mount：user_id 不符合安全白名单 user_id=%r",
+                user_id,
+            )
+            return None
+
+        # PR-0 feature gate：默认 False，只有在 host bind 链路已经 ready 的
+        # 环境（PR-6 及之后）才会置 True。False 时直接返回 None，DockerSandbox
+        # 按旧行为启动，避免把"不存在的 host source"暴露给 Docker daemon。
+        if not getattr(settings, "sandbox_memory_mount_enabled", False):
+            return None
+
+        # 两条 root 都先 expanduser，让 memory_root_container 写 "~/..." 的极端
+        # 配置也能解析（validator 允许 ``/`` 或 ``~`` 开头；container 侧若没
+        # expanduser，Docker 会把 "~" 解释成相对路径直接启动失败）。
+        container_root = Path(settings.memory_root_container).expanduser()
+        host_root = Path(settings.memory_root_host).expanduser()
+
+        container_mem_dir = container_root / user_id
+        host_mem_dir = host_root / user_id
+        # 最后兜底：resolve 后必须仍在各自 root 内（防御 symlink + 不规范 user_id）
+        if not _is_within(container_mem_dir, container_root) or not _is_within(
+            host_mem_dir, host_root
+        ):
+            logger.warning(
+                "拒绝构造 memory bind mount：路径越界 user_id=%r",
+                user_id,
+            )
+            return None
+
+        try:
+            container_mem_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # 开启 mount 但 mkdir 失败 → bind source 大概率也不在，直接
+            # 拒绝挂载而不是让 Docker daemon 抛一个更难诊断的启动错误。
+            logger.warning(
+                "memory 目录 mkdir 失败，跳过 memory bind mount: user_id=%s err=%s",
+                user_id,
+                exc,
+            )
+            return None
+
+        return Mount(
+            target=str(settings.sandbox_memory_mount_target),
+            source=str(host_mem_dir),
+            type="bind",
+            read_only=True,
+        )
 
     async def destroy(self) -> bool:
         """销毁当前的DockerSandbox实例"""

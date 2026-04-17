@@ -20,6 +20,8 @@ from app.interfaces.dependencies.rate_limit import rate_limit_read, rate_limit_w
 from app.interfaces.service_dependencies import get_memory_management_service
 from app.main import app
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 pytestmark = pytest.mark.anyio
 
 
@@ -33,7 +35,7 @@ def anyio_backend() -> str:
 
 def _fake_user() -> User:
     return User(
-        id="user-001",
+        id=TEST_USER_ID_FIXED,
         username="tester",
         role=UserRole.USER,
         status=UserStatus.ACTIVE,
@@ -43,7 +45,7 @@ def _fake_user() -> User:
 def _make_chunk(
     *,
     chunk_id: str = "mem-1",
-    user_id: str = "user-001",
+    user_id: str = TEST_USER_ID_FIXED,
     content: str = "记忆内容",
     content_hash: str = "abc123",
     source: str = "manual",
@@ -303,7 +305,7 @@ async def test_update_memory_200_on_success(
     assert data["content_hash"] == "new-hash"
     assert data["metadata"] == {"tag": "x"}
     mock_service.update_memory_content.assert_awaited_once_with(
-        "user-001", "mem-1", "updated content"
+        TEST_USER_ID_FIXED, "mem-1", "updated content"
     )
 
 
@@ -362,7 +364,7 @@ async def test_bulk_delete_success_returns_count(
     data = response.json()["data"]
     assert data["deleted_count"] == 2
     mock_service.bulk_delete_memories.assert_awaited_once_with(
-        "user-001", ["mem-1", "mem-2", "mem-3"]
+        TEST_USER_ID_FIXED, ["mem-1", "mem-2", "mem-3"]
     )
 
 
@@ -379,4 +381,4 @@ async def test_delete_all_returns_count(
     assert response.status_code == 200
     data = response.json()["data"]
     assert data["deleted_count"] == 7
-    mock_service.delete_all_memories.assert_awaited_once_with("user-001")
+    mock_service.delete_all_memories.assert_awaited_once_with(TEST_USER_ID_FIXED)

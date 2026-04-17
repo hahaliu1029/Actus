@@ -18,10 +18,12 @@ import pytest
 from app.application.services.memory_management_service import MemoryManagementService
 from app.domain.models.memory_chunk import MemoryChunk
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 pytestmark = pytest.mark.anyio
 
 
-def _chunk(user_id: str = "u1", content: str = "test") -> MemoryChunk:
+def _chunk(user_id: str = TEST_USER_ID_FIXED, content: str = "test") -> MemoryChunk:
     now = datetime.now(timezone.utc)
     return MemoryChunk(
         id=str(uuid.uuid4()),
@@ -87,7 +89,7 @@ class TestListMemories:
         mock_repo.list_by_user.return_value = [chunk]
         mock_repo.count_by_user.return_value = 1
 
-        items, total = await service.list_memories("u1")
+        items, total = await service.list_memories(TEST_USER_ID_FIXED)
         assert len(items) == 1
         assert total == 1
 
@@ -95,7 +97,7 @@ class TestListMemories:
         mock_repo.list_by_user.return_value = []
         mock_repo.count_by_user.return_value = 0
 
-        await service.list_memories("u1", page_size=100)
+        await service.list_memories(TEST_USER_ID_FIXED, page_size=100)
         call_kwargs = mock_repo.list_by_user.call_args
         assert call_kwargs.kwargs["limit"] == 50
 
@@ -103,11 +105,11 @@ class TestListMemories:
 class TestUpdateMemoryContent:
     async def test_empty_content_raises(self, service):
         with pytest.raises(ValueError, match="empty"):
-            await service.update_memory_content("u1", "chunk-1", "   ")
+            await service.update_memory_content(TEST_USER_ID_FIXED, "chunk-1", "   ")
 
     async def test_not_found_returns_none(self, service, mock_repo):
         mock_repo.get_by_id.return_value = None
-        result = await service.update_memory_content("u1", "missing", "new text")
+        result = await service.update_memory_content(TEST_USER_ID_FIXED, "missing", "new text")
         assert result is None
 
     async def test_embedding_failure_degrades(self, service, mock_repo, mock_embed):
@@ -119,7 +121,7 @@ class TestUpdateMemoryContent:
         mock_repo.update_content.return_value = updated
         mock_embed.embed.side_effect = EmbeddingUnavailableError("provider down")
 
-        result = await service.update_memory_content("u1", old.id, "new")
+        result = await service.update_memory_content(TEST_USER_ID_FIXED, old.id, "new")
         assert result is not None
         # embedding=None should be passed to repo
         call_kwargs = mock_repo.update_content.call_args.kwargs
@@ -142,7 +144,7 @@ class TestUpdateMemoryContent:
         from app.application.errors.exceptions import ConflictError
 
         with pytest.raises(ConflictError):
-            await service.update_memory_content("u1", old.id, "dup content")
+            await service.update_memory_content(TEST_USER_ID_FIXED, old.id, "dup content")
 
     async def test_non_unique_integrity_error_propagates(self, service, mock_repo):
         """FK 违反等其他完整性错误不应被误包装为 ConflictError。"""
@@ -159,25 +161,25 @@ class TestUpdateMemoryContent:
         )
 
         with pytest.raises(IntegrityError):
-            await service.update_memory_content("u1", old.id, "content")
+            await service.update_memory_content(TEST_USER_ID_FIXED, old.id, "content")
 
 
 class TestDeleteMemory:
     async def test_not_found_returns_false(self, service, mock_repo):
         mock_repo.get_by_id.return_value = None
-        assert await service.delete_memory("u1", "missing") is False
+        assert await service.delete_memory(TEST_USER_ID_FIXED, "missing") is False
 
     async def test_success_returns_true(self, service, mock_repo):
         chunk = _chunk()
         mock_repo.get_by_id.return_value = chunk
         mock_repo.delete_by_ids.return_value = [chunk]
-        assert await service.delete_memory("u1", chunk.id) is True
+        assert await service.delete_memory(TEST_USER_ID_FIXED, chunk.id) is True
 
     async def test_concurrent_delete_returns_false(self, service, mock_repo):
         """get_by_id 看到了 chunk，但 DELETE ... RETURNING 返回空（被并发删了）。"""
         mock_repo.get_by_id.return_value = _chunk()
         mock_repo.delete_by_ids.return_value = []
-        assert await service.delete_memory("u1", "id") is False
+        assert await service.delete_memory(TEST_USER_ID_FIXED, "id") is False
 
 
 class TestBulkDelete:
@@ -187,7 +189,7 @@ class TestBulkDelete:
             _chunk(content="b"),
             _chunk(content="c"),
         ]
-        count = await service.bulk_delete_memories("u1", ["a", "b", "c"])
+        count = await service.bulk_delete_memories(TEST_USER_ID_FIXED, ["a", "b", "c"])
         assert count == 3
 
 
@@ -198,14 +200,14 @@ class TestDeleteAll:
             "session_flush": 7,
             "file": 3,
         }
-        count = await service.delete_all_memories("u1")
+        count = await service.delete_all_memories(TEST_USER_ID_FIXED)
         assert count == 10
 
     async def test_empty_returns_zero_and_no_audit(
         self, service, mock_repo, mock_session
     ):
         mock_repo.delete_all_by_user.return_value = {}
-        count = await service.delete_all_memories("u1")
+        count = await service.delete_all_memories(TEST_USER_ID_FIXED)
         assert count == 0
         assert not mock_session.add.called
 
@@ -217,7 +219,7 @@ class TestAuditWritten:
         mock_repo.get_by_id.return_value = old
         mock_repo.update_content.return_value = updated
 
-        await service.update_memory_content("u1", old.id, "new")
+        await service.update_memory_content(TEST_USER_ID_FIXED, old.id, "new")
         # _write_audit calls session.add with MemoryAuditLogModel
         assert mock_session.add.called
         audit_obj = mock_session.add.call_args[0][0]
@@ -236,7 +238,7 @@ class TestAuditWritten:
             "file": 8,
         }
 
-        await service.delete_all_memories("u1")
+        await service.delete_all_memories(TEST_USER_ID_FIXED)
         assert mock_session.add.called
         audit_obj = mock_session.add.call_args[0][0]
         assert audit_obj.action == "delete_all"
@@ -261,7 +263,7 @@ class TestAuditWritten:
         mock_repo.delete_by_ids.return_value = [owned]
 
         await service.bulk_delete_memories(
-            "u1", [owned.id, "not-mine-id", "already-gone-by-concurrent-delete"]
+            TEST_USER_ID_FIXED, [owned.id, "not-mine-id", "already-gone-by-concurrent-delete"]
         )
         audit_obj = mock_session.add.call_args[0][0]
         assert audit_obj.action == "bulk_delete"
@@ -278,7 +280,7 @@ class TestAuditWritten:
         mock_repo.get_by_id.return_value = chunk
         mock_repo.delete_by_ids.return_value = [chunk]
 
-        result = await service.delete_memory("u1", chunk.id)
+        result = await service.delete_memory(TEST_USER_ID_FIXED, chunk.id)
 
         assert result is True
         assert mock_session.add.called
@@ -300,7 +302,7 @@ class TestAuditWritten:
         mock_repo.get_by_id.return_value = old
         mock_repo.update_content.return_value = updated
 
-        await service.update_memory_content("u1", old.id, "B" * 300)
+        await service.update_memory_content(TEST_USER_ID_FIXED, old.id, "B" * 300)
 
         audit_obj = mock_session.add.call_args[0][0]
         assert len(audit_obj.old_snapshot["content"]) == 200

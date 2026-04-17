@@ -1,4 +1,7 @@
+import uuid
 from types import SimpleNamespace
+
+import pytest
 
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 
@@ -68,3 +71,107 @@ def test_create_task_sets_tz_for_spawned_sandbox_container(monkeypatch) -> None:
     assert fake_docker_client.containers.run_kwargs["network"] == "actus-net"
     assert fake_docker_client.containers.run_kwargs["mem_limit"] == "4g"
     assert fake_docker_client.closed is True
+
+
+# ── _build_memory_mount ────────────────────────────────────────────────────
+# 覆盖 PR-0 新引入的 bind mount helper 所有分支：feature gate / 非法 user_id /
+# target-path 构造 / mkdir 失败降级。这些分支独立于 Docker SDK，可以脱离
+# _create_task 单独测，避免引入 docker 依赖。
+
+
+def _mount_settings(tmp_path, *, enabled: bool = True, target: str = "/workspace/.memory"):
+    """构造 _build_memory_mount 所需的最小 settings。"""
+    return SimpleNamespace(
+        memory_root_host=str(tmp_path / "host"),
+        memory_root_container=str(tmp_path / "container"),
+        sandbox_memory_mount_target=target,
+        sandbox_memory_mount_enabled=enabled,
+    )
+
+
+def test_build_memory_mount_returns_none_when_user_id_missing(tmp_path) -> None:
+    """user_id=None → 返回 None（旧 caller 不受影响）。"""
+    settings = _mount_settings(tmp_path)
+    assert DockerSandbox._build_memory_mount(settings, None) is None
+    assert DockerSandbox._build_memory_mount(settings, "") is None
+
+
+@pytest.mark.parametrize(
+    "bad_user_id",
+    [
+        "../etc",
+        "../../root",
+        "/absolute/path",
+        "with/slash",
+        "has space",
+        "has\ttab",
+        "x" * 200,  # 超长
+        "unicode-café",
+    ],
+)
+def test_build_memory_mount_rejects_unsafe_user_id(tmp_path, bad_user_id) -> None:
+    """非白名单字符的 user_id 必须被拒绝，防止路径穿越或注入。"""
+    settings = _mount_settings(tmp_path)
+    assert DockerSandbox._build_memory_mount(settings, bad_user_id) is None
+
+
+def test_build_memory_mount_returns_none_when_feature_gate_off(tmp_path) -> None:
+    """PR-0 默认 sandbox_memory_mount_enabled=False：即使 user_id 合法也不挂载。
+
+    这条是 PR-0 对外的硬约定——在 PR-6 把 host bind 配好之前，绝不让
+    Docker 看到一个可能不存在的 bind source。
+    """
+    settings = _mount_settings(tmp_path, enabled=False)
+    user_id = str(uuid.uuid4())
+    assert DockerSandbox._build_memory_mount(settings, user_id) is None
+
+
+def test_build_memory_mount_builds_readonly_bind_when_enabled(tmp_path) -> None:
+    """feature gate 开 + 合法 user_id → 返回 read-only bind mount。
+
+    - source = ${memory_root_host}/{user_id}（宿主机路径，docker daemon 视角）
+    - target = sandbox_memory_mount_target（sandbox 内固定路径，M0 spike 约定）
+    - target **不带** user_id 后缀，因为 sandbox 容器本身就是 per-user
+    - read_only=True，agent 只读取 memory，写入由 api 容器侧的 FsMemoryWriter 负责
+    - api 容器视角的 ${memory_root_container}/{user_id} 应被 mkdir 出来
+    """
+    settings = _mount_settings(tmp_path, target="/workspace/.memory")
+    user_id = str(uuid.uuid4())
+
+    mount = DockerSandbox._build_memory_mount(settings, user_id)
+
+    assert mount is not None
+    # docker.types.Mount spec dict 的字段名大写，见 docker-py Mount.__init__
+    assert mount["Target"] == "/workspace/.memory"
+    assert mount["Source"] == str(tmp_path / "host" / user_id)
+    assert mount["Type"] == "bind"
+    assert mount["ReadOnly"] is True
+
+    # mkdir 已生效，container 侧的 user 子目录存在
+    assert (tmp_path / "container" / user_id).is_dir()
+
+
+def test_build_memory_mount_returns_none_when_mkdir_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """mkdir 抛 OSError → 降级为不挂载，避免把更难诊断的错误甩给 Docker daemon。"""
+    settings = _mount_settings(tmp_path)
+    user_id = str(uuid.uuid4())
+
+    def _boom(self, *args, **kwargs):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr("pathlib.Path.mkdir", _boom)
+
+    assert DockerSandbox._build_memory_mount(settings, user_id) is None
+
+
+def test_build_memory_mount_honors_custom_target(tmp_path) -> None:
+    """sandbox_memory_mount_target 必须被使用——不能硬编码 /workspace/.memory。"""
+    settings = _mount_settings(tmp_path, target="/mnt/memory")
+    user_id = str(uuid.uuid4())
+
+    mount = DockerSandbox._build_memory_mount(settings, user_id)
+
+    assert mount is not None
+    assert mount["Target"] == "/mnt/memory"

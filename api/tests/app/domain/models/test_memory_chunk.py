@@ -7,6 +7,8 @@ import pytest
 
 from app.domain.models.memory_chunk import FlushBatch, MemoryChunk, RawChunk
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 
 class TestRawChunk:
     def test_fields_accessible(self) -> None:
@@ -14,14 +16,14 @@ class TestRawChunk:
         chunk = RawChunk(
             content="hello world",
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             source="react_graph",
             metadata={"key": "value"},
             content_hash="abc123",
         )
         assert chunk.content == "hello world"
         assert chunk.session_id == "sess-1"
-        assert chunk.user_id == "user-1"
+        assert chunk.user_id == TEST_USER_ID_FIXED
         assert chunk.source == "react_graph"
         assert chunk.metadata == {"key": "value"}
         assert chunk.content_hash == "abc123"
@@ -31,7 +33,7 @@ class TestRawChunk:
         chunk = RawChunk(
             content="hello",
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             source="react_graph",
             metadata={},
             content_hash="abc123",
@@ -44,7 +46,7 @@ class TestRawChunk:
         chunk_a = RawChunk(
             content="hello",
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             source="react_graph",
             metadata={"k": "v"},
             content_hash="abc123",
@@ -52,7 +54,7 @@ class TestRawChunk:
         chunk_b = RawChunk(
             content="hello",
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             source="react_graph",
             metadata={"k": "v"},
             content_hash="abc123",
@@ -65,7 +67,7 @@ class TestFlushBatch:
         return RawChunk(
             content=content,
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             source="react_graph",
             metadata={},
             content_hash="hash_" + content[:8],
@@ -76,13 +78,13 @@ class TestFlushBatch:
         chunk = self._make_chunk()
         batch = FlushBatch(
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=5,
             chunks=(chunk,),
         )
         assert batch.session_id == "sess-1"
-        assert batch.user_id == "user-1"
+        assert batch.user_id == TEST_USER_ID_FIXED
         assert batch.from_cursor == 0
         assert batch.target_cursor == 5
         assert len(batch.chunks) == 1
@@ -92,7 +94,7 @@ class TestFlushBatch:
         """FlushBatch 是 frozen dataclass，修改字段应抛出 FrozenInstanceError。"""
         batch = FlushBatch(
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=5,
             chunks=(),
@@ -104,7 +106,7 @@ class TestFlushBatch:
         """from_cursor 和 target_cursor 正确存储游标值。"""
         batch = FlushBatch(
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=10,
             target_cursor=20,
             chunks=(),
@@ -116,7 +118,7 @@ class TestFlushBatch:
         """FlushBatch 支持空 chunks 元组。"""
         batch = FlushBatch(
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=0,
             chunks=(),
@@ -129,7 +131,7 @@ class TestFlushBatch:
         chunks = tuple(self._make_chunk(f"content {i}") for i in range(3))
         batch = FlushBatch(
             session_id="sess-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=3,
             chunks=chunks,
@@ -143,7 +145,7 @@ class TestMemoryChunk:
     def _make_chunk(self, **overrides) -> MemoryChunk:
         defaults = dict(
             id="chunk-1",
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             content="hello world",
             content_hash="abc123def456",
             source="session_flush",
@@ -158,7 +160,7 @@ class TestMemoryChunk:
         """MemoryChunk 字段可以正常访问。"""
         chunk = self._make_chunk()
         assert chunk.id == "chunk-1"
-        assert chunk.user_id == "user-1"
+        assert chunk.user_id == TEST_USER_ID_FIXED
         assert chunk.content == "hello world"
         assert chunk.content_hash == "abc123def456"
         assert chunk.source == "session_flush"

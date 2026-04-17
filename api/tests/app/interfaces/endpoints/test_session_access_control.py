@@ -64,13 +64,20 @@ class FakeLifecycle:
         self.handle = handle
         self.acquire_calls: list[str] = []
         self.bind_new_calls: list[str] = []
+        # 捕获 bind_new 收到的 user_id kwarg，用于回归 admin 越权 bug：
+        # SessionService 必须**不**把 requester user_id 透传给 bind_new，
+        # 应交由 bind_new 内部回退到 session.user_id。
+        self.bind_new_user_ids: list[str | None] = []
 
     async def acquire(self, session_id: str) -> FakeSandboxHandle:
         self.acquire_calls.append(session_id)
         raise SessionUnboundError(session_id)
 
-    async def bind_new(self, session_id: str) -> FakeSandboxHandle:
+    async def bind_new(
+        self, session_id: str, *, user_id: str | None = None
+    ) -> FakeSandboxHandle:
         self.bind_new_calls.append(session_id)
+        self.bind_new_user_ids.append(user_id)
         return self.handle
 
 
@@ -125,3 +132,76 @@ def test_get_vnc_url_auto_creates_sandbox_when_missing() -> None:
     assert vnc_url == "ws://127.0.0.1:5901"
     assert lifecycle.acquire_calls == ["s1"]
     assert lifecycle.bind_new_calls == ["s1"]
+
+
+# ── admin 越权 regression（M1 memory 系统配套修复） ─────────────────────────
+# 场景：管理员通过 _get_accessible_session 拿到**他人** session 的访问权。
+# 此时 SessionService 若把 requester 的 user_id 透传给 bind_new，bind_new 会
+# 把管理员自己的 memory 目录挂进 session owner 的 sandbox 里，构成租户越权。
+# 修复后 SessionService 必须不传 user_id，交由 bind_new 内部回退到 session.user_id。
+
+
+def test_get_vnc_url_admin_does_not_leak_requester_user_id_into_bind_new() -> None:
+    """admin 打开他人 session 的 VNC 时，bind_new 不应收到 admin 的 user_id。"""
+    session = Session(id="s1", title="demo", user_id="session-owner", sandbox_id=None)
+    handle = FakeSandboxHandle()
+    lifecycle = FakeLifecycle(handle)
+    service = SessionService(
+        uow_factory=make_uow_factory(session=session),
+        sandbox_lifecycle_service=lifecycle,
+    )
+
+    # admin 请求他人 session → 获得访问权
+    asyncio.run(service.get_vnc_url("s1", user_id="admin-impersonator", is_admin=True))
+
+    assert lifecycle.bind_new_calls == ["s1"]
+    # 关键断言：SessionService 没有把 admin 的 user_id 透传给 bind_new。
+    # bind_new 会走内部回退把 session.user_id("session-owner") 用作 mount user。
+    assert lifecycle.bind_new_user_ids == [None], (
+        "SessionService 不应把 requester user_id 透传给 bind_new；"
+        f"实际收到 {lifecycle.bind_new_user_ids!r}"
+    )
+
+
+class _FakeResult:
+    def __init__(self, success: bool) -> None:
+        self.success = success
+        self.message = "ok"
+
+
+class _FakeTakeoverHandle:
+    """ensure_takeover_shell_session 需要 handle 提供 read_shell_output."""
+
+    @property
+    def vnc_url(self) -> str:
+        return "ws://127.0.0.1:5901"
+
+    async def read_shell_output(self, *, session_id: str, console: bool):  # noqa: D401
+        # success=True 直接跳过 exec_command 分支，让断言聚焦在 bind_new 调用
+        return _FakeResult(success=True)
+
+
+def test_ensure_takeover_admin_does_not_leak_requester_user_id_into_bind_new() -> None:
+    """admin 接管他人 session 的 shell 时同样不应把 admin user_id 透传 bind_new。"""
+    session = Session(id="s1", title="demo", user_id="session-owner", sandbox_id=None)
+    handle = _FakeTakeoverHandle()
+    lifecycle = FakeLifecycle(handle)  # handle 类型不影响本测试，只断言 bind_new
+    service = SessionService(
+        uow_factory=make_uow_factory(session=session),
+        sandbox_lifecycle_service=lifecycle,
+    )
+
+    asyncio.run(
+        service.ensure_takeover_shell_session(
+            "s1",
+            takeover_id="t1",
+            user_id="admin-impersonator",
+            is_admin=True,
+        )
+    )
+
+    assert lifecycle.bind_new_calls == ["s1"]
+    assert lifecycle.bind_new_user_ids == [None], (
+        "ensure_takeover_shell_session 不应把 requester user_id 透传给 bind_new；"
+        f"实际收到 {lifecycle.bind_new_user_ids!r}"
+    )

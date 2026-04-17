@@ -61,7 +61,7 @@ class FakeSandbox:
         return True
 
     @classmethod
-    async def create(cls):
+    async def create(cls, user_id: str | None = None):
         return cls()
 
     @classmethod

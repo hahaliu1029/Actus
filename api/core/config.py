@@ -2,7 +2,7 @@ import logging
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _logger = logging.getLogger(__name__)
@@ -110,6 +110,37 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
 
+    # Memory 系统（M1）——文件挂载、LLM gate、用户配额
+    # 三条路径彼此独立、含义不同：
+    # - ``memory_root_host``：**宿主机**上 memory 根目录（docker bind source）
+    # - ``memory_root_container``：**api 容器**视角下 memory 根目录（用于 mkdir
+    #   创建用户子目录；需要 docker-compose bind 把它映射到 memory_root_host，
+    #   PR-6 落地）
+    # - ``sandbox_memory_mount_target``：**sandbox 容器**视角下的挂载点，由
+    #   M0 spike 选定为 ``/workspace/.memory``；所有 agent 工具在沙箱里按这个
+    #   固定路径读取 memory 文件
+    # 见 docs/superpowers/specs/2026-04-17-m0-sandbox-memory-mount-spike.md
+    memory_root_host: str = Field("~/.actus/memory")
+    memory_root_container: str = Field("/app/data/memory")
+    sandbox_memory_mount_target: str = Field("/workspace/.memory")
+    # PR-0 默认关闭——只有当 docker-compose 已把 memory_root_host 正确 bind 到
+    # memory_root_container 时（PR-6），才应打开本开关实际挂载 memory 目录；
+    # 否则 Docker 会因为 bind source 不存在而拒绝启动 sandbox。
+    sandbox_memory_mount_enabled: bool = Field(False)
+    actus_uid: int = Field(1000, ge=0)
+    actus_gid: int = Field(1000, ge=0)
+    # LLM 质量 gate：None 表示 gate 未启用（PR-0 默认关闭）。
+    # 部署时应显式设置为 ``summary_llm`` / ``chat_llm`` 之一。
+    memory_gate_llm: str | None = Field(None)
+    memory_gate_threshold: float = Field(0.7, ge=0.0, le=1.0)
+    # 单次 gate 批量评估的最大候选数。
+    memory_gate_batch_cap: int = Field(20, gt=0)
+    # **per-user** 每日 auto-promote（gate 通过）的上限。与下方 user_daily_quota
+    # 正交：gate cap 限速 gate-approved 写，user quota 限速所有 memory 写入。
+    memory_gate_daily_cap: int = Field(100, gt=0)
+    # per-user 每日任意写入上限（含手动 + gate + 自动）。
+    memory_user_daily_quota: int = Field(500, gt=0)
+
     # 微信公众号配置
     wechat_app_id: str = ""
     wechat_app_secret: str = ""
@@ -120,6 +151,18 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
+
+    @field_validator("memory_root_host", "memory_root_container")
+    @classmethod
+    def _must_be_absolute(cls, v: str) -> str:
+        """memory_root 必须是绝对路径（``/``）或家目录展开前缀（``~``）。
+
+        相对路径在 Docker bind mount source 处会被 docker daemon 解释为卷名，
+        后续写入 ``{root}/{user_id}`` 会在容器外拼错路径。
+        """
+        if not (v.startswith("/") or v.startswith("~")):
+            raise ValueError(f"{v!r} 必须是绝对路径（以 / 或 ~ 开头）")
+        return v
 
     @model_validator(mode="after")
     def _reject_default_jwt_secret(self) -> "Settings":

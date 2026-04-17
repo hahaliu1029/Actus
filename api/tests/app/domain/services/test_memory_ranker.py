@@ -8,6 +8,8 @@ import pytest
 
 from app.domain.models.memory_chunk import MemoryChunk
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 
 def _make_chunk(
     embedding: tuple[float, ...] | None = None,
@@ -15,7 +17,7 @@ def _make_chunk(
 ) -> MemoryChunk:
     defaults = dict(
         id="chunk-1",
-        user_id="user-1",
+        user_id=TEST_USER_ID_FIXED,
         content="test content",
         content_hash="hash1",
         source="session_flush",

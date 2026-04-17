@@ -160,7 +160,9 @@ class AgentService:
             try:
                 sandbox = await self._sandbox_lifecycle_service.acquire(session.id)
             except SessionUnboundError:
-                sandbox = await self._sandbox_lifecycle_service.bind_new(session.id)
+                sandbox = await self._sandbox_lifecycle_service.bind_new(
+                    session.id, user_id=session.user_id
+                )
             except SessionSuspendedError:
                 # I2 + §6: SUSPENDED → ACTIVE 必须显式 resume()，_create_task 不隐式 unsuspend。
                 # Caller（chat 的 reopen 分支、resume_tool_confirmation 等）负责判断是否 resume。
@@ -174,7 +176,7 @@ class AgentService:
             if binding_id:
                 _sandbox = await self._sandbox_cls.get(binding_id)
             if not _sandbox:
-                _sandbox = await self._sandbox_cls.create()
+                _sandbox = await self._sandbox_cls.create(user_id=session.user_id)
                 session.sandbox_binding = session.sandbox_binding.model_copy(
                     update={"id": _sandbox.id}
                 )

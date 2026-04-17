@@ -16,6 +16,8 @@ from app.domain.models.app_config import AgentConfig
 from app.domain.models.memory import Memory
 from app.domain.models.message import Message
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 
 def _make_uow_factory(session_repo):
     """Create a proper async context manager uow_factory."""
@@ -36,7 +38,7 @@ def _make_flow(**overrides):
         "llm": MagicMock(),
         "agent_config": AgentConfig(),
         "session_id": "test-session",
-        "user_id": "test-user",
+        "user_id": TEST_USER_ID_FIXED,
         "uow_factory": MagicMock(),
         "browser": MagicMock(),
         "sandbox": MagicMock(),

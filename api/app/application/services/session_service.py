@@ -249,6 +249,10 @@ class SessionService:
             raise ServerRequestsError("Sandbox lifecycle service not available")
 
         # 2. 获取或创建沙箱（I5: UNBOUND → bind_new, ACTIVE → acquire, SUSPENDED → resume）
+        # 注意：_get_accessible_session 允许管理员访问他人 session，所以**不能**
+        # 把 `user_id`（请求者身份）透传给 bind_new——否则管理员打开他人 VNC
+        # 会把自己的 memory 挂进 session owner 的 sandbox。让 bind_new 走内部
+        # 的 session.user_id 回退拿到真正的 session owner。
         try:
             handle = await self._lifecycle.acquire(session_id)
         except SessionUnboundError:
@@ -274,6 +278,8 @@ class SessionService:
             raise ServerRequestsError("Sandbox lifecycle service not available")
 
         # 获取或创建沙箱
+        # 同 get_vnc_url：admin takeover 不能用 requester user_id，
+        # 交给 bind_new 内部的 session.user_id 回退。
         try:
             handle = await self._lifecycle.acquire(session_id)
         except SessionUnboundError:

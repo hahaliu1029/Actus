@@ -9,6 +9,8 @@ import pytest
 from app.domain.models.memory_chunk import MemoryChunk
 from app.domain.repositories.memory_chunk_repository import MemoryChunkRepository
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 pytestmark = pytest.mark.anyio
 
 
@@ -43,7 +45,7 @@ class StubMemoryChunkRepository:
 def _make_chunk(**overrides) -> MemoryChunk:
     defaults = dict(
         id="chunk-1",
-        user_id="user-1",
+        user_id=TEST_USER_ID_FIXED,
         content="test content",
         content_hash="hash123",
         source="session_flush",
@@ -89,7 +91,7 @@ class TestMemoryChunkRepositoryProtocol:
         """search_by_vector 接受参数并返回 list[MemoryChunk]。"""
         repo = StubMemoryChunkRepository()
         result = await repo.search_by_vector(
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             embedding=[0.1, 0.2, 0.3],
             top_k=5,
             threshold=0.35,
@@ -100,7 +102,7 @@ class TestMemoryChunkRepositoryProtocol:
         """search_by_vector 的 top_k 和 threshold 有默认值。"""
         repo = StubMemoryChunkRepository()
         result = await repo.search_by_vector(
-            user_id="user-1",
+            user_id=TEST_USER_ID_FIXED,
             embedding=[0.1, 0.2, 0.3],
         )
         assert isinstance(result, list)
@@ -115,7 +117,7 @@ class TestMemoryChunkRepositoryProtocol:
     async def test_get_by_id_returns_none(self) -> None:
         """get_by_id stub returns None."""
         repo = StubMemoryChunkRepository()
-        result = await repo.get_by_id("chunk-1", user_id="user-1")
+        result = await repo.get_by_id("chunk-1", user_id=TEST_USER_ID_FIXED)
         assert result is None
 
     def test_protocol_has_four_methods(self) -> None:

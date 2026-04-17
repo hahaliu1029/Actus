@@ -77,6 +77,43 @@ class TooManyRequestsError(AppException):
         super().__init__(code=429, status_code=429, msg=msg, data=data or None)
 
 
+class SecurityError(ForbiddenError):
+    """安全校验失败（路径穿越 / user_id 不匹配 / sandbox 越权等）。
+
+    继承 ``ForbiddenError`` → HTTP 403。独立命名便于日志审计和 metrics 区分，
+    domain / application 层统一抛该异常，interfaces 层由既有 exception handler
+    走 ``status_code`` 映射。
+    """
+
+    def __init__(self, msg: str = "安全校验失败"):
+        super().__init__(msg=msg)
+
+
+class QuotaExceededError(TooManyRequestsError):
+    """Memory / Gate 日配额超限。
+
+    继承 ``TooManyRequestsError`` → HTTP 429。保留 retry_after / limit / bucket
+    等字段以供前端展示；``bucket`` 推荐使用 ``"memory_user_daily"`` /
+    ``"memory_gate_daily"`` 等值。
+    """
+
+    def __init__(
+        self,
+        msg: str = "配额已用尽",
+        retry_after: int | None = None,
+        limit: int | None = None,
+        window_seconds: int | None = None,
+        bucket: str | None = None,
+    ):
+        super().__init__(
+            msg=msg,
+            retry_after=retry_after,
+            limit=limit,
+            window_seconds=window_seconds,
+            bucket=bucket,
+        )
+
+
 class ServiceUnavailableError(AppException):
     """服务不可用异常"""
 

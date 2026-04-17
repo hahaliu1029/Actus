@@ -459,8 +459,13 @@ def get_memory_management_service(
       AsyncSession 实例化。
     """
     postgres_client = get_postgres()
+    # file_store 在 PR-0 恒为 None（DB-only），PR-5A 由 lifespan 注入真实的
+    # FsMemoryWriter。用 getattr 而非属性访问以兼容测试环境（fake app 可能
+    # 未设置该属性）。
+    file_store = getattr(request.app.state, "file_memory_store", None)
     return MemoryManagementService(
         repo_factory=DBMemoryChunkRepository,
         embedding_provider=request.app.state.memory_embedding_provider,
         session_factory=postgres_client.session_factory,
+        file_store=file_store,
     )

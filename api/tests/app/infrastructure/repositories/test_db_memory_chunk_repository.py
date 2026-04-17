@@ -11,6 +11,8 @@ from app.domain.models.memory_chunk import MemoryChunk
 from app.infrastructure.models.memory_chunk_orm import MemoryChunkModel
 from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
 
+from tests.conftest import TEST_OTHER_USER_ID_FIXED, TEST_USER_ID_FIXED
+
 pytestmark = pytest.mark.anyio
 
 
@@ -22,7 +24,7 @@ def _make_orm_row(
     """Create a MagicMock that mimics MemoryChunkModel attributes."""
     row = MagicMock(spec=MemoryChunkModel)
     row.id = "chunk-1"
-    row.user_id = "user-1"
+    row.user_id = TEST_USER_ID_FIXED
     row.session_id = "sess-1"
     row.content = "test content"
     row.content_hash = "hash123"
@@ -37,7 +39,7 @@ def _make_orm_row(
 def _make_domain_chunk(**overrides: Any) -> MemoryChunk:
     defaults = dict(
         id="chunk-1",
-        user_id="user-1",
+        user_id=TEST_USER_ID_FIXED,
         session_id="sess-1",
         content="test content",
         content_hash="hash123",
@@ -59,7 +61,7 @@ class TestToDomain:
 
         assert isinstance(result, MemoryChunk)
         assert result.id == "chunk-1"
-        assert result.user_id == "user-1"
+        assert result.user_id == TEST_USER_ID_FIXED
         assert result.session_id == "sess-1"
         assert result.content == "test content"
         assert result.content_hash == "hash123"
@@ -103,7 +105,7 @@ class TestToOrmDict:
 
         assert isinstance(result, dict)
         assert result["id"] == "chunk-1"
-        assert result["user_id"] == "user-1"
+        assert result["user_id"] == TEST_USER_ID_FIXED
         assert result["content"] == "test content"
         assert result["source"] == "session_flush"
         # Key must be Python attribute name, NOT DB column name
@@ -135,7 +137,7 @@ class TestGetById:
         mock_session.execute.return_value = mock_result
 
         repo = DBMemoryChunkRepository(db_session=mock_session)
-        result = await repo.get_by_id("chunk-1", user_id="user-1")
+        result = await repo.get_by_id("chunk-1", user_id=TEST_USER_ID_FIXED)
 
         assert isinstance(result, MemoryChunk)
         assert result.id == "chunk-1"
@@ -149,7 +151,7 @@ class TestGetById:
         mock_session.execute.return_value = mock_result
 
         repo = DBMemoryChunkRepository(db_session=mock_session)
-        result = await repo.get_by_id("nonexistent", user_id="user-1")
+        result = await repo.get_by_id("nonexistent", user_id=TEST_USER_ID_FIXED)
 
         assert result is None
 
@@ -161,7 +163,7 @@ class TestGetById:
         mock_session.execute.return_value = mock_result
 
         repo = DBMemoryChunkRepository(db_session=mock_session)
-        result = await repo.get_by_id("chunk-1", user_id="wrong-user")
+        result = await repo.get_by_id("chunk-1", user_id=TEST_OTHER_USER_ID_FIXED)
 
         assert result is None
 

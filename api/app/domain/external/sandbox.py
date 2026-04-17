@@ -161,8 +161,13 @@ class Sandbox(Protocol):
         ...
 
     @classmethod
-    async def create(cls) -> Self:
-        """类方法，用于快速创建一个沙箱"""
+    async def create(cls, user_id: Optional[str] = None) -> Self:
+        """类方法，用于快速创建一个沙箱。
+
+        ``user_id`` 在 M1 引入：不传时容器只挂载基础目录（向后兼容），
+        传入时实现方应同时 bind mount 该用户的 memory 目录
+        （``${MEMORY_ROOT_HOST}/{user_id}`` → ``${MEMORY_ROOT_CONTAINER}/{user_id}``）。
+        """
         ...
 
     @classmethod

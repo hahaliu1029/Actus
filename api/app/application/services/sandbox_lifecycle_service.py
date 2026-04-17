@@ -227,8 +227,14 @@ class SandboxLifecycleService:
         # Registry miss — rehydrate or mark orphan
         return await self._rehydrate_or_mark_orphan(session_id, binding)
 
-    async def bind_new(self, session_id: str) -> SandboxHandle:
+    async def bind_new(
+        self, session_id: str, *, user_id: str | None = None
+    ) -> SandboxHandle:
         """UNBOUND → CREATING → ACTIVE. Creates a new sandbox container.
+
+        ``user_id`` drives the M1 memory bind-mount. Caller normally passes
+        the authenticated user; if omitted we fall back to ``session.user_id``
+        so old call sites keep working without a signature churn.
 
         Raises:
             SessionSuspendedError: if already SUSPENDED (use resume instead)
@@ -257,9 +263,12 @@ class SandboxLifecycleService:
             # Step 1: UNBOUND → CREATING
             await self._transition(session_id, target=CREATING)
 
+            # Resolve user_id: explicit arg wins, otherwise fall back to session
+            effective_user_id = user_id if user_id is not None else session.user_id
+
             # Step 2: Actually create the sandbox container
             try:
-                sandbox = await self._sandbox_cls.create()
+                sandbox = await self._sandbox_cls.create(user_id=effective_user_id)
                 await sandbox.ensure_sandbox()
             except Exception:
                 # Create failed — roll back to UNBOUND

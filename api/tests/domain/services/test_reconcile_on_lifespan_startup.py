@@ -33,7 +33,7 @@ class DeadContainerSandbox:
     """Sandbox stub where get() always returns None (container dead)."""
 
     @classmethod
-    async def create(cls):
+    async def create(cls, user_id: str | None = None):
         return None
 
     @classmethod

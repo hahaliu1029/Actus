@@ -9,13 +9,15 @@ import pytest
 from app.domain.external.embedding_provider import EmbeddingUnavailableError
 from app.domain.models.memory_chunk import MemoryChunk
 
+from tests.conftest import TEST_OTHER_USER_ID_FIXED, TEST_USER_ID_FIXED
+
 pytestmark = pytest.mark.anyio
 
 
 def _make_chunk(**overrides) -> MemoryChunk:
     defaults = dict(
         id="chunk-1",
-        user_id="user-1",
+        user_id=TEST_USER_ID_FIXED,
         content="test content for memory chunk",
         content_hash="hash1",
         source="session_flush",
@@ -48,7 +50,7 @@ def _make_tools(**overrides):
         embedding_provider=provider,
         session_factory=session_factory,
         repo_factory=repo_factory,
-        user_id=overrides.get("user_id", "user-1"),
+        user_id=overrides.get("user_id", TEST_USER_ID_FIXED),
         half_life_days=overrides.get("half_life_days", 30),
         mmr_lambda=overrides.get("mmr_lambda", 0.7),
     )
@@ -177,8 +179,8 @@ class TestMemoryGet:
     async def test_passes_user_id_to_repo(self) -> None:
         mock_repo = AsyncMock()
         mock_repo.get_by_id.return_value = None
-        tools, _, _ = _make_tools(_mock_repo=mock_repo, user_id="user-42")
+        tools, _, _ = _make_tools(_mock_repo=mock_repo, user_id=TEST_OTHER_USER_ID_FIXED)
         get = next(t for t in tools if t.name == "memory_get")
 
         await get.ainvoke({"chunk_id": "c1"})
-        mock_repo.get_by_id.assert_awaited_once_with("c1", user_id="user-42")
+        mock_repo.get_by_id.assert_awaited_once_with("c1", user_id=TEST_OTHER_USER_ID_FIXED)

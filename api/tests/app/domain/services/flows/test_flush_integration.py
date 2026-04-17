@@ -19,6 +19,8 @@ from app.domain.models.app_config import AgentConfig, MemoryConfig
 from app.domain.models.memory_chunk import FlushBatch, RawChunk
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 
 # ─── Helper: Capturing Flusher ────────────────────────────────────────────────
 
@@ -50,7 +52,7 @@ def _make_flow(**overrides):
             )
         ),
         "session_id": "s1",
-        "user_id": "u1",
+        "user_id": TEST_USER_ID_FIXED,
         "uow_factory": MagicMock(),
         "browser": MagicMock(),
         "sandbox": MagicMock(),
@@ -133,14 +135,14 @@ class TestRunnerSubmitsBatchFromFlow:
         # Manually set a pending batch (as flow would after _evaluate_flush_gate)
         batch = FlushBatch(
             session_id="s1",
-            user_id="u1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=5,
             chunks=(
                 RawChunk(
                     content="test content",
                     session_id="s1",
-                    user_id="u1",
+                    user_id=TEST_USER_ID_FIXED,
                     source="conversation",
                     metadata={"turn_index": 0, "message_types": ["HumanMessage"], "created_at": "2024-01-01T00:00:00"},
                     content_hash="abc123",
@@ -192,7 +194,7 @@ class TestFlusherNoneGuard:
 
         batch = FlushBatch(
             session_id="s1",
-            user_id="u1",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=3,
             chunks=(),
@@ -224,7 +226,7 @@ class TestFullGateChunkBatchPipeline:
 
     def test_gate_produces_batch_with_correct_cursors(self) -> None:
         """flush_enabled=True, sufficient steps + tokens → batch with correct cursors."""
-        flow = _make_flow(session_id="s1", user_id="u1")
+        flow = _make_flow(session_id="s1", user_id=TEST_USER_ID_FIXED)
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(10)
@@ -235,7 +237,7 @@ class TestFullGateChunkBatchPipeline:
         assert batch is not None, "Gate should pass and produce a FlushBatch"
         assert isinstance(batch, FlushBatch)
         assert batch.session_id == "s1"
-        assert batch.user_id == "u1"
+        assert batch.user_id == TEST_USER_ID_FIXED
         assert batch.from_cursor == 0
         assert batch.target_cursor == len(msgs)
 

@@ -41,11 +41,15 @@ async def _ensure_session(db_session, session_id: str) -> None:
     )
 
 
+_INTEG_UID = str(uuid.uuid4())
+_INTEG_SID = f"sess-integ-{uuid.uuid4().hex[:8]}"
+
+
 def _make_chunk(
     *,
     content: str = "test content",
-    user_id: str = "user-integ-1",
-    session_id: str | None = "sess-integ-1",
+    user_id: str = _INTEG_UID,
+    session_id: str | None = _INTEG_SID,
     embedding: tuple[float, ...] | None = None,
     content_hash: str | None = None,
 ) -> MemoryChunk:
@@ -68,8 +72,8 @@ def _make_chunk(
 _VEC_A = tuple([1.0 / (MEMORY_EMBEDDING_DIM ** 0.5)] * MEMORY_EMBEDDING_DIM)
 _VEC_C = tuple([-v for v in _VEC_A])  # opposite to A → distance ≈ 2
 
-_SEARCH_UID = "user-search-test"
-_SEARCH_SID = "sess-search-test"
+_SEARCH_UID = str(uuid.uuid4())
+_SEARCH_SID = f"sess-search-{uuid.uuid4().hex[:8]}"
 
 
 # ---- batch_insert_ignore tests ----
@@ -78,8 +82,8 @@ class TestBatchInsertIgnore:
 
     async def test_insert_returns_count(self, db_session) -> None:
         """Scenario 1: Normal insert returns correct count."""
-        await _ensure_user(db_session, "user-integ-1")
-        await _ensure_session(db_session, "sess-integ-1")
+        await _ensure_user(db_session, _INTEG_UID)
+        await _ensure_session(db_session, _INTEG_SID)
         repo = DBMemoryChunkRepository(db_session)
         chunks = [_make_chunk(content=f"chunk {i}") for i in range(3)]
 
@@ -90,8 +94,8 @@ class TestBatchInsertIgnore:
 
     async def test_duplicate_is_idempotent(self, db_session) -> None:
         """Scenario 2: Re-inserting same (user_id, content_hash) returns 0."""
-        await _ensure_user(db_session, "user-integ-1")
-        await _ensure_session(db_session, "sess-integ-1")
+        await _ensure_user(db_session, _INTEG_UID)
+        await _ensure_session(db_session, _INTEG_SID)
         repo = DBMemoryChunkRepository(db_session)
         chunk = _make_chunk(content_hash="fixed_hash_for_dedup")
 
@@ -107,8 +111,8 @@ class TestBatchInsertIgnore:
 
     async def test_insert_with_none_embedding(self, db_session) -> None:
         """Scenario 3: embedding=None chunk (cold data) can be inserted."""
-        await _ensure_user(db_session, "user-integ-1")
-        await _ensure_session(db_session, "sess-integ-1")
+        await _ensure_user(db_session, _INTEG_UID)
+        await _ensure_session(db_session, _INTEG_SID)
         repo = DBMemoryChunkRepository(db_session)
         chunk = _make_chunk(embedding=None)
 
@@ -209,7 +213,7 @@ class TestSearchByVector:
 
     async def test_top_k_limits_results(self, db_session) -> None:
         """Scenario 7: top_k caps the number of returned results."""
-        uid = f"user-topk-{uuid.uuid4().hex[:8]}"
+        uid = str(uuid.uuid4())
         await _ensure_user(db_session, uid)
         repo = DBMemoryChunkRepository(db_session)
         chunks = [
@@ -231,7 +235,7 @@ class TestSearchByVector:
 
     async def test_user_id_isolation(self, db_session) -> None:
         """Scenario 8: Different users can't see each other's chunks."""
-        other_user = f"user-other-{uuid.uuid4().hex[:8]}"
+        other_user = str(uuid.uuid4())
         await _ensure_user(db_session, other_user)
         await _ensure_user(db_session, _SEARCH_UID)
         repo = DBMemoryChunkRepository(db_session)
@@ -258,7 +262,7 @@ class TestSearchByVector:
         repo = DBMemoryChunkRepository(db_session)
 
         results = await repo.search_by_vector(
-            user_id="user-does-not-exist",
+            user_id=str(uuid.uuid4()),
             embedding=list(_VEC_A),
             top_k=10,
             threshold=0.0,
@@ -273,7 +277,7 @@ class TestDeleteBySession:
 
     async def test_delete_returns_count(self, db_session) -> None:
         """Scenario 9: Delete existing chunks returns correct count."""
-        uid = f"user-del-{uuid.uuid4().hex[:8]}"
+        uid = str(uuid.uuid4())
         target_session = f"sess-del-{uuid.uuid4().hex[:8]}"
         await _ensure_user(db_session, uid)
         await _ensure_session(db_session, target_session)
@@ -304,7 +308,7 @@ class TestGetById:
 
     async def test_found_returns_chunk(self, db_session) -> None:
         """get_by_id with correct user_id returns the chunk."""
-        uid = f"user-getid-{uuid.uuid4().hex[:8]}"
+        uid = str(uuid.uuid4())
         await _ensure_user(db_session, uid)
         repo = DBMemoryChunkRepository(db_session)
         chunk = _make_chunk(user_id=uid, session_id=None, embedding=None)
@@ -318,8 +322,8 @@ class TestGetById:
 
     async def test_wrong_user_returns_none(self, db_session) -> None:
         """get_by_id with different user_id returns None (tenant isolation)."""
-        uid = f"user-owner-{uuid.uuid4().hex[:8]}"
-        other = f"user-other-{uuid.uuid4().hex[:8]}"
+        uid = str(uuid.uuid4())
+        other = str(uuid.uuid4())
         await _ensure_user(db_session, uid)
         await _ensure_user(db_session, other)
         repo = DBMemoryChunkRepository(db_session)

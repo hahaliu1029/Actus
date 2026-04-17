@@ -171,6 +171,11 @@ async def lifespan(app: FastAPI):
         app.state.flush_service = flush_service
         logger.info("MemoryFlushService 初始化完成")
 
+        # 7b. FileMemoryStore 占位（M1 PR-0）：
+        # PR-5A 会替换为真实的 FsMemoryWriter。在此之前保持 None，
+        # MemoryManagementService 降级为 DB-only（不碰 memory 文件系统）。
+        app.state.file_memory_store = None
+
         # 8. 初始化 SandboxLifecycleService 单例（同 checkpointer_pool 模式，eng review #9）
         from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
         from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox

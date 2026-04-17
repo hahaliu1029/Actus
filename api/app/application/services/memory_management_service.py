@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from app.domain.external.embedding_provider import EmbeddingProvider
+    from app.domain.external.file_memory_store import FileMemoryStore
     from app.domain.repositories.memory_chunk_repository import MemoryChunkRepository
 
 logger = logging.getLogger(__name__)
@@ -41,10 +42,16 @@ class MemoryManagementService:
         repo_factory: Callable[["AsyncSession"], "MemoryChunkRepository"],
         embedding_provider: "EmbeddingProvider",
         session_factory: "async_sessionmaker[AsyncSession]",
+        *,
+        file_store: "FileMemoryStore | None" = None,
     ) -> None:
+        # ``file_store`` 在 PR-0 期间恒为 None（DB-only 模式），PR-5A 起由
+        # lifespan 注入真实的 ``FsMemoryWriter``。None 时所有 CRUD 只落 DB，
+        # 不碰文件系统，保持现有行为。
         self._repo_factory = repo_factory
         self._embedding_provider = embedding_provider
         self._session_factory = session_factory
+        self._file_store = file_store
 
     async def list_memories(
         self,

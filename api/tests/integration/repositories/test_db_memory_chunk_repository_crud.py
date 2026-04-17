@@ -210,7 +210,8 @@ class TestDeleteByIds:
         await repo.batch_insert_ignore([chunk])
         await db_session.flush()
 
-        deleted = await repo.delete_by_ids(user_id="other-user", ids=[chunk.id])
+        # 使用一个随机 UUID 作为"其它用户"——delete 只做过滤匹配，不需要 FK 存在
+        deleted = await repo.delete_by_ids(user_id=str(uuid.uuid4()), ids=[chunk.id])
         assert deleted == []
 
     async def test_empty_ids_returns_empty_list(self, repo, user_id):

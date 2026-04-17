@@ -18,6 +18,8 @@ from app.domain.models.app_config import AgentConfig, MemoryConfig
 from app.domain.models.memory_chunk import FlushBatch
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 
 def _make_flow(**overrides):
     """Create a PlannerReActFlow with all required mocks."""
@@ -27,7 +29,7 @@ def _make_flow(**overrides):
         "llm": MagicMock(),
         "agent_config": AgentConfig(),
         "session_id": "test-session",
-        "user_id": "test-user",
+        "user_id": TEST_USER_ID_FIXED,
         "uow_factory": AsyncMock(),
         "browser": MagicMock(),
         "sandbox": MagicMock(),
@@ -94,7 +96,7 @@ class TestFlushGateDisabled:
         # Simulate a stale batch from a previous call
         flow._pending_flush_batch = FlushBatch(
             session_id="test-session",
-            user_id="test-user",
+            user_id=TEST_USER_ID_FIXED,
             from_cursor=0,
             target_cursor=5,
             chunks=(),
@@ -160,7 +162,7 @@ class TestFlushGatePasses:
         flow = _make_flow(
             agent_config=AgentConfig(memory=config),
             session_id="sess-gate",
-            user_id="user-gate",
+            user_id=TEST_USER_ID_FIXED,
         )
         flow._flush_cursor = 0
 
@@ -176,7 +178,7 @@ class TestFlushGatePasses:
         assert batch is not None
         assert isinstance(batch, FlushBatch)
         assert batch.session_id == "sess-gate"
-        assert batch.user_id == "user-gate"
+        assert batch.user_id == TEST_USER_ID_FIXED
         assert batch.from_cursor == 0
         assert batch.target_cursor == len(msgs)
         assert len(batch.chunks) > 0
@@ -252,7 +254,7 @@ class TestChunkMessages:
 
     def test_basic_chunking_produces_raw_chunks(self) -> None:
         """基本分块产生 RawChunk 列表。"""
-        flow = _make_flow(session_id="sess-chunk", user_id="user-chunk")
+        flow = _make_flow(session_id="sess-chunk", user_id=TEST_USER_ID_FIXED)
 
         msgs = [
             HumanMessage(content="What is the weather?"),
@@ -263,7 +265,7 @@ class TestChunkMessages:
         assert len(chunks) > 0
         for chunk in chunks:
             assert chunk.session_id == "sess-chunk"
-            assert chunk.user_id == "user-chunk"
+            assert chunk.user_id == TEST_USER_ID_FIXED
             assert chunk.content  # non-empty
             assert chunk.content_hash  # non-empty
 

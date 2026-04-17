@@ -21,6 +21,8 @@ import pytest
 
 from app.domain.models.memory_chunk import FlushBatch, RawChunk
 
+from tests.conftest import TEST_USER_ID_FIXED
+
 pytestmark = pytest.mark.anyio
 
 
@@ -28,14 +30,14 @@ def _make_batch(**overrides) -> FlushBatch:
     """Create a minimal FlushBatch for testing."""
     defaults = {
         "session_id": "test-session",
-        "user_id": "test-user",
+        "user_id": TEST_USER_ID_FIXED,
         "from_cursor": 0,
         "target_cursor": 5,
         "chunks": (
             RawChunk(
                 content="test content",
                 session_id="test-session",
-                user_id="test-user",
+                user_id=TEST_USER_ID_FIXED,
                 source="test",
                 metadata={},
                 content_hash="abc123",

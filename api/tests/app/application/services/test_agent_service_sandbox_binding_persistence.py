@@ -50,7 +50,7 @@ class _FakeSandbox:
         return MagicMock()
 
     @classmethod
-    async def create(cls) -> "_FakeSandbox":
+    async def create(cls, user_id: str | None = None) -> "_FakeSandbox":
         cls._counter += 1
         return cls(f"sbx-{cls._counter}")
 

@@ -90,7 +90,7 @@ class FakeSandbox:
         return True
 
     @classmethod
-    async def create(cls) -> "FakeSandbox":
+    async def create(cls, user_id: Optional[str] = None) -> "FakeSandbox":
         return cls()
 
     @classmethod
@@ -340,7 +340,7 @@ async def test_reconcile_destroying_container_dead() -> None:
 
     class NoContainerSandbox:
         @classmethod
-        async def create(cls):
+        async def create(cls, user_id: Optional[str] = None):
             return None
 
         @classmethod
@@ -375,7 +375,7 @@ async def test_orphan_transitions_to_destroyed() -> None:
 
     class NoContainerSandbox:
         @classmethod
-        async def create(cls):
+        async def create(cls, user_id: Optional[str] = None):
             return None
 
         @classmethod
