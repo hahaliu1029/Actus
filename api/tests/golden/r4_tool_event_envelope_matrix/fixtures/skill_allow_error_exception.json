@@ -1,0 +1,35 @@
+{
+  "type": "tool",
+  "id": "evt-golden-skill-allow-error-exception",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_skill_aee",
+  "tool_name": "skill",
+  "function_name": "skill_data_processor",
+  "function_args": {"input": "malformed input"},
+  "status": "called",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_data_processor"
+  },
+  "artifact": {
+    "tool_call_id": "c_skill_aee",
+    "tool_name": "skill_data_processor",
+    "tool_source": {
+      "source": "skill",
+      "category": "skill",
+      "canonical_name": "skill_data_processor"
+    },
+    "outcome": {
+      "variant": "allow_error",
+      "content": "Skill execution failed: ValueError in data processing",
+      "reason": {
+        "type": "exception",
+        "code": "SkillExecutionError",
+        "message": "Input validation failed: expected JSON, got plain text"
+      },
+      "retryable": false,
+      "data": null
+    }
+  }
+}

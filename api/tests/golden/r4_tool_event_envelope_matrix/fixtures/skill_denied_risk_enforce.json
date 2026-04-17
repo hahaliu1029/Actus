@@ -1,0 +1,33 @@
+{
+  "type": "tool",
+  "id": "evt-golden-skill-denied-risk-enforce",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_skill_dre",
+  "tool_name": "skill",
+  "function_name": "skill_deploy_prod",
+  "function_args": {"env": "production", "version": "1.0.0"},
+  "status": "called",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_deploy_prod"
+  },
+  "artifact": {
+    "tool_call_id": "c_skill_dre",
+    "tool_name": "skill_deploy_prod",
+    "tool_source": {
+      "source": "skill",
+      "category": "skill",
+      "canonical_name": "skill_deploy_prod"
+    },
+    "outcome": {
+      "variant": "denied",
+      "content": "Skill denied by risk_enforce: production deployment requires confirmation",
+      "reason": {
+        "type": "risk_enforce",
+        "code": "prod_deploy_enforce",
+        "message": "SkillTool.risk_mode=enforce_confirmation triggered"
+      }
+    }
+  }
+}

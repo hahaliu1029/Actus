@@ -21,13 +21,16 @@ blob still loads into a valid ``ToolEvent`` with sensible defaults.
 """
 from __future__ import annotations
 
-from pydantic import TypeAdapter
+import pytest
+from pydantic import TypeAdapter, ValidationError
 
 from app.domain.models.event import (
     Event,
     ToolEvent,
     ToolEventStatus,
 )
+from app.domain.models.tool_result import AllowSuccess, ToolArtifact
+from app.domain.services.tools.tool_source_resolver import ToolSource
 
 
 class TestLegacyToolEventDirectValidation:
@@ -192,11 +195,183 @@ class TestLegacyToolEventRoundTrip:
         evt = ToolEvent.model_validate(legacy_json)
         dumped = evt.model_dump(mode="json")
 
-        # ToolEvent has no `artifact` field — asserting absence
-        # documents the R4 envelope boundary.
-        assert "artifact" not in dumped
+        # R4 post-F5: artifact key may be present (= None) or absent depending on
+        # future serialization config (e.g. exclude_none). Either is acceptable —
+        # legacy blobs never populate it; projector's legacy fallback path handles this.
+        assert dumped.get("artifact") is None
         # function_result defaults to None and is still present in
         # the dump (not stripped) — consumers that read it must
         # handle None gracefully.
         assert "function_result" in dumped
         assert dumped["function_result"] is None
+
+
+class TestR4ToolEventExtensions:
+    """R4 新增 6 个 Optional 字段测试 (F2 fix: artifact 是 dict 而非 typed)."""
+
+    def test_r4_tool_event_all_optional_fields_default(self) -> None:
+        evt = ToolEvent(
+            tool_call_id="c1",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={"command": "ls"},
+        )
+        assert evt.artifact is None
+        assert evt.tool_source is None
+        assert evt.activity_description == ""
+        assert evt.display_icon is None
+        assert evt.render_style is None
+        assert evt.media_type is None
+
+    def test_r4_tool_event_artifact_accepts_dict(self) -> None:
+        """F2: artifact 字段类型 Optional[Dict[str, Any]], 不是 typed ToolArtifact."""
+        artifact_dict = {
+            "tool_call_id": "c1",
+            "tool_name": "shell_execute",
+            "tool_source": {"source": "native", "category": "shell", "canonical_name": "shell_execute"},
+            "outcome": {
+                "variant": "allow_success",
+                "content": "ok",
+                "data": None,
+            },
+        }
+        evt = ToolEvent(
+            tool_call_id="c1",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={},
+            artifact=artifact_dict,
+        )
+        assert isinstance(evt.artifact, dict)
+        assert evt.artifact["outcome"]["variant"] == "allow_success"
+
+    def test_r4_tool_event_artifact_rejects_typed_object(self) -> None:
+        """F2: Pydantic Optional[Dict[str, Any]] 会拒绝非 dict 输入到 artifact 字段.
+
+        spec 锁 fail-fast 语义: react_graph 必须手动 .model_dump() 再赋给
+        ToolEvent.artifact, 不能直接塞 typed ToolArtifact 实例.
+        """
+        typed_artifact = ToolArtifact(
+            tool_call_id="c1",
+            tool_name="shell_execute",
+            tool_source=ToolSource(source="native", category="shell", canonical_name="shell_execute"),
+            outcome=AllowSuccess(content="ok"),
+        )
+        with pytest.raises(ValidationError):
+            ToolEvent(
+                tool_call_id="c1",
+                tool_name="shell",
+                function_name="shell_execute",
+                function_args={},
+                artifact=typed_artifact,
+            )
+
+    def test_r4_tool_event_tool_source_typed(self) -> None:
+        ts = ToolSource(source="native", category="shell", canonical_name="shell_execute")
+        evt = ToolEvent(
+            tool_call_id="c1",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={},
+            tool_source=ts,
+        )
+        assert evt.tool_source.source == "native"
+        assert evt.tool_source.category == "shell"
+        assert evt.tool_source.canonical_name == "shell_execute"
+
+    def test_r4_tool_event_with_artifact_dict_deserializes(self) -> None:
+        """R4 shape JSON (artifact as dict) validate 通过."""
+        json_data = {
+            "type": "tool",
+            "id": "evt_r4_1",
+            "tool_call_id": "c1",
+            "tool_name": "shell",
+            "function_name": "shell_execute",
+            "function_args": {"command": "ls"},
+            "status": "called",
+            "artifact": {
+                "tool_call_id": "c1",
+                "tool_name": "shell_execute",
+                "tool_source": {"source": "native", "category": "shell",
+                                "canonical_name": "shell_execute"},
+                "outcome": {"variant": "allow_success", "content": "ok", "data": None},
+            },
+        }
+        evt = ToolEvent.model_validate(json_data)
+        assert evt.artifact is not None
+        assert evt.artifact["outcome"]["variant"] == "allow_success"
+
+    def test_r4_pre_r4_json_validates_via_type_adapter(self) -> None:
+        """R0/R1 shape (无 artifact) 仍 TypeAdapter(Event) 通过."""
+        pre_r4_json = {
+            "type": "tool",
+            "id": "evt_pre_r4_1",
+            "tool_call_id": "c1",
+            "tool_name": "shell",
+            "function_name": "shell_execute",
+            "function_args": {},
+        }
+        adapter: TypeAdapter[Event] = TypeAdapter(Event)
+        evt = adapter.validate_python(pre_r4_json)
+        assert isinstance(evt, ToolEvent)
+        assert evt.artifact is None
+        assert evt.tool_source is None
+
+    def test_r4_unknown_variant_artifact_no_type_adapter_error(self) -> None:
+        """F2 关键: artifact 是 dict 而非 typed, 未知 variant 不在事件日志反序列化层炸."""
+        future_variant_json = {
+            "type": "tool",
+            "id": "evt_future_variant",
+            "tool_call_id": "c1",
+            "tool_name": "shell",
+            "function_name": "shell_execute",
+            "function_args": {},
+            "status": "called",
+            "artifact": {
+                "tool_call_id": "c1",
+                "tool_name": "shell_execute",
+                "tool_source": {"source": "native", "category": "shell",
+                                "canonical_name": "shell_execute"},
+                # 未来 R2 可能加 "partial_success" variant — 老 server 读这个 JSON
+                # 必须 TypeAdapter 成功 (artifact 是 dict), projector 层才降级
+                "outcome": {"variant": "partial_success", "content": "部分成功"},
+            },
+        }
+        adapter: TypeAdapter[Event] = TypeAdapter(Event)
+        evt = adapter.validate_python(future_variant_json)
+        assert isinstance(evt, ToolEvent)
+        assert evt.artifact["outcome"]["variant"] == "partial_success"
+
+    def test_r4_dump_includes_envelope_version_when_projected(self) -> None:
+        """Projector 输出必有 envelope_version=1 (所有路径)."""
+        from app.application.services.tool_event_envelope_v1 import (
+            project_tool_event_to_envelope_v1,
+        )
+
+        evt = ToolEvent(
+            tool_call_id="c1",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={},
+        )
+        envelope = project_tool_event_to_envelope_v1(evt)
+        wire = envelope.model_dump(mode="json", by_alias=True)
+        assert wire["envelope_version"] == 1
+
+    def test_r4_r2_legacy_test_assertions_still_valid(self) -> None:
+        """R4 更新后, 现有 test_legacy_dump_does_not_add_artifact_field 变体仍绿.
+        这里再加一条覆盖 artifact=None 时 wire roundtrip 不丢信息."""
+        evt = ToolEvent(
+            tool_call_id="c1",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={},
+        )
+        dumped = evt.model_dump(mode="json")
+        # R4 字段 1/6: artifact — 存在且为 None
+        assert "artifact" in dumped
+        assert dumped["artifact"] is None
+        # R4 字段 2-6/6: 其他 5 个 Optional key 都存在
+        for key in ("tool_source", "activity_description", "display_icon",
+                    "render_style", "media_type"):
+            assert key in dumped

@@ -1,0 +1,35 @@
+{
+  "type": "tool",
+  "id": "evt-golden-mcp-allow-error-exception",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_mcp_aee",
+  "tool_name": "mcp",
+  "function_name": "mcp_weather_get",
+  "function_args": {"location": "Unknown City"},
+  "status": "called",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_weather_get"
+  },
+  "artifact": {
+    "tool_call_id": "c_mcp_aee",
+    "tool_name": "mcp_weather_get",
+    "tool_source": {
+      "source": "mcp",
+      "category": "mcp",
+      "canonical_name": "mcp_weather_get"
+    },
+    "outcome": {
+      "variant": "allow_error",
+      "content": "MCP server returned 404: location not found",
+      "reason": {
+        "type": "exception",
+        "code": "MCPResponseError",
+        "message": "Location not found in weather database"
+      },
+      "retryable": false,
+      "data": null
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "type": "tool",
+  "id": "evt-golden-a2a-allow-error-exception",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_a2a_aee",
+  "tool_name": "a2a",
+  "function_name": "call_remote_agent",
+  "function_args": {"agent_id": "broken-agent", "task": "analyze"},
+  "status": "called",
+  "tool_source": {
+    "source": "a2a",
+    "category": "a2a",
+    "canonical_name": "call_remote_agent"
+  },
+  "artifact": {
+    "tool_call_id": "c_a2a_aee",
+    "tool_name": "call_remote_agent",
+    "tool_source": {
+      "source": "a2a",
+      "category": "a2a",
+      "canonical_name": "call_remote_agent"
+    },
+    "outcome": {
+      "variant": "allow_error",
+      "content": "Remote agent returned error: internal failure",
+      "reason": {
+        "type": "exception",
+        "code": "A2ARemoteError",
+        "message": "Remote agent internal server error"
+      },
+      "retryable": true,
+      "data": null
+    }
+  }
+}

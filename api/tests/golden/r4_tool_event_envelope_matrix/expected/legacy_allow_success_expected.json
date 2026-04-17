@@ -1,0 +1,27 @@
+{
+  "event_id": "evt-golden-legacy-allow-success",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_legacy_as",
+  "name": "shell",
+  "tool_source": null,
+  "function": "shell_execute",
+  "args": {
+    "command": "echo hello"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "ok",
+    "message": "hello\n",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": null
+  },
+  "content": null
+}

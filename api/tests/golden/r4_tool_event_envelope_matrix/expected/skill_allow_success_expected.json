@@ -1,0 +1,34 @@
+{
+  "event_id": "evt-golden-skill-allow-success",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_skill_as",
+  "name": "skill",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_data_processor"
+  },
+  "function": "skill_data_processor",
+  "args": {
+    "input": "raw data here"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "ok",
+    "message": "Skill executed successfully: processed 42 records",
+    "data": {
+      "records_processed": 42,
+      "output": "processed data"
+    },
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": null
+  },
+  "content": null
+}

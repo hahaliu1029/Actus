@@ -1,0 +1,31 @@
+{
+  "event_id": "evt-golden-native-allow-success",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_native_as",
+  "name": "shell",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "function": "shell_execute",
+  "args": {
+    "command": "ls -la"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "ok",
+    "message": "total 0\n",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": null
+  },
+  "content": null
+}

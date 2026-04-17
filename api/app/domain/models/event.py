@@ -10,6 +10,7 @@ from .message import SkillConfirmationAction
 from .plan import Plan, Step
 from .search import SearchResultItem
 from .tool_result import ToolResult
+from app.domain.services.tools.tool_source_resolver import ToolSource
 
 
 class PlanEventStatus(str, Enum):
@@ -159,16 +160,33 @@ ToolContent = Union[
 
 
 class ToolEvent(BaseEvent):
-    """工具事件"""
+    """工具事件 (R4 extended: internal artifact as dict + external wire metadata)."""
 
     type: Literal["tool"] = "tool"
-    tool_call_id: str  # 工具调用id
-    tool_name: str  # 工具箱/工具集的名字
-    tool_content: Optional[ToolContent] = None  # 工具扩展内容
-    function_name: str  # LLM调用函数/工具名字
-    function_args: Dict[str, Any]  # LLM生成的工具调用参数
-    function_result: Optional[ToolResult] = None  # 工具调用结果
-    status: ToolEventStatus = ToolEventStatus.CALLING  # 工具事件状态
+
+    # --- 现有字段 (保留, pre-R4 兼容) ---
+    tool_call_id: str
+    tool_name: str                            # canonical category, R1 写入
+    tool_content: Optional[ToolContent] = None
+    function_name: str
+    function_args: Dict[str, Any]
+    function_result: Optional[ToolResult] = None    # R2 legacy shape, soft-coexistence
+    status: ToolEventStatus = ToolEventStatus.CALLING
+
+    # --- R4 新增 (all Optional, default=None/"", pre-R4 JSON 仍可 validate) ---
+    # F2 fix: artifact 是 dict (R2 JSON serialized form), 不是 typed ToolArtifact.
+    # TypeAdapter(Event).validate_python 在事件日志回放路径不会触发
+    # ToolOutcome discriminated union dispatch, 未来 R2 加新 variant 不会在
+    # 反序列化层硬抛 ValidationError. Projector 用 TOOL_ARTIFACT_ADAPTER.validate_python
+    # 懒校验 + try/except 兜底消费.
+    artifact: Optional[Dict[str, Any]] = None        # R2 ToolArtifact.model_dump(mode='json') output, INTERNAL ONLY
+    tool_source: Optional[ToolSource] = None         # CS1, 从 artifact.tool_source 冗余上来
+    activity_description: str = ""                   # B10 驱动
+    display_icon: Optional[str] = None               # B10 驱动
+    render_style: Optional[
+        Literal["text", "code", "table", "image", "document"]
+    ] = None                                         # B12 驱动
+    media_type: Optional[str] = None                 # B12 驱动
 
 
 class WaitEvent(BaseEvent):

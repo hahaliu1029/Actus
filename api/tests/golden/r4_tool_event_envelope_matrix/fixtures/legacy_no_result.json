@@ -1,0 +1,10 @@
+{
+  "type": "tool",
+  "id": "evt-golden-legacy-no-result",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_legacy_no_result",
+  "tool_name": "shell",
+  "function_name": "shell_execute",
+  "function_args": {"command": "fire_and_forget.sh"},
+  "status": "called"
+}

@@ -1,0 +1,35 @@
+{
+  "event_id": "evt-golden-mcp-allow-error-timeout",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_mcp_aet",
+  "name": "mcp",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_slow_api"
+  },
+  "function": "mcp_slow_api",
+  "args": {
+    "query": "big data"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "timeout",
+    "message": "MCP call timed out after 15s",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": {
+      "type": "timeout",
+      "code": "step_timeout",
+      "message": "MCP server did not respond within 15 seconds"
+    },
+    "result_blocks": null
+  },
+  "content": null
+}

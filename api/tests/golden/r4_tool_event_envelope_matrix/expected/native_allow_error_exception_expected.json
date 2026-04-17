@@ -1,0 +1,35 @@
+{
+  "event_id": "evt-golden-native-allow-error-exception",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_native_aee",
+  "name": "shell",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "function": "shell_execute",
+  "args": {
+    "command": "cat /nonexistent"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "error",
+    "message": "Command failed: No such file or directory",
+    "data": null,
+    "retryable": true,
+    "user_action_required": false,
+    "reason": {
+      "type": "exception",
+      "code": "FileNotFoundError",
+      "message": "No such file or directory"
+    },
+    "result_blocks": null
+  },
+  "content": null
+}

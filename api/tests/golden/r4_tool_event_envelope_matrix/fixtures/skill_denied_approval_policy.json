@@ -1,0 +1,33 @@
+{
+  "type": "tool",
+  "id": "evt-golden-skill-denied-approval-policy",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_skill_dap",
+  "tool_name": "skill",
+  "function_name": "skill_privileged_op",
+  "function_args": {"operation": "admin_reset"},
+  "status": "called",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_privileged_op"
+  },
+  "artifact": {
+    "tool_call_id": "c_skill_dap",
+    "tool_name": "skill_privileged_op",
+    "tool_source": {
+      "source": "skill",
+      "category": "skill",
+      "canonical_name": "skill_privileged_op"
+    },
+    "outcome": {
+      "variant": "denied",
+      "content": "Skill denied by approval policy",
+      "reason": {
+        "type": "approval_policy",
+        "code": "privileged_skill_blocked",
+        "message": "Privileged skill operations require explicit session approval"
+      }
+    }
+  }
+}

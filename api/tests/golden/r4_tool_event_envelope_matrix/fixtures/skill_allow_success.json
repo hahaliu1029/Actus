@@ -1,0 +1,29 @@
+{
+  "type": "tool",
+  "id": "evt-golden-skill-allow-success",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_skill_as",
+  "tool_name": "skill",
+  "function_name": "skill_data_processor",
+  "function_args": {"input": "raw data here"},
+  "status": "called",
+  "tool_source": {
+    "source": "skill",
+    "category": "skill",
+    "canonical_name": "skill_data_processor"
+  },
+  "artifact": {
+    "tool_call_id": "c_skill_as",
+    "tool_name": "skill_data_processor",
+    "tool_source": {
+      "source": "skill",
+      "category": "skill",
+      "canonical_name": "skill_data_processor"
+    },
+    "outcome": {
+      "variant": "allow_success",
+      "content": "Skill executed successfully: processed 42 records",
+      "data": {"records_processed": 42, "output": "processed data"}
+    }
+  }
+}

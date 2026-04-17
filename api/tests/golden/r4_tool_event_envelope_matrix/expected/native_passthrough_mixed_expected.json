@@ -1,0 +1,46 @@
+{
+  "event_id": "evt-golden-native-passthrough-mixed",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_native_ptm",
+  "name": "file",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "function": "file_view",
+  "args": {
+    "path": "/workspace/"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": "document",
+  "media_type": "application/pdf",
+  "function_result": {
+    "status": "passthrough",
+    "message": "[file_view: 1 image(s) + 1 PDF(s) loaded]",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": [
+      {
+        "type": "image_url",
+        "image_url": {
+          "url": "data:image/png;base64,abc",
+          "detail": "auto"
+        }
+      },
+      {
+        "type": "file",
+        "file": {
+          "filename": "report.pdf",
+          "file_data": "data:application/pdf;base64,abc"
+        }
+      }
+    ]
+  },
+  "content": null
+}

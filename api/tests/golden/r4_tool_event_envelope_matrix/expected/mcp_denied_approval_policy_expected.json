@@ -1,0 +1,36 @@
+{
+  "event_id": "evt-golden-mcp-denied-approval-policy",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_mcp_dap",
+  "name": "mcp",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_database_write"
+  },
+  "function": "mcp_database_write",
+  "args": {
+    "table": "users",
+    "data": {}
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "denied",
+    "message": "MCP tool denied by approval policy",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": {
+      "type": "approval_policy",
+      "code": "db_write_blocked",
+      "message": "Database write operations are blocked by policy"
+    },
+    "result_blocks": null
+  },
+  "content": null
+}

@@ -264,7 +264,7 @@ async def chat(
                 if sse_event:
                     yield ServerSentEvent(
                         event=sse_event.event,
-                        data=sse_event.data.model_dump_json(),
+                        data=sse_event.to_sse_data_json(),
                     )
         finally:
             await lease.release()

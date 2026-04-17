@@ -1,0 +1,34 @@
+{
+  "event_id": "evt-golden-a2a-allow-success",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_a2a_as",
+  "name": "a2a",
+  "tool_source": {
+    "source": "a2a",
+    "category": "a2a",
+    "canonical_name": "call_remote_agent"
+  },
+  "function": "call_remote_agent",
+  "args": {
+    "agent_id": "analyst-agent",
+    "task": "summarize data"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "ok",
+    "message": "Remote agent completed task: Summary generated",
+    "data": {
+      "summary": "Data shows upward trend"
+    },
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": null
+  },
+  "content": null
+}

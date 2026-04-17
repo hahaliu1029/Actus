@@ -1,0 +1,35 @@
+{
+  "type": "tool",
+  "id": "evt-golden-native-allow-error-timeout",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_native_aet",
+  "tool_name": "shell",
+  "function_name": "shell_execute",
+  "function_args": {"command": "sleep 999"},
+  "status": "called",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "artifact": {
+    "tool_call_id": "c_native_aet",
+    "tool_name": "shell_execute",
+    "tool_source": {
+      "source": "native",
+      "category": "shell",
+      "canonical_name": "shell_execute"
+    },
+    "outcome": {
+      "variant": "allow_error",
+      "content": "Tool execution timed out after 30s",
+      "reason": {
+        "type": "timeout",
+        "code": "step_timeout",
+        "message": "Execution exceeded 30 second limit"
+      },
+      "retryable": false,
+      "data": null
+    }
+  }
+}

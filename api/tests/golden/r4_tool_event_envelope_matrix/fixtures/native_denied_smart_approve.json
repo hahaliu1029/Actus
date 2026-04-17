@@ -1,0 +1,33 @@
+{
+  "type": "tool",
+  "id": "evt-golden-native-denied-smart-approve",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_native_dsa",
+  "tool_name": "shell",
+  "function_name": "shell_execute",
+  "function_args": {"command": "dd if=/dev/urandom of=/dev/sda"},
+  "status": "called",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "artifact": {
+    "tool_call_id": "c_native_dsa",
+    "tool_name": "shell_execute",
+    "tool_source": {
+      "source": "native",
+      "category": "shell",
+      "canonical_name": "shell_execute"
+    },
+    "outcome": {
+      "variant": "denied",
+      "content": "Smart approve denied: disk overwrite risk",
+      "reason": {
+        "type": "smart_approve",
+        "code": "llm_deny",
+        "message": "High risk disk write operation denied"
+      }
+    }
+  }
+}

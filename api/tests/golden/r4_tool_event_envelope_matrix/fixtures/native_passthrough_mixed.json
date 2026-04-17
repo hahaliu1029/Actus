@@ -1,0 +1,46 @@
+{
+  "type": "tool",
+  "id": "evt-golden-native-passthrough-mixed",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_native_ptm",
+  "tool_name": "file",
+  "function_name": "file_view",
+  "function_args": {"path": "/workspace/"},
+  "status": "called",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "artifact": {
+    "tool_call_id": "c_native_ptm",
+    "tool_name": "file_view",
+    "tool_source": {
+      "source": "native",
+      "category": "file",
+      "canonical_name": "file_view"
+    },
+    "outcome": {
+      "variant": "passthrough",
+      "content": "[file_view: 1 image(s) + 1 PDF(s) loaded]",
+      "data": {
+        "blocks": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,abc",
+              "detail": "auto"
+            }
+          },
+          {
+            "type": "file",
+            "file": {
+              "filename": "report.pdf",
+              "file_data": "data:application/pdf;base64,abc"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

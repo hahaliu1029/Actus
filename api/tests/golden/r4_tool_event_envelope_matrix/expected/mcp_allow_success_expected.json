@@ -1,0 +1,34 @@
+{
+  "event_id": "evt-golden-mcp-allow-success",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_mcp_as",
+  "name": "mcp",
+  "tool_source": {
+    "source": "mcp",
+    "category": "mcp",
+    "canonical_name": "mcp_weather_get"
+  },
+  "function": "mcp_weather_get",
+  "args": {
+    "location": "San Francisco"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": null,
+  "media_type": null,
+  "function_result": {
+    "status": "ok",
+    "message": "Current temperature: 18°C, partly cloudy",
+    "data": {
+      "temperature": 18,
+      "condition": "partly_cloudy"
+    },
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": null
+  },
+  "content": null
+}

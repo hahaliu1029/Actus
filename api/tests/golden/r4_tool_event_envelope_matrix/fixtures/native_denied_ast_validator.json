@@ -1,0 +1,33 @@
+{
+  "type": "tool",
+  "id": "evt-golden-native-denied-ast-validator",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_native_dav",
+  "tool_name": "shell",
+  "function_name": "shell_execute",
+  "function_args": {"command": "rm -rf /"},
+  "status": "called",
+  "tool_source": {
+    "source": "native",
+    "category": "shell",
+    "canonical_name": "shell_execute"
+  },
+  "artifact": {
+    "tool_call_id": "c_native_dav",
+    "tool_name": "shell_execute",
+    "tool_source": {
+      "source": "native",
+      "category": "shell",
+      "canonical_name": "shell_execute"
+    },
+    "outcome": {
+      "variant": "denied",
+      "content": "AST validator blocked: rm -rf pattern detected",
+      "reason": {
+        "type": "ast_validator",
+        "code": "dangerous_rm_pattern",
+        "message": "rm -rf / is not allowed"
+      }
+    }
+  }
+}

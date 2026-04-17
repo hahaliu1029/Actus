@@ -1,0 +1,15 @@
+{
+  "type": "tool",
+  "id": "evt-golden-legacy-pre-r1-no-tool-source",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_legacy_r0",
+  "tool_name": "shell",
+  "function_name": "shell_execute",
+  "function_args": {"command": "pwd"},
+  "status": "called",
+  "function_result": {
+    "success": true,
+    "message": "/workspace\n",
+    "data": null
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "event_id": "evt-golden-native-passthrough-pdf",
+  "created_at": 1776340800,
+  "envelope_version": 1,
+  "tool_call_id": "c_native_ptp",
+  "name": "file",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "function": "file_view",
+  "args": {
+    "path": "/workspace/report.pdf"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": "document",
+  "media_type": "application/pdf",
+  "function_result": {
+    "status": "passthrough",
+    "message": "[file_view: report.pdf — 1 page(s) loaded]",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": [
+      {
+        "type": "file",
+        "file": {
+          "filename": "report.pdf",
+          "file_data": "data:application/pdf;base64,abc"
+        }
+      }
+    ]
+  },
+  "content": null
+}

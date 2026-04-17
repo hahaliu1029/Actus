@@ -19,7 +19,9 @@ from app.domain.models.event import (
 )
 from app.domain.models.file import File
 from app.domain.models.plan import ExecutionStatus
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.domain.services.tools.tool_source_resolver import ToolSource
 
 
 class BaseEventData(BaseModel):
@@ -53,6 +55,10 @@ class BaseSSEEvent(BaseModel):
 
     event: str  # 事件类型
     data: BaseEventData  # 数据
+
+    def to_sse_data_json(self) -> str:
+        """默认 SSE 序列化. 子类若需要特殊 wire 处理可 override."""
+        return self.data.model_dump_json()
 
     @classmethod
     def from_event(cls, event: Event) -> Self:
@@ -184,6 +190,103 @@ class PlanSSEEvent(BaseSSEEvent):
         )
 
 
+ToolStatusV1 = Literal[
+    "ok",          # AllowSuccess variant
+    "error",       # AllowError(reason.type="exception")
+    "denied",      # Denied variant
+    "timeout",     # AllowError(reason.type="timeout")
+    "passthrough", # Passthrough variant
+    # 注意：没有 "asked" — Asked outcome 走独立 ToolConfirmationEvent
+]
+
+
+class DecisionReasonWire(BaseModel):
+    """CS3 wire-shape projection of DecisionReason.
+
+    Projector 会发出以下 7 个 type 值：
+    - domain 6 值 (R2 已定义): approval_policy, smart_approve, ast_validator,
+      risk_enforce, exception, timeout
+    - wire-only fallback 1 值: unknown_variant (projector 的
+      _project_unknown_variant_fallback 产出)
+
+    type 字段有意保留为开放 str（不是 Literal），以便未来 R2 新增
+    reason 类型时老 server 反序列化不硬抛。前端 tolerant reader
+    遇到 7 值以外的 type 降级显示 "unknown" 徽章（I-R4.5）。
+    """
+    type: str
+    code: str = ""
+    message: str = ""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class FunctionResultV1(BaseModel):
+    """扁平 function_result, projector 从 ToolArtifact.outcome 投影而来."""
+    status: ToolStatusV1
+    message: str = ""
+    data: Any = None
+    retryable: bool = False
+    user_action_required: bool = False  # v1 envelope 恒 False（Asked 走 tool_confirmation）
+    reason: Optional[DecisionReasonWire] = None
+    # Passthrough 多模态 blocks, 严格 by_alias wire format:
+    # [{"type": "image_url", "image_url": {...}}, {"type": "file", "file": {...}}]
+    result_blocks: Optional[list[dict[str, Any]]] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ToolEventEnvelopeV1(BaseEventData):
+    """CS3 contract surface v1. 冻结 frontend / Flutter / N2 SSE / B10 / B12 读取路径的 wire shape.
+
+    Wire 字段名向后兼容（F1 fix）: 通过 Pydantic Field(alias=...) 保留现有 wire
+    短名 name / function / args, Python 属性名改为描述性长名便于代码可读.
+    by_alias=True 序列化时出 wire 仍是 name / function / args, 现有前端零改.
+
+    Versioning 术语区分 (Round 2c 厘清):
+    - release bump (项目 semver/CHANGELOG): 改本类字段集都是 release 层面的 minor
+      或 major, 和 envelope_version 无关.
+    - envelope_version bump (本字段的数值变化): 只在 breaking 改动时触发.
+
+    字段集演化规则:
+    - Additive optional 字段新增 (*: Optional[T] = None 到 ToolEventEnvelopeV1
+      或 FunctionResultV1): release minor, envelope_version 保持 1.
+    - Breaking 改动 (必填字段新增 / 字段重命名 / 字段删除 / Literal 值域收缩 /
+      字段类型变更): release major, envelope_version bump 到 2.
+
+    envelope_version 类型用 int + validator (>=1), 不用 Literal[1],
+    以便未来 v2 事件流经老 server 时 Pydantic 不硬抛.
+    """
+    envelope_version: int = 1
+
+    tool_call_id: str
+    tool_name: str = Field(alias="name")
+    tool_source: Optional[ToolSource] = None
+    function_name: str = Field(alias="function")
+    function_args: dict[str, Any] = Field(alias="args")
+    status: Literal["calling", "called"]
+    activity_description: str = ""
+    display_icon: Optional[str] = None
+    render_style: Optional[
+        Literal["text", "code", "table", "image", "document"]
+    ] = None
+    media_type: Optional[str] = None
+
+    function_result: Optional[FunctionResultV1] = None
+    content: Optional[dict[str, Any]] = None
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    @field_validator("envelope_version")
+    @classmethod
+    def _validate_version(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"envelope_version must be >= 1, got {v}")
+        return v
+
+
 class ToolEventData(BaseEventData):
     """工具事件数据"""
 
@@ -196,24 +299,26 @@ class ToolEventData(BaseEventData):
 
 
 class ToolSSEEvent(BaseSSEEvent):
-    """工具流式事件"""
+    """工具流式事件 (R4 after).
+
+    I-R4.6: wire 序列化必须用 by_alias=True 输出短字段名 (name/function/args).
+    """
 
     event: Literal["tool"] = "tool"
-    data: ToolEventData
+    data: ToolEventEnvelopeV1
+
+    model_config = ConfigDict(populate_by_name=True)
 
     @classmethod
-    def from_event(cls, event: ToolEvent) -> Self:
-        return cls(
-            data=ToolEventData(
-                **BaseEventData.base_event_data(event),
-                tool_call_id=event.tool_call_id,
-                name=event.tool_name,
-                status=event.status,
-                function=event.function_name,
-                args=event.function_args,
-                content=event.tool_content,
-            )
+    def from_event(cls, event: ToolEvent) -> "ToolSSEEvent":
+        from app.application.services.tool_event_envelope_v1 import (
+            project_tool_event_to_envelope_v1,
         )
+        return cls(data=project_tool_event_to_envelope_v1(event))
+
+    def to_sse_data_json(self) -> str:
+        """SSE 序列化入口: 走 by_alias=True 保留 wire 短名 (I-R4.6)."""
+        return self.data.model_dump_json(by_alias=True, exclude_none=False)
 
 
 class DoneEventData(BaseEventData):
