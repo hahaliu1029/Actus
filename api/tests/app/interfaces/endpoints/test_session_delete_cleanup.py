@@ -1,7 +1,22 @@
+"""SessionService.delete_session 清理行为单元测试.
+
+commit 5b9199f 之后, sandbox destroy 的职责迁到 SandboxLifecycleService, 由
+SessionService 通过 `self._lifecycle.destroy(session_id, DestroyReason.SESSION_DELETE)`
+委托. 本测试验证两条 SessionService 层面的契约:
+
+1. 当 lifecycle 注入时, delete_session 会发出 destroy 调用并传正确的
+   DestroyReason.
+2. 当 lifecycle 未注入 (shared-sandbox DI / 单测场景) 时, delete_session
+   不试图 destroy, 避免空指针.
+
+取代了 pre-refactor 依赖 `sandbox_cls` + `get_settings().sandbox_address`
+的旧路径. 共享沙箱模式下 "skip destroy" 的决策现在在 DI wiring 层完成
+(不注入 lifecycle), 由测试 2 间接覆盖.
+"""
 import asyncio
 
 from app.application.services.session_service import SessionService
-from app.domain.models.session import Session
+from app.domain.models.session import DestroyReason, Session
 
 
 class _FakeSessionRepo:
@@ -31,32 +46,14 @@ class _FakeUnitOfWork:
         return None
 
 
-class _FakeSandbox:
-    registry: dict[str, "_FakeSandbox"] = {}
+class _FakeLifecycle:
+    """跟踪 destroy 调用. 模拟 SandboxLifecycleService 最小接口."""
 
-    def __init__(self, sandbox_id: str) -> None:
-        self._sandbox_id = sandbox_id
-        self.destroy_called = False
+    def __init__(self) -> None:
+        self.destroy_calls: list[tuple[str, DestroyReason]] = []
 
-    @property
-    def id(self) -> str:
-        return self._sandbox_id
-
-    @property
-    def cdp_url(self) -> str:
-        return "http://127.0.0.1:9222"
-
-    @property
-    def vnc_url(self) -> str:
-        return "ws://127.0.0.1:5901"
-
-    async def destroy(self) -> bool:
-        self.destroy_called = True
-        return True
-
-    @classmethod
-    async def get(cls, sandbox_id: str):
-        return cls.registry.get(sandbox_id)
+    async def destroy(self, session_id: str, reason: DestroyReason) -> None:
+        self.destroy_calls.append((session_id, reason))
 
 
 class _FakeTask:
@@ -86,7 +83,6 @@ def _make_uow_factory(repo: _FakeSessionRepo):
 
 
 def test_delete_session_cleans_related_task_and_sandbox() -> None:
-    _FakeSandbox.registry.clear()
     _FakeTaskCls.registry.clear()
 
     session = Session(
@@ -97,27 +93,27 @@ def test_delete_session_cleans_related_task_and_sandbox() -> None:
         task_id="task-1",
     )
     repo = _FakeSessionRepo(session=session)
-    sandbox = _FakeSandbox("sb-1")
     task = _FakeTask()
-    _FakeSandbox.registry["sb-1"] = sandbox
     _FakeTaskCls.registry["task-1"] = task
+    lifecycle = _FakeLifecycle()
 
     service = SessionService(
         uow_factory=_make_uow_factory(repo),
-        sandbox_cls=_FakeSandbox,
         task_cls=_FakeTaskCls,
+        sandbox_lifecycle_service=lifecycle,
     )
 
     asyncio.run(service.delete_session("s-delete-1", user_id="owner", is_admin=False))
 
     assert task.cancel_called is True
     assert task.cancel_reason == "session_delete"
-    assert sandbox.destroy_called is True
+    assert lifecycle.destroy_calls == [("s-delete-1", DestroyReason.SESSION_DELETE)]
     assert repo.deleted_ids == ["s-delete-1"]
 
 
-def test_delete_session_skips_sandbox_destroy_when_shared_sandbox(monkeypatch) -> None:
-    _FakeSandbox.registry.clear()
+def test_delete_session_skips_sandbox_destroy_when_lifecycle_absent() -> None:
+    """当 lifecycle 未注入 (e.g. shared-sandbox 模式下 DI 决定不给 SessionService
+    挂 lifecycle), delete_session 必须跳过 destroy 路径, 不抛 AttributeError."""
     _FakeTaskCls.registry.clear()
 
     session = Session(
@@ -128,24 +124,13 @@ def test_delete_session_skips_sandbox_destroy_when_shared_sandbox(monkeypatch) -
         task_id=None,
     )
     repo = _FakeSessionRepo(session=session)
-    sandbox = _FakeSandbox("sb-shared")
-    _FakeSandbox.registry["sb-shared"] = sandbox
-
-    class _Settings:
-        sandbox_address = "shared-sandbox.example.com"
-
-    monkeypatch.setattr(
-        "app.application.services.session_service.get_settings",
-        lambda: _Settings(),
-    )
 
     service = SessionService(
         uow_factory=_make_uow_factory(repo),
-        sandbox_cls=_FakeSandbox,
         task_cls=_FakeTaskCls,
+        sandbox_lifecycle_service=None,  # DI 决定不注入: shared / 单测场景
     )
 
     asyncio.run(service.delete_session("s-delete-2", user_id="owner", is_admin=False))
 
-    assert sandbox.destroy_called is False
     assert repo.deleted_ids == ["s-delete-2"]

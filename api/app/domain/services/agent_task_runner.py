@@ -1917,9 +1917,25 @@ class AgentTaskRunner(TaskRunner):
 
     @staticmethod
     def _is_unknown_tool_event(event: ToolEvent) -> bool:
-        """判断 ToolEvent 是否为 unknown-tool 降级结果。"""
+        """判断 ToolEvent 是否为 unknown-tool 降级结果.
+
+        R4 路径: react_graph 合成 AllowError(reason.code="unknown_tool") 后,
+        _translate_outcome 把 payload 存到 event.artifact dict 而非 function_result.data.
+        优先读 artifact.outcome.reason.code, legacy fallback 保留用于
+        pre-R4 事件日志回放 (function_result.data["code"] == "UNKNOWN_TOOL").
+        """
         if event.status != ToolEventStatus.CALLED:
             return False
+
+        # R4 path: artifact dict 保留 outcome.reason.code (小写 "unknown_tool")
+        if isinstance(event.artifact, dict):
+            outcome = event.artifact.get("outcome")
+            if isinstance(outcome, dict):
+                reason = outcome.get("reason")
+                if isinstance(reason, dict) and reason.get("code") == "unknown_tool":
+                    return True
+
+        # Legacy path: pre-R4 事件日志回放 (大写 "UNKNOWN_TOOL")
         result = event.function_result
         if not result or result.success:
             return False
