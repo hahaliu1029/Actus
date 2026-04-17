@@ -422,6 +422,77 @@ async def test_create_memory_returns_201(
     assert kwargs["category"] == "user"
     assert kwargs["pinned"] is True
     assert kwargs["source"] == "manual"
+    # tags 默认没传 → None（service 侧可选参数）
+    assert kwargs.get("tags") is None
+
+
+async def test_create_memory_with_tags_passes_cleaned_list(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """PR-7 tags 路径：输入 strip/dedupe 后交给 service。"""
+    import dataclasses
+
+    created = _make_chunk(
+        chunk_id="mem-tagged",
+        user_id=TEST_USER_ID_FIXED,
+        content="Go preference",
+        source="manual",
+    )
+    created = dataclasses.replace(created, category="user", fs_synced=True)
+    mock_service.create_memory = AsyncMock(return_value=created)
+
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={
+            "content": "Go preference",
+            "category": "user",
+            "tags": [" Go ", "", "backend", "Go"],  # 冗余 + 空 + 重复
+        },
+    )
+    assert response.status_code == 201
+    kwargs = mock_service.create_memory.call_args.kwargs
+    # pydantic _normalize_tags 清洗后：strip + 丢空 + 保序去重
+    assert kwargs["tags"] == ["Go", "backend"]
+
+
+async def test_create_memory_tag_too_long_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """单个 tag 超过 64 字符 → pydantic 422，不到 service。"""
+    mock_service.create_memory = AsyncMock()
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={
+            "content": "x",
+            "category": "fact",
+            "tags": ["x" * 65],
+        },
+    )
+    assert response.status_code == 422
+    mock_service.create_memory.assert_not_called()
+
+
+async def test_create_memory_too_many_tags_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """tags 数量超过 20 → pydantic 422。"""
+    mock_service.create_memory = AsyncMock()
+    response = await _request(
+        client_app,
+        "POST",
+        "/api/v2/memories",
+        json={
+            "content": "x",
+            "category": "fact",
+            "tags": [f"t{i}" for i in range(21)],
+        },
+    )
+    assert response.status_code == 422
+    mock_service.create_memory.assert_not_called()
 
 
 async def test_create_memory_pinned_rule_rejected_by_schema(

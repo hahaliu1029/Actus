@@ -4,6 +4,7 @@
 
 import { del, get, post, request } from "./fetch";
 import type {
+  CreateMemoryRequest,
   DeleteCountResponse,
   MemoryDetail,
   MemoryListParams,
@@ -25,6 +26,7 @@ export const memoryApi = {
     const query: Record<string, string | number | boolean> = {};
     if (params.query) query.query = params.query;
     if (params.source) query.source = params.source;
+    if (params.category) query.category = params.category;
     if (params.created_from) query.created_from = params.created_from;
     if (params.created_to) query.created_to = params.created_to;
     if (params.updated_from) query.updated_from = params.updated_from;
@@ -33,6 +35,9 @@ export const memoryApi = {
     if (params.page_size) query.page_size = params.page_size;
     return get<MemoryListResponse>("/v2/memories", query);
   },
+
+  create: (body: CreateMemoryRequest) =>
+    post<MemoryDetail>("/v2/memories", body),
 
   getDetail: (id: string) =>
     get<MemoryDetail>(`/v2/memories/${id}`),

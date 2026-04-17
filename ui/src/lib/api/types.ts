@@ -680,6 +680,12 @@ export type UserStatusUpdateRequest = {
 
 // ==================== Memory Management ====================
 
+/**
+ * PR-1 起后端把 memory 分三类。旧数据 category=NULL（不强制回填），
+ * 所以 UI 侧在列表里要能显式表达 "legacy（未分类）" 的场景。
+ */
+export type MemoryCategory = "user" | "rule" | "fact";
+
 export interface MemoryItem {
   id: string;
   content: string;
@@ -687,11 +693,18 @@ export interface MemoryItem {
   created_at: string;
   updated_at: string;
   session_id: string | null;
+  // PR-1 新增字段——列表视图按 category 过滤 + 显示 pinned badge。
+  // legacy 行 category=null 表示 PR-1 前的数据，UI 显示为 "未分类"。
+  category: MemoryCategory | null;
+  pinned: boolean;
+  auto_promoted_at: string | null;
 }
 
 export interface MemoryDetail extends MemoryItem {
   content_hash: string;
   metadata: Record<string, unknown>;
+  // fs_synced 只在详情暴露（设计 L35）：list 视图不关心同步状态。
+  fs_synced: boolean;
 }
 
 export interface MemoryListResponse {
@@ -705,12 +718,29 @@ export interface MemoryListResponse {
 export interface MemoryListParams {
   query?: string;
   source?: string;
+  /** 传 undefined 返回全部（含 legacy null）；传具体 category 只返回该类。 */
+  category?: MemoryCategory;
   created_from?: string;
   created_to?: string;
   updated_from?: string;
   updated_to?: string;
   page?: number;
   page_size?: number;
+}
+
+/**
+ * POST /v2/memories 请求体。source 由服务端固定为 "manual"，客户端不传。
+ * pinned=true 仅在 category="user" 时合法——后端 400，UI 侧也提前 disable。
+ *
+ * ``tags``（可选）：落到 frontmatter ``tags:`` + ``metadata.tags``。后端侧已做
+ * strip/dedupe/单条 64 字符/最多 20 条的校验，客户端只需把用户输入切开传上去；
+ * 空数组可以直接不传（或传 undefined）。
+ */
+export interface CreateMemoryRequest {
+  content: string;
+  category: MemoryCategory;
+  pinned?: boolean;
+  tags?: string[];
 }
 
 export interface DeleteCountResponse {

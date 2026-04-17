@@ -742,6 +742,85 @@ class TestDeriveTitle:
         assert fm["title"] == "pref: go 10 years"  # content 首行
 
 
+class TestCreateTags:
+    """PR-7: 手动创建支持 tags → metadata["tags"] → frontmatter。"""
+
+    async def test_clean_tags_helper_dedupes_strips_and_caps(self):
+        from app.application.services.memory_management_service import _clean_tags
+
+        # 空 / None → []
+        assert _clean_tags(None) == []
+        assert _clean_tags([]) == []
+        # strip + 丢空 + 去重（大小写敏感、保序）
+        assert _clean_tags([" Go ", "", "  ", "react", "go", "Go"]) == [
+            "Go", "react", "go",
+        ]
+        # 超过 20 条截断
+        many = [f"t{i}" for i in range(30)]
+        out = _clean_tags(many)
+        assert len(out) == 20
+        assert out[0] == "t0" and out[19] == "t19"
+        # 单 tag 超长截断到 64
+        long_tag = "x" * 100
+        assert _clean_tags([long_tag]) == ["x" * 64]
+
+    async def test_create_memory_persists_tags_to_metadata(
+        self, service, mock_repo, mock_session
+    ):
+        """service.create_memory(tags=[...]) → chunk.metadata["tags"] 被填充。"""
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+
+        chunk = await service.create_memory(
+            TEST_USER_ID_FIXED,
+            content="prefers Go",
+            category="user",
+            tags=["Go", "backend"],
+        )
+        assert chunk.metadata.get("tags") == ["Go", "backend"]
+
+    async def test_create_memory_empty_tags_no_metadata_key(
+        self, service, mock_repo, mock_session
+    ):
+        """tags=None 或 []  不写 metadata["tags"] key——避免 DB 里一堆空 list 噪声。"""
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+
+        chunk_none = await service.create_memory(
+            TEST_USER_ID_FIXED, "x", "rule", tags=None
+        )
+        assert "tags" not in chunk_none.metadata
+
+        chunk_empty = await service.create_memory(
+            TEST_USER_ID_FIXED, "y", "rule", tags=[]
+        )
+        assert "tags" not in chunk_empty.metadata
+
+    async def test_build_frontmatter_renders_tags_from_metadata(self):
+        """_build_frontmatter 已读 metadata['tags']——这里回归 tags 从 service
+        的 metadata 一路传到 frontmatter 的链路。"""
+        from datetime import datetime, timezone
+
+        from app.application.services.memory_management_service import (
+            MemoryManagementService,
+        )
+        from app.domain.models.memory_chunk import MemoryChunk
+
+        chunk = MemoryChunk(
+            id="01HXYZ",
+            user_id=TEST_USER_ID_FIXED,
+            content="c",
+            content_hash="h",
+            source="manual",
+            metadata={"tags": ["Go", "TypeScript"]},
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            session_id=None,
+            embedding=None,
+            category="user",
+        )
+        fm = MemoryManagementService._build_frontmatter(chunk)
+        assert fm["tags"] == ["Go", "TypeScript"]
+
+
 class TestCreateFsSync:
     async def test_fs_write_includes_title_in_frontmatter(
         self, mock_repo, mock_embed, mock_session

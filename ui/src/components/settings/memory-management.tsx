@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 
+import { MemoryCreateDialog } from "@/components/settings/memory-create-dialog";
 import { MemoryDetailDrawer } from "@/components/settings/memory-detail-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,10 +21,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import type { MemoryItem } from "@/lib/api/types";
+import type { MemoryCategory, MemoryItem } from "@/lib/api/types";
 import {
+  MEMORY_CATEGORY_FILTER_OPTIONS,
   MEMORY_SOURCE_OPTIONS,
   formatRelativeTime,
+  memoryCategoryLabel,
   memorySourceLabel,
   truncateText,
 } from "@/lib/memory-utils";
@@ -36,6 +39,8 @@ import {
   ChevronRight,
   LoaderCircle,
   Pencil,
+  Pin,
+  Plus,
   RotateCcw,
   Search,
   Trash2,
@@ -71,10 +76,17 @@ export function MemoryManagement() {
   const [sourceValue, setSourceValue] = useState<string>(
     memoryFilters.source ?? ""
   );
+  // Category filter: "" = all (含 legacy null 行)；具体枚举只返回该类（后端
+  // 行为见 list_memories endpoint）。state 用 "" | MemoryCategory 联合以便
+  // 直接绑定原生 <select>。
+  const [categoryValue, setCategoryValue] = useState<"" | MemoryCategory>(
+    (memoryFilters.category ?? "") as "" | MemoryCategory
+  );
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const [detailId, setDetailId] = useState<string | null>(null);
   const [isDetailOpen, setIsDetailOpen] = useState(false);
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
 
   const [singleDeleteTarget, setSingleDeleteTarget] =
     useState<MemoryItem | null>(null);
@@ -101,6 +113,7 @@ export function MemoryManagement() {
   useEffect(() => {
     setQueryInput("");
     setSourceValue("");
+    setCategoryValue("");
     loadMemoriesIgnore({ page: 1 }, { replaceFilters: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -137,9 +150,22 @@ export function MemoryManagement() {
     [loadMemoriesIgnore]
   );
 
+  const handleCategoryChange = useCallback(
+    (value: "" | MemoryCategory) => {
+      setCategoryValue(value);
+      // "" → 不传 category（含 legacy null）；具体枚举 → 精确过滤。
+      loadMemoriesIgnore({
+        category: value === "" ? undefined : value,
+        page: 1,
+      });
+    },
+    [loadMemoriesIgnore]
+  );
+
   const handleReset = useCallback(() => {
     setQueryInput("");
     setSourceValue("");
+    setCategoryValue("");
     setSelectedIds(new Set());
     // replaceFilters=true 清空所有 filter（不依赖把 undefined 并进旧对象）。
     loadMemoriesIgnore({ page: 1 }, { replaceFilters: true });
@@ -156,6 +182,7 @@ export function MemoryManagement() {
     return Boolean(
       f.query ||
         f.source ||
+        f.category ||
         f.created_from ||
         f.created_to ||
         f.updated_from ||
@@ -301,6 +328,21 @@ export function MemoryManagement() {
         </div>
 
         <select
+          aria-label="按分类筛选"
+          value={categoryValue}
+          onChange={(e) =>
+            handleCategoryChange(e.target.value as "" | MemoryCategory)
+          }
+          className="h-9 rounded-md border border-input bg-background px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
+        >
+          {MEMORY_CATEGORY_FILTER_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+
+        <select
           aria-label="按来源筛选"
           value={sourceValue}
           onChange={(e) => handleSourceChange(e.target.value)}
@@ -322,6 +364,15 @@ export function MemoryManagement() {
           <span className="text-sm text-muted-foreground">
             共 {memoryTotal} 条记忆
           </span>
+          <Button
+            variant="default"
+            size="sm"
+            onClick={() => setIsCreateOpen(true)}
+            aria-label="新建记忆"
+          >
+            <Plus className="mr-1 size-4" />
+            新建记忆
+          </Button>
           <Button
             variant="destructive"
             size="sm"
@@ -440,6 +491,24 @@ export function MemoryManagement() {
                         {truncateText(item.content, 200)}
                       </p>
                       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        {/* Category badge — legacy (null) 用 outline 区分 PR-1 前的历史数据 */}
+                        <Badge
+                          variant={item.category === null ? "outline" : "default"}
+                          className="rounded-md text-xs"
+                          data-testid={`memory-category-badge-${item.id}`}
+                        >
+                          {memoryCategoryLabel(item.category)}
+                        </Badge>
+                        {item.pinned && (
+                          <Badge
+                            variant="secondary"
+                            className="rounded-md text-xs"
+                            data-testid={`memory-pinned-badge-${item.id}`}
+                          >
+                            <Pin className="mr-0.5 size-3" />
+                            置顶
+                          </Badge>
+                        )}
                         <Badge
                           variant="secondary"
                           className="rounded-md text-xs"
@@ -646,6 +715,12 @@ export function MemoryManagement() {
           if (!open) setDetailId(null);
         }}
       />
+
+      {/* Create dialog — 条件渲染：每次打开都是新 mount，初始 state 干净，
+          不需要 useEffect 手动复位（避免 react-hooks/set-state-in-effect）。 */}
+      {isCreateOpen && (
+        <MemoryCreateDialog open onOpenChange={setIsCreateOpen} />
+      )}
     </div>
   );
 }

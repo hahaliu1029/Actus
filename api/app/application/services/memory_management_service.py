@@ -30,9 +30,35 @@ from app.domain.models.memory_chunk import MemoryChunk, memory_content_hash
 
 _AUDIT_CONTENT_PREVIEW_LIMIT = 200
 _TITLE_MAX_LENGTH = 80
+_TAG_MAX_LENGTH = 64
+_TAGS_MAX_COUNT = 20
 # 允许的 manual / memory_save 写入路径枚举；DB CHECK 再兜一次
 _ALLOWED_CATEGORIES = frozenset({"user", "rule", "fact"})
 _ALLOWED_SOURCES = frozenset({"session_flush", "manual", "memory_save"})
+
+
+def _clean_tags(tags: list[str] | None) -> list[str]:
+    """Service 侧的 tags 容错清洗：strip + 丢空 + 去重（保序、大小写敏感）+ 长度截断。
+
+    interfaces 层 ``CreateMemoryRequest._normalize_tags`` 已做主清洗；这里再跑一遍
+    是为了覆盖 interfaces 之外的调用者（未来 flush gate / 批量导入路径）——service
+    层不能假设 tags 一定来自 API 入口。返回空 list 表示"无 tags"。
+    """
+    if not tags:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in tags:
+        if not isinstance(raw, str):
+            continue
+        t = raw.strip()[:_TAG_MAX_LENGTH]
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= _TAGS_MAX_COUNT:
+            break
+    return out
 
 
 def _derive_title(content: str) -> str:
@@ -151,6 +177,7 @@ class MemoryManagementService:
         source: str = "manual",
         pinned: bool = False,
         session_id: str | None = None,
+        tags: list[str] | None = None,
     ) -> MemoryChunk:
         """DB-first 写入（设计文档 "Create Flow"）。
 
@@ -169,6 +196,9 @@ class MemoryManagementService:
         - ``source`` 必须在 ``{session_flush, manual, memory_save}`` 内
         - ``pinned=True`` 仅允许在 ``category='user'`` 时——DB CHECK 兜底，这里
           提前校验给调用方一个 ValueError（API 层会 map 成 400）
+        - ``tags`` 可选（设计 L71）：落到 ``metadata.tags``，被 ``_build_frontmatter``
+          序列化到磁盘 YAML。已由 ``CreateMemoryRequest`` pydantic 侧做 strip/dedupe/
+          长度校验；service 只做容错清洗（非 str / 超长）+ 持久化。
         """
         content = content.strip()
         if not content:
@@ -183,6 +213,7 @@ class MemoryManagementService:
             )
         if pinned and category != "user":
             raise ValueError("pinned=True 仅允许在 category='user' 时使用")
+        cleaned_tags = _clean_tags(tags)
 
         # Per-user 每日 quota（跨 memory_save / POST / 未来文件导入共享）。
         # ``quota_was_incremented`` 追踪本次是否真的 INCR 过——只有当 Redis
@@ -218,6 +249,11 @@ class MemoryManagementService:
         # fs_synced 一定从 False 起步——FsMemoryWriter 落盘后才翻成 True，
         # 若注入 NoopFileMemoryStore（测试）或保持 None（DB-only），下面的
         # fs-write step 会处理 true 的翻转
+        # metadata 里只在有 tags 时放 "tags" key——避免一堆 {"tags": []} 的噪声
+        # 落到 DB。``_build_frontmatter`` 读取时 ``metadata.get("tags", [])`` 兜底。
+        metadata: dict = {}
+        if cleaned_tags:
+            metadata["tags"] = cleaned_tags
         chunk = MemoryChunk(
             id=chunk_id,
             user_id=user_id,
@@ -225,7 +261,7 @@ class MemoryManagementService:
             content=content,
             content_hash=content_hash,
             source=source,
-            metadata={},
+            metadata=metadata,
             created_at=now,
             updated_at=now,
             embedding=embedding,

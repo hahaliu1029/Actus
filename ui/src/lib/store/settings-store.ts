@@ -92,8 +92,9 @@ type SettingsActions = {
   deleteMemory: (id: string) => Promise<void>;
   bulkDeleteMemories: (ids: string[]) => Promise<void>;
   deleteAllMemories: () => Promise<void>;
-  // 注：记忆内容的编辑由 detail drawer 直接调用 memoryApi.updateContent
-  // 以便内联展示 409 冲突；store 不再维护第二套更新路径，避免双路径漂移。
+  // 注：记忆内容的编辑和 **新建** 都由相应的 dialog/drawer 直接调用 memoryApi，
+  // 以便内联展示 409/429/400 等业务错误，而不是被全局 error toast 吞掉；
+  // 刷新列表走 get().loadMemories()。store 不维护第二套写入路径，避免双路径漂移。
 };
 
 type SettingsStore = SettingsState & SettingsActions;

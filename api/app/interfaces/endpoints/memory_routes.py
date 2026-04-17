@@ -106,6 +106,7 @@ async def create_memory(
             category=body.category,
             pinned=body.pinned,
             source="manual",
+            tags=body.tags,
         )
     except ValueError as exc:
         # service 对空内容 / 非法分类抛 ValueError → 400
