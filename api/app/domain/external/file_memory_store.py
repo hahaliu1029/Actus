@@ -43,8 +43,16 @@ class FileMemoryStore(Protocol):
         memory_id: str,
         from_category: str,
         to_category: str,
+        content: str,
+        new_frontmatter: dict,
     ) -> None:
-        """category 变更：先写新路径、再删旧路径。"""
+        """category 变更：先写新路径、再删旧路径。
+
+        ``content`` + ``new_frontmatter`` 由 service 层提供——writer 侧不再
+        "读旧文件 + 搬 bytes"，那样会把旧 ``category: X`` 残留写到新路径下
+        的 YAML 里，路径和 frontmatter 自相矛盾。由 service 构造新 frontmatter
+        (category 已更新) 和 content，writer 只负责原子落盘 + 清旧。
+        """
         ...
 
 
@@ -83,5 +91,7 @@ class NoopFileMemoryStore(FileMemoryStore):
         memory_id: str,
         from_category: str,
         to_category: str,
+        content: str,
+        new_frontmatter: dict,
     ) -> None:
         return None

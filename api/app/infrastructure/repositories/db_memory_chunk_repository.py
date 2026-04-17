@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -198,6 +197,10 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
     ) -> MemoryChunk | None:
         # updated_at 走数据库 now() —— `update().values()` 绕过 ORM 脏标记，
         # onupdate=datetime.now 不会触发；使用服务端时间消除多 pod 时钟漂移。
+        # fs_synced=False 原子归并到同一条 UPDATE：内容一变，文件就 out-of-sync，
+        # 直到 FsMemoryWriter 回写完成。放一条语句里可免一次 round trip + 避免
+        # "content 已改但 flag 还没翻" 的窗口期（如果两步分开，窗口内 reconciler
+        # 看到 fs_synced=true 会跳过已失效文件）。
         stmt = (
             update(MemoryChunkModel)
             .where(
@@ -209,6 +212,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
                 content_hash=content_hash,
                 embedding=list(embedding) if embedding is not None else None,
                 updated_at=text("now()"),
+                fs_synced=False,
             )
             .returning(MemoryChunkModel)
         )
@@ -237,21 +241,25 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         result = await self.db_session.execute(stmt)
         return [self._to_domain(row) for row in result.scalars().all()]
 
-    async def delete_all_by_user(self, *, user_id: str) -> dict[str, int]:
-        """删除本用户所有记忆，返回实际被删除行按 source 分组的数量。
+    async def delete_all_by_user(self, *, user_id: str) -> list[MemoryChunk]:
+        """删除本用户所有记忆，返回实际被删除的行（``DELETE ... RETURNING *``）。
 
-        使用 ``DELETE ... RETURNING source`` + 应用层 Counter 聚合，确保
-        "实际删除"和"source 分布"来自同一条语句，避免多次查询的竞态不一致。
-        返回单个 source 字符串（~10 字符），即便 10 万条记忆也只占 ~1MB 内存。
+        PR-5A 起返回完整 row：调用方同时需要 source 分布（审计）和 (id, category)
+        对（FsMemoryWriter.delete）。单条 RETURNING 把"实际删除集"、"source
+        分布"、"待清盘文件列表"锁在同一语句下，避免 READ COMMITTED 并发竞态。
+
+        N.B. 相对于 PR-0 版本（``RETURNING source`` 标量），本版本把每行所有列
+        拉回来。nuclear delete 是低频操作（用户 "danger zone" 按钮），多出的
+        列开销可接受；memory_chunks 行无超大字段（content 典型 <1KB），10 万
+        行 ≈ 100MB 也只在一次请求内存里活几秒。
         """
         stmt = (
             delete(MemoryChunkModel)
             .where(MemoryChunkModel.user_id == user_id)
-            .returning(MemoryChunkModel.source)
+            .returning(MemoryChunkModel)
         )
         result = await self.db_session.execute(stmt)
-        sources = list(result.scalars().all())
-        return dict(Counter(sources))
+        return [self._to_domain(row) for row in result.scalars().all()]
 
     # ---- Filter helper ----
 

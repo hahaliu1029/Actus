@@ -144,11 +144,14 @@ class MemoryChunkRepository(Protocol):
         """
         ...
 
-    async def delete_all_by_user(self, *, user_id: str) -> dict[str, int]:
-        """删除当前用户全部记忆，返回实际被删除行按 source 分组的数量。
+    async def delete_all_by_user(self, *, user_id: str) -> list[MemoryChunk]:
+        """删除当前用户全部记忆，返回实际被删除的行（``DELETE ... RETURNING``）。
 
-        使用 DELETE ... RETURNING source：确保"实际删除集"和"source 分布"
-        出自同一条语句，避免 READ COMMITTED 下多次查询的竞态不一致。
-        调用方取总数用 ``sum(result.values())``。
+        PR-5A 起返回完整 row 列表——调用方同时需要 source 分布（审计）和
+        (id, category) 对（FsMemoryWriter.delete 清盘）。用单条 RETURNING
+        保证这两视图出自同一条语句，避免 READ COMMITTED 下多次查询的竞态。
+
+        调用方侧：``source 分布 = Counter(c.source for c in result)``；
+        ``总数 = len(result)``。
         """
         ...

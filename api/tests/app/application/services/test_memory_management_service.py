@@ -76,8 +76,9 @@ def mock_repo():
     repo.update_content = AsyncMock(return_value=None)
     # delete_by_ids 现在返回 DELETE ... RETURNING 的实际删除行列表
     repo.delete_by_ids = AsyncMock(return_value=[])
-    # delete_all_by_user 返回 RETURNING source 聚合后的分布
-    repo.delete_all_by_user = AsyncMock(return_value={})
+    # PR-5A 起 delete_all_by_user 返回完整 row 列表（RETURNING *），供服务
+    # 层同时聚合 source_dist（审计）+ 提取 (id, category)（fs 清盘）
+    repo.delete_all_by_user = AsyncMock(return_value=[])
     return repo
 
 
@@ -223,18 +224,19 @@ class TestBulkDelete:
 
 class TestDeleteAll:
     async def test_returns_count(self, service, mock_repo):
-        # delete_all_by_user 返回 RETURNING source 聚合后的分布；总数 = sum(values)
-        mock_repo.delete_all_by_user.return_value = {
-            "session_flush": 7,
-            "file": 3,
-        }
+        # PR-5A: delete_all_by_user 返回完整 row 列表；总数 = len(list)
+        mock_repo.delete_all_by_user.return_value = [
+            _chunk(content="a"),
+            _chunk(content="b"),
+            _chunk(content="c"),
+        ]
         count = await service.delete_all_memories(TEST_USER_ID_FIXED)
-        assert count == 10
+        assert count == 3
 
     async def test_empty_returns_zero_and_no_audit(
         self, service, mock_repo, mock_session
     ):
-        mock_repo.delete_all_by_user.return_value = {}
+        mock_repo.delete_all_by_user.return_value = []
         count = await service.delete_all_memories(TEST_USER_ID_FIXED)
         assert count == 0
         assert not mock_session.add.called
@@ -260,11 +262,16 @@ class TestAuditWritten:
         self, service, mock_repo, mock_session
     ):
         """delete_all 审计的 source_distribution 与 affected_count 必须
-        来自同一条 DELETE ... RETURNING source 语句，避免多次查询的竞态。"""
-        mock_repo.delete_all_by_user.return_value = {
-            "session_flush": 42,
-            "file": 8,
-        }
+        来自同一条 DELETE ... RETURNING * 语句（PR-5A）。Service 在 rows
+        上做 Counter 聚合，保证审计 + fs 清盘共享同一真实集。"""
+        import dataclasses
+        flush_rows = [_chunk(content=f"flush_{i}") for i in range(42)]
+        file_rows = [
+            dataclasses.replace(_chunk(content=f"file_{i}"), source="file")
+            for i in range(8)
+        ]
+        rows = flush_rows + file_rows
+        mock_repo.delete_all_by_user.return_value = rows
 
         await service.delete_all_memories(TEST_USER_ID_FIXED)
         assert mock_session.add.called
@@ -642,3 +649,382 @@ class TestCreateMemory:
         assert chunk.id is not None
         # fs_synced 保持 False（DB 侧未翻）——reconciler 会补
         assert chunk.fs_synced is False
+
+
+# ─── M1 PR-5A: fs sync 挂接（update / delete / bulk_delete / delete_all）──────
+
+
+class _RecordingFileStore:
+    """Simple ``FileMemoryStore`` impl that records every call for assertions.
+
+    Subclass / configure via constructor to inject failures. Default is
+    "all ops succeed, no-op on disk". ``write_fails`` triggers exception on
+    every write; ``delete_fails`` triggers exception on every delete. Uses
+    the same ``NoopFileMemoryStore``-style signatures (kwargs).
+    """
+
+    def __init__(
+        self,
+        *,
+        write_fails: Exception | None = None,
+        delete_fails: Exception | None = None,
+    ):
+        self.writes: list[dict] = []
+        self.deletes: list[dict] = []
+        self._write_fails = write_fails
+        self._delete_fails = delete_fails
+
+    async def write(self, **kwargs):
+        self.writes.append(kwargs)
+        if self._write_fails is not None:
+            raise self._write_fails
+
+    async def delete(self, **kwargs):
+        self.deletes.append(kwargs)
+        if self._delete_fails is not None:
+            raise self._delete_fails
+
+    async def move_category(self, **kwargs):
+        pass
+
+
+class TestDeriveTitle:
+    """P2-1 回归：service 落盘的 frontmatter 必须含 canonical 声明的 title 字段。"""
+
+    def test_derive_title_takes_first_line_stripped(self):
+        from app.application.services.memory_management_service import _derive_title
+        assert _derive_title("  Hello world  \ntrailing line") == "Hello world"
+
+    def test_derive_title_empty_content_falls_back_to_untitled(self):
+        from app.application.services.memory_management_service import _derive_title
+        assert _derive_title("") == "untitled"
+        assert _derive_title("   \n\n  ") == "untitled"
+
+    def test_derive_title_truncates_long_first_line_with_ellipsis(self):
+        from app.application.services.memory_management_service import (
+            _TITLE_MAX_LENGTH,
+            _derive_title,
+        )
+        long_text = "A" * (_TITLE_MAX_LENGTH + 20)
+        out = _derive_title(long_text)
+        assert len(out) == _TITLE_MAX_LENGTH + 1  # 80 chars + "…"
+        assert out.endswith("…")
+
+    def test_build_frontmatter_includes_title(self):
+        """_build_frontmatter output 的 key 集必须覆盖 canonical—— PR-5A
+        service 和 writer 协议不能各说各话。"""
+        from datetime import datetime, timezone
+
+        from app.application.services.memory_management_service import (
+            MemoryManagementService,
+        )
+        from app.domain.models.memory_chunk import MemoryChunk
+
+        chunk = MemoryChunk(
+            id="01HXYZ",
+            user_id=TEST_USER_ID_FIXED,
+            content="pref: go 10 years\nmore details",
+            content_hash="h",
+            source="manual",
+            metadata={"tags": ["go"]},
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            session_id=None,
+            embedding=None,
+            category="user",
+            pinned=True,
+        )
+        fm = MemoryManagementService._build_frontmatter(chunk)
+        # Canonical 8 字段缺一不可
+        expected = {"id", "title", "category", "source", "created_at",
+                    "updated_at", "pinned", "tags"}
+        assert expected <= set(fm.keys())
+        assert fm["title"] == "pref: go 10 years"  # content 首行
+
+
+class TestCreateFsSync:
+    async def test_fs_write_includes_title_in_frontmatter(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """Happy-path create → file_store.write 收到的 frontmatter 必须含 title。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        await svc.create_memory(
+            TEST_USER_ID_FIXED, "user prefers dark mode\nother notes", "user"
+        )
+        assert len(store.writes) == 1
+        fm = store.writes[0]["frontmatter"]
+        assert "title" in fm
+        assert fm["title"] == "user prefers dark mode"
+
+    async def test_fs_write_failure_logs_audit(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """FsMemoryWriter 重试耗尽后抛 OSError → service 写 fs_write_failed 审计。
+
+        设计 L426：retries 耗尽 → memory_audit_log.action='fs_write_failed' +
+        错误快照供 ops grep。MagicMock 会为每一条不同 session 记录 .add 调用，
+        这里断言任一 add 调用的对象 action 是 fs_write_failed。
+        """
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        mock_repo.batch_insert_ignore = AsyncMock(return_value=1)
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = _RecordingFileStore(write_fails=OSError("disk full"))
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        chunk = await svc.create_memory(TEST_USER_ID_FIXED, "x", "fact")
+        assert chunk.fs_synced is False
+        # add 至少被调用一次——fs_write_failed audit 写入路径
+        audit_calls = [
+            c for c in mock_session.add.call_args_list
+            if getattr(c[0][0], "action", None) == "fs_write_failed"
+        ]
+        assert len(audit_calls) == 1
+        audit = audit_calls[0][0][0]
+        assert audit.new_snapshot["failed_op"] == "create"
+        assert audit.new_snapshot["error_type"] == "OSError"
+        assert "disk full" in audit.new_snapshot["error_msg"]
+
+
+class TestUpdateFsSync:
+    async def test_update_calls_file_store_write_with_overwrite(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """PATCH → file_store.write(overwrite=True) + fs_synced flip True。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        old = _chunk()
+        import dataclasses
+        updated = dataclasses.replace(old, content="new content", fs_synced=False, category="user")
+        mock_repo.get_by_id.return_value = old
+        mock_repo.update_content.return_value = updated
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        result = await svc.update_memory_content(TEST_USER_ID_FIXED, old.id, "new content")
+
+        assert result is not None
+        assert result.fs_synced is True
+        assert len(store.writes) == 1
+        call = store.writes[0]
+        assert call["overwrite"] is True
+        assert call["memory_id"] == old.id
+        assert call["content"] == "new content"
+        # mark_fs_synced 翻 True
+        mock_repo.mark_fs_synced.assert_awaited_once()
+
+    async def test_update_fs_failure_keeps_fs_synced_false(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """file_store.write 失败 → 不翻 fs_synced=true，审计写入 fs_write_failed。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        old = _chunk()
+        import dataclasses
+        updated = dataclasses.replace(old, content="n", fs_synced=False, category="user")
+        mock_repo.get_by_id.return_value = old
+        mock_repo.update_content.return_value = updated
+        mock_repo.mark_fs_synced = AsyncMock()
+        store = _RecordingFileStore(write_fails=OSError("disk full"))
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        result = await svc.update_memory_content(TEST_USER_ID_FIXED, old.id, "n")
+        assert result is not None
+        assert result.fs_synced is False
+        mock_repo.mark_fs_synced.assert_not_called()
+
+    async def test_update_legacy_null_category_skips_fs(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """Legacy row（category IS NULL）没有文件盘路径——update 跳过 fs sync。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        import dataclasses
+        old = _chunk()
+        old = dataclasses.replace(old, category=None)
+        updated = dataclasses.replace(old, content="n")
+        mock_repo.get_by_id.return_value = old
+        mock_repo.update_content.return_value = updated
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        await svc.update_memory_content(TEST_USER_ID_FIXED, old.id, "n")
+        # Legacy 行没写盘，file_store 不应被 write 调到
+        assert store.writes == []
+
+
+class TestDeleteFsSync:
+    async def test_delete_calls_file_store_delete(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        import dataclasses
+        chunk = dataclasses.replace(_chunk(), category="user")
+        mock_repo.delete_by_ids.return_value = [chunk]
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        assert await svc.delete_memory(TEST_USER_ID_FIXED, chunk.id) is True
+        assert len(store.deletes) == 1
+        assert store.deletes[0]["memory_id"] == chunk.id
+        assert store.deletes[0]["category"] == "user"
+
+    async def test_delete_legacy_null_category_skips_fs(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        import dataclasses
+        chunk = dataclasses.replace(_chunk(), category=None)
+        mock_repo.delete_by_ids.return_value = [chunk]
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        await svc.delete_memory(TEST_USER_ID_FIXED, chunk.id)
+        assert store.deletes == []
+
+    async def test_delete_fs_failure_is_swallowed(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """file_store.delete 失败不应让 DELETE API 返回 500——
+        留作孤儿等 reconciler 清。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        import dataclasses
+        chunk = dataclasses.replace(_chunk(), category="user")
+        mock_repo.delete_by_ids.return_value = [chunk]
+        store = _RecordingFileStore(delete_fails=OSError("disk gone"))
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        # Shouldn't raise
+        assert await svc.delete_memory(TEST_USER_ID_FIXED, chunk.id) is True
+
+    async def test_bulk_delete_calls_file_store_delete_per_id(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        import dataclasses
+        chunks = [
+            dataclasses.replace(_chunk(content=f"c{i}"), category="user")
+            for i in range(3)
+        ]
+        # 混一条 legacy 进去
+        chunks.append(dataclasses.replace(_chunk(content="legacy"), category=None))
+        mock_repo.delete_by_ids.return_value = chunks
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        count = await svc.bulk_delete_memories(
+            TEST_USER_ID_FIXED, [c.id for c in chunks]
+        )
+        assert count == 4
+        # 3 条 user + 1 条 legacy → 只 fs delete 3 条
+        assert len(store.deletes) == 3
+        assert all(d["category"] == "user" for d in store.deletes)
+
+    async def test_delete_all_calls_file_store_delete_per_row(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        import dataclasses
+        rows = [
+            dataclasses.replace(_chunk(content=f"r{i}"), category="user")
+            for i in range(5)
+        ]
+        mock_repo.delete_all_by_user.return_value = rows
+        store = _RecordingFileStore()
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=store,
+        )
+
+        count = await svc.delete_all_memories(TEST_USER_ID_FIXED)
+        assert count == 5
+        assert len(store.deletes) == 5

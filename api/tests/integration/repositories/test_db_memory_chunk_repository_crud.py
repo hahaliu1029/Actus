@@ -220,10 +220,14 @@ class TestDeleteByIds:
 
 
 class TestDeleteAllByUser:
-    async def test_deletes_all_returning_source_distribution(
+    async def test_deletes_all_returning_rows(
         self, repo, user_id, db_session
     ):
-        """delete_all_by_user 返回 DELETE ... RETURNING source 聚合后的分布。"""
+        """PR-5A: delete_all_by_user 返回 DELETE ... RETURNING * 的完整行列表。
+        调用方（MemoryManagementService）从 rows 聚合 source_dist + 遍历
+        (id, category) 调 FsMemoryWriter.delete。"""
+        from collections import Counter
+
         await repo.batch_insert_ignore([
             _make_chunk(user_id, "a", source="session_flush"),
             _make_chunk(user_id, "b", source="session_flush"),
@@ -232,17 +236,18 @@ class TestDeleteAllByUser:
         await db_session.flush()
 
         deleted = await repo.delete_all_by_user(user_id=user_id)
-        assert deleted == {"session_flush": 2, "memory_save": 1}
-        # 总数即 sum(values)
-        assert sum(deleted.values()) == 3
+        assert len(deleted) == 3
+        # source 聚合出自 list，等同旧 dict API
+        dist = Counter(row.source for row in deleted)
+        assert dict(dist) == {"session_flush": 2, "memory_save": 1}
 
         remaining = await repo.list_by_user(user_id)
         assert len(remaining) == 0
 
-    async def test_empty_user_returns_empty_dict(self, repo, user_id):
-        """没有记忆时返回空 dict，调用方取 sum(values) == 0。"""
+    async def test_empty_user_returns_empty_list(self, repo, user_id):
+        """没有记忆时返回空 list，调用方取 len == 0。"""
         deleted = await repo.delete_all_by_user(user_id=user_id)
-        assert deleted == {}
+        assert deleted == []
 
 
 class TestListByUserTimeRange:

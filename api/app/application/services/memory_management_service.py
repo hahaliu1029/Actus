@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
@@ -28,9 +29,27 @@ from app.domain.external.embedding_provider import EmbeddingUnavailableError
 from app.domain.models.memory_chunk import MemoryChunk, memory_content_hash
 
 _AUDIT_CONTENT_PREVIEW_LIMIT = 200
+_TITLE_MAX_LENGTH = 80
 # 允许的 manual / memory_save 写入路径枚举；DB CHECK 再兜一次
 _ALLOWED_CATEGORIES = frozenset({"user", "rule", "fact"})
 _ALLOWED_SOURCES = frozenset({"session_flush", "manual", "memory_save"})
+
+
+def _derive_title(content: str) -> str:
+    """M1 降级版 title：内容首行 strip + 截断。
+
+    设计 L66：``title`` = "一行摘要，用户可手写或 LLM 自动生成"。PR-5A 阶段
+    没有 UI 输入也没有 LLM summary，取内容首行做 best-effort 衍生——保证
+    frontmatter canonical 完整性，不让 service / writer 协议各说各话。
+    后续 PR（UI title 字段 / LLM gate）接回 LLM 版本时替换本函数即可。
+    """
+    first_line = content.split("\n", 1)[0].strip()
+    if not first_line:
+        return "untitled"
+    if len(first_line) <= _TITLE_MAX_LENGTH:
+        return first_line
+    # 带省略号提示截断，避免 operator 误把截断后文本当完整 summary
+    return first_line[:_TITLE_MAX_LENGTH].rstrip() + "…"
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -243,56 +262,156 @@ class MemoryManagementService:
         # Step 4: 异步写文件；file_store=None 时保持 fs_synced=False 返回，
         # FsReconciler 或未来 lifespan 注入真实 writer 后再收尾
         if self._file_store is not None:
-            try:
-                await self._file_store.write(
+            fs_written = await self._try_fs_write(
+                user_id=user_id,
+                chunk=chunk,
+                content=content,
+                category=category,
+                overwrite=False,
+                action="create",
+            )
+            if fs_written:
+                chunk = await self._try_mark_fs_synced(
                     user_id=user_id,
-                    memory_id=chunk_id,
-                    category=category,
-                    content=content,
-                    frontmatter=self._build_frontmatter(chunk),
-                    overwrite=False,
-                )
-            except Exception:
-                # 写文件失败不 rollback DB——fs_synced=false 让 FsReconciler 重试
-                logger.warning(
-                    "file_store.write 失败，保留 fs_synced=false 等 reconciler 重试 chunk_id=%s",
-                    chunk_id,
-                    exc_info=True,
-                )
-                return chunk
-
-            # 成功写盘 → 翻 fs_synced。这里独立一个 session/事务，如果第二
-            # 事务失败（连接抖动、pool exhausted 等）**不能** 把整个请求打成
-            # 500——DB 行已经落了（fs_synced=false + 文件也写了），FsReconciler
-            # 扫到 false 会重试把 flag 补齐。吞异常 + warning，保持请求成功。
-            try:
-                async with self._session_factory() as session:
-                    repo = self._repo_factory(session)
-                    await repo.mark_fs_synced(
-                        chunk_id=chunk_id, user_id=user_id, synced=True
-                    )
-                    await session.commit()
-                # 返回反映最新状态的 chunk（frozen dataclass → replace）
-                chunk = dataclasses.replace(chunk, fs_synced=True)
-            except Exception:
-                logger.warning(
-                    "mark_fs_synced 失败——文件已落盘但 DB flag 未翻，"
-                    "等待 FsReconciler 补写 chunk_id=%s",
-                    chunk_id,
-                    exc_info=True,
+                    chunk=chunk,
+                    synced=True,
                 )
 
         return chunk
 
+    async def _try_fs_write(
+        self,
+        *,
+        user_id: str,
+        chunk: MemoryChunk,
+        content: str,
+        category: str,
+        overwrite: bool,
+        action: str,
+    ) -> bool:
+        """Wrap ``file_store.write`` with audit logging on final failure.
+
+        Returns True on success, False on failure. Failure path writes
+        ``memory_audit_log`` with ``action='fs_write_failed'`` (design L426)
+        so ops can grep for it + FsReconciler can pick up the
+        ``fs_synced=false`` row on next scan.
+
+        ``action`` is forwarded to the audit log field so callers distinguish
+        create / update / move failures. The FsMemoryWriter's internal retry
+        exhaustion triggers this path only once per logical operation.
+        """
+        if self._file_store is None:
+            return False
+        try:
+            await self._file_store.write(
+                user_id=user_id,
+                memory_id=chunk.id,
+                category=category,
+                content=content,
+                frontmatter=self._build_frontmatter(chunk),
+                overwrite=overwrite,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "file_store.write 失败（action=%s），保留 fs_synced=false 等 reconciler 重试 chunk_id=%s: %s",
+                action,
+                chunk.id,
+                exc,
+                exc_info=True,
+            )
+            await self._write_fs_failure_audit(
+                user_id=user_id,
+                chunk_id=chunk.id,
+                action=action,
+                error_type=type(exc).__name__,
+                error_msg=str(exc)[:500],
+            )
+            return False
+
+    async def _try_mark_fs_synced(
+        self,
+        *,
+        user_id: str,
+        chunk: MemoryChunk,
+        synced: bool,
+    ) -> MemoryChunk:
+        """Flip ``fs_synced`` in its own txn, swallowing failures.
+
+        DB row 已经落了（fs_synced=false + 文件也写了），mark 失败只是 flag
+        暂时没翻，FsReconciler 扫到 false 会重试补齐。吞异常 + warning，
+        保持请求成功——否则 500 让 UI 看起来像写入失败，但文件实际已落盘，
+        用户状态不一致，下次重试撞 ConflictError。
+        """
+        try:
+            async with self._session_factory() as session:
+                repo = self._repo_factory(session)
+                await repo.mark_fs_synced(
+                    chunk_id=chunk.id, user_id=user_id, synced=synced
+                )
+                await session.commit()
+            return dataclasses.replace(chunk, fs_synced=synced)
+        except Exception:
+            logger.warning(
+                "mark_fs_synced 失败——文件状态 %s 但 DB flag 未翻，"
+                "等待 FsReconciler 补写 chunk_id=%s",
+                "已落盘" if synced else "待补写",
+                chunk.id,
+                exc_info=True,
+            )
+            return chunk
+
+    async def _write_fs_failure_audit(
+        self,
+        *,
+        user_id: str,
+        chunk_id: str,
+        action: str,
+        error_type: str,
+        error_msg: str,
+    ) -> None:
+        """Append a ``fs_write_failed`` audit row.
+
+        独立事务——审计写失败不应掩盖原错误 / 不应让调用方感知额外异常。
+        设计 L426：retries 耗尽后写 audit，让 ops 有可 grep 的入口。
+        """
+        try:
+            async with self._session_factory() as session:
+                await self._write_audit(
+                    session,
+                    user_id=user_id,
+                    chunk_id=chunk_id,
+                    action="fs_write_failed",
+                    new_snapshot={
+                        "failed_op": action,
+                        "error_type": error_type,
+                        "error_msg": error_msg,
+                    },
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "fs_write_failed audit 记录本身失败 chunk_id=%s",
+                chunk_id,
+                exc_info=True,
+            )
+
     @staticmethod
     def _build_frontmatter(chunk: MemoryChunk) -> dict:
-        """SKILL.md / memory frontmatter canonical set（设计文档 L424）。
+        """Memory frontmatter canonical set（设计文档 L63-73 / L424）。
 
-        保持与 FsMemoryWriter（PR-5A）期望的字段一致，避免字段漂移。
-        依赖 MemoryChunk 的类型保证（created_at/updated_at/metadata 非空）。
+        字段必须覆盖 ``frontmatter.FRONTMATTER_KEYS`` 声明的 canonical 集，
+        否则 service 写出的文件和 writer 的 canonical 契约会漂移——canonical
+        声明 ``title`` 却永远不写，就是契约坏点。
+
+        ``title`` 的语义（设计 L66）："一行摘要，用户可手写或 LLM 自动生成"。
+        M1 没有 UI title 输入也没有 LLM auto-summary，降级为**内容首行衍生**：
+        strip + 截断到 80 字符，空内容兜底 ``"untitled"``。LLM 版本留到后续
+        PR（可在 PR-4+8 自动 flush gate 里一并接 title 生成）。
         """
         return {
             "id": chunk.id,
+            "title": _derive_title(chunk.content),
             "category": chunk.category,
             "source": chunk.source,
             "created_at": chunk.created_at.isoformat(),
@@ -380,7 +499,26 @@ class MemoryManagementService:
                 },
             )
             await session.commit()
-            return updated
+
+        # Fs sync 路径：``update_content`` 已把 fs_synced 原子翻成 False（单条
+        # SQL 合并）。这里独立写盘 + 成功后再把 flag 翻回 True。category 在 M1
+        # 不变（PATCH 不允许改 category），复用 ``updated.category``。
+        if self._file_store is not None and updated.category is not None:
+            fs_written = await self._try_fs_write(
+                user_id=user_id,
+                chunk=updated,
+                content=updated.content,
+                category=updated.category,
+                overwrite=True,
+                action="update",
+            )
+            if fs_written:
+                updated = await self._try_mark_fs_synced(
+                    user_id=user_id,
+                    chunk=updated,
+                    synced=True,
+                )
+        return updated
 
     async def delete_memory(self, user_id: str, chunk_id: str) -> bool:
         """单条删除。审计快照用 DELETE ... RETURNING 返回的真实被删行，
@@ -406,7 +544,34 @@ class MemoryManagementService:
                 },
             )
             await session.commit()
-            return True
+
+        # Fs delete 是 best-effort：DB 是检索主键来源，DB 删掉即对 agent 立刻
+        # 不可见；文件残留只是孤儿，由 FsReconciler 下一次扫描清。Legacy 行
+        # (category IS NULL) 从未写盘过，直接跳过。
+        if self._file_store is not None and actually_deleted.category is not None:
+            await self._best_effort_fs_delete(
+                user_id=user_id,
+                chunk_id=actually_deleted.id,
+                category=actually_deleted.category,
+            )
+        return True
+
+    async def _best_effort_fs_delete(
+        self, *, user_id: str, chunk_id: str, category: str
+    ) -> None:
+        """Idempotent fs-level unlink. Logs but does not raise on failure."""
+        if self._file_store is None:
+            return
+        try:
+            await self._file_store.delete(
+                user_id=user_id, memory_id=chunk_id, category=category
+            )
+        except Exception:
+            logger.warning(
+                "file_store.delete 失败，留作孤儿等 FsReconciler 清 chunk_id=%s",
+                chunk_id,
+                exc_info=True,
+            )
 
     async def bulk_delete_memories(self, user_id: str, ids: list[str]) -> int:
         """批量删除。仅删除本用户拥有的 id；审计只记录被 DELETE ... RETURNING
@@ -436,19 +601,37 @@ class MemoryManagementService:
                     },
                 )
                 await session.commit()
-            return deleted
+
+        # Fs cleanup 放 DB 事务之外，best-effort。循环一行一行调 delete 而非
+        # 批量 API 是因为 FileMemoryStore 协议只暴露单条 delete——M1 范围内不
+        # 扩协议。Legacy 行（category IS NULL）从未写盘，直接跳过。
+        if self._file_store is not None and deleted_rows:
+            for row in deleted_rows:
+                if row.category is None:
+                    continue
+                await self._best_effort_fs_delete(
+                    user_id=user_id,
+                    chunk_id=row.id,
+                    category=row.category,
+                )
+        return deleted
 
     async def delete_all_memories(self, user_id: str) -> int:
         """一键清空本用户全部记忆。
 
-        审计的 source_distribution 与 affected_count 均来自同一条
-        ``DELETE ... RETURNING source`` 语句（repo 层聚合），保证三者一致。
+        PR-5A 起 repo 返回完整 row 列表——调用方同时用于：
+        - 审计 ``source_distribution``（``Counter(c.source for c in rows)``）
+        - fs 清盘（遍历 rows 拿 (id, category)）
+
+        repo 侧单条 ``DELETE ... RETURNING *`` 保证两视图出自同一语句，
+        避免 READ COMMITTED 并发竞态。
         """
         async with self._session_factory() as session:
             repo = self._repo_factory(session)
-            source_dist = await repo.delete_all_by_user(user_id=user_id)
-            deleted = sum(source_dist.values())
+            deleted_rows = await repo.delete_all_by_user(user_id=user_id)
+            deleted = len(deleted_rows)
             if deleted > 0:
+                source_dist = dict(Counter(row.source for row in deleted_rows))
                 await self._write_audit(
                     session,
                     user_id=user_id,
@@ -460,7 +643,20 @@ class MemoryManagementService:
                     old_snapshot={"source_distribution": source_dist},
                 )
                 await session.commit()
-            return deleted
+
+        # Fs cleanup best-effort。同 bulk_delete，legacy (category IS NULL)
+        # 跳过。数量大时也不 Parallelize——避免 thread pool 饱和影响其他请求；
+        # delete_all 是用户主动点 "danger zone" 按钮的低频操作，顺序 I/O 可接受。
+        if self._file_store is not None and deleted_rows:
+            for row in deleted_rows:
+                if row.category is None:
+                    continue
+                await self._best_effort_fs_delete(
+                    user_id=user_id,
+                    chunk_id=row.id,
+                    category=row.category,
+                )
+        return deleted
 
     async def _write_audit(
         self,

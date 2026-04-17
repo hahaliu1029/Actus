@@ -171,10 +171,19 @@ async def lifespan(app: FastAPI):
         app.state.flush_service = flush_service
         logger.info("MemoryFlushService 初始化完成")
 
-        # 7b. FileMemoryStore 占位（M1 PR-0）：
-        # PR-5A 会替换为真实的 FsMemoryWriter。在此之前保持 None，
-        # MemoryManagementService 降级为 DB-only（不碰 memory 文件系统）。
-        app.state.file_memory_store = None
+        # 7b. FileMemoryStore 初始化（M1 PR-5A）：
+        # FsMemoryWriter 接 ``memory_root_container`` 下的落盘路径。容器内的
+        # 真实物理目录由 docker-compose 在 PR-6A 做 host 端 bind-mount；
+        # 在开发 / 单元测试环境下目录可能尚不存在（M0 spike 未跑或 config
+        # 指向 ``~/.actus/memory`` 默认值），FsMemoryWriter 内部首次 write
+        # 时会 mkdir -p 创建用户子目录，不依赖构造期目录存在。
+        from app.infrastructure.external.memory import FsMemoryWriter
+
+        _memory_root = settings.memory_root_container
+        app.state.file_memory_store = FsMemoryWriter(memory_root=_memory_root)
+        logger.info(
+            "FsMemoryWriter 初始化完成，memory_root=%s", _memory_root
+        )
 
         # 8. 初始化 SandboxLifecycleService 单例（同 checkpointer_pool 模式，eng review #9）
         from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
