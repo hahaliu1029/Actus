@@ -417,16 +417,66 @@ export type StepEvent = {
   description: string;
 };
 
-export type ToolEvent = {
+// ==================== R4 CS3 ToolEventEnvelopeV1 ====================
+
+export type ToolStatusV1 =
+  | "ok"
+  | "error"
+  | "denied"
+  | "timeout"
+  | "passthrough";
+  // 注意: asked 不在 envelope, 走独立 tool_confirmation 事件
+
+export type DecisionReasonWire = {
+  type: string;        // domain 白名单 6 值 + wire-only fallback "unknown_variant"
+                       //   domain: approval_policy | smart_approve | ast_validator |
+                       //           risk_enforce | exception | timeout
+                       //   wire-only: unknown_variant (projector fallback)
+  code: string;
+  message: string;
+};
+
+export type FunctionResultV1 = {
+  status: ToolStatusV1;
+  message: string;
+  data: unknown;
+  retryable: boolean;
+  user_action_required: boolean;  // 恒为 false in v1 (asked 走 tool_confirmation)
+  reason?: DecisionReasonWire | null;
+  result_blocks?: Array<Record<string, unknown>> | null;
+};
+
+export type RenderStyle = "text" | "code" | "table" | "image" | "document";
+
+export type ToolSource = {
+  source: "native" | "mcp" | "a2a" | "skill";
+  category: string;
+  canonical_name: string;
+};
+
+export type ToolEventEnvelopeV1 = {
+  envelope_version: 1;
   event_id?: string;
   created_at?: number;
+
   tool_call_id: string;
-  name: string;
-  function: string;
-  args: Record<string, unknown>;
-  content?: unknown;
-  status?: ToolEventStatus;
+  name: string;                          // wire 短名 (backend alias from tool_name)
+  tool_source?: ToolSource | null;
+  function: string;                      // wire 短名 (backend alias from function_name)
+  args: Record<string, unknown>;         // wire 短名 (backend alias from function_args)
+  status: "calling" | "called";
+  activity_description: string;
+  display_icon?: string | null;
+  render_style?: RenderStyle | null;
+  media_type?: string | null;
+
+  function_result?: FunctionResultV1 | null;
+  content?: Record<string, unknown> | null;  // 保留 tool_content enrichment channel
 };
+
+// R4: backward compat alias. 旧 consumer 逐步迁到 ToolEventEnvelopeV1.
+/** @deprecated Use ToolEventEnvelopeV1 */
+export type ToolEvent = ToolEventEnvelopeV1;
 
 export type TitleEvent = {
   event_id?: string;

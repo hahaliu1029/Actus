@@ -409,6 +409,16 @@ class ToolRuntimeConfig(BaseModel):
             "give the model more headroom."
         ),
     )
+    enabled_outcome_variants: list[str] = Field(
+        default_factory=lambda: [
+            "allow_success", "allow_error", "denied", "asked", "passthrough",
+        ],
+        description=(
+            "R4 P2.1 executable guard 1: wrapper 产出新 variant 前必须 config 开启, "
+            "runtime 未启用的 variant 在 _translate_outcome 内部 fail-fast. "
+            "控制 coordinated rollout — 运维先灰度, 再启用 wrapper."
+        ),
+    )
 
 
 class AppConfig(BaseModel):

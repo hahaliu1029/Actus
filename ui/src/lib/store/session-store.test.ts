@@ -199,6 +199,7 @@ describe("session-store", () => {
       onEvent({
         type: "tool",
         data: {
+          envelope_version: 1,
           event_id: "evt-tool-1",
           created_at: Math.floor(Date.now() / 1000),
           tool_call_id: "tool-123",
@@ -206,11 +207,13 @@ describe("session-store", () => {
           function: "write_file",
           args: { filepath: "/home/ubuntu/a.txt" },
           status: "calling",
+          activity_description: "Writing file",
         },
       });
       onEvent({
         type: "tool",
         data: {
+          envelope_version: 1,
           event_id: "evt-tool-2",
           created_at: Math.floor(Date.now() / 1000),
           tool_call_id: "tool-123",
@@ -218,6 +221,7 @@ describe("session-store", () => {
           function: "write_file",
           args: { filepath: "/home/ubuntu/a.txt" },
           status: "called",
+          activity_description: "Writing file",
         },
       });
       onEvent({

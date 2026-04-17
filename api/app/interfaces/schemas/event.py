@@ -191,12 +191,12 @@ class PlanSSEEvent(BaseSSEEvent):
 
 
 ToolStatusV1 = Literal[
-    "ok",          # AllowSuccess variant
-    "error",       # AllowError(reason.type="exception")
-    "denied",      # Denied variant
-    "timeout",     # AllowError(reason.type="timeout")
-    "passthrough", # Passthrough variant
-    # 注意：没有 "asked" — Asked outcome 走独立 ToolConfirmationEvent
+    "ok",          # outcome: success
+    "error",       # outcome: error (reason.type="exception")
+    "denied",      # outcome: denied by policy
+    "timeout",     # outcome: error (reason.type="timeout")
+    "passthrough", # outcome: passthrough multimodal
+    # 注意：没有 "asked" — asked outcome 走独立 ToolConfirmationEvent
 ]
 
 
@@ -221,14 +221,14 @@ class DecisionReasonWire(BaseModel):
 
 
 class FunctionResultV1(BaseModel):
-    """扁平 function_result, projector 从 ToolArtifact.outcome 投影而来."""
+    """扁平 function_result, projector 从 tool artifact 的 outcome 投影而来."""
     status: ToolStatusV1
     message: str = ""
     data: Any = None
     retryable: bool = False
-    user_action_required: bool = False  # v1 envelope 恒 False（Asked 走 tool_confirmation）
+    user_action_required: bool = False  # v1 envelope 恒 False（asked outcome 走 tool_confirmation）
     reason: Optional[DecisionReasonWire] = None
-    # Passthrough 多模态 blocks, 严格 by_alias wire format:
+    # passthrough 多模态 blocks, 严格 by_alias wire format:
     # [{"type": "image_url", "image_url": {...}}, {"type": "file", "file": {...}}]
     result_blocks: Optional[list[dict[str, Any]]] = None
 

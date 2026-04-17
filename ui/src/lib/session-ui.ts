@@ -1,4 +1,4 @@
-import type { FileInfo } from "@/lib/api/types";
+import type { FileInfo, ToolEventEnvelopeV1 } from "@/lib/api/types";
 
 type PreviewSource = {
   filename?: string;
@@ -867,4 +867,35 @@ export function getShellSessionIds(events: SessionEventLike[]): string[] {
   }
 
   return ids;
+}
+
+/**
+ * R4 tolerant reader: normalize envelope_version to 1 for frontend consumers.
+ *
+ * - version=1 → pass through as-is.
+ * - version=2+ (future) → normalize to 1, preserve v1 subset, console.warn
+ *   (UI degrades but doesn't crash).
+ * - version=undefined/null → normalize to 1 (pre-R4 compat or R4 default-elided).
+ *
+ * 前端组件 render 时统一按 v1 shape 消费. tolerant reader 保证未来 v2 上线时
+ * 旧前端不会崩, 只会丢失新字段的视觉展示.
+ */
+export function parseToolEventEnvelope(raw: unknown): ToolEventEnvelopeV1 | null {
+  // Reject non-plain-object inputs. Array.isArray 额外排除 array
+  // (在 JS 里 typeof [] === "object"), 避免 `[]` 被错误规范化为伪 envelope.
+  if (!isRecord(raw) || Array.isArray(raw)) {
+    return null;
+  }
+  const version = raw.envelope_version;
+  if (version === 1) {
+    return raw as unknown as ToolEventEnvelopeV1;
+  }
+  if (version !== undefined && version !== null) {
+    console.warn(
+      `parseToolEventEnvelope: unknown envelope_version=${String(version)}, ` +
+        `falling back to v1 subset. Frontend may need upgrade.`,
+    );
+  }
+  // Normalize: set envelope_version=1, preserve all fields.
+  return { ...raw, envelope_version: 1 } as unknown as ToolEventEnvelopeV1;
 }

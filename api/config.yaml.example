@@ -182,7 +182,13 @@ skill_risk_policy:
 #     frame_strategy: "scene"        # scene | uniform
 #     scene_threshold: 0.3           # 场景切换检测阈值（0~1）
 
-# R2 CS2: tool runtime 配置（Layer 2 wrapper guard + Layer 1 SmartApprove 超时）
+# R2 CS2: tool runtime 配置（Layer 2 wrapper guard + Layer 1 SmartApprove 超时 + R4 variant 白名单）
 # tool_runtime:
 #   max_wrapper_output_bytes: 1048576   # 1 MiB — Layer 2 wrapper 返回的 content 超过此字节数会被转成 AllowError(wrapper_output_too_large)，防止内存尖峰
 #   smart_approve_timeout_seconds: 15   # Layer 1 Stage P.2 SmartApprove LLM 调用超时（秒）。超时 fail-open（当作 allow），避免 LLM 挂死整个 tool 调用
+#   enabled_outcome_variants:           # R4 CS3: ToolOutcome variant 白名单. 新 variant 上线 3 步: (1) deploy 新 projector → (2) 加到此白名单 → (3) 启用 wrapper
+#     - allow_success
+#     - allow_error
+#     - denied
+#     - asked
+#     - passthrough

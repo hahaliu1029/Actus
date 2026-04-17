@@ -382,6 +382,7 @@ async def _translate_outcome(
     *,
     tool_result_max_chars: int,
     guide_injector: GuideInjector | None,
+    enabled_outcome_variants: list[str] | None = None,   # ← NEW (Round 2f P1)
 ) -> tuple[ToolMessage | None, list[HumanMessage], list[Any]]:
     """Layer 3: convert ``ToolOutcome`` → ``ToolMessage`` + deferred ``HumanMessage`` list + events.
 
@@ -406,6 +407,20 @@ async def _translate_outcome(
     ``ToolMessage.status`` correctly and records the typed artifact.
     """
     del session_ctx  # accepted in signature for consistency; not used yet
+    # Runtime enforcement guard (Round 2f P1): refuse unknown/disabled variants.
+    # enabled_outcome_variants=None → skip (backward-compat / dev envs).
+    if enabled_outcome_variants is not None:
+        variant_name = getattr(outcome, "variant", None)
+        if variant_name is not None and variant_name not in enabled_outcome_variants:
+            logger.error(
+                "CS3 executable guard: outcome variant %r not in enabled_outcome_variants=%r. "
+                "Refusing to emit — wrapper must respect runtime flag for coordinated rollout.",
+                variant_name, enabled_outcome_variants,
+            )
+            raise ValueError(
+                f"variant {variant_name!r} not enabled in runtime config "
+                f"(enabled={enabled_outcome_variants})"
+            )
     artifact = ToolArtifact(
         tool_call_id=tool_call["id"],
         tool_name=tool_call["name"],
@@ -1087,6 +1102,7 @@ def build_react_graph(
                 session_ctx,
                 tool_result_max_chars=tool_result_max_chars,
                 guide_injector=guide_injector,
+                enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
             )
             if msg is not None:
                 new_messages.append(msg)
@@ -1831,6 +1847,7 @@ def build_react_graph(
             _session_ctx_from(config),
             tool_result_max_chars=tool_result_max_chars,
             guide_injector=guide_injector,
+            enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
         )
 
         # NOTE: deny_events are regular ToolEvents (not ToolConfirmationEvents).
