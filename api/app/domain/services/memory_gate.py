@@ -279,16 +279,44 @@ class MemoryGateBreaker:
 # ---- Daily auto-promote cap -------------------------------------------------
 
 
+class AsyncRedisPipelineLike(Protocol):
+    """Duck-type of redis-py ``Pipeline`` async context manager.
+
+    ``try_reserve`` 用 ``pipeline(transaction=True)`` 把 INCRBY + EXPIRE 打成
+    MULTI/EXEC 原子块；任何 fake/adapter 实现本 Protocol 都能替换 redis-py
+    自身的 pipeline。方法签名与 redis-py Pipeline 对齐（queue 类方法是
+    **同步** 的，只有 execute 才 await；exit 时抛自动回收——和真实 redis-py 行为一致）。
+    """
+
+    def incrby(self, key: str, amount: int) -> object: ...
+
+    def expire(self, key: str, seconds: int) -> object: ...
+
+    async def execute(self) -> list: ...
+
+    async def __aenter__(self) -> "AsyncRedisPipelineLike": ...
+
+    async def __aexit__(self, exc_type, exc, tb) -> None: ...
+
+
 class AsyncRedisLike(Protocol):
     """Duck-type of the subset of redis-py we rely on. Keeps this module
     free of a hard infra dependency—any async object with the right
-    signatures (including fakes in tests) works."""
+    signatures (including fakes in tests) works.
+
+    ``pipeline(transaction=True)`` 被 ``MemoryGateDailyCap.try_reserve`` 依赖
+    （INCRBY + EXPIRE 原子化，见本模块实现注释）；任何新 fake/adapter 只实现
+    incrby/expire/get 会在 runtime 抛 ``AttributeError``，因此 pipeline 必须
+    同样出现在 Protocol 里。
+    """
 
     async def incrby(self, key: str, amount: int) -> int: ...
 
     async def expire(self, key: str, seconds: int) -> bool: ...
 
     async def get(self, key: str) -> bytes | str | None: ...
+
+    def pipeline(self, transaction: bool = True) -> AsyncRedisPipelineLike: ...
 
 
 class MemoryGateDailyCap:
