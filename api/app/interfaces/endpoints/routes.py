@@ -6,6 +6,7 @@ from . import (
     auth_routes,
     file_routes,
     memory_routes,
+    notification_routes,
     skill_routes,
     skill_v2_routes,
     session_routes,
@@ -34,6 +35,7 @@ def create_api_routes() -> APIRouter:
     api_router.include_router(user_routes.router)
     api_router.include_router(user_tools_v2_routes.router)
     api_router.include_router(memory_routes.router)
+    api_router.include_router(notification_routes.router)
 
     # 管理员路由
     api_router.include_router(admin_routes.router)

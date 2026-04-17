@@ -43,6 +43,9 @@ from app.infrastructure.repositories.file_app_config_repository import (
     FileAppConfigRepository,
 )
 from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
+from app.infrastructure.repositories.db_memory_system_notification_repository import (
+    DBMemorySystemNotificationRepository,
+)
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.minio import MinioStore, get_minio
 from app.infrastructure.storage.postgres import get_db_session, get_postgres, get_uow
@@ -328,6 +331,25 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
 
     overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
 
+    # M1 PR-4+8 memory gate LLM resolution. ``settings.memory_gate_llm`` is
+    # a string **key** chosen by the deployer in config—``"summary_llm"``
+    # (reuse summary_llm instance), ``"chat_llm"`` (reuse main llm), or
+    # ``None`` (disabled). Other values currently fall through to None
+    # rather than silently picking an arbitrary model—if ops wants a third
+    # LLM just for gate, a new branch here + new LLMConfig is the
+    # explicit extension path.
+    memory_gate_llm_key = getattr(settings, "memory_gate_llm", None)
+    memory_gate_llm: BaseChatModel | None = None
+    if memory_gate_llm_key == "summary_llm":
+        memory_gate_llm = summary_llm
+    elif memory_gate_llm_key == "chat_llm":
+        memory_gate_llm = llm
+    elif memory_gate_llm_key:
+        logger.warning(
+            "settings.memory_gate_llm=%r not recognized; gate disabled.",
+            memory_gate_llm_key,
+        )
+
     return _ConfigSnapshot(
         llm=llm,
         agent_config=app_config.agent_config,
@@ -342,6 +364,9 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
         supports_pdf_input=effective_pdf_input,
         file_understanding_config=app_config.file_understanding,
         tool_runtime=app_config.tool_runtime,
+        memory_gate_llm=memory_gate_llm,
+        memory_gate_threshold=settings.memory_gate_threshold,
+        memory_gate_batch_cap=settings.memory_gate_batch_cap,
     )
 
 
@@ -384,6 +409,31 @@ def _build_agent_service(
         ),
     )
 
+    # M1 PR-4+8 gate: single in-process breaker shared across sessions (so
+    # N concurrent flushes see the same "LLM is flaky" signal); daily cap
+    # is a thin Redis wrapper (stateless). Both are None when Redis or
+    # gate LLM aren't available, and PlannerReActFlow's gate path treats
+    # None as legacy passthrough.
+    from app.application.services.memory_notification_emitter import (
+        DBMemoryNotificationEmitter,
+    )
+    from app.domain.services.memory_gate import (
+        MemoryGateBreaker,
+        MemoryGateDailyCap,
+    )
+    memory_gate_breaker = MemoryGateBreaker() if snapshot.memory_gate_llm else None
+    memory_gate_daily_cap: MemoryGateDailyCap | None = None
+    if snapshot.memory_gate_llm and memory_redis_client is not None:
+        memory_gate_daily_cap = MemoryGateDailyCap(
+            redis=memory_redis_client,
+            cap=settings.memory_gate_daily_cap,
+        )
+    # Notification emitter is always constructible (DB-only, no Redis
+    # dep); gate-off deployments just never call it.
+    memory_notification_emitter = DBMemoryNotificationEmitter(
+        session_factory=get_postgres().session_factory,
+    )
+
     agent_svc = AgentService(
         uow_factory=get_uow,
         config_snapshot=snapshot,
@@ -403,6 +453,9 @@ def _build_agent_service(
         memory_repo_factory=DBMemoryChunkRepository,
         memory_write_service=memory_write_service,
         memory_session_save_cap=settings.memory_session_save_cap,
+        memory_gate_breaker=memory_gate_breaker,
+        memory_gate_daily_cap=memory_gate_daily_cap,
+        memory_notification_emitter=memory_notification_emitter,
         event_recovery=RedisEventRecovery(),
         sandbox_lifecycle_service=sandbox_lifecycle_service,
     )
@@ -513,3 +566,23 @@ def get_memory_management_service(
         redis=redis_client,
         user_daily_quota=user_daily_quota,
     )
+
+
+async def get_memory_system_notification_repository(
+    db_session: AsyncSession = Depends(get_db_session),
+):
+    """Notification repo DI — session-scoped with explicit commit.
+
+    Two endpoints call this: GET /unread (pure read) and POST /mark-read
+    (single-row UPDATE). No multi-repo coordination, no embedding, no
+    cross-layer invariants ⇒ skip a dedicated service. ``get_db_session``
+    already owns the rollback-on-exception + close-on-finally lifecycle;
+    we only add an explicit commit so mark-read actually sticks. If the
+    endpoint raises before the ``yield repo`` completes, get_db_session's
+    ``except`` branch rolls back and the ``await db_session.commit()``
+    line is unreachable, so we don't double-commit.
+    """
+
+    repo = DBMemorySystemNotificationRepository(db_session)
+    yield repo
+    await db_session.commit()

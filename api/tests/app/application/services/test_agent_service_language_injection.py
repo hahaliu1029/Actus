@@ -82,6 +82,13 @@ def skeletal_service_with_captured_runner(monkeypatch):
     svc._memory_repo_factory = MagicMock()
     svc._memory_write_service = None
     svc._memory_session_save_cap = 20
+    # PR-4+8: _create_task now passes gate deps to AgentTaskRunner.
+    # Stub all four to None so the path doesn't hit AttributeError; the
+    # captured kwargs verify the contract, but this test only asserts on
+    # ``initial_language`` so the actual gate values don't matter.
+    svc._memory_gate_breaker = None
+    svc._memory_gate_daily_cap = None
+    svc._memory_notification_emitter = None
 
     # Skip file_processor_lookup / approval_cache / confirmation_manager
     # side paths — all are guarded on config being populated.

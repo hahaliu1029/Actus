@@ -79,6 +79,9 @@ class MemoryFlushService:
                 embeddings = await self._embed_batch(batch.chunks)
 
                 # 2. 构建 MemoryChunk
+                # M1 PR-4+8：plumb gate-assigned category + auto_promoted_at
+                # （只有 LLM 质量闸通过的 chunk 才带值；size-only 路径两个都
+                # 是 None，入库后 MemoryChunk.category 留 NULL = legacy 语义）。
                 now = datetime.now(tz=timezone.utc)
                 memory_chunks = [
                     MemoryChunk(
@@ -92,6 +95,8 @@ class MemoryFlushService:
                         created_at=now,
                         updated_at=now,
                         embedding=emb,
+                        category=c.category,
+                        auto_promoted_at=c.auto_promoted_at,
                     )
                     for c, emb in zip(batch.chunks, embeddings)
                 ]

@@ -8,7 +8,14 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RawChunk:
-    """对话分块，不含 embedding。由 flow 产出，传递给 flush service。"""
+    """对话分块，不含 embedding。由 flow 产出，传递给 flush service。
+
+    M1 PR-4+8 起可选携带 gate 分类结果：
+    - ``category`` = 'user' | 'rule' | 'fact' | None；None 表示 gate 未
+      启用（旧 size-only 路径，MemoryChunk.category 入库时留 None）。
+    - ``auto_promoted_at`` = 只有 gate 通过的 chunk 才带时间戳；None 表示
+      "没被 LLM 主动晋升"——UI 的 "auto_promoted" badge 用它判定。
+    """
 
     content: str
     session_id: str
@@ -16,6 +23,8 @@ class RawChunk:
     source: str
     metadata: dict[str, Any]
     content_hash: str
+    category: str | None = None
+    auto_promoted_at: datetime | None = None
 
 
 @dataclass(frozen=True)

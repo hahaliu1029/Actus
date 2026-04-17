@@ -1,0 +1,25 @@
+{"id": "u1", "text": "用户：我平时主要写 Go，已经有 10 年了；React 是最近才接触的", "expected_verdict": "keep", "expected_category": "user", "notes": "profile / 偏好"}
+{"id": "u2", "text": "用户：以后回答我全部用中文，英文 thread 里也是", "expected_verdict": "keep", "expected_category": "user", "notes": "language preference"}
+{"id": "u3", "text": "用户：我负责数据平台的 ingestion pipeline", "expected_verdict": "keep", "expected_category": "user", "notes": "role"}
+{"id": "u4", "text": "用户：我在小型创业公司工作，没有正式的 code review 流程", "expected_verdict": "keep", "expected_category": "user", "notes": "context that shapes advice"}
+{"id": "u5", "text": "用户：帮我把这个按钮颜色改成蓝色", "expected_verdict": "drop", "expected_category": "user", "notes": "task-local request, not profile"}
+{"id": "r1", "text": "用户：以后写测试不要用 mock 数据库，必须跑真实 PG", "expected_verdict": "keep", "expected_category": "rule", "notes": "hard rule"}
+{"id": "r2", "text": "用户：commit 之前必须先让我 review，不要自己直接提交", "expected_verdict": "keep", "expected_category": "rule", "notes": "existing CLAUDE.md constraint analog"}
+{"id": "r3", "text": "用户：永远不要 force push 到 main", "expected_verdict": "keep", "expected_category": "rule", "notes": "permanent prohibition"}
+{"id": "r4", "text": "用户：这次别加 retry，我想看到直接的错误", "expected_verdict": "drop", "expected_category": "rule", "notes": "this-task only ('这次' = this time)"}
+{"id": "r5", "text": "用户：所有对外 API 必须走 rate limit，不管是内部服务还是公网", "expected_verdict": "keep", "expected_category": "rule", "notes": "scope: all APIs"}
+{"id": "f1", "text": "用户：数据库是 PostgreSQL 17，在 docker-compose.yml 里启动", "expected_verdict": "keep", "expected_category": "fact", "notes": "verifiable tech fact"}
+{"id": "f2", "text": "用户：staging API 部署在 actus.internal:8443/v2", "expected_verdict": "keep", "expected_category": "fact", "notes": "stable endpoint"}
+{"id": "f3", "text": "用户：沙箱生命周期 spec 在 docs/superpowers/specs/ 里", "expected_verdict": "keep", "expected_category": "fact", "notes": "pointer to docs"}
+{"id": "f4", "text": "用户：刚才跑 test_flush_gate 出了 5 个 error", "expected_verdict": "drop", "expected_category": "fact", "notes": "transient status"}
+{"id": "f5", "text": "用户：我们用 Redis 8.2 做 session 缓存和 rate limit", "expected_verdict": "keep", "expected_category": "fact", "notes": "stable stack fact"}
+{"id": "d1", "text": "Agent：已创建分支 feature/memory-gate 并切换到", "expected_verdict": "drop", "expected_category": "user", "notes": "agent's own status reply"}
+{"id": "d2", "text": "Agent：好的，我会根据你的反馈调整", "expected_verdict": "drop", "expected_category": "user", "notes": "agent acknowledgement"}
+{"id": "d3", "text": "工具输出：{\"status\": \"ok\", \"rows_affected\": 3}", "expected_verdict": "drop", "expected_category": "fact", "notes": "tool stdout"}
+{"id": "d4", "text": "用户：刚才的那个测试为什么过了又挂了", "expected_verdict": "drop", "expected_category": "fact", "notes": "debug question"}
+{"id": "d5", "text": "用户：打印一下 session_id 我看看值", "expected_verdict": "drop", "expected_category": "fact", "notes": "local debug command"}
+{"id": "e1", "text": "用户：我 *特别* 不喜欢写 YAML", "expected_verdict": "keep", "expected_category": "user", "notes": "edge: 带 emoji/标点的偏好表达仍算 preference"}
+{"id": "e2", "text": "用户：哦对了这个项目没有 E2E 测试", "expected_verdict": "keep", "expected_category": "fact", "notes": "edge: 口语化但是 stable fact"}
+{"id": "e3", "text": "用户：就这样吧，先这么写着", "expected_verdict": "drop", "expected_category": "user", "notes": "edge: 貌似是决策其实是搁置"}
+{"id": "e4", "text": "用户：你总是漏掉类型注解", "expected_verdict": "keep", "expected_category": "rule", "notes": "edge: 投诉/批评蕴含一条 rule — 以后加上类型注解"}
+{"id": "e5", "text": "用户：在美国东部时区，我们是 UTC-5 或 UTC-4", "expected_verdict": "drop", "expected_category": "fact", "notes": "edge: 常识性事实，没有项目特定价值"}

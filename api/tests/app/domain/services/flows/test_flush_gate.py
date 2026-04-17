@@ -21,6 +21,13 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from tests.conftest import TEST_USER_ID_FIXED
 
 
+# PR-4+8: _evaluate_flush_gate became async; tests below that invoke it are
+# updated to async.
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
 def _make_flow(**overrides):
     """Create a PlannerReActFlow with all required mocks."""
     from app.domain.services.flows.planner_react import PlannerReActFlow
@@ -77,7 +84,8 @@ def _make_plan_with_completed_steps(num_steps: int) -> Plan:
 class TestFlushGateDisabled:
     """Gate disabled → batch is None."""
 
-    def test_gate_disabled_returns_none(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_disabled_returns_none(self) -> None:
         """flush_enabled=False 时不产生 batch。"""
         config = MemoryConfig(flush_enabled=False)
         flow = _make_flow(agent_config=AgentConfig(memory=config))
@@ -85,11 +93,12 @@ class TestFlushGateDisabled:
 
         msgs = _make_messages(10)
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 
-    def test_clears_stale_batch_when_gate_disabled(self) -> None:
+    @pytest.mark.anyio
+    async def test_clears_stale_batch_when_gate_disabled(self) -> None:
         """gate disabled 时清除之前遗留的 batch。"""
         config = MemoryConfig(flush_enabled=False)
         flow = _make_flow(agent_config=AgentConfig(memory=config))
@@ -104,7 +113,7 @@ class TestFlushGateDisabled:
 
         msgs = _make_messages(10)
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 
@@ -112,7 +121,8 @@ class TestFlushGateDisabled:
 class TestFlushGateMinStepsNotMet:
     """Min steps not met → batch is None."""
 
-    def test_min_steps_not_met(self) -> None:
+    @pytest.mark.anyio
+    async def test_min_steps_not_met(self) -> None:
         """步骤数不足 flush_min_steps 时不产生 batch。"""
         config = MemoryConfig(
             flush_enabled=True,
@@ -124,7 +134,7 @@ class TestFlushGateMinStepsNotMet:
 
         msgs = _make_messages(20, content="测试内容" * 50)
         plan = _make_plan_with_completed_steps(2)  # Only 2 < 5
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 
@@ -132,7 +142,8 @@ class TestFlushGateMinStepsNotMet:
 class TestFlushGateMinTokensNotMet:
     """Min tokens not met → batch is None."""
 
-    def test_min_tokens_not_met(self) -> None:
+    @pytest.mark.anyio
+    async def test_min_tokens_not_met(self) -> None:
         """新消息 token 不足 flush_min_new_tokens 时不产生 batch。"""
         config = MemoryConfig(
             flush_enabled=True,
@@ -144,7 +155,7 @@ class TestFlushGateMinTokensNotMet:
 
         msgs = _make_messages(5)  # Short messages, not enough tokens
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 
@@ -152,7 +163,8 @@ class TestFlushGateMinTokensNotMet:
 class TestFlushGatePasses:
     """Gate passes → batch has correct cursors."""
 
-    def test_gate_passes_with_sufficient_content(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_passes_with_sufficient_content(self) -> None:
         """flush_min_steps=1, flush_min_new_tokens=500, 足够的 CJK 内容 → batch 产生。"""
         config = MemoryConfig(
             flush_enabled=True,
@@ -172,7 +184,7 @@ class TestFlushGatePasses:
         # So we need at least 500*3 = 1500 chars of content across messages
         msgs = _make_messages(10, content="测试内容" * 200)
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -187,7 +199,8 @@ class TestFlushGatePasses:
 class TestFlushGateCompactionShrink:
     """Compaction shrink resets cursor."""
 
-    def test_compaction_shrink_resets_cursor(self) -> None:
+    @pytest.mark.anyio
+    async def test_compaction_shrink_resets_cursor(self) -> None:
         """cursor=10 but only 5 messages → cursor 重置到 5, no batch。"""
         config = MemoryConfig(
             flush_enabled=True,
@@ -199,7 +212,7 @@ class TestFlushGateCompactionShrink:
 
         msgs = _make_messages(5)
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         # Cursor should be reset to current_len
         assert flow._flush_cursor == 5
@@ -209,7 +222,8 @@ class TestFlushGateCompactionShrink:
 class TestFlushGateNoPlanOrNoSteps:
     """Plan is None or has no steps → steps_completed=0, gate doesn't pass."""
 
-    def test_no_plan_no_batch(self) -> None:
+    @pytest.mark.anyio
+    async def test_no_plan_no_batch(self) -> None:
         """plan=None → batch 不产生。"""
         config = MemoryConfig(
             flush_enabled=True,
@@ -220,7 +234,7 @@ class TestFlushGateNoPlanOrNoSteps:
         flow._flush_cursor = 0
 
         msgs = _make_messages(10, content="测试内容" * 200)
-        flow._evaluate_flush_gate(msgs, plan=None)
+        await flow._evaluate_flush_gate(msgs, plan=None)
 
         assert flow._pending_flush_batch is None
 
@@ -228,7 +242,8 @@ class TestFlushGateNoPlanOrNoSteps:
 class TestFlushGateNoNewMessages:
     """No new messages (cursor == len) → no batch."""
 
-    def test_no_new_messages(self) -> None:
+    @pytest.mark.anyio
+    async def test_no_new_messages(self) -> None:
         """cursor == message count → 无新消息，不产生 batch。"""
         config = MemoryConfig(
             flush_enabled=True,
@@ -241,7 +256,7 @@ class TestFlushGateNoNewMessages:
         flow._flush_cursor = 5  # Already at the end
 
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 

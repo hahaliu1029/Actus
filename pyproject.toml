@@ -53,6 +53,10 @@ tiktoken = ["tiktoken>=0.7.0"]
 [tool.pytest.ini_options]
 pythonpath = ["api"]
 testpaths = ["api/tests"]
+# Markers + addopts live in api/pytest.ini — it's the config file pytest
+# picks up when cwd is inside api/ (the canonical dev workflow). Keeping
+# two configs in sync is a drift hazard; let api/pytest.ini be the
+# source of truth.
 
 [tool.uv.workspace]
 members = [

@@ -77,6 +77,13 @@ class _ConfigSnapshot:
     supports_pdf_input: bool
     file_understanding_config: "FileUnderstandingConfig | None"
     tool_runtime: ToolRuntimeConfig = field(default_factory=ToolRuntimeConfig)
+    # M1 PR-4+8 memory gate — snapshot holds the pre-resolved BaseChatModel
+    # (from the settings.memory_gate_llm string key) so config refresh can
+    # atomically swap it; threshold/batch_cap are immutable numbers that
+    # also move via the snapshot.
+    memory_gate_llm: BaseChatModel | None = None
+    memory_gate_threshold: float = 0.7
+    memory_gate_batch_cap: int = 20
 
 
 class AgentService:
@@ -100,6 +107,9 @@ class AgentService:
         memory_session_save_cap: int = 20,  # PR-3: per-session memory_save cap
         event_recovery=None,
         sandbox_lifecycle_service=None,
+        memory_gate_breaker=None,  # PR-4+8: MemoryGateBreaker shared across sessions
+        memory_gate_daily_cap=None,  # PR-4+8: MemoryGateDailyCap
+        memory_notification_emitter=None,  # PR-4+8: MemoryNotificationEmitter
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -117,6 +127,9 @@ class AgentService:
         self._memory_repo_factory = memory_repo_factory
         self._memory_write_service = memory_write_service
         self._memory_session_save_cap = memory_session_save_cap
+        self._memory_gate_breaker = memory_gate_breaker
+        self._memory_gate_daily_cap = memory_gate_daily_cap
+        self._memory_notification_emitter = memory_notification_emitter
         self._event_recovery = event_recovery
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
@@ -278,6 +291,12 @@ class AgentService:
                 else None
             ),
             memory_session_save_cap=self._memory_session_save_cap,
+            memory_gate_llm=snap.memory_gate_llm,
+            memory_gate_breaker=self._memory_gate_breaker,
+            memory_gate_daily_cap=self._memory_gate_daily_cap,
+            memory_gate_threshold=snap.memory_gate_threshold,
+            memory_gate_batch_cap=snap.memory_gate_batch_cap,
+            memory_notification_emitter=self._memory_notification_emitter,
             approval_cache=approval_cache,
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,

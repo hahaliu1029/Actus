@@ -22,6 +22,17 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from tests.conftest import TEST_USER_ID_FIXED
 
 
+# PR-4+8: _evaluate_flush_gate became async so callers can await the LLM
+# gate + Redis quota checks. Module-level anyio mark + backend fixture lets
+# the gate/chunking tests run under asyncio; sync tests in this file are
+# unaffected (anyio mark is a no-op on non-async test functions).
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
 # ─── Helper: Capturing Flusher ────────────────────────────────────────────────
 
 
@@ -224,14 +235,15 @@ class TestFlusherNoneGuard:
 class TestFullGateChunkBatchPipeline:
     """End-to-end: _evaluate_flush_gate produces a correct FlushBatch."""
 
-    def test_gate_produces_batch_with_correct_cursors(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_produces_batch_with_correct_cursors(self) -> None:
         """flush_enabled=True, sufficient steps + tokens → batch with correct cursors."""
         flow = _make_flow(session_id="s1", user_id=TEST_USER_ID_FIXED)
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(10)
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None, "Gate should pass and produce a FlushBatch"
@@ -241,27 +253,29 @@ class TestFullGateChunkBatchPipeline:
         assert batch.from_cursor == 0
         assert batch.target_cursor == len(msgs)
 
-    def test_gate_batch_has_chunks(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_batch_has_chunks(self) -> None:
         """Gate-produced batch must contain at least one chunk."""
         flow = _make_flow()
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(10)
         plan = _make_plan_with_completed_steps(2)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
         assert len(batch.chunks) > 0
 
-    def test_gate_batch_chunks_are_raw_chunks(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_batch_chunks_are_raw_chunks(self) -> None:
         """Each chunk in the batch must be a RawChunk instance."""
         flow = _make_flow(session_id="sess42", user_id="user42")
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(8)
         plan = _make_plan_with_completed_steps(1)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -272,7 +286,8 @@ class TestFullGateChunkBatchPipeline:
             assert chunk.content  # non-empty
             assert chunk.content_hash  # non-empty
 
-    def test_gate_disabled_produces_no_batch(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_disabled_produces_no_batch(self) -> None:
         """flush_enabled=False → _pending_flush_batch stays None."""
         flow = _make_flow(
             agent_config=AgentConfig(memory=MemoryConfig(flush_enabled=False))
@@ -281,11 +296,12 @@ class TestFullGateChunkBatchPipeline:
 
         msgs = _make_rich_messages(10)
         plan = _make_plan_with_completed_steps(5)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 
-    def test_gate_min_steps_not_met_produces_no_batch(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_min_steps_not_met_produces_no_batch(self) -> None:
         """flush_min_steps=5 but only 2 completed steps → no batch."""
         flow = _make_flow(
             agent_config=AgentConfig(
@@ -300,18 +316,19 @@ class TestFullGateChunkBatchPipeline:
 
         msgs = _make_rich_messages(10)
         plan = _make_plan_with_completed_steps(2)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         assert flow._pending_flush_batch is None
 
-    def test_gate_updates_cursor_on_batch_production(self) -> None:
+    @pytest.mark.anyio
+    async def test_gate_updates_cursor_on_batch_production(self) -> None:
         """After _evaluate_flush_gate, the cursor is stored in the batch's target_cursor."""
         flow = _make_flow()
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(6)
         plan = _make_plan_with_completed_steps(2)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -319,7 +336,8 @@ class TestFullGateChunkBatchPipeline:
         # C5.1: cursor should be advanced after batch creation
         assert flow._flush_cursor == 6  # == target_cursor == len(msgs)
 
-    def test_flusher_receives_batch_after_gate(self) -> None:
+    @pytest.mark.anyio
+    async def test_flusher_receives_batch_after_gate(self) -> None:
         """Full chain: gate passes → capturing flusher receives the batch."""
         flusher = _CapturingFlusher()
         flow = _make_flow(session_id="chain-s", user_id="chain-u")
@@ -327,7 +345,7 @@ class TestFullGateChunkBatchPipeline:
 
         msgs = _make_rich_messages(8)
         plan = _make_plan_with_completed_steps(2)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         # Simulate runner submission
         flush_batch = getattr(flow, "_pending_flush_batch", None)
@@ -348,14 +366,15 @@ class TestFullGateChunkBatchPipeline:
 class TestChunkingMetadata:
     """Verify chunks contain required metadata fields after full pipeline."""
 
-    def test_chunks_have_message_types(self) -> None:
+    @pytest.mark.anyio
+    async def test_chunks_have_message_types(self) -> None:
         """Each chunk metadata must include message_types."""
         flow = _make_flow()
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(6)
         plan = _make_plan_with_completed_steps(1)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -364,14 +383,15 @@ class TestChunkingMetadata:
                 f"chunk.metadata missing 'message_types': {chunk.metadata}"
             )
 
-    def test_chunks_have_created_at(self) -> None:
+    @pytest.mark.anyio
+    async def test_chunks_have_created_at(self) -> None:
         """Each chunk metadata must include created_at."""
         flow = _make_flow()
         flow._flush_cursor = 0
 
         msgs = _make_rich_messages(6)
         plan = _make_plan_with_completed_steps(1)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -380,7 +400,8 @@ class TestChunkingMetadata:
                 f"chunk.metadata missing 'created_at': {chunk.metadata}"
             )
 
-    def test_chunks_tool_names_only_present_when_nonempty(self) -> None:
+    @pytest.mark.anyio
+    async def test_chunks_tool_names_only_present_when_nonempty(self) -> None:
         """tool_names is only added to metadata when non-empty (conditional inclusion).
 
         Chunks from pure HumanMessage/AIMessage groups do not have tool_names.
@@ -392,7 +413,7 @@ class TestChunkingMetadata:
         # Simple messages without tool calls — tool_names should NOT be present
         msgs = _make_rich_messages(6)
         plan = _make_plan_with_completed_steps(1)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -403,7 +424,8 @@ class TestChunkingMetadata:
                     "tool_names key present but empty — should only appear when non-empty"
                 )
 
-    def test_chunks_have_step_title_with_plan(self) -> None:
+    @pytest.mark.anyio
+    async def test_chunks_have_step_title_with_plan(self) -> None:
         """When plan has completed steps, step_title is added to chunk metadata.
 
         step_title is conditionally included — only when non-empty. With completed
@@ -414,7 +436,7 @@ class TestChunkingMetadata:
 
         msgs = _make_rich_messages(8)
         plan = _make_plan_with_completed_steps(3)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None
@@ -427,7 +449,8 @@ class TestChunkingMetadata:
             "Expected at least some chunks to have 'step_title' when plan has completed steps"
         )
 
-    def test_chunks_with_tool_messages_have_tool_names(self) -> None:
+    @pytest.mark.anyio
+    async def test_chunks_with_tool_messages_have_tool_names(self) -> None:
         """Chunks produced from AIMessage+ToolMessage groups include tool_names."""
         flow = _make_flow(
             agent_config=AgentConfig(
@@ -462,7 +485,7 @@ class TestChunkingMetadata:
             AIMessage(content="You are welcome " * 30),
         ]
         plan = _make_plan_with_completed_steps(2)
-        flow._evaluate_flush_gate(msgs, plan)
+        await flow._evaluate_flush_gate(msgs, plan)
 
         batch = flow._pending_flush_batch
         assert batch is not None

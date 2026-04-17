@@ -58,6 +58,11 @@ from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
 
 from .base import BaseFlow, FlowStatus
+
+
+def _iso_or_none(dt: datetime | None) -> str | None:
+    """Serialize optional datetime → ISO-8601 string for JSON payloads."""
+    return dt.isoformat() if dt is not None else None
 from .skill_creation_graph import SkillCreationGraph
 from .skill_graph_canary import is_skill_graph_enabled
 
@@ -101,6 +106,14 @@ class PlannerReActFlow(BaseFlow):
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
         _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
         tool_runtime: "ToolRuntimeConfig | None" = None,  # R2 CS2
+        # M1 PR-4+8 LLM quality gate (all optional — None = gate disabled,
+        # falls back to legacy size-only path)
+        memory_gate_llm: BaseChatModel | None = None,
+        memory_gate_breaker: Any = None,  # MemoryGateBreaker | None
+        memory_gate_daily_cap: Any = None,  # MemoryGateDailyCap | None
+        memory_gate_threshold: float = 0.7,
+        memory_gate_batch_cap: int = 20,
+        memory_notification_emitter: Any = None,  # MemoryNotificationEmitter | None
     ) -> None:
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
@@ -215,6 +228,15 @@ class PlannerReActFlow(BaseFlow):
         self._memory_session_redis = memory_session_redis
         self._memory_session_save_cap = memory_session_save_cap
         self._has_memory_tools = False  # set by _collect_all_tools
+
+        # M1 PR-4+8 gate state — all None when gate disabled, in which
+        # case _evaluate_flush_gate skips the LLM branch entirely.
+        self._memory_gate_llm = memory_gate_llm
+        self._memory_gate_breaker = memory_gate_breaker
+        self._memory_gate_daily_cap = memory_gate_daily_cap
+        self._memory_gate_threshold = memory_gate_threshold
+        self._memory_gate_batch_cap = memory_gate_batch_cap
+        self._memory_notification_emitter = memory_notification_emitter
 
         # Dangerous tool approval cache (Task 17)
         self._approval_cache = approval_cache
@@ -1153,7 +1175,9 @@ class PlannerReActFlow(BaseFlow):
 
         # Evaluate flush gate BEFORE Memory construction (uses raw_messages)
         try:
-            self._evaluate_flush_gate(raw_messages, final.get("plan") or self.plan)
+            await self._evaluate_flush_gate(
+                raw_messages, final.get("plan") or self.plan,
+            )
         except Exception as exc:
             logger.warning("flush gate 评估失败: %s", exc)
 
@@ -1213,16 +1237,25 @@ class PlannerReActFlow(BaseFlow):
 
     # ── Flush scheduling: gate + chunking ────────────────────────────────────
 
-    def _evaluate_flush_gate(
+    async def _evaluate_flush_gate(
         self,
         raw_messages: Sequence[BaseMessage],
         plan: Any,
     ) -> None:
         """Evaluate whether to produce a FlushBatch for background flushing.
 
+        Two-stage gate:
+        1. **Size gate** (legacy)：completed steps + new token count 必须
+           达标，否则直接返回。把显然没实质内容的小 flush 挡在 LLM 费用
+           产生之前。
+        2. **LLM quality gate** (M1 PR-4+8)：启用时（``memory_gate_llm is
+           not None``），每个 chunk 过 classifier 打分；threshold + daily
+           cap + 进程级 circuit breaker 共同决定最终保留集。禁用时直接
+           透传全部 chunk 与历史 size-only 行为一致。
+
         Side-effects:
         - Always clears ``_pending_flush_batch`` at entry.
-        - Sets ``_pending_flush_batch`` if the gate passes.
+        - Sets ``_pending_flush_batch`` to kept chunks when any pass.
         - May reset ``_flush_cursor`` on compaction shrink.
         """
         self._pending_flush_batch = None
@@ -1259,9 +1292,18 @@ class PlannerReActFlow(BaseFlow):
         if new_token_count < self._memory_config.flush_min_new_tokens:
             return
 
-        # Gate passes — build chunks and FlushBatch
+        # Size gate passed — build chunks
         chunks = self._chunk_messages(list(new_messages), plan=plan)
         if not chunks:
+            return
+
+        # LLM quality gate
+        kept_chunks = await self._apply_llm_gate(chunks)
+        if not kept_chunks:
+            # 推进 cursor，即使全部 drop——否则下一次 _evaluate_flush_gate
+            # 会用同一段 new_messages 再跑一次 LLM gate，既浪费钱又会把
+            # 同一批内容在审计视图里重复评估。
+            self._flush_cursor = current_len
             return
 
         self._pending_flush_batch = FlushBatch(
@@ -1269,9 +1311,188 @@ class PlannerReActFlow(BaseFlow):
             user_id=self._user_id,
             from_cursor=self._flush_cursor,
             target_cursor=current_len,
-            chunks=tuple(chunks),
+            chunks=tuple(kept_chunks),
         )
         self._flush_cursor = current_len  # C5.1: 乐观推进，在 persist 之前生效
+
+    async def _emit_memory_notification(
+        self,
+        *,
+        event_type: str,
+        payload: dict,
+    ) -> None:
+        """Fire-and-forget notification write. Swallows emitter errors—
+        a failed notification must never break the flush pipeline.
+        No user_id → no-op (test paths that don't wire the emitter)."""
+        if self._memory_notification_emitter is None:
+            return
+        if not self._user_id:
+            return
+        try:
+            await self._memory_notification_emitter.emit(
+                user_id=self._user_id,
+                event_type=event_type,
+                payload=payload,
+            )
+        except Exception as exc:
+            logger.warning(
+                "memory notification emission failed: event=%s err=%s",
+                event_type, exc,
+            )
+
+    async def _apply_llm_gate(
+        self,
+        chunks: "list[RawChunk]",
+    ) -> "list[RawChunk]":
+        """Run the LLM quality gate and return kept chunks.
+
+        Gate 禁用（``_memory_gate_llm is None``）时不做任何过滤——legacy
+        size-only 路径，全部 chunk 透传，``category`` 和 ``auto_promoted_at``
+        保持 None（入库后 ``MemoryChunk.category = NULL``，等同 M1 前语义）。
+
+        Gate 启用时每个 drop 的 chunk 不会入 memory_chunks / fs。breaker
+        OPEN / daily cap 打满 / LLM 异常这三类情况都走 "drop 全部" 路径
+        （degraded fail-closed）；调用方下一轮 flush 继续尝试。
+        """
+        # Gate off → legacy passthrough
+        if self._memory_gate_llm is None:
+            return list(chunks)
+
+        # Empty user_id + gate on = construction error. The daily cap
+        # Redis key would collapse to ``memory:auto_promote_daily::<date>``,
+        # pooling every anonymous user's quota into one bucket; the
+        # notification emitter also refuses to fire. Safer to drop the
+        # batch silently than to poison shared state.
+        if not self._user_id:
+            logger.warning(
+                "memory_gate enabled but user_id is empty — dropping batch; "
+                "wire a real user_id or disable the gate for this session",
+            )
+            return []
+
+        # Circuit breaker OPEN → drop everything for this flush without
+        # calling LLM or Redis. Rising-edge notification happens inside the
+        # except branch below via ``record_failure()``; the OPEN-on-entry
+        # path re-uses the existing notification (no re-emit to avoid tray
+        # flooding when LLM is down for many consecutive flushes).
+        if self._memory_gate_breaker is not None and self._memory_gate_breaker.is_open():
+            logger.info(
+                "memory_gate circuit breaker OPEN — dropping %d chunks "
+                "without LLM call", len(chunks),
+            )
+            return []
+
+        # Truncate to per-batch cost cap before anything else. Chunks past
+        # the cap don't silently fall through to storage—they are simply
+        # not offered to the LLM and never get ``auto_promoted_at`` set,
+        # so they stay dropped (not retried with a fresh cursor, because
+        # _evaluate_flush_gate advances the cursor past the full window).
+        if len(chunks) > self._memory_gate_batch_cap:
+            logger.info(
+                "memory_gate batch cap %d < %d chunks; truncating tail",
+                self._memory_gate_batch_cap, len(chunks),
+            )
+            chunks = chunks[: self._memory_gate_batch_cap]
+
+        # Classify via LLM
+        from app.domain.services.memory_gate import (
+            MemoryGateClassifier,
+            MemoryGateInput,
+            filter_kept_decisions,
+        )
+        classifier = MemoryGateClassifier(self._memory_gate_llm)
+        try:
+            inputs = [
+                MemoryGateInput(chunk_index=i, text=c.content)
+                for i, c in enumerate(chunks)
+            ]
+            decisions = await classifier.classify(inputs)
+        except Exception as exc:
+            just_opened = False
+            if self._memory_gate_breaker is not None:
+                just_opened = self._memory_gate_breaker.record_failure()
+            logger.warning("memory_gate LLM classify failed: %s", exc)
+            # Only emit on the rising edge (counter just crossed threshold)
+            # so the user's tray doesn't flood with identical notifications
+            # when LLM is down for many flushes in a row.
+            if just_opened:
+                await self._emit_memory_notification(
+                    event_type="memory_gate_paused",
+                    payload={
+                        "consecutive_failures": (
+                            self._memory_gate_breaker.consecutive_failures
+                        ),
+                        "last_error": str(exc)[:500],
+                        "cooldown_until": _iso_or_none(
+                            self._memory_gate_breaker.cooldown_until()
+                        ),
+                    },
+                )
+            return []
+        if self._memory_gate_breaker is not None:
+            self._memory_gate_breaker.record_success()
+
+        kept_decisions = filter_kept_decisions(
+            decisions, threshold=self._memory_gate_threshold,
+        )
+        if not kept_decisions:
+            return []
+
+        # Daily cap — reserve N slots; if oversubscribed, drop all kept
+        # chunks this flush. "Partial-grant" (keep top-K, drop rest) is
+        # tempting but picks a semantic: whose top-K? By confidence?
+        # By order? For M1 we choose "all or nothing per flush" to keep
+        # the failure mode simple; M2 eval can revisit.
+        if self._memory_gate_daily_cap is not None:
+            granted, _remaining = await self._memory_gate_daily_cap.try_reserve(
+                self._user_id, len(kept_decisions),
+            )
+            if not granted:
+                logger.info(
+                    "memory_gate daily cap exhausted for user=%s; "
+                    "dropping %d kept chunks",
+                    self._user_id, len(kept_decisions),
+                )
+                # Unlike breaker rising-edge, daily cap notification fires
+                # at most once per user per day because downstream flushes
+                # short-circuit to `granted=False` too; dedup-by-day in the
+                # store is not added yet (accepted M1 noise ceiling — UI
+                # polling coalesces identical event_types visually).
+                await self._emit_memory_notification(
+                    event_type="quota_exceeded",
+                    payload={
+                        "attempted": len(kept_decisions),
+                        "cap": getattr(
+                            self._memory_gate_daily_cap, "cap", None,
+                        ),
+                    },
+                )
+                return []
+
+        # Enrich kept chunks with gate-assigned category + promotion ts.
+        # Decisions came back keyed by chunk_index (== position in the
+        # truncated ``chunks`` list); we re-resolve via a dict so LLM
+        # output order doesn't matter.
+        now = datetime.now(timezone.utc)
+        by_index = {d.chunk_index: d for d in kept_decisions}
+        kept_chunks: list[RawChunk] = []
+        for i, c in enumerate(chunks):
+            d = by_index.get(i)
+            if d is None:
+                continue
+            kept_chunks.append(
+                RawChunk(
+                    content=c.content,
+                    session_id=c.session_id,
+                    user_id=c.user_id,
+                    source=c.source,
+                    metadata=c.metadata,
+                    content_hash=c.content_hash,
+                    category=d.category,
+                    auto_promoted_at=now,
+                )
+            )
+        return kept_chunks
 
     def _chunk_messages(
         self,
