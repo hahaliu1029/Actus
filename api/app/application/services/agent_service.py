@@ -110,6 +110,13 @@ class AgentService:
         memory_gate_breaker=None,  # PR-4+8: MemoryGateBreaker shared across sessions
         memory_gate_daily_cap=None,  # PR-4+8: MemoryGateDailyCap
         memory_notification_emitter=None,  # PR-4+8: MemoryNotificationEmitter
+        memory_gate_rebuild_fn: Callable[
+            ["_ConfigSnapshot"], "tuple[object | None, object | None]"
+        ] | None = None,
+        # PR-4+8: hot-refresh hook. Called from ``_refresh_config`` when the
+        # snapshot's ``memory_gate_llm`` identity changes so breaker +
+        # daily_cap track the new LLM. None = static wiring (tests /
+        # legacy callers that don't reshape gate config at runtime).
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -130,6 +137,7 @@ class AgentService:
         self._memory_gate_breaker = memory_gate_breaker
         self._memory_gate_daily_cap = memory_gate_daily_cap
         self._memory_notification_emitter = memory_notification_emitter
+        self._memory_gate_rebuild_fn = memory_gate_rebuild_fn
         self._event_recovery = event_recovery
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
@@ -149,8 +157,33 @@ class AgentService:
         logger.info("AgentService初始化成功")
 
     def _refresh_config(self, snapshot: _ConfigSnapshot) -> None:
-        """Atomically replace config snapshot. CPython GIL guarantees single-attr assignment is atomic."""
+        """Atomically replace config snapshot. CPython GIL guarantees single-attr assignment is atomic.
+
+        **PR-4+8**: memory gate breaker + daily_cap are derived from
+        ``snapshot.memory_gate_llm``; if the deployer hot-refreshes
+        ``summary_model`` (or any config that changes the gate LLM),
+        the refresh must also rebuild breaker + daily_cap or else we'd
+        leave them at the init-time None while the gate is now enabled
+        —— auto-promote would bypass both protections.
+
+        Identity check is conservative: ``is`` instead of equality
+        because LLMConfig clones by value would compare equal even when
+        we want to reset state. Only ``is`` reliably signals "same
+        instance, keep breaker counter".
+        """
+        old_gate_llm = self._config_snapshot.memory_gate_llm
+        new_gate_llm = snapshot.memory_gate_llm
         self._config_snapshot = snapshot
+
+        if old_gate_llm is not new_gate_llm and self._memory_gate_rebuild_fn is not None:
+            new_breaker, new_daily_cap = self._memory_gate_rebuild_fn(snapshot)
+            # Atomic-enough for CPython: each attr swap is single-bytecode.
+            # A task in flight might briefly see the old breaker + new
+            # daily_cap (or vice versa); both combinations are valid —
+            # worst case is one extra flush going through the stale
+            # breaker while the new cap is already live. Not worth a lock.
+            self._memory_gate_breaker = new_breaker
+            self._memory_gate_daily_cap = new_daily_cap
 
     async def _get_task(self, session: Session) -> Optional[Task]:
         """根据传递的任务会话获取任务实例"""

@@ -421,13 +421,28 @@ def _build_agent_service(
         MemoryGateBreaker,
         MemoryGateDailyCap,
     )
-    memory_gate_breaker = MemoryGateBreaker() if snapshot.memory_gate_llm else None
-    memory_gate_daily_cap: MemoryGateDailyCap | None = None
-    if snapshot.memory_gate_llm and memory_redis_client is not None:
-        memory_gate_daily_cap = MemoryGateDailyCap(
-            redis=memory_redis_client,
-            cap=settings.memory_gate_daily_cap,
-        )
+
+    def _build_memory_gate_deps(snap: "_ConfigSnapshot"):
+        """Derive breaker + daily_cap from a snapshot's memory_gate_llm.
+
+        Factored out so AgentService._refresh_config can re-run it on
+        config reload when the gate LLM identity changes (PR-4+8 bug:
+        first build pinned breaker/cap at init time, hot-refresh of
+        ``summary_model`` would leave them stale at None while the new
+        snapshot's gate was enabled, bypassing both protections).
+        """
+        if snap.memory_gate_llm is None:
+            return (None, None)
+        breaker = MemoryGateBreaker()
+        daily_cap = None
+        if memory_redis_client is not None:
+            daily_cap = MemoryGateDailyCap(
+                redis=memory_redis_client,
+                cap=settings.memory_gate_daily_cap,
+            )
+        return (breaker, daily_cap)
+
+    memory_gate_breaker, memory_gate_daily_cap = _build_memory_gate_deps(snapshot)
     # Notification emitter is always constructible (DB-only, no Redis
     # dep); gate-off deployments just never call it.
     memory_notification_emitter = DBMemoryNotificationEmitter(
@@ -456,6 +471,7 @@ def _build_agent_service(
         memory_gate_breaker=memory_gate_breaker,
         memory_gate_daily_cap=memory_gate_daily_cap,
         memory_notification_emitter=memory_notification_emitter,
+        memory_gate_rebuild_fn=_build_memory_gate_deps,
         event_recovery=RedisEventRecovery(),
         sandbox_lifecycle_service=sandbox_lifecycle_service,
     )
