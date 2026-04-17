@@ -15,6 +15,7 @@ import shlex
 from typing import Any, Awaitable, List, Literal, Optional, Union
 
 from langchain_core.tools import StructuredTool, tool as lc_tool
+from pydantic import BaseModel
 
 from app.domain.external.browser import Browser
 from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
@@ -80,7 +81,15 @@ def _wrap_result_outcome(
         )
 
     content = _coerce_result_content(result) or default_success_message
-    data = result.data if hasattr(result, "data") and isinstance(result.data, dict) else None
+    # AllowSuccess.data is Optional[dict[str, Any]]; coerce BaseModel (e.g., SearchResults)
+    # via model_dump so typed Pydantic producers don't silently drop their payload.
+    raw_data = result.data if hasattr(result, "data") else None
+    if isinstance(raw_data, dict):
+        data = raw_data
+    elif isinstance(raw_data, BaseModel):
+        data = raw_data.model_dump(mode="json")
+    else:
+        data = None
     return AllowSuccess(content=content, data=data)
 
 

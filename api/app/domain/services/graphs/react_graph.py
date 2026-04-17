@@ -497,6 +497,9 @@ async def _translate_outcome(
                 message=final_content,
             ),
             status=ToolEventStatus.CALLED,
+            # R4: artifact as dict (F2 fix). Projector 消费时用 TOOL_ARTIFACT_ADAPTER 懒校验.
+            artifact=artifact_json,
+            tool_source=tool_source,
         )
     )
 

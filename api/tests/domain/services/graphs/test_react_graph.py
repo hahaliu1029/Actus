@@ -492,3 +492,79 @@ class TestToolNodeTruncation:
         assert len(tool_msgs) >= 1
         assert len(tool_msgs[0].content) < 200
         assert "已截断" in tool_msgs[0].content
+
+
+class TestTranslateOutcomeR4Extensions:
+    """R4: _translate_outcome 必须在 ToolEvent 里填 artifact (dict) + tool_source.
+
+    _translate_outcome 是 async function, 测试必须 await.
+    """
+
+    def _build_artifact_and_event(self, outcome):
+        from app.domain.models.tool_result import ToolArtifact
+        from app.domain.services.tools.tool_source_resolver import ToolSource
+
+        ts = ToolSource(source="native", category="shell", canonical_name="shell_execute")
+        artifact = ToolArtifact(
+            tool_call_id="c1", tool_name="shell_execute",
+            tool_source=ts, outcome=outcome,
+        )
+        return artifact, ts
+
+    async def test_allow_success_emits_event_with_artifact_dict(self) -> None:
+        """ToolEvent.artifact 必须是 dict (F2 fix), 不是 ToolArtifact 对象."""
+        from app.domain.models.tool_result import AllowSuccess
+        from app.domain.services.graphs.react_graph import _translate_outcome
+
+        artifact, ts = self._build_artifact_and_event(AllowSuccess(content="ok"))
+        tool_call = {"id": "c1", "name": "shell_execute", "args": {"command": "ls"}}
+
+        msg, deferred, events = await _translate_outcome(
+            outcome=artifact.outcome,
+            tool_call=tool_call,
+            tool_source=ts,
+            session_ctx=None,
+            tool_result_max_chars=8000,
+            guide_injector=None,
+        )
+        assert len(events) == 1
+        tool_evt = events[0]
+        assert tool_evt.artifact is not None
+        assert isinstance(tool_evt.artifact, dict)
+        assert tool_evt.artifact["outcome"]["variant"] == "allow_success"
+        assert tool_evt.tool_source == ts
+
+    async def test_denied_emits_event_with_artifact_dict_containing_reason(self) -> None:
+        from app.domain.models.tool_result import Denied, DecisionReason
+        from app.domain.services.graphs.react_graph import _translate_outcome
+
+        outcome = Denied(content="blocked", reason=DecisionReason(type="ast_validator", code="rm_rf"))
+        artifact, ts = self._build_artifact_and_event(outcome)
+        tool_call = {"id": "c1", "name": "shell_execute", "args": {"command": "rm -rf /"}}
+
+        _, _, events = await _translate_outcome(
+            outcome=outcome, tool_call=tool_call, tool_source=ts,
+            session_ctx=None, tool_result_max_chars=8000, guide_injector=None,
+        )
+        assert len(events) == 1
+        tool_evt = events[0]
+        assert tool_evt.artifact is not None
+        assert tool_evt.artifact["outcome"]["variant"] == "denied"
+        assert tool_evt.artifact["outcome"]["reason"]["type"] == "ast_validator"
+        assert tool_evt.tool_source == ts
+
+    async def test_asked_still_emits_zero_events(self) -> None:
+        """Asked 路径不改: 仍然 return None msg + empty events."""
+        from app.domain.models.tool_result import Asked, DecisionReason
+        from app.domain.services.graphs.react_graph import _translate_outcome
+
+        outcome = Asked(content="confirm?", reason=DecisionReason(type="approval_policy"))
+        artifact, ts = self._build_artifact_and_event(outcome)
+        tool_call = {"id": "c1", "name": "shell_execute", "args": {}}
+
+        msg, deferred, events = await _translate_outcome(
+            outcome=outcome, tool_call=tool_call, tool_source=ts,
+            session_ctx=None, tool_result_max_chars=8000, guide_injector=None,
+        )
+        assert msg is None
+        assert events == []

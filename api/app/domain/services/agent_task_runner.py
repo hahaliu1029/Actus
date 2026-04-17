@@ -2107,6 +2107,13 @@ class AgentTaskRunner(TaskRunner):
             if event.status == ToolEventStatus.CALLED:
                 # R1: react_graph 已将 ToolEvent.tool_name 写为 canonical category
                 # （见 graphs/react_graph.py 中对 resolve_tool_source(...).category 的调用），此处直接消费。
+                # R4 CS3 Task 15+16: compute envelope ONCE; all 7 enrichment branches
+                # (search/mcp/a2a/shell/file/skill/skill_creator) now consume envelope.*
+                # instead of event.function_result / event.function_args directly.
+                from app.application.services.tool_event_envelope_v1 import (
+                    project_tool_event_to_envelope_v1,
+                )
+                envelope = project_tool_event_to_envelope_v1(event)
                 category = event.tool_name
                 logger.debug("处理工具事件: tool_name=%s, function=%s, category=%s", event.tool_name, event.function_name, category)
                 # 2.工具为浏览器则补全工具浏览器工具内容
@@ -2118,23 +2125,27 @@ class AgentTaskRunner(TaskRunner):
                     )
                 elif category == "search":
                     # 3.工具为搜索则添加搜索工具内容
-                    try:
-                        if (
-                            hasattr(event.function_result, "data")
-                            and event.function_result.data
-                            and hasattr(event.function_result.data, "results")
-                        ):
-                            event.tool_content = SearchToolContent(
-                                results=event.function_result.data.results
-                            )
-                        else:
-                            # LangChain 路径：结构化数据已丢失
-                            event.tool_content = SearchToolContent(results=[])
-                    except Exception:
+                    # R4 CS3 Task 15 migration: read envelope.function_result.data (dict)
+                    # instead of event.function_result.data. Pre-migration used
+                    # hasattr(data, "results") which was always False for dict input —
+                    # latent bug fixed here via isinstance + SearchResultItem.model_validate.
+                    from app.domain.models.search import SearchResultItem
+
+                    fr = envelope.function_result
+                    data = fr.data if fr else None
+                    if isinstance(data, dict) and isinstance(data.get("results"), list):
+                        try:
+                            results = [SearchResultItem.model_validate(r) for r in data["results"]]
+                        except Exception:
+                            logger.warning("search result dict shape drift, falling back to empty")
+                            results = []
+                        event.tool_content = SearchToolContent(results=results)
+                    else:
                         event.tool_content = SearchToolContent(results=[])
                 elif category == "shell":
                     # 4.工具为shell则生成shell工具内容
-                    session_id = event.function_args.get("session_id", "default")
+                    # R4 CS3 Task 16: use envelope.function_args for consistency.
+                    session_id = envelope.function_args.get("session_id", "default")
                     shell_result = await self._sandbox.read_shell_output(
                         session_id, console=True,
                     )
@@ -2143,12 +2154,13 @@ class AgentTaskRunner(TaskRunner):
                         console=console_records
                     )
                     # Shell 命令可能生成输出文件，主动扫描并同步
-                    exec_dir = event.function_args.get("exec_dir", "")
+                    exec_dir = envelope.function_args.get("exec_dir", "")
                     if exec_dir:
                         await self._sync_generated_files(exec_dir)
                 elif category == "file":
                     # 5.工具为file则将文件同步到对象存储
-                    filepath = event.function_args.get("filepath")
+                    # R4 CS3 Task 16: use envelope.function_args / envelope.function_name.
+                    filepath = envelope.function_args.get("filepath")
                     if filepath:
                         file_read_result = await self._sandbox.read_file(filepath)
                         file_content: str = (file_read_result.data or {}).get(
@@ -2156,7 +2168,7 @@ class AgentTaskRunner(TaskRunner):
                         )
                         event.tool_content = FileToolContent(content=file_content)
                         # 写操作和显式文件查看都需要把沙箱文件同步到会话文件列表
-                        if event.function_name in (
+                        if envelope.function_name in (
                             "file_write",
                             "file_str_replace",
                             "file_view",
@@ -2166,67 +2178,46 @@ class AgentTaskRunner(TaskRunner):
                         event.tool_content = FileToolContent(content="(No Content)")
                 elif category in ("mcp", "a2a"):
                     # 6.工具为mcp/a2a则处理调用结果
+                    # R4 CS3 Task 15 migration: projector-driven enrichment.
+                    # fr.status == "ok" with data → passthrough data; ok without data → message;
+                    # non-ok → placeholder from fr.message.
                     is_mcp = category == "mcp"
-                    logger.info(
-                        f"处理MCP/A2A工具事件, function_result: {event.function_result}"
-                    )
-                    if event.function_result:
-                        # 7.如果结果包含data则提取data
-                        if (
-                            hasattr(event.function_result, "data")
-                            and event.function_result.data
-                        ):
-                            logger.info(
-                                f"MCP/A2A工具调用结果: {event.function_result.data}"
-                            )
-                            event.tool_content = (
-                                MCPToolContent(result=event.function_result.data)
-                                if is_mcp
-                                else A2AToolContent(
-                                    a2a_result=event.function_result.data
-                                )
-                            )
-                        elif (
-                            hasattr(event.function_result, "success")
-                            and event.function_result.success
-                        ):
-                            # 8.mcp/a2a工具调用正常，但是无结果产生
-                            logger.info(
-                                f"MCP/A2A工具调用成功返回，但无结果: {event.function_result}"
-                            )
-                            result_data = (
-                                event.function_result.model_dump()
-                                if hasattr(event.function_result, "model_dump")
-                                else str(event.function_result)
-                            )
-                            event.tool_content = (
-                                MCPToolContent(result=result_data)
-                                if is_mcp
-                                else A2AToolContent(a2a_result=result_data)
-                            )
-                        else:
-                            # 9.其他情况将结果转换成字符串进行传递（含 LangChain 路径）
-                            msg = getattr(event.function_result, "message", None) or str(event.function_result)
-                            logger.info(f"MCP/A2A工具结果: {msg}")
-                            event.tool_content = (
-                                MCPToolContent(result=msg)
-                                if is_mcp
-                                else A2AToolContent(a2a_result=msg)
-                            )
-                    else:
+                    fr = envelope.function_result
+                    if fr is None:
                         logger.warning("MCP/A2A工具调用结果未发现")
                         event.tool_content = (
                             MCPToolContent(result="(MCP工具无可用结果)")
                             if is_mcp
                             else A2AToolContent(a2a_result="(A2A智能体无可用结果)")
                         )
+                    elif fr.status != "ok":
+                        # error / denied / timeout — fall back to message
+                        logger.info("MCP/A2A工具失败: status=%s, message=%s", fr.status, fr.message)
+                        event.tool_content = (
+                            MCPToolContent(result=fr.message)
+                            if is_mcp
+                            else A2AToolContent(a2a_result=fr.message)
+                        )
+                    elif fr.data is not None:
+                        logger.info("MCP/A2A工具调用结果: %s", fr.data)
+                        event.tool_content = (
+                            MCPToolContent(result=fr.data)
+                            if is_mcp
+                            else A2AToolContent(a2a_result=fr.data)
+                        )
+                    else:
+                        # ok but no data — use message
+                        logger.info("MCP/A2A工具调用成功返回，但无 data: %s", fr.message)
+                        event.tool_content = (
+                            MCPToolContent(result=fr.message)
+                            if is_mcp
+                            else A2AToolContent(a2a_result=fr.message)
+                        )
                 elif category == "skill":
                     # Native skill 通过 ToolResult.data.shell_session_id 传递沙箱会话
-                    skill_data = (
-                        event.function_result.data
-                        if event.function_result and event.function_result.data is not None
-                        else {}
-                    )
+                    # R4 CS3 Task 16: use envelope.function_result instead of event.function_result.
+                    fr = envelope.function_result
+                    skill_data = fr.data if fr and fr.data is not None else {}
                     shell_sid = (
                         skill_data.get("shell_session_id")
                         if isinstance(skill_data, dict)
@@ -2248,13 +2239,13 @@ class AgentTaskRunner(TaskRunner):
                             event.tool_content = SkillToolContent(
                                 skill_result=skill_data
                             )
-                    elif event.function_result and event.function_result.data is not None:
+                    elif fr and fr.data is not None:
                         event.tool_content = SkillToolContent(
-                            skill_result=event.function_result.data
+                            skill_result=fr.data
                         )
-                    elif event.function_result and event.function_result.message:
+                    elif fr and fr.message:
                         event.tool_content = SkillToolContent(
-                            skill_result=event.function_result.message
+                            skill_result=fr.message
                         )
                     else:
                         event.tool_content = SkillToolContent(
@@ -2269,13 +2260,15 @@ class AgentTaskRunner(TaskRunner):
                     if skill_exec_dir:
                         await self._sync_generated_files(skill_exec_dir)
                 elif category == "skill creator":
-                    if event.function_result and event.function_result.data is not None:
+                    # R4 CS3 Task 16: use envelope.function_result instead of event.function_result.
+                    fr = envelope.function_result
+                    if fr and fr.data is not None:
                         event.tool_content = SkillToolContent(
-                            skill_result=event.function_result.data
+                            skill_result=fr.data
                         )
-                    elif event.function_result and event.function_result.message:
+                    elif fr and fr.message:
                         event.tool_content = SkillToolContent(
-                            skill_result=event.function_result.message
+                            skill_result=fr.message
                         )
                     else:
                         event.tool_content = SkillToolContent(
