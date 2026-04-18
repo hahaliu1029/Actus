@@ -314,6 +314,83 @@ async def test_gate_wilson_hard_gate() -> None:
     )
 
 
+async def test_gate_marker_hint_regression() -> None:
+    """Codex round-2 [P2]: fail-fast on marker-as-hint keepables.
+
+    Locks in the prompt fix from gap #2 closure (codex round-1 [P1]):
+    markers 暂时/如果/万一/演示用/最好/希望/也行 are **semantic hints**,
+    not lexical vetoes. The seed rows tagged in their notes as
+    ``marker-as-hint regression`` (currently p21-p27 in
+    ``synthetic/dataset.jsonl``) all encode "marker present but content
+    is keepable" — standing rules with conditional triggers, current
+    real choices with hedges, demo-scoped real objects, polite
+    expressions of long-term preferences.
+
+    If a future prompt change regresses to lexical-veto behavior on
+    these markers (i.e. drops the row purely because 暂时/最好/也行
+    appears), this test fires immediately. Without it the regression
+    is only visible in ``test_gate_precision_baseline`` (no assertion)
+    and ``test_gate_wilson_hard_gate`` (skipped without private set),
+    so codex round-2 review flagged the gap.
+
+    Selection by ``notes`` prefix (not by ID range) so adding new rows
+    is just "set notes prefix" — no test edit required.
+    """
+    all_core = _load_jsonl(synthetic_dataset_path())
+    samples = [
+        s for s in all_core
+        if s.get("notes", "").startswith("marker-as-hint regression")
+    ]
+    assert len(samples) >= 4, (
+        f"marker-hint regression seed shrank below safety floor: "
+        f"got {len(samples)}, need >= 4 (p21-p24 minimum). Check "
+        f"synthetic/dataset.jsonl for accidentally-removed notes prefixes."
+    )
+
+    llm = _resolve_llm()
+    classifier = MemoryGateClassifier(llm)
+    decisions = await _run_classifier(samples, classifier)
+    by_idx = {d.chunk_index: d for d in decisions}
+
+    failures: list[str] = []
+    for i, s in enumerate(samples):
+        d = by_idx.get(i)
+        if d is None:
+            failures.append(f"  {s['id']} (no decision returned): {s['text']!r}")
+            continue
+        if d.verdict != "keep":
+            failures.append(
+                f"  {s['id']} verdict={d.verdict} conf={d.confidence:.2f} "
+                f"cat={d.category}: {s['text']!r}"
+            )
+            continue
+        if d.confidence < 0.7:
+            failures.append(
+                f"  {s['id']} verdict=keep but low conf={d.confidence:.2f} "
+                f"(< 0.7 threshold means it'd be filtered downstream): "
+                f"{s['text']!r}"
+            )
+
+    print("\n" + "=" * 60)
+    print(f"memory_gate MARKER-HINT REGRESSION @ threshold=0.7, N={len(samples)}")
+    print(f"  passes = {len(samples) - len(failures)} / {len(samples)}")
+    if failures:
+        print("  failures:")
+        for f in failures:
+            print(f)
+    print("=" * 60)
+
+    assert not failures, (
+        f"Marker-hint regression failed — gate dropped or low-conf'd "
+        f"{len(failures)}/{len(samples)} rows that contain hypothetical/"
+        f"temporary markers but encode standing rules / current facts / "
+        f"demo-scoped objects / polite long-term preferences. The prompt "
+        f"in app/domain/services/memory_gate.py:_SYSTEM_PROMPT may have "
+        f"regressed to lexical-veto behavior on these markers (codex "
+        f"round-1 [P1]). Failures:\n" + "\n".join(failures)
+    )
+
+
 # Per-suite minimum bars — step 3 split. Kept lenient because each
 # suite currently has only 3-5 samples, so a single mis-classification
 # would already swing the metric by 20-33pp. The design target (§634)
@@ -366,7 +443,14 @@ async def test_gate_adversarial_resistance(suite_name: str) -> None:
     Design doc §634 target of Wilson lower CI ≥ 0.80 per suite requires
     20-30 samples per suite; gap #2 grew each suite to 22 (2026-04-19).
     All 5 suites pass single-batch after the gap #2 prompt fix
-    (explicit hypothetical/temporary markers in ``_SYSTEM_PROMPT``).
+    (semantic-hint markers in ``_SYSTEM_PROMPT``).
+
+    NOTE on Wilson gate: per-suite Wilson precision CI ≥ 0.80 is **not**
+    yet satisfied at this suite layout. Drop-only suites (4 of 5)
+    contribute zero TPs and are precision-undefined; only ``ambiguous``
+    is precision-scorable, with 13 keeps capping Wilson lower at 0.772
+    even at 100% precision. See ``synthetic/adversarial/README.md``
+    "Scaling target" for the math and the path to clearing 0.80.
     """
     suite_paths = synthetic_adversarial_suite_paths()
     suite_path = suite_paths.get(suite_name)

@@ -1,17 +1,20 @@
 """Memory gate eval harness (M1 → M2).
 
 Contents:
-- ``synthetic/dataset.jsonl`` — 45 public core samples (PR-5 expanded
-  from 25); target 100 at M2 ship
+- ``synthetic/dataset.jsonl`` — 52 public core samples (45 from PR-5 +
+  marker-as-hint regression rows added in gap #2 closure; the regression
+  set is selected dynamically by ``notes`` prefix, not by ID range, so
+  the count drifts as samples are added — see
+  ``test_gate_marker_hint_regression`` in ``test_memory_gate_eval.py``
+  for the live count). Target 100 at M2 ship.
 - ``synthetic/adversarial/{ambiguous,sarcasm,temporary,contradictions,
-  testing}.jsonl`` — 20 hand-crafted adversarial samples split across
-  the five suites from design doc §621. Step 3 of gap-closure work
-  replaced the pre-PR-5 monolithic ``adversarial.jsonl`` with per-suite
-  files so the pytest harness can parametrize per suite (each suite
-  has its own accuracy bar, progressing toward design's Wilson CI ≥
-  0.80 target once gap #2 grows each suite to 20-30 samples). See
-  ``synthetic/adversarial/README.md`` for the suite taxonomy and the
-  ``sarcasm`` proxy-grouping note.
+  testing}.jsonl`` — 110 hand-crafted adversarial samples (22 per suite)
+  split across the five suites from design doc §621. Gap #2 grew each
+  suite from 3-5 to 22 samples; per-suite Wilson precision CI ≥ 0.80
+  (design §634) is **not yet** satisfied — see
+  ``synthetic/adversarial/README.md`` "Per-suite Wilson precision gate
+  status" for the math (only ``ambiguous`` is precision-scorable, with
+  13 keeps that cap Wilson lower at 0.772 even at 100% precision).
 - ``labelling_rubric.md`` — verdict/category definitions, M2 semantics
 - ``stats.py`` — Wilson CI + Cohen's kappa helpers (no external deps)
 - ``paths.py`` — public + private dataset + adversarial path resolution

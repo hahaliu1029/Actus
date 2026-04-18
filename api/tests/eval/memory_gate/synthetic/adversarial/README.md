@@ -30,19 +30,25 @@ be fooled by surface alignment", and all three exercise that capability.
 Per-class breakdowns can come later if the gate regresses on one class
 specifically.
 
-## Scaling target (gap #2 — done)
+## Scaling target — sample count met, Wilson precision gate NOT met
 
 Design doc §634 target: **20-30 samples per suite, per-suite Wilson CI
-lower ≥ 0.80**. Each suite now ships 22 samples (gap #2 expansion).
-`test_gate_adversarial_resistance` still applies the
-"≤ 1 mis-classification per suite" accuracy bar (`(n-1)/n` ≈ 0.955 at
-n=22); the Wilson lower bound on per-suite precision becomes meaningful
-once the gate run produces enough kept samples (N≥15 keeps with all
-correct → Wilson lower ≈ 0.80). Drop-only suites (temporary, testing,
-contradictions, sarcasm) can't directly produce a meaningful precision
-CI — they're scored on accuracy/specificity. Only `ambiguous` (mixed
-13 keep / 9 drop) directly contributes to the per-suite Wilson CI on
-precision.
+lower ≥ 0.80**. Sample-count half is satisfied (each suite now ships 22
+samples, gap #2 expansion). **Per-suite Wilson precision gate is NOT
+yet satisfied** and will not be at this suite layout — math:
+
+- Drop-only suites (`temporary`, `testing`, `contradictions`, `sarcasm`)
+  contribute zero TPs to per-suite precision (no keep gold), so per-suite
+  precision CI is undefined. They're scored on accuracy/specificity via
+  `test_gate_adversarial_resistance`'s `(n-1)/n` ≈ 0.955 bar at n=22.
+- Only `ambiguous` is precision-scorable. With 13 keep gold rows, even a
+  perfect 13/13 yields Wilson 95% lower = **0.772** (< 0.80). 15/15
+  → 0.796; need ≥ 17 all-correct keeps to clear 0.80.
+
+To clear the design §634 Wilson 0.80 per-suite gate, either: (a) grow
+`ambiguous` keeps to ≥ 17 (adding 4-5 more borderline-keep samples),
+or (b) fold positive samples into one of the drop-only suites and
+relabel that suite as mixed. Tracked separately; not in this PR.
 
 ## Single-suite batch resistance — `testing` (2026-04-19 finding + fix)
 
@@ -58,12 +64,34 @@ hypothetical / subjunctive markers. When a single-suite batch provided
 zero contrastive anchors (all 22 rows hypothetical), the gate read
 surface patterns like "我会用 Rust" as preference signals.
 
-**Fix (same session):** extended `_SYSTEM_PROMPT` to enumerate two
-explicit drop-marker classes: 假设/反事实/条件性 (如果/假设/万一/倘若/
-要是/可能的话/可以的话/理想情况下) and 临时性范围 (这次/今天/刚才/
-暂时/本次/先...再/演示用). Post-fix all 5 suites pass single-batch and
-union batches remain at 100% (core recall improved 0.967 → 1.000;
-Wilson lower 0.833 → 0.838 — Pareto improvement).
+**Fix (same session, multi-round):** rewrote `_SYSTEM_PROMPT` to treat
+hypothetical / temporary markers (如果/假设/万一/倘若/要是/可能的话/
+可以的话/理想情况下/这次/今天/刚才/暂时/本次/演示用) as **semantic
+hints, NOT lexical vetoes** — the gate must judge whether the marker
+scopes the content as transient (hypothetical scenario / one-shot task
+override → drop) vs. modifying a real standing rule or current fact
+(condition trigger + concrete recurring action / hedge over a real
+choice / demo-scoped real object → keep). Codex round-1 + round-2
+review iterations specifically flagged early lexical-veto drafts as
+introducing false negatives on legitimate keepable content like
+"我们暂时用 PostgreSQL 17" (current real choice with hedge),
+"如果要改 schema 先写 migration" (standing rule with conditional
+trigger), "我希望 secret 都走 KMS" (polite long-term preference).
+
+**Regression guard:** `test_gate_marker_hint_regression` (in
+`test_memory_gate_eval.py`) selects all rows tagged
+`marker-as-hint regression` in `synthetic/dataset.jsonl` (currently 7,
+adding more is just "set the notes prefix" — no test edit needed) and
+fail-fast asserts each is `keep` with confidence ≥ 0.7. If a future
+prompt change drifts back toward lexical-veto behavior, this test
+fires immediately rather than silently regressing in
+`test_gate_precision_baseline` (visibility-only) or
+`test_gate_wilson_hard_gate` (skipped without private set).
+
+Post-fix all 5 single-batch suites pass with 0 misclassifications,
+adversarial union 110 maintains 100% precision/recall, core recall
+0.967 → 0.973, Wilson lower 0.833 → 0.862 (cumulative across
+round-1 prompt fix and round-2 semantic-hint refinement).
 
 ## Adding new samples
 

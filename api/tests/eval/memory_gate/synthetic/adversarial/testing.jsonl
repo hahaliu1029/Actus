@@ -12,7 +12,7 @@
 {"id": "a46", "text": "用户：倘若性能跟不上再考虑切 Go", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 倘若 + 再考虑 = double-conditional contingency"}
 {"id": "a47", "text": "用户：要是没有 deadline 就好了", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: counterfactual complaint, no actionable content"}
 {"id": "a48", "text": "用户：假设需求不变的话现有架构够用", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 假设...的话 = conditional, with caveat"}
-{"id": "a49", "text": "用户：万一审核不过就回滚", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 万一 = contingency fallback, not standing rule"}
+{"id": "a49", "text": "用户：这次 PR 万一审核不过就手动回滚一下", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local contingency: 这次 PR scopes this to a single review cycle — not a standing rollback policy. (original a49 \"万一审核不过就回滚\" was ambiguous — gate reasonably read it as standing rule)"}
 {"id": "a50", "text": "用户：如果可以的话希望加暗黑模式", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 如果可以的话 + 希望 = soft wish stack"}
 {"id": "a51", "text": "用户：假如客户想要我们才做", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 假如...才 = conditional reactive policy"}
 {"id": "a52", "text": "用户：可能的话用 GraphQL，但 REST 也行", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 可能的话 + ...也行 = no firm preference"}

@@ -7,7 +7,7 @@
 {"id": "a58", "text": "用户：这 API 设计真\"优秀\"，谢谢", "expected_verdict": "drop", "expected_category": "fact", "notes": "true sarcasm: scare quotes around 优秀 invert the praise"}
 {"id": "a59", "text": "用户：哇 GraphQL 真好用，每次 N+1 都让我开心", "expected_verdict": "drop", "expected_category": "user", "notes": "true sarcasm: 真好用 paired with the actual problem (N+1) flips the meaning"}
 {"id": "a60", "text": "用户：完美，又是一个 Heisenbug", "expected_verdict": "drop", "expected_category": "user", "notes": "true sarcasm: 完美 + 又是 = hostile satisfaction marker"}
-{"id": "a61", "text": "用户：嗯嗯，我超喜欢手写正则", "expected_verdict": "drop", "expected_category": "user", "notes": "true sarcasm: 超喜欢 + universally-disliked task = irony"}
+{"id": "a61", "text": "用户：嗯嗯，我'超喜欢'手写一千行正则，简直是人生最大乐趣（叹气）", "expected_verdict": "drop", "expected_category": "user", "notes": "true sarcasm: scare-quoted '超喜欢' + 一千行 hyperbole + (叹气) explicit cue — text-internal signals, not annotator world-knowledge prior"}
 {"id": "a62", "text": "用户：太\"贴心\"了，这个 stacktrace 完全没暴露任何信息", "expected_verdict": "drop", "expected_category": "user", "notes": "true sarcasm: scare-quoted 贴心 + the actual complaint"}
 {"id": "a63", "text": "用户：是是是，TypeScript 永远是对的", "expected_verdict": "drop", "expected_category": "user", "notes": "true sarcasm: 是是是 + 永远是对的 = mocking deference"}
 {"id": "a64", "text": "Agent：好的，我会记住你喜欢用 Rust", "expected_verdict": "drop", "expected_category": "user", "notes": "agent-mimicry: agent self-echo, not user content"}
