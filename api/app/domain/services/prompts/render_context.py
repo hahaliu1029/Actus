@@ -10,13 +10,16 @@ config dicts.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from app.domain.services.prompts.section import RenderContext
 from app.domain.services.tools.tool_source_resolver import (
     ToolSourceUnknownError,
     resolve_tool_source,
 )
+
+if TYPE_CHECKING:
+    from app.domain.services.prompts.memory_snapshot import MemorySnapshot
 
 
 def _infer_provider(llm: Any) -> Literal["openai", "anthropic"]:
@@ -96,6 +99,8 @@ def build_render_context(
     state: dict,
     config: dict,
     agent_config: Any,
+    *,
+    memory_snapshot: "MemorySnapshot | None" = None,
 ) -> RenderContext:
     """Build a ``RenderContext`` from LangGraph state + config + AgentConfig.
 
@@ -109,6 +114,12 @@ def build_render_context(
     The function is defensive — missing fields fall back to safe defaults
     (empty sets, ``"zh"``, etc.) so partial state during graph initialization
     doesn't crash assembly.
+
+    M2 PR-4: ``memory_snapshot`` is an optional pre-built bundle of
+    category-bucketed memory chunks. Callers that have user_id + repo
+    await ``build_memory_snapshot`` upstream (in the async node) and pass
+    the result here as a kwarg. Absent (the test / no-memory default)
+    leaves the three memory sections inert.
     """
     configurable = (config.get("configurable") if config else None) or {}
     llm = configurable.get("llm")
@@ -145,4 +156,5 @@ def build_render_context(
         tool_categories=_categorize_tools(bound_tool_names),
         mcp_active=_has_category(bound_tool_names, "mcp"),
         a2a_active=_has_category(bound_tool_names, "a2a"),
+        memory_snapshot=memory_snapshot,
     )

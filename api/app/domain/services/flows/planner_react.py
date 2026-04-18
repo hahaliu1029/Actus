@@ -6,11 +6,20 @@ so that AgentTaskRunner requires minimal changes.
 
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Optional,
+    Sequence,
+)
 
 if TYPE_CHECKING:
     from app.domain.models.app_config import ToolRuntimeConfig
     from app.domain.services.prompts.assembler import PromptAssembler
+    from app.domain.services.prompts.memory_snapshot import MemorySnapshot
 
 
 from langchain_core.language_models import BaseChatModel
@@ -447,6 +456,8 @@ class PlannerReActFlow(BaseFlow):
             assembler=assembler,
             tool_runtime_config=self._tool_runtime,
         )
+        memory_snapshot_provider = self._build_memory_snapshot_provider()
+
         self._main_graph = build_main_graph(
             planner_llm=self._llm,
             react_graph=self._react_graph,
@@ -458,9 +469,55 @@ class PlannerReActFlow(BaseFlow):
             assembler=assembler,
             prompt_assembler=self._prompt_assembler,
             supports_vision=self._supports_vision,
+            memory_snapshot_provider=memory_snapshot_provider,
             _allow_default_prompt_assembler=self._allow_default_prompt_assembler,
         )
         self._graphs_built = True
+
+    def _build_memory_snapshot_provider(
+        self,
+    ) -> "Callable[[], Awaitable[MemorySnapshot | None]] | None":
+        """Return an async closure that fetches a ``MemorySnapshot`` per call.
+
+        The provider is handed to ``build_main_graph`` and invoked by each
+        node (planner / executor / updater) before it builds its
+        ``RenderContext``. We keep the DI concerns here (session factory,
+        repo factory, user_id, exception handling) and hand ``main_graph``
+        a single, already-safe async callable.
+
+        Returns ``None`` when any of the required dependencies is missing
+        (test harnesses without memory wiring, or anonymous sessions with
+        ``user_id == ""``). ``build_main_graph`` interprets ``None`` as
+        "keep memory sections inert".
+
+        On every invocation we open a fresh async session so each render
+        gets an up-to-date view (the agent loop may have written new
+        chunks between steps). Any DB / network / unexpected error is
+        swallowed here and logged — memory is a nice-to-have; an
+        unreachable DB must not abort the plan.
+        """
+        if not (self._user_id and self._memory_session_factory and self._memory_repo_factory):
+            return None
+
+        from app.domain.services.prompts.memory_snapshot import build_memory_snapshot
+
+        session_factory = self._memory_session_factory
+        repo_factory = self._memory_repo_factory
+        user_id = self._user_id
+
+        async def _provider() -> "MemorySnapshot | None":
+            try:
+                async with session_factory() as session:
+                    repo = repo_factory(session)
+                    return await build_memory_snapshot(repo, user_id)
+            except Exception as exc:
+                logger.warning(
+                    "build_memory_snapshot failed (swallowed, user_id=%s): %s",
+                    user_id, exc,
+                )
+                return None
+
+        return _provider
 
     def _build_previous_plan_context(self) -> str:
         """构建前一轮计划的上下文摘要，包含步骤结果和生成的文件路径。

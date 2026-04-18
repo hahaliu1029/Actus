@@ -13,7 +13,7 @@ import asyncio
 import logging
 import re
 import uuid
-from typing import Any, Callable, Literal, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Literal, TYPE_CHECKING
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -51,6 +51,7 @@ from .state import MainGraphState
 if TYPE_CHECKING:
     from .context_assembler import ContextAssembler
     from app.domain.services.prompts.assembler import PromptAssembler
+    from app.domain.services.prompts.memory_snapshot import MemorySnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,7 @@ def build_main_graph(
     assembler: ContextAssembler | None = None,
     prompt_assembler: "PromptAssembler | None" = None,
     supports_vision: bool = True,
+    memory_snapshot_provider: "Callable[[], Awaitable[MemorySnapshot | None]] | None" = None,
     _allow_default_prompt_assembler: bool = False,
 ) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
@@ -139,6 +141,27 @@ def build_main_graph(
         production this MUST be provided (``AgentTaskRunner`` constructs
         a configured instance and passes it in). Missing it raises
         ``RuntimeError`` unless ``_allow_default_prompt_assembler=True``.
+    memory_snapshot_provider : M2 PR-4 optional async callable returning a
+        ``MemorySnapshot`` per render. ``PlannerReActFlow`` builds a closure
+        that opens a DB session, calls ``build_memory_snapshot(repo, user_id)``,
+        and swallows exceptions (returns None) so an unavailable DB never
+        crashes the agent loop — memory injection degrades to "sections emit
+        nothing", which is the same as the no-memory default.
+
+        **Invoked ONLY from ``executor_node``.** The three memory sections
+        (``memory_rules`` / ``memory_user_profile`` / ``memory_fact_index``)
+        live exclusively in the executor registry per M2 design doc
+        §585-599 — planner / updater registries declare a small ``planner_*``
+        section set that doesn't read ``ctx.memory_snapshot``. Fetching from
+        those two nodes would burn four extra DB queries per ainvoke with
+        zero behavioral change; the CI guard
+        ``test_planner_and_updater_never_invoke_provider`` locks this
+        decision. If a future PR ever adds a memory-aware section to the
+        planner or updater registry, re-add the fetch at that call site
+        and update the guard.
+
+        None means memory sections stay inert (tests, flows without
+        memory wiring).
     _allow_default_prompt_assembler : Test-only escape hatch (leading
         underscore to mark internal). When True AND ``prompt_assembler``
         is None, this constructor builds a minimal-budget default
@@ -184,6 +207,28 @@ def build_main_graph(
             telemetry=None,
         )
 
+    async def _resolve_memory_snapshot() -> "MemorySnapshot | None":
+        """Invoke ``memory_snapshot_provider`` defensively.
+
+        The provider itself already swallows its own DB / timeout errors
+        (see ``PlannerReActFlow._ensure_graphs`` — it wraps the session /
+        repo / ``build_memory_snapshot`` chain in try/except and logs).
+        We still catch here as a second safety net so any unexpected
+        raise from the closure contract never escalates to crashing
+        planner / executor / updater — a missing snapshot is equivalent
+        to "no memory" and should NOT abort plan generation.
+        """
+        if memory_snapshot_provider is None:
+            return None
+        try:
+            return await memory_snapshot_provider()
+        except Exception as exc:
+            logger.warning(
+                "memory_snapshot_provider raised; degrading to no-memory prompt: %s",
+                exc,
+            )
+            return None
+
     # ---- Nodes --------------------------------------------------------- #
 
     async def planner_node(state: MainGraphState, config: RunnableConfig) -> dict:
@@ -207,6 +252,8 @@ def build_main_graph(
         # runs BEFORE react_graph_provider and has no per-step tool binding.
         section_bundle = get_prompt_section_bundle(state.get("language", "zh"))
         planner_config = {"configurable": {}}
+        # M2 PR-4: planner registry does NOT include memory sections —
+        # skip the snapshot fetch. See ``memory_snapshot_provider`` docstring.
         ctx = build_render_context(state, planner_config, agent_config)
         result = prompt_assembler.assemble(
             section_bundle.planner,
@@ -411,7 +458,11 @@ def build_main_graph(
             # parameter (not per-request state). It's stable for the lifetime
             # of the graph and safe to read via ``getattr(..., default)``
             # inside ``build_render_context``.
-            ctx = build_render_context(state_for_render, fresh_config, agent_config)
+            memory_snapshot = await _resolve_memory_snapshot()
+            ctx = build_render_context(
+                state_for_render, fresh_config, agent_config,
+                memory_snapshot=memory_snapshot,
+            )
             # fallback_used=True when react_graph_provider was unavailable
             # and we're relying on the legacy state.skill_context path.
             fallback_used = react_graph_provider is None
@@ -678,6 +729,9 @@ def build_main_graph(
                     state.get("language", "zh")
                 )
                 updater_config = {"configurable": {}}
+                # M2 PR-4: updater registry does NOT include memory sections —
+                # skip the snapshot fetch. See ``memory_snapshot_provider``
+                # docstring.
                 ctx = build_render_context(state, updater_config, agent_config)
                 result = prompt_assembler.assemble(
                     section_bundle.updater,
