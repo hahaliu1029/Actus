@@ -155,15 +155,26 @@ def _score_at_threshold(
     expected: list[bool],
     threshold: float,
 ) -> ThresholdResult:
-    """Given per-sample ``(gate_decision, gate_confidence)`` and expected
+    """Given per-sample ``(verdict_is_keep, gate_confidence)`` and expected
     keep labels, compute confusion counts at a threshold.
 
-    The gate outputs a confidence; samples are "kept" when
-    ``confidence >= threshold``.
+    **Production-aligned semantic** (matches ``filter_kept_decisions`` in
+    ``domain/services/memory_gate.py``): a sample is "kept" iff
+    ``verdict == "keep" AND confidence >= threshold``. A verdict of "drop"
+    is treated as predicted_keep=False regardless of confidence — gate
+    routinely assigns high confidence (0.9+) to both its keep AND drop
+    decisions, and a pure-confidence sweep would mis-count every
+    high-confidence drop as a positive.
+
+    The pre-PR-2 revision of this function used a confidence-only rule
+    (ignoring verdict). It reported apparent precision = base rate on the
+    M2 spike run because the gate's drop verdicts (correctly classified)
+    were being counted as false positives. Verdict-aware scoring restored
+    agreement between the CLI table and ``filter_kept_decisions``.
     """
     tp = fp = fn = tn = 0
-    for (_, conf), exp in zip(predictions, expected):
-        predicted_keep = conf >= threshold
+    for (verdict_is_keep, conf), exp in zip(predictions, expected):
+        predicted_keep = verdict_is_keep and conf >= threshold
         if predicted_keep and exp:
             tp += 1
         elif predicted_keep and not exp:
@@ -198,11 +209,12 @@ async def _classify_all(samples: list[Sample], llm) -> list[tuple[bool, float]]:
         for i, s in enumerate(samples)
     ]
     decisions = await classifier.classify(inputs)
-    # Align decisions back to input order by chunk_index. The decision's
-    # own internal ``verdict`` (keep/drop) isn't used by the sweep —
-    # we only need ``confidence`` so each threshold in the sweep can
-    # re-decide keep/drop post-hoc. The bool half of the tuple preserves
-    # the gate's own verdict for future introspection / logging.
+    # Align decisions back to input order by chunk_index. The bool half
+    # of the tuple (``d.verdict == "keep"``) AND the confidence together
+    # drive scoring in ``_score_at_threshold`` — this matches the
+    # production gate rule (``verdict == "keep" AND conf >= threshold``).
+    # Confidence alone is not sufficient because the gate routinely
+    # assigns high confidence to both keep AND drop decisions.
     by_idx = {d.chunk_index: d for d in decisions}
     out: list[tuple[bool, float]] = []
     for i in range(len(samples)):

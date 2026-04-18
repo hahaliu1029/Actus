@@ -128,6 +128,52 @@ class TestScoreAtThreshold:
         # Known: Wilson CI 95% lower for 80/100 is ~0.7111
         assert 0.70 < r.precision_lower < 0.72
 
+    def test_high_confidence_drop_is_true_negative(self) -> None:
+        """Regression for the PR-2 spike finding: gates routinely emit
+        ``verdict='drop'`` with confidence >= 0.9. Pre-PR-2 code used
+        confidence-only scoring, which mis-counted those as false
+        positives and drove apparent precision down to the base rate.
+
+        Production rule (``filter_kept_decisions``): keep iff
+        ``verdict=='keep' AND conf>=threshold``. A high-confidence drop
+        on an expected=drop sample must score as TN, not FP.
+        """
+        # 3 keep (correctly predicted) + 2 drop (correctly predicted with
+        # high confidence — the critical case).
+        predictions = [
+            (True, 0.95),   # keep / keep
+            (True, 0.90),   # keep / keep
+            (True, 0.85),   # keep / keep
+            (False, 0.99),  # drop with 0.99 conf — must be TN not FP
+            (False, 0.95),  # drop with 0.95 conf — must be TN not FP
+        ]
+        expected = [True, True, True, False, False]
+        r = _score_at_threshold(predictions, expected, threshold=0.7)
+        assert r.tp == 3
+        assert r.fp == 0, (
+            f"high-confidence drop mis-scored as FP; got fp={r.fp}. "
+            f"This is the M2 spike bug — confidence-only scoring inflated "
+            f"false positives because gate verdict was ignored."
+        )
+        assert r.fn == 0
+        assert r.tn == 2
+        assert r.precision == 1.0
+        assert r.recall == 1.0
+
+    def test_verdict_drop_overrides_high_confidence(self) -> None:
+        """If verdict=='drop' the sample must be predicted_keep=False
+        regardless of how high the confidence is — threshold can only
+        filter OUT keeps, never promote drops."""
+        predictions = [(False, 0.999)]
+        expected = [True]
+        # Even at threshold=0.0 (accept everything confidence-wise), a
+        # drop verdict stays drop.
+        r = _score_at_threshold(predictions, expected, threshold=0.0)
+        assert r.tp == 0
+        assert r.fp == 0
+        assert r.fn == 1  # expected keep but gate said drop
+        assert r.tn == 0
+
 
 # ---- Dataset loading --------------------------------------------------- #
 
