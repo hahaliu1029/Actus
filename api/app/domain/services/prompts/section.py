@@ -30,6 +30,7 @@ from typing import Any, Callable, Literal
 
 from app.domain.services.prompts.errors import SectionValidationError
 from app.domain.services.prompts.invariants import _assert_no_dangling_skill_tool_refs
+from app.domain.services.prompts.memory_snapshot import MemorySnapshot
 
 
 # ---- Mode --------------------------------------------------------------- #
@@ -90,6 +91,17 @@ class RenderContext:
     tool_categories: frozenset[str] = field(default_factory=frozenset)
     mcp_active: bool = False
     a2a_active: bool = False
+    memory_snapshot: MemorySnapshot | None = None
+    """M2-PR3: bucketed memory chunks for prompt-time injection.
+
+    Built upstream (repo query happens there, see
+    ``memory_snapshot.build_memory_snapshot``) and attached to the
+    context before any section renders. When ``None``, the three memory
+    sections (``memory_rules``, ``memory_user_profile``,
+    ``memory_fact_index``) emit nothing — non-memory-aware call sites
+    (legacy executor path, tests without memory fixtures) therefore
+    remain unaffected.
+    """
 
 
 # ---- SectionOutput ------------------------------------------------------ #

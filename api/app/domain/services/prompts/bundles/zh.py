@@ -22,6 +22,13 @@ from app.domain.services.prompts.sections.conversation_summaries import (
     conversation_summaries_section,
 )
 from app.domain.services.prompts.sections.identity import identity_section
+from app.domain.services.prompts.sections.memory_fact_index import (
+    memory_fact_index_section,
+)
+from app.domain.services.prompts.sections.memory_rules import memory_rules_section
+from app.domain.services.prompts.sections.memory_user_profile import (
+    memory_user_profile_section,
+)
 from app.domain.services.prompts.sections.output_format import output_format_section
 from app.domain.services.prompts.sections.planner_identity import (
     planner_identity_section,
@@ -58,11 +65,21 @@ ZH_EXECUTOR_REGISTRY = SectionRegistry(
         identity_section,
         behavior_core_section,
         output_format_section,
-        # C3 sections (priority 8, 7, 7, 6, 5) — conditional render
+        # C3 sections (priority 8, 7, 7, 6, 5) — conditional render.
+        # M2-PR3 memory sections interleave by priority bucket:
+        #   memory_rules (prio 8) after tools_guide_stable (prio 8) so
+        #     hard behavior rules reach the agent before it engages tools;
+        #   memory_user_profile (prio 7) before skill_context (prio 7) so
+        #     preferences inform skill selection;
+        #   memory_fact_index (prio 5) before sandbox_state (prio 5) as a
+        #     last-block reference the agent can consult by id.
         tools_guide_stable_section,
         tools_guide_dynamic_section,
+        memory_rules_section,
+        memory_user_profile_section,
         skill_context_section,
         conversation_summaries_section,
+        memory_fact_index_section,
         sandbox_state_section,
     ),
     name="zh_executor",

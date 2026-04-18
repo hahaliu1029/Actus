@@ -21,6 +21,13 @@ from app.domain.services.prompts.sections.conversation_summaries import (
     conversation_summaries_section,
 )
 from app.domain.services.prompts.sections.identity import identity_section
+from app.domain.services.prompts.sections.memory_fact_index import (
+    memory_fact_index_section,
+)
+from app.domain.services.prompts.sections.memory_rules import memory_rules_section
+from app.domain.services.prompts.sections.memory_user_profile import (
+    memory_user_profile_section,
+)
 from app.domain.services.prompts.sections.output_format import output_format_section
 from app.domain.services.prompts.sections.planner_identity import (
     planner_identity_section,
@@ -40,6 +47,9 @@ from app.domain.services.prompts.sections.tools_guide_stable import (
 
 # ---- Executor registry (ReAct system prompt) --------------------------- #
 
+# Mirror of ZH_EXECUTOR_REGISTRY — see bundles/zh.py for the rationale on
+# the M2-PR3 memory section placement (rules near tool guides,
+# user_profile before skill_context, fact_index as a bottom reference).
 EN_EXECUTOR_REGISTRY = SectionRegistry(
     sections=(
         identity_section,
@@ -47,8 +57,11 @@ EN_EXECUTOR_REGISTRY = SectionRegistry(
         output_format_section,
         tools_guide_stable_section,
         tools_guide_dynamic_section,
+        memory_rules_section,
+        memory_user_profile_section,
         skill_context_section,
         conversation_summaries_section,
+        memory_fact_index_section,
         sandbox_state_section,
     ),
     name="en_executor",

@@ -60,6 +60,7 @@ class MemoryChunkRepository(Protocol):
         query: str | None = None,
         source: str | None = None,
         category: str | None = None,
+        pinned: bool | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
@@ -71,6 +72,11 @@ class MemoryChunkRepository(Protocol):
 
         ``category`` 为 None 时不过滤（等价 PR-1 前行为）；传入 ``user/rule/fact``
         只返回对应类。legacy 行 ``category IS NULL`` 在任何非空 filter 下都不命中。
+
+        ``pinned`` 为 None 时不过滤；True 只返回 pinned 行，False 只返回未 pinned
+        行。M2 user_profile prompt section 用 ``pinned=True`` 先拉全部 pinned（由
+        ``ix_memory_chunks_user_pinned`` partial index 支撑，独立于 recency 窗口），
+        再拉 top-N unpinned，保证 "pinned 永远先浮现" 不被最近 N 条的滑窗吞掉。
         """
         ...
 
@@ -81,6 +87,7 @@ class MemoryChunkRepository(Protocol):
         query: str | None = None,
         source: str | None = None,
         category: str | None = None,
+        pinned: bool | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,

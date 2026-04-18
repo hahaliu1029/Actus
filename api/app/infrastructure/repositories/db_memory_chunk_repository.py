@@ -91,6 +91,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         query: str | None = None,
         source: str | None = None,
         category: str | None = None,
+        pinned: bool | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
@@ -104,6 +105,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             query=query,
             source=source,
             category=category,
+            pinned=pinned,
             created_from=created_from,
             created_to=created_to,
             updated_from=updated_from,
@@ -130,6 +132,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         query: str | None = None,
         source: str | None = None,
         category: str | None = None,
+        pinned: bool | None = None,
         created_from: datetime | None = None,
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
@@ -143,6 +146,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             query=query,
             source=source,
             category=category,
+            pinned=pinned,
             created_from=created_from,
             created_to=created_to,
             updated_from=updated_from,
@@ -275,6 +279,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         query: str | None,
         source: str | None,
         category: str | None = None,
+        pinned: bool | None = None,
         created_from: datetime | None,
         created_to: datetime | None,
         updated_from: datetime | None,
@@ -291,6 +296,11 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         if category is not None:
             # 显式传入类别 → 只返回该类；category IS NULL 的 legacy 行不命中
             stmt = stmt.where(MemoryChunkModel.category == category)
+        if pinned is not None:
+            # DB CHECK 保证 pinned=true 仅在 category='user' 时合法；partial index
+            # ``ix_memory_chunks_user_pinned`` (pinned=true WHERE) 支撑 M2 snapshot
+            # 的 "pinned 优先" 两阶段拉取。
+            stmt = stmt.where(MemoryChunkModel.pinned.is_(pinned))
         if created_from is not None:
             stmt = stmt.where(MemoryChunkModel.created_at >= created_from)
         if created_to is not None:

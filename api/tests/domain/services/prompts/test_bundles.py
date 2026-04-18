@@ -1,9 +1,10 @@
-"""B5 C4: tests for the per-language PromptBundle assembly.
+"""B5 C4 / M2-PR3: tests for the per-language PromptBundle assembly.
 
 Verifies that the ZH and EN bundles from ``prompts/bundles/`` construct
 correctly, pass ``SectionRegistry.__post_init__`` startup validation, and
-that the executor registry renders the expected 8 sections when given a
-fully-populated ``RenderContext``.
+that the executor registry renders the expected canonical section set
+(C2 + C3 + M2-PR3 memory sections) when given a fully-populated
+``RenderContext``.
 
 These are structural sanity tests rather than byte-equivalence snapshots:
 
@@ -50,8 +51,11 @@ _EXPECTED_EXECUTOR_SECTION_IDS = [
     "output_format",
     "tools_guide_stable",
     "tools_guide_dynamic",
+    "memory_rules",
+    "memory_user_profile",
     "skill_context",
     "conversation_summaries",
+    "memory_fact_index",
     "sandbox_state",
 ]
 
@@ -115,7 +119,7 @@ def test_en_bundle_is_prompt_bundle_instance() -> None:
     assert EN_BUNDLE.updater is EN_UPDATER_REGISTRY
 
 
-def test_executor_registries_declare_8_sections_in_canonical_order() -> None:
+def test_executor_registries_declare_canonical_sections_in_order() -> None:
     for registry in (ZH_EXECUTOR_REGISTRY, EN_EXECUTOR_REGISTRY):
         ids = [s.id for s in registry.sections]
         assert ids == _EXPECTED_EXECUTOR_SECTION_IDS, (
@@ -207,7 +211,12 @@ def test_executor_assembly_renders_expected_sections(
     lang: str, bundle: PromptBundle
 ) -> None:
     """Assembling the executor registry with a full ctx renders every
-    section except ``sandbox_state`` (which is a stub returning None).
+    section except ``sandbox_state`` (stub returning None) and the three
+    M2-PR3 memory sections (``memory_rules`` / ``memory_user_profile`` /
+    ``memory_fact_index``), which return None whenever
+    ``ctx.memory_snapshot`` is not populated. ``_make_full_ctx`` leaves
+    ``memory_snapshot`` at its ``None`` default so this test still
+    reflects the non-memory legacy assembly.
 
     The expected list is derived from ``_EXPECTED_EXECUTOR_SECTION_IDS``
     so it stays accurate when new sections are added.
@@ -216,8 +225,18 @@ def test_executor_assembly_renders_expected_sections(
     result = _make_assembler().assemble(bundle.executor, ctx, PromptMode.FULL)
 
     assert result.text
-    # sandbox_state is a stub → not included
-    expected = [s for s in _EXPECTED_EXECUTOR_SECTION_IDS if s != "sandbox_state"]
+    # sandbox_state = stub → None; memory_* = snapshot absent → None
+    not_emitted_without_memory_or_sandbox = {
+        "sandbox_state",
+        "memory_rules",
+        "memory_user_profile",
+        "memory_fact_index",
+    }
+    expected = [
+        s
+        for s in _EXPECTED_EXECUTOR_SECTION_IDS
+        if s not in not_emitted_without_memory_or_sandbox
+    ]
     assert result.sections_included == expected
 
 

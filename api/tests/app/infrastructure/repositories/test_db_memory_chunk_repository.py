@@ -279,6 +279,76 @@ class TestApplyFiltersCategory:
             assert "category" not in where_no
 
 
+class TestApplyFiltersPinned:
+    """M2-PR3 post-codex-review: pinned 过滤用于 snapshot 两阶段拉取。
+    确保 pinned=True / False / None 的 WHERE 段正确生成。"""
+
+    def test_pinned_true_produces_pinned_predicate(self) -> None:
+        from sqlalchemy import select
+
+        stmt = DBMemoryChunkRepository._apply_filters(
+            select(MemoryChunkModel),
+            query=None,
+            source=None,
+            category=None,
+            pinned=True,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+        )
+        compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "WHERE" in compiled
+        where_segment = compiled.split("WHERE", 1)[1]
+        # SQLAlchemy emits ``pinned IS 1`` / ``IS true`` depending on dialect
+        assert "pinned" in where_segment
+        assert "true" in where_segment.lower() or "1" in where_segment
+
+    def test_pinned_false_produces_unpinned_predicate(self) -> None:
+        from sqlalchemy import select
+
+        stmt = DBMemoryChunkRepository._apply_filters(
+            select(MemoryChunkModel),
+            query=None,
+            source=None,
+            category=None,
+            pinned=False,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+        )
+        compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "WHERE" in compiled
+        where_segment = compiled.split("WHERE", 1)[1]
+        assert "pinned" in where_segment
+        assert "false" in where_segment.lower() or "0" in where_segment
+
+    def test_pinned_none_adds_no_filter(self) -> None:
+        """Default None must not emit any ``pinned`` predicate — existing
+        non-memory-snapshot callers rely on pinned being a no-op."""
+        from sqlalchemy import select
+
+        stmt = DBMemoryChunkRepository._apply_filters(
+            select(MemoryChunkModel),
+            query=None,
+            source=None,
+            category=None,
+            pinned=None,
+            created_from=None,
+            created_to=None,
+            updated_from=None,
+            updated_to=None,
+        )
+        compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        if "WHERE" in compiled:
+            where_segment = compiled.split("WHERE", 1)[1]
+            # ``pinned`` column name can still appear in the SELECT list,
+            # but not as a predicate after WHERE.
+            assert "pinned = " not in where_segment
+            assert "pinned IS" not in where_segment
+
+
 class TestFindPendingFsSync:
     """find_pending_fs_sync：FsReconciler 用的待同步行查询。"""
 
