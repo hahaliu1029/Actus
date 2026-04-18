@@ -88,9 +88,10 @@ class LLMConfig(BaseModel):
         0.75, gt=0, le=1
     )  # Phase 1 工具结果压缩触发比例（占预算百分比）
     system_prompt_max_tokens: int = Field(
-        3500, ge=0
-    )  # B5 C9: system prompt token 预算上限。PromptAssembler 用这个硬封顶 section 装配结果，
+        10000, ge=0
+    )  # B5 C9 / M2-PR0: system prompt token 预算上限。PromptAssembler 用这个硬封顶 section 装配结果，
     # compute_effective_window() 把它从 context_window 里扣掉，留给 history 的预算。
+    # M2-PR0 bump 3500→10000 为 memory sections (user/rule/fact_index) 留出空间。
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):

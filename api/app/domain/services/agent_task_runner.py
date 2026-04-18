@@ -509,8 +509,8 @@ class AgentTaskRunner(TaskRunner):
         ``RuntimeError`` if DI is misconfigured.
 
         Budget: ``ContextOverflowConfig.system_prompt_max_tokens`` (canonical
-        source since B5 C9). Falls back to the pre-C9 hardcoded default of
-        3500 when no overflow_config is attached (test fixtures).
+        source since B5 C9). Falls back to the canonical default of 10000
+        (post M2-PR0) when no overflow_config is attached (test fixtures).
         Telemetry: ``self._prompt_telemetry`` populated by
         ``_build_prompt_telemetry`` (B5 C11). ``None`` when the runner
         skipped telemetry setup (test path that bypasses ``__init__``).
@@ -521,13 +521,14 @@ class AgentTaskRunner(TaskRunner):
         )
         from app.domain.services.prompts.budget import SystemPromptBudget
 
-        # B5 C9: budget comes from ``ContextOverflowConfig.system_prompt_max_tokens``
-        # (canonical config source). When no overflow_config is attached
-        # (e.g. in tests), fall back to the pre-C9 hardcoded default of 3500.
+        # B5 C9 / M2-PR0: budget comes from ``ContextOverflowConfig.system_prompt_max_tokens``
+        # (canonical config source, default 10000 post M2-PR0). When no
+        # overflow_config is attached (e.g. in tests), fall back to the same
+        # canonical default so fallback behavior matches production defaults.
         max_tokens = (
             self._overflow_config.system_prompt_max_tokens
             if self._overflow_config
-            else 3500
+            else 10000
         )
         budget = SystemPromptBudget(max_tokens=max_tokens)
         strategy = (

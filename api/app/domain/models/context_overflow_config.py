@@ -23,13 +23,19 @@ class ContextOverflowConfig(BaseModel):
     tool_compress_trigger_ratio: float = Field(0.75, gt=0, le=1)
     target_ratio: float = Field(0.65, gt=0, le=1)
     summary_max_chars: int = Field(16_000, ge=1000)
-    system_prompt_max_tokens: int = Field(3500, ge=0)
-    """B5 C9: system prompt token 预算上限（canonical config source）。
+    system_prompt_max_tokens: int = Field(10000, ge=0)
+    """B5 C9 / M2-PR0: system prompt token 预算上限（canonical config source）。
 
     Consumed by:
     - ``PromptAssembler`` via ``SystemPromptBudget(max_tokens=...)``
     - ``compute_effective_window()`` to derive the history window
       (``total - system_prompt_max_tokens - reserved_output_tokens``).
+
+    M2-PR0 bumped the default from 3500 → 10000 to make room for the
+    three memory sections (``memory_user_profile`` ~1500,
+    ``memory_rules`` ~2500, ``memory_fact_index`` ~1000) alongside
+    identity / behavior_core / output_format / tools_guide. Under
+    budget pressure the existing priority-DESC drop loop still applies.
     """
 
     @classmethod

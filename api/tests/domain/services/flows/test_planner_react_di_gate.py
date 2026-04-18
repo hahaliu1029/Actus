@@ -128,5 +128,8 @@ async def test_run_planner_for_detection_uses_default_with_flag(monkeypatch) -> 
 
     # After the call, a default assembler is attached
     assert flow._prompt_assembler is not None
-    # And its budget is the hardcoded fallback (3500 tokens)
-    assert flow._prompt_assembler._budget.max_tokens == 3500
+    # And its budget matches the canonical default (10000 tokens post M2-PR0).
+    # Pre-M2-PR0 this was hardcoded 3500; now it matches the canonical
+    # ContextOverflowConfig.system_prompt_max_tokens default so the test-only
+    # fallback doesn't silently diverge from production.
+    assert flow._prompt_assembler._budget.max_tokens == 10000

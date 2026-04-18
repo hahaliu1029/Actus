@@ -191,6 +191,130 @@ def test_critical_priority_min_constant_matches_default() -> None:
     assert CRITICAL_PRIORITY_MIN == SystemPromptBudget(max_tokens=1).critical_priority_min
 
 
+# ---- M2-PR0 regression: memory section priorities drop in the right order #
+
+
+def test_memory_sections_priority_desc_drop_under_budget_pressure() -> None:
+    """M2-PR0 regression: when the three memory sections (rule=8, user=7,
+    fact_index=5) compete for a constrained budget, the priority-DESC drop
+    loop in ``assembler.py`` must keep rule (priority >= CRITICAL_PRIORITY_MIN)
+    and drop both user and fact_index.
+
+    Drop order along the priority-DESC walk is user (7) first, then
+    fact_index (5) second — the walk iterates from highest priority
+    downward, so user is encountered before fact_index. This doesn't
+    change the final kept/dropped sets, just the drop-loop sequence.
+
+    Protects against a future refactor that re-orders or removes the
+    priority-DESC drop logic once concrete memory sections land in PR-3.
+    The sections here are mocks — they don't exercise Section.max_tokens
+    (that's per-section truncation inside render() and covered by the
+    memory section tests in PR-3), only the assembler's cross-section
+    drop behavior.
+    """
+    # Token budgets chosen so the memory sections alone blow past the
+    # cap, forcing the drop loop to exercise each priority threshold.
+    # Hybrid estimator treats ASCII text as ~0.25 tokens/char.
+    identity = _section("identity", text="I am an agent.", priority=10)
+    behavior_core = _section("behavior_core", text="Behave.", priority=10)
+    mem_rule = _section(
+        "memory_rules", text="x" * 4000, priority=8
+    )  # critical, protected
+    mem_user = _section(
+        "memory_user_profile", text="x" * 4000, priority=7
+    )  # droppable
+    mem_fact = _section(
+        "memory_fact_index", text="x" * 4000, priority=5
+    )  # most droppable
+
+    registry = SectionRegistry(
+        sections=[identity, behavior_core, mem_rule, mem_user, mem_fact],
+        name="m2_pr0_regression",
+    )
+    # Budget picked to fit identity+behavior_core+rule (~1000 tokens from rule
+    # alone) but not user/fact_index.
+    assembler = _make_assembler(max_tokens=1200)
+    result = assembler.assemble(registry, _ctx())
+
+    # identity / behavior_core / memory_rules all protected (priority >= 8)
+    assert "identity" in result.sections_included
+    assert "behavior_core" in result.sections_included
+    assert "memory_rules" in result.sections_included
+    # user (priority=7) and fact_index (priority=5) dropped
+    assert "memory_fact_index" in result.sections_dropped
+    assert "memory_user_profile" in result.sections_dropped
+
+
+def test_assembler_does_not_enforce_section_max_tokens() -> None:
+    """M2-PR0 contract: ``Section.max_tokens`` is a per-section self-truncation
+    hint. The assembler does NOT enforce it — it trusts the rendered text
+    as-is.
+
+    Why this contract: the assembler doesn't know a section's semantic
+    boundaries (markdown headers, list items, code blocks). Post-render
+    truncation would slice into structure and corrupt output. Each memory
+    section's render() is responsible for applying its own sort-and-drop
+    rule within ``max_tokens``.
+
+    This test pins the contract by constructing a section with
+    ``max_tokens=5`` but a render() that returns 500+ tokens worth of text.
+    The assembler must include the full rendered text verbatim — no
+    truncation, no warning, no error — so long as the global budget
+    permits.
+    """
+    overflow_text = "x" * 2000  # ~500 tokens (hybrid: ASCII = 0.25/char)
+
+    noisy_section = Section(
+        id="noisy_mock_section",
+        priority=10,  # critical so global budget doesn't mask the bug
+        cacheable=False,
+        dynamic=True,
+        render=lambda ctx: SectionOutput(text=overflow_text),
+        max_tokens=5,  # deliberately tiny; assembler must ignore this
+    )
+    registry = SectionRegistry(
+        sections=[noisy_section],
+        name="max_tokens_contract",
+    )
+    # Budget generous enough that global drop loop doesn't interfere.
+    assembler = _make_assembler(max_tokens=10_000)
+    result = assembler.assemble(registry, _ctx())
+
+    # Full text survives: assembler does not post-truncate.
+    assert overflow_text in result.text
+    # Token count reflects the actual rendered size (~500), not max_tokens (5).
+    assert result.tokens_used >= 400
+    # Section included (not dropped).
+    assert "noisy_mock_section" in result.sections_included
+    assert result.sections_dropped == []
+
+
+def test_memory_fact_index_drops_before_user_under_mild_pressure() -> None:
+    """Priority ordering: when budget is tight but not extreme, the lowest-
+    priority section (fact_index=5) should be the only one dropped; user
+    (priority=7) survives.
+
+    Validates the design decision in the M2 spec: fact_index is the
+    "if budget allows" tier, user_profile is more important.
+    """
+    identity = _section("identity", text="I am.", priority=10)
+    mem_rule = _section("memory_rules", text="R" * 200, priority=8)  # ~50 tokens
+    mem_user = _section("memory_user_profile", text="U" * 200, priority=7)  # ~50 tokens
+    mem_fact = _section("memory_fact_index", text="F" * 4000, priority=5)  # ~1000 tokens
+
+    registry = SectionRegistry(
+        sections=[identity, mem_rule, mem_user, mem_fact],
+        name="m2_pr0_ordering",
+    )
+    # Budget fits rule + user but not fact_index
+    assembler = _make_assembler(max_tokens=200)
+    result = assembler.assemble(registry, _ctx())
+
+    assert "memory_rules" in result.sections_included
+    assert "memory_user_profile" in result.sections_included
+    assert "memory_fact_index" in result.sections_dropped
+
+
 # ---- Metadata aggregation ---------------------------------------------- #
 
 

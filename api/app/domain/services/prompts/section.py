@@ -152,6 +152,29 @@ class Section:
     """Optional override of the token estimator. None means "use the
     PromptAssembler's default TokenEstimator instance"."""
 
+    max_tokens: int | None = None
+    """M2-PR0: per-section token cap used by the section's own render()
+    for internal truncation.
+
+    Contract:
+    - ``None`` = no per-section cap; the section relies only on the
+      global ``PromptAssembler`` budget + priority-DESC drop loop.
+    - ``int`` = the section's render() is expected to truncate its
+      own output at roughly this many tokens (sorting rules defined
+      inside the section). The assembler does NOT enforce it — it
+      only trusts the rendered text as-is.
+
+    Used by M2 memory sections (``memory_user_profile``,
+    ``memory_rules``, ``memory_fact_index``) to cap each category's
+    contribution so the section can't dominate the global budget
+    even when fact index returns hundreds of rows.
+
+    Note: we deliberately do NOT add an ``allocate()`` method to
+    ``PromptAssembler`` — the existing priority-DESC drop loop in
+    ``assembler.py:140-151`` handles cross-section budget pressure.
+    ``max_tokens`` is strictly the section-internal cap.
+    """
+
 
 # ---- MINIMAL_MODE_ALLOWLIST --------------------------------------------- #
 

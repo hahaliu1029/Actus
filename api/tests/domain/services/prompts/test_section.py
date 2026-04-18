@@ -145,6 +145,29 @@ def test_section_dataclass_construction() -> None:
     assert section.cacheable is True
     assert section.dynamic is False
     assert section.estimate_tokens is None  # default
+    assert section.max_tokens is None  # M2-PR0 default
+
+
+def test_section_max_tokens_field_accepts_int() -> None:
+    """M2-PR0: Section.max_tokens is a per-section cap the memory sections
+    use internally. PR-0 only adds the field; truthy behavior is in the
+    section's render() in PR-3."""
+    section = Section(
+        id="memory_user_profile",
+        priority=7,
+        cacheable=False,
+        dynamic=True,
+        render=lambda ctx: SectionOutput(text="stub"),
+        max_tokens=1500,
+    )
+    assert section.max_tokens == 1500
+
+
+def test_section_max_tokens_is_immutable() -> None:
+    """Frozen dataclass: max_tokens cannot be reassigned at runtime."""
+    section = _make_section("x", priority=5)
+    with pytest.raises(Exception):  # FrozenInstanceError
+        section.max_tokens = 500  # type: ignore[misc]
 
 
 def test_section_render_returns_section_output() -> None:

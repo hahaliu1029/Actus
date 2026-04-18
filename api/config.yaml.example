@@ -20,7 +20,7 @@ llm_config:
   # tool_compress_trigger_ratio: 0.75    # Phase 1 工具结果压缩触发比例
   # target_ratio: 0.65                   # Level 2 压缩后目标水位
   # summary_max_chars: 16000             # 摘要上限字符数
-  # system_prompt_max_tokens: 3500       # B5 C9: system prompt token 预算上限（PromptAssembler 硬封顶 + effective_window 基数）
+  # system_prompt_max_tokens: 10000      # B5 C9 / M2-PR0: system prompt token 预算上限（PromptAssembler 硬封顶 + effective_window 基数）；M2-PR0 从 3500 提到 10000 为 memory sections 留出空间
 
 # OpenAI 官方 API 示例（gpt-5.4，推荐）
 # llm_config:

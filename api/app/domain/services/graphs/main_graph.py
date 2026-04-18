@@ -179,7 +179,7 @@ def build_main_graph(
             "AgentTaskRunner._build_prompt_assembler."
         )
         prompt_assembler = _PromptAssemblerImpl(
-            budget=SystemPromptBudget(max_tokens=3500),
+            budget=SystemPromptBudget(max_tokens=10000),
             token_estimator=TokenEstimator(strategy="hybrid"),
             telemetry=None,
         )
