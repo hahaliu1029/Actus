@@ -1,0 +1,3 @@
+{"id": "a11", "text": "用户：之前说用 Redis 的事忘了吧", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: cancels prior memory without stating new state → no new keepable content"}
+{"id": "a12", "text": "用户：我刚才那个偏好不算数", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: explicit recall of previous statement"}
+{"id": "a13", "text": "用户：取消之前关于 mock 数据库的说法", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: explicit cancel of prior rule"}

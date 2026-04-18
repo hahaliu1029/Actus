@@ -16,12 +16,17 @@ Two-tier assertion model:
    the M2 acceptance criterion from the labelling rubric §130-140.
    Skipped automatically when the dataset is too small to be meaningful
    (``n < 40`` — see skip-condition comment inline).
-3. ``test_gate_adversarial_resistance`` (M2 PR-5, new) — scores the
-   adversarial suite separately with a **dual specificity + sensitivity**
-   gate. Plain accuracy on a drop-heavy distribution (17/20 drop) would
-   pass an always-drop gate at 0.85, so we split: specificity bar
-   locks "don't get fooled by deceptive drops"; sensitivity bar locks
-   "don't over-reject borderline keeps". Both must clear.
+3. ``test_gate_adversarial_resistance`` (M2 PR-5 + gap-step-3,
+   **parametrized per suite**) — loads each of the five suite files
+   from ``synthetic/adversarial/`` (design doc §621: ``ambiguous``,
+   ``sarcasm``, ``temporary``, ``contradictions``, ``testing``) and
+   applies a "≤ 1 mis-classification" accuracy bar scaled to the
+   suite's current sample count. The pre-step-3 single-gate version
+   used specificity+sensitivity on the 20-row union; the per-suite
+   split surfaces WHICH pattern class failed when the gate regresses,
+   and provides the structural hook for the design §634 Wilson CI
+   ≥ 0.80 per-suite target (activates once gap #2 grows each suite
+   to 20-30 samples).
 
 All tests skip with an explanatory message when ``EVAL_MEMORY_GATE_LLM``
 is unset — the harness has no useful behavior without a real LLM.
@@ -40,10 +45,12 @@ from app.domain.services.memory_gate import (
     filter_kept_decisions,
 )
 from tests.eval.memory_gate.paths import (
+    ADVERSARIAL_SUITE_NAMES,
     private_available,
     private_dataset_path,
     synthetic_adversarial_available,
-    synthetic_adversarial_path,
+    synthetic_adversarial_suite_path,
+    synthetic_adversarial_suite_paths,
     synthetic_dataset_path,
 )
 from tests.eval.memory_gate.stats import wilson_ci_lower
@@ -307,41 +314,71 @@ async def test_gate_wilson_hard_gate() -> None:
     )
 
 
-async def test_gate_adversarial_resistance() -> None:
-    """Adversarial suite — dual specificity + sensitivity gates (M2 PR-5).
+# Per-suite minimum bars — step 3 split. Kept lenient because each
+# suite currently has only 3-5 samples, so a single mis-classification
+# would already swing the metric by 20-33pp. The design target (§634)
+# is Wilson lower CI ≥ 0.80 per suite, which requires 20-30 samples
+# per suite — scheduled for gap #2 dataset growth, not this PR.
+#
+# Current floor is "at most ONE mis-classification per suite", expressed
+# as (n-1)/n so future sample additions auto-tighten the bar:
+# - suite with 3 samples: 2/3 ≈ 0.667
+# - suite with 5 samples: 4/5 = 0.80
+# - suite with 10 samples: 9/10 = 0.90
+#
+# Bars measure verdict accuracy (specificity on drop-only suites,
+# combined on mixed suites). See per-suite rationale in the test body.
+def _min_accuracy_bar(n: int) -> float:
+    """Allow ≤ 1 mis-classification out of n samples."""
+    if n <= 0:
+        return 1.0
+    if n == 1:
+        return 1.0  # a 1-sample suite cannot tolerate a miss
+    return (n - 1) / n
 
-    Loads ``synthetic/adversarial.jsonl`` — 20 hand-crafted samples
-    designed to fool the gate (task-local masquerading as rules,
-    hypotheticals, agent-output mimicry, retractions, prompt-injection
-    attempts, and borderline keeps).
 
-    Why two assertions instead of accuracy: the suite is drop-heavy
-    (17/20 drop, 3/20 keep). Plain accuracy would let an "always-drop"
-    gate score 17/20 = 0.85 and pass, even though that gate has zero
-    recall on borderline keeps. Split the bars:
+@pytest.mark.parametrize("suite_name", ADVERSARIAL_SUITE_NAMES)
+async def test_gate_adversarial_resistance(suite_name: str) -> None:
+    """Adversarial per-suite resistance — design doc §621 layout.
 
-    - **specificity** = TN / (TN + FP) — fraction of deceptive drops
-      the gate correctly rejected. Locks "don't get fooled."
-    - **sensitivity** = TP / (TP + FN) — fraction of borderline keeps
-      the gate correctly kept. Locks "don't over-reject."
+    Parametrized across the five suites (``ambiguous``, ``sarcasm``,
+    ``temporary``, ``contradictions``, ``testing``). Each suite file
+    lives at ``synthetic/adversarial/{suite}.jsonl``. A suite is skipped
+    if its file is missing (dataset mid-migration).
 
-    Both must clear to pass. An over-conservative gate fails sensitivity;
-    a fooled gate fails specificity.
+    Scoring approach (revised from the pre-split single-gate version):
 
-    Threshold is 0.7 same as the main gate — we don't tune per suite.
+    - **Drop-only suites** (``temporary``, ``contradictions``,
+      ``sarcasm``, ``testing``): all samples have ``expected_verdict=drop``,
+      so specificity alone captures gate robustness. Accuracy ≡
+      specificity here.
+    - **Mixed suite** (``ambiguous``): contains both drops and
+      borderline keeps, so accuracy = (tp + tn) / total.
 
-    Skip conditions: no LLM configured, or adversarial file missing
-    (someone deleted it locally during bisection).
+    Per-suite bar: ``≤ 1 mis-classification`` (see ``_min_accuracy_bar``
+    rationale above). Tightens automatically as suites grow.
+
+    Skip conditions:
+    - No LLM configured (handled by ``_resolve_llm``).
+    - Suite file missing (e.g. you deleted ``sarcasm.jsonl`` while
+      relabelling).
+
+    Design doc §634 target of Wilson lower CI ≥ 0.80 per suite requires
+    20-30 samples per suite; deferred to gap #2 dataset growth.
     """
-    if not synthetic_adversarial_available():
+    suite_paths = synthetic_adversarial_suite_paths()
+    suite_path = suite_paths.get(suite_name)
+    if suite_path is None:
         pytest.skip(
-            f"adversarial suite missing at {synthetic_adversarial_path()} — "
-            f"PR-5 shipped it; did someone delete it locally?"
+            f"adversarial suite '{suite_name}' not available at "
+            f"{synthetic_adversarial_suite_path(suite_name)} — "
+            f"dataset mid-migration?"
         )
 
-    samples = _load_jsonl(synthetic_adversarial_path())
-    assert len(samples) >= 15, (
-        f"adversarial suite shrunk unexpectedly: {len(samples)}"
+    samples = _load_jsonl(suite_path)
+    assert len(samples) >= 3, (
+        f"suite '{suite_name}' has {len(samples)} samples; minimum 3 "
+        f"to keep the accuracy bar meaningful (see _min_accuracy_bar)"
     )
 
     llm = _resolve_llm()
@@ -349,46 +386,23 @@ async def test_gate_adversarial_resistance() -> None:
     decisions = await _run_classifier(samples, classifier)
     tp, fp, fn, tn = _score(samples, decisions, threshold=0.7)
     total = tp + fp + fn + tn
+    accuracy = (tp + tn) / total if total else 0.0
 
-    total_drops = tn + fp
-    total_keeps = tp + fn
-    specificity = tn / total_drops if total_drops else 1.0
-    sensitivity = tp / total_keeps if total_keeps else 1.0
-
-    # Bars anchored to the PR-5 17/20 drop — 3/20 keep composition:
-    # specificity >= 14/17 ≈ 0.824 → gate was fooled on ≤ 3 deceptive drops.
-    # sensitivity >= 2/3 ≈ 0.667 → gate over-rejected ≤ 1 borderline keep.
-    # Stored as pre-computed decimals so dataset growth doesn't silently
-    # weaken the test — bump explicitly when confidence grows.
-    MIN_SPECIFICITY = 14 / 17
-    MIN_SENSITIVITY = 2 / 3
+    min_bar = _min_accuracy_bar(total)
+    allowed_misses = total - int(round(total * min_bar))
 
     print("\n" + "=" * 60)
-    print(f"memory_gate ADVERSARIAL @ threshold=0.7, N={total}")
-    print(
-        f"  specificity = {specificity:.3f}  (tn={tn}/{total_drops})"
-        f"  ← gate resists deceptive drops (min {MIN_SPECIFICITY:.3f})"
-    )
-    print(
-        f"  sensitivity = {sensitivity:.3f}  (tp={tp}/{total_keeps})"
-        f"  ← gate catches borderline keeps (min {MIN_SENSITIVITY:.3f})"
-    )
-    print(f"  false positives  = {fp}  (gate KEPT a deceptive drop)")
-    print(f"  false negatives  = {fn}  (gate DROPPED a borderline keep)")
+    print(f"memory_gate ADVERSARIAL [{suite_name}] @ threshold=0.7, N={total}")
+    print(f"  accuracy = {accuracy:.3f}  (tp={tp}, tn={tn})")
+    print(f"  misses   = {fp + fn} (fp={fp}, fn={fn})  max allowed={allowed_misses}")
+    print(f"  min bar  = {min_bar:.3f}")
     print("=" * 60)
 
-    assert specificity >= MIN_SPECIFICITY, (
-        f"adversarial specificity = {specificity:.3f} < "
-        f"{MIN_SPECIFICITY:.3f} target. Gate was fooled into keeping "
-        f"{fp} deceptive drop(s) out of {total_drops}. Inspect which "
-        f"a* samples tripped the gate (task-local, hypothetical, "
-        f"injection, retraction, agent-mimicry)."
-    )
-    assert sensitivity >= MIN_SENSITIVITY, (
-        f"adversarial sensitivity = {sensitivity:.3f} < "
-        f"{MIN_SENSITIVITY:.3f} target. Gate over-rejected {fn} "
-        f"borderline keep(s) out of {total_keeps}. Inspect a17-a19 "
-        f"(team-stack fact, contrastive toolchain, nuanced language "
-        f"preference). An always-drop gate fails here even if it "
-        f"scores high on plain accuracy."
+    assert accuracy >= min_bar, (
+        f"adversarial suite '{suite_name}' accuracy = {accuracy:.3f} < "
+        f"{min_bar:.3f} target. Misses: fp={fp} (gate KEPT a deceptive "
+        f"drop), fn={fn} (gate DROPPED a borderline keep). Inspect "
+        f"{suite_path.name} to identify which row(s) tripped the gate. "
+        f"Per-suite Wilson CI ≥ 0.80 target (design §634) will activate "
+        f"after gap #2 grows each suite to 20-30 samples."
     )

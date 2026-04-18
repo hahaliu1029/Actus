@@ -41,7 +41,7 @@ from tests.eval.memory_gate.paths import (
     private_available,
     private_dataset_path,
     synthetic_adversarial_available,
-    synthetic_adversarial_path,
+    synthetic_adversarial_suite_paths,
     synthetic_dataset_path,
 )
 from tests.eval.memory_gate.stats import wilson_ci_lower
@@ -81,12 +81,14 @@ def _load_combined(
     with_adversarial: bool = False,
 ) -> list[Sample]:
     """Load public synthetic + optional private real dataset + optional
-    adversarial suite.
+    adversarial suites (union across all 5).
 
     Returns samples in a stable order (core public → private → adversarial)
     so output is reproducible across runs. Adversarial rows are loaded
     LAST so operators scrolling the per-row output can visually see the
-    cutover by id prefix (``a*``).
+    cutover by id prefix (``a*``). Within the adversarial block, suite
+    order follows ``ADVERSARIAL_SUITE_NAMES``
+    (ambiguous, sarcasm, temporary, contradictions, testing).
 
     ``with_adversarial=False`` by default because the primary hard-gate
     calculation (Wilson CI on union) should be computed on the core
@@ -95,8 +97,9 @@ def _load_combined(
     rows = _load_jsonl(synthetic_dataset_path())
     if not public_only and private_available():
         rows.extend(_load_jsonl(private_dataset_path()))
-    if with_adversarial and synthetic_adversarial_available():
-        rows.extend(_load_jsonl(synthetic_adversarial_path()))
+    if with_adversarial:
+        for _name, path in synthetic_adversarial_suite_paths().items():
+            rows.extend(_load_jsonl(path))
     return rows
 
 
@@ -318,9 +321,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--with-adversarial",
         action="store_true",
         help=(
-            "Include the synthetic/adversarial.jsonl suite. Adversarial "
-            "rows are appended after core + private so order stays stable "
-            "and operators can visually spot the ``a*`` id prefix."
+            "Include the union of synthetic/adversarial/*.jsonl suite "
+            "files. Rows are appended after core + private in suite order "
+            "(ambiguous, sarcasm, temporary, contradictions, testing) so "
+            "operators can visually spot the ``a*`` id block at the tail. "
+            "Per-suite scoring (design §634 Wilson ≥ 0.80) runs under "
+            "``pytest -m slow test_gate_adversarial_resistance``."
         ),
     )
     parser.add_argument(
@@ -359,7 +365,11 @@ async def _amain(args: argparse.Namespace) -> int:
 
     adv_samples: list[Sample] = []
     if args.with_adversarial and synthetic_adversarial_available():
-        adv_samples = _load_jsonl(synthetic_adversarial_path())
+        # Union across all 5 suite files. Individual-suite scoring
+        # happens in pytest (``test_gate_adversarial_resistance``) —
+        # the CLI stays a single combined table for exploratory use.
+        for _name, path in synthetic_adversarial_suite_paths().items():
+            adv_samples.extend(_load_jsonl(path))
 
     # ``--limit`` caps the TOTAL batched prompt size (help text promises
     # "Cap total samples"). Apply it to ``core + adversarial`` so a quick

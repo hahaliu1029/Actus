@@ -296,6 +296,32 @@ class TestWalkUserDirectoryOrphanFiles:
         assert not nested.exists()
         assert result["orphan_files"] == 1
 
+    async def test_filename_mismatch_quarantined(self, tmp_path: Path) -> None:
+        """frontmatter id 和 DB row 都存在，但 basename 不是 ``{id}.md`` 时，
+        仍应视为非 canonical 路径并搬进 .orphans。"""
+        chunk = _chunk(id_="real-id", category="user")
+        wrong_dir = tmp_path / _USER / "user"
+        wrong_dir.mkdir(parents=True)
+        wrong_name = wrong_dir / "wrong-name.md"
+        wrong_name.write_text(
+            serialize_memory_file(build_memory_frontmatter(chunk), chunk.content),
+            encoding="utf-8",
+        )
+
+        repo = AsyncMock()
+        repo.get_by_id.return_value = _chunk(id_="real-id", category="user")
+        repo.list_by_user.return_value = []
+        repo.count_by_user.return_value = 0
+
+        writer = FsMemoryWriter(tmp_path, max_retries=1, base_backoff_seconds=0.0)
+        reconciler = _build_reconciler(repo, writer, tmp_path)
+        result = await reconciler.walk_user_directory(_USER)
+
+        assert not wrong_name.exists()
+        moved = list((tmp_path / _USER / ".orphans").rglob("wrong-name.md"))
+        assert len(moved) == 1
+        assert result["orphan_files"] == 1
+
     async def test_symlink_in_user_dir_quarantined(self, tmp_path: Path) -> None:
         """symlink（design L655 Case C: 恶意预置到 user_id 下指向 /etc/passwd）必须搬
         走到 .orphans，防止 sandbox 透过 bind-mount 读到任意路径。"""

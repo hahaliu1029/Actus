@@ -1,0 +1,5 @@
+{"id": "a1", "text": "用户：这次的 PR 不加单测了", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这次 = one-time scope, NOT a permanent rule"}
+{"id": "a2", "text": "用户：今天先别跑 linter，赶 demo", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 今天 scopes the directive to today only"}
+{"id": "a3", "text": "用户：刚才那个函数别用 async，换 sync", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 刚才那个 = pointing to one specific function"}
+{"id": "a4", "text": "用户：这个 endpoint 别加 auth，演示用", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这个 + 演示用 = demo-only override"}
+{"id": "a5", "text": "用户：这次迁移先跳过 dry-run", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这次 scopes to single migration"}

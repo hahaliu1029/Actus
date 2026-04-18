@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.eval.memory_gate.paths import (
+    ADVERSARIAL_SUITE_NAMES,
     _DEFAULT_PRIVATE_ROOT,
     _ENV_VAR,
     control_set_available,
@@ -22,7 +23,9 @@ from tests.eval.memory_gate.paths import (
     private_dir,
     resolve_private_root,
     synthetic_adversarial_available,
-    synthetic_adversarial_path,
+    synthetic_adversarial_dir,
+    synthetic_adversarial_suite_path,
+    synthetic_adversarial_suite_paths,
     synthetic_dataset_path,
     synthetic_dir,
 )
@@ -50,29 +53,72 @@ class TestPublicDataset:
             f"M2 PR-5 shipped 45 rows"
         )
 
-    def test_synthetic_adversarial_file_exists(self) -> None:
-        """M2 PR-5 introduces a sibling adversarial file; it's hand-crafted
-        and safe to publish alongside the main synthetic set. Rows count
-        is separate from the core dataset so the Wilson CI on core
-        precision doesn't get skewed by deliberately-tricky samples.
+    def test_synthetic_adversarial_dir_exists(self) -> None:
+        """Post-step-3 layout: adversarial samples live under
+        ``synthetic/adversarial/`` split by suite (design doc §621).
+        The monolithic ``adversarial.jsonl`` was removed.
         """
-        p = synthetic_adversarial_path()
-        assert p.is_file(), (
-            f"synthetic/adversarial.jsonl missing at {p} — PR-5 regressed?"
-        )
-        lines = [ln for ln in p.read_text().splitlines() if ln.strip()]
-        assert len(lines) >= 15, (
-            f"adversarial suite shrunk unexpectedly: {len(lines)} lines; "
-            f"M2 PR-5 shipped 20 rows"
+        d = synthetic_adversarial_dir()
+        assert d.is_dir(), (
+            f"synthetic/adversarial/ directory missing at {d} — "
+            f"adversarial split regressed?"
         )
 
-    def test_synthetic_adversarial_available_reflects_file(self) -> None:
-        """Availability helper must agree with the file-existence check.
+    def test_all_five_design_suites_present(self) -> None:
+        """Design doc §621 names five adversarial suites. Each must
+        resolve to a real file under ``synthetic/adversarial/``.
+        Missing files would silently disable per-suite coverage, so
+        we lock the set explicitly."""
+        resolved = synthetic_adversarial_suite_paths()
+        assert set(resolved) == set(ADVERSARIAL_SUITE_NAMES), (
+            f"adversarial suite set drifted from design; got "
+            f"{sorted(resolved)} vs design {sorted(ADVERSARIAL_SUITE_NAMES)}"
+        )
+        for name, path in resolved.items():
+            lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+            assert len(lines) >= 3, (
+                f"suite '{name}' has only {len(lines)} rows at {path} — "
+                f"minimum 3 for the pytest parametrize path to remain "
+                f"meaningful"
+            )
 
-        Keeps the two call sites (tests + harness) from drifting if the
-        helper implementation changes (e.g., adds caching).
+    def test_total_adversarial_rows_preserved_after_split(self) -> None:
+        """Step-3 split moved 20 rows from the monolithic file into
+        5 suite files. Total count must be preserved so the union
+        loader (``tune_threshold._load_combined(with_adversarial=True)``)
+        still produces the same sample count the pre-split tests
+        asserted on.
         """
+        total = 0
+        for _name, path in synthetic_adversarial_suite_paths().items():
+            total += sum(
+                1 for ln in path.read_text().splitlines() if ln.strip()
+            )
+        assert total >= 15, (
+            f"adversarial union shrank to {total} rows after split; "
+            f"M2 PR-5 shipped 20"
+        )
+
+    def test_synthetic_adversarial_available_reflects_suite_files(
+        self,
+    ) -> None:
+        """Availability is True iff at least one suite file exists.
+        After step-3 ship all five are present; the OR check stays
+        True even if a single suite is temporarily removed for
+        dataset work."""
         assert synthetic_adversarial_available() is True
+
+    def test_suite_path_returns_predictable_filename(self) -> None:
+        """``synthetic_adversarial_suite_path(name)`` must return
+        ``synthetic/adversarial/{name}.jsonl`` — tests and the CLI
+        both depend on this predictable shape for error messages and
+        suite-name display."""
+        for name in ADVERSARIAL_SUITE_NAMES:
+            p = synthetic_adversarial_suite_path(name)
+            assert p.name == f"{name}.jsonl", (
+                f"suite path shape changed for {name}: got {p.name}"
+            )
+            assert p.parent == synthetic_adversarial_dir()
 
 
 class TestPrivateRootResolution:

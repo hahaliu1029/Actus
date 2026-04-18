@@ -3,9 +3,15 @@
 Contents:
 - ``synthetic/dataset.jsonl`` — 45 public core samples (PR-5 expanded
   from 25); target 100 at M2 ship
-- ``synthetic/adversarial.jsonl`` — 20 hand-crafted adversarial samples
-  (PR-5) covering task-local masquerade, hypotheticals, agent-output
-  mimicry, retractions, prompt-injection attempts, and borderline keeps
+- ``synthetic/adversarial/{ambiguous,sarcasm,temporary,contradictions,
+  testing}.jsonl`` — 20 hand-crafted adversarial samples split across
+  the five suites from design doc §621. Step 3 of gap-closure work
+  replaced the pre-PR-5 monolithic ``adversarial.jsonl`` with per-suite
+  files so the pytest harness can parametrize per suite (each suite
+  has its own accuracy bar, progressing toward design's Wilson CI ≥
+  0.80 target once gap #2 grows each suite to 20-30 samples). See
+  ``synthetic/adversarial/README.md`` for the suite taxonomy and the
+  ``sarcasm`` proxy-grouping note.
 - ``labelling_rubric.md`` — verdict/category definitions, M2 semantics
 - ``stats.py`` — Wilson CI + Cohen's kappa helpers (no external deps)
 - ``paths.py`` — public + private dataset + adversarial path resolution

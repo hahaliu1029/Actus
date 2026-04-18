@@ -285,14 +285,20 @@ class FsReconciler:
             # 条件 1：层级不对（深/浅于 2 层）→ 孤儿
             # 条件 2：entry 所在目录名 != chunk.category → move_category 半失败
             #        残留的旧路径，搬走（旧 id/旧内容留在 .orphans 里供追溯）
+            # 条件 3：basename != ``{memory_id}.md`` → 非 canonical 文件名，搬走
             try:
                 path_category = entry.parent.name
                 is_canonical_depth = entry.parent.parent == user_dir
             except (OSError, ValueError):
                 is_canonical_depth = False
                 path_category = None
+            expected_name = f"{memory_id}.md"
 
-            if not is_canonical_depth or chunk.category != path_category:
+            if (
+                not is_canonical_depth
+                or chunk.category != path_category
+                or entry.name != expected_name
+            ):
                 await self._move_to_orphans(entry, user_dir, bucket=orphan_bucket)
                 orphan_files += 1
 

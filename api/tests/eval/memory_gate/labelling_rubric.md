@@ -84,24 +84,36 @@ carry-over + 20 paraphrases; remaining 55 will land across subsequent
 dataset-growth passes). Manually crafted + paraphrased so the content
 is safe to publish.
 
-### Adversarial subsuite, checked into the repo
+### Adversarial subsuites, checked into the repo
 
-Path: `api/tests/eval/memory_gate/synthetic/adversarial.jsonl`.
+Directory: `api/tests/eval/memory_gate/synthetic/adversarial/`.
 
-M2 PR-5 ships 20 samples covering the documented failure modes:
-task-local rules masquerading as permanent (5), hypotheticals /
-subjunctives (3), agent-output mimicry (2), retraction / cancellation
-(3), prompt-injection attempts (3), and borderline-keep controls (3)
-plus off-topic chatter (1). Deliberately drop-heavy — the gate's
-primary failure mode is being fooled into keeping non-memory.
+Design doc §621 defines five suite files (each a `.jsonl`, one row per
+sample):
 
-Scored separately from the core dataset (``test_gate_adversarial_resistance``
-in ``test_memory_gate_eval.py``) so a dip on deliberately deceptive
-samples doesn't skew the Wilson CI on the representative distribution.
-The ``tune_threshold.py --with-adversarial`` CLI emits two tables —
-core (hard-gate verdict applies) and adversarial (visibility only,
-explicitly NOT gated) — so operators reading the sweep output can't
-accidentally use a polluted Wilson CI to justify a threshold change.
+| Suite | Semantics |
+|---|---|
+| `ambiguous.jsonl` | 模糊偏好 — nuanced/borderline keeps and off-topic chatter |
+| `sarcasm.jsonl` | 反讽 — currently a proxy grouping (agent-mimicry + injection, see `adversarial/README.md`) until gap #2 adds true sarcasm samples |
+| `temporary.jsonl` | 临时任务 — task-local directives (这次/今天/刚才) dressed as permanent rules |
+| `contradictions.jsonl` | 矛盾规则 — retractions/cancels of prior memories without replacement |
+| `testing.jsonl` | 会话内试探 — exploratory hypotheticals/subjunctives (如果/假设/要是) |
+
+Step 3 of the M2 PR-5 gap-closure work replaced the monolithic
+`adversarial.jsonl` with this per-suite layout so the pytest harness
+can parametrize per suite (each suite gets its own accuracy bar). The
+design doc §634 target of Wilson CI lower ≥ 0.80 per suite needs 20-30
+samples per suite — deferred to gap #2 dataset expansion. Until then,
+`test_gate_adversarial_resistance[{suite}]` uses a lenient
+"≤ 1 mis-classification per suite" bar that tightens automatically as
+suites grow.
+
+The `tune_threshold.py --with-adversarial` CLI loads the union of all
+five suites and emits two tables — core (hard-gate verdict applies) and
+adversarial (visibility only, explicitly NOT gated) — so operators
+reading the sweep output can't accidentally use a polluted Wilson CI
+to justify a threshold change. Per-suite scoring lives in the pytest
+parametrize path.
 
 ### Private (real), gitignored
 

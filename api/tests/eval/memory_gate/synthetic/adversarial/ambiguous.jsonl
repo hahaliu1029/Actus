@@ -1,0 +1,4 @@
+{"id": "a17", "text": "用户：我们团队不写 Java，都是 Go + Python", "expected_verdict": "keep", "expected_category": "fact", "notes": "ambiguous-keep: team tech stack = project-level fact. Negative framing doesn't change verdict OR category"}
+{"id": "a18", "text": "用户：我用 mise 管 Python 版本，不用 pyenv", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: contrastive preference is still a preference"}
+{"id": "a19", "text": "用户：主语言是简体中文，不过专业术语可以中英混用", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: nuanced language preference, still keepable"}
+{"id": "a20", "text": "用户：今天天气真冷，手指都冻僵了", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: off-topic personal remark with no memory value"}

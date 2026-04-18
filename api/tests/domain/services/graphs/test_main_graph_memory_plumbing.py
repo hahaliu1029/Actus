@@ -565,3 +565,192 @@ class TestEnsureGraphsForwardsProvider:
         await flow._ensure_graphs()
 
         assert captured.get("memory_snapshot_provider") is None
+
+
+# ---- Cold-start E2E: memory section headers in executor prompt -------- #
+#
+# Design doc §636 (M2 验收):
+#   "Agent 冷启动（新 session 第一 turn）prompt 里有
+#    <memory_user_profile> / <memory_rules> / <memory_fact_index>
+#    sections（日志 grep 验证）"
+#
+# Unit tests already verify (snapshot → section text) in isolation
+# (``test_sections_m2_unit.py``). The plumbing tests above verify
+# (provider → RenderContext.memory_snapshot) wiring. What was missing
+# until now is the end-to-end loop:
+#
+#   MemorySnapshot → build_render_context → PromptAssembler.assemble
+#     → rendered system prompt → messages handed to react_graph
+#
+# If any link in that chain regresses (e.g. a future refactor
+# inadvertently passes the wrong ctx to the assembler, or the
+# executor registry drops a memory section), the unit tests and the
+# plumbing tests would still pass — but the cold-start prompt would
+# lose its memory payload silently. This class locks the end-to-end
+# observation: "headers present in the assembled executor text".
+
+
+def _full_category_snapshot() -> MemorySnapshot:
+    """Build a MemorySnapshot with one chunk per category.
+
+    All three sections must render for the three headers to appear.
+    Using a pinned user chunk triggers the ``★`` marker branch of
+    ``memory_user_profile`` — if the marker logic regresses (e.g.
+    dropped to a plain bullet), that branch still renders, so the
+    header assertion below still passes. Pin choice is about
+    exercising the common production path, not locking a specific
+    bullet format.
+    """
+    from app.domain.models.memory_chunk import MemoryChunk
+
+    now = datetime.now(timezone.utc)
+
+    def _chunk(
+        id_: str, category: str, content: str, *, pinned: bool = False
+    ) -> "MemoryChunk":
+        return MemoryChunk(
+            id=id_,
+            user_id="u1",
+            content=content,
+            content_hash=f"h-{id_}",
+            source="manual",
+            metadata={},
+            created_at=now,
+            updated_at=now,
+            embedding=None,
+            category=category,
+            pinned=pinned,
+        )
+
+    return MemorySnapshot(
+        user_chunks=(
+            _chunk("u1", "user", "prefers Go over Python", pinned=True),
+        ),
+        rule_chunks=(
+            _chunk("r1", "rule", "never commit without asking"),
+        ),
+        fact_chunks=(
+            _chunk("f1", "fact", "DB is PostgreSQL 17"),
+        ),
+    )
+
+
+class _PromptAssemblerSpy:
+    """Capture ``assemble()`` output by registry.name.
+
+    Hooks the class method so every PromptAssembler instance built
+    during ``build_main_graph`` is observed — including the internal
+    default-assembler path (``_allow_default_prompt_assembler=True``).
+    """
+
+    def __init__(self) -> None:
+        self.captured_by_registry: dict[str, str] = {}
+
+    def install(self, monkeypatch) -> None:
+        from app.domain.services.prompts import assembler as asm_mod
+
+        real_assemble = asm_mod.PromptAssembler.assemble
+
+        def _spy_assemble(inner_self, registry, ctx, mode, **kwargs):
+            result = real_assemble(inner_self, registry, ctx, mode, **kwargs)
+            # Capture the most recent text per registry — if the same
+            # registry assembles multiple times (e.g. executor across
+            # iterations), we keep the last one, which is the current
+            # production-aligned observation.
+            self.captured_by_registry[registry.name] = result.text
+            return result
+
+        monkeypatch.setattr(asm_mod.PromptAssembler, "assemble", _spy_assemble)
+
+
+class TestColdStartEmitsMemorySections:
+    """End-to-end: three memory section headers appear in the
+    executor-assembled prompt when the provider returns a populated
+    snapshot.
+
+    Guards design doc §636 acceptance criterion. Single test that runs
+    the full ``main_graph.ainvoke`` path with a mocked react_graph and
+    planner LLM (same harness the sibling tests use), with a
+    non-trivial provider. Fails loudly if ANY of the three section
+    headers goes missing — the cold-start user experience depends on
+    all three being present.
+    """
+
+    async def test_executor_prompt_contains_all_three_memory_headers(
+        self, monkeypatch
+    ) -> None:
+        snapshot = _full_category_snapshot()
+
+        async def _provider() -> MemorySnapshot | None:
+            return snapshot
+
+        spy = _PromptAssemblerSpy()
+        spy.install(monkeypatch)
+
+        graph = _make_graph(provider=_provider)
+        await graph.ainvoke(_empty_initial_state())
+
+        # ``_empty_initial_state`` sets language="en" and the mock planner
+        # returns language="en", so the executor dispatches to the EN bundle.
+        executor_prompt = spy.captured_by_registry.get("en_executor")
+        assert executor_prompt is not None, (
+            f"executor never assembled a prompt; captured registries: "
+            f"{list(spy.captured_by_registry)}"
+        )
+
+        # The three memory section EN headers (zh counterparts:
+        # "## 用户画像" / "## 项目规则" / "## 事实索引"). Using ``in``
+        # not regex because the headers are stable literals declared in
+        # the section modules.
+        missing = [
+            header
+            for header in ("## User Profile", "## Project Rules", "## Fact Index")
+            if header not in executor_prompt
+        ]
+        assert not missing, (
+            f"cold-start executor prompt missing memory section headers: "
+            f"{missing}. Design doc §636 requires all three. "
+            f"Assembled text (first 500 chars): {executor_prompt[:500]}"
+        )
+
+    async def test_planner_prompt_does_not_render_memory_headers(
+        self, monkeypatch
+    ) -> None:
+        """Sanity — planner/updater registries don't declare memory
+        sections (see M2 PR-4 design §585-599). Even when the provider
+        returns a populated snapshot, the planner's assembled prompt
+        must NOT contain the three memory headers.
+
+        This locks the round-2 codex P3 finding (planner/updater should
+        not fetch memory) at the observable-output level: not only is
+        the provider not called from planner_node, but even if someone
+        later wires it up, the sections still won't render because
+        they're absent from the registry.
+        """
+        snapshot = _full_category_snapshot()
+
+        async def _provider() -> MemorySnapshot | None:
+            return snapshot
+
+        spy = _PromptAssemblerSpy()
+        spy.install(monkeypatch)
+
+        graph = _make_graph(provider=_provider)
+        await graph.ainvoke(_empty_initial_state())
+
+        planner_prompt = spy.captured_by_registry.get("en_planner")
+        assert planner_prompt is not None, (
+            "planner never assembled; test harness changed?"
+        )
+        # Any of the three memory headers showing up here means a
+        # memory section leaked into the planner registry — which
+        # would defeat the executor-only scope.
+        leaks = [
+            header
+            for header in ("## User Profile", "## Project Rules", "## Fact Index")
+            if header in planner_prompt
+        ]
+        assert not leaks, (
+            f"memory section(s) leaked into planner prompt: {leaks}. "
+            f"Registries should keep memory sections in executor only."
+        )

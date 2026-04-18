@@ -68,20 +68,60 @@ def synthetic_dataset_path() -> Path:
     return synthetic_dir() / "dataset.jsonl"
 
 
-def synthetic_adversarial_path() -> Path:
-    """Return the canonical adversarial dataset path.
+ADVERSARIAL_SUITE_NAMES: tuple[str, ...] = (
+    "ambiguous",
+    "sarcasm",
+    "temporary",
+    "contradictions",
+    "testing",
+)
+"""Design doc §621 defines these five adversarial suite names. Each
+suite is a separate file under ``synthetic/adversarial/``. Per-suite
+scoring (specificity / sensitivity, and eventually Wilson lower CI
+≥ 0.80 per-suite) depends on this list staying in sync with the
+files on disk — ``synthetic_adversarial_suite_paths()`` returns only
+the suites that actually resolve to an existing file, so the runtime
+stays robust if a suite is temporarily removed during dataset work.
+"""
 
-    M2 PR-5 adds this file to probe gate robustness against patterns
-    that *look* memory-worthy but the rubric says to drop (or vice-versa
-    on a small borderline-keep subset). Scoring is reported separately
-    from the core dataset so a precision dip in adversarial doesn't
-    swamp the Wilson CI on core.
 
-    Kept under ``synthetic/`` because the content is hand-crafted and
-    safe to publish; private real adversarial samples (if any) would
-    live under the private root using the same filename convention.
+def synthetic_adversarial_dir() -> Path:
+    """Directory holding per-suite adversarial .jsonl files.
+
+    One file per suite named ``{suite}.jsonl`` (e.g.
+    ``temporary.jsonl``). The layout replaces the pre-PR-5 monolithic
+    ``adversarial.jsonl`` — splitting by suite makes the per-suite
+    Wilson CI bar (design doc §634) observable and gives operators a
+    natural place to add new samples without loading an unrelated
+    taxonomy.
     """
-    return synthetic_dir() / "adversarial.jsonl"
+    return synthetic_dir() / "adversarial"
+
+
+def synthetic_adversarial_suite_path(name: str) -> Path:
+    """Return the ``.jsonl`` path for one adversarial suite.
+
+    Does not check existence — callers combine this with
+    ``is_file()`` or ``synthetic_adversarial_suite_paths()`` which
+    filters out missing suites.
+    """
+    return synthetic_adversarial_dir() / f"{name}.jsonl"
+
+
+def synthetic_adversarial_suite_paths() -> dict[str, Path]:
+    """Return ``{suite_name: path}`` for each existing suite file.
+
+    Iteration order follows ``ADVERSARIAL_SUITE_NAMES``. Missing files
+    are silently excluded — a deliberate choice so the harness stays
+    usable mid-migration (e.g. you deleted ``sarcasm.jsonl`` while
+    relabelling). Callers that want to detect the missing-all case
+    use ``synthetic_adversarial_available()``.
+    """
+    return {
+        name: p
+        for name in ADVERSARIAL_SUITE_NAMES
+        if (p := synthetic_adversarial_suite_path(name)).is_file()
+    }
 
 
 # ---- Private dataset --------------------------------------------------- #
@@ -148,14 +188,14 @@ def private_available() -> bool:
 
 
 def synthetic_adversarial_available() -> bool:
-    """True if the synthetic adversarial dataset file exists.
+    """True if at least one adversarial suite file exists.
 
-    Currently always True (checked into the repo), but callers that
-    want to gracefully degrade if someone deletes the file locally
-    (e.g. during bisection) can use this check instead of a bare
-    ``is_file()``.
+    Cheap OR-check used by the CLI (``tune_threshold.py``) and the
+    pytest harness (``test_gate_adversarial_resistance``) to decide
+    whether to run the adversarial branch at all. If every suite file
+    has been removed, the caller typically skips with a clear message.
     """
-    return synthetic_adversarial_path().is_file()
+    return bool(synthetic_adversarial_suite_paths())
 
 
 def control_set_available() -> bool:

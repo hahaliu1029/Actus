@@ -1,0 +1,3 @@
+{"id": "a6", "text": "用户：如果让我选我会用 Rust，不过现在 Python 就 Python", "expected_verdict": "drop", "expected_category": "user", "notes": "exploratory/hypothetical: stated preference overridden by 不过现在… = actual state is Python"}
+{"id": "a7", "text": "用户：假设数据量上 TB 级，我们再考虑切 ClickHouse", "expected_verdict": "drop", "expected_category": "fact", "notes": "exploratory/hypothetical: 假设 gates on a future condition that hasn't occurred"}
+{"id": "a8", "text": "用户：要是当初早点发现就好了", "expected_verdict": "drop", "expected_category": "user", "notes": "exploratory/hypothetical: retrospective subjunctive, no actionable fact"}
