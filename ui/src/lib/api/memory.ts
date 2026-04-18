@@ -53,4 +53,10 @@ export const memoryApi = {
 
   deleteAll: () =>
     post<DeleteCountResponse>("/v2/memories/delete-all", {}),
+
+  // M3-A: 清理 LLM gate 上线前入库的旧 session_flush 块
+  // 条件：source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL
+  // categorized / auto-promoted / manual / memory_save 行永远不受影响
+  deleteLegacy: () =>
+    del<DeleteCountResponse>("/v2/memories/legacy"),
 };

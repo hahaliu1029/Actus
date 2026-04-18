@@ -92,6 +92,10 @@ type SettingsActions = {
   deleteMemory: (id: string) => Promise<void>;
   bulkDeleteMemories: (ids: string[]) => Promise<void>;
   deleteAllMemories: () => Promise<void>;
+  // M3-A: 清理 legacy session_flush 遗留记忆（后端条件合取：
+  // source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL）。
+  // 返回实际删除条数的承诺通过 reportSuccess toast 呈现。
+  deleteLegacyMemories: () => Promise<number>;
   // 注：记忆内容的编辑和 **新建** 都由相应的 dialog/drawer 直接调用 memoryApi，
   // 以便内联展示 409/429/400 等业务错误，而不是被全局 error toast 吞掉；
   // 刷新列表走 get().loadMemories()。store 不维护第二套写入路径，避免双路径漂移。
@@ -557,6 +561,29 @@ export const useSettingsStore = create<SettingsStore>()(
       } catch (refreshError) {
         throw new MemoryRefreshAfterMutationError(refreshError);
       }
+    },
+
+    deleteLegacyMemories: async () => {
+      let deletedCount = 0;
+      try {
+        const resp = await memoryApi.deleteLegacy();
+        deletedCount = resp.deleted_count;
+      } catch (error) {
+        reportError(error, "清理旧记忆失败");
+        throw error;
+      }
+      // 即便 deleted_count=0 也当成"操作成功，没东西可清"——不静默。
+      if (deletedCount > 0) {
+        reportSuccess(`已清理 ${deletedCount} 条旧记忆`);
+      } else {
+        reportSuccess("没有需要清理的旧记忆");
+      }
+      try {
+        await get().loadMemories({ page: 1 });
+      } catch (refreshError) {
+        throw new MemoryRefreshAfterMutationError(refreshError);
+      }
+      return deletedCount;
     },
   }))
 );

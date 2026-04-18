@@ -35,6 +35,7 @@ import {
   useSettingsStore,
 } from "@/lib/store/settings-store";
 import {
+  Archive,
   ChevronLeft,
   ChevronRight,
   LoaderCircle,
@@ -68,6 +69,9 @@ export function MemoryManagement() {
   const deleteAllMemories = useSettingsStore(
     (state) => state.deleteAllMemories
   );
+  const deleteLegacyMemories = useSettingsStore(
+    (state) => state.deleteLegacyMemories
+  );
 
   // Local UI state — not persisted in the store.
   const [queryInput, setQueryInput] = useState<string>(
@@ -93,6 +97,7 @@ export function MemoryManagement() {
   const [isBulkDeleteOpen, setIsBulkDeleteOpen] = useState(false);
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
   const [deleteAllConfirmText, setDeleteAllConfirmText] = useState("");
+  const [isDeleteLegacyOpen, setIsDeleteLegacyOpen] = useState(false);
 
   const [isActionPending, setIsActionPending] = useState(false);
 
@@ -298,6 +303,26 @@ export function MemoryManagement() {
     }
   }, [deleteAllConfirmText, deleteAllMemories]);
 
+  // M3-A: 清理旧 session_flush 遗留。后端用过滤条件真删，UI 只需一次确认
+  // （不像 delete-all 需要键入短语——这里选择性更强，破坏范围更小）。
+  const handleConfirmDeleteLegacy = useCallback(async () => {
+    setIsActionPending(true);
+    const finishSuccess = () => {
+      setIsDeleteLegacyOpen(false);
+    };
+    try {
+      await deleteLegacyMemories();
+      finishSuccess();
+    } catch (err) {
+      if (err instanceof MemoryRefreshAfterMutationError) {
+        finishSuccess();
+      }
+      // 其他错误：保留 dialog 便于重试
+    } finally {
+      setIsActionPending(false);
+    }
+  }, [deleteLegacyMemories]);
+
   const openDetail = useCallback((id: string) => {
     setDetailId(id);
     setIsDetailOpen(true);
@@ -372,6 +397,16 @@ export function MemoryManagement() {
           >
             <Plus className="mr-1 size-4" />
             新建记忆
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setIsDeleteLegacyOpen(true)}
+            aria-label="清理旧记忆"
+            title="清理 LLM gate 上线前入库、未分类也未被自动收录的旧 session_flush 块"
+          >
+            <Archive className="mr-1 size-4" />
+            清理旧记忆
           </Button>
           <Button
             variant="destructive"
@@ -647,6 +682,47 @@ export function MemoryManagement() {
                 <LoaderCircle className="mr-1 size-4 animate-spin" />
               ) : null}
               确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete-legacy confirmation (M3-A). 单次确认即可——真删条件是
+          source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL，
+          后端保证 categorized / auto-promoted / manual / memory_save 行永不受影响。 */}
+      <Dialog
+        open={isDeleteLegacyOpen}
+        onOpenChange={(open) => {
+          if (!open) setIsDeleteLegacyOpen(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>清理旧记忆？</DialogTitle>
+            <DialogDescription>
+              清除 LLM gate 上线前入库、**未分类且未被自动收录**的旧
+              session_flush 块。新自动收录（已分类或已 auto-promoted）、
+              手动创建、Agent 帮记（memory_save）的条目都**不会**被清理。
+              操作不可恢复。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setIsDeleteLegacyOpen(false)}
+              disabled={isActionPending}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleConfirmDeleteLegacy}
+              disabled={isActionPending}
+            >
+              {isActionPending ? (
+                <LoaderCircle className="mr-1 size-4 animate-spin" />
+              ) : null}
+              确认清理
             </Button>
           </DialogFooter>
         </DialogContent>

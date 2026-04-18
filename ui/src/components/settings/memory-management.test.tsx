@@ -10,6 +10,7 @@ vi.mock("@/lib/api/memory", () => ({
     deleteOne: vi.fn(),
     bulkDelete: vi.fn(),
     deleteAll: vi.fn(),
+    deleteLegacy: vi.fn(),
     create: vi.fn(),
   },
 }));
@@ -152,6 +153,60 @@ describe("MemoryManagement smoke", () => {
     expect(await screen.findByTestId("memory-load-error")).toHaveTextContent(
       /network down/,
     );
+  });
+
+  // ─── M3-D: 清理旧记忆按钮 + dialog ───────────────────────────────────
+
+  it("legacy cleanup button opens dialog and calls deleteLegacy on confirm", async () => {
+    const user = userEvent.setup();
+    mockedMemoryApi.deleteLegacy.mockResolvedValue({ deleted_count: 3 });
+    render(<MemoryManagement />);
+
+    await screen.findByText(/first memory content/);
+
+    await user.click(screen.getByRole("button", { name: /清理旧记忆/ }));
+
+    // Dialog 打开
+    expect(await screen.findByText("清理旧记忆？")).toBeInTheDocument();
+
+    // 确认按钮存在（legacy 清理不需要输入短语，一次点击即可）
+    const confirmBtn = screen.getByRole("button", { name: /确认清理/ });
+    expect(confirmBtn).not.toBeDisabled();
+
+    await user.click(confirmBtn);
+
+    // API 被调用
+    await waitFor(() =>
+      expect(mockedMemoryApi.deleteLegacy).toHaveBeenCalledTimes(1),
+    );
+    // Dialog 关闭
+    await waitFor(() =>
+      expect(screen.queryByText("清理旧记忆？")).not.toBeInTheDocument(),
+    );
+    // 成功后刷新列表
+    await waitFor(() =>
+      // list 调用至少 2 次：初次加载 + 清理后刷新
+      expect(mockedMemoryApi.list.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
+  });
+
+  it("legacy cleanup keeps dialog open on mutation error", async () => {
+    const user = userEvent.setup();
+    mockedMemoryApi.deleteLegacy.mockRejectedValueOnce(
+      new ApiError("network down", 0),
+    );
+    render(<MemoryManagement />);
+
+    await screen.findByText(/first memory content/);
+
+    await user.click(screen.getByRole("button", { name: /清理旧记忆/ }));
+    await user.click(screen.getByRole("button", { name: /确认清理/ }));
+
+    await waitFor(() =>
+      expect(mockedMemoryApi.deleteLegacy).toHaveBeenCalledTimes(1),
+    );
+    // Dialog 保留以便用户重试
+    expect(screen.getByText("清理旧记忆？")).toBeInTheDocument();
   });
 
   it("delete-all button is gated by typed confirmation", async () => {
