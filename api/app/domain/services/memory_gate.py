@@ -121,7 +121,12 @@ _SYSTEM_PROMPT = """\
 - "以后别 X" / "必须 Y" / "项目规则" → rule
 - "我们用 PostgreSQL 17" / "API 地址 X" → fact
 - **默认保守**：模糊、反讽、临时调试、Agent 自己的回复、语境内一次性
-  信息——一律 drop。疑似 keep 但不明确的，judge drop 并给低 confidence。
+  信息——一律 drop。具体 drop 标记（即便表面像 keep）：
+  - 假设/反事实/条件性："如果 / 假设 / 万一 / 倘若 / 要是 / 可能的话 /
+    可以的话 / 理想情况下"——是潜在/反事实，不是真实承诺或事实
+  - 临时性范围："这次 / 今天 / 刚才 / 暂时 / 本次 / 先...再 / 演示用"
+    ——指令只在当前任务/时段有效，不是 permanent rule
+  疑似 keep 但不明确的，judge drop 并给低 confidence。
 
 严格按照 batch 里 chunk 的编号逐条返回，不要合并、不要漏掉。
 """

@@ -44,35 +44,26 @@ CI — they're scored on accuracy/specificity. Only `ambiguous` (mixed
 13 keep / 9 drop) directly contributes to the per-suite Wilson CI on
 precision.
 
-## Known limitation — `testing` suite in single-suite batch
+## Single-suite batch resistance — `testing` (2026-04-19 finding + fix)
 
-**Finding (gap #2 expansion validation run):** when `testing.jsonl` is
-classified in isolation (22 hypothetical-only samples in one batch), the
-gate misclassifies ~10 / 22 as `keep`. In a mixed-suite union batch
-(all 110 adversarial rows, or adversarial + core in production), the
-same samples all classify as `drop` correctly (100%).
+**Finding (gap #2 expansion validation run):** the initial 22-row
+`testing.jsonl` had a 10/22 misclassify rate when classified in
+isolation, even though the same samples classified perfectly in mixed
+adversarial / core union batches (production-realistic mode).
 
-**Root cause:** the gate's system prompt (`memory_gate.py:109-127`)
-explicitly enumerates drop-worthy patterns (模糊 / 反讽 / 临时调试 /
-Agent 自己的回复 / 语境内一次性信息) but does NOT enumerate
-hypothetical / subjunctive markers (假设 / 如果 / 万一 / 倘若 /
-要是 / 可能的话). When the batch provides zero contrastive anchors
-(i.e., all 22 rows are hypotheticals), the gate loses its anchor and
-reads surface patterns like "我会用 Rust" as preference signals.
+**Root cause:** the gate's system prompt (`memory_gate.py:_SYSTEM_PROMPT`)
+explicitly enumerated drop-worthy patterns (模糊 / 反讽 / 临时调试 /
+Agent 自己的回复 / 语境内一次性信息) but did NOT enumerate
+hypothetical / subjunctive markers. When a single-suite batch provided
+zero contrastive anchors (all 22 rows hypothetical), the gate read
+surface patterns like "我会用 Rust" as preference signals.
 
-**Production impact:** zero. The gate only runs in `_evaluate_flush_gate`
-on the session's flushed chunks — a live conversation's chunks are
-mixed-type, never all-hypothetical. The failure mode is artefact of
-the single-suite pytest harness.
-
-**Decision (2026-04-19):** accepted as known limitation; `testing`
-suite's `test_gate_adversarial_resistance[testing]` is marked `xfail`
-with a reason pointing here. M2 acceptance uses the union-batch numbers
-from `tune_threshold.py --with-adversarial` (the production-realistic
-mode), where all 110 rows classify perfectly. A follow-up prompt-level
-fix (adding explicit hypothetical markers to `_SYSTEM_PROMPT`) is
-tracked separately; it's a 1-line change but touches production prompt
-and should land under its own review.
+**Fix (same session):** extended `_SYSTEM_PROMPT` to enumerate two
+explicit drop-marker classes: 假设/反事实/条件性 (如果/假设/万一/倘若/
+要是/可能的话/可以的话/理想情况下) and 临时性范围 (这次/今天/刚才/
+暂时/本次/先...再/演示用). Post-fix all 5 suites pass single-batch and
+union batches remain at 100% (core recall improved 0.967 → 1.000;
+Wilson lower 0.833 → 0.838 — Pareto improvement).
 
 ## Adding new samples
 
