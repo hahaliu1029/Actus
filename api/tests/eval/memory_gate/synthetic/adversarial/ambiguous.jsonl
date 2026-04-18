@@ -2,3 +2,21 @@
 {"id": "a18", "text": "用户：我用 mise 管 Python 版本，不用 pyenv", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: contrastive preference is still a preference"}
 {"id": "a19", "text": "用户：主语言是简体中文，不过专业术语可以中英混用", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: nuanced language preference, still keepable"}
 {"id": "a20", "text": "用户：今天天气真冷，手指都冻僵了", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: off-topic personal remark with no memory value"}
+{"id": "a93", "text": "用户：我们后端 Go，但偶尔写点 Bash 脚本", "expected_verdict": "keep", "expected_category": "fact", "notes": "ambiguous-keep: primary stack with caveat — still a project tech-stack fact"}
+{"id": "a94", "text": "用户：偏好 vim 但 vscode 也用", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: 偏好 = explicit preference word, secondary editor doesn't dilute it"}
+{"id": "a95", "text": "用户：尽量不用 lambda，可读性差", "expected_verdict": "keep", "expected_category": "rule", "notes": "ambiguous-keep: 尽量不用 = soft constraint with rationale, still a standing rule"}
+{"id": "a96", "text": "用户：我习惯先写测试，TDD 不严格但方向对", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: 我习惯 = working habit, hedging doesn't invalidate"}
+{"id": "a97", "text": "用户：commit message 用英文，注释偶尔中文", "expected_verdict": "keep", "expected_category": "rule", "notes": "ambiguous-keep: project convention with documented exception"}
+{"id": "a98", "text": "用户：DB 默认 PG，但分析跑 ClickHouse", "expected_verdict": "keep", "expected_category": "fact", "notes": "ambiguous-keep: dual-DB stack fact, both halves are persistent"}
+{"id": "a99", "text": "用户：我接受 PR 时只 review 后端，前端让队友看", "expected_verdict": "keep", "expected_category": "user", "notes": "ambiguous-keep: working habit / role boundary, recurring"}
+{"id": "a100", "text": "用户：响应里别堆 emoji，但代码块里允许少量说明用的", "expected_verdict": "keep", "expected_category": "rule", "notes": "ambiguous-keep: rule with explicit exception clause, both parts persist"}
+{"id": "a101", "text": "用户：我们项目主分支叫 develop，main 只放 release", "expected_verdict": "keep", "expected_category": "fact", "notes": "ambiguous-keep: project branching convention, durable fact"}
+{"id": "a102", "text": "用户：日志用 JSON，本地可以 plain 但 prod 必须 JSON", "expected_verdict": "keep", "expected_category": "rule", "notes": "ambiguous-keep: env-conditional rule, but the prod constraint is firm"}
+{"id": "a103", "text": "用户：今天有点头疼，效率不高", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: personal status, not durable"}
+{"id": "a104", "text": "用户：刚才电脑卡了一下", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: transient hardware blip, no value"}
+{"id": "a105", "text": "用户：我去喝杯咖啡", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: status update / break announcement"}
+{"id": "a106", "text": "用户：今天午饭吃啥", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: off-topic small talk"}
+{"id": "a107", "text": "用户：哎其实我也不太确定", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: hedging filler, no concrete content"}
+{"id": "a108", "text": "用户：嗯嗯了解", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: acknowledgement token"}
+{"id": "a109", "text": "用户：好的，谢谢", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: polite acknowledgement"}
+{"id": "a110", "text": "用户：行，我去看看", "expected_verdict": "drop", "expected_category": "user", "notes": "ambiguous-chatter: vague action ack with no detail to capture"}

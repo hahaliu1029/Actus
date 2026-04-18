@@ -1,3 +1,22 @@
 {"id": "a11", "text": "用户：之前说用 Redis 的事忘了吧", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: cancels prior memory without stating new state → no new keepable content"}
 {"id": "a12", "text": "用户：我刚才那个偏好不算数", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: explicit recall of previous statement"}
 {"id": "a13", "text": "用户：取消之前关于 mock 数据库的说法", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: explicit cancel of prior rule"}
+{"id": "a74", "text": "用户：之前说要用 Postgres 的不算了", "expected_verdict": "drop", "expected_category": "fact", "notes": "contradiction: 之前说...不算了 = explicit prior-state cancel"}
+{"id": "a75", "text": "用户：我刚才说错了，撤回那条", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: 撤回 = retract, no replacement provided"}
+{"id": "a76", "text": "用户：忽略上一条偏好", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: 忽略上一条 = explicit invalidation of prior memory"}
+{"id": "a77", "text": "用户：刚才那条规则取消", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: 取消 = cancel, dangling without new directive"}
+{"id": "a78", "text": "用户：把之前那个 rule 删掉", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: explicit delete request, not a new rule"}
+{"id": "a79", "text": "用户：算了，刚才说的都不算", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: bulk retraction without alternative"}
+{"id": "a80", "text": "用户：之前关于命名规范的说法忘记吧", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: 忘记吧 = soft cancel, no new convention proposed"}
+{"id": "a81", "text": "用户：撤销刚才说的事", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: 撤销 = formal retraction"}
+{"id": "a82", "text": "用户：那条记忆作废", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: 作废 = invalidate target memory"}
+{"id": "a83", "text": "用户：抱歉，刚才说反了，但具体怎样我也不确定", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: retracts AND admits uncertainty about replacement"}
+{"id": "a84", "text": "用户：刚说的那个偏好取消", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: 刚说的 + 取消 = immediate cancellation"}
+{"id": "a85", "text": "用户：之前关于使用 React 的说法不再适用", "expected_verdict": "drop", "expected_category": "fact", "notes": "contradiction: 不再适用 = invalidate without replacement"}
+{"id": "a86", "text": "用户：那条规则不重要了，忘了吧", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: 不重要了 + 忘了吧 = double-soft cancel"}
+{"id": "a87", "text": "用户：刚刚让你记的那条不算", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: 刚刚让你记...不算 = direct revocation"}
+{"id": "a88", "text": "用户：我收回之前关于 timeout 的说法", "expected_verdict": "drop", "expected_category": "fact", "notes": "contradiction: 收回 = formal withdrawal"}
+{"id": "a89", "text": "用户：把 memory 里关于 cache 的那条清掉", "expected_verdict": "drop", "expected_category": "rule", "notes": "contradiction: explicit memory deletion request"}
+{"id": "a90", "text": "用户：算了不要记那条了", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: 算了 + 不要记 = abandon prior intent"}
+{"id": "a91", "text": "用户：之前那条偏好失效了", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: 失效 = expired, no successor offered"}
+{"id": "a92", "text": "用户：把刚才说的从记忆中移除", "expected_verdict": "drop", "expected_category": "user", "notes": "contradiction: explicit removal directive"}

@@ -3,3 +3,20 @@
 {"id": "a3", "text": "用户：刚才那个函数别用 async，换 sync", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 刚才那个 = pointing to one specific function"}
 {"id": "a4", "text": "用户：这个 endpoint 别加 auth，演示用", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这个 + 演示用 = demo-only override"}
 {"id": "a5", "text": "用户：这次迁移先跳过 dry-run", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这次 scopes to single migration"}
+{"id": "a21", "text": "用户：今天先用 npm，明天再换 pnpm", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 今天/明天 markers, transient toolchain choice"}
+{"id": "a22", "text": "用户：本次会话先跳过 type 检查", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 本次会话 explicitly bounds scope to this session"}
+{"id": "a23", "text": "用户：暂时把超时调到 60 秒", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 暂时 = temporary override, not a standing config"}
+{"id": "a24", "text": "用户：现在先用 console.log，等下再换 logger", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 现在/等下 acknowledges its own transience"}
+{"id": "a25", "text": "用户：这道 leetcode 题先用暴力解", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这道题 scopes to one problem"}
+{"id": "a26", "text": "用户：刚才那个测试先 skip 掉", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 刚才那个 + 先 = single-test deferral"}
+{"id": "a27", "text": "用户：先把 commit 推上去，CI 等会儿再看", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 先/等会儿 = ad-hoc workflow tweak"}
+{"id": "a28", "text": "用户：这次先不写文档了", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这次 + 先 stack as scope limiters"}
+{"id": "a29", "text": "用户：本次回答先用英语", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 本次回答 binds to one response, NOT a language preference"}
+{"id": "a30", "text": "用户：这一轮先不要管性能优化", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这一轮 = current iteration only"}
+{"id": "a31", "text": "用户：今天的 standup 先跳过吧", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 今天的 X = single-instance skip"}
+{"id": "a32", "text": "用户：这次只 review 后端，前端下次", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这次/下次 explicitly demarcate review scope"}
+{"id": "a33", "text": "用户：暂时先 hardcode 这个值", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 暂时先 = double temporary marker"}
+{"id": "a34", "text": "用户：本次部署先关掉 alarm", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 本次部署 binds to current deploy only"}
+{"id": "a35", "text": "用户：这一周先不上 prod", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这一周 = bounded time window"}
+{"id": "a36", "text": "用户：这道题先用伪代码", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 这道题 scopes to single problem"}
+{"id": "a37", "text": "用户：先把这条注释掉，回头再查", "expected_verdict": "drop", "expected_category": "rule", "notes": "task-local: 先/回头再 = explicit defer, no commitment"}

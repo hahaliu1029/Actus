@@ -1,3 +1,22 @@
 {"id": "a6", "text": "用户：如果让我选我会用 Rust，不过现在 Python 就 Python", "expected_verdict": "drop", "expected_category": "user", "notes": "exploratory/hypothetical: stated preference overridden by 不过现在… = actual state is Python"}
 {"id": "a7", "text": "用户：假设数据量上 TB 级，我们再考虑切 ClickHouse", "expected_verdict": "drop", "expected_category": "fact", "notes": "exploratory/hypothetical: 假设 gates on a future condition that hasn't occurred"}
 {"id": "a8", "text": "用户：要是当初早点发现就好了", "expected_verdict": "drop", "expected_category": "user", "notes": "exploratory/hypothetical: retrospective subjunctive, no actionable fact"}
+{"id": "a38", "text": "用户：假如有时间，可以试试 Rust 重写", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 假如 + 可以 = double conditional, no commitment"}
+{"id": "a39", "text": "用户：万一数据库挂了我们怎么办", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 万一 = contingency planning question, not a fact"}
+{"id": "a40", "text": "用户：如果以后用户量上来了再考虑分库", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 如果...再考虑 = conditional future planning"}
+{"id": "a41", "text": "用户：要是 Anthropic 早点出 caching 就好了", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 要是...就好了 = subjunctive lament about the past"}
+{"id": "a42", "text": "用户：可以的话最好把 monorepo 拆开", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 可以的话/最好 = soft wish, not a directive"}
+{"id": "a43", "text": "用户：假设我们有无限资源", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: thought experiment opener, not a fact"}
+{"id": "a44", "text": "用户：理想情况下应该用事件驱动架构", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 理想情况下 explicitly marks aspirational, not actual"}
+{"id": "a45", "text": "用户：如果重新做我会用 Rust 而不是 Python", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 如果重新做 = counterfactual, not the actual choice"}
+{"id": "a46", "text": "用户：倘若性能跟不上再考虑切 Go", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 倘若 + 再考虑 = double-conditional contingency"}
+{"id": "a47", "text": "用户：要是没有 deadline 就好了", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: counterfactual complaint, no actionable content"}
+{"id": "a48", "text": "用户：假设需求不变的话现有架构够用", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 假设...的话 = conditional, with caveat"}
+{"id": "a49", "text": "用户：万一审核不过就回滚", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 万一 = contingency fallback, not standing rule"}
+{"id": "a50", "text": "用户：如果可以的话希望加暗黑模式", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 如果可以的话 + 希望 = soft wish stack"}
+{"id": "a51", "text": "用户：假如客户想要我们才做", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 假如...才 = conditional reactive policy"}
+{"id": "a52", "text": "用户：可能的话用 GraphQL，但 REST 也行", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 可能的话 + ...也行 = no firm preference"}
+{"id": "a53", "text": "用户：假设这个 API 是稳定的", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 假设 = working assumption, not a verified fact"}
+{"id": "a54", "text": "用户：如果有更好的方案再换", "expected_verdict": "drop", "expected_category": "rule", "notes": "hypothetical: 如果有...再 = open-ended contingency"}
+{"id": "a55", "text": "用户：要不要试试 Rust 随便聊聊", "expected_verdict": "drop", "expected_category": "user", "notes": "hypothetical: 要不要 + 随便聊聊 = exploratory chat opener"}
+{"id": "a56", "text": "用户：假定 token 用不完", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical: 假定 = posited assumption for argument"}
