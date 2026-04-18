@@ -96,6 +96,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
         updated_to: datetime | None = None,
+        auto_promoted_after: datetime | None = None,
         offset: int = 0,
         limit: int = 20,
     ) -> list[MemoryChunk]:
@@ -110,6 +111,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             created_to=created_to,
             updated_from=updated_from,
             updated_to=updated_to,
+            auto_promoted_after=auto_promoted_after,
         )
         # id DESC 作为 updated_at 并列时的确定性 tie-breaker：
         # MemoryFlushService 会给同一 batch 复用同一 now()，并列行非常常见；
@@ -137,6 +139,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
         updated_to: datetime | None = None,
+        auto_promoted_after: datetime | None = None,
     ) -> int:
         stmt = select(func.count()).select_from(MemoryChunkModel).where(
             MemoryChunkModel.user_id == user_id
@@ -151,6 +154,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             created_to=created_to,
             updated_from=updated_from,
             updated_to=updated_to,
+            auto_promoted_after=auto_promoted_after,
         )
         result = await self.db_session.execute(stmt)
         return int(result.scalar_one())
@@ -284,6 +288,7 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         created_to: datetime | None,
         updated_from: datetime | None,
         updated_to: datetime | None,
+        auto_promoted_after: datetime | None = None,
     ) -> Select[Any]:
         """共享的过滤条件装配，list_by_user / count_by_user 复用。"""
         if query is not None and query != "":
@@ -309,6 +314,13 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
             stmt = stmt.where(MemoryChunkModel.updated_at >= updated_from)
         if updated_to is not None:
             stmt = stmt.where(MemoryChunkModel.updated_at <= updated_to)
+        if auto_promoted_after is not None:
+            # 仅 auto-flush 路径写 auto_promoted_at；manual / memory_save 路径
+            # 留 NULL。NULL 不进入比较结果集合，下游 audit 视图自动只看 LLM gate
+            # 实际收录的行。索引：用户级走 ix_memory_chunks_user_updated_at 命中
+            # user，再在用户范围内 in-memory 比较 timestamp（典型 100-1000 行
+            # 量级，不需要 dedicated index）。
+            stmt = stmt.where(MemoryChunkModel.auto_promoted_at >= auto_promoted_after)
         return stmt
 
     # ---- Conversion helpers ----

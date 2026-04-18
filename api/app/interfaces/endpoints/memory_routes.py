@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import AwareDatetime
 
 from app.application.errors.exceptions import BadRequestError, NotFoundError
 from app.interfaces.dependencies import (
@@ -57,6 +58,21 @@ async def list_memories(
     created_to: datetime | None = None,
     updated_from: datetime | None = None,
     updated_to: datetime | None = None,
+    # AwareDatetime: 拒绝 naive datetime 输入，避免不同时区部署节点对同一
+    # cutoff 字符串解释不一致（codex round-3 [P2]）。客户端必须传 ISO 8601
+    # 带时区，例如 ``2026-04-12T00:00:00Z`` 或 ``2026-04-12T08:00:00+08:00``。
+    # 已知遗留：created_from / updated_to 等同类参数仍是 naive-tolerant
+    # ``datetime``，独立 cleanup（不属于本 PR scope）。
+    auto_promoted_after: AwareDatetime | None = Query(
+        None,
+        description=(
+            "审阅最近 N 天 LLM gate 自动收录的 memory（design doc §777 入口）："
+            "只返回 ``auto_promoted_at >= auto_promoted_after`` 的行。manual / "
+            "memory_save 入口的行 ``auto_promoted_at IS NULL``，自动排除。"
+            "通常配合 ``source=session_flush`` 使用。**必须 timezone-aware** "
+            "（例如 ``2026-04-12T00:00:00Z``），naive datetime 返回 422。"
+        ),
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=50),
 ) -> Response[MemoryListResponse]:
@@ -69,6 +85,7 @@ async def list_memories(
         created_to=created_to,
         updated_from=updated_from,
         updated_to=updated_to,
+        auto_promoted_after=auto_promoted_after,
         page=page,
         page_size=page_size,
     )

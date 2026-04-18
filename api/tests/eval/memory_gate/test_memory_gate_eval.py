@@ -314,6 +314,74 @@ async def test_gate_wilson_hard_gate() -> None:
     )
 
 
+async def test_gate_wilson_hard_gate_public_only() -> None:
+    """M2 acceptance — public-only Wilson hard gate (no private set required).
+
+    **Why this exists:** the original ``test_gate_wilson_hard_gate`` skips
+    when the private real-flush dataset is absent. For solo deployments
+    that don't accumulate enough real-session data to sample 200+ rows
+    (or that explicitly defer the private-set workflow, the current Actus
+    state as of 2026-04-19), the public-only Wilson lower bound on the
+    synthetic core dataset is the strongest permanent CI signal. This
+    variant runs that gate unconditionally (subject to LLM availability)
+    and acts as the M2 verification floor when private validation is
+    deferred.
+
+    The two gates coexist intentionally:
+
+    - ``test_gate_wilson_hard_gate`` — strictest, runs only when private
+      data is populated (rubric §130-140 union semantics). When that
+      data exists this is the authoritative M2 acceptance signal.
+    - ``test_gate_wilson_hard_gate_public_only`` — always-on, lower
+      ceiling (synthetic-only distribution). Catches gross gate
+      regressions even on deployments without private data.
+
+    Caveat acknowledged here so the result isn't misread: a synthetic-
+    only Wilson lower of 0.85 does NOT prove production precision is
+    ≥ 0.70 in the wild — it proves the gate clears 0.70 on the
+    synthetic distribution, which is necessary but not sufficient for
+    production readiness. If real-flush data later becomes available,
+    the union gate above takes precedence as the authoritative signal.
+    """
+    samples = _load_jsonl(synthetic_dataset_path())
+    if len(samples) < 40:
+        pytest.skip(
+            f"public-only hard gate needs n >= 40 for Wilson CI to be "
+            f"meaningful; got {len(samples)}. Grow synthetic/dataset.jsonl."
+        )
+
+    llm = _resolve_llm()
+    classifier = MemoryGateClassifier(llm)
+    decisions = await _run_classifier(samples, classifier)
+    tp, fp, fn, tn = _score(samples, decisions, threshold=0.7)
+
+    denom = tp + fp
+    if denom == 0:
+        pytest.fail(
+            f"gate dropped every sample ({tp+fp+fn+tn} total, 0 kept); "
+            f"recall = 0. Check prompt / threshold / LLM degradation."
+        )
+
+    point = tp / denom
+    lower = wilson_ci_lower(tp, denom)
+
+    print("\n" + "=" * 60)
+    print(f"memory_gate WILSON HARD GATE [public-only] @ threshold=0.7, N={len(samples)}")
+    print(f"  precision point = {point:.3f}  (tp={tp}, fp={fp})")
+    print(f"  Wilson 95% lower= {lower:.3f}")
+    print(f"  hard gate target= 0.700  (public-only floor)")
+    print("=" * 60)
+
+    assert lower >= 0.70, (
+        f"M2 public-only hard gate failed: Wilson 95% lower bound on "
+        f"precision = {lower:.3f} < 0.70 target. "
+        f"tp={tp} fp={fp} fn={fn} tn={tn} at threshold=0.7 on N={len(samples)} "
+        f"public synthetic samples. Run `uv run python -m "
+        f"tests.eval.memory_gate.tune_threshold --llm chat_llm --public-only` "
+        f"to inspect, or iterate on app/domain/services/memory_gate.py."
+    )
+
+
 async def test_gate_marker_hint_regression() -> None:
     """Codex round-2 [P2]: fail-fast on marker-as-hint keepables.
 

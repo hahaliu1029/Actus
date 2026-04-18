@@ -170,13 +170,26 @@ week's denominator instead of breaking the current comparison.
 
 ## M2 precision gate
 
-M2 acceptance criterion:
+M2 acceptance criterion (two-tier — pick whichever applies to the
+deployment):
 
-> precision point estimate and **Wilson 95% CI lower bound** on the
-> union (public + private) dataset at `threshold=0.7`, with the lower
-> bound ≥ 0.70 as the hard gate.
+1. **Authoritative (union path) — `test_gate_wilson_hard_gate`:**
+   precision point estimate and **Wilson 95% CI lower bound** on the
+   union (public synthetic + private real) dataset at `threshold=0.7`,
+   with the lower bound ≥ 0.70 as the hard gate. Skips automatically
+   if private dataset is absent or empty (deployments without enough
+   real-flush data to sample 200+ rows).
 
-Use `stats.wilson_ci_lower(tp, tp+fp)` in test assertions.
-`tune_threshold.py --sweep 0.5:0.9:0.1 --llm chat_llm` sweeps over
-candidate thresholds and flags the best-recall threshold that clears
-the gate.
+2. **Floor (public-only path) — `test_gate_wilson_hard_gate_public_only`:**
+   same lower-bound ≥ 0.70 assertion, but on the **public synthetic
+   set alone**. Always runs (subject to LLM availability). This is the
+   permanent CI signal for solo deployments that defer the private-set
+   workflow. Caveat: a synthetic-only Wilson lower of 0.85 doesn't prove
+   production precision is ≥ 0.70 in the wild — it proves the gate
+   clears 0.70 on the synthetic distribution. When real-flush data
+   later becomes available, the union path takes precedence.
+
+Both use `stats.wilson_ci_lower(tp, tp+fp)`. `tune_threshold.py
+--sweep 0.5:0.9:0.1 --llm chat_llm` sweeps over candidate thresholds
+and flags the best-recall threshold that clears the gate; pass
+`--public-only` to scope to the floor path explicitly.

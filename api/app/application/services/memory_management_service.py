@@ -125,6 +125,7 @@ class MemoryManagementService:
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
         updated_to: datetime | None = None,
+        auto_promoted_after: datetime | None = None,
         page: int = 1,
         page_size: int = 20,
     ) -> tuple[list[MemoryChunk], int]:
@@ -132,6 +133,12 @@ class MemoryManagementService:
 
         ``category`` 传入 ``user/rule/fact`` 精确过滤；传 None 返回全部（含 legacy
         的 ``category IS NULL`` 行）。
+
+        ``auto_promoted_after`` 传入 ``datetime`` 仅返回
+        ``auto_promoted_at >= auto_promoted_after`` 的行。配合
+        ``source='session_flush'`` 即 design doc §777 的"最近自动收录的 memory 审阅"
+        路径——manual / memory_save 入口的行 ``auto_promoted_at IS NULL``，自动
+        排除在 audit 视图外。
         """
         page_size = min(page_size, 50)
         page = max(page, 1)
@@ -148,6 +155,7 @@ class MemoryManagementService:
                 created_to=created_to,
                 updated_from=updated_from,
                 updated_to=updated_to,
+                auto_promoted_after=auto_promoted_after,
                 offset=offset,
                 limit=page_size,
             )
@@ -160,6 +168,7 @@ class MemoryManagementService:
                 created_to=created_to,
                 updated_from=updated_from,
                 updated_to=updated_to,
+                auto_promoted_after=auto_promoted_after,
             )
         return items, total
 

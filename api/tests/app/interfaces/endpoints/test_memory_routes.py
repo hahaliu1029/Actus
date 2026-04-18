@@ -602,3 +602,55 @@ async def test_list_memories_invalid_category_returns_422(
     )
     assert response.status_code == 422
     mock_service.list_memories.assert_not_called()
+
+
+async def test_list_memories_forwards_auto_promoted_after(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """design doc §777：?source=session_flush&auto_promoted_after=<iso> →
+    service.list_memories 收到等价 datetime。审阅最近 N 天 LLM gate 收录路径。"""
+    from datetime import datetime, timezone
+
+    iso = "2026-04-12T00:00:00+00:00"
+    response = await _request(
+        client_app,
+        "GET",
+        "/api/v2/memories",
+        params={"source": "session_flush", "auto_promoted_after": iso},
+    )
+    assert response.status_code == 200
+    kwargs = mock_service.list_memories.call_args.kwargs
+    assert kwargs["source"] == "session_flush"
+    assert kwargs["auto_promoted_after"] == datetime(
+        2026, 4, 12, tzinfo=timezone.utc
+    )
+
+
+async def test_list_memories_invalid_auto_promoted_after_returns_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """非 datetime 字符串 → FastAPI 422，service 不被调用。"""
+    response = await _request(
+        client_app,
+        "GET",
+        "/api/v2/memories",
+        params={"auto_promoted_after": "not-a-date"},
+    )
+    assert response.status_code == 422
+    mock_service.list_memories.assert_not_called()
+
+
+async def test_list_memories_naive_auto_promoted_after_returns_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """codex round-3 [P2]: naive datetime（无 timezone 后缀）必须 422 拒绝，
+    避免不同部署节点对同一 cutoff 字符串按 host TZ 解释而产生不同结果。
+    AwareDatetime 强制要求 ISO 8601 带时区。"""
+    response = await _request(
+        client_app,
+        "GET",
+        "/api/v2/memories",
+        params={"auto_promoted_after": "2026-04-12T00:00:00"},  # 缺 TZ 后缀
+    )
+    assert response.status_code == 422
+    mock_service.list_memories.assert_not_called()

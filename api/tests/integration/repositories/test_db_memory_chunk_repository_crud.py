@@ -250,6 +250,149 @@ class TestDeleteAllByUser:
         assert deleted == []
 
 
+class TestAutoPromotedAfterFilter:
+    """design doc §777 audit query: GET /v2/memories?source=session_flush
+    &auto_promoted_after=<ts> 让用户/运维审阅最近 N 天 LLM gate 自动收录。
+    NULL 行（manual / memory_save 入口）不命中。"""
+
+    async def test_only_returns_rows_promoted_after_cutoff(
+        self, repo, user_id, db_session
+    ):
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        old = MemoryChunk(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            content="old auto-promoted",
+            content_hash="hash-old-auto-promote",
+            source="session_flush",
+            metadata={},
+            created_at=now - timedelta(days=14),
+            updated_at=now - timedelta(days=14),
+            session_id=None,
+            embedding=None,
+            auto_promoted_at=now - timedelta(days=14),
+        )
+        recent = MemoryChunk(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            content="recent auto-promoted",
+            content_hash="hash-recent-auto-promote",
+            source="session_flush",
+            metadata={},
+            created_at=now - timedelta(days=2),
+            updated_at=now - timedelta(days=2),
+            session_id=None,
+            embedding=None,
+            auto_promoted_at=now - timedelta(days=2),
+        )
+        await repo.batch_insert_ignore([old, recent])
+        await db_session.flush()
+
+        cutoff = now - timedelta(days=7)
+        result = await repo.list_by_user(user_id, auto_promoted_after=cutoff)
+        assert len(result) == 1
+        assert result[0].id == recent.id
+
+        count = await repo.count_by_user(user_id, auto_promoted_after=cutoff)
+        assert count == 1
+
+    async def test_null_auto_promoted_at_excluded(
+        self, repo, user_id, db_session
+    ):
+        """manual / memory_save 入口的行 auto_promoted_at IS NULL，
+        必须不被任何非空 auto_promoted_after filter 命中。"""
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        manual = _make_chunk(user_id, "manual entry", source="manual")
+        await repo.batch_insert_ignore([manual])
+        await db_session.flush()
+
+        # manual 行没设 auto_promoted_at（默认 None）
+        cutoff = now - timedelta(days=365)  # 极宽 cutoff，仍应排除 NULL
+        result = await repo.list_by_user(user_id, auto_promoted_after=cutoff)
+        assert len(result) == 0
+
+        count = await repo.count_by_user(user_id, auto_promoted_after=cutoff)
+        assert count == 0
+
+    async def test_inclusive_cutoff_boundary(
+        self, repo, user_id, db_session
+    ):
+        """codex round-3 fence-post check: 参数名叫 *_after* 但语义是 inclusive
+        (>=)。文档明确 inclusive，钉死边界以防未来意外改成 strict (>)。"""
+        cutoff = datetime(2026, 4, 12, 12, 0, 0, tzinfo=timezone.utc)
+        on_boundary = MemoryChunk(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            content="exactly at cutoff",
+            content_hash="hash-on-boundary",
+            source="session_flush",
+            metadata={},
+            created_at=cutoff,
+            updated_at=cutoff,
+            session_id=None,
+            embedding=None,
+            auto_promoted_at=cutoff,  # 与 cutoff 完全相等
+        )
+        await repo.batch_insert_ignore([on_boundary])
+        await db_session.flush()
+
+        result = await repo.list_by_user(user_id, auto_promoted_after=cutoff)
+        assert len(result) == 1, "inclusive cutoff (>=) must include row at boundary"
+        assert result[0].id == on_boundary.id
+
+    async def test_combines_with_source_filter(
+        self, repo, user_id, db_session
+    ):
+        """典型用法：source='session_flush' AND auto_promoted_after=<ts>"""
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        # 同时间段但 source 不同——只 session_flush 应命中
+        flush_recent = MemoryChunk(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            content="flush recent",
+            content_hash="hash-flush-recent",
+            source="session_flush",
+            metadata={},
+            created_at=now - timedelta(hours=1),
+            updated_at=now - timedelta(hours=1),
+            session_id=None,
+            embedding=None,
+            auto_promoted_at=now - timedelta(hours=1),
+        )
+        # 边界场景：memory_save 也可以理论上有 auto_promoted_at（虽然实际 service
+        # 路径不写），用此构造确认 source filter 真在用
+        save_recent = MemoryChunk(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            content="save recent with timestamp",
+            content_hash="hash-save-recent",
+            source="memory_save",
+            metadata={},
+            created_at=now - timedelta(hours=1),
+            updated_at=now - timedelta(hours=1),
+            session_id=None,
+            embedding=None,
+            auto_promoted_at=now - timedelta(hours=1),
+        )
+        await repo.batch_insert_ignore([flush_recent, save_recent])
+        await db_session.flush()
+
+        cutoff = now - timedelta(days=1)
+        result = await repo.list_by_user(
+            user_id,
+            source="session_flush",
+            auto_promoted_after=cutoff,
+        )
+        assert len(result) == 1
+        assert result[0].id == flush_recent.id
+
+
 class TestListByUserTimeRange:
     async def test_created_from_filter(self, repo, user_id, db_session):
         from datetime import timedelta

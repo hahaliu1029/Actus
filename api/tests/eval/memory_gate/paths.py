@@ -62,8 +62,10 @@ def synthetic_dataset_path() -> Path:
     """Return the canonical synthetic dataset path.
 
     M1 ships 25 samples; M2 PR-5 expanded to 45 core (original 25 + 20
-    paraphrases). Adversarial suites live in sibling files; see
-    ``synthetic_adversarial_path``.
+    paraphrases); gap #2 closure added 7 marker-as-hint regression rows
+    (current count: 52). Adversarial suites live in sibling files; see
+    ``synthetic_adversarial_path``. Live count is whatever
+    ``dataset.jsonl`` currently has — don't hard-code it elsewhere.
     """
     return synthetic_dir() / "dataset.jsonl"
 

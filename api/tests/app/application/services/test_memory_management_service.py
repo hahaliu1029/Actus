@@ -130,6 +130,20 @@ class TestListMemories:
         call_kwargs = mock_repo.list_by_user.call_args
         assert call_kwargs.kwargs["limit"] == 50
 
+    async def test_forwards_auto_promoted_after_to_repo(self, service, mock_repo):
+        """design doc §777 audit query 透传：service 必须把 auto_promoted_after
+        透到 repo 的 list + count 两边，否则 total 与 items 跨页对不上。"""
+        cutoff = datetime(2026, 4, 12, tzinfo=timezone.utc)
+        await service.list_memories(
+            TEST_USER_ID_FIXED,
+            source="session_flush",
+            auto_promoted_after=cutoff,
+        )
+        list_kwargs = mock_repo.list_by_user.call_args.kwargs
+        count_kwargs = mock_repo.count_by_user.call_args.kwargs
+        assert list_kwargs["auto_promoted_after"] == cutoff
+        assert count_kwargs["auto_promoted_after"] == cutoff
+
 
 class TestUpdateMemoryContent:
     async def test_empty_content_raises(self, service):

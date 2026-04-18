@@ -65,6 +65,7 @@ class MemoryChunkRepository(Protocol):
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
         updated_to: datetime | None = None,
+        auto_promoted_after: datetime | None = None,
         offset: int = 0,
         limit: int = 20,
     ) -> list[MemoryChunk]:
@@ -77,6 +78,12 @@ class MemoryChunkRepository(Protocol):
         行。M2 user_profile prompt section 用 ``pinned=True`` 先拉全部 pinned（由
         ``ix_memory_chunks_user_pinned`` partial index 支撑，独立于 recency 窗口），
         再拉 top-N unpinned，保证 "pinned 永远先浮现" 不被最近 N 条的滑窗吞掉。
+
+        ``auto_promoted_after`` 为 None 时不过滤；传入 ``datetime`` 只返回
+        ``auto_promoted_at >= auto_promoted_after`` 的行。配合 ``source='session_flush'``
+        即 design doc §777 的"最近自动收录的 memory 审阅"路径——用户/运维想验证
+        最近 N 天 LLM gate 收录质量。``auto_promoted_at IS NULL`` 的旧行（包括
+        legacy 历史 + manual / memory_save 入口写的）在任何非空 filter 下都不命中。
         """
         ...
 
@@ -92,6 +99,7 @@ class MemoryChunkRepository(Protocol):
         created_to: datetime | None = None,
         updated_from: datetime | None = None,
         updated_to: datetime | None = None,
+        auto_promoted_after: datetime | None = None,
     ) -> int:
         """相同过滤条件的总条数，用于分页。"""
         ...
