@@ -93,3 +93,10 @@ TODO4.md
 
 # B5 C12: live bench results contain raw LLM API responses — keep out of git
 api/tests/evals/reminder_bench_results.json
+
+# M2-PR1: private memory-gate eval dataset must NEVER land in the repo.
+# The canonical private path is outside the repo (${ACTUS_EVAL_DATA_DIR} or
+# ~/.actus/eval/memory_gate/real/). This pattern is a defensive guard against
+# someone accidentally placing a private dataset inside tests/ while iterating.
+api/tests/eval/memory_gate/real/
+api/tests/eval/**/real/
