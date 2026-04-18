@@ -393,6 +393,113 @@ class TestAutoPromotedAfterFilter:
         assert result[0].id == flush_recent.id
 
 
+class TestDeleteLegacyByUser:
+    """M3-A: DELETE /v2/memories/legacy 底层 repo 方法。
+
+    语义：真删 ``source='session_flush' AND category IS NULL AND
+    auto_promoted_at IS NULL`` 的行。这对应 design doc §689 P6 的
+    "NULL-first 历史行" ——那是 M1 migration 前遗留的、从没走过 LLM gate
+    也没分类的旧 flush 块，信噪比差，用户通过"一键清理"按钮丢掉。
+
+    不命中的行（必须保留）：
+    - ``category`` 已填值（user/rule/fact）→ 新路径写入，已分类
+    - ``auto_promoted_at`` 非 NULL → LLM gate 后自动收录，已定性
+    - ``source='manual'`` 或 ``'memory_save'`` → 用户显式写入或 Agent 帮记
+    """
+
+    async def test_deletes_only_legacy_rows(
+        self, repo, user_id, db_session
+    ):
+        """多种不应被删的行（categorized / auto-promoted 近期 / auto-promoted
+        epoch / manual / memory_save）+ 一种 legacy 行。只 legacy 被删。
+
+        **epoch 边界**：``auto_promoted_at=1970-01-01T00:00:00Z`` 也**不**被
+        删——SQL 条件是 ``IS NULL``，任何非 NULL 的 timestamp（即便 epoch）
+        都保留。永久钉死这个设计语义，避免未来有人把条件改成
+        ``auto_promoted_at < <某 cutoff>`` 把 epoch 误当 "legacy"。
+        """
+        now = datetime.now(timezone.utc)
+
+        # 1) legacy (要删)：session_flush + category=None + auto_promoted_at=None
+        legacy = _make_chunk(user_id, "legacy flush", source="session_flush")
+        # 2) categorized (保留)：session_flush + category='fact'
+        import dataclasses as _dc
+
+        categorized = _dc.replace(
+            _make_chunk(user_id, "categorized flush", source="session_flush"),
+            category="fact",
+        )
+        # 3) auto-promoted 近期 (保留)：session_flush + auto_promoted_at=now
+        promoted = _dc.replace(
+            _make_chunk(user_id, "auto-promoted flush", source="session_flush"),
+            auto_promoted_at=now,
+        )
+        # 4) auto-promoted epoch (保留)：IS NULL 边界——非 NULL 就不删，
+        # 即便是 1970-01-01。钉死 "IS NULL ≠ 任何时间戳" 的设计语义。
+        epoch_promoted = _dc.replace(
+            _make_chunk(user_id, "epoch promoted", source="session_flush"),
+            auto_promoted_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+        )
+        # 5) manual (保留)：source='manual'
+        manual = _make_chunk(user_id, "manual entry", source="manual")
+        # 6) memory_save (保留)：source='memory_save'
+        save = _make_chunk(user_id, "save entry", source="memory_save")
+
+        await repo.batch_insert_ignore(
+            [legacy, categorized, promoted, epoch_promoted, manual, save]
+        )
+        await db_session.flush()
+
+        deleted = await repo.delete_legacy_by_user(user_id=user_id)
+        assert len(deleted) == 1
+        assert deleted[0].id == legacy.id
+        assert deleted[0].source == "session_flush"
+        assert deleted[0].category is None
+        assert deleted[0].auto_promoted_at is None
+
+        remaining = await repo.list_by_user(user_id)
+        remaining_ids = {row.id for row in remaining}
+        assert legacy.id not in remaining_ids
+        assert {
+            categorized.id,
+            promoted.id,
+            epoch_promoted.id,
+            manual.id,
+            save.id,
+        } <= remaining_ids
+
+    async def test_empty_user_returns_empty_list(self, repo, user_id):
+        """无任何 legacy 时返回空 list（调用方取 len == 0）。"""
+        deleted = await repo.delete_legacy_by_user(user_id=user_id)
+        assert deleted == []
+
+    async def test_does_not_touch_other_users(
+        self, repo, user_id, db_session
+    ):
+        """跨 user_id 边界：别的 user 的 legacy 行不在本次清理范围内。"""
+        from app.infrastructure.models.user import UserModel
+
+        other_uid = str(uuid.uuid4())
+        db_session.add(
+            UserModel(id=other_uid, username=f"other_{other_uid[:8]}", password_hash="x")
+        )
+        await db_session.flush()
+
+        mine = _make_chunk(user_id, "mine legacy", source="session_flush")
+        theirs = _make_chunk(other_uid, "their legacy", source="session_flush")
+        await repo.batch_insert_ignore([mine, theirs])
+        await db_session.flush()
+
+        deleted = await repo.delete_legacy_by_user(user_id=user_id)
+        assert len(deleted) == 1
+        assert deleted[0].id == mine.id
+
+        # 对方的 legacy 行完好
+        other_remaining = await repo.list_by_user(other_uid)
+        assert len(other_remaining) == 1
+        assert other_remaining[0].id == theirs.id
+
+
 class TestListByUserTimeRange:
     async def test_created_from_filter(self, repo, user_id, db_session):
         from datetime import timedelta

@@ -694,6 +694,56 @@ class MemoryManagementService:
                 )
         return deleted
 
+    async def delete_legacy_memories(self, user_id: str) -> int:
+        """一键清理旧 session_flush 遗留行（M3-A）。
+
+        删除条件（仓库侧 AND 合取）：``source='session_flush' AND category
+        IS NULL AND auto_promoted_at IS NULL`` —— M1 之前未经 LLM gate 分类、
+        也未被系统背书的旧 flush 块。categorized / auto-promoted / manual /
+        memory_save 行永远不会进入清理范围。
+
+        Audit 快照存每行 ``content_hash`` 列表（无 PII，可事后查 orphan bug
+        或用户误点按钮后追溯）。不存 content preview——legacy 行按设计是
+        "可安全丢"的数据，但 hash 保留一层可追溯性。
+
+        返回值：实际删除条数。空时不写审计（与 delete_all_memories 一致）。
+
+        fs 清盘：legacy 行 category IS NULL，本来从未落盘，跳过
+        ``file_store.delete``。如果意外遇到非 None category（SQL 条件应已
+        排除），写 warn log 但不触发 fs delete——legacy 清理应该只针对
+        "确定从未落盘"的行，兜底调 fs 路径反而可能把正常文件当 orphan 删。
+        """
+        async with self._session_factory() as session:
+            repo = self._repo_factory(session)
+            deleted_rows = await repo.delete_legacy_by_user(user_id=user_id)
+            deleted = len(deleted_rows)
+            if deleted > 0:
+                await self._write_audit(
+                    session,
+                    user_id=user_id,
+                    chunk_id=None,
+                    chunk_ids=[c.id for c in deleted_rows],
+                    action="delete_legacy",
+                    affected_count=deleted,
+                    old_snapshot={
+                        "content_hashes": [c.content_hash for c in deleted_rows],
+                    },
+                )
+                await session.commit()
+
+        # 防御式：legacy 条件 (category IS NULL) 理论保证不会有 non-None
+        # category 行进来；若真发生说明 repo 过滤逻辑已被破坏——记 warn，
+        # 但不调 fs_store.delete（可能误删正常文件）。
+        for row in deleted_rows:
+            if row.category is not None:
+                logger.warning(
+                    "delete_legacy 遇到 category=%s 的行（预期 None），"
+                    "可能 repo 过滤逻辑有 bug chunk_id=%s",
+                    row.category,
+                    row.id,
+                )
+        return deleted
+
     async def delete_all_memories(self, user_id: str) -> int:
         """一键清空本用户全部记忆。
 

@@ -75,6 +75,7 @@ def mock_service() -> AsyncMock:
     svc.delete_memory = AsyncMock(return_value=False)
     svc.bulk_delete_memories = AsyncMock(return_value=0)
     svc.delete_all_memories = AsyncMock(return_value=0)
+    svc.delete_legacy_memories = AsyncMock(return_value=0)
     return svc
 
 
@@ -382,6 +383,58 @@ async def test_delete_all_returns_count(
     data = response.json()["data"]
     assert data["deleted_count"] == 7
     mock_service.delete_all_memories.assert_awaited_once_with(TEST_USER_ID_FIXED)
+
+
+# --- delete_legacy (M3-A) ---------------------------------------------------
+
+
+async def test_delete_legacy_returns_count(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """M3-A: DELETE /v2/memories/legacy → 清理旧 session_flush 数据。
+
+    条件：source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL。
+    Service 负责过滤；route 只传递 user_id + 返 count。
+    """
+    mock_service.delete_legacy_memories = AsyncMock(return_value=5)
+
+    response = await _request(client_app, "DELETE", "/api/v2/memories/legacy")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["deleted_count"] == 5
+    mock_service.delete_legacy_memories.assert_awaited_once_with(TEST_USER_ID_FIXED)
+
+
+async def test_delete_legacy_returns_zero_when_empty(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """无 legacy 行 → 200 + deleted_count=0（不是 404）。"""
+    mock_service.delete_legacy_memories = AsyncMock(return_value=0)
+
+    response = await _request(client_app, "DELETE", "/api/v2/memories/legacy")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["deleted_count"] == 0
+
+
+async def test_delete_legacy_route_not_shadowed_by_chunk_id(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """确保 ``/legacy`` 的 DELETE 走 delete_legacy，而非 delete_memory({chunk_id='legacy'})。
+
+    FastAPI 按注册顺序匹配；具体路径必须在 parametric ``/{chunk_id}`` 之前注册，
+    否则 'legacy' 会被当成 chunk_id 参数。本测试钉死路由顺序。
+    """
+    mock_service.delete_legacy_memories = AsyncMock(return_value=0)
+    mock_service.delete_memory = AsyncMock(return_value=False)
+
+    response = await _request(client_app, "DELETE", "/api/v2/memories/legacy")
+
+    assert response.status_code == 200
+    mock_service.delete_legacy_memories.assert_awaited_once()
+    # delete_memory 绝不应被调用——'legacy' 不是 chunk_id
+    mock_service.delete_memory.assert_not_awaited()
 
 
 # --- create_memory (PR-2) ---------------------------------------------------

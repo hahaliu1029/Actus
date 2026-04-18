@@ -274,6 +274,31 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         result = await self.db_session.execute(stmt)
         return [self._to_domain(row) for row in result.scalars().all()]
 
+    async def delete_legacy_by_user(self, *, user_id: str) -> list[MemoryChunk]:
+        """删除 legacy session_flush 行（``DELETE ... RETURNING *``）。
+
+        条件合取 ``source='session_flush' AND category IS NULL AND
+        auto_promoted_at IS NULL`` —— 未分类、也未经 LLM gate 收录的旧
+        flush 块。categorized / auto-promoted / manual / memory_save 行
+        永远不命中，防止误删已被用户或系统背书的数据。
+
+        单条 RETURNING * 让调用方同时拿到"被删条数 + chunk_ids（审计）"+
+        "(id, category) 对（fs 清盘）"——legacy 行 category IS NULL 从未
+        落盘，service 层跳过 ``file_store.delete``。
+        """
+        stmt = (
+            delete(MemoryChunkModel)
+            .where(
+                MemoryChunkModel.user_id == user_id,
+                MemoryChunkModel.source == "session_flush",
+                MemoryChunkModel.category.is_(None),
+                MemoryChunkModel.auto_promoted_at.is_(None),
+            )
+            .returning(MemoryChunkModel)
+        )
+        result = await self.db_session.execute(stmt)
+        return [self._to_domain(row) for row in result.scalars().all()]
+
     # ---- Filter helper ----
 
     @staticmethod

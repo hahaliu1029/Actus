@@ -256,6 +256,141 @@ class TestDeleteAll:
         assert not mock_session.add.called
 
 
+class TestDeleteLegacy:
+    """M3-A: 一键清理旧 session_flush 数据（design doc §689）。
+
+    - 返回值 = DELETE ... RETURNING 实际行数
+    - 空时不写审计（与 delete_all 一致）
+    - 写审计 ``action='delete_legacy'`` + affected_count + chunk_ids
+    - Legacy 行 ``category IS NULL`` 从未写过 fs → 跳过 ``file_store.delete``
+    """
+
+    async def test_returns_count_from_returning_rows(
+        self, service, mock_repo
+    ):
+        mock_repo.delete_legacy_by_user = AsyncMock(
+            return_value=[_chunk(content="l1"), _chunk(content="l2")]
+        )
+        count = await service.delete_legacy_memories(TEST_USER_ID_FIXED)
+        assert count == 2
+
+    async def test_empty_returns_zero_and_no_audit(
+        self, service, mock_repo, mock_session
+    ):
+        mock_repo.delete_legacy_by_user = AsyncMock(return_value=[])
+        count = await service.delete_legacy_memories(TEST_USER_ID_FIXED)
+        assert count == 0
+        assert not mock_session.add.called
+        # 没 rows 也没必要 commit
+        mock_session.commit.assert_not_called()
+
+    async def test_writes_audit_with_chunk_ids_and_hashes(
+        self, service, mock_repo, mock_session
+    ):
+        """审计记录 chunk_ids + content_hashes，不含 content preview。
+
+        content_hash 无 PII 可长期保留，用于事后查 orphan bug 或误点追溯；
+        content 不入 audit 以避开敏感数据流入 log 聚合系统。
+        """
+        import dataclasses
+        rows = [
+            dataclasses.replace(
+                _chunk(content=f"legacy_{i}"),
+                content_hash=f"hash-legacy-{i}",
+            )
+            for i in range(3)
+        ]
+        mock_repo.delete_legacy_by_user = AsyncMock(return_value=rows)
+
+        await service.delete_legacy_memories(TEST_USER_ID_FIXED)
+
+        assert mock_session.add.called
+        audit_obj = mock_session.add.call_args[0][0]
+        assert audit_obj.action == "delete_legacy"
+        assert audit_obj.affected_count == 3
+        assert audit_obj.chunk_ids == [r.id for r in rows]
+        # 关键：hash 列表与 chunk_ids 顺序对齐，且**不**含 content preview
+        assert audit_obj.old_snapshot == {
+            "content_hashes": [f"hash-legacy-{i}" for i in range(3)],
+        }
+        assert "content" not in audit_obj.old_snapshot
+        mock_session.commit.assert_called_once()
+
+    async def test_warns_and_skips_fs_when_non_null_category_slips_through(
+        self, mock_repo, mock_embed, mock_session, caplog
+    ):
+        """防御契约：repo 若意外返 category 非 None 的行 → warn + 绝不 fs_delete。
+
+        两个断言缺一不可：
+        - logger.warning 被触发（运维可发现 repo bug）
+        - fs_store.delete **绝不**被调用（legacy 行从未落盘，误调可能把正常
+          文件当 orphan 删）。需要注入真的 fs_store 才能钉这个契约，默认
+          service fixture 的 file_store=None 覆盖不到这层。
+        """
+        import dataclasses
+        import logging
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        fs_store = AsyncMock()
+        fs_store.delete = AsyncMock()
+
+        # 造一条 category='user' 的漏网行（repo bug simulation）
+        slipped = dataclasses.replace(
+            _chunk(content="shouldn't be here"), category="user"
+        )
+        mock_repo.delete_legacy_by_user = AsyncMock(return_value=[slipped])
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=fs_store,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await svc.delete_legacy_memories(TEST_USER_ID_FIXED)
+
+        # 契约 1：warn 被触发
+        assert any(
+            "delete_legacy 遇到 category=user" in record.message
+            for record in caplog.records
+        ), f"expected defensive warn, got {[r.message for r in caplog.records]}"
+        # 契约 2：fs_store.delete 绝不被调用，即便 slipped row 有非 None category
+        fs_store.delete.assert_not_called()
+
+    async def test_skips_fs_delete_for_null_category_rows(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """Legacy 行 category IS NULL，从没写过文件——不应触发 fs_store.delete。"""
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        fs_store = AsyncMock()
+        fs_store.delete = AsyncMock()
+
+        rows = [_chunk(content="legacy")]
+        # 明确 category=None（dataclass 默认已是 None，显式 override 留给 reader）
+        import dataclasses
+        rows = [dataclasses.replace(r, category=None) for r in rows]
+        mock_repo.delete_legacy_by_user = AsyncMock(return_value=rows)
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=fs_store,
+        )
+
+        await svc.delete_legacy_memories(TEST_USER_ID_FIXED)
+
+        # 关键断言：file_store.delete 不被调用（legacy 从未写过盘）
+        fs_store.delete.assert_not_called()
+
+
 class TestAuditWritten:
     async def test_edit_writes_audit(self, service, mock_repo, mock_session):
         old = _chunk()

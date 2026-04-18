@@ -179,3 +179,21 @@ class MemoryChunkRepository(Protocol):
         ``总数 = len(result)``。
         """
         ...
+
+    async def delete_legacy_by_user(self, *, user_id: str) -> list[MemoryChunk]:
+        """删除"旧 session_flush"遗留行，返回被删除的完整行列表。
+
+        "一键清理旧 session_flush" 入口的底层 SQL。
+
+        条件（**AND** 合取，缺一不可）：
+        - ``source = 'session_flush'`` — 只清 flush 管线遗留
+        - ``category IS NULL`` — 未分类的老行；新 flush 行若经 LLM gate 收录
+          会有 category='user/rule/fact'，不在清理范围内
+        - ``auto_promoted_at IS NULL`` — LLM gate 没收录的；经 gate 收录的
+          行会有 auto_promoted_at 非空，属于"系统已背书"的数据，不能乱删
+
+        用 ``DELETE ... RETURNING *`` 单语句出，调用方一次拿到 "被删行数 +
+        chunk_ids"（审计所需）+ (id, category) 对（fs 清盘需要，但 legacy
+        本来 category IS NULL → 从未落盘，跳过）。
+        """
+        ...

@@ -132,6 +132,29 @@ async def create_memory(
     return Response.success(data=MemoryDetail(**_to_detail_dict(chunk)))
 
 
+@router.delete(
+    path="/legacy",
+    response_model=Response[DeleteCountResponse],
+    summary="一键清理旧 session_flush 遗留记忆",
+    description=(
+        "清除 LLM gate 上线前入库、未分类也未被 gate 收录的旧 flush 块："
+        "``source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL``。"
+        "三个条件 AND 合取——**任何一个非 NULL / 不匹配的行都不会被删**："
+        "新 flush 路径（已分类 或 已 auto-promoted）、manual / memory_save 入口都不受影响。"
+        "低频运维操作；返回实际删除的行数，空时返回 0（非 404）。"
+    ),
+    dependencies=[Depends(rate_limit_write)],
+)
+async def delete_legacy(
+    current_user: CurrentUser,
+    service: "MemoryManagementService" = Depends(get_memory_management_service),
+) -> Response[DeleteCountResponse]:
+    # 必须注册在 ``/{chunk_id}`` 之前——FastAPI 按注册顺序匹配，
+    # 否则 'legacy' 会被当成 chunk_id 参数走 delete_memory 路径。
+    count = await service.delete_legacy_memories(current_user.id)
+    return Response.success(data=DeleteCountResponse(deleted_count=count))
+
+
 @router.get(
     path="/{chunk_id}",
     response_model=Response[MemoryDetail],
