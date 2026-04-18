@@ -79,8 +79,29 @@ Two datasets, both consumed by `tune_threshold.py` and the eval pytest suite.
 
 Path: `api/tests/eval/memory_gate/synthetic/dataset.jsonl`.
 
-Scale target: **100 samples** at M2 ship (25 today, carried over from M1).
-Manually crafted + paraphrased so the content is safe to publish.
+Scale target: **100 samples** at M2 ship (45 shipped in PR-5 — 25 M1
+carry-over + 20 paraphrases; remaining 55 will land across subsequent
+dataset-growth passes). Manually crafted + paraphrased so the content
+is safe to publish.
+
+### Adversarial subsuite, checked into the repo
+
+Path: `api/tests/eval/memory_gate/synthetic/adversarial.jsonl`.
+
+M2 PR-5 ships 20 samples covering the documented failure modes:
+task-local rules masquerading as permanent (5), hypotheticals /
+subjunctives (3), agent-output mimicry (2), retraction / cancellation
+(3), prompt-injection attempts (3), and borderline-keep controls (3)
+plus off-topic chatter (1). Deliberately drop-heavy — the gate's
+primary failure mode is being fooled into keeping non-memory.
+
+Scored separately from the core dataset (``test_gate_adversarial_resistance``
+in ``test_memory_gate_eval.py``) so a dip on deliberately deceptive
+samples doesn't skew the Wilson CI on the representative distribution.
+The ``tune_threshold.py --with-adversarial`` CLI emits two tables —
+core (hard-gate verdict applies) and adversarial (visibility only,
+explicitly NOT gated) — so operators reading the sweep output can't
+accidentally use a polluted Wilson CI to justify a threshold change.
 
 ### Private (real), gitignored
 
@@ -119,12 +140,21 @@ kappa between consecutive weeks is the drift signal:
 | kappa | Action |
 |---|---|
 | ≥ 0.7 | Stable — rubric unchanged. |
-| 0.4 – 0.7 | Borderline. Pick the most-drifting sample and add it to the rubric with explicit commentary. |
-| < 0.4 | Rubric too ambiguous — tighten definitions or split into more categories. |
+| 0.4 – 0.7 | Borderline. Pick the most-drifting sample and add it to the rubric with explicit commentary. Test WARNs, does not fail. |
+| < 0.4 | Rubric too ambiguous — tighten definitions or split into more categories. Test FAILS. |
 
-`stats.cohens_kappa()` computes the value; the weekly check runs under
-`test_annotator_consistency` (landed in a later PR; PR-1 only ships the
-helper + the layout conventions).
+Weekly re-label passes live as separate files under
+`${ACTUS_EVAL_DATA_DIR}/memory_gate/real/control_set_history/`, one file
+per pass named by ISO date (`2026-04-20.jsonl`, `2026-04-27.jsonl`, …).
+Sorted ascending by filename gives chronological order; the drift kappa
+compares the two most-recent files. Adding a new pass is a single
+`cp control_set.jsonl control_set_history/YYYY-MM-DD.jsonl` after
+re-labelling and diffing.
+
+Implementation lives in `test_annotator_consistency.py` (PR-5 ships it).
+Only ids that appear in **both** the previous and current pass count
+toward kappa — newly-added samples in the current pass join the next
+week's denominator instead of breaking the current comparison.
 
 ## M2 precision gate
 

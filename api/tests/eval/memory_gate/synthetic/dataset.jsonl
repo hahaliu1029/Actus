@@ -23,3 +23,23 @@
 {"id": "e3", "text": "用户：就这样吧，先这么写着", "expected_verdict": "drop", "expected_category": "user", "notes": "edge: 貌似是决策其实是搁置"}
 {"id": "e4", "text": "用户：你总是漏掉类型注解", "expected_verdict": "keep", "expected_category": "rule", "notes": "edge: 投诉/批评蕴含一条 rule — 以后加上类型注解"}
 {"id": "e5", "text": "用户：在美国东部时区，我们是 UTC-5 或 UTC-4", "expected_verdict": "drop", "expected_category": "fact", "notes": "edge: 常识性事实，没有项目特定价值"}
+{"id": "p1", "text": "用户：过去十年我主要做 Go 后端，最近才碰 React", "expected_verdict": "keep", "expected_category": "user", "notes": "paraphrase of u1 — same profile, different wording"}
+{"id": "p2", "text": "用户：帮我把回复语言切换为中文吧，后面都用中文", "expected_verdict": "keep", "expected_category": "user", "notes": "paraphrase of u2 — language preference"}
+{"id": "p3", "text": "用户：我的主要工作是维护数据 ingestion pipeline 的稳定性", "expected_verdict": "keep", "expected_category": "user", "notes": "paraphrase of u3 — role"}
+{"id": "p4", "text": "用户：我目前在一家 20 人的早期创业公司", "expected_verdict": "keep", "expected_category": "user", "notes": "paraphrase of u4 — company context"}
+{"id": "p5", "text": "用户：先把这行字体颜色从红色改成绿色", "expected_verdict": "drop", "expected_category": "user", "notes": "paraphrase of u5 — task-local UI tweak"}
+{"id": "p6", "text": "用户：往后写测试不允许走 mock，必须是真实 PG 连接", "expected_verdict": "keep", "expected_category": "rule", "notes": "paraphrase of r1 — test hardening rule"}
+{"id": "p7", "text": "用户：commit 之前必须让我人眼过一遍才能 push", "expected_verdict": "keep", "expected_category": "rule", "notes": "paraphrase of r2 — review gate"}
+{"id": "p8", "text": "用户：main 分支永远不要 force push，这是底线", "expected_verdict": "keep", "expected_category": "rule", "notes": "paraphrase of r3 — force-push prohibition"}
+{"id": "p9", "text": "用户：就这一次别加 retry，我想看错误原样冒出来", "expected_verdict": "drop", "expected_category": "rule", "notes": "paraphrase of r4 — one-off scope, 就这一次 locks to single task"}
+{"id": "p10", "text": "用户：所有对外接口都要挂 rate limit，内外都不例外", "expected_verdict": "keep", "expected_category": "rule", "notes": "paraphrase of r5 — API hardening scope"}
+{"id": "p11", "text": "用户：后端数据库是 PostgreSQL 17，跟 docker-compose 一起起", "expected_verdict": "keep", "expected_category": "fact", "notes": "paraphrase of f1 — stable stack fact"}
+{"id": "p12", "text": "用户：staging 环境 API 在 actus.internal:8443/v2", "expected_verdict": "keep", "expected_category": "fact", "notes": "paraphrase of f2 — stable endpoint"}
+{"id": "p13", "text": "用户：sandbox spec 文档都在 docs/superpowers/specs/ 下面", "expected_verdict": "keep", "expected_category": "fact", "notes": "paraphrase of f3 — pointer to docs"}
+{"id": "p14", "text": "用户：刚那个 pytest 跑出来有 5 个 failure", "expected_verdict": "drop", "expected_category": "fact", "notes": "paraphrase of f4 — transient status"}
+{"id": "p15", "text": "用户：session cache 和 rate limit 都是 Redis 8.2", "expected_verdict": "keep", "expected_category": "fact", "notes": "paraphrase of f5 — stable infrastructure fact"}
+{"id": "p16", "text": "用户：我用的是 M3 Max 64G 的 MacBook Pro", "expected_verdict": "keep", "expected_category": "user", "notes": "new sample — stable hardware, relevant for performance discussion"}
+{"id": "p17", "text": "用户：打个日志看看这个变量现在是什么值", "expected_verdict": "drop", "expected_category": "user", "notes": "new sample — task-local debug command"}
+{"id": "p18", "text": "用户：所有 secret 都走环境变量，绝对不要硬编码在代码里", "expected_verdict": "keep", "expected_category": "rule", "notes": "new sample — security rule, permanent"}
+{"id": "p19", "text": "用户：刚那次 docker build 卡了差不多 2 分钟", "expected_verdict": "drop", "expected_category": "fact", "notes": "new sample — transient performance observation"}
+{"id": "p20", "text": "用户：LangGraph 的事件流是 stream_mode=updates 驱动的", "expected_verdict": "keep", "expected_category": "fact", "notes": "new sample — stable architecture fact"}

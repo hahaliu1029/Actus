@@ -40,6 +40,8 @@ from pathlib import Path
 from tests.eval.memory_gate.paths import (
     private_available,
     private_dataset_path,
+    synthetic_adversarial_available,
+    synthetic_adversarial_path,
     synthetic_dataset_path,
 )
 from tests.eval.memory_gate.stats import wilson_ci_lower
@@ -73,15 +75,28 @@ def _load_jsonl(path: Path) -> list[Sample]:
     return rows
 
 
-def _load_combined(*, public_only: bool) -> list[Sample]:
-    """Load public synthetic + optional private real dataset.
+def _load_combined(
+    *,
+    public_only: bool,
+    with_adversarial: bool = False,
+) -> list[Sample]:
+    """Load public synthetic + optional private real dataset + optional
+    adversarial suite.
 
-    Returns samples in a stable order (public first, then private) so
-    output is reproducible across runs.
+    Returns samples in a stable order (core public → private → adversarial)
+    so output is reproducible across runs. Adversarial rows are loaded
+    LAST so operators scrolling the per-row output can visually see the
+    cutover by id prefix (``a*``).
+
+    ``with_adversarial=False`` by default because the primary hard-gate
+    calculation (Wilson CI on union) should be computed on the core
+    distribution; adversarial is a secondary, separately-reported signal.
     """
     rows = _load_jsonl(synthetic_dataset_path())
     if not public_only and private_available():
         rows.extend(_load_jsonl(private_dataset_path()))
+    if with_adversarial and synthetic_adversarial_available():
+        rows.extend(_load_jsonl(synthetic_adversarial_path()))
     return rows
 
 
@@ -300,6 +315,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--with-adversarial",
+        action="store_true",
+        help=(
+            "Include the synthetic/adversarial.jsonl suite. Adversarial "
+            "rows are appended after core + private so order stays stable "
+            "and operators can visually spot the ``a*`` id prefix."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -309,43 +333,200 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 async def _amain(args: argparse.Namespace) -> int:
-    samples = _load_combined(public_only=args.public_only)
-    if args.limit is not None:
-        samples = samples[: args.limit]
-    if not samples:
+    # Load public and private EXPLICITLY so we can distinguish
+    # "private file exists" from "private rows reached the scoring
+    # batch". The latter is what the rubric §130-140 hard-gate verdict
+    # depends on: a private file that's empty OR one whose rows were
+    # truncated out by --limit both yield "synthetic-only precision"
+    # and must NOT be labelled as the union. Previously the function
+    # used ``_load_combined`` + a ``private_row_count`` check against
+    # the raw file, which false-greened the --limit-truncates-private
+    # case flagged by round-4 codex review.
+    public_rows = _load_jsonl(synthetic_dataset_path())
+    private_file_exists = not args.public_only and private_available()
+    private_rows: list[Sample] = []
+    if private_file_exists:
+        private_rows = _load_jsonl(private_dataset_path())
+    private_rows_total = len(private_rows)
+
+    # Union preserving (public first, private second) order — matches
+    # _load_combined's concatenation so the slice-based split below is
+    # positional and doesn't need per-Sample provenance tracking.
+    core_samples = public_rows + private_rows
+    if not core_samples:
         print("no samples loaded; check synthetic/dataset.jsonl", file=sys.stderr)
         return 1
 
+    adv_samples: list[Sample] = []
+    if args.with_adversarial and synthetic_adversarial_available():
+        adv_samples = _load_jsonl(synthetic_adversarial_path())
+
+    # ``--limit`` caps the TOTAL batched prompt size (help text promises
+    # "Cap total samples"). Apply it to ``core + adversarial`` so a quick
+    # probe like ``--limit 10 --with-adversarial`` doesn't silently
+    # balloon to 30. Core comes first (it's the representative
+    # distribution — most probes care about core); adversarial fills the
+    # remainder only if there's headroom.
+    if args.limit is not None:
+        total = max(0, args.limit)
+        core_samples = core_samples[:total]
+        remaining = total - len(core_samples)
+        adv_samples = adv_samples[: max(0, remaining)]
+
+    # POST-LIMIT composition: this is what the LLM actually scores, and
+    # what the hard-gate verdict must reflect. len(core_samples) -
+    # len(public_rows) is the count of private rows still in the batch
+    # because the union kept public-first order and --limit truncates
+    # from the tail.
+    private_in_batch = max(0, len(core_samples) - len(public_rows))
+    has_real_private = private_in_batch > 0
+
+    # Union was intended (user didn't pass --public-only) but didn't
+    # materialize in the actual batch. THREE sub-cases handled by the
+    # branch below:
+    # (a) private file missing entirely (round-5 finding)
+    # (b) private file exists but is empty (round-3 finding)
+    # (c) private rows truncated out by --limit (round-4 finding)
+    union_implied_but_public_only_in_batch = (
+        not args.public_only and not has_real_private
+    )
+
     thresholds = _parse_sweep(args.sweep)
 
-    print(f"loaded {len(samples)} samples (public + private combined="
-          f"{'yes' if not args.public_only and private_available() else 'no'})")
+    adv_note = f" (+{len(adv_samples)} adversarial, separate report)" if adv_samples else ""
+    print(
+        f"loaded {len(core_samples)} core samples "
+        f"(public + private combined="
+        f"{'yes' if has_real_private else 'no'}"
+        f"){adv_note}"
+    )
     print(f"sweeping thresholds: {thresholds}")
 
+    # Single LLM batch call: batch core + adversarial together, then
+    # split predictions before scoring. Keeps cost at 1 LLM call
+    # regardless of --with-adversarial.
     llm = _resolve_llm(args.llm)
-    predictions = await _classify_all(samples, llm)
-    expected = [s.expected_keep for s in samples]
+    all_samples = core_samples + adv_samples
+    predictions = await _classify_all(all_samples, llm)
 
-    results = [
-        _score_at_threshold(predictions, expected, t) for t in thresholds
+    core_predictions = predictions[: len(core_samples)]
+    core_expected = [s.expected_keep for s in core_samples]
+    core_results = [
+        _score_at_threshold(core_predictions, core_expected, t)
+        for t in thresholds
     ]
-    print()
-    print(_format_table(results))
 
-    # Flag the M2 hard gate crossings
-    print()
-    passing = [r for r in results if r.precision_lower >= 0.70]
-    if passing:
-        best = max(passing, key=lambda r: r.recall)
-        print(
-            f"M2 hard gate (precision lower CI ≥ 0.70) clears at threshold "
-            f"{best.threshold:.2f} with recall {best.recall:.3f}."
-        )
+    # Section header reflects the actual scope of the scoring batch,
+    # not an assumed union. Three cases:
+    # - has_real_private: union materialized → header announces the
+    #   M2 hard gate as applicable
+    # - args.public_only: user explicitly opted out of union; header
+    #   notes public-only scope but still allows the verdict below
+    #   (round-1 agreement: --public-only user owns the scope)
+    # - otherwise: union was implied but didn't materialize → header
+    #   says visibility only so operators can't misread the table as
+    #   a union-scoped result
+    if has_real_private:
+        scope_label = "public + private"
+        gate_label = "gated by M2 hard gate"
+    elif args.public_only:
+        scope_label = "public only"
+        gate_label = "gated by M2 hard gate (public-only scope)"
     else:
+        scope_label = "public only"
+        gate_label = "visibility only, union not available"
+
+    print()
+    print(
+        f"===== CORE ({scope_label}) N={len(core_samples)} — "
+        f"{gate_label} ====="
+    )
+    print(_format_table(core_results))
+
+    # Hard gate verdict — ONLY on the core distribution. This is the
+    # contract: rubric §130-140 says acceptance is on public+private
+    # union, and the adversarial suite is explicitly out of scope.
+    print()
+    if union_implied_but_public_only_in_batch:
+        # Sweep above is synthetic-only precision. Emitting "M2 hard
+        # gate clears at X" here would mislead the operator into
+        # thinking the rubric acceptance criterion passed, when it only
+        # holds on the public subset. Suppress the verdict and surface
+        # the fix paths. Distinguish the three sub-cases so the message
+        # is actionable:
+        if not private_available():
+            # Round-5: private file doesn't exist at all
+            print(
+                f"WARN: private dataset not found at "
+                f"{private_dataset_path()}. Sweep above reflects "
+                f"synthetic-only precision, NOT the public + private "
+                f"union required by rubric §130-140. NOT emitting M2 "
+                f"hard-gate verdict. Create the file (populate "
+                f"$ACTUS_EVAL_DATA_DIR/memory_gate/real/dataset.jsonl) "
+                f"or pass --public-only to acknowledge public-only scope."
+            )
+        elif private_rows_total == 0:
+            # Round-3: file exists but empty
+            print(
+                f"WARN: private dataset at {private_dataset_path()} "
+                f"exists but contains 0 rows. Sweep above reflects "
+                f"synthetic-only precision, NOT the public + private "
+                f"union required by rubric §130-140. NOT emitting M2 "
+                f"hard-gate verdict. Populate the file, remove it, or "
+                f"pass --public-only to get a public-only verdict."
+            )
+        else:
+            # Round-4: --limit truncated the private rows out of the batch
+            print(
+                f"WARN: --limit {args.limit} truncated the batch to "
+                f"{len(core_samples)} sample(s), all from the public "
+                f"set; private dataset has {private_rows_total} row(s) "
+                f"but none reached the sweep. Sweep above reflects "
+                f"synthetic-only precision, NOT the public + private "
+                f"union required by rubric §130-140. NOT emitting M2 "
+                f"hard-gate verdict. Raise --limit above "
+                f"{len(public_rows)} or pass --public-only."
+            )
+    else:
+        passing = [r for r in core_results if r.precision_lower >= 0.70]
+        if passing:
+            best = max(passing, key=lambda r: r.recall)
+            print(
+                f"M2 hard gate (precision lower CI ≥ 0.70) clears at threshold "
+                f"{best.threshold:.2f} with recall {best.recall:.3f}."
+            )
+        else:
+            print(
+                "WARN: no threshold clears the M2 hard gate "
+                "(precision Wilson lower CI ≥ 0.70). Consider prompt engineering."
+            )
+
+    # Adversarial separate report — no hard-gate verdict. If someone
+    # wants a pass/fail on this suite they should run
+    # ``pytest -m slow tests/eval/memory_gate/test_memory_gate_eval.py
+    # ::test_gate_adversarial_resistance`` which applies specificity +
+    # sensitivity bars tuned to the deliberately-tricky distribution.
+    if adv_samples:
+        adv_predictions = predictions[len(core_samples):]
+        adv_expected = [s.expected_keep for s in adv_samples]
+        adv_results = [
+            _score_at_threshold(adv_predictions, adv_expected, t)
+            for t in thresholds
+        ]
+        print()
         print(
-            "WARN: no threshold clears the M2 hard gate "
-            "(precision Wilson lower CI ≥ 0.70). Consider prompt engineering."
+            f"===== ADVERSARIAL N={len(adv_samples)} — "
+            f"visibility only, NOT gated by M2 hard gate ====="
         )
+        print(_format_table(adv_results))
+        print(
+            "NOTE: adversarial precision/recall are not directly comparable "
+            "to core. Drop-heavy composition (17/20) means a pure-drop gate "
+            "scores high on accuracy-like metrics. Use "
+            "test_gate_adversarial_resistance for specificity+sensitivity "
+            "assertions."
+        )
+
     return 0
 
 

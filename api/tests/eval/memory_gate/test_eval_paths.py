@@ -21,6 +21,8 @@ from tests.eval.memory_gate.paths import (
     private_dataset_path,
     private_dir,
     resolve_private_root,
+    synthetic_adversarial_available,
+    synthetic_adversarial_path,
     synthetic_dataset_path,
     synthetic_dir,
 )
@@ -34,16 +36,43 @@ class TestPublicDataset:
         assert d.is_dir(), f"synthetic dir must exist at {d}"
 
     def test_synthetic_dataset_file_exists(self) -> None:
-        """M1 shipped with a 25-sample dataset; it must still be there."""
+        """M1 shipped with a 25-sample dataset; M2 PR-5 expanded to 45."""
         p = synthetic_dataset_path()
         assert p.is_file(), (
             f"synthetic/dataset.jsonl missing at {p} — M1 regressed?"
         )
-        # Verify it's non-empty (>= 10 samples, defensive lower bound)
+        # M2 PR-5 floor: 40 samples (was 25 at M1). Bump if we grow
+        # the dataset further; lower bound is defensive against
+        # accidental truncation.
         lines = [ln for ln in p.read_text().splitlines() if ln.strip()]
-        assert len(lines) >= 10, (
-            f"synthetic dataset shrunk unexpectedly: {len(lines)} lines"
+        assert len(lines) >= 40, (
+            f"synthetic dataset shrunk unexpectedly: {len(lines)} lines; "
+            f"M2 PR-5 shipped 45 rows"
         )
+
+    def test_synthetic_adversarial_file_exists(self) -> None:
+        """M2 PR-5 introduces a sibling adversarial file; it's hand-crafted
+        and safe to publish alongside the main synthetic set. Rows count
+        is separate from the core dataset so the Wilson CI on core
+        precision doesn't get skewed by deliberately-tricky samples.
+        """
+        p = synthetic_adversarial_path()
+        assert p.is_file(), (
+            f"synthetic/adversarial.jsonl missing at {p} — PR-5 regressed?"
+        )
+        lines = [ln for ln in p.read_text().splitlines() if ln.strip()]
+        assert len(lines) >= 15, (
+            f"adversarial suite shrunk unexpectedly: {len(lines)} lines; "
+            f"M2 PR-5 shipped 20 rows"
+        )
+
+    def test_synthetic_adversarial_available_reflects_file(self) -> None:
+        """Availability helper must agree with the file-existence check.
+
+        Keeps the two call sites (tests + harness) from drifting if the
+        helper implementation changes (e.g., adds caching).
+        """
+        assert synthetic_adversarial_available() is True
 
 
 class TestPrivateRootResolution:

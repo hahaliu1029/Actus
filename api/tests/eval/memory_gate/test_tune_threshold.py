@@ -19,6 +19,7 @@ import pytest
 from tests.eval.memory_gate.tune_threshold import (
     Sample,
     ThresholdResult,
+    _amain,
     _classify_all,
     _format_table,
     _load_combined,
@@ -260,6 +261,65 @@ class TestLoadCombined:
         ), "private-prefixed ids must not leak when private dir is absent"
 
 
+class TestLoadCombinedWithAdversarial:
+    """M2 PR-5: adversarial suite is opt-in and loaded LAST so the stable
+    order is core → private → adversarial. These tests pin the ordering
+    contract and the off-by-default behavior.
+    """
+
+    def test_default_excludes_adversarial(self) -> None:
+        """``with_adversarial=False`` (the default) must NOT include
+        ``a*``-prefixed rows. Core dataset precision is the primary
+        signal — adversarial scoring is a separate report."""
+        rows = _load_combined(public_only=True)
+        assert not any(r.id.startswith("a") for r in rows), (
+            "default load should not include adversarial ids — only "
+            "--with-adversarial pulls them in"
+        )
+
+    def test_with_adversarial_appends_suite(self) -> None:
+        """``with_adversarial=True`` adds the adversarial rows AFTER
+        the core dataset. Order matters because the CLI table prints
+        per-sample rows and operators visually expect the ``a*`` block
+        at the bottom."""
+        rows_without = _load_combined(public_only=True, with_adversarial=False)
+        rows_with = _load_combined(public_only=True, with_adversarial=True)
+        assert len(rows_with) > len(rows_without), (
+            "adversarial load should add rows"
+        )
+        # Core rows appear in the same order and at the same positions
+        for i, core_row in enumerate(rows_without):
+            assert rows_with[i].id == core_row.id, (
+                f"adversarial load perturbed core order at {i}: "
+                f"core={core_row.id} vs with-adv={rows_with[i].id}"
+            )
+        # Tail is all adversarial
+        tail = rows_with[len(rows_without):]
+        assert len(tail) >= 15, (
+            f"adversarial suite should contribute >= 15 rows; got {len(tail)}"
+        )
+        assert all(r.id.startswith("a") for r in tail), (
+            "all appended rows should have a* adversarial prefix"
+        )
+
+    def test_adversarial_rows_expose_drop_majority(self) -> None:
+        """Adversarial file is intentionally heavy on ``expected_verdict=drop``
+        (deceptive keeps are the core failure mode). Document the ratio
+        here so a future author who re-balances the file has to update
+        this test — forcing them to think about whether the rebalance
+        still exercises the gate's robustness."""
+        rows = _load_combined(public_only=True, with_adversarial=True)
+        adv = [r for r in rows if r.id.startswith("a")]
+        drop_count = sum(1 for r in adv if not r.expected_keep)
+        # PR-5 shipped with 17/20 drop (hypotheticals + injections + etc)
+        # and 3/20 keep (borderline-keep controls). Guard the drop-heavy
+        # ratio so the suite keeps exercising "don't be fooled".
+        assert drop_count / len(adv) >= 0.70, (
+            f"adversarial suite should be drop-heavy; got "
+            f"{drop_count}/{len(adv)} drops"
+        )
+
+
 # ---- Classifier wiring (attribute-access contract) --------------------- #
 
 
@@ -358,6 +418,236 @@ class TestClassifyAll:
 
 
 # ---- Table formatting --------------------------------------------------- #
+
+
+class TestAmainPrivateEmptyGuard:
+    """Round-3 codex finding: CLI path had the same empty-private
+    bypass the test path fixed. Tests pin the three CLI outcomes:
+
+    1. Empty private + not --public-only → banner says combined=no,
+       hard-gate verdict suppressed, warning emitted.
+    2. --public-only + empty private → user explicitly opted out of the
+       union, so verdict still emits on public-only distribution.
+    3. Private file populated → banner says combined=yes, verdict emits.
+
+    These run without a real LLM by monkey-patching ``_resolve_llm`` and
+    ``_classify_all`` to return canned decisions.
+    """
+
+    @staticmethod
+    def _run_amain(
+        monkeypatch,
+        *,
+        public_only: bool,
+        limit: int | None = None,
+    ) -> str:
+        """Drive _amain with a fake classifier and return captured stdout."""
+        from app.domain.services.memory_gate import MemoryGateDecision
+        from tests.eval.memory_gate import tune_threshold as mod
+
+        class _FakeClassifier:
+            async def classify(self, inputs):
+                return [
+                    MemoryGateDecision(
+                        chunk_index=i,
+                        verdict="keep",
+                        category="user",
+                        confidence=0.85,
+                    )
+                    for i, _ in enumerate(inputs)
+                ]
+
+        from app.domain.services import memory_gate as gate_mod
+
+        monkeypatch.setattr(
+            gate_mod, "MemoryGateClassifier", lambda _llm: _FakeClassifier()
+        )
+
+        class _FakeLLM:
+            pass
+
+        monkeypatch.setattr(mod, "_resolve_llm", lambda _key: _FakeLLM())
+
+        args = argparse.Namespace(
+            llm="chat_llm",
+            sweep="0.7:0.7:0.1",
+            public_only=public_only,
+            with_adversarial=False,
+            limit=limit,
+        )
+        # capsys can't capture from ``asyncio.run`` subinvocations easily;
+        # route stdout through StringIO instead.
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = asyncio.run(_amain(args))
+        assert rc == 0
+        return buf.getvalue()
+
+    def test_empty_private_suppresses_hard_gate_verdict(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Reproduce the round-3 bug: empty private file exists, user
+        did NOT pass --public-only, so the CLI previously claimed
+        "combined=yes" and emitted "M2 hard gate clears at ...".
+        After the fix: banner says combined=no and verdict is replaced
+        with an empty-private warning.
+        """
+        monkeypatch.setenv("ACTUS_EVAL_DATA_DIR", str(tmp_path))
+        priv_dir = tmp_path / "memory_gate" / "real"
+        priv_dir.mkdir(parents=True)
+        # Empty file — passes private_available() but contributes 0 rows
+        (priv_dir / "dataset.jsonl").write_text("")
+
+        out = self._run_amain(monkeypatch, public_only=False)
+
+        # Banner must tell the truth about what was loaded
+        assert "combined=no" in out, (
+            f"empty private should show combined=no; got:\n{out}"
+        )
+        # Hard-gate verdict must NOT be emitted — this is the round-3 fix
+        assert "M2 hard gate (precision lower CI" not in out, (
+            f"empty private should suppress hard-gate verdict; got:\n{out}"
+        )
+        # Warning must point at the specific failure mode
+        assert "contains 0 rows" in out, (
+            f"warning should cite empty private; got:\n{out}"
+        )
+        assert "rubric §130-140" in out
+
+    def test_public_only_emits_verdict_even_with_empty_private(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """--public-only means "I explicitly don't want the union".
+        Empty private file under that flag is irrelevant; verdict still
+        emits on public-only distribution. This guards against the
+        overcorrection where my fix silently swallows the verdict
+        whenever an empty file is sitting in the private dir."""
+        monkeypatch.setenv("ACTUS_EVAL_DATA_DIR", str(tmp_path))
+        priv_dir = tmp_path / "memory_gate" / "real"
+        priv_dir.mkdir(parents=True)
+        (priv_dir / "dataset.jsonl").write_text("")
+
+        out = self._run_amain(monkeypatch, public_only=True)
+
+        # Verdict line emits (either "clears at" or "no threshold clears")
+        emits_verdict = (
+            "M2 hard gate (precision lower CI" in out
+            or "no threshold clears the M2 hard gate" in out
+        )
+        assert emits_verdict, (
+            f"--public-only should still emit verdict even if an empty "
+            f"private file exists; got:\n{out}"
+        )
+        # Warning about empty private should NOT appear — user opted out
+        assert "contains 0 rows" not in out, (
+            f"--public-only opts out of union; empty-private warning "
+            f"shouldn't fire; got:\n{out}"
+        )
+
+    def test_populated_private_shows_combined_yes(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Sanity: the happy path still works after the round-3 fix.
+        Non-empty private contributes rows → banner claims combined=yes
+        → verdict emits."""
+        monkeypatch.setenv("ACTUS_EVAL_DATA_DIR", str(tmp_path))
+        priv_dir = tmp_path / "memory_gate" / "real"
+        priv_dir.mkdir(parents=True)
+        (priv_dir / "dataset.jsonl").write_text(
+            '{"id": "p1", "text": "hi", "expected_verdict": "keep"}\n'
+        )
+
+        out = self._run_amain(monkeypatch, public_only=False)
+
+        assert "combined=yes" in out
+        assert "contains 0 rows" not in out
+        emits_verdict = (
+            "M2 hard gate (precision lower CI" in out
+            or "no threshold clears the M2 hard gate" in out
+        )
+        assert emits_verdict
+
+    def test_limit_truncates_private_out_suppresses_verdict(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Round-4 codex finding: private=1 row + public=45 rows +
+        --limit 10 means the 10-sample batch is public-only, even
+        though the private file has real content. Banner must say
+        combined=no and the verdict must be suppressed — previously
+        `has_real_private` was computed from the raw file count,
+        making this a false-green union claim.
+        """
+        monkeypatch.setenv("ACTUS_EVAL_DATA_DIR", str(tmp_path))
+        priv_dir = tmp_path / "memory_gate" / "real"
+        priv_dir.mkdir(parents=True)
+        (priv_dir / "dataset.jsonl").write_text(
+            '{"id": "p1", "text": "hi", "expected_verdict": "keep"}\n'
+        )
+
+        out = self._run_amain(monkeypatch, public_only=False, limit=10)
+
+        # Batch was 10 samples, all from the public 45 (since public
+        # comes first in the union order) — private didn't make it.
+        assert "combined=no" in out, (
+            f"--limit truncating private out should show combined=no; "
+            f"got:\n{out}"
+        )
+        # Header must not claim the M2 hard gate applies when union
+        # didn't materialize in the batch.
+        assert "visibility only, union not available" in out, (
+            f"header should degrade to visibility when union missing; "
+            f"got:\n{out}"
+        )
+        assert "M2 hard gate (precision lower CI" not in out, (
+            f"--limit-truncates-private should suppress verdict; got:\n{out}"
+        )
+        # Warning must identify the --limit cause and cite the counts
+        assert "--limit 10 truncated" in out
+        assert "1 row(s)" in out  # private_rows_total=1
+        assert "none reached the sweep" in out
+        assert "rubric §130-140" in out
+
+    def test_missing_private_suppresses_hard_gate_verdict(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Round-5 codex finding: when the private dataset doesn't exist
+        at all and the user didn't pass --public-only, the CLI used to
+        emit the ``gated by M2 hard gate`` header and the verdict on
+        public-only 45 rows — false-green union claim.
+
+        After the fix:
+        - banner says ``combined=no``
+        - CORE section header says ``visibility only, union not available``
+        - verdict is replaced with a missing-private warning that cites
+          the path and the two fix options (create file or --public-only)
+        """
+        # Point at a tmp_path with no private directory created — so
+        # private_available() returns False.
+        monkeypatch.setenv("ACTUS_EVAL_DATA_DIR", str(tmp_path))
+
+        out = self._run_amain(monkeypatch, public_only=False)
+
+        assert "combined=no" in out, (
+            f"missing private should show combined=no; got:\n{out}"
+        )
+        # Header must degrade to visibility-only — previously this said
+        # "gated by M2 hard gate" unconditionally.
+        assert "visibility only, union not available" in out, (
+            f"missing-private header should degrade to visibility; got:\n{out}"
+        )
+        assert "M2 hard gate (precision lower CI" not in out, (
+            f"missing-private should suppress verdict; got:\n{out}"
+        )
+        # Warning must surface the specific failure mode + fix paths
+        assert "private dataset not found" in out, (
+            f"warning should cite missing private file; got:\n{out}"
+        )
+        assert "ACTUS_EVAL_DATA_DIR" in out
+        assert "--public-only" in out
+        assert "rubric §130-140" in out
 
 
 class TestFormatTable:

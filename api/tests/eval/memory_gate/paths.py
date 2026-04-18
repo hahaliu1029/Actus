@@ -61,10 +61,27 @@ def synthetic_dir() -> Path:
 def synthetic_dataset_path() -> Path:
     """Return the canonical synthetic dataset path.
 
-    M1 ships 25 samples; M2 scales to 100 (adversarial suites added
-    in sibling files under the same dir).
+    M1 ships 25 samples; M2 PR-5 expanded to 45 core (original 25 + 20
+    paraphrases). Adversarial suites live in sibling files; see
+    ``synthetic_adversarial_path``.
     """
     return synthetic_dir() / "dataset.jsonl"
+
+
+def synthetic_adversarial_path() -> Path:
+    """Return the canonical adversarial dataset path.
+
+    M2 PR-5 adds this file to probe gate robustness against patterns
+    that *look* memory-worthy but the rubric says to drop (or vice-versa
+    on a small borderline-keep subset). Scoring is reported separately
+    from the core dataset so a precision dip in adversarial doesn't
+    swamp the Wilson CI on core.
+
+    Kept under ``synthetic/`` because the content is hand-crafted and
+    safe to publish; private real adversarial samples (if any) would
+    live under the private root using the same filename convention.
+    """
+    return synthetic_dir() / "adversarial.jsonl"
 
 
 # ---- Private dataset --------------------------------------------------- #
@@ -128,6 +145,17 @@ def private_available() -> bool:
     value on subsequent calls unless the file is created/removed.
     """
     return private_dataset_path().is_file()
+
+
+def synthetic_adversarial_available() -> bool:
+    """True if the synthetic adversarial dataset file exists.
+
+    Currently always True (checked into the repo), but callers that
+    want to gracefully degrade if someone deletes the file locally
+    (e.g. during bisection) can use this check instead of a bare
+    ``is_file()``.
+    """
+    return synthetic_adversarial_path().is_file()
 
 
 def control_set_available() -> bool:
