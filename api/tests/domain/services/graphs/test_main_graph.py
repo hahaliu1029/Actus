@@ -201,6 +201,66 @@ class TestMainGraphFlow:
         plan = result.get("plan")
         assert plan is not None
 
+    async def test_empty_memory_recall_plan_falls_through_to_executor(self):
+        """记忆型问题在 planner 返回空步骤时，应自动补一条查询步骤继续执行。"""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        planner_llm = _make_structured_planner_llm(
+            create_response=PlanResponse(
+                title="职业信息查询",
+                goal="",
+                language="zh",
+                steps=[],
+                message=(
+                    "您好！我理解您想了解自己的职业信息。但是，作为AI助手，"
+                    "我无法直接知道您的职业是什么。"
+                ),
+            )
+        )
+
+        mock_uow = AsyncMock()
+        mock_uow.__aenter__ = AsyncMock(return_value=mock_uow)
+        mock_uow.__aexit__ = AsyncMock(return_value=False)
+        mock_uow.session = AsyncMock()
+        mock_uow.session.get_skill_graph_state = AsyncMock(return_value=None)
+
+        graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
+            planner_llm=planner_llm,
+            react_graph=_make_mock_react_graph(),
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(return_value=mock_uow),
+            session_id="sess-memory",
+        )
+
+        result = await graph.ainvoke(
+            {
+                "message": "我的职业是什么",
+                "language": "zh",
+                "attachments": [],
+                "image_content_blocks": [],
+                "plan": None,
+                "current_step": None,
+                "messages": [],
+                "execution_summary": "",
+                "events": [],
+                "flow_status": "idle",
+                "session_id": "sess-memory",
+                "should_interrupt": False,
+                "resume_value": None,
+                "original_request": "",
+                "skill_context": "## Available Tool Summary\n- memory: memory_search, memory_get",
+                "conversation_summaries": [],
+            },
+            config={"configurable": {"has_memory_tools": True}},
+        )
+
+        plan = result.get("plan")
+        assert plan is not None
+        assert len(plan.steps) == 1
+        assert plan.message == "正在查询你的记忆以回答这个问题……"
+        assert "查询记忆" in plan.steps[0].description
+
     async def test_planner_receives_conversation_summaries(self):
         """Planner system prompt should include conversation summaries when available."""
         from app.domain.services.graphs.main_graph import build_main_graph

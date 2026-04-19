@@ -15,6 +15,7 @@ from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import DoneEvent, PlanEvent, WaitEvent
 from app.domain.models.memory import Memory
 from app.domain.models.message import Message
+from app.domain.models.llm_responses import PlanResponse
 from app.domain.models.plan import Plan, Step
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -288,6 +289,40 @@ async def test_generator_early_close_still_persists(
 
     # Memory should be saved via finally block, even on early close
     mock_uow.session.save_memory.assert_called()
+
+
+async def test_run_planner_for_detection_rewrites_empty_memory_recall_refusal(
+    mock_llm, mock_uow,
+):
+    """记忆型问题 + memory 工具可用时，planner 首轮消息不应直接拒答。"""
+    flow = _make_flow(mock_llm, mock_uow)
+    flow._allow_default_prompt_assembler = True
+    flow._has_memory_tools = True
+    flow._skill_context_provider = lambda: (
+        "## Available Tool Summary\n- memory: memory_search, memory_get"
+    )
+
+    mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+        return_value=PlanResponse(
+            title="职业信息查询",
+            goal="",
+            language="zh",
+            steps=[],
+            message=(
+                "您好！我理解您想了解自己的职业信息。但是，作为AI助手，"
+                "我无法直接知道您的职业是什么。"
+            ),
+        )
+    )
+
+    plan, _ = await flow._run_planner_for_detection(
+        Message(message="我的职业是什么", language="zh"),
+        [],
+    )
+
+    assert len(plan.steps) == 1
+    assert plan.message == "正在查询你的记忆以回答这个问题……"
+    assert "查询记忆" in plan.steps[0].description
 
 
 class TestRunPlannerForDetectionLanguageDispatch:

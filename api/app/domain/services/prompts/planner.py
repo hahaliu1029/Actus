@@ -23,6 +23,7 @@ CREATE_PLAN_PROMPT = """
   - 正确示例：`"分析用户上传的设计图，用 HTML/CSS 还原页面效果"` ← 不描述图片内容
 - **MCP/A2A 工具优先**：如果下方 `Available Tool Summary` 中包含 `mcp tools`，说明已接入对应的 MCP 服务（如 Notion、GitHub 等）。**制定计划时必须优先安排使用这些 MCP 工具，而不是通过浏览器或终端访问对应服务。** MCP 工具通过 API 直接操作，比浏览器更可靠高效。例如用户说"查看 Notion 中的内容"且有 Notion 相关的 MCP 工具可用时，步骤应为"调用 Notion MCP 工具检索数据"而非"通过浏览器访问 Notion"。
 - **Skill 创建请求的特殊处理**：当用户请求"创建/制作/开发/写一个 Skill（技能/工具）"时，不要将 Skill 的功能逻辑拆解为实现步骤。执行者拥有专门的 `brainstorm_skill` 和 `generate_skill` 工具来完成 Skill 创建。你只需生成**单步计划**，步骤描述为"根据用户需求，使用专用工具流程（brainstorm_skill → generate_skill → install_skill）完成 Skill 的蓝图设计、代码生成和安装"，让执行者在同一步骤内通过工具链完成整个流程。
+- **empty steps + memory tools 的约束**：如果你原本想返回空 `steps`，但 `Available Tool Summary` 显示有 memory 工具（如 `memory_search` / `memory_get`），不要在 `message` 里直接拒答。改为输出一个单步计划去查询记忆再回答，`message` 使用中性进度提示，例如"正在查询你的记忆以回答这个问题……"。
 - **汇总/整理类步骤必须复用前序产出**：若计划中安排了"整理/汇总/归纳/总结/合并"类步骤，且其依赖的信息已由前序步骤搜索/采集产出，该步骤描述必须显式要求"基于前序步骤已产出的文件整合"，并注明"禁止重新执行 search_web / mcp_*_web_search 等检索工具，除非前序产出明显缺失"。不写硬约束会导致执行者在"整理"阶段再次全量搜索，浪费工具调用。
 
 返回格式要求：

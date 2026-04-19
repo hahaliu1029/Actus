@@ -58,6 +58,7 @@ from app.domain.services.graphs.message_utils import (
 from app.domain.services.graphs.react_graph import build_react_graph
 from app.domain.services.graphs.compaction import CompactionResult, GradualCompactor
 from app.domain.services.graphs.token_estimator import TokenEstimator
+from app.domain.services.planner_guardrails import salvage_empty_memory_recall_plan
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
@@ -931,6 +932,13 @@ class PlannerReActFlow(BaseFlow):
                 steps=[StepDef(description=message.message)],
                 message="好的，我来帮你处理。",
             )
+        parsed = salvage_empty_memory_recall_plan(
+            parsed,
+            user_message=message.message,
+            fallback_language=message.language,
+            has_memory_tools=self._has_memory_tools,
+            skill_context=self._get_skill_context_seed(),
+        )
 
         steps = [
             Step(description=s.description)

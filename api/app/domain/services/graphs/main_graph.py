@@ -44,6 +44,7 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.flows.base import FlowStatus
 from app.domain.services.json_envelope import unwrap_message_envelope
+from app.domain.services.planner_guardrails import salvage_empty_memory_recall_plan
 
 from .message_utils import build_multimodal_content, dedup_messages, format_attachments_text
 from .state import MainGraphState
@@ -330,6 +331,15 @@ def build_main_graph(
                 steps=[StepDef(description=state["message"])],
                 message="好的，我来帮你处理。",
             )
+        parsed = salvage_empty_memory_recall_plan(
+            parsed,
+            user_message=state["message"],
+            fallback_language=state.get("language", "zh"),
+            has_memory_tools=bool(
+                (config.get("configurable") or {}).get("has_memory_tools", False)
+            ),
+            skill_context=state.get("skill_context"),
+        )
 
         steps = [
             Step(description=s.description)
