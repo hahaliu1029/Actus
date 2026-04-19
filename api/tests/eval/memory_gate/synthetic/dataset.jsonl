@@ -50,3 +50,51 @@
 {"id": "p25", "text": "用户：项目里所有 commit message 最好用英文写，方便国际协作", "expected_verdict": "keep", "expected_category": "rule", "notes": "marker-as-hint regression (codex round-2 P1): 最好 alone (no hypothetical hedge) = polite phrasing of standing convention — keep"}
 {"id": "p26", "text": "用户：我希望 production 上所有 secret 都走 KMS，绝对不要硬编码", "expected_verdict": "keep", "expected_category": "rule", "notes": "marker-as-hint regression (codex round-2 P1): 希望 + 绝对不要 = standing security rule expressed politely — keep"}
 {"id": "p27", "text": "用户：临时 hack 用 Bash 也行，正式服务必须 Go", "expected_verdict": "keep", "expected_category": "rule", "notes": "marker-as-hint regression (codex round-2 P1): 也行 + 必须 = stable language-stack policy — keep"}
+{"id": "x1", "text": "用户：我是做 NLP 的，对 transformer 架构很熟", "expected_verdict": "keep", "expected_category": "user", "notes": "domain expertise"}
+{"id": "x2", "text": "用户：平时我晚上 10 点到凌晨 2 点效率最高，白天基本在开会", "expected_verdict": "keep", "expected_category": "user", "notes": "working hours preference"}
+{"id": "x3", "text": "用户：我视力不太好，代码字体调大一点看着舒服", "expected_verdict": "keep", "expected_category": "user", "notes": "accessibility preference"}
+{"id": "x4", "text": "用户：我习惯用 neovim + tmux，不是 VSCode", "expected_verdict": "keep", "expected_category": "user", "notes": "tooling preference"}
+{"id": "x5", "text": "用户：作为 DBA，我对 query plan 比较敏感", "expected_verdict": "keep", "expected_category": "user", "notes": "role + expertise"}
+{"id": "x6", "text": "用户：我的母语是粤语，普通话也可以但不是第一语言", "expected_verdict": "keep", "expected_category": "user", "notes": "language background"}
+{"id": "x7", "text": "用户：我有色盲（红绿），图表尽量别只用颜色区分", "expected_verdict": "keep", "expected_category": "user", "notes": "accessibility / perceptual"}
+{"id": "x8", "text": "用户：所有 API 调用都要带 request_id，便于追踪", "expected_verdict": "keep", "expected_category": "rule", "notes": "observability rule"}
+{"id": "x9", "text": "用户：生产环境日志级别永远是 INFO 以上，禁止 DEBUG", "expected_verdict": "keep", "expected_category": "rule", "notes": "ops rule"}
+{"id": "x10", "text": "用户：代码评审时，圈复杂度 > 10 必须拆函数", "expected_verdict": "keep", "expected_category": "rule", "notes": "code quality gate"}
+{"id": "x11", "text": "用户：所有对外接口必须走 gateway，不能直连内部服务", "expected_verdict": "keep", "expected_category": "rule", "notes": "architecture constraint"}
+{"id": "x12", "text": "用户：凡是涉及金额的字段一律用 decimal 不要 float", "expected_verdict": "keep", "expected_category": "rule", "notes": "data correctness rule"}
+{"id": "x13", "text": "用户：DB schema 变更必须走 alembic migration，不允许手改生产库", "expected_verdict": "keep", "expected_category": "rule", "notes": "db governance"}
+{"id": "x14", "text": "用户：发 PR 前跑一遍 `make lint test`，不要偷懒", "expected_verdict": "keep", "expected_category": "rule", "notes": "pre-merge checklist"}
+{"id": "x15", "text": "我们公司用 Clickhouse 做分析，MySQL 做 OLTP", "expected_verdict": "keep", "expected_category": "fact", "notes": "tech stack split"}
+{"id": "x16", "text": "用户：线上监控用的 Grafana 在 grafana.internal，Prometheus 在后面", "expected_verdict": "keep", "expected_category": "fact", "notes": "observability infra pointer"}
+{"id": "x17", "text": "用户：JWT secret 存在 HashiCorp Vault 的 kv/auth 路径下", "expected_verdict": "keep", "expected_category": "fact", "notes": "secret management pointer"}
+{"id": "x18", "text": "用户：我们的 CI 在 GitLab，不是 GitHub Actions", "expected_verdict": "keep", "expected_category": "fact", "notes": "ci pointer"}
+{"id": "x19", "text": "用户：feature flag 走 LaunchDarkly，gradual rollout 的单位是按 user hash 分桶", "expected_verdict": "keep", "expected_category": "fact", "notes": "feature-flag system"}
+{"id": "x20", "text": "用户：客服系统是用 Zendesk 不是 Intercom", "expected_verdict": "keep", "expected_category": "fact", "notes": "third-party tool fact"}
+{"id": "x21", "text": "agent：已经把 JWT secret 改成了环境变量 JWT_SECRET_KEY", "expected_verdict": "drop", "expected_category": "fact", "notes": "agent action announcement, not user memory"}
+{"id": "x22", "text": "用户：稍等，我看一下 log", "expected_verdict": "drop", "expected_category": "user", "notes": "conversational filler"}
+{"id": "x23", "text": "用户：这个 bug 复现了吗", "expected_verdict": "drop", "expected_category": "fact", "notes": "transient debug query"}
+{"id": "x24", "text": "工具输出：Traceback (most recent call last):\n  File \"foo.py\", line 12, in <module>", "expected_verdict": "drop", "expected_category": "fact", "notes": "stack trace output"}
+{"id": "x25", "text": "用户：再试一次，上次可能是网络抖", "expected_verdict": "drop", "expected_category": "fact", "notes": "transient retry suggestion"}
+{"id": "x26", "text": "用户：哎我手滑按了回车", "expected_verdict": "drop", "expected_category": "user", "notes": "accidental input acknowledgement"}
+{"id": "x27", "text": "用户：你先跑一下 `pytest -k foo`", "expected_verdict": "drop", "expected_category": "fact", "notes": "ad-hoc command, not a rule"}
+{"id": "x28", "text": "用户：这个变量叫什么来着，foo_bar 还是 fooBar", "expected_verdict": "drop", "expected_category": "fact", "notes": "transient naming question"}
+{"id": "x29", "text": "Agent：当前计划：1. 修 bug；2. 跑测试；3. 提 PR", "expected_verdict": "drop", "expected_category": "fact", "notes": "agent's own plan output"}
+{"id": "x30", "text": "用户：我找到原因了，是 off-by-one", "expected_verdict": "drop", "expected_category": "fact", "notes": "session-local debug finding"}
+{"id": "x31", "text": "用户：下面这个函数能优化一下吗", "expected_verdict": "drop", "expected_category": "fact", "notes": "current task directive"}
+{"id": "x32", "text": "用户：我喜欢用 print 调试，这不是生产代码别紧张", "expected_verdict": "drop", "expected_category": "rule", "notes": "local debug override; NOT a standing preference (print 调试 is session-scoped)"}
+{"id": "x33", "text": "用户：没事了就这样吧，我下班了", "expected_verdict": "drop", "expected_category": "user", "notes": "conversation end, not a preference"}
+{"id": "x34", "text": "用户：把这个函数搬到 utils/ 下", "expected_verdict": "drop", "expected_category": "fact", "notes": "current refactor instruction, not a rule"}
+{"id": "x35", "text": "Agent：好的，已根据您的要求完成", "expected_verdict": "drop", "expected_category": "user", "notes": "agent acknowledgement"}
+{"id": "x36", "text": "用户：要是真的有人把 prod 密码 push 到 github 我就直接离职", "expected_verdict": "drop", "expected_category": "rule", "notes": "sarcasm / hypothetical frustration — NOT a standing rule"}
+{"id": "x37", "text": "用户：假设 Redis 挂了会怎样，只是问问", "expected_verdict": "drop", "expected_category": "fact", "notes": "hypothetical exploration, explicitly '只是问问'"}
+{"id": "x38", "text": "用户：如果下个季度我们切到 k8s，这套 service 怎么改", "expected_verdict": "drop", "expected_category": "fact", "notes": "conditional future scenario, not a current fact/rule"}
+{"id": "x39", "text": "用户：我最近都在用 Rust，感觉不错", "expected_verdict": "keep", "expected_category": "user", "notes": "recent preference — 最近都在 indicates standing usage not transient"}
+{"id": "x40", "text": "用户：刚刚你回答得太啰嗦，精简一点", "expected_verdict": "keep", "expected_category": "rule", "notes": "marker-as-hint: 刚刚 scoping the specific reply, but 精简一点 generalizes as preference — keep"}
+{"id": "x41", "text": "用户：这次先用 SQLite 顶着，后面再换 Postgres", "expected_verdict": "drop", "expected_category": "fact", "notes": "marker-as-hint: 这次 + 先...后面再 = explicit transient decision — drop"}
+{"id": "x42", "text": "用户：今天我不想改 UI，明天再说", "expected_verdict": "drop", "expected_category": "user", "notes": "marker-as-hint: 今天/明天 + 不想 = session-local mood, not standing preference"}
+{"id": "x43", "text": "用户：我们团队在 Slack 的 #backend 频道同步，有事找那里", "expected_verdict": "keep", "expected_category": "fact", "notes": "communication channel pointer"}
+{"id": "x44", "text": "用户：Code review 至少需要两个人批准才能 merge", "expected_verdict": "keep", "expected_category": "rule", "notes": "merge policy"}
+{"id": "x45", "text": "用户：这个 API 我跑了 10 次都超时", "expected_verdict": "drop", "expected_category": "fact", "notes": "current debugging observation, not permanent fact"}
+{"id": "x46", "text": "用户：不对，你用的是 python 2 的语法，我们只支持 python 3.12+", "expected_verdict": "keep", "expected_category": "rule", "notes": "version constraint: correction statement doubles as rule"}
+{"id": "x47", "text": "用户：反讽一下：这段代码真是杰作啊，连 type hints 都没有", "expected_verdict": "drop", "expected_category": "rule", "notes": "sarcasm marked explicitly — drop despite the content looking like a complaint/rule"}
+{"id": "x48", "text": "用户：以后给我写代码一律加 docstring 和 type hints", "expected_verdict": "keep", "expected_category": "rule", "notes": "以后 + 一律 = standing rule; paired with x47 which sarcastically gestures the same content"}

@@ -20,6 +20,7 @@ Note:
   - Right example: `"Analyze the user-uploaded design image and reproduce the page with HTML/CSS"` ← does not describe image content.
 - **Prefer MCP/A2A tools**: If the `Available Tool Summary` below contains `mcp tools`, the corresponding MCP services (e.g. Notion, GitHub) are connected. **When planning, you must prioritize using these MCP tools instead of accessing the same services through a browser or terminal.** MCP tools operate via API and are more reliable and efficient than a browser. For example, if the user says "look at content in Notion" and a Notion-related MCP tool is available, the step should be "Call the Notion MCP tool to retrieve the data" rather than "Open Notion in the browser".
 - **Special handling for skill creation requests**: When the user asks to "create / build / develop / write a skill (tool)", do not break down the skill's functional logic into implementation steps. The executor has dedicated `brainstorm_skill` and `generate_skill` tools to complete skill creation. You only need to produce a **single-step plan** with the description "Use the dedicated tool workflow (brainstorm_skill → generate_skill → install_skill) to complete blueprint design, code generation, and installation of the skill based on the user's requirements", letting the executor complete the entire flow within that single step.
+- **Consolidation / summary steps must reuse prior step outputs**: If the plan includes a "consolidate / summarize / aggregate / merge" step whose input is already produced by earlier search / gathering steps, its description must explicitly require "based on the files produced by prior steps" and state "must not re-run search_web / mcp_*_web_search or any retrieval tool unless the prior outputs are clearly insufficient". Without this hard constraint the executor will re-issue full searches during the consolidation phase and waste tool calls — this behavior has been observed in real runs.
 
 Return format requirements:
 - Must return JSON format that complies with the following TypeScript interface
@@ -92,6 +93,7 @@ Note:
 - Delete the step if it is completed or not necessary
 - Carefully read the step result to determine if it is successful, if not, change the following steps
 - According to the step result, you need to update the plan steps accordingly
+- **Remaining consolidation / summary steps must reuse prior outputs**: If any upcoming step is of the "consolidate / summarize / aggregate / merge" variety and earlier steps have already produced usable files (see step.attachments), its description must explicitly require "based on files produced by prior steps" and state "must not re-run search unless the prior outputs are clearly insufficient". This prevents the executor from re-issuing redundant searches during the consolidation phase, which has been observed to waste tool calls and should be avoided.
 
 Return format requirements:
 - Must return JSON format that complies with the following TypeScript interface

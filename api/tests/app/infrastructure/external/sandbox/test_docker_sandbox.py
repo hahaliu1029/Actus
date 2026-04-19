@@ -126,6 +126,22 @@ def test_build_memory_mount_returns_none_when_feature_gate_off(tmp_path) -> None
     assert DockerSandbox._build_memory_mount(settings, user_id) is None
 
 
+def test_build_memory_mount_rejects_non_absolute_roots(tmp_path) -> None:
+    """host/container root 不是绝对路径时直接拒绝。
+
+    回归 codex round-4：``~/.actus/memory`` 在 api 容器里会被误展开成
+    ``/root/...``，然后作为宿主机 bind source 传给 Docker daemon。
+    """
+    settings = SimpleNamespace(
+        memory_root_host="~/.actus/memory",
+        memory_root_container="/app/data/memory",
+        sandbox_memory_mount_target="/workspace/.memory",
+        sandbox_memory_mount_enabled=True,
+    )
+    user_id = str(uuid.uuid4())
+    assert DockerSandbox._build_memory_mount(settings, user_id) is None
+
+
 def test_build_memory_mount_builds_readonly_bind_when_enabled(tmp_path) -> None:
     """feature gate 开 + 合法 user_id → 返回 read-only bind mount。
 

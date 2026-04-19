@@ -5,9 +5,32 @@ where ``RunnableWithFallbacks.__getattr__`` calls ``typing.get_type_hints()``
 on ``BaseChatModel.with_structured_output``, which fails because ``builtins``
 is imported under ``TYPE_CHECKING`` only in langchain-core.
 
-This model delegates to ``primary`` first; on any exception it retries with
-``fallback``. Both ``bind_tools`` and ``with_structured_output`` propagate to
-both inner models so that tool schemas stay consistent.
+Semantics: this wrapper is for **cross-protocol escalation**
+(chat.completions → responses), not same-protocol retry. It only falls
+through on exceptions that specifically indicate "primary doesn't accept
+this protocol/payload" — currently:
+
+- ``openai.BadRequestError`` (400)
+- ``openai.UnprocessableEntityError`` (422)
+
+``openai.NotFoundError`` is deliberately NOT in the trigger set:
+``NotFoundError`` is a generic 404 that also fires on wrong model name
+or wrong base_url path, which are permanent user-config errors that
+would be silently papered over by an escalation hop. If a future
+provider really needs "chat endpoint missing → try responses" routing,
+replace this tuple with a predicate that inspects ``exc.request.url``
+or ``exc.body["code"]`` rather than widening the class match.
+
+All other exceptions (``ServerRequestsError`` — timeout/empty-response
+wrapper translated by ``_timeout_helpers``, 5xx, rate limits, auth
+failures, arbitrary ``Exception`` subclasses) propagate so LangGraph
+node ``RetryPolicy`` or upper layers can retry same endpoint. Funneling
+transient errors through fallback hides the real retry path and, on
+providers without a Responses API (e.g. Zhipu ``glm-*`` on
+``/api/paas/v4``), converts a retryable error into a hard 404.
+
+Both ``bind_tools`` and ``with_structured_output`` propagate to both
+inner models so tool schemas stay consistent.
 """
 
 from __future__ import annotations
@@ -15,6 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator, List, Literal, Optional
 
+import openai
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -24,6 +48,15 @@ from langchain_core.messages import BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 logger = logging.getLogger(__name__)
+
+# Exception types that mean "primary does not accept this protocol/payload".
+# Only these trigger the cross-protocol escalation to fallback. Anything
+# else propagates — see module docstring for why ``NotFoundError`` is NOT
+# included.
+_FALLBACK_TRIGGER_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    openai.BadRequestError,
+    openai.UnprocessableEntityError,
+)
 
 
 class ActusFallbackChatModel(BaseChatModel):
@@ -102,10 +135,10 @@ class ActusFallbackChatModel(BaseChatModel):
             return await self.primary._agenerate(
                 messages, stop=stop, run_manager=run_manager, **kwargs,
             )
-        except Exception as primary_exc:
+        except _FALLBACK_TRIGGER_EXCEPTIONS as primary_exc:
             logger.warning(
-                "Primary LLM (%s) failed, falling back: %s",
-                self.primary._llm_type, primary_exc,
+                "Primary LLM (%s) protocol incompatible, escalating to %s: %s",
+                self.primary._llm_type, self.fallback._llm_type, primary_exc,
             )
             return await self.fallback._agenerate(
                 messages, stop=stop, run_manager=run_manager, **kwargs,
@@ -123,10 +156,10 @@ class ActusFallbackChatModel(BaseChatModel):
                 messages, stop=stop, run_manager=run_manager, **kwargs,
             ):
                 yield chunk
-        except Exception as primary_exc:
+        except _FALLBACK_TRIGGER_EXCEPTIONS as primary_exc:
             logger.warning(
-                "Primary LLM stream (%s) failed, falling back: %s",
-                self.primary._llm_type, primary_exc,
+                "Primary LLM stream (%s) protocol incompatible, escalating to %s: %s",
+                self.primary._llm_type, self.fallback._llm_type, primary_exc,
             )
             async for chunk in self.fallback._astream(
                 messages, stop=stop, run_manager=run_manager, **kwargs,

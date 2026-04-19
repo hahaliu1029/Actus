@@ -10,6 +10,7 @@ import type {
   MemoryDetail,
   MemoryListParams,
   MemoryListResponse,
+  ReindexResponse,
 } from "./types";
 
 function patch<T>(endpoint: string, data: unknown): Promise<T> {
@@ -66,4 +67,11 @@ export const memoryApi = {
   // 前端在显示"清理旧记忆"对话框前拉一次，据此展示具体 cutoff 或警告。
   getCleanupConfig: () =>
     get<LegacyCleanupConfigResponse>("/v2/memories/cleanup-config"),
+
+  // Post-M3 reindex：hand-edit 工作流闭环。用户改了
+  // ${MEMORY_ROOT}/{uid}/{category}/{id}.md 的正文后调此接口，服务端读盘
+  // → 重算 embedding → UPDATE DB。Option A：只同步 body content，其它
+  // frontmatter 字段改动进 warnings 不 apply。
+  reindex: (id: string) =>
+    post<ReindexResponse>(`/v2/memories/${id}/reindex`, {}),
 };

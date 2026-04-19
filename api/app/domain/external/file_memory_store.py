@@ -55,6 +55,27 @@ class FileMemoryStore(Protocol):
         """
         ...
 
+    async def read(
+        self,
+        user_id: str,
+        memory_id: str,
+        category: str,
+    ) -> tuple[dict, str]:
+        """读取 memory 文件并解析 frontmatter 与 body。
+
+        返回 ``(frontmatter_dict, body_str)``。
+
+        语义（reindex endpoint 的底层）：
+        - 文件不存在 → raise ``FileNotFoundError``（service 层 map 成 409）
+        - frontmatter YAML 解析失败 → raise ``ValueError``（→ 400）
+        - 路径穿越 / symlink → raise ``SecurityError``（→ 403，与 write 路径同源防御）
+
+        读侧的 symlink 防御必须复用 write 侧的 ``_resolve_target`` 校验——
+        不允许 host 预植 symlink 通过 reindex 路径被 service 拿到 bytes 以外
+        的 target 内容（与 MemoryMountScope 客户端守卫对偶但独立）。
+        """
+        ...
+
 
 class NoopFileMemoryStore(FileMemoryStore):
     """DB-only 模式 / 单测用的空实现。所有方法都是 no-op。
@@ -95,3 +116,14 @@ class NoopFileMemoryStore(FileMemoryStore):
         new_frontmatter: dict,
     ) -> None:
         return None
+
+    async def read(
+        self,
+        user_id: str,
+        memory_id: str,
+        category: str,
+    ) -> tuple[dict, str]:
+        raise NotImplementedError(
+            "NoopFileMemoryStore 不支持 read —— DB-only 模式下没有 fs 侧数据可读。"
+            " reindex endpoint 需要 file_store 注入 FsMemoryWriter 才能工作。"
+        )

@@ -25,6 +25,7 @@ from app.interfaces.schemas.memory_schemas import (
     MemoryDetail,
     MemoryItem,
     MemoryListResponse,
+    ReindexResponse,
     UpdateMemoryRequest,
 )
 from app.interfaces.service_dependencies import get_memory_management_service
@@ -242,6 +243,45 @@ async def delete_memory(
     if not deleted:
         raise NotFoundError("记忆不存在")
     return Response.success(data=DeleteCountResponse(deleted_count=1))
+
+
+@router.post(
+    path="/{chunk_id}/reindex",
+    response_model=Response[ReindexResponse],
+    summary="从磁盘重建索引（hand-edit 闭环）",
+    description=(
+        "Power-user 工作流：用户 hand-edit "
+        "``${MEMORY_ROOT_HOST}/{user_id}/{category}/{id}.md`` 的 body "
+        "后调此 endpoint，服务端读盘 → 重算 embedding → UPDATE DB，"
+        "``memory_search`` / ``memory_recall`` 立即能查到新内容，不必重启"
+        " session 或跑 CLI reconciler。\n\n"
+        "**Option A 权威契约**：\n"
+        "- ``body`` → apply 到 DB\n"
+        "- ``id`` → mismatch 直接 409（不允许 hand-edit 改 id）\n"
+        "- ``source`` / ``created_at`` / ``auto_promoted_at`` → 系统字段，"
+        "改动列入 warnings 忽略\n"
+        "- ``title`` / ``category`` / ``pinned`` / ``tags`` → **file-only**："
+        "改动留在文件层（File LIVE view 可见），但**不**进 DB / search / "
+        "prompt；当前无受支持的同步路径\n\n"
+        "**错误状态**: 404 chunk 不存在 / 409 file 不存在或 id 不匹配 / "
+        "400 frontmatter parse 失败或空 body / 403 path 穿越或 symlink / "
+        "503 deployment 未配置 file_store。"
+    ),
+    dependencies=[Depends(rate_limit_write)],
+)
+async def reindex_memory(
+    chunk_id: str,
+    current_user: CurrentUser,
+    service: "MemoryManagementService" = Depends(get_memory_management_service),
+) -> Response[ReindexResponse]:
+    result = await service.reindex_memory(current_user.id, chunk_id)
+    return Response.success(
+        data=ReindexResponse(
+            reindexed_fields=result.reindexed_fields,
+            warnings=result.warnings,
+            fs_synced=result.fs_synced,
+        )
+    )
 
 
 @router.post(

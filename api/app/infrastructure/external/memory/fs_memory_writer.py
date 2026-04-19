@@ -35,7 +35,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.application.errors.exceptions import SecurityError
-from app.infrastructure.external.memory.frontmatter import serialize_memory_file
+from app.infrastructure.external.memory.frontmatter import (
+    parse_memory_file,
+    serialize_memory_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +148,32 @@ class FsMemoryWriter:
         # Best-effort delete of old path; reconciler mops up if this partially
         # fails (design L451, §Update Flow / Category Change).
         await self._run_with_retry(self._delete_if_exists, source)
+
+    async def read(
+        self,
+        user_id: str,
+        memory_id: str,
+        category: str,
+    ) -> tuple[dict, str]:
+        """读取并 parse memory 文件。
+
+        复用 ``_resolve_target`` 的 path traversal + symlink 防御——读侧和写侧
+        必须同一校验链，不允许 hand-edit 后 symlink 透过 reindex 路径被
+        service 拿到 target bytes（reindex endpoint 的 P0 安全点）。
+
+        ``SecurityError`` 由 ``_resolve_target`` 直接抛出，``FileNotFoundError``
+        和 ``ValueError``（parse 失败）原样传播给 service 层。
+        """
+        target = self._resolve_target(user_id, memory_id, category)
+        # ``_resolve_target`` 调用了 ``.resolve()``——不存在的路径也会返回规范化
+        # Path（resolve 不要求存在），所以 read 前必须显式 ``exists()`` 检查。
+        if not target.exists():
+            raise FileNotFoundError(
+                f"memory file not found: user={user_id} id={memory_id} category={category}"
+            )
+        text = await asyncio.to_thread(target.read_text, encoding="utf-8")
+        # parse_memory_file 失败时抛 ValueError，service 层 map 成 400。
+        return parse_memory_file(text)
 
     # ---- Internals (run on thread pool via asyncio.to_thread) --------- #
 

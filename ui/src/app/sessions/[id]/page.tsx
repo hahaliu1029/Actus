@@ -982,7 +982,6 @@ export default function SessionPage() {
     });
 
     return unsubscribe;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, downloadFile, downloadSandboxFile, updateTransferProgress, completeTransferTask, failTransferTask]);
 
   const closePreview = useCallback(() => {

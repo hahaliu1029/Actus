@@ -111,6 +111,40 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     return compacted
 
 
+_PRIOR_STEP_OUTPUTS_EMPTY_BY_LANG = {"zh": "无", "en": "None"}
+_PRIOR_STEP_DESCRIPTION_MAX_CHARS = 80
+
+
+def _format_prior_step_outputs(plan: Plan | None, language: str = "zh") -> str:
+    """Render completed plan steps' attachments as an executor-facing hint.
+
+    The output is injected into ``EXECUTION_PROMPT`` so later steps know
+    which files earlier steps produced and can ``file_read`` them instead
+    of re-issuing searches. Only ``ExecutionStatus.COMPLETED`` steps with
+    non-empty ``attachments`` are rendered; order matches ``plan.steps``.
+
+    Returns a locale-appropriate placeholder (``"无"`` for ZH, ``"None"``
+    for EN, falling back to ZH for unknown languages) when there is
+    nothing to show — keeps the EN executor prompt free of stray Chinese
+    characters.
+    """
+    empty = _PRIOR_STEP_OUTPUTS_EMPTY_BY_LANG.get(
+        language, _PRIOR_STEP_OUTPUTS_EMPTY_BY_LANG["zh"]
+    )
+    if plan is None or not plan.steps:
+        return empty
+    lines: list[str] = []
+    for s in plan.steps:
+        if s.status != ExecutionStatus.COMPLETED or not s.attachments:
+            continue
+        desc = (s.description or "").strip()
+        if len(desc) > _PRIOR_STEP_DESCRIPTION_MAX_CHARS:
+            desc = desc[: _PRIOR_STEP_DESCRIPTION_MAX_CHARS - 1] + "…"
+        paths = ", ".join(s.attachments)
+        lines.append(f"- [{desc}] {paths}" if desc else f"- {paths}")
+    return "\n".join(lines) if lines else empty
+
+
 def build_main_graph(
     planner_llm: BaseChatModel,
     react_graph: CompiledStateGraph,
@@ -278,8 +312,17 @@ def build_main_graph(
 
         try:
             parsed: PlanResponse = await structured_llm.ainvoke(messages)
+        except ServerRequestsError:
+            # Transient transport error — let ``planner_retry``
+            # (RetryPolicy on ServerRequestsError at line ~965) handle it.
+            # Swallowing here would mask retryable failures as "parse
+            # failed" and push a degraded single-step plan downstream.
+            raise
         except Exception:
-            logger.warning("Planner structured output failed, using fallback plan")
+            logger.warning(
+                "Planner structured output failed, using fallback plan",
+                exc_info=True,
+            )
             parsed = PlanResponse(
                 title="Task",
                 goal=state["message"],
@@ -511,6 +554,7 @@ def build_main_graph(
                 HumanMessage(content=bundle.EXECUTION_PROMPT.format(
                     message=state["message"],
                     attachments=format_attachments_text(attachments),
+                    prior_step_outputs=_format_prior_step_outputs(state.get("plan"), language),
                     language=language,
                     step=step.description,
                 )),
@@ -524,6 +568,7 @@ def build_main_graph(
             execution_text = bundle.EXECUTION_PROMPT.format(
                 message=state["message"],
                 attachments=attachments_text,
+                prior_step_outputs=_format_prior_step_outputs(state.get("plan"), language),
                 language=language,
                 step=step.description,
             )
@@ -590,12 +635,28 @@ def build_main_graph(
         if seen_interrupt:
             react_final["should_interrupt"] = True
 
-        # Extract execution summary from last AI message
-        react_messages: list = react_final.get("messages", [])
+        # Extract execution summary from last AI message, and also parse
+        # the JSON envelope (``{"result"|"message", "attachments"}``) so we
+        # can populate ``step.attachments`` for the next step's
+        # ``prior_step_outputs`` hint. We parse the FULL content (not the
+        # 500-char summary) because envelopes with long ``result`` bodies
+        # place ``attachments`` after the text and would be cut off.
+        #
+        # Scan ONLY the messages added in this react run (``all_react_messages``).
+        # ``react_final["messages"]`` is initial + new deduped, so scanning
+        # that list would fall back to the previous step's AI envelope
+        # when the current step produced no new AIMessage(content) — and
+        # ``prior_step_outputs`` would then carry the previous step's
+        # attachments into every subsequent step.
         summary = ""
-        for msg in reversed(react_messages):
+        step_attachments: list[str] = []
+        for msg in reversed(all_react_messages):
             if isinstance(msg, AIMessage) and msg.content:
-                summary = msg.content[:500]
+                content_str = (
+                    msg.content if isinstance(msg.content, str) else str(msg.content)
+                )
+                summary = content_str[:500]
+                _, step_attachments = unwrap_message_envelope(content_str)
                 break
 
         # Detect step success from react_graph's accumulated failure_count
@@ -636,6 +697,7 @@ def build_main_graph(
             "status": ExecutionStatus.COMPLETED,
             "success": step_success,
             "result": summary,
+            "attachments": step_attachments,
         })
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 

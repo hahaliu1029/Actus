@@ -1392,3 +1392,461 @@ class TestDeleteFsSync:
         count = await svc.delete_all_memories(TEST_USER_ID_FIXED)
         assert count == 5
         assert len(store.deletes) == 5
+
+
+# ─── reindex_memory（Option A：post-M3 hand-edit 闭环）─────────────────────
+
+class TestReindexMemory:
+    """``MemoryManagementService.reindex_memory`` Option A：只同步 body；
+    其它 frontmatter 字段进 warnings 不 apply。"""
+
+    def _make_chunk_with_fs(
+        self, *, content: str = "original body", category: str = "user"
+    ):
+        """生成一个 fs_synced=True、category 非空的 chunk（reindex 前提条件）。"""
+        import dataclasses
+        return dataclasses.replace(
+            _chunk(content=content),
+            category=category,
+            fs_synced=True,
+            content_hash="hash-original",
+        )
+
+    def _make_file_store(self, *, read_return=None, read_exc=None):
+        """Fake FileMemoryStore for reindex tests."""
+        store = AsyncMock()
+        if read_exc is not None:
+            store.read = AsyncMock(side_effect=read_exc)
+        else:
+            store.read = AsyncMock(return_value=read_return)
+        store.write = AsyncMock()
+        store.delete = AsyncMock()
+        return store
+
+    def _build_svc(self, mock_repo, mock_embed, mock_session, file_store):
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+        return MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=file_store,
+        )
+
+    async def test_not_found_when_db_miss(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        from app.application.errors.exceptions import NotFoundError
+
+        mock_repo.get_by_id.return_value = None
+        store = self._make_file_store(read_return=({"id": "x"}, "body"))
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        with pytest.raises(NotFoundError):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, "missing")
+        # DB miss 时不应读 fs（防止浪费 I/O + 信息泄露）
+        store.read.assert_not_called()
+
+    async def test_service_unavailable_when_file_store_is_none(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """codex round-4 P2：file_store=None 是 deployment 配置问题（不是
+        客户端请求错），应该映射到 503，不是 400。"""
+        from app.application.errors.exceptions import ServiceUnavailableError
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=None,
+        )
+        with pytest.raises(ServiceUnavailableError, match="DB-only"):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, "any")
+
+    async def test_service_unavailable_when_noop_store_raises(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """NoopFileMemoryStore.read() 抛 NotImplementedError →
+        service 映射到 503（与 file_store=None 同族语义）。"""
+        from app.application.errors.exceptions import ServiceUnavailableError
+        from app.domain.external.file_memory_store import NoopFileMemoryStore
+
+        chunk = self._make_chunk_with_fs()
+        mock_repo.get_by_id.return_value = chunk
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            file_store=NoopFileMemoryStore(),
+        )
+        with pytest.raises(ServiceUnavailableError):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+    async def test_conflict_when_legacy_null_category(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        from app.application.errors.exceptions import ConflictError
+
+        import dataclasses
+        legacy = dataclasses.replace(
+            _chunk(content="legacy"), category=None, fs_synced=False
+        )
+        mock_repo.get_by_id.return_value = legacy
+        store = self._make_file_store(read_return=({"id": "x"}, "body"))
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        with pytest.raises(ConflictError, match="legacy"):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, legacy.id)
+        store.read.assert_not_called()
+
+    async def test_conflict_when_file_missing(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        from app.application.errors.exceptions import ConflictError
+
+        chunk = self._make_chunk_with_fs()
+        mock_repo.get_by_id.return_value = chunk
+        store = self._make_file_store(read_exc=FileNotFoundError("gone"))
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        with pytest.raises(ConflictError, match="磁盘上不存在"):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+    async def test_bad_request_on_frontmatter_parse_fail(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        from app.application.errors.exceptions import BadRequestError
+
+        chunk = self._make_chunk_with_fs()
+        mock_repo.get_by_id.return_value = chunk
+        store = self._make_file_store(read_exc=ValueError("bad YAML"))
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        with pytest.raises(BadRequestError, match="frontmatter 解析"):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+    async def test_conflict_on_id_mismatch(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        from app.application.errors.exceptions import ConflictError
+
+        chunk = self._make_chunk_with_fs()
+        mock_repo.get_by_id.return_value = chunk
+        # frontmatter.id 与 DB.id 不匹配 → hand-edit 改了 id
+        store = self._make_file_store(
+            read_return=({"id": "different-id-hand-edited", "source": chunk.source}, "new body")
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        with pytest.raises(ConflictError, match="id 不匹配"):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+        # id mismatch 不推进 update
+        mock_repo.update_content.assert_not_called()
+
+    async def test_noop_when_body_unchanged(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """盘上 body 与 DB content 相同 → no-op 幂等返回，不写 DB / audit。"""
+        chunk = self._make_chunk_with_fs(content="same body")
+        mock_repo.get_by_id.return_value = chunk
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "same body",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+        assert result.reindexed_fields == []
+        assert result.fs_synced is True
+        # no-op：update_content 不被调，audit 不写，commit 不发生
+        mock_repo.update_content.assert_not_called()
+        assert not mock_session.add.called
+
+    async def test_happy_path_uses_reindex_content_not_update_content(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """codex round-4 P0：body 改动必须走 ``repo.reindex_content`` 单语句
+        UPDATE（fs_synced=True），**不**走 update_content（后者置 False
+        会被 reconciler 当 pending 覆盖 hand-edit）。
+
+        同时钉死：
+        - update_content 绝不被调用（P0 race fix 的核心不变式）
+        - 后置 _try_mark_fs_synced(True) 也不需要（reindex_content 原子置 True）
+        """
+        import dataclasses
+
+        chunk = self._make_chunk_with_fs(content="original body")
+        mock_repo.get_by_id.return_value = chunk
+        updated_row = dataclasses.replace(
+            chunk, content="edited body", content_hash="new-hash", fs_synced=True
+        )
+        mock_repo.reindex_content = AsyncMock(return_value=updated_row)
+        mock_repo.update_content = AsyncMock()  # 不应被调
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "edited body",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+        assert result.reindexed_fields == ["content"]
+        assert result.warnings == []
+        assert result.fs_synced is True
+
+        # P0 核心不变式：reindex_content 被调，update_content **绝不**被调
+        mock_repo.reindex_content.assert_awaited_once()
+        mock_repo.update_content.assert_not_called()
+
+        call_kwargs = mock_repo.reindex_content.call_args.kwargs
+        assert call_kwargs["content"] == "edited body"
+        assert call_kwargs["content_hash"] != chunk.content_hash
+        # audit action='reindex'
+        audit_obj = mock_session.add.call_args[0][0]
+        assert audit_obj.action == "reindex"
+        assert audit_obj.old_snapshot["content_hash"] == chunk.content_hash
+        assert audit_obj.new_snapshot["content_hash"] == call_kwargs["content_hash"]
+        # 核心 P0 race fix：reindex 完成后**不再**需要后置 mark_fs_synced(True)
+        # 因为 reindex_content 已经原子置 True；不经过 False 窗口
+        mock_repo.mark_fs_synced.assert_not_called()
+
+    async def test_noop_with_stale_fs_synced_false_repairs_flag(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """codex round-4 P0 no-op 分支 fix：existing.fs_synced=False 时，
+        即使 body 没变（no-op）也要调 mark_fs_synced(True)——否则把 stale
+        False 留给 reconciler 会引起"canonical frontmatter 覆盖 hand-edit"
+        的 race 再次发生。"""
+        import dataclasses
+
+        # 盘与 DB body 相同，但 DB fs_synced=False（某次先前 update 后没翻回来）
+        chunk = dataclasses.replace(
+            self._make_chunk_with_fs(content="same body"), fs_synced=False
+        )
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.mark_fs_synced = AsyncMock(return_value=True)
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "same body",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+        assert result.reindexed_fields == []  # body 同 → no-op
+        # 但 stale fs_synced=False 必须被修：mark_fs_synced(True) 被调
+        mock_repo.mark_fs_synced.assert_awaited_once()
+        call_kwargs = mock_repo.mark_fs_synced.call_args.kwargs
+        assert call_kwargs["synced"] is True
+
+    async def test_noop_with_fresh_fs_synced_true_no_db_writes(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """no-op + existing.fs_synced=True → 完全空操作，不碰 DB。"""
+        chunk = self._make_chunk_with_fs(content="same body")  # fs_synced=True
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.mark_fs_synced = AsyncMock()
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "same body",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+        assert result.reindexed_fields == []
+        assert result.fs_synced is True
+        # fresh True 不需要修
+        mock_repo.mark_fs_synced.assert_not_called()
+
+    async def test_warnings_for_ignored_frontmatter_fields(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """codex round-4 P1 权威契约：warnings 覆盖所有 5 个 file-only /
+        系统字段（source / created_at / auto_promoted_at / title /
+        category / pinned / tags）。
+
+        id 不在 warnings 里 —— mismatch 直接 409（见 test_conflict_on_id_mismatch）。
+        """
+        import dataclasses
+
+        chunk = self._make_chunk_with_fs(content="orig body")  # source="session_flush"
+        mock_repo.get_by_id.return_value = chunk
+        updated_row = dataclasses.replace(
+            chunk, content="edited body", content_hash="nh", fs_synced=True
+        )
+        mock_repo.reindex_content = AsyncMock(return_value=updated_row)
+
+        # hand-edit 改了全套 file-only + 系统字段
+        store = self._make_file_store(
+            read_return=(
+                {
+                    "id": chunk.id,
+                    "source": "manual",              # 系统字段：session_flush → manual
+                    "created_at": "1970-01-01T00:00:00+00:00",  # 系统字段：改到 epoch
+                    "category": "rule",              # file-only：user → rule
+                    "pinned": True,                  # file-only
+                    "tags": ["new-tag"],             # file-only
+                    "title": "my custom title",      # file-only：vs derived
+                },
+                "edited body",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+        assert result.reindexed_fields == ["content"]
+
+        joined = " | ".join(result.warnings)
+        # 系统字段
+        assert "source" in joined and "manual" in joined
+        assert "created_at" in joined
+        # file-only 字段
+        assert "category" in joined and "rule" in joined
+        assert "pinned" in joined
+        assert "tags" in joined
+        # **title 必须被检查**（codex round-4 P1 漏检补）
+        assert "title" in joined
+        assert "my custom title" in joined
+
+        # **诚实文案**（codex round-4 P1）：warnings 不能承诺虚假恢复路径
+        assert "PATCH" not in joined, (
+            f"warning 不该提 PATCH（PATCH 只收 content 不接受 category/pinned/tags）: {joined}"
+        )
+        assert "reconciler" not in joined, (
+            f"warning 不该提 reconciler（walk 不写回 frontmatter 到 DB）: {joined}"
+        )
+        # 但要明示"留在文件侧，不进 DB/search/prompt"语义
+        assert "文件" in joined or "file" in joined.lower()
+
+        # P0 race fix 回归：走 reindex_content 不走 update_content
+        mock_repo.reindex_content.assert_awaited_once()
+
+    async def test_title_mismatch_warned_even_when_body_changed(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """codex round-4 P1 补测：hand-edit title 改动 → warning 说 title
+        仍由正文首行派生覆盖，不 apply 到 DB。"""
+        import dataclasses
+
+        chunk = self._make_chunk_with_fs(content="orig body")
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.reindex_content = AsyncMock(
+            return_value=dataclasses.replace(
+                chunk, content="new first line\nmore", fs_synced=True
+            )
+        )
+        store = self._make_file_store(
+            read_return=(
+                {
+                    "id": chunk.id,
+                    "source": chunk.source,
+                    "category": chunk.category,
+                    "title": "用户自定义标题",
+                },
+                "new first line\nmore",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+        joined = " | ".join(result.warnings)
+        assert "title" in joined
+        assert "用户自定义标题" in joined
+        # 提示系统真实行为：title 来自 derive_title(body) 即 "new first line"
+        assert "new first line" in joined
+
+    async def test_empty_body_rejected_with_400(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """codex round-4 P2：hand-edit 删光正文 → 400，与 create/update 契约一致。
+
+        否则 hand-edit 成为唯一绕过 "content must not be empty" 不变式的
+        入口，contract 漂移。
+        """
+        from app.application.errors.exceptions import BadRequestError
+
+        chunk = self._make_chunk_with_fs(content="orig")
+        mock_repo.get_by_id.return_value = chunk
+        # 盘上 body 被清空（只留空白）
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "   \n\n  ",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        with pytest.raises(BadRequestError, match="body 为空"):
+            await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+    async def test_embedding_failure_degrades_to_none(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """embedding provider 故障 → 写 None embedding 继续 UPDATE。"""
+        import dataclasses
+        from app.domain.external.embedding_provider import EmbeddingUnavailableError
+
+        chunk = self._make_chunk_with_fs(content="orig body")
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.reindex_content = AsyncMock(
+            return_value=dataclasses.replace(
+                chunk, content="new body", content_hash="nh", fs_synced=True
+            )
+        )
+        mock_embed.embed = AsyncMock(
+            side_effect=EmbeddingUnavailableError("circuit open")
+        )
+
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "new body",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+
+        assert result.reindexed_fields == ["content"]
+        # embedding=None 被传给 reindex_content（冷数据写入）
+        assert mock_repo.reindex_content.call_args.kwargs["embedding"] is None
+
+    async def test_trailing_newline_does_not_trigger_reindex(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """fs 文件末尾 ``\\n``（POSIX 规范）vs DB content（无 trailing \\n）
+        应当视作等价，避免每次 hand-edit 跑一下都以为改了。"""
+        chunk = self._make_chunk_with_fs(content="body without newline")
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.reindex_content = AsyncMock()  # 不应被调
+        # 盘上 body 多一个尾 \n
+        store = self._make_file_store(
+            read_return=(
+                {"id": chunk.id, "source": chunk.source, "category": chunk.category},
+                "body without newline\n",
+            )
+        )
+        svc = self._build_svc(mock_repo, mock_embed, mock_session, store)
+
+        result = await svc.reindex_memory(TEST_USER_ID_FIXED, chunk.id)
+        assert result.reindexed_fields == []  # no-op
+        mock_repo.reindex_content.assert_not_called()

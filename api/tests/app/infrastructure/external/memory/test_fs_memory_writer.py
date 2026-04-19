@@ -345,3 +345,99 @@ class TestMemoryRootResolution:
         monkeypatch.chdir(tmp_path)
         w = FsMemoryWriter("relative/memory")
         assert w._root.is_absolute()
+
+
+# ─── FsMemoryWriter.read（post-M3 reindex）────────────────────────────────
+
+class TestReadHappyPath:
+    """``FsMemoryWriter.read`` 返 (frontmatter_dict, body_str)，
+    复用 write 的 path traversal + symlink 防御。"""
+
+    async def test_read_returns_frontmatter_and_body(
+        self, tmp_path: Path
+    ):
+        """写一个 memory 文件后 read 回来，frontmatter dict + body str。"""
+        writer = FsMemoryWriter(tmp_path)
+        await writer.write(
+            user_id="alice",
+            memory_id="mem-1",
+            category="user",
+            content="用户偏好：Go 10 年",
+            frontmatter={
+                "id": "mem-1",
+                "title": "Go 经验",
+                "category": "user",
+                "source": "memory_save",
+                "created_at": "2026-04-19T00:00:00+00:00",
+                "updated_at": "2026-04-19T00:00:00+00:00",
+                "tags": ["go"],
+                "pinned": True,
+            },
+        )
+
+        fm, body = await writer.read(
+            user_id="alice", memory_id="mem-1", category="user"
+        )
+        assert fm["id"] == "mem-1"
+        assert fm["category"] == "user"
+        assert fm["pinned"] is True
+        assert fm["tags"] == ["go"]
+        assert body.strip() == "用户偏好：Go 10 年"
+
+    async def test_read_missing_file_raises_file_not_found(
+        self, tmp_path: Path
+    ):
+        """不存在的文件抛 FileNotFoundError，service 层 map 409。"""
+        writer = FsMemoryWriter(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            await writer.read(
+                user_id="alice", memory_id="nope", category="user"
+            )
+
+    async def test_read_bad_yaml_raises_value_error(
+        self, tmp_path: Path
+    ):
+        """frontmatter 格式损坏 → ValueError，service 层 map 400。"""
+        user_dir = tmp_path / "alice" / "user"
+        user_dir.mkdir(parents=True)
+        # 无 closing --- fence
+        (user_dir / "bad.md").write_text(
+            "---\nid: bad\ntitle: oops\n\nno closing fence\n",
+            encoding="utf-8",
+        )
+
+        writer = FsMemoryWriter(tmp_path)
+        with pytest.raises(ValueError):
+            await writer.read(user_id="alice", memory_id="bad", category="user")
+
+    async def test_read_rejects_symlink_target(self, tmp_path: Path):
+        """host-planted symlink 在 read 侧也要被 SecurityError 拦——读侧
+        与写侧同源防御（codex round-2 客户端守卫的对偶）。"""
+        import os
+        from app.application.errors.exceptions import SecurityError
+
+        user_dir = tmp_path / "alice" / "user"
+        user_dir.mkdir(parents=True)
+        victim = tmp_path / "outside_secret.md"
+        victim.write_text("secret", encoding="utf-8")
+        symlink = user_dir / "evil.md"
+        try:
+            os.symlink(victim, symlink)
+        except (OSError, NotImplementedError):
+            pytest.skip("fs 不支持 symlink")
+
+        writer = FsMemoryWriter(tmp_path)
+        with pytest.raises(SecurityError):
+            await writer.read(
+                user_id="alice", memory_id="evil", category="user"
+            )
+
+    async def test_read_rejects_traversal(self, tmp_path: Path):
+        """memory_id 含 ``..`` → SecurityError（_reject_segment 防御）。"""
+        from app.application.errors.exceptions import SecurityError
+
+        writer = FsMemoryWriter(tmp_path)
+        with pytest.raises(SecurityError):
+            await writer.read(
+                user_id="alice", memory_id="../../etc/passwd", category="user"
+            )

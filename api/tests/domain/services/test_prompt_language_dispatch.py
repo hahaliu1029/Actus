@@ -88,6 +88,7 @@ def test_execution_prompt_placeholders_match() -> None:
         "step": "test step",
         "message": "test message",
         "attachments": "[]",
+        "prior_step_outputs": "无",
         "language": "en",
     }
     for lang in ("zh", "en"):

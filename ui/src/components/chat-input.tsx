@@ -93,6 +93,8 @@ export function ChatInput({
 
   // Recover pendingFiles from completed upload tasks on mount/session change/upload completion.
   // Guard: only recover if pendingFiles is empty (user hasn't manually modified the list).
+  // ``exhaustive-deps`` 故意省略 pendingFiles / completedUploads 深依赖——
+  // 只在 count 变化时做一次性恢复，不是 deep-watch。
   const completedUploadCount = completedUploads.length;
   useEffect(() => {
     if (completedUploadCount > 0 && pendingFiles.length === 0) {
@@ -102,7 +104,8 @@ export function ChatInput({
       setPendingFiles(files);
       setTaskIdByFileId(mapping);
     }
-  }, [sessionId, completedUploadCount]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, completedUploadCount]);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -167,8 +170,9 @@ export function ChatInput({
     if (taskId) {
       removeTransferTask(taskId);
       setTaskIdByFileId((prev) => {
-        const { [fileId]: _, ...rest } = prev;
-        return rest;
+        const next = { ...prev };
+        delete next[fileId];
+        return next;
       });
     }
   };

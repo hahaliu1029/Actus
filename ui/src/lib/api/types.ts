@@ -758,3 +758,26 @@ export interface DeleteCountResponse {
 export interface LegacyCleanupConfigResponse {
   rollout_at: string | null;
 }
+
+/**
+ * Post-M3 reindex endpoint 响应（Option A 权威契约；codex round-4 收口）。
+ *
+ * 契约表（与后端 service / route / schema docstring 四层对齐）：
+ * - `body` → apply 到 DB
+ * - `id` mismatch → 409（不在 warnings 里）
+ * - `source` / `created_at` / `auto_promoted_at` → warnings（系统字段）
+ * - `title` / `category` / `pinned` / `tags` → warnings + **file-only**
+ *
+ * - `reindexed_fields`: 实际 apply 到 DB 的字段；`["content"]` = body 改动已同步；
+ *   `[]` = no-op 幂等（盘上与 DB 一致）。未来扩展新字段 append 到 Literal。
+ * - `warnings`: hand-edit 改了 file-only / 系统字段被忽略的说明；**这些字段
+ *   只停留在文件侧（sandbox `file_read` 能看到），不进入 DB /
+ *   `memory_search` / prompt；当前没有受支持的自动同步路径**。前端需原样
+ *   展示，不能承诺"走 PATCH"或"等 reconciler"——两个路径都不真实可用。
+ * - `fs_synced`: reindex 后 DB 的 fs_synced 值（正常路径恒 True）。
+ */
+export interface ReindexResponse {
+  reindexed_fields: ("content")[];
+  warnings: string[];
+  fs_synced: boolean;
+}

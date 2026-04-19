@@ -287,11 +287,18 @@ class DockerSandbox(Sandbox):
         if not getattr(settings, "sandbox_memory_mount_enabled", False):
             return None
 
-        # 两条 root 都先 expanduser，让 memory_root_container 写 "~/..." 的极端
-        # 配置也能解析（validator 允许 ``/`` 或 ``~`` 开头；container 侧若没
-        # expanduser，Docker 会把 "~" 解释成相对路径直接启动失败）。
-        container_root = Path(settings.memory_root_container).expanduser()
-        host_root = Path(settings.memory_root_host).expanduser()
+        # 两条 root 都要求绝对路径；这里不做 expanduser，避免把 ``~`` 在 api
+        # 容器里误展开成 ``/root/...`` 后再传给宿主机 docker daemon。
+        container_root = Path(settings.memory_root_container)
+        host_root = Path(settings.memory_root_host)
+        if not container_root.is_absolute() or not host_root.is_absolute():
+            logger.warning(
+                "拒绝构造 memory bind mount：root 不是绝对路径 "
+                "host_root=%r container_root=%r",
+                str(host_root),
+                str(container_root),
+            )
+            return None
 
         container_mem_dir = container_root / user_id
         host_mem_dir = host_root / user_id

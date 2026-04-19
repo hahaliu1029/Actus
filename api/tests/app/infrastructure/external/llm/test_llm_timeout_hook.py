@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import openai
 import pytest
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
@@ -24,6 +25,7 @@ from app.infrastructure.external.llm.actus_fallback_chat_model import (
     ActusFallbackChatModel,
 )
 from app.infrastructure.external.llm.actus_responses_model import ActusResponsesModel
+from app.infrastructure.external.llm._timeout_helpers import with_llm_timeout
 
 pytestmark = pytest.mark.anyio
 
@@ -715,19 +717,30 @@ class TestResponsesModelBindToolsClone:
 class TestFallbackModelBudgetIndependence:
     """D5.1: FallbackChatModel inherits timeout behavior from children.
 
-    ActusFallbackChatModel._agenerate (line 82-112) catches ``Exception``
-    (which includes ``ServerRequestsError`` from D5.1's ``with_llm_timeout``
-    helper) and falls through to fallback. Each child's wait_for wrap is
-    independent — primary's 120s budget is separate from fallback's 120s
-    budget. The ``test_primary_timeout_triggers_fallback`` test pins this
-    specifically via a caplog assertion on the ``"exceeded Ns hard timeout"``
-    log message.
+    Timeouts are wrapped as ``ServerRequestsError`` by ``with_llm_timeout``.
+    Per the selective-fallback semantics (see ``ActusFallbackChatModel``
+    module docstring), ``ServerRequestsError`` is NOT a protocol-
+    incompatibility signal — it's a transient/server-side error that
+    should be retried at the same endpoint by LangGraph's ``RetryPolicy``,
+    not escalated to Responses API. Fallback trigger is now restricted
+    to ``openai.BadRequestError`` / ``UnprocessableEntityError`` —
+    ``NotFoundError`` was deliberately excluded because a generic 404
+    also fires on wrong model name or wrong base_url path.
+
+    See also ``test_fallback_selective_exception.py`` for the full
+    exception-routing matrix.
     """
 
-    async def test_primary_timeout_triggers_fallback(
+    async def test_primary_timeout_propagates_no_fallback(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """When primary._agenerate raises ServerRequestsError (timeout), fallback is invoked."""
+        """D5.1 timeout (ServerRequestsError) must propagate — not trigger fallback.
+
+        This pins the selective-fallback contract: transient server errors
+        stay with primary so LangGraph RetryPolicy can retry the same
+        endpoint. Cross-protocol escalation is reserved for genuine
+        protocol/payload incompatibility (openai.BadRequestError etc.).
+        """
         primary = ActusChatModel(
             base_url="https://x.test/v1",
             api_key="k",
@@ -738,11 +751,12 @@ class TestFallbackModelBudgetIndependence:
             base_url="https://y.test/v1",
             api_key="k",
             model_name="fallback-model",
-            timeout_seconds=0.2,  # also tight, but will succeed because mock returns fast
+            timeout_seconds=0.2,
         )
         fallback_model = ActusFallbackChatModel(primary=primary, fallback=fallback)
 
-        # Primary hangs
+        # Primary hangs → with_llm_timeout wraps asyncio.TimeoutError
+        # as ServerRequestsError("... exceeded 0.2s hard timeout").
         async def slow_create(**_kwargs):
             await asyncio.sleep(5.0)
             return _make_chat_completion()
@@ -752,7 +766,6 @@ class TestFallbackModelBudgetIndependence:
         primary_client.chat.completions = MagicMock()
         primary_client.chat.completions.create = AsyncMock(side_effect=slow_create)
 
-        # Fallback returns immediately
         fallback_client = MagicMock()
         fallback_client.chat = MagicMock()
         fallback_client.chat.completions = MagicMock()
@@ -763,27 +776,19 @@ class TestFallbackModelBudgetIndependence:
         with patch.object(primary, "_get_client", return_value=primary_client):
             with patch.object(fallback, "_get_client", return_value=fallback_client):
                 with caplog.at_level(logging.WARNING):
-                    result = await fallback_model._agenerate([HumanMessage(content="hi")])
+                    with pytest.raises(
+                        ServerRequestsError,
+                        match=r"exceeded 0\.2s hard timeout",
+                    ):
+                        await fallback_model._agenerate(
+                            [HumanMessage(content="hi")]
+                        )
 
-        # Fallback path should have succeeded
-        assert result.generations[0].message.content == "from-fallback"
-        # Primary should have been attempted (and timed out)
+        # Primary was attempted and timed out.
         assert primary_client.chat.completions.create.await_count == 1
-        assert fallback_client.chat.completions.create.await_count == 1
-
-        # Proves the SPECIFIC timeout triggered fallback, not just any exception.
-        # ActusFallbackChatModel._agenerate logs "Primary LLM ... failed, falling back"
-        # at WARNING level when primary raises. The log message includes the original
-        # exception str, which for D5.1 timeouts is "LLM ({model}) call exceeded {N}s
-        # hard timeout". Without this assertion, the test would pass even if the
-        # primary raised any other Exception subclass.
-        assert any(
-            "exceeded 0.2s hard timeout" in record.message
-            for record in caplog.records
-        ), (
-            f"Expected ServerRequestsError with 'exceeded 0.2s hard timeout' "
-            f"in fallback warning log; got: {[r.message for r in caplog.records]}"
-        )
+        # Fallback must NOT have been invoked — ServerRequestsError is not
+        # a protocol-incompatibility signal.
+        assert fallback_client.chat.completions.create.await_count == 0
 
     async def test_fallback_bind_tools_propagates_timeout_seconds_to_children(self) -> None:
         """When FallbackChatModel.bind_tools clones, both children keep timeout_seconds."""
@@ -976,3 +981,154 @@ class TestMidStreamWatchdogContract:
         # and 0.2s adapter timeout. D5 ExecutionWatchdog would handle this at
         # the graph level instead.
         assert "first" in collected
+
+
+# ---------------------------------------------------------------------------
+# Transient-error translation in with_llm_timeout
+# ---------------------------------------------------------------------------
+
+
+def _make_openai_error(cls: type[Exception], message: str = "boom") -> Exception:
+    """Instantiate an openai SDK error without needing a real httpx.Response."""
+    err = cls.__new__(cls)
+    Exception.__init__(err, message)
+    return err
+
+
+class TestTransientOpenaiTranslation:
+    """``with_llm_timeout`` translates SDK transport exceptions so LangGraph
+    ``RetryPolicy(retry_on=ServerRequestsError)`` at ``react_graph.llm_node``
+    and ``main_graph.planner_node`` can retry them. Without this, the SDK's
+    ``max_retries=0`` plus RetryPolicy's narrow ``retry_on`` leaves these
+    errors with no retry path at all.
+    """
+
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+            openai.RateLimitError,
+        ],
+    )
+    async def test_transient_openai_is_translated_to_server_requests_error(
+        self, exc_cls: type[Exception],
+    ) -> None:
+        adapter = SimpleNamespace(timeout_seconds=5.0, model_name="test-m")
+
+        async def coro():
+            raise _make_openai_error(exc_cls, "transport-level")
+
+        with pytest.raises(ServerRequestsError) as excinfo:
+            await with_llm_timeout(adapter, coro())
+
+        # Message identifies both the adapter and the original class.
+        msg = str(excinfo.value)
+        assert "test-m" in msg
+        assert exc_cls.__name__ in msg
+
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [
+            openai.BadRequestError,
+            openai.UnprocessableEntityError,
+            openai.NotFoundError,
+            openai.AuthenticationError,
+            openai.PermissionDeniedError,
+        ],
+    )
+    async def test_non_transient_openai_is_not_translated(
+        self, exc_cls: type[Exception],
+    ) -> None:
+        """Protocol/permanent errors must surface as-is so:
+        - BadRequestError / UnprocessableEntityError reach ActusFallbackChatModel
+          for cross-protocol escalation
+        - NotFoundError / AuthenticationError / PermissionDeniedError surface as
+          permanent failures (not silently retried)
+        """
+        adapter = SimpleNamespace(timeout_seconds=5.0, model_name="test-m")
+
+        async def coro():
+            raise _make_openai_error(exc_cls, "not-transient")
+
+        with pytest.raises(exc_cls):
+            await with_llm_timeout(adapter, coro())
+
+    async def test_translation_applies_when_timeout_is_disabled(self) -> None:
+        """timeout_seconds=0 skips wait_for, but translation still runs."""
+        adapter = SimpleNamespace(timeout_seconds=0, model_name="test-m")
+
+        async def coro():
+            raise _make_openai_error(openai.RateLimitError, "limit")
+
+        with pytest.raises(ServerRequestsError, match="RateLimitError"):
+            await with_llm_timeout(adapter, coro())
+
+
+class TestAstreamMidStreamTranslation:
+    """Regression: ``with_llm_timeout`` only bounds stream *setup*; the
+    iteration loop runs after the wait_for wrap has released. Transient
+    SDK errors thrown mid-iteration (read timeout, TCP reset, upstream
+    5xx mid-SSE) used to leak out as raw openai exceptions — past both
+    ActusFallbackChatModel (not a protocol signal) and past LangGraph's
+    ``RetryPolicy(retry_on=ServerRequestsError)``. They must now translate
+    to ``ServerRequestsError`` like the sync path does.
+    """
+
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [
+            # TRANSIENT_OPENAI_EXCEPTIONS branch
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+            openai.RateLimitError,
+            # openai.APIError branch — bare APIError is what the SDK raises
+            # on mid-stream SSE ``error`` events (see openai/_streaming.py
+            # 75/92/178/195). APIResponseValidationError covers malformed
+            # response payloads. Both must also translate so llm_node retries.
+            openai.APIError,
+            openai.APIResponseValidationError,
+        ],
+    )
+    async def test_mid_stream_transient_is_translated(
+        self, exc_cls: type[Exception],
+    ) -> None:
+        model = ActusChatModel(
+            base_url="https://x.test/v1",
+            api_key="k",
+            model_name="stream-m",
+            timeout_seconds=5.0,
+        )
+
+        async def transient_stream(**_kwargs):
+            async def _gen():
+                # Yield one good chunk so ``has_content`` becomes True,
+                # which proves the raise is not the empty-stream validator
+                # but the mid-iter translation path.
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(content="partial", tool_calls=None),
+                    )],
+                )
+                raise _make_openai_error(exc_cls, "mid-stream-boom")
+
+            return _gen()
+
+        mock_client = MagicMock()
+        mock_client.chat = MagicMock()
+        mock_client.chat.completions = MagicMock()
+        mock_client.chat.completions.create = MagicMock(side_effect=transient_stream)
+
+        with patch.object(model, "_get_client", return_value=mock_client):
+            collected: list[str] = []
+            with pytest.raises(ServerRequestsError) as excinfo:
+                async for chunk in model._astream([HumanMessage(content="hi")]):
+                    collected.append(chunk.message.content)
+
+        assert collected == ["partial"], (
+            "Expected the one good chunk to flush before the mid-stream raise"
+        )
+        assert exc_cls.__name__ in str(excinfo.value)
+        assert "stream-m" in str(excinfo.value)

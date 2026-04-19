@@ -20,7 +20,13 @@ from typing import TYPE_CHECKING, Callable
 
 from sqlalchemy.exc import IntegrityError
 
-from app.application.errors.exceptions import ConflictError
+from app.application.errors.exceptions import (
+    BadRequestError,
+    ConflictError,
+    NotFoundError,
+    SecurityError,
+    ServiceUnavailableError,
+)
 from app.application.services.memory_quota import (
     check_and_increment_user_daily,
     refund_user_daily,
@@ -36,6 +42,23 @@ _TAG_MAX_LENGTH = 64
 _TAGS_MAX_COUNT = 20
 # 允许的 manual / memory_save 写入路径枚举；DB CHECK 再兜一次
 _ALLOWED_CATEGORIES = frozenset({"user", "rule", "fact"})
+
+
+@dataclasses.dataclass(frozen=True)
+class ReindexResult:
+    """``MemoryManagementService.reindex_memory`` 返回值。
+
+    - ``reindexed_fields``: 实际被 apply 到 DB 的字段；Option A 只有 ``content``
+      或空 list（no-op）。
+    - ``warnings``: frontmatter 中 Option A 不支持 / 只读字段被忽略的说明
+      列表；前端 dialog 展示给 power user。
+    - ``fs_synced``: reindex 后 DB 的 ``fs_synced`` 值（成功翻为 True；
+      ``_try_mark_fs_synced`` 失败时可能留 False，reconciler 会补）。
+    """
+
+    reindexed_fields: list[str]
+    warnings: list[str]
+    fs_synced: bool
 _ALLOWED_SOURCES = frozenset({"session_flush", "manual", "memory_save"})
 
 
@@ -603,6 +626,305 @@ class MemoryManagementService:
                     synced=True,
                 )
         return updated
+
+    async def reindex_memory(
+        self, user_id: str, chunk_id: str
+    ) -> "ReindexResult":
+        """从磁盘读 hand-edit 的 memory 文件并同步 DB（Option A：body-only）。
+
+        闭环 hand-edit power-user 工作流：用户编辑 ``${MEMORY_ROOT}/{uid}/
+        {cat}/{id}.md`` → POST /reindex → DB content + embedding 立即重算，
+        ``memory_search`` / ``memory_recall`` 可查到新内容，不必重启 session
+        或跑 CLI reconciler。
+
+        **Option A 权威契约表（codex round-4 收口，四层对齐）：**
+
+        | Frontmatter field                 | 行为       | 原因                              |
+        |-----------------------------------|------------|-----------------------------------|
+        | body (正文)                       | **apply**  | reindex 本职：同步正文到 DB       |
+        | id                                | **409 Conflict** | id 不允许 hand-edit；mismatch 直接报错而非 warn |
+        | source / created_at / auto_promoted_at | warning    | 系统字段，被忽略（不 apply）       |
+        | title / category / pinned / tags  | warning (file-only) | 留在文件层；**不进 DB / search / prompt** |
+
+        **警告文案必须诚实**：file-only 字段改动后没有受支持的 DB 同步路径
+        （PATCH 只收 content；FsReconciler 不回写 frontmatter 到 DB）——
+        文案直说"留在文件层"而不是承诺虚假恢复路径。codex round-4 P1
+        把这条钉死。
+
+        **错误映射**：
+        - DB 无此 chunk → ``NotFoundError`` (404)
+        - file_store 未注入 → ``ServiceUnavailableError`` (503) —— deployment
+          配置问题不是客户端错（codex round-4 P2）
+        - 文件不存在 → ``ConflictError`` (409)
+        - frontmatter parse 失败 / 空 body → ``BadRequestError`` (400)
+        - frontmatter id 与 DB id 不匹配 → ``ConflictError`` (409)
+        - 路径穿越 / symlink → ``SecurityError`` (403)，writer 原样抛出
+
+        **fs_synced 契约（codex round-4 P0 race fix）**：走
+        ``repo.reindex_content`` 直接 ``fs_synced=True`` 的 UPDATE，绕开
+        ``update_content`` 的 "原子置 False + 后置翻 True" 两阶段。并发
+        ``FsReconciler.scan_pending_fs_sync`` 无法捕到 False 窗口 → 不会用
+        canonical frontmatter 覆盖 hand-edit。no-op 分支若 existing 行
+        ``fs_synced=False``，也补调 ``mark_fs_synced(True)`` 修复 stale 状态。
+
+        ``embedding_provider`` 不可用时降级为 None（与 ``update_memory_content``
+        一致，保留文本但暂不可召回）。
+        """
+        if self._file_store is None:
+            # deployment 配置问题（DB-only 模式部署但 UI 启用 reindex）；
+            # 503 比 400 更准确——不是客户端请求错（codex round-4 P2）
+            raise ServiceUnavailableError(
+                "reindex 需要 file_store 后端；当前 deployment 运行在 DB-only 模式"
+            )
+
+        # Step 1: 从 DB 取现有 chunk
+        async with self._session_factory() as session:
+            repo = self._repo_factory(session)
+            existing = await repo.get_by_id(chunk_id, user_id)
+        if existing is None:
+            raise NotFoundError("记忆不存在")
+
+        # Legacy 行 category IS NULL → 不能 reindex（没有 fs 路径可读）
+        if existing.category is None:
+            raise ConflictError(
+                "legacy 记忆（category 为空）不支持 reindex；"
+                "请先通过 UI / API 分类后再操作"
+            )
+
+        # Step 2: 从 fs 读文件 + parse
+        try:
+            frontmatter, body = await self._file_store.read(
+                user_id=user_id,
+                memory_id=chunk_id,
+                category=existing.category,
+            )
+        except FileNotFoundError as exc:
+            raise ConflictError(
+                f"磁盘上不存在此记忆文件（{existing.category}/{chunk_id}.md）；"
+                f"可能已被 hand-delete，调用 DELETE /v2/memories/{chunk_id} 清 DB 行"
+            ) from exc
+        except ValueError as exc:
+            raise BadRequestError(f"memory 文件 frontmatter 解析失败：{exc}") from exc
+        except NotImplementedError as exc:
+            # NoopFileMemoryStore.read() 会抛 NotImplementedError；DI 注入
+            # 空实现时语义等同于"不支持 reindex"，映射 503 而非裸 500。
+            raise ServiceUnavailableError(
+                "当前 file_store 实现不支持 read 操作（DB-only 变体）"
+            ) from exc
+        # SecurityError 原样抛出到 interfaces 层
+
+        # Step 3: invariant check — frontmatter id 必须与 DB id 一致
+        fm_id = frontmatter.get("id")
+        if fm_id != chunk_id:
+            raise ConflictError(
+                f"frontmatter id 不匹配：fs={fm_id!r} DB={chunk_id!r}；"
+                f"hand-edit 不允许改 id，建议重启 session 让 reconciler 搬至 .orphans/"
+            )
+
+        # Step 4: 对比 body content；空 body → 与 create/update 契约一致拒绝
+        body_normalized = body.rstrip("\n")
+        if not body_normalized.strip():
+            # 与 create_memory / update_memory_content 的 "content must not be
+            # empty" 契约对齐——否则 hand-edit 成为唯一绕过不变式的入口
+            # （codex round-4 P2）
+            raise BadRequestError(
+                "reindex 结果 body 为空；与 create/update 契约对齐，拒绝写入 DB"
+            )
+
+        # Step 5: 收集 warnings（需要 body_normalized 才能对比 derived title）
+        warnings: list[str] = self._collect_reindex_warnings(
+            existing, frontmatter, body_normalized
+        )
+
+        # Step 6: 对比 body；相同 → no-op 幂等返回（但 existing.fs_synced=False
+        # 要修回 True，避免把旧的 stale flag 留给 reconciler 覆盖）
+        db_normalized = existing.content.rstrip("\n")
+        if body_normalized == db_normalized:
+            logger.info(
+                "reindex no-op（盘上 body 与 DB 一致）user_id=%s chunk_id=%s fs_synced=%s",
+                user_id, chunk_id, existing.fs_synced,
+            )
+            fs_synced = existing.fs_synced
+            if not fs_synced:
+                # codex round-4 P0：no-op 也要修 stale fs_synced=False，否则
+                # reconciler 下次扫到会用 canonical builder 覆盖 hand-edit。
+                fixed = await self._try_mark_fs_synced(
+                    user_id=user_id, chunk=existing, synced=True,
+                )
+                fs_synced = fixed.fs_synced
+            return ReindexResult(
+                reindexed_fields=[],
+                warnings=warnings,
+                fs_synced=fs_synced,
+            )
+
+        # Step 7: 重算 embedding + UPDATE DB（走 reindex_content 保持 fs_synced=True）
+        new_hash = memory_content_hash(body_normalized)
+        embedding: tuple[float, ...] | None = None
+        try:
+            vectors = await self._embedding_provider.embed([body_normalized])
+            if vectors:
+                embedding = tuple(vectors[0])
+        except EmbeddingUnavailableError:
+            logger.warning(
+                "reindex embedding 降级（provider 不可用）chunk_id=%s",
+                chunk_id,
+                exc_info=True,
+            )
+
+        async with self._session_factory() as session:
+            repo = self._repo_factory(session)
+            try:
+                # codex round-4 P0 race fix：走 reindex_content 单语句把
+                # content/hash/embedding/fs_synced=True 一起 UPDATE，**不**
+                # 经过 update_content 的 fs_synced=False 窗口。
+                updated = await repo.reindex_content(
+                    chunk_id=chunk_id,
+                    user_id=user_id,
+                    content=body_normalized,
+                    content_hash=new_hash,
+                    embedding=embedding,
+                )
+            except IntegrityError as exc:
+                orig = getattr(exc, "orig", None)
+                pgcode = (
+                    getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+                )
+                if pgcode == "23505":
+                    # hand-edit 出了与其它 chunk 内容完全相同的文本 → unique
+                    # violation on (user_id, content_hash)。
+                    raise ConflictError(
+                        "reindex 结果与本用户其它记忆内容重复"
+                    ) from exc
+                raise
+
+            if updated is None:
+                # repo.reindex_content 返 None = chunk_id + user_id 不匹配；
+                # Step 1 get_by_id 已确认过——可能刚被并发删了。
+                raise NotFoundError("记忆已被并发删除")
+
+            await self._write_audit(
+                session,
+                user_id=user_id,
+                chunk_id=chunk_id,
+                action="reindex",
+                old_snapshot={
+                    "content": existing.content[:_AUDIT_CONTENT_PREVIEW_LIMIT],
+                    "content_hash": existing.content_hash,
+                },
+                new_snapshot={
+                    "content": body_normalized[:_AUDIT_CONTENT_PREVIEW_LIMIT],
+                    "content_hash": new_hash,
+                    "warnings": warnings,
+                },
+            )
+            await session.commit()
+
+        # fs_synced 已经是 True（reindex_content 直接 UPDATE set），不需要
+        # 后置 _try_mark_fs_synced(True) —— 这是 P0 race fix 的核心。
+        return ReindexResult(
+            reindexed_fields=["content"],
+            warnings=warnings,
+            fs_synced=updated.fs_synced,
+        )
+
+    @staticmethod
+    def _collect_reindex_warnings(
+        existing: MemoryChunk,
+        frontmatter: dict,
+        body_normalized: str,
+    ) -> list[str]:
+        """收集 Option A 不 apply 的 frontmatter 改动（codex round-4 收口）。
+
+        权威契约（service docstring / route description / schema / UI 四处对齐）:
+
+        - ``body`` → reindex 的唯一 apply 对象（在本函数外对比）
+        - ``id`` → 不在 warnings 里；mismatch 直接 409（reindex_memory Step 3）
+        - ``source`` / ``created_at`` / ``auto_promoted_at`` → warnings（系统字段）
+        - ``title`` / ``category`` / ``pinned`` / ``tags`` → warnings + file-only
+
+        **诚实文案**（codex round-4 P1）：file-only 字段改动后**没有**受支持的
+        DB 同步路径——``PATCH /v2/memories/{id}`` 只收 ``content``，
+        ``FsReconciler.walk_user_directory`` 不把这些 frontmatter 字段写回 DB。
+        所以 warning 不能承诺虚假恢复路径；直接说"留在文件层，不进 DB /
+        search / prompt"。
+
+        ``updated_at`` 不检查——用户 hand-edit 可能改也可能不改，reindex
+        完成后服务端会统一刷新（走 DB ``now()``）。
+        """
+        warnings: list[str] = []
+
+        # ---- 只读系统字段（source / created_at / auto_promoted_at）----
+        # id 不在这里：mismatch 已经在调用方直接 409（避免降级为 warning 把
+        # 契约冲突掩盖掉）。
+        if frontmatter.get("source") not in (None, existing.source):
+            warnings.append(
+                f"frontmatter.source='{frontmatter['source']}' 与 DB "
+                f"'{existing.source}' 不一致；系统字段，已忽略"
+            )
+        fm_created = frontmatter.get("created_at")
+        if fm_created is not None:
+            existing_iso = existing.created_at.isoformat()
+            if str(fm_created) != existing_iso:
+                warnings.append(
+                    f"frontmatter.created_at='{fm_created}' 与 DB "
+                    f"'{existing_iso}' 不一致；系统字段，已忽略"
+                )
+        if "auto_promoted_at" in frontmatter:
+            fm_ap_raw = frontmatter["auto_promoted_at"]
+            fm_ap = str(fm_ap_raw) if fm_ap_raw is not None else None
+            db_ap = (
+                existing.auto_promoted_at.isoformat()
+                if existing.auto_promoted_at is not None
+                else None
+            )
+            if fm_ap != db_ap:
+                warnings.append(
+                    "frontmatter.auto_promoted_at 改动已忽略（系统字段，仅 LLM gate 写入）"
+                )
+
+        # ---- file-only 字段（title / category / pinned / tags）----
+        # 核心契约：这些字段仍保留在盘上（File LIVE view 可见），但**不进入**
+        # DB / memory_search / prompt snapshot。目前**没有**同步路径——
+        # PATCH 只收 content，reconciler walk 也不写回 frontmatter。
+
+        # title：系统真实语义是 derive_title(body_normalized) —— 用户手改的
+        # title 即便 body 没变也无法生效（系统重新 derive 会覆盖）
+        from app.infrastructure.external.memory.frontmatter import derive_title
+
+        expected_title = derive_title(body_normalized)
+        fm_title = frontmatter.get("title")
+        if fm_title is not None and str(fm_title) != expected_title:
+            warnings.append(
+                f"frontmatter.title='{fm_title}' 已忽略；当前系统 title 仍由"
+                f" 正文首行派生为 '{expected_title}'，不进入 DB"
+            )
+
+        fm_category = frontmatter.get("category")
+        if fm_category is not None and fm_category != existing.category:
+            warnings.append(
+                f"frontmatter.category='{fm_category}' 已忽略；Option A 仅"
+                f" 同步正文，category 仍只存在于文件侧，不会进入 DB 索引 /"
+                f" search / prompt"
+            )
+        fm_pinned = frontmatter.get("pinned")
+        if fm_pinned is not None and bool(fm_pinned) != bool(existing.pinned):
+            warnings.append(
+                f"frontmatter.pinned={fm_pinned} 已忽略；Option A 仅同步正文，"
+                f"pinned 仍只存在于文件侧，不会进入 DB 索引 / prompt 注入排序"
+            )
+        fm_tags = frontmatter.get("tags")
+        if fm_tags is not None:
+            existing_tags = (
+                existing.metadata.get("tags", []) if existing.metadata else []
+            )
+            if list(fm_tags) != list(existing_tags):
+                warnings.append(
+                    "frontmatter.tags 改动已忽略；Option A 仅同步正文，tags"
+                    " 仍只存在于文件侧，不会进入 DB 索引"
+                )
+
+        return warnings
 
     async def delete_memory(self, user_id: str, chunk_id: str) -> bool:
         """单条删除。审计快照用 DELETE ... RETURNING 返回的真实被删行，

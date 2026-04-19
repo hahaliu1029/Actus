@@ -55,7 +55,14 @@ class LLMConfig(BaseModel):
         default=None, ge=1024
     )  # 上下文窗口大小，空表示根据模型映射自动推断
     api_type: Literal["chat_completions", "responses", "auto"] = (
-        "chat_completions"  # API 类型: chat_completions / responses / auto（先 chat 失败回退 responses）
+        "chat_completions"
+        # API 类型: chat_completions / responses / auto。
+        # auto 是跨协议升级（不是同协议 retry）：chat.completions 仅在抛出
+        # 协议不兼容信号 (BadRequestError / UnprocessableEntityError) 时
+        # 升级到 responses；瞬时错误由 ActusChatModel + _timeout_helpers
+        # 翻译成 ServerRequestsError，交 LangGraph RetryPolicy 处理。
+        # Provider 若未实现 Responses API（如智谱 /api/paas/v4），应使用
+        # chat_completions 避免 fallback 路径 404。
     )
     supports_response_format: bool = True  # 是否支持 response_format 参数，部分兼容 API 不支持需设为 False
     supports_vision: bool = True  # 模型是否支持视觉/多模态输入（图片嵌入），关闭后强制使用 MCP 工具分析图片

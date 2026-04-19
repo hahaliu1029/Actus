@@ -34,10 +34,15 @@ from langchain_core.messages import (
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 import httpx
+import openai
 from openai import AsyncOpenAI
 
 from app.application.errors.exceptions import ServerRequestsError
-from app.infrastructure.external.llm._timeout_helpers import with_llm_timeout
+from app.infrastructure.external.llm._timeout_helpers import (
+    TRANSIENT_OPENAI_EXCEPTIONS,
+    translate_transient,
+    with_llm_timeout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -697,42 +702,72 @@ class ActusChatModel(BaseChatModel):
 
         stream = await with_llm_timeout(self, _obtain_stream())
 
+        # The ``wait_for`` wrap in ``with_llm_timeout`` only bounds the
+        # "obtain stream" step; the chunk loop below is deliberately
+        # unbounded (long streams can run for minutes). But SDK-level
+        # transport failures mid-stream (read timeout, TCP reset, upstream
+        # 5xx) still surface here as ``openai.APITimeoutError`` /
+        # ``APIConnectionError`` / ``InternalServerError`` / ``RateLimitError``.
+        # In addition, the SDK raises the bare ``openai.APIError`` when it
+        # receives an SSE ``error`` event from the provider mid-stream
+        # (see ``openai/_streaming.py`` lines 75/92/178/195 in SDK 2.14.0)
+        # — this class is NOT a subclass of the transient tuple.
+        # Translate both so ``RetryPolicy(retry_on=ServerRequestsError)`` at
+        # ``react_graph.llm_node`` can actually retry — otherwise they'd
+        # leak out past both ``ActusFallbackChatModel`` (not a protocol
+        # signal) and the graph-level retry and become terminal.
+        #
+        # Note: once streaming has started, ``ActusFallbackChatModel``'s
+        # cross-protocol escalation is no longer applicable (we've already
+        # committed to chat.completions and yielded partial output), so
+        # funneling every mid-stream ``APIError`` to the same-endpoint
+        # retry path is the correct routing regardless of subclass.
         has_content = False
-        async for chunk in stream:
-            # Guard against proxies yielding raw strings or malformed chunks
-            if not hasattr(chunk, "choices") or not chunk.choices:
-                continue
+        try:
+            async for chunk in stream:
+                # Guard against proxies yielding raw strings or malformed chunks
+                if not hasattr(chunk, "choices") or not chunk.choices:
+                    continue
 
-            delta = chunk.choices[0].delta
+                delta = chunk.choices[0].delta
 
-            # Extract content
-            content = delta.content or ""
+                # Extract content
+                content = delta.content or ""
 
-            # Extract tool_call_chunks for streaming aggregation
-            tool_call_chunks = []
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    fn = tc.function if hasattr(tc, "function") else None
-                    tool_call_chunks.append({
-                        "index": tc.index if hasattr(tc, "index") else 0,
-                        "id": tc.id if hasattr(tc, "id") and tc.id else None,
-                        "name": fn.name if fn and hasattr(fn, "name") and fn.name else None,
-                        "args": fn.arguments if fn and hasattr(fn, "arguments") else "",
-                    })
+                # Extract tool_call_chunks for streaming aggregation
+                tool_call_chunks = []
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        fn = tc.function if hasattr(tc, "function") else None
+                        tool_call_chunks.append({
+                            "index": tc.index if hasattr(tc, "index") else 0,
+                            "id": tc.id if hasattr(tc, "id") and tc.id else None,
+                            "name": fn.name if fn and hasattr(fn, "name") and fn.name else None,
+                            "args": fn.arguments if fn and hasattr(fn, "arguments") else "",
+                        })
 
-            if content or tool_call_chunks:
-                has_content = True
+                if content or tool_call_chunks:
+                    has_content = True
 
-            ai_chunk = AIMessageChunk(
-                content=content,
-                tool_call_chunks=tool_call_chunks if tool_call_chunks else [],
-            )
-            gen_chunk = ChatGenerationChunk(message=ai_chunk)
+                ai_chunk = AIMessageChunk(
+                    content=content,
+                    tool_call_chunks=tool_call_chunks if tool_call_chunks else [],
+                )
+                gen_chunk = ChatGenerationChunk(message=ai_chunk)
 
-            if run_manager:
-                await run_manager.on_llm_new_token(content, chunk=gen_chunk)
+                if run_manager:
+                    await run_manager.on_llm_new_token(content, chunk=gen_chunk)
 
-            yield gen_chunk
+                yield gen_chunk
+        except TRANSIENT_OPENAI_EXCEPTIONS as exc:
+            raise translate_transient(self, exc) from exc
+        except openai.APIError as exc:
+            # See comment above: bare ``APIError`` (SSE error events) and
+            # any other APIError subclass not in TRANSIENT_OPENAI_EXCEPTIONS
+            # (APIResponseValidationError, and the protocol/permanent
+            # subclasses which almost never fire mid-stream). Funnel them
+            # all to ServerRequestsError so the llm_node retry fires.
+            raise translate_transient(self, exc) from exc
 
         # Validate: stream produced zero useful chunks (same 404-in-200 scenario)
         if not has_content:

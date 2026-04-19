@@ -76,6 +76,7 @@ def mock_service() -> AsyncMock:
     svc.bulk_delete_memories = AsyncMock(return_value=0)
     svc.delete_all_memories = AsyncMock(return_value=0)
     svc.delete_legacy_memories = AsyncMock(return_value=0)
+    svc.reindex_memory = AsyncMock()
     return svc
 
 
@@ -504,6 +505,155 @@ async def test_get_cleanup_config_route_not_shadowed_by_chunk_id(
     # 若被 /{chunk_id} 吞了，get_memory 会被调 → 这里应该没 await
     # 注意：mock_service 默认 get_memory 返 None → NotFoundError 404
     assert "rollout_at" in response.json()["data"]
+
+
+# --- reindex_memory (post-M3 Option A) --------------------------------------
+
+
+async def test_reindex_returns_200_with_reindexed_fields(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """happy path：service 返回 ReindexResult → 200 + reindexed_fields。"""
+    from app.application.services.memory_management_service import ReindexResult
+
+    mock_service.reindex_memory = AsyncMock(
+        return_value=ReindexResult(
+            reindexed_fields=["content"],
+            warnings=[],
+            fs_synced=True,
+        )
+    )
+
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/mem-123/reindex"
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["reindexed_fields"] == ["content"]
+    assert data["warnings"] == []
+    assert data["fs_synced"] is True
+    mock_service.reindex_memory.assert_awaited_once_with(TEST_USER_ID_FIXED, "mem-123")
+
+
+async def test_reindex_noop_returns_200_with_empty_fields(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """no-op 场景（盘与 DB 一致）也返 200——幂等契约。"""
+    from app.application.services.memory_management_service import ReindexResult
+
+    mock_service.reindex_memory = AsyncMock(
+        return_value=ReindexResult(
+            reindexed_fields=[], warnings=[], fs_synced=True
+        )
+    )
+
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/mem-noop/reindex"
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["reindexed_fields"] == []
+
+
+async def test_reindex_surfaces_warnings(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """service 返的 warnings 原样透给前端。Option A 的核心 UX 契约。"""
+    from app.application.services.memory_management_service import ReindexResult
+
+    warnings = [
+        "frontmatter.category='rule' 与 DB 'user' 不一致；reindex 不支持",
+        "frontmatter.pinned=True 与 DB False 不一致",
+    ]
+    mock_service.reindex_memory = AsyncMock(
+        return_value=ReindexResult(
+            reindexed_fields=["content"], warnings=warnings, fs_synced=True
+        )
+    )
+
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/mem-w/reindex"
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["warnings"] == warnings
+
+
+async def test_reindex_404_when_not_found(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """service 抛 NotFoundError → 404。"""
+    from app.application.errors.exceptions import NotFoundError
+
+    mock_service.reindex_memory = AsyncMock(
+        side_effect=NotFoundError("记忆不存在")
+    )
+
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/missing/reindex"
+    )
+    assert response.status_code == 404
+
+
+async def test_reindex_409_when_file_missing(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """file 不存在 / id 不匹配 → 409（service 抛 ConflictError）。"""
+    mock_service.reindex_memory = AsyncMock(
+        side_effect=ConflictError("磁盘上不存在此记忆文件")
+    )
+
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/ghost/reindex"
+    )
+    assert response.status_code == 409
+
+
+async def test_reindex_400_on_parse_failure(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """frontmatter YAML 解析失败 → 400。"""
+    from app.application.errors.exceptions import BadRequestError
+
+    mock_service.reindex_memory = AsyncMock(
+        side_effect=BadRequestError("memory 文件 frontmatter 解析失败：...")
+    )
+
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/bad-yaml/reindex"
+    )
+    assert response.status_code == 400
+
+
+async def test_reindex_400_on_empty_body(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """codex round-4 P2：hand-edit 删光正文 → 400，与 create/update 契约对齐。"""
+    from app.application.errors.exceptions import BadRequestError
+
+    mock_service.reindex_memory = AsyncMock(
+        side_effect=BadRequestError("reindex 结果 body 为空；与 create/update 契约对齐")
+    )
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/empty/reindex"
+    )
+    assert response.status_code == 400
+
+
+async def test_reindex_503_when_file_store_not_configured(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """codex round-4 P2：deployment 未配置 file_store → 503 而非 400。"""
+    from app.application.errors.exceptions import ServiceUnavailableError
+
+    mock_service.reindex_memory = AsyncMock(
+        side_effect=ServiceUnavailableError(
+            "reindex 需要 file_store 后端；当前 deployment 运行在 DB-only 模式"
+        )
+    )
+    response = await _request(
+        client_app, "POST", "/api/v2/memories/any/reindex"
+    )
+    assert response.status_code == 503
 
 
 # --- create_memory (PR-2) ---------------------------------------------------

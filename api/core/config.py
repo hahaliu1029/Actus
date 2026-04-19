@@ -113,7 +113,8 @@ class Settings(BaseSettings):
 
     # Memory 系统（M1）——文件挂载、LLM gate、用户配额
     # 三条路径彼此独立、含义不同：
-    # - ``memory_root_host``：**宿主机**上 memory 根目录（docker bind source）
+    # - ``memory_root_host``：**宿主机**上 memory 根目录（docker bind source，
+    #   必须是绝对路径；不要使用 ``~``）
     # - ``memory_root_container``：**api 容器**视角下 memory 根目录（用于 mkdir
     #   创建用户子目录；需要 docker-compose bind 把它映射到 memory_root_host，
     #   PR-6 落地）
@@ -121,7 +122,10 @@ class Settings(BaseSettings):
     #   M0 spike 选定为 ``/workspace/.memory``；所有 agent 工具在沙箱里按这个
     #   固定路径读取 memory 文件
     # 见 docs/superpowers/specs/2026-04-17-m0-sandbox-memory-mount-spike.md
-    memory_root_host: str = Field("~/.actus/memory")
+    # 仅作为非 compose / 测试环境下的保守 fallback；docker-compose.yml 已要求
+    # 显式提供 ``MEMORY_ROOT_HOST`` 绝对路径，避免 ``~`` 在容器里误展开成
+    # ``/root/...`` 后再传给宿主机 docker daemon。
+    memory_root_host: str = Field("/tmp/actus-memory")
     memory_root_container: str = Field("/app/data/memory")
     sandbox_memory_mount_target: str = Field("/workspace/.memory")
     # M1 PR-6A 起默认 True：docker-compose.yml 已把 memory_root_host bind 到
@@ -172,16 +176,28 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    @field_validator("memory_root_host", "memory_root_container")
+    @field_validator("memory_root_host")
     @classmethod
-    def _must_be_absolute(cls, v: str) -> str:
-        """memory_root 必须是绝对路径（``/``）或家目录展开前缀（``~``）。
+    def _host_root_must_be_absolute(cls, v: str) -> str:
+        """宿主机 memory_root 必须是绝对路径。
 
-        相对路径在 Docker bind mount source 处会被 docker daemon 解释为卷名，
-        后续写入 ``{root}/{user_id}`` 会在容器外拼错路径。
+        ``memory_root_host`` 会被 Docker daemon 当作 bind mount source 解释；
+        若写成 ``~/.actus/memory``，api 容器内 ``expanduser()`` 会把它误展开成
+        ``/root/.actus/memory``，最终指向错误的宿主机路径。
         """
-        if not (v.startswith("/") or v.startswith("~")):
-            raise ValueError(f"{v!r} 必须是绝对路径（以 / 或 ~ 开头）")
+        if not v.startswith("/"):
+            raise ValueError(
+                f"{v!r} 不是宿主机绝对路径。"
+                "memory_root_host 必须以 / 开头，不能使用 ~"
+            )
+        return v
+
+    @field_validator("memory_root_container")
+    @classmethod
+    def _container_root_must_be_absolute(cls, v: str) -> str:
+        """api 容器内 memory_root 也要求绝对路径，避免被当成相对目录。"""
+        if not v.startswith("/"):
+            raise ValueError(f"{v!r} 必须是绝对路径（以 / 开头）")
         return v
 
     @model_validator(mode="after")

@@ -95,7 +95,7 @@ services:
       # Memory 系统 (M1 PR-6A)：host 侧根 + api 容器视角根 + sandbox mount 开关。
       # api 通过下方 volume 把 host 路径绑到容器内；sandbox 在起容器时通过
       # Docker SDK 再把同一 host 路径只读挂到 /workspace/.memory（DockerSandbox._build_memory_mount）。
-      MEMORY_ROOT_HOST: ${MEMORY_ROOT_HOST:-~/.actus/memory}
+      MEMORY_ROOT_HOST: ${MEMORY_ROOT_HOST:?MEMORY_ROOT_HOST is required and must be an absolute host path}
       MEMORY_ROOT_CONTAINER: ${MEMORY_ROOT_CONTAINER:-/app/data/memory}
       SANDBOX_MEMORY_MOUNT_TARGET: ${SANDBOX_MEMORY_MOUNT_TARGET:-/workspace/.memory}
       SANDBOX_MEMORY_MOUNT_ENABLED: ${SANDBOX_MEMORY_MOUNT_ENABLED:-true}
@@ -115,10 +115,10 @@ services:
       # Memory bind (M1 PR-6A)：host 侧的 memory 根目录同时可见给 api（读写，
       # FsMemoryWriter 在此落盘）和 sandbox（只读，由 DockerSandbox 程序化注入）。
       # 首次启动前部署者必须：
-      #   mkdir -p ${MEMORY_ROOT_HOST:-~/.actus/memory}
+      #   mkdir -p ${MEMORY_ROOT_HOST}
       #   # 如果把 ACTUS_UID 设成非 root，额外：
       #   # sudo chown -R ${ACTUS_UID}:${ACTUS_GID} ${MEMORY_ROOT_HOST}
-      - ${MEMORY_ROOT_HOST:-~/.actus/memory}:${MEMORY_ROOT_CONTAINER:-/app/data/memory}
+      - ${MEMORY_ROOT_HOST:?MEMORY_ROOT_HOST is required and must be an absolute host path}:${MEMORY_ROOT_CONTAINER:-/app/data/memory}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/docs > /dev/null || exit 1"]
       interval: 10s

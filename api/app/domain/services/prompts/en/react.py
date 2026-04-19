@@ -17,10 +17,15 @@ User Message:
 Attachments:
 {attachments}
 
+Prior step outputs (prior_step_outputs):
+{prior_step_outputs}
+
 Working Language:
 {language}
 
-Reminder: Tool analysis results take priority over task descriptions; return results in JSON format per the system prompt.
+Reminders:
+- Tool analysis results take priority over task descriptions; return results in JSON format per the system prompt.
+- If the "Prior step outputs" section lists reusable files, prefer reading and consolidating them via file_read. Do not re-run searches or regenerate content unless strictly necessary.
 """
 
 # 汇总总结提示词模板，将历史信息进行相应的总结

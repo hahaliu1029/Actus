@@ -273,8 +273,9 @@ export const useTransferStore = create<TransferStore>()((set, get) => ({
     sourceFiles.delete(id);
 
     set((state) => {
-      const { [id]: _, ...rest } = state.tasks;
-      return { tasks: rest };
+      const nextTasks = { ...state.tasks };
+      delete nextTasks[id];
+      return { tasks: nextTasks };
     });
   },
 

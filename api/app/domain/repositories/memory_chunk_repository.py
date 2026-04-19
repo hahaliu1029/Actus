@@ -148,6 +148,33 @@ class MemoryChunkRepository(Protocol):
         """
         ...
 
+    async def reindex_content(
+        self,
+        *,
+        chunk_id: str,
+        user_id: str,
+        content: str,
+        content_hash: str,
+        embedding: tuple[float, ...] | None,
+    ) -> MemoryChunk | None:
+        """reindex 专用 UPDATE：内容同步 **且** 强制 ``fs_synced=True``
+        （codex round-4 P0 race fix）。
+
+        和 ``update_content`` 的语义差异：
+        - ``update_content`` 原子置 ``fs_synced=False`` —— 因为 API 写 DB 后文件
+          还没落盘，reconciler 要把这条标记为待回写
+        - ``reindex_content`` 强制 ``fs_synced=True`` —— 因为 reindex 语义是
+          "从盘上权威 content 回填 DB"，盘和 DB 此时**已经一致**；中间 rollback
+          为 ``False`` 会让并发的 ``FsReconciler.scan_pending_fs_sync`` 把这条
+          行当 pending 用 ``build_memory_frontmatter(chunk)`` 覆盖盘上的
+          hand-edit frontmatter，破坏 "Option A 只同步 body 保留文件侧手改"
+          的契约
+
+        返回被更新的行；chunk_id 不存在或非该用户 → None。
+        content_hash unique 冲突 → ``IntegrityError``（由调用方 map 409）。
+        """
+        ...
+
     async def delete_by_ids(
         self, *, user_id: str, ids: list[str]
     ) -> list[MemoryChunk]:

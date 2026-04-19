@@ -16,10 +16,15 @@ EXECUTION_PROMPT = """
 附件(attachments):
 {attachments}
 
+前序步骤产出(prior_step_outputs):
+{prior_step_outputs}
+
 工作语言(language):
 {language}
 
-提醒：工具返回的分析结果优先于任务描述；按系统提示中的 JSON 格式返回结果。
+提醒：
+- 工具返回的分析结果优先于任务描述；按系统提示中的 JSON 格式返回结果。
+- 若「前序步骤产出」中已有可复用的文件，请优先通过 file_read 读取和整合，非必要不重新搜索或重建。
 """
 
 # 汇总总结提示词模板，将历史信息进行相应的总结

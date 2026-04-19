@@ -228,6 +228,43 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         row = result.scalar_one_or_none()
         return self._to_domain(row) if row else None
 
+    async def reindex_content(
+        self,
+        *,
+        chunk_id: str,
+        user_id: str,
+        content: str,
+        content_hash: str,
+        embedding: tuple[float, ...] | None,
+    ) -> MemoryChunk | None:
+        """reindex 专用 UPDATE：同步 content + embedding 且**保持 fs_synced=True**。
+
+        codex round-4 P0 race fix：``update_content`` 原子置 ``fs_synced=False``
+        是为 "API 写 DB → writer 落盘" 路径设计的；reindex 是反向链路
+        （盘 → DB），盘和 DB 在 UPDATE 完成的一刻就一致，没必要经过 False
+        过渡态。若走 ``update_content`` 再 ``mark_fs_synced(True)``，中间
+        窗口会让 ``FsReconciler.scan_pending_fs_sync`` 把这条误判为待回写，
+        用 canonical frontmatter 覆盖用户的 hand-edit。
+        """
+        stmt = (
+            update(MemoryChunkModel)
+            .where(
+                MemoryChunkModel.id == chunk_id,
+                MemoryChunkModel.user_id == user_id,
+            )
+            .values(
+                content=content,
+                content_hash=content_hash,
+                embedding=list(embedding) if embedding is not None else None,
+                updated_at=text("now()"),
+                fs_synced=True,
+            )
+            .returning(MemoryChunkModel)
+        )
+        result = await self.db_session.execute(stmt)
+        row = result.scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
     async def delete_by_ids(
         self, *, user_id: str, ids: list[str]
     ) -> list[MemoryChunk]:

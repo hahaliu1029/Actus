@@ -109,6 +109,33 @@ class DeleteCountResponse(BaseModel):
     deleted_count: int
 
 
+class ReindexResponse(BaseModel):
+    """POST ``/v2/memories/{id}/reindex`` 的响应载荷（Option A 权威契约）。
+
+    契约表（service / route / schema / UI 四处对齐；codex round-4 收口）：
+
+    | frontmatter field                        | 行为       |
+    |------------------------------------------|------------|
+    | body                                     | apply 到 DB |
+    | id                                       | mismatch → 409（不在 warnings 里）|
+    | source / created_at / auto_promoted_at   | warnings（系统字段）|
+    | title / category / pinned / tags         | warnings + **file-only**（不进 DB/search/prompt）|
+
+    - ``reindexed_fields``：实际被 apply 的字段集合；body 改动 →
+      ``["content"]``；盘上与 DB 正文一致 → ``[]``（no-op，幂等）。
+    - ``warnings``：列出 hand-edit 但 Option A 不 apply 的字段。**不承诺**
+      有后续同步路径——这些字段就停留在文件层。前端需原样展示给
+      power user。
+    - ``fs_synced``：reindex 完成后 DB 的 fs_synced 值；正常路径恒 True
+      （走 ``repo.reindex_content`` 直接 UPDATE 到 True，不经过 False
+      过渡避开 reconciler race）。
+    """
+
+    reindexed_fields: list[Literal["content"]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    fs_synced: bool
+
+
 class LegacyCleanupConfigResponse(BaseModel):
     """Deployment-level legacy cleanup config exposed to UI so前端可以在点击
     "清理旧记忆" 前知道是否设置了时间边界（codex fix P1）。
