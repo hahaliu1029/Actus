@@ -107,3 +107,17 @@ class BulkDeleteRequest(BaseModel):
 
 class DeleteCountResponse(BaseModel):
     deleted_count: int
+
+
+class LegacyCleanupConfigResponse(BaseModel):
+    """Deployment-level legacy cleanup config exposed to UI so前端可以在点击
+    "清理旧记忆" 前知道是否设置了时间边界（codex fix P1）。
+
+    - ``rollout_at`` 非空：SQL 会加 ``AND created_at < rollout_at``，dialog 展示
+      具体 cutoff 时间
+    - ``rollout_at`` 为空：保持旧谓词（清除所有未分类 session_flush），dialog
+      展示显式警告"当前 deployment 未设 gate 上线时间，按钮会清除所有未经
+      gate 收录的 session_flush 行"
+    """
+
+    rollout_at: datetime | None = None

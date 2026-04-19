@@ -6,6 +6,7 @@ import { del, get, post, request } from "./fetch";
 import type {
   CreateMemoryRequest,
   DeleteCountResponse,
+  LegacyCleanupConfigResponse,
   MemoryDetail,
   MemoryListParams,
   MemoryListResponse,
@@ -54,9 +55,15 @@ export const memoryApi = {
   deleteAll: () =>
     post<DeleteCountResponse>("/v2/memories/delete-all", {}),
 
-  // M3-A: 清理 LLM gate 上线前入库的旧 session_flush 块
+  // M3-A: 清理未分类且未被 gate 收录的 session_flush 遗留
   // 条件：source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL
+  //       [AND created_at < rollout_at 若 settings 设置了 memory_gate_rollout_at]
   // categorized / auto-promoted / manual / memory_save 行永远不受影响
   deleteLegacy: () =>
     del<DeleteCountResponse>("/v2/memories/legacy"),
+
+  // M3-A codex fix P1：查询 legacy cleanup 的时间边界配置（rollout_at）。
+  // 前端在显示"清理旧记忆"对话框前拉一次，据此展示具体 cutoff 或警告。
+  getCleanupConfig: () =>
+    get<LegacyCleanupConfigResponse>("/v2/memories/cleanup-config"),
 };

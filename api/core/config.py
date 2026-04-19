@@ -1,8 +1,9 @@
 import logging
+from datetime import datetime
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _logger = logging.getLogger(__name__)
@@ -145,6 +146,20 @@ class Settings(BaseSettings):
     # per-session memory_save 工具硬上限——防止 Agent 在一次任务内频繁保存。
     # 与 user_daily_quota 正交：前者防单 session flood，后者防跨 session 累积。
     memory_session_save_cap: int = Field(20, gt=0)
+    # M3-A codex fix P1：LLM gate 启用的时间边界（ISO 8601 **timezone-aware**）。
+    # `DELETE /v2/memories/legacy` 用 ``source='session_flush' AND category IS
+    # NULL AND auto_promoted_at IS NULL`` 作为"未经 gate 收录"的推断；但 gate
+    # 关闭（memory_gate_llm=None）的 deployment 里 **新** 写入的 session_flush
+    # 也满足这组谓词，会被误删。设置本字段后 SQL 额外加 ``AND created_at <
+    # rollout_at``，把"上线前"语义显式编码。未设 = 保持旧行为 + 前端警告
+    # （由调用方负责）。
+    #
+    # 类型 ``AwareDatetime``（codex fix P1 round-2）：强制 ``tzinfo`` 非空，
+    # 拒绝裸 naive ``"2026-04-01T00:00:00"``。destructive delete 的时间边界
+    # 如果按宿主机 local tz 解释，跨时区部署节点会产生不同的 cutoff，删错
+    # 行的风险写不能留。合法输入：``"2026-04-01T00:00:00Z"`` /
+    # ``"2026-04-01T08:00:00+08:00"``。
+    memory_gate_rollout_at: AwareDatetime | None = Field(None)
 
     # 微信公众号配置
     wechat_app_id: str = ""

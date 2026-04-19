@@ -20,6 +20,7 @@ from app.interfaces.schemas.memory_schemas import (
     BulkDeleteRequest,
     CreateMemoryRequest,
     DeleteCountResponse,
+    LegacyCleanupConfigResponse,
     MemoryCategory,
     MemoryDetail,
     MemoryItem,
@@ -27,6 +28,7 @@ from app.interfaces.schemas.memory_schemas import (
     UpdateMemoryRequest,
 )
 from app.interfaces.service_dependencies import get_memory_management_service
+from core.config import get_settings
 
 if TYPE_CHECKING:
     from app.application.services.memory_management_service import (
@@ -132,15 +134,43 @@ async def create_memory(
     return Response.success(data=MemoryDetail(**_to_detail_dict(chunk)))
 
 
+@router.get(
+    path="/cleanup-config",
+    response_model=Response[LegacyCleanupConfigResponse],
+    summary="获取 legacy 清理的时间边界配置",
+    description=(
+        "返回当前 deployment 的 ``memory_gate_rollout_at`` 配置。前端在显示"
+        "\"清理旧记忆\"对话框前调用，根据返回值展示具体 cutoff 或警告语。"
+        "注册在 ``/{chunk_id}`` 之前避免被 chunk_id 路径吞掉。"
+    ),
+    dependencies=[Depends(rate_limit_read)],
+)
+async def get_legacy_cleanup_config(
+    current_user: CurrentUser,
+) -> Response[LegacyCleanupConfigResponse]:
+    # current_user 只用于 AuthN——配置本身是 deployment 级，不含 PII。
+    # 读 settings 单例即可，不需要 service；避免为一个 scalar 起整条 DI 链。
+    _ = current_user
+    settings = get_settings()
+    return Response.success(
+        data=LegacyCleanupConfigResponse(
+            rollout_at=settings.memory_gate_rollout_at,
+        )
+    )
+
+
 @router.delete(
     path="/legacy",
     response_model=Response[DeleteCountResponse],
     summary="一键清理旧 session_flush 遗留记忆",
     description=(
-        "清除 LLM gate 上线前入库、未分类也未被 gate 收录的旧 flush 块："
+        "清除未分类也未被 gate 收录的 session_flush 遗留："
         "``source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL``。"
         "三个条件 AND 合取——**任何一个非 NULL / 不匹配的行都不会被删**："
-        "新 flush 路径（已分类 或 已 auto-promoted）、manual / memory_save 入口都不受影响。"
+        "新 flush 路径（已分类 或 已 auto-promoted）、manual / memory_save 入口都不受影响。\n\n"
+        "**时间边界（codex fix P1）：** 若 settings 设 ``memory_gate_rollout_at``，"
+        "SQL 额外 ``AND created_at < rollout_at``，仅清掉上线前的遗留；未设时"
+        "沿用旧谓词（清除所有未分类 session_flush），由前端 dialog 显式警告。\n\n"
         "低频运维操作；返回实际删除的行数，空时返回 0（非 404）。"
     ),
     dependencies=[Depends(rate_limit_write)],

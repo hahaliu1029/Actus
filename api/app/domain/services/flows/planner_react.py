@@ -306,7 +306,27 @@ class PlannerReActFlow(BaseFlow):
             processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
+            memory_mount_scope=self._build_memory_mount_scope(),
         )
+
+    def _build_memory_mount_scope(self):
+        """Build MemoryMountScope for client-side symlink guard (codex fix P0).
+
+        走 ``memory_mount_scope.build_memory_mount_scope_from_settings``
+        shared factory——同一语义要同时应用于 ``AgentTaskRunner._build_lc_tools_full``
+        的 step graph 绑定路径。settings 拿不到（测试）时 factory 收 None 返 None。
+        """
+        try:
+            from core.config import get_settings
+
+            settings = get_settings()
+        except Exception:
+            return None
+        from app.domain.services.tools.memory_mount_scope import (
+            build_memory_mount_scope_from_settings,
+        )
+
+        return build_memory_mount_scope_from_settings(self._user_id, settings)
 
     async def _collect_mcp_tools(self) -> list:
         """Collect MCP tools with progressive loading.

@@ -746,3 +746,15 @@ export interface CreateMemoryRequest {
 export interface DeleteCountResponse {
   deleted_count: number;
 }
+
+/**
+ * M3-A codex fix P1: legacy cleanup 的时间边界配置。
+ *
+ * - `rollout_at` 非空（ISO 8601）：后端 SQL 会加 `AND created_at < rollout_at`，
+ *   dialog 显示具体 cutoff 时间
+ * - `rollout_at` 为 null：未配置 → 后端沿用旧谓词（清所有未分类 session_flush），
+ *   UI 显示显式警告
+ */
+export interface LegacyCleanupConfigResponse {
+  rollout_at: string | null;
+}

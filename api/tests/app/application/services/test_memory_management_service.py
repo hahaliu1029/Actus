@@ -287,10 +287,12 @@ class TestDeleteLegacy:
     async def test_writes_audit_with_chunk_ids_and_hashes(
         self, service, mock_repo, mock_session
     ):
-        """审计记录 chunk_ids + content_hashes，不含 content preview。
+        """审计记录 chunk_ids + content_hashes + rollout_at，不含 content preview。
 
         content_hash 无 PII 可长期保留，用于事后查 orphan bug 或误点追溯；
-        content 不入 audit 以避开敏感数据流入 log 聚合系统。
+        content 不入 audit 以避开敏感数据流入 log 聚合系统。``rollout_at``
+        记录本次清理的时间边界（codex fix P1）；默认 service fixture 未设 →
+        None，表明沿用旧谓词。
         """
         import dataclasses
         rows = [
@@ -309,12 +311,45 @@ class TestDeleteLegacy:
         assert audit_obj.action == "delete_legacy"
         assert audit_obj.affected_count == 3
         assert audit_obj.chunk_ids == [r.id for r in rows]
-        # 关键：hash 列表与 chunk_ids 顺序对齐，且**不**含 content preview
+        # 关键：hash 列表与 chunk_ids 顺序对齐 + rollout_at None，**不**含 content preview
         assert audit_obj.old_snapshot == {
             "content_hashes": [f"hash-legacy-{i}" for i in range(3)],
+            "rollout_at": None,
         }
         assert "content" not in audit_obj.old_snapshot
         mock_session.commit.assert_called_once()
+
+    async def test_rollout_at_forwarded_to_repo_and_audit(
+        self, mock_repo, mock_embed, mock_session
+    ):
+        """rollout_at 非空时：(a) 透传到 repo.delete_legacy_by_user；
+        (b) 审计 old_snapshot["rollout_at"] 记录 ISO 串。
+        codex fix P1：legacy 清理时间边界必须端到端可追溯。"""
+        from datetime import datetime, timezone
+
+        @asynccontextmanager
+        async def fake_session_factory():
+            yield mock_session
+
+        cutoff = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+        rows = [_chunk(content="legacy-cut")]
+        mock_repo.delete_legacy_by_user = AsyncMock(return_value=rows)
+
+        svc = MemoryManagementService(
+            repo_factory=lambda s: mock_repo,
+            embedding_provider=mock_embed,
+            session_factory=fake_session_factory,
+            memory_gate_rollout_at=cutoff,
+        )
+        await svc.delete_legacy_memories(TEST_USER_ID_FIXED)
+
+        # (a) 透传到 repo
+        mock_repo.delete_legacy_by_user.assert_awaited_once_with(
+            user_id=TEST_USER_ID_FIXED, rollout_at=cutoff
+        )
+        # (b) 审计记录 rollout_at（ISO 串，非 datetime 对象，便于 JSON 序列化）
+        audit_obj = mock_session.add.call_args[0][0]
+        assert audit_obj.old_snapshot["rollout_at"] == cutoff.isoformat()
 
     async def test_warns_and_skips_fs_when_non_null_category_slips_through(
         self, mock_repo, mock_embed, mock_session, caplog

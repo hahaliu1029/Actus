@@ -1247,7 +1247,13 @@ class AgentTaskRunner(TaskRunner):
         return "\n\n".join(sections)
 
     def _get_native_tool_names_by_category(self) -> dict[str, list[str]]:
-        """从 create_native_tools 动态派生原生工具名，确保摘要与实际绑定一致。"""
+        """从 create_native_tools 动态派生原生工具名，确保摘要与实际绑定一致。
+
+        tool name 仅受 ``create_native_tools`` 的输入影响；memory_mount_scope
+        只改变 wrapper 的运行时行为不改变 ``tool.name``，这里可以不传。但为
+        了与 ``_build_lc_tools_full`` 保持参数一致避免未来漂移（比如新增
+        依赖 scope 的工具），仍透传 scope。
+        """
         if hasattr(self, "_cached_native_tool_names"):
             return self._cached_native_tool_names
         from app.domain.services.tools.langchain_tools import create_native_tools
@@ -1259,6 +1265,7 @@ class AgentTaskRunner(TaskRunner):
             processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
+            memory_mount_scope=self._build_memory_mount_scope(),
         )
         groups: dict[str, list[str]] = {}
         for tool in tools:
@@ -1266,6 +1273,27 @@ class AgentTaskRunner(TaskRunner):
             groups.setdefault(prefix, []).append(tool.name)
         self._cached_native_tool_names = groups
         return groups
+
+    def _build_memory_mount_scope(self):
+        """Shared scope factory for both _get_native_tool_names_by_category
+        和 _build_lc_tools_full（codex fix P0 round-2）。
+
+        走 ``memory_mount_scope.build_memory_mount_scope_from_settings`` —
+        与 PlannerReActFlow._build_memory_mount_scope 同源实现，确保 step graph
+        每次重建 tool set 时都带上客户端 symlink 守卫，不只 planner 阶段。
+        settings 拿不到（测试环境绕过 lifespan）时 factory 返 None → 旧行为。
+        """
+        try:
+            from core.config import get_settings
+
+            settings = get_settings()
+        except Exception:
+            return None
+        from app.domain.services.tools.memory_mount_scope import (
+            build_memory_mount_scope_from_settings,
+        )
+
+        return build_memory_mount_scope_from_settings(self._user_id, settings)
 
     def _build_available_tool_summary(self) -> str:
         """构建可用工具摘要，减少模型对工具可用性的错觉。"""
@@ -1641,6 +1669,9 @@ class AgentTaskRunner(TaskRunner):
                 processor_lookup=self._file_processor_lookup,
                 supports_vision=self._supports_vision,
                 supports_pdf_input=self._supports_pdf_input,
+                # codex fix P0 round-2：step graph 每次 rebuild 都要带守卫，
+                # 否则 planner 阶段守护拦了，实际 tool call 路径还是裸透传。
+                memory_mount_scope=self._build_memory_mount_scope(),
             )
         )
 

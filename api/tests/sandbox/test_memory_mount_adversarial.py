@@ -52,17 +52,27 @@ def anyio_backend() -> str:
 
 
 def _docker_or_skip():
-    """返回 docker client；daemon 不可达或镜像不在时 skip。
+    """返回 docker client；daemon 不可达或镜像不在时按 require 策略 skip 或 fail。
 
-    macOS + Docker Desktop 默认 socket 是 ``~/.docker/run/docker.sock``，不是
-    Linux 的 ``/var/run/docker.sock``。``docker.from_env()`` 读不到
-    ``DOCKER_HOST`` 时会直接找 Linux 默认路径 → 找不到。依次尝试候选 socket，
-    保证 macOS / Linux / CI 都能就绪。
+    - macOS + Docker Desktop 默认 socket 是 ``~/.docker/run/docker.sock``，不是
+      Linux 的 ``/var/run/docker.sock``。``docker.from_env()`` 读不到
+      ``DOCKER_HOST`` 时会直接找 Linux 默认路径 → 找不到。依次尝试候选 socket，
+      保证 macOS / Linux / CI 都能就绪。
+    - CI 必须跑到这些对抗测试（M3 验收项）。开 ``ACTUS_REQUIRE_SANDBOX_TESTS=1``
+      的环境下，docker / image 缺失会 ``pytest.fail`` 硬失败而非 skip——防止
+      "CI 静默 skip = 安全测试形同虚设" 的隐蔽退化（codex review P1）。
     """
+    require = os.environ.get("ACTUS_REQUIRE_SANDBOX_TESTS") == "1"
+
+    def _miss(msg: str) -> None:
+        if require:
+            pytest.fail(f"ACTUS_REQUIRE_SANDBOX_TESTS=1 但 {msg}")
+        pytest.skip(msg)
+
     try:
         import docker
     except ImportError:
-        pytest.skip("docker SDK 不可用")
+        _miss("docker SDK 不可用")
 
     candidates: list[str] = []
     env_host = os.environ.get("DOCKER_HOST")
@@ -85,12 +95,13 @@ def _docker_or_skip():
             last_err = exc
             client = None
     if client is None:
-        pytest.skip(f"docker daemon 不可达（尝试 {candidates or 'env'}): {last_err}")
+        _miss(f"docker daemon 不可达（尝试 {candidates or 'env'}): {last_err}")
+        return None  # pragma: no cover — _miss 必然 fail/skip
 
     try:
         client.images.get(_ALPINE_IMAGE)
     except Exception:
-        pytest.skip(f"本地缺少 {_ALPINE_IMAGE}，不在线拉取避免网络依赖")
+        _miss(f"本地缺少 {_ALPINE_IMAGE}；CI 需要 pre-pull 或开启在线拉取")
     return client
 
 
@@ -171,23 +182,34 @@ class TestMemoryMountKernelInvariants:
         assert b"Read-only file system" in logs, f"logs 缺少 EROFS 字样: {logs!r}"
 
 
-class TestMemoryMountSymlinkRisk:
-    """Case C：host 端预置 symlink 透过 bind mount 读到容器内敏感路径。
+class TestMemoryMountSymlinkKernelReality:
+    """Case C kernel 侧现实：单纯 ``:ro`` bind mount **不拦**读 symlink，仅作现象
+    记录。**真正的防御**是客户端工具层 + host 端 reconciler 双层，见：
 
-    单纯 ``:ro`` **拦不住**读 path traversal via host-planted symlink。正式防御
-    是 FsReconciler 把 symlink 搬到 ``.orphans/``（已在 ``test_fs_reconciler.py``
-    钉死）。本测试走完整 exploit → mitigation 流程，确保整条链条可验证。
+    - 客户端守护（codex fix P0）：``tests/app/domain/services/tools/
+      test_memory_mount_scope_guard.py`` — agent 调用 ``file_read`` 时，若
+      path 在 memory mount scope 内且 target 是 symlink → ``Denied``，
+      **不发 sandbox HTTP**
+    - reconciler 侧：``tests/app/infrastructure/external/memory/
+      test_fs_reconciler.py::test_symlink_in_user_dir_quarantined`` — host
+      端 symlink 扫描时被搬到 ``.orphans/``
+
+    本测试不再作为"mitigation 有效"的 oracle，而是文档化 kernel 层面行为，
+    防止误把 :ro 当作读侧防御。
     """
 
-    async def test_exploit_then_reconciler_removes_symlink(
-        self, tmp_path: Path, monkeypatch
+    async def test_ro_bind_mount_does_not_block_symlink_read(
+        self, tmp_path: Path
     ) -> None:
-        """端到端：host 预置 → exploit 读通 → reconciler 清理 → 再读 404。"""
+        """记录 kernel 行为：host 预置 symlink → 容器 ``cat`` 透读 target 成功。
+
+        这是**已知风险**，不是"预期安全行为"。客户端守护 + reconciler 负责
+        真实拦截；本测试存在的唯一价值是防止有人把 :ro 误当作读侧防御——
+        若某天 kernel 行为变了（symlink 不再被 follow），这测试会 fail，
+        那时应当去掉此 test + 更新 design §704。
+        """
         client = _docker_or_skip()
 
-        # 1) Host 预置 symlink，指向容器 namespace 内已知存在的 /etc/hostname。
-        #    选 /etc/hostname 而非 /etc/passwd：前者可预期必存在 & 无 PII；
-        #    后者在某些最小镜像可能不存在，引入 flake。
         user_dir = tmp_path / "user-evil"
         user_dir.mkdir()
         symlink = user_dir / "evil.md"
@@ -196,31 +218,43 @@ class TestMemoryMountSymlinkRisk:
         except (OSError, NotImplementedError):
             pytest.skip("当前 fs 不支持 symlink")
 
-        # 2) 容器读 symlink：证明 exploit 确实能透过 bind mount 读到 target。
         exit_code, logs = _run_alpine_with_ro_mount(
             client,
             user_dir,
             f"cat {_MOUNT_TARGET}/evil.md",
         )
+        # 记录现象，非"expected secure behavior"。
         assert exit_code == 0, (
-            f"exploit 读取 symlink 应该成功 (证明 :ro 不拦): exit={exit_code}"
+            f":ro bind mount 当前不拦 symlink 读——如果这里失败说明 kernel 行为"
+            f"变了，需要更新 design §704 + 考虑去掉本测试: exit={exit_code}"
         )
-        # logs 包含容器自己的 hostname（一串随机 hex），内容非空即可
-        assert logs.strip(), "logs 应含容器 /etc/hostname 内容，为空说明 exploit 未触发"
+        assert logs.strip(), "symlink target 读取后应有内容"
 
-        # 3) 跑 FsReconciler walk_user_directory（真实防御链）。
+    async def test_reconciler_quarantines_host_planted_symlink(
+        self, tmp_path: Path
+    ) -> None:
+        """验证第二层防御：host 端 reconciler 把 symlink 搬到 ``.orphans/``。
+
+        与上方 kernel 测试独立：kernel 是"读时会 follow"的现象记录；本测试
+        是"用户开新 session 时 reconciler 主动清理"的正常路径。两者正交。
+        """
+        from contextlib import asynccontextmanager
         from unittest.mock import AsyncMock
 
         from app.infrastructure.external.memory.fs_reconciler import FsReconciler
+
+        user_dir = tmp_path / "user-evil"
+        user_dir.mkdir()
+        symlink = user_dir / "evil.md"
+        try:
+            os.symlink("/etc/hostname", symlink)
+        except (OSError, NotImplementedError):
+            pytest.skip("当前 fs 不支持 symlink")
 
         repo = AsyncMock()
         repo.get_by_id.return_value = None
         repo.list_by_user.return_value = []
         repo.count_by_user.return_value = 0
-
-        writer = AsyncMock()
-
-        from contextlib import asynccontextmanager
 
         @asynccontextmanager
         async def fake_session_factory():
@@ -229,24 +263,11 @@ class TestMemoryMountSymlinkRisk:
         reconciler = FsReconciler(
             session_factory=fake_session_factory,
             repo_factory=lambda _s: repo,
-            file_store=writer,
+            file_store=AsyncMock(),
             memory_root=tmp_path,
         )
         result = await reconciler.walk_user_directory("user-evil")
-        assert result["orphan_symlinks"] >= 1, (
-            f"reconciler 应把 symlink 计作 orphan，实际: {result}"
-        )
-        assert not symlink.is_symlink(), "symlink 必须已从 user_dir 移走"
-        orphans_dir = user_dir / ".orphans"
-        assert orphans_dir.exists(), "symlink 应被迁到 .orphans/"
 
-        # 4) 再跑同样的 exploit —— 此时文件已不在 user_dir，容器读到空/不存在。
-        exit_code_post, logs_post = _run_alpine_with_ro_mount(
-            client,
-            user_dir,
-            f"cat {_MOUNT_TARGET}/evil.md 2>&1; echo 'cat-exit='$?",
-        )
-        # cat 对不存在文件返 1，并输出 "No such file or directory"
-        assert b"No such file or directory" in logs_post, (
-            f"reconciler 处理后容器应读不到 symlink 内容: logs={logs_post!r}"
-        )
+        assert result["orphan_symlinks"] >= 1
+        assert not symlink.is_symlink(), "symlink 必须已从 user_dir 移走"
+        assert (user_dir / ".orphans").exists(), "symlink 应被迁到 .orphans/"

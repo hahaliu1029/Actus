@@ -11,6 +11,7 @@ vi.mock("@/lib/api/memory", () => ({
     bulkDelete: vi.fn(),
     deleteAll: vi.fn(),
     deleteLegacy: vi.fn(),
+    getCleanupConfig: vi.fn(),
     create: vi.fn(),
   },
 }));
@@ -157,8 +158,9 @@ describe("MemoryManagement smoke", () => {
 
   // ─── M3-D: 清理旧记忆按钮 + dialog ───────────────────────────────────
 
-  it("legacy cleanup button opens dialog and calls deleteLegacy on confirm", async () => {
+  it("legacy cleanup button opens dialog, fetches config and confirms", async () => {
     const user = userEvent.setup();
+    mockedMemoryApi.getCleanupConfig.mockResolvedValue({ rollout_at: null });
     mockedMemoryApi.deleteLegacy.mockResolvedValue({ deleted_count: 3 });
     render(<MemoryManagement />);
 
@@ -169,9 +171,12 @@ describe("MemoryManagement smoke", () => {
     // Dialog 打开
     expect(await screen.findByText("清理旧记忆？")).toBeInTheDocument();
 
+    // rollout_at=null → 显示警告
+    await screen.findByTestId("legacy-no-cutoff-warning");
+
     // 确认按钮存在（legacy 清理不需要输入短语，一次点击即可）
     const confirmBtn = screen.getByRole("button", { name: /确认清理/ });
-    expect(confirmBtn).not.toBeDisabled();
+    await waitFor(() => expect(confirmBtn).not.toBeDisabled());
 
     await user.click(confirmBtn);
 
@@ -190,8 +195,51 @@ describe("MemoryManagement smoke", () => {
     );
   });
 
+  it("legacy cleanup warning points to env var, not api/config.yaml", async () => {
+    // codex fix round-3 P1：rollout_at 的真实配置面是 Settings/env，不是
+    // api/config.yaml（那是 app_config 的文件）。destructive delete 的
+    // 安全指引必须指向正确的运维动作，避免误导。
+    const user = userEvent.setup();
+    mockedMemoryApi.getCleanupConfig.mockResolvedValue({ rollout_at: null });
+    render(<MemoryManagement />);
+
+    await screen.findByText(/first memory content/);
+    await user.click(screen.getByRole("button", { name: /清理旧记忆/ }));
+
+    const warning = await screen.findByTestId("legacy-no-cutoff-warning");
+    const text = warning.textContent ?? "";
+
+    // 不能硬编码 api/config.yaml（codex round-3 指错配置面）
+    expect(text).not.toContain("api/config.yaml");
+    // 必须指向真实配置面：env 变量名 MEMORY_GATE_ROLLOUT_AT
+    expect(text).toContain("MEMORY_GATE_ROLLOUT_AT");
+    // 附带给出合法的 ISO 8601 tz-aware 示例，帮助运维一次改对
+    expect(text).toMatch(/2026-04-01T00:00:00Z/);
+  });
+
+  it("legacy cleanup dialog shows cutoff when rollout_at configured", async () => {
+    // codex fix P1：rollout_at 非空 → 显示具体 cutoff 时间，不显警告
+    const user = userEvent.setup();
+    mockedMemoryApi.getCleanupConfig.mockResolvedValue({
+      rollout_at: "2026-04-01T00:00:00Z",
+    });
+    render(<MemoryManagement />);
+
+    await screen.findByText(/first memory content/);
+    await user.click(screen.getByRole("button", { name: /清理旧记忆/ }));
+
+    await screen.findByText("清理旧记忆？");
+    // cutoff banner 显示
+    await screen.findByTestId("legacy-cutoff-info");
+    // 警告 banner 不显示（互斥）
+    expect(
+      screen.queryByTestId("legacy-no-cutoff-warning"),
+    ).not.toBeInTheDocument();
+  });
+
   it("legacy cleanup keeps dialog open on mutation error", async () => {
     const user = userEvent.setup();
+    mockedMemoryApi.getCleanupConfig.mockResolvedValue({ rollout_at: null });
     mockedMemoryApi.deleteLegacy.mockRejectedValueOnce(
       new ApiError("network down", 0),
     );
@@ -200,6 +248,8 @@ describe("MemoryManagement smoke", () => {
     await screen.findByText(/first memory content/);
 
     await user.click(screen.getByRole("button", { name: /清理旧记忆/ }));
+    // 等 config 拉完
+    await screen.findByTestId("legacy-no-cutoff-warning");
     await user.click(screen.getByRole("button", { name: /确认清理/ }));
 
     await waitFor(() =>
@@ -207,6 +257,23 @@ describe("MemoryManagement smoke", () => {
     );
     // Dialog 保留以便用户重试
     expect(screen.getByText("清理旧记忆？")).toBeInTheDocument();
+  });
+
+  it("legacy cleanup dialog falls back to warning when config fetch fails", async () => {
+    // config 请求失败不阻塞用户操作——dialog 退化到"默认警告" UX，
+    // 同时展示底层错误信息便于排障。
+    const user = userEvent.setup();
+    mockedMemoryApi.getCleanupConfig.mockRejectedValueOnce(
+      new Error("config endpoint 500"),
+    );
+    render(<MemoryManagement />);
+
+    await screen.findByText(/first memory content/);
+    await user.click(screen.getByRole("button", { name: /清理旧记忆/ }));
+
+    // 应显警告 banner（null path）+ 错误 fallback 提示
+    await screen.findByTestId("legacy-no-cutoff-warning");
+    expect(screen.getByText(/config endpoint 500/)).toBeInTheDocument();
   });
 
   it("delete-all button is gated by typed confirmation", async () => {

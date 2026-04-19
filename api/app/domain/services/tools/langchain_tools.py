@@ -25,6 +25,7 @@ from app.domain.models.tool_result import (
     AllowError,
     AllowSuccess,
     DecisionReason,
+    Denied,
     FileBlock,
     ImageUrlBlock,
     Passthrough,
@@ -32,6 +33,7 @@ from app.domain.models.tool_result import (
     ToolOutcome,
     MultimodalPayload,
 )
+from app.domain.services.tools.memory_mount_scope import MemoryMountScope
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
@@ -185,8 +187,54 @@ def _make_message_tools() -> list[StructuredTool]:
 # --------------------------------------------------------------------------- #
 
 
-def _make_file_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
-    """Create file tools that delegate to sandbox."""
+def _make_file_tools(
+    sandbox: SandboxHandle,
+    *,
+    memory_mount_scope: MemoryMountScope | None = None,
+) -> list[StructuredTool]:
+    """Create file tools that delegate to sandbox.
+
+    ``memory_mount_scope``（codex fix P0）：非空时，读类工具（file_read /
+    file_str_replace / file_find_in_content）会先把 filepath 映射回 api
+    容器侧实际路径，``lstat`` 判 symlink——是 symlink 就直接 SecurityError
+    不发 sandbox HTTP。这是 design §724 Case C (iii) 的读侧 containment，
+    防 host 预植 symlink 透过 bind mount 暴露容器内敏感文件。scope 为空时
+    保持旧行为（兼容非 memory 场景 / 未 mount memory 的 sandbox）。
+    """
+    # 异常信息写在一处，避免 log grep 时三处文案漂移。
+    _SYMLINK_ERR = (
+        "refuse to follow symlink within memory mount scope "
+        "(memory bind-mount read containment)"
+    )
+
+    async def _refuse_symlink_outcome(filepath: str) -> tuple[str, ToolOutcome]:
+        """Client-side security gate：symlink → ``Denied`` outcome。
+
+        ``Denied.reason.type = 'ast_validator'`` 契合"静态 pre-execution 拒绝"
+        语义（CS2.4 允许的四类之一）。LangGraph react_graph 把 content 写入
+        tool_result 暴露给 LLM，让 LLM 看到拒绝原因而非超时/network error。
+        **不发 sandbox HTTP**——这是整个守护的核心不变式。
+        """
+        message = f"{_SYMLINK_ERR}: {filepath}"
+        reason = DecisionReason(
+            type="ast_validator",
+            code="memory_mount_symlink_refused",
+            message=message,
+        )
+        outcome = Denied(content=message, reason=reason)
+        return outcome.content, outcome
+
+    def _is_symlink_in_scope(filepath: str) -> bool:
+        """scope 非空 + memory mount 内 + 任一祖先（含 user_id 根）是 symlink。
+
+        codex fix P1 round-2：叶子 lstat 不够——攻击者把 ``{user_id}/user/``
+        做成 symlink 指向 ``/etc``，叶子文件 ``secret.txt`` 自己不是 symlink
+        但父目录是，整条路径仍被 kernel resolve 到 target。由
+        ``MemoryMountScope.any_ancestor_is_symlink`` 逐段 lstat 检测。
+        """
+        if memory_mount_scope is None:
+            return False
+        return memory_mount_scope.any_ancestor_is_symlink(filepath)
 
     @lc_tool(response_format="content_and_artifact")
     async def file_read(
@@ -197,6 +245,8 @@ def _make_file_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         max_length: int = 2000,
     ) -> tuple[str, ToolOutcome]:
         """Read file content from the sandbox filesystem."""
+        if _is_symlink_in_scope(filepath):
+            return await _refuse_symlink_outcome(filepath)
         return await _invoke_result_tool(
             "file_read",
             sandbox.read_file(
@@ -240,6 +290,9 @@ def _make_file_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         filepath: str, old_str: str, new_str: str, sudo: bool = False
     ) -> tuple[str, ToolOutcome]:
         """Replace a string in a file."""
+        # memory mount 内读写都可能跟随 symlink；守护覆盖所有读类 file tools。
+        if _is_symlink_in_scope(filepath):
+            return await _refuse_symlink_outcome(filepath)
         return await _invoke_result_tool(
             "file_str_replace",
             sandbox.replace_in_file(filepath, old_str, new_str, sudo=sudo),
@@ -254,6 +307,8 @@ def _make_file_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         filepath: str, regex: str, sudo: bool = False
     ) -> tuple[str, ToolOutcome]:
         """Search file content using regex."""
+        if _is_symlink_in_scope(filepath):
+            return await _refuse_symlink_outcome(filepath)
         return await _invoke_result_tool(
             "file_find_in_content",
             sandbox.search_in_file(filepath, regex, sudo=sudo),
@@ -787,14 +842,19 @@ def create_native_tools(
     processor_lookup: FileProcessorLookup | None = None,
     supports_vision: bool = True,
     supports_pdf_input: bool = False,
+    memory_mount_scope: MemoryMountScope | None = None,
 ) -> list[StructuredTool]:
     """Create all native LangChain tools.
+
+    ``memory_mount_scope``（codex fix P0）透传到 ``_make_file_tools`` 打开
+    客户端侧 symlink 守护。agent runner / planner_react 构造 scope 后传入；
+    没有 user_id 或 memory mount 未启用时保持 None（旧行为）。
 
     Returns a flat list of tools ready to be bound to an LLM or added to a ToolNode.
     """
     tools: list[StructuredTool] = []
     tools.extend(_make_message_tools())
-    tools.extend(_make_file_tools(sandbox))
+    tools.extend(_make_file_tools(sandbox, memory_mount_scope=memory_mount_scope))
     if processor_lookup:
         tools.extend(_make_file_view_tools(sandbox, processor_lookup, supports_vision, supports_pdf_input))
     tools.extend(_make_shell_tools(sandbox))

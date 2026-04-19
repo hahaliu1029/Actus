@@ -437,6 +437,75 @@ async def test_delete_legacy_route_not_shadowed_by_chunk_id(
     mock_service.delete_memory.assert_not_awaited()
 
 
+# --- cleanup-config (M3-A codex fix P1) -------------------------------------
+
+
+async def test_get_cleanup_config_exposes_rollout_at(
+    client_app, monkeypatch
+) -> None:
+    """``GET /v2/memories/cleanup-config`` 返 settings 里的 rollout_at。
+
+    前端在显示 "清理旧记忆" 对话框前拉此 endpoint：设了 → 显 cutoff，没设 →
+    显警告。codex fix P1 的 UI 配套。
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from app.interfaces.endpoints import memory_routes
+
+    cutoff = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        memory_routes, "get_settings",
+        lambda: SimpleNamespace(memory_gate_rollout_at=cutoff),
+    )
+
+    response = await _request(client_app, "GET", "/api/v2/memories/cleanup-config")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    # ISO 串（FastAPI json encoder 把 datetime 序列化为 ISO 8601）
+    assert data["rollout_at"].startswith("2026-04-01T00:00:00")
+
+
+async def test_get_cleanup_config_null_when_not_set(
+    client_app, monkeypatch
+) -> None:
+    """未配置 rollout_at → 返 null，前端 dialog 展示警告。"""
+    from types import SimpleNamespace
+
+    from app.interfaces.endpoints import memory_routes
+
+    monkeypatch.setattr(
+        memory_routes, "get_settings",
+        lambda: SimpleNamespace(memory_gate_rollout_at=None),
+    )
+
+    response = await _request(client_app, "GET", "/api/v2/memories/cleanup-config")
+    assert response.status_code == 200
+    assert response.json()["data"]["rollout_at"] is None
+
+
+async def test_get_cleanup_config_route_not_shadowed_by_chunk_id(
+    client_app, monkeypatch
+) -> None:
+    """``/cleanup-config`` GET 必须在 ``/{chunk_id}`` GET 之前注册；否则会被
+    当成 get_memory(chunk_id='cleanup-config') 走到 404 或 500。"""
+    from types import SimpleNamespace
+
+    from app.interfaces.endpoints import memory_routes
+
+    monkeypatch.setattr(
+        memory_routes, "get_settings",
+        lambda: SimpleNamespace(memory_gate_rollout_at=None),
+    )
+
+    response = await _request(client_app, "GET", "/api/v2/memories/cleanup-config")
+    assert response.status_code == 200
+    # 若被 /{chunk_id} 吞了，get_memory 会被调 → 这里应该没 await
+    # 注意：mock_service 默认 get_memory 返 None → NotFoundError 404
+    assert "rollout_at" in response.json()["data"]
+
+
 # --- create_memory (PR-2) ---------------------------------------------------
 
 

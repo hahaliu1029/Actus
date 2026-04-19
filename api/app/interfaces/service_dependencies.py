@@ -423,6 +423,10 @@ def _build_agent_service(
         # 路径不受影响；但生产部署必须注入，否则 schema 宣称的 event_type
         # 永不写入，等同于空承诺。
         notification_emitter=memory_notification_emitter,
+        # codex fix P1：legacy 清理时间边界——与上方 get_memory_management_service
+        # 保持同源，两条 DI 路径（lifespan write service + per-request CRUD service）
+        # 必须用同一语义。
+        memory_gate_rollout_at=settings.memory_gate_rollout_at,
     )
 
     # M1 PR-4+8 gate: single in-process breaker shared across sessions (so
@@ -600,6 +604,10 @@ def get_memory_management_service(
         redis=redis_client,
         user_daily_quota=user_daily_quota,
         notification_emitter=notification_emitter,
+        # codex fix P1：legacy 清理时间边界。settings 未设 → None，
+        # service 沿用旧谓词 + 前端 dialog 警告；设了 → SQL 加
+        # AND created_at < rollout_at。
+        memory_gate_rollout_at=settings.memory_gate_rollout_at,
     )
 
 

@@ -98,6 +98,13 @@ export function MemoryManagement() {
   const [isDeleteAllOpen, setIsDeleteAllOpen] = useState(false);
   const [deleteAllConfirmText, setDeleteAllConfirmText] = useState("");
   const [isDeleteLegacyOpen, setIsDeleteLegacyOpen] = useState(false);
+  // codex fix P1：legacy cleanup 时间边界。undefined = 尚未拉取；null = 未设
+  // （显警告）；string = 已设（显具体 cutoff）。
+  const [legacyRolloutAt, setLegacyRolloutAt] =
+    useState<string | null | undefined>(undefined);
+  const [legacyConfigError, setLegacyConfigError] = useState<string | null>(
+    null
+  );
 
   const [isActionPending, setIsActionPending] = useState(false);
 
@@ -401,9 +408,26 @@ export function MemoryManagement() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setIsDeleteLegacyOpen(true)}
+            onClick={async () => {
+              // 打开 dialog 前拉一次 cleanup-config，拿 rollout_at 展示正确
+              // 文案——codex fix P1 要求前端明确告知是否有时间边界。
+              setLegacyConfigError(null);
+              setLegacyRolloutAt(undefined);
+              setIsDeleteLegacyOpen(true);
+              try {
+                const { memoryApi } = await import("@/lib/api/memory");
+                const cfg = await memoryApi.getCleanupConfig();
+                setLegacyRolloutAt(cfg.rollout_at);
+              } catch (err) {
+                // 拉配置失败不阻塞用户操作——dialog 退化显示通用警告。
+                setLegacyConfigError(
+                  err instanceof Error ? err.message : "配置获取失败"
+                );
+                setLegacyRolloutAt(null);
+              }
+            }}
             aria-label="清理旧记忆"
-            title="清理 LLM gate 上线前入库、未分类也未被自动收录的旧 session_flush 块"
+            title="清理未分类也未被自动收录的旧 session_flush 块"
           >
             <Archive className="mr-1 size-4" />
             清理旧记忆
@@ -687,9 +711,10 @@ export function MemoryManagement() {
         </DialogContent>
       </Dialog>
 
-      {/* Delete-legacy confirmation (M3-A). 单次确认即可——真删条件是
-          source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL，
-          后端保证 categorized / auto-promoted / manual / memory_save 行永不受影响。 */}
+      {/* Delete-legacy confirmation (M3-A)。codex fix P1：根据 rollout_at 配置
+          区分两种文案：
+          - 设了 cutoff：显示具体时间，"清除 cutoff 前的未分类 session_flush"
+          - 未设 cutoff：**显示显式警告**，gate 关闭 deployment 新数据也会被删 */}
       <Dialog
         open={isDeleteLegacyOpen}
         onOpenChange={(open) => {
@@ -700,12 +725,56 @@ export function MemoryManagement() {
           <DialogHeader>
             <DialogTitle>清理旧记忆？</DialogTitle>
             <DialogDescription>
-              清除 LLM gate 上线前入库、**未分类且未被自动收录**的旧
-              session_flush 块。新自动收录（已分类或已 auto-promoted）、
-              手动创建、Agent 帮记（memory_save）的条目都**不会**被清理。
-              操作不可恢复。
+              清除**未分类且未被自动收录**的 session_flush 块（
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+                category IS NULL AND auto_promoted_at IS NULL
+              </code>
+              ）。已分类 / 已 auto-promoted / manual / memory_save 条目
+              **不会**被清理。操作不可恢复。
             </DialogDescription>
           </DialogHeader>
+
+          {/* rollout_at 状态分支 */}
+          {legacyRolloutAt === undefined ? (
+            <div
+              className="flex items-center gap-2 rounded-md border border-muted bg-muted/30 px-3 py-2 text-sm"
+              role="status"
+              data-testid="legacy-config-loading"
+            >
+              <LoaderCircle className="size-4 animate-spin" />
+              <span>加载时间边界配置…</span>
+            </div>
+          ) : legacyRolloutAt ? (
+            <div
+              className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-sm"
+              data-testid="legacy-cutoff-info"
+            >
+              时间边界：仅清理 <code className="font-mono">{legacyRolloutAt}</code>{" "}
+              之前创建的行（gate 上线时间，已配置）。
+            </div>
+          ) : (
+            <div
+              className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
+              role="alert"
+              data-testid="legacy-no-cutoff-warning"
+            >
+              <strong>⚠️ 警告：</strong>
+              当前 deployment 未配置 gate 上线时间。本操作将清除
+              <strong>所有</strong>未分类 session_flush 行，包括 LLM gate
+              关闭时 post-launch 新写入的数据。若仅需删除历史遗留，请先
+              为当前 deployment 设置环境变量{" "}
+              <code className="font-mono">MEMORY_GATE_ROLLOUT_AT</code>
+              （ISO 8601 timezone-aware，例如{" "}
+              <code className="font-mono">2026-04-01T00:00:00Z</code>）后再
+              操作。
+              {legacyConfigError && (
+                <div className="mt-1 text-xs opacity-80">
+                  （配置接口请求失败：{legacyConfigError}）
+                </div>
+              )}
+            </div>
+          )}
+
           <DialogFooter>
             <Button
               variant="outline"
@@ -717,7 +786,7 @@ export function MemoryManagement() {
             <Button
               variant="destructive"
               onClick={handleConfirmDeleteLegacy}
-              disabled={isActionPending}
+              disabled={isActionPending || legacyRolloutAt === undefined}
             >
               {isActionPending ? (
                 <LoaderCircle className="mr-1 size-4 animate-spin" />

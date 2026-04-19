@@ -180,7 +180,12 @@ class MemoryChunkRepository(Protocol):
         """
         ...
 
-    async def delete_legacy_by_user(self, *, user_id: str) -> list[MemoryChunk]:
+    async def delete_legacy_by_user(
+        self,
+        *,
+        user_id: str,
+        rollout_at: datetime | None = None,
+    ) -> list[MemoryChunk]:
         """删除"旧 session_flush"遗留行，返回被删除的完整行列表。
 
         "一键清理旧 session_flush" 入口的底层 SQL。
@@ -191,6 +196,10 @@ class MemoryChunkRepository(Protocol):
           会有 category='user/rule/fact'，不在清理范围内
         - ``auto_promoted_at IS NULL`` — LLM gate 没收录的；经 gate 收录的
           行会有 auto_promoted_at 非空，属于"系统已背书"的数据，不能乱删
+        - ``rollout_at`` 非空 → 额外 AND ``created_at < rollout_at``（codex fix
+          P1）：gate 关闭 deployment 里 post-launch 新写入的 session_flush
+          也是 (NULL, NULL)，若不加时间边界会被误删。rollout_at 为空时沿用
+          旧谓词（未经 gate 全清）——由 service 层在 UI 上显式警告。
 
         用 ``DELETE ... RETURNING *`` 单语句出，调用方一次拿到 "被删行数 +
         chunk_ids"（审计所需）+ (id, category) 对（fs 清盘需要，但 legacy

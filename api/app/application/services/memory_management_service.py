@@ -90,6 +90,7 @@ class MemoryManagementService:
         redis: "Redis | None" = None,
         user_daily_quota: int | None = None,
         notification_emitter: "MemoryNotificationEmitter | None" = None,
+        memory_gate_rollout_at: datetime | None = None,
     ) -> None:
         # ``file_store`` 在 PR-0 期间恒为 None（DB-only 模式），PR-5A 起由
         # lifespan 注入真实的 ``FsMemoryWriter``。None 时所有 CRUD 只落 DB，
@@ -113,6 +114,11 @@ class MemoryManagementService:
         # 只写 audit_log，保持 legacy 路径可用，但对外契约里 ``fs_permanent_failure``
         # 就等同于空承诺——生产部署必须通过 DI 注入真实 emitter。
         self._notification_emitter = notification_emitter
+        # ``memory_gate_rollout_at``（codex fix P1）：legacy 清理的时间边界。
+        # 非空时 ``delete_legacy_memories`` 额外 AND ``created_at < rollout_at``；
+        # 为空时沿用旧谓词（未经 gate 全清），由前端 dialog 显式警告当前
+        # deployment 未设 rollout 时间。
+        self._memory_gate_rollout_at = memory_gate_rollout_at
 
     async def list_memories(
         self,
@@ -715,7 +721,10 @@ class MemoryManagementService:
         """
         async with self._session_factory() as session:
             repo = self._repo_factory(session)
-            deleted_rows = await repo.delete_legacy_by_user(user_id=user_id)
+            deleted_rows = await repo.delete_legacy_by_user(
+                user_id=user_id,
+                rollout_at=self._memory_gate_rollout_at,
+            )
             deleted = len(deleted_rows)
             if deleted > 0:
                 await self._write_audit(
@@ -727,6 +736,12 @@ class MemoryManagementService:
                     affected_count=deleted,
                     old_snapshot={
                         "content_hashes": [c.content_hash for c in deleted_rows],
+                        # 审计保留本次清理的时间边界（None = 未设，沿用旧谓词）。
+                        "rollout_at": (
+                            self._memory_gate_rollout_at.isoformat()
+                            if self._memory_gate_rollout_at is not None
+                            else None
+                        ),
                     },
                 )
                 await session.commit()
