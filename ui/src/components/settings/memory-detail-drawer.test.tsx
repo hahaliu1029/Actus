@@ -7,6 +7,7 @@ vi.mock("@/lib/api/memory", () => ({
     list: vi.fn(),
     getDetail: vi.fn(),
     updateContent: vi.fn(),
+    updatePinned: vi.fn(),
     deleteOne: vi.fn(),
     bulkDelete: vi.fn(),
     deleteAll: vi.fn(),
@@ -119,6 +120,220 @@ describe("MemoryDetailDrawer reindex", () => {
       errorSpy.mockRestore();
       warnSpy.mockRestore();
     }
+  });
+
+  // ─── pin/unpin PATCH 扩展 ──────────────────────────────────────────────
+
+  it("shows pin button only for user category", async () => {
+    mockedMemoryApi.getDetail.mockResolvedValue(
+      makeDetail({ category: "user", pinned: false }),
+    );
+    renderOpen();
+    await screen.findByText(/original body/);
+    expect(
+      screen.getByRole("button", { name: /^置顶$/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides pin button for non-user category", async () => {
+    mockedMemoryApi.getDetail.mockResolvedValue(
+      makeDetail({ category: "rule", pinned: false }),
+    );
+    renderOpen();
+    await screen.findByText(/original body/);
+    // 非 user 类隐藏 pin 按钮（后端 400 约束，避免死按钮）
+    expect(screen.queryByRole("button", { name: /^置顶$/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /取消置顶/ })).toBeNull();
+  });
+
+  it("unpin button appears for pinned user memory", async () => {
+    mockedMemoryApi.getDetail.mockResolvedValue(
+      makeDetail({ category: "user", pinned: true }),
+    );
+    renderOpen();
+    await screen.findByText(/original body/);
+    expect(
+      screen.getByRole("button", { name: /取消置顶/ }),
+    ).toBeInTheDocument();
+    // 置顶状态下 pressed=true
+    expect(
+      screen.getByRole("button", { name: /取消置顶/ }),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("clicking pin toggles pinned and refreshes detail", async () => {
+    const user = userEvent.setup();
+    mockedMemoryApi.getDetail.mockResolvedValue(
+      makeDetail({ category: "user", pinned: false }),
+    );
+    mockedMemoryApi.updatePinned.mockResolvedValue(
+      makeDetail({ category: "user", pinned: true }),
+    );
+    mockedMemoryApi.list.mockResolvedValue({
+      items: [],
+      total: 0,
+      page: 1,
+      page_size: 20,
+      has_next: false,
+    });
+    renderOpen();
+    await screen.findByText(/original body/);
+
+    await user.click(screen.getByRole("button", { name: /^置顶$/ }));
+
+    await waitFor(() =>
+      expect(mockedMemoryApi.updatePinned).toHaveBeenCalledWith(
+        "chunk-1",
+        true,
+      ),
+    );
+    // 按钮切到"取消置顶"态
+    await screen.findByRole("button", { name: /取消置顶/ });
+
+    const msg = useUIStore.getState().message;
+    expect(msg?.type).toBe("success");
+    expect(msg?.text).toMatch(/已置顶/);
+  });
+
+  // NOTE（codex round-13 P2 背景）：曾经尝试过一条"rerender 和 stale resolve
+  // 挤在同一个 act microtask tick"的合成时序测试，目的是 probe 比下一条
+  // "rerender commits 后 stale resolve"更紧的窗口。结论：**做不到**——
+  // `rerender()` 只把 React work 入队（scheduler macrotask），同 tick 的
+  // `resolvePin()` 的 `.then` 是 microtask，**microtask 先于 macrotask**。
+  // render-sync epoch 和 effect-sync ref 此时同样没机会 bump。要守住那个
+  // 窗口只能父组件命令式调用 drawer.invalidate()（useImperativeHandle），
+  // 属更大 API 改动，当前需求不驱动。真实网络时序下 pin 响应 RTT ≫ React
+  // flush 延迟，下一条 "commit-first" 测试覆盖的就是唯一现实场景。
+  it("switching chunk while pin is pending drops stale response", async () => {
+    // codex round-12 P1/P2：A(user) pin pending 时切到 B(rule)，A 的响应
+    // 回来后**不能**覆盖 B 的 detail，也**不能**发 A 的 success toast，
+    // 也**不能**刷新列表（stale response 完全丢弃）。
+    //
+    // 关键：A / B 的内容必须**显著不同**（不同 id / content / category /
+    // pinned），让"stale 响应覆盖 B" 与"正确丢弃 stale" 的 assertion
+    // 可区分——A makeDetail 默认 content="original body" 如果也给 B 默认
+    // 值就 false-positive。
+    const user = userEvent.setup();
+
+    // A：category=user，pinned=false，内容 A-BODY
+    const detailA = makeDetail({
+      id: "chunk-a",
+      category: "user",
+      pinned: false,
+      content: "AAA-unique-content-from-chunk-a",
+    });
+    // A 的 pin 响应（若被错误 apply，会覆盖 detail 为这条）
+    const detailAUpdated = makeDetail({
+      id: "chunk-a",
+      category: "user",
+      pinned: true,
+      content: "AAA-unique-content-from-chunk-a",
+    });
+    // B：category=rule（pin 按钮会被隐藏），内容完全不同
+    const detailB = makeDetail({
+      id: "chunk-b",
+      category: "rule",
+      pinned: false,
+      content: "BBB-totally-different-body-for-chunk-b",
+    });
+
+    mockedMemoryApi.getDetail
+      .mockImplementation((id: string) => {
+        if (id === "chunk-a") return Promise.resolve(detailA);
+        if (id === "chunk-b") return Promise.resolve(detailB);
+        return Promise.reject(new Error("unexpected id " + id));
+      });
+
+    // pin 请求挂起直到手动 resolve
+    let resolvePin: ((v: unknown) => void) | null = null;
+    mockedMemoryApi.updatePinned.mockImplementation(
+      () => new Promise((res) => { resolvePin = res as (v: unknown) => void; }),
+    );
+    mockedMemoryApi.list.mockResolvedValue({
+      items: [],
+      total: 0,
+      page: 1,
+      page_size: 20,
+      has_next: false,
+    });
+
+    const onOpenChange = vi.fn();
+    const { rerender } = render(
+      <MemoryDetailDrawer chunkId="chunk-a" open onOpenChange={onOpenChange} />,
+    );
+    // A 的独特内容确实先渲染出来
+    await screen.findByText(/AAA-unique-content-from-chunk-a/);
+
+    // 对 A 点 "置顶"——pin 请求挂起
+    await user.click(screen.getByRole("button", { name: /^置顶$/ }));
+    await waitFor(() =>
+      expect(mockedMemoryApi.updatePinned).toHaveBeenCalledWith(
+        "chunk-a",
+        true,
+      ),
+    );
+
+    // 切到 B
+    rerender(
+      <MemoryDetailDrawer chunkId="chunk-b" open onOpenChange={onOpenChange} />,
+    );
+    // B 的独特内容确实渲染出来（确认切换已完成 + ref 已更新）
+    await screen.findByText(/BBB-totally-different-body-for-chunk-b/);
+
+    // list API 调用次数快照——stale 响应若错误刷列表，这个计数会增
+    const listCallsBeforeStaleResponse = mockedMemoryApi.list.mock.calls.length;
+    // toast 清空，便于检测 stale success toast 是否偷偷发出
+    useUIStore.getState().reset();
+
+    // 现在 A 的 pin 响应回来——drawer 已切到 B，stale 必须完全丢弃
+    await act(async () => {
+      resolvePin?.(detailAUpdated);
+    });
+
+    // 断言 1：B 的内容未被覆盖（若 setDetail(detailAUpdated) 被错误调用，
+    // 这里就会渲染 AAA 那段 unique content）
+    expect(
+      screen.getByText(/BBB-totally-different-body-for-chunk-b/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/AAA-unique-content-from-chunk-a/),
+    ).toBeNull();
+
+    // 断言 2：pin 按钮仍是隐藏态（B=rule）；未因 A 的 user 覆盖而重新出现
+    expect(screen.queryByRole("button", { name: /^置顶$/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /取消置顶/ })).toBeNull();
+
+    // 断言 3：不触发 stale success toast
+    expect(useUIStore.getState().message).toBeNull();
+
+    // 断言 4：不错误刷新列表（loadMemories 调用次数未增）
+    expect(mockedMemoryApi.list.mock.calls.length).toBe(
+      listCallsBeforeStaleResponse,
+    );
+  });
+
+  it("pin error keeps state and shows error toast", async () => {
+    const user = userEvent.setup();
+    mockedMemoryApi.getDetail.mockResolvedValue(
+      makeDetail({ category: "user", pinned: false }),
+    );
+    mockedMemoryApi.updatePinned.mockRejectedValueOnce(
+      new Error("rate limited"),
+    );
+    renderOpen();
+    await screen.findByText(/original body/);
+
+    await user.click(screen.getByRole("button", { name: /^置顶$/ }));
+
+    await waitFor(() => {
+      const msg = useUIStore.getState().message;
+      expect(msg?.type).toBe("error");
+      expect(msg?.text).toMatch(/置顶失败/);
+    });
+    // 按钮仍在"置顶"态（未 apply）
+    expect(
+      screen.getByRole("button", { name: /^置顶$/ }),
+    ).toBeInTheDocument();
   });
 
   it("shows reindex button in view mode and hides it while editing", async () => {

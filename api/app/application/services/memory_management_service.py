@@ -627,6 +627,87 @@ class MemoryManagementService:
                 )
         return updated
 
+    async def update_memory_pinned(
+        self, user_id: str, chunk_id: str, pinned: bool
+    ) -> MemoryChunk | None:
+        """切换 chunk 的 pinned 字段。
+
+        **约束**：``pinned=True`` 仅允许在 ``category='user'`` 上（与
+        ``create_memory`` 一致 + DB CHECK 兜底）。非 user 类 + pinned=True
+        → ``BadRequestError`` (400)；IntegrityError(23514) 也 map 到同一错误
+        （防御 DB 约束和 app 校验漂移）。
+
+        **幂等 PATCH 语义**（codex round-11 P1）：PATCH 是"设为目标状态"不是
+        toggle——对已 ``pinned=target`` 的行重复请求不写 audit、不 UPDATE、
+        直接返现有 chunk。避免 no-op 污染 audit log 噪音 + 无意义刷
+        ``updated_at`` 扰乱列表排序。
+
+        **fs 语义**（codex round-11 P1）：不改 content / embedding，走
+        ``repo.update_pinned`` 单 SQL UPDATE **保留现有 fs_synced**（不强制
+        True——否则会吞 pre-existing ``fs_synced=false`` backlog，让
+        reconciler scan_pending 扫不到先前写盘失败的行）。file 层 frontmatter
+        的 pinned 字段可能与 DB 漂移——当前 PATCH 不回写文件，漂移由未来
+        显式 rewrite/rebuild 路径处理（reindex Option A 也不同步 pinned
+        字段回 DB）。
+
+        返回更新后的 chunk；chunk 不存在或越权返 None（route 层 map 404）。
+        """
+        # 先拉一次 chunk 做 category 校验 + no-op 短路。比让 DB CHECK 抛错
+        # 再 map 400 更友好，错误消息能直接说清原因。
+        async with self._session_factory() as session:
+            repo = self._repo_factory(session)
+            existing = await repo.get_by_id(chunk_id, user_id)
+        if existing is None:
+            return None
+
+        # codex round-11 P1 no-op 短路：幂等 PATCH 对已经是目标状态的行
+        # 直接返回现有，不碰 DB 也不写 audit。
+        if existing.pinned == pinned:
+            return existing
+
+        if pinned and existing.category != "user":
+            raise BadRequestError(
+                f"pinned=True 仅允许 category='user'，当前 category="
+                f"{existing.category!r}（DB CHECK 约束：pinned=false "
+                f"OR category='user'）"
+            )
+
+        async with self._session_factory() as session:
+            repo = self._repo_factory(session)
+            try:
+                updated = await repo.update_pinned(
+                    chunk_id=chunk_id, user_id=user_id, pinned=pinned,
+                )
+            except IntegrityError as exc:
+                orig = getattr(exc, "orig", None)
+                pgcode = (
+                    getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+                )
+                if pgcode == "23514":
+                    # CHECK constraint violation（理论上前置校验已拦，
+                    # 这里兜 race / 过期 existing 状态）
+                    raise BadRequestError(
+                        "pinned=True 仅允许 category='user'（DB CHECK 约束）"
+                    ) from exc
+                raise
+
+            if updated is None:
+                return None
+
+            # 审计：action='pin' 或 'unpin'，old/new snapshot 记 pinned 值
+            action = "pin" if pinned else "unpin"
+            await self._write_audit(
+                session,
+                user_id=user_id,
+                chunk_id=chunk_id,
+                action=action,
+                old_snapshot={"pinned": existing.pinned},
+                new_snapshot={"pinned": pinned},
+            )
+            await session.commit()
+
+        return updated
+
     async def reindex_memory(
         self, user_id: str, chunk_id: str
     ) -> "ReindexResult":

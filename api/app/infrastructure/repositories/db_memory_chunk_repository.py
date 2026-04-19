@@ -228,6 +228,39 @@ class DBMemoryChunkRepository(MemoryChunkRepository):
         row = result.scalar_one_or_none()
         return self._to_domain(row) if row else None
 
+    async def update_pinned(
+        self,
+        *,
+        chunk_id: str,
+        user_id: str,
+        pinned: bool,
+    ) -> MemoryChunk | None:
+        """切 pinned（codex round-11 P1：不动 ``fs_synced``）。
+
+        只 UPDATE ``pinned`` + ``updated_at``——**保留 fs_synced 原值**，避免
+        吞掉 pre-existing ``fs_synced=false`` backlog（先前 create/update
+        写盘失败的行，还在等 FsReconciler 回写；如果 pin/unpin 把它们置
+        True，reconciler scan_pending 扫不到，磁盘继续 stale）。
+
+        约束冲突（pinned=true 但 category!=user）由 DB CHECK 抛
+        IntegrityError (pgcode 23514)，service 层映射 400。
+        """
+        stmt = (
+            update(MemoryChunkModel)
+            .where(
+                MemoryChunkModel.id == chunk_id,
+                MemoryChunkModel.user_id == user_id,
+            )
+            .values(
+                pinned=pinned,
+                updated_at=text("now()"),
+            )
+            .returning(MemoryChunkModel)
+        )
+        result = await self.db_session.execute(stmt)
+        row = result.scalar_one_or_none()
+        return self._to_domain(row) if row else None
+
     async def reindex_content(
         self,
         *,

@@ -771,10 +771,21 @@ def build_main_graph(
             ]
             plan = plan.model_copy(update={"steps": updated_steps})
 
-        # 2. Call planner LLM to update remaining steps based on execution results
+        # 2. Call planner LLM to update remaining steps based on execution results.
+        # Skip when the plan has no pending steps left — there is nothing to
+        # re-plan, and making a redundant LLM round-trip has two real costs
+        # we just observed in a production trace:
+        #   (a) wasted tokens / latency on an unused PlanUpdateResponse;
+        #   (b) if the outer LangGraph task is cancelled while that call is
+        #       in flight (e.g. SSE client disconnect), the httpx/openai
+        #       read raises asyncio.CancelledError which bypasses our
+        #       ``except Exception`` below (CancelledError is BaseException
+        #       in py3.8+) and surfaces as a run-failure stack trace even
+        #       though the last step already succeeded.
         execution_summary = state.get("execution_summary", "")
         plan_updated = False
-        if completed_step and execution_summary:
+        has_pending_step = plan.get_next_step() is not None
+        if completed_step and execution_summary and has_pending_step:
             try:
                 query = bundle.UPDATE_PLAN_PROMPT.format(
                     plan=plan.model_dump_json(),

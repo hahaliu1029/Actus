@@ -1394,6 +1394,186 @@ class TestDeleteFsSync:
         assert len(store.deletes) == 5
 
 
+# ─── update_memory_pinned（PATCH pin/unpin 扩展）──────────────────────────
+
+class TestUpdateMemoryPinned:
+    """``MemoryManagementService.update_memory_pinned``：单字段切 pinned。
+
+    DB CHECK 约束 ``pinned=true OR category='user'``：非 user 类 + pin=True
+    应被 service 前置校验拒绝（400），race 场景兜底的 IntegrityError 23514
+    也 map 到同一错误。``repo.update_pinned`` **保留现有 fs_synced**（不强
+    制置 True），避免吞掉 pre-existing pending backlog——pin 切换不改盘面
+    正文，fs_synced 该是什么就是什么，让 reconciler / FsMemoryWriter 各走
+    各的同步路径。
+    """
+
+    def _user_chunk(self, pinned: bool = False):
+        import dataclasses
+        return dataclasses.replace(
+            _chunk(content="profile"),
+            category="user",
+            pinned=pinned,
+            fs_synced=True,
+        )
+
+    async def test_returns_none_when_chunk_missing(
+        self, service, mock_repo
+    ):
+        mock_repo.get_by_id.return_value = None
+        result = await service.update_memory_pinned(
+            TEST_USER_ID_FIXED, "missing", True
+        )
+        assert result is None
+
+    async def test_pin_user_chunk_happy_path(
+        self, service, mock_repo, mock_session
+    ):
+        import dataclasses
+        chunk = self._user_chunk(pinned=False)
+        updated_row = dataclasses.replace(chunk, pinned=True)
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.update_pinned = AsyncMock(return_value=updated_row)
+
+        result = await service.update_memory_pinned(
+            TEST_USER_ID_FIXED, chunk.id, True
+        )
+
+        assert result is not None
+        assert result.pinned is True
+        mock_repo.update_pinned.assert_awaited_once()
+        call_kwargs = mock_repo.update_pinned.call_args.kwargs
+        assert call_kwargs["pinned"] is True
+        # audit action='pin'
+        audit_obj = mock_session.add.call_args[0][0]
+        assert audit_obj.action == "pin"
+        assert audit_obj.old_snapshot == {"pinned": False}
+        assert audit_obj.new_snapshot == {"pinned": True}
+
+    async def test_unpin_happy_path_writes_unpin_action(
+        self, service, mock_repo, mock_session
+    ):
+        import dataclasses
+        chunk = self._user_chunk(pinned=True)
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.update_pinned = AsyncMock(
+            return_value=dataclasses.replace(chunk, pinned=False)
+        )
+
+        await service.update_memory_pinned(TEST_USER_ID_FIXED, chunk.id, False)
+        audit_obj = mock_session.add.call_args[0][0]
+        assert audit_obj.action == "unpin"
+        assert audit_obj.old_snapshot == {"pinned": True}
+        assert audit_obj.new_snapshot == {"pinned": False}
+
+    async def test_pin_rejected_for_non_user_category(
+        self, service, mock_repo
+    ):
+        """core contract：category=rule/fact/None 时 pin=True → 400。"""
+        from app.application.errors.exceptions import BadRequestError
+        import dataclasses
+        chunk = dataclasses.replace(
+            _chunk(content="rule content"), category="rule", pinned=False
+        )
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.update_pinned = AsyncMock()
+
+        with pytest.raises(BadRequestError, match="category='user'"):
+            await service.update_memory_pinned(
+                TEST_USER_ID_FIXED, chunk.id, True
+            )
+        # 不应推进到 DB update
+        mock_repo.update_pinned.assert_not_called()
+
+    async def test_unpin_allowed_for_non_user_category_is_noop(
+        self, service, mock_repo, mock_session
+    ):
+        """DB CHECK 保证 category!=user 的 chunk pinned 永远 False，所以对
+        这类 chunk 调 unpin（target=False）是 no-op。
+
+        这条测试的 spirit 是"非 user 类也不会被 BadRequestError 拦"（因为
+        pinned=False 不触发 pinned/category 约束）。结合 codex round-11 P1
+        的 no-op 短路：本 case 走 short-circuit path 返 existing，不调
+        update_pinned、不写 audit——仍然不报错，语义一致（幂等）。
+        """
+        import dataclasses
+        chunk = dataclasses.replace(
+            _chunk(content="fact"), category="fact", pinned=False,
+        )
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.update_pinned = AsyncMock()  # 不应被调（no-op）
+
+        result = await service.update_memory_pinned(
+            TEST_USER_ID_FIXED, chunk.id, False
+        )
+        # 幂等：返 existing chunk，非 None，非 BadRequest
+        assert result is chunk
+        mock_repo.update_pinned.assert_not_called()
+
+    async def test_noop_pin_short_circuits_no_db_write(
+        self, service, mock_repo, mock_session
+    ):
+        """codex round-11 P1：对已 pinned=True 的行再 pin → no-op 短路，
+        不调 repo.update_pinned、不写 audit、不 commit、不刷 updated_at。"""
+        chunk = self._user_chunk(pinned=True)
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.update_pinned = AsyncMock()  # 不应被调
+
+        result = await service.update_memory_pinned(
+            TEST_USER_ID_FIXED, chunk.id, True
+        )
+        # 返回现有 chunk（语义：幂等设目标状态成功）
+        assert result is chunk
+        mock_repo.update_pinned.assert_not_called()
+        # 不写 audit
+        assert not mock_session.add.called
+        # 不 commit
+        mock_session.commit.assert_not_called()
+
+    async def test_noop_unpin_short_circuits_for_non_user(
+        self, service, mock_repo, mock_session
+    ):
+        """对 category=rule 的行 unpin（pinned=False），DB invariant 下
+        它 pinned 本就是 False → 也走 no-op 短路。"""
+        import dataclasses
+        chunk = dataclasses.replace(
+            _chunk(content="rule"), category="rule", pinned=False
+        )
+        mock_repo.get_by_id.return_value = chunk
+        mock_repo.update_pinned = AsyncMock()
+
+        result = await service.update_memory_pinned(
+            TEST_USER_ID_FIXED, chunk.id, False
+        )
+        assert result is chunk
+        mock_repo.update_pinned.assert_not_called()
+        assert not mock_session.add.called
+
+    async def test_integrity_error_check_violation_maps_to_400(
+        self, service, mock_repo, mock_embed, mock_session
+    ):
+        """race 场景兜底：前置 get_by_id 看到 category='user'，update 时
+        category 被并发改成非 user → DB CHECK 抛 IntegrityError(23514) →
+        service 映射 400（与前置校验同语义）。"""
+        from sqlalchemy.exc import IntegrityError
+        from app.application.errors.exceptions import BadRequestError
+
+        chunk = self._user_chunk(pinned=False)
+        mock_repo.get_by_id.return_value = chunk
+
+        class _FakeCheck(Exception):
+            sqlstate = "23514"
+
+        mock_repo.update_pinned = AsyncMock(
+            side_effect=IntegrityError(
+                "check", params=None, orig=_FakeCheck("check violation")
+            )
+        )
+        with pytest.raises(BadRequestError, match="CHECK"):
+            await service.update_memory_pinned(
+                TEST_USER_ID_FIXED, chunk.id, True
+            )
+
+
 # ─── reindex_memory（Option A：post-M3 hand-edit 闭环）─────────────────────
 
 class TestReindexMemory:

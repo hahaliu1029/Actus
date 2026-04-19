@@ -47,6 +47,11 @@ export const memoryApi = {
   updateContent: (id: string, content: string) =>
     patch<MemoryDetail>(`/v2/memories/${id}`, { content }),
 
+  // 2026-04-20 pin/unpin 扩展：PATCH /v2/memories/{id} 接受 content xor pinned。
+  // pinned=true 仅 category='user' 合法（后端 400），false 对任意 category OK。
+  updatePinned: (id: string, pinned: boolean) =>
+    patch<MemoryDetail>(`/v2/memories/${id}`, { pinned }),
+
   deleteOne: (id: string) =>
     del<DeleteCountResponse>(`/v2/memories/${id}`),
 

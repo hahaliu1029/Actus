@@ -206,7 +206,21 @@ async def get_memory(
 @router.patch(
     path="/{chunk_id}",
     response_model=Response[MemoryDetail],
-    summary="编辑长期记忆内容",
+    summary="编辑长期记忆（content 或 pinned 互斥二选一）",
+    description=(
+        "PATCH 支持 content 或 pinned 二选一（Schema 互斥 validator 强制）。"
+        "一次请求只改一个字段——combo 改动请分两次调用，避免 partial failure。"
+        "\n\n"
+        "- ``content``: 非空字符串，走 update_memory_content（重算 embedding + "
+        "fs_synced → false 等 reconciler 回写文件）\n"
+        "- ``pinned``: bool，走 update_memory_pinned 单 SQL UPDATE，**保留"
+        "现有 fs_synced**（避免吞 pre-existing pending backlog）；当前 PATCH"
+        "**不回写文件**——文件 frontmatter 的 pinned 可能长期漂移，只在未来"
+        "显式 rewrite/rebuild 路径下才可能带上新 pinned。``pinned=True`` 需"
+        "``category='user'``（DB CHECK + service 验证），否则 400。"
+        "**幂等语义**：对已是目标状态的行重复调用返 200 但不写 audit / "
+        "不刷 updated_at。"
+    ),
     dependencies=[Depends(rate_limit_write)],
 )
 async def update_memory(
@@ -216,9 +230,18 @@ async def update_memory(
     service: "MemoryManagementService" = Depends(get_memory_management_service),
 ) -> Response[MemoryDetail]:
     try:
-        updated = await service.update_memory_content(
-            current_user.id, chunk_id, body.content
-        )
+        if body.content is not None:
+            # content 路径：走既有 update_memory_content，fs_synced=False
+            # 过渡等 reconciler 回写盘。
+            updated = await service.update_memory_content(
+                current_user.id, chunk_id, body.content
+            )
+        else:
+            # pinned 路径：schema validator 保证 body.pinned is not None
+            assert body.pinned is not None
+            updated = await service.update_memory_pinned(
+                current_user.id, chunk_id, body.pinned
+            )
     except ValueError as exc:
         # service 对空内容 / 非法输入抛 ValueError，转为 400
         raise BadRequestError(str(exc)) from exc

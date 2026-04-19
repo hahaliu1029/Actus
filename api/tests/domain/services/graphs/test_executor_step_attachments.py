@@ -333,6 +333,48 @@ class TestLongEnvelopeAttachmentRegression:
             "cannot yield attachments; executor must parse full content."
         )
 
+    def test_updater_node_skips_llm_when_no_pending_step(self) -> None:
+        """updater_node must not call ``structured_llm.ainvoke`` when the
+        plan has no pending steps left.
+
+        Observed failure mode: after the final step completed, updater_node
+        still hit the planner LLM to produce a ``PlanUpdateResponse`` that
+        would never be used. If the outer LangGraph task got cancelled
+        (SSE client disconnect, watchdog abort) while that call was in
+        flight, the openai/httpx read raised ``asyncio.CancelledError`` —
+        which is a ``BaseException`` in py3.8+ and therefore escaped
+        updater_node's ``except Exception`` block, surfacing as a run
+        failure even though the step already succeeded.
+
+        Pin the guard so future refactors can't regress it silently.
+        """
+        src = _main_graph_source()
+        tree = ast.parse(src)
+        updater = _find_function(tree, "updater_node")
+        assert updater is not None
+        updater_src = ast.unparse(updater)
+
+        # The function must reference ``get_next_step`` (the source of
+        # truth for "is there a pending step") before invoking the
+        # planner LLM for the update.
+        assert "get_next_step" in updater_src, (
+            "updater_node must consult plan.get_next_step() to skip the "
+            "LLM call when no pending step remains"
+        )
+        # And the invocation ordering must be: get_next_step check
+        # appears before structured_llm.ainvoke in source order.
+        idx_guard = updater_src.find("get_next_step")
+        idx_invoke = updater_src.find("structured_llm.ainvoke")
+        # If structured_llm.ainvoke isn't present (someone removed it),
+        # the test can't make a claim — but we still need the guard to
+        # exist, so keep the first assertion above.
+        if idx_invoke != -1:
+            assert 0 <= idx_guard < idx_invoke, (
+                "updater_node must check get_next_step BEFORE invoking "
+                "structured_llm.ainvoke (found guard at "
+                f"{idx_guard}, invoke at {idx_invoke})"
+            )
+
     def test_executor_parses_full_content_not_summary(self) -> None:
         """AST-level pin: executor_node must call ``unwrap_message_envelope``
         on the *full* AI content variable (the same var assigned before

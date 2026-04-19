@@ -18,7 +18,7 @@ import type { MemoryDetail } from "@/lib/api/types";
 import { memorySourceLabel } from "@/lib/memory-utils";
 import { useSettingsStore } from "@/lib/store/settings-store";
 import { useUIStore } from "@/lib/store/ui-store";
-import { LoaderCircle, Pencil, RefreshCw, X } from "lucide-react";
+import { LoaderCircle, Pencil, Pin, PinOff, RefreshCw, X } from "lucide-react";
 
 type MemoryDetailDrawerProps = {
   chunkId: string | null;
@@ -47,6 +47,9 @@ export function MemoryDetailDrawer({
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  // Pin/unpin state（2026-04-20 PATCH 扩展）
+  const [isPinToggling, setIsPinToggling] = useState(false);
+
   // Reindex state (post-M3 Option A)
   const [isReindexing, setIsReindexing] = useState(false);
   const [reindexError, setReindexError] = useState<string | null>(null);
@@ -58,6 +61,38 @@ export function MemoryDetailDrawer({
   const [reindexWarnings, setReindexWarnings] = useState<string[]>([]);
 
   const cancelledRef = useRef(false);
+
+  // 前端 stale-response guard：**render-time epoch counter**（单调递增）。
+  //
+  // 迭代历史（别再退回去踩坑）：
+  // - round-11：``chunkId === requestChunkId`` 闭包比较——**永真**，因为
+  //   挂起的 handleTogglePin 闭包里的 chunkId 不会跟随 rerender 更新
+  // - round-12：``useEffect`` 里 ``activeChunkRef.current = chunkId``
+  //   同步——passive effect 在 commit 后才跑；切 chunk 但 effect 尚未跑
+  //   的微窗口内，stale 响应会绕过检查
+  // - round-13：render 阶段直接 ++epoch（ref 赋值不触发 re-render，安全）
+  //
+  // 守卫时序范围（诚实版）：guard 保护的是**"rerender 已 commit 之后"stale
+  // 响应**——也就是 React 把新 chunk 渲染完、epoch 已 bump 的场景。这是
+  // 真实浏览器里 pin 响应回来时的典型时序（网络 RTT ≫ React scheduler flush
+  // 延迟）。不保护的是合成时序"rerender schedule 和 stale resolve 发生在
+  // 同一个 microtask tick"——那要做到需要父组件在 setState 前**命令式调用
+  // drawer.invalidate()**（或 useImperativeHandle），属于更大的架构改动，
+  // 当前版本留给后续需求驱动。
+  //
+  // 用 epoch 而非单纯 "currentChunkId" 的原因：A→B→A 往返时，第一次 pin
+  // 的 stale 响应如果只按 chunkId 比对，回到 A 会被误认为当前，造成覆盖。
+  const viewEpochRef = useRef(0);
+  const lastChunkRef = useRef<string | null>(null);
+  const lastOpenRef = useRef<boolean>(false);
+  if (
+    lastChunkRef.current !== chunkId ||
+    lastOpenRef.current !== open
+  ) {
+    viewEpochRef.current += 1;
+    lastChunkRef.current = chunkId;
+    lastOpenRef.current = open;
+  }
 
   const fetchDetail = useCallback(
     async (id: string, opts?: { rethrow?: boolean }) => {
@@ -95,6 +130,13 @@ export function MemoryDetailDrawer({
     setReindexWarnings([]);
     setReindexError(null);
     setIsReindexing(false);
+    // codex round-11 P1：pin toggling 同样受 chunkId 切换影响——A pin
+    // pending 时切到 B，B 继承 disabled；如果 B 非 user（按钮隐藏），用户
+    // 看到的是 "edit/reindex 全 disabled 但无 loading 指示"的死态。
+    setIsPinToggling(false);
+    // race guard 走 render-time ``viewEpochRef``（见 ref 定义处注释），
+    // 不在 effect 里同步——effect 在 commit 后异步跑，留下 "prop 已切但
+    // ref 未同步" 的 race 窗口（codex round-13 P1）。
     void fetchDetail(chunkId);
     return () => {
       cancelledRef.current = true;
@@ -104,6 +146,8 @@ export function MemoryDetailDrawer({
   const handleOpenChange = (nextOpen: boolean) => {
     if (!nextOpen) {
       cancelledRef.current = true;
+      // viewEpochRef 不用手动清——close 时 open 变 false 会在下次 render
+      // 自动触发 epoch++，已经起到"旧挂起响应全丢弃"效果。
       setDetail(null);
       setLoadError(null);
       setSaveError(null);
@@ -113,6 +157,7 @@ export function MemoryDetailDrawer({
       setIsReindexing(false);
       setReindexError(null);
       setReindexWarnings([]);
+      setIsPinToggling(false);
     }
     onOpenChange(nextOpen);
   };
@@ -243,6 +288,59 @@ export function MemoryDetailDrawer({
     setReindexWarnings([]);
   };
 
+  // Pin/unpin handler（2026-04-20 PATCH 扩展 + codex round-13 P1 race fix）
+  // pinned=true 仅 category='user' 合法（后端 400 拦）；前端只在 user 类显示
+  // toggle 按钮，避免用户看到"可以点但一定失败"的死按钮。
+  //
+  // **race 防御**：用 render-time ``viewEpochRef``（见 component 顶部的
+  // epoch 同步逻辑）。发起时 snapshot ``requestEpoch``；响应 apply 前检查
+  // ``viewEpochRef.current === requestEpoch``。drawer 切 chunk / 关闭 /
+  // 重新打开都会 ++epoch，stale 响应被全部丢弃。比 "同步 chunkId 到 ref"
+  // 方案更 robust——A→B→A 往返时第一次 pin 的 stale 响应仍被丢弃。
+  const handleTogglePin = async () => {
+    if (!detail) return;
+    const requestChunkId = detail.id;
+    const requestEpoch = viewEpochRef.current;
+    const prevPinned = detail.pinned;
+    setIsPinToggling(true);
+    try {
+      const next = !prevPinned;
+      const updated = await memoryApi.updatePinned(requestChunkId, next);
+      // Stale-response guard：drawer 已切到别的 chunk / 关 / 重开，丢弃本次
+      // 响应——不改 detail、不发 toast、不刷列表。
+      if (cancelledRef.current) return;
+      if (viewEpochRef.current !== requestEpoch) return;
+      setDetail(updated);
+      setDraft(updated.content);
+      useUIStore.getState().setMessage({
+        type: "success",
+        text: next ? "已置顶" : "已取消置顶",
+      });
+      try {
+        await useSettingsStore.getState().loadMemories();
+      } catch {
+        // 刷新失败由 memoryLoadError 呈现，不阻塞 pin UX
+      }
+    } catch (err: unknown) {
+      if (cancelledRef.current) return;
+      if (viewEpochRef.current !== requestEpoch) return;
+      const message = err instanceof Error ? err.message : "操作失败";
+      useUIStore.getState().setMessage({
+        type: "error",
+        text: `${prevPinned ? "取消置顶" : "置顶"}失败：${message}`,
+      });
+    } finally {
+      // 只有本次响应对应当前 epoch 才清 loading——切 chunk 时
+      // chunkId effect 自己会 reset setIsPinToggling(false)。
+      if (
+        !cancelledRef.current &&
+        viewEpochRef.current === requestEpoch
+      ) {
+        setIsPinToggling(false);
+      }
+    }
+  };
+
   // codex round-6 P2：SheetContent 在任何状态下都必须有稳定的 SheetTitle /
   // SheetDescription（Radix a11y 要求）；之前只在 detail 分支里渲染 header
   // 导致 loading / loadError 状态下 Radix 打 DialogTitle/Description warning。
@@ -294,11 +392,39 @@ export function MemoryDetailDrawer({
                   </>
                 ) : (
                   <>
+                    {/* Pin toggle：仅 category='user' 可 pin（后端 400 约束）；
+                        非 user 类隐藏 pin 按钮避免死按钮。unpin 对任意 category
+                        合法，但 pinned=true 只可能出现在 user 上，所以本按钮
+                        条件直接用 category === 'user'。 */}
+                    {detail.category === "user" && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleTogglePin}
+                        disabled={isPinToggling || isReindexing}
+                        aria-label={detail.pinned ? "取消置顶" : "置顶"}
+                        aria-pressed={detail.pinned}
+                        title={
+                          detail.pinned
+                            ? "取消置顶（pinned=true 在 prompt 注入里永远优先保留）"
+                            : "置顶（prompt 注入时永远优先保留，不被 recency 截断）"
+                        }
+                      >
+                        {isPinToggling ? (
+                          <LoaderCircle className="mr-1 size-4 animate-spin" />
+                        ) : detail.pinned ? (
+                          <PinOff className="mr-1 size-4" />
+                        ) : (
+                          <Pin className="mr-1 size-4" />
+                        )}
+                        {detail.pinned ? "取消置顶" : "置顶"}
+                      </Button>
+                    )}
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={handleReindex}
-                      disabled={isReindexing}
+                      disabled={isReindexing || isPinToggling}
                       aria-label="从磁盘重新索引"
                       title="从磁盘重新读取 memory 文件并更新 DB / embedding（hand-edit 闭环）"
                     >
@@ -312,11 +438,11 @@ export function MemoryDetailDrawer({
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={isReindexing}
+                      disabled={isReindexing || isPinToggling}
                       onClick={() => {
                         // codex round-5 P1：reindex 进行中禁止进编辑态，
                         // 否则成功后的 fetchDetail 会覆盖未保存 draft
-                        if (isReindexing) return;
+                        if (isReindexing || isPinToggling) return;
                         setIsEditing(true);
                         setSaveError(null);
                       }}

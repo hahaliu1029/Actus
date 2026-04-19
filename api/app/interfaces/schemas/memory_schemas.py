@@ -94,7 +94,40 @@ class CreateMemoryRequest(BaseModel):
 
 
 class UpdateMemoryRequest(BaseModel):
-    content: str = Field(..., min_length=1, max_length=50000)
+    """PATCH /v2/memories/{id} 请求体。
+
+    **互斥契约**（2026-04-20 pin/unpin 扩展）：``content`` 和 ``pinned`` 必须
+    **exactly one** 提供——一次 PATCH 只改一个字段。理由：两字段走独立的
+    repo UPDATE 语句（不同 fs_synced 语义），混在一起改会引入 partial failure
+    语义（content 改完 pinned 因 category 约束失败 → DB 半更新）。真需要
+    combo 改动请做两次 API 调用。
+
+    - ``content``（str, optional）：非空字符串改正文；走
+      ``update_memory_content`` 重算 embedding（fs_synced 原子置 False 等
+      reconciler 回写文件）
+    - ``pinned``（bool, optional）：切换置顶；走 ``update_memory_pinned``
+      单 SQL UPDATE，**保留现有 fs_synced**（避免吞 pre-existing pending
+      backlog）。``pinned=True`` 需 ``category='user'``（DB CHECK +
+      service 验证）。**幂等语义**：重复对已 ``pinned=target`` 的行调用
+      不写 audit / 不刷 updated_at。文件 frontmatter 的 pinned 字段可能
+      长期漂移——当前 PATCH **不回写文件**，只在未来显式 rewrite/rebuild
+      路径下才可能带上新 pinned。
+    """
+
+    content: str | None = Field(None, min_length=1, max_length=50000)
+    pinned: bool | None = Field(None)
+
+    @model_validator(mode="after")
+    def _exactly_one_field(self) -> "UpdateMemoryRequest":
+        has_content = self.content is not None
+        has_pinned = self.pinned is not None
+        if has_content == has_pinned:
+            # 二者同时 None 或同时非 None 都违约
+            raise ValueError(
+                "PATCH /v2/memories 必须且只能提供 content 或 pinned 之一；"
+                "combo 改动请做两次 API 调用以避免 partial failure"
+            )
+        return self
 
 
 class BulkDeleteRequest(BaseModel):

@@ -72,6 +72,7 @@ def mock_service() -> AsyncMock:
     svc.list_memories = AsyncMock(return_value=([], 0))
     svc.get_memory = AsyncMock(return_value=None)
     svc.update_memory_content = AsyncMock(return_value=None)
+    svc.update_memory_pinned = AsyncMock(return_value=None)
     svc.delete_memory = AsyncMock(return_value=False)
     svc.bulk_delete_memories = AsyncMock(return_value=0)
     svc.delete_all_memories = AsyncMock(return_value=0)
@@ -309,6 +310,104 @@ async def test_update_memory_200_on_success(
     mock_service.update_memory_content.assert_awaited_once_with(
         TEST_USER_ID_FIXED, "mem-1", "updated content"
     )
+
+
+# --- PATCH pinned（pin/unpin 扩展）-------------------------------------------
+
+
+async def test_patch_pinned_true_routes_to_update_memory_pinned(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """``{"pinned": true}`` → 走 update_memory_pinned，不碰 content 路径。"""
+    import dataclasses
+
+    chunk = _make_chunk(chunk_id="mem-1", content="profile")
+    chunk = dataclasses.replace(chunk, category="user", pinned=True)
+    mock_service.update_memory_pinned = AsyncMock(return_value=chunk)
+
+    response = await _request(
+        client_app, "PATCH", "/api/v2/memories/mem-1", json={"pinned": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["pinned"] is True
+    mock_service.update_memory_pinned.assert_awaited_once_with(
+        TEST_USER_ID_FIXED, "mem-1", True
+    )
+    # content 路径**绝不**被调（互斥契约）
+    mock_service.update_memory_content.assert_not_called()
+
+
+async def test_patch_pinned_false_unpin_routes_correctly(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """``{"pinned": false}`` 正常路由到 pinned 分支（False 也是 pinned 分支，
+    schema exactly-one 断言靠的是"是否传了"，不是值）。"""
+    import dataclasses
+
+    chunk = _make_chunk(chunk_id="mem-1")
+    chunk = dataclasses.replace(chunk, category="user", pinned=False)
+    mock_service.update_memory_pinned = AsyncMock(return_value=chunk)
+
+    response = await _request(
+        client_app, "PATCH", "/api/v2/memories/mem-1", json={"pinned": False},
+    )
+    assert response.status_code == 200
+    mock_service.update_memory_pinned.assert_awaited_once_with(
+        TEST_USER_ID_FIXED, "mem-1", False
+    )
+
+
+async def test_patch_both_fields_rejected_by_schema_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """互斥契约：同时传 content + pinned → Pydantic validator 422。"""
+    response = await _request(
+        client_app,
+        "PATCH",
+        "/api/v2/memories/mem-1",
+        json={"content": "x", "pinned": True},
+    )
+    assert response.status_code == 422
+    # service 未被调（schema 前置拦截）
+    mock_service.update_memory_content.assert_not_called()
+    mock_service.update_memory_pinned.assert_not_called()
+
+
+async def test_patch_empty_body_rejected_by_schema_422(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """互斥契约：两字段都不传 → 422。"""
+    response = await _request(
+        client_app, "PATCH", "/api/v2/memories/mem-1", json={},
+    )
+    assert response.status_code == 422
+
+
+async def test_patch_pin_non_user_category_400(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """service 抛 BadRequestError（category!=user + pin=True）→ 400。"""
+    from app.application.errors.exceptions import BadRequestError
+
+    mock_service.update_memory_pinned = AsyncMock(
+        side_effect=BadRequestError("pinned=True 仅允许 category='user'")
+    )
+    response = await _request(
+        client_app, "PATCH", "/api/v2/memories/rule-1", json={"pinned": True},
+    )
+    assert response.status_code == 400
+
+
+async def test_patch_pinned_404_when_chunk_missing(
+    client_app, mock_service: AsyncMock
+) -> None:
+    """service 返 None（chunk 不存在）→ 404。"""
+    mock_service.update_memory_pinned = AsyncMock(return_value=None)
+    response = await _request(
+        client_app, "PATCH", "/api/v2/memories/absent", json={"pinned": True},
+    )
+    assert response.status_code == 404
 
 
 # --- delete_memory ----------------------------------------------------------

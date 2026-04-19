@@ -148,6 +148,33 @@ class MemoryChunkRepository(Protocol):
         """
         ...
 
+    async def update_pinned(
+        self,
+        *,
+        chunk_id: str,
+        user_id: str,
+        pinned: bool,
+    ) -> MemoryChunk | None:
+        """切换 chunk 的 ``pinned`` 字段（单字段 UPDATE）。
+
+        - ``pinned=True`` 时必须已有 ``category='user'``；DB CHECK 约束拦着，
+          service 层也会前置校验（见 ``update_memory_pinned``）。约束违反
+          抛 ``IntegrityError``（pgcode 23514 check_violation），由 service
+          层映射 400。
+        - ``updated_at`` 走 DB ``now()`` 刷新，标记"pin 状态变更"的时间戳。
+        - **``fs_synced`` 保持不变**（codex round-11 P1 fix）：早期版本曾强制
+          置 True，理由是"pin/unpin 不改 content 所以 DB 与 fs 一致"；但
+          这忽略了 **pre-existing `fs_synced=false` backlog**——如果某条 chunk
+          因先前 create/update 写盘失败还在等 ``FsReconciler.scan_pending_fs_sync``
+          回写，pin/unpin 强制置 True 会把这条从待处理队列里抹掉，磁盘
+          正文/frontmatter 继续 stale。正确行为：pin/unpin 只改 pinned 字段
+          **保留** fs_synced 原值；文件侧 frontmatter 的 pinned 漂移由未来
+          显式 rewrite/rebuild 路径同步（当前不存在这个路径——见 schema 注释）。
+
+        返回被更新的行；chunk_id 不存在或非该用户 → None。
+        """
+        ...
+
     async def reindex_content(
         self,
         *,

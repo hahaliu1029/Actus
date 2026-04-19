@@ -183,6 +183,99 @@ class TestUpdateContent:
         assert result is None
 
 
+class TestUpdatePinned:
+    """``DBMemoryChunkRepository.update_pinned``：pin/unpin 单字段 UPDATE。
+
+    关键不变式（codex round-11 P1）：**不动 fs_synced**。如果这条 chunk 原本
+    fs_synced=false（先前 create/update 写盘失败等 reconciler 回写），
+    pin/unpin 后 fs_synced 必须仍为 false；否则 reconciler scan_pending
+    扫不到这条，磁盘继续 stale。
+    """
+
+    async def test_pin_user_chunk_preserves_pending_fs_synced_false(
+        self, repo, user_id, db_session
+    ):
+        """核心回归：fs_synced=false 的行 pin 后仍为 false。"""
+        import dataclasses as _dc
+
+        chunk = _dc.replace(
+            _make_chunk(user_id, "profile", source="manual"),
+            category="user",
+            pinned=False,
+            fs_synced=False,  # 模拟先前写盘失败的 pending backlog
+        )
+        await repo.batch_insert_ignore([chunk])
+        await db_session.flush()
+
+        updated = await repo.update_pinned(
+            chunk_id=chunk.id, user_id=user_id, pinned=True
+        )
+        assert updated is not None
+        assert updated.pinned is True
+        # 关键：fs_synced 保留 false，未被强制翻 true
+        assert updated.fs_synced is False
+
+    async def test_unpin_preserves_pending_fs_synced_false(
+        self, repo, user_id, db_session
+    ):
+        """对 pinned=true + fs_synced=false 的行 unpin 后 fs_synced 仍 false。"""
+        import dataclasses as _dc
+
+        chunk = _dc.replace(
+            _make_chunk(user_id, "pinned profile", source="manual"),
+            category="user",
+            pinned=True,
+            fs_synced=False,
+        )
+        await repo.batch_insert_ignore([chunk])
+        await db_session.flush()
+
+        updated = await repo.update_pinned(
+            chunk_id=chunk.id, user_id=user_id, pinned=False
+        )
+        assert updated is not None
+        assert updated.pinned is False
+        assert updated.fs_synced is False
+
+    async def test_pin_with_fs_synced_true_stays_true(
+        self, repo, user_id, db_session
+    ):
+        """fs_synced=true 的 happy-path 行也保留 true（不是被我们强制，
+        是"保留原值"的另一方向）。"""
+        import dataclasses as _dc
+
+        chunk = _dc.replace(
+            _make_chunk(user_id, "x", source="manual"),
+            category="user",
+            pinned=False,
+            fs_synced=True,
+        )
+        await repo.batch_insert_ignore([chunk])
+        await db_session.flush()
+
+        updated = await repo.update_pinned(
+            chunk_id=chunk.id, user_id=user_id, pinned=True
+        )
+        assert updated is not None
+        assert updated.fs_synced is True
+
+    async def test_returns_none_for_wrong_user(
+        self, repo, user_id, db_session
+    ):
+        import dataclasses as _dc
+
+        chunk = _dc.replace(
+            _make_chunk(user_id, "x"), category="user", pinned=False,
+        )
+        await repo.batch_insert_ignore([chunk])
+        await db_session.flush()
+
+        result = await repo.update_pinned(
+            chunk_id=chunk.id, user_id=str(uuid.uuid4()), pinned=True
+        )
+        assert result is None
+
+
 class TestDeleteByIds:
     async def test_deletes_matching_ids_returning_rows(
         self, repo, user_id, db_session
