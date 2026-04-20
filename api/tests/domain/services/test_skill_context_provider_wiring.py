@@ -164,6 +164,10 @@ async def test_run_planner_for_detection_reads_provider(
     )
     flow._llm = MagicMock()
     flow._session_id = "detection-test"
+    # Added by commit 84e1853 — salvage_empty_memory_recall_plan(has_memory_tools=...)
+    # reads this; production code sets it in __init__ L240 + _collect_all_tools L409,
+    # but __new__ bypasses both.
+    flow._has_memory_tools = False
 
     # Capture the state passed to build_render_context (which reads
     # detection_state["skill_context"]).

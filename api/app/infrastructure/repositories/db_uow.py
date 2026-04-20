@@ -5,6 +5,7 @@ from typing import Optional
 from app.domain.repositories.uow import IUnitOfWork
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .db_approval_grant_repository import DBApprovalGrantRepository
 from .db_file_repository import DBFileRepository
 from .db_sandbox_lifecycle_log_repository import DBSandboxLifecycleLogRepository
 from .db_session_repository import DBSessionRepository
@@ -39,6 +40,7 @@ class DBUnitOfWork(IUnitOfWork):
         self.session = DBSessionRepository(db_session=self.db_session)
         self.tool_approval_log = DBToolApprovalLogRepository(db_session=self.db_session)
         self.sandbox_lifecycle_log = DBSandboxLifecycleLogRepository(db_session=self.db_session)
+        self.approval_grants = DBApprovalGrantRepository(db_session=self.db_session)
 
         return self
 

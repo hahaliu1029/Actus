@@ -24,6 +24,7 @@ class ToolApprovalLogModel(Base):
     __table_args__ = (
         PrimaryKeyConstraint("id", name="pk_tool_approval_log_id"),
         Index("ix_tool_approval_log_session_id", "session_id"),
+        Index("ix_tool_approval_log_decision_id", "decision_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -65,6 +66,15 @@ class ToolApprovalLogModel(Base):
     approved_by: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
+    )
+    decision_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "tool_approval_grants.decision_id",
+            name="fk_tool_approval_log_decision_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import TypeVar
 
+from .approval_grant_repository import ApprovalGrantRepository
 from .file_repository import FileRepository
 from .sandbox_lifecycle_log_repository import SandboxLifecycleLogRepository
 from .session_repository import SessionRepository
@@ -16,6 +17,7 @@ class IUnitOfWork(ABC):
     session: SessionRepository
     tool_approval_log: ToolApprovalLogRepository
     sandbox_lifecycle_log: SandboxLifecycleLogRepository
+    approval_grants: ApprovalGrantRepository
 
     @abstractmethod
     async def commit(self):

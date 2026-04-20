@@ -225,6 +225,15 @@ class ToolConfirmationConfig(BaseModel):
     timeout_seconds: int = Field(default=300, ge=30, le=3600, description="确认超时秒数")
     smart_approve_enabled: bool = Field(default=False, description="启用 Smart Approve（LLM 辅助审批）")
     smart_approve_medium_only: bool = Field(default=False, description="Smart Approve 仅对 medium 工具生效")
+    legacy_rule_fallback: bool = Field(
+        default=True,
+        description=(
+            "R5 CS4 过渡期开关：当 ApprovalStateReader 在 grants 表查不到匹配时，"
+            "是否回退读旧 tool_approval_rules 表。默认 True；运维手动跑 "
+            "`uv run python -m app.cli.backfill_approval_grants` 完成迁移后切 False。"
+            "Phase 2 PermissionEngine 落地后删除本字段。"
+        ),
+    )
 
 
 class ExecutionConfig(BaseModel):
