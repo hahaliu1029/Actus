@@ -340,6 +340,49 @@ describe("recoverSession", () => {
     const session = useSessionStore.getState().currentSession;
     expect(session!.status).toBe("timed_out");
   });
+
+  it("live + recovery merge dedups overlapping event_ids", async () => {
+    // 本地已有 3 帧 live events (来自 SSE), event_id "1000-0" / "1000-1" / "1000-2"
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-0" } },
+          { event: "message", data: { role: "assistant", event_id: "1000-1" } },
+          { event: "message", data: { role: "assistant", event_id: "1000-2" } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+    vi.clearAllMocks();
+
+    const { sessionApi } = await import("../../api/session");
+    // Recovery 返回 5 帧, 前 3 帧 id 与 live 重叠, 后 2 帧是新 gap
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        { event: "message", data: { role: "assistant", event_id: "1000-0" } },
+        { event: "message", data: { role: "assistant", event_id: "1000-1" } },
+        { event: "message", data: { role: "assistant", event_id: "1000-2" } },
+        { event: "message", data: { role: "assistant", event_id: "1000-3" } },
+        { event: "message", data: { role: "assistant", event_id: "1000-4" } },
+      ],
+      session_status: "running",
+      has_more: false,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const merged = useSessionStore.getState().currentSession?.events ?? [];
+    const ids = merged.map((e) => e.data?.event_id as string | undefined);
+    // 断言: 合并后 exactly 5 条, 无重复, 顺序正确
+    expect(ids).toEqual(["1000-0", "1000-1", "1000-2", "1000-3", "1000-4"]);
+    expect(new Set(ids).size).toBe(5);
+  });
 });
 
 describe("stream disconnect recovery with streamConnected + sawTerminalEvent", () => {

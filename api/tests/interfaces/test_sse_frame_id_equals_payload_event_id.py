@@ -1,30 +1,145 @@
-"""R4 / N2 double-ID contract: SSE frame `id:` field == payload `event_id`.
+"""CS3 wire contract: SSE frame `id:` field == payload `event_id`.
 
-F6 fix: N2 未落地前，此测试 xfail 作为 executable guard. N2 实现 SSE frame `id:`
-field 时，开发者负责去掉 xfail marker 让此测试转绿.
+N2 landing 后摘 xfail. chat endpoint 每一帧 SSE 必须满足:
+    frame.id == json.loads(frame.data)["event_id"]
 
-规则 (docs/adr/CS3-tool-event-envelope-v1.md):
-- SSE frame 里的 `id:` 字段必须 == 同 frame payload 里的 `event_id` 字段
-- 防止断点续传时双 ID 通道错位 (一个事件被前端处理两次, 或漏事件)
+CS3 ADR 硬契约 (docs/adr/CS3-tool-event-envelope-v1.md).
+
+Spec: docs/superpowers/specs/2026-04-17-n2-sse-transport-repair-design.md §2, §7
+SSE endpoint: POST /api/sessions/{session_id}/chat
 """
+
 from __future__ import annotations
 
+import json
+from typing import Any, AsyncGenerator
+
+import httpx
 import pytest
 
+from app.domain.models.event import BaseEvent, MessageEvent, ToolEvent, ToolEventStatus
+from app.domain.models.user import User, UserRole, UserStatus
+from app.interfaces.dependencies import rate_limit_chat
+from app.interfaces.dependencies.auth import get_current_user
+from app.interfaces.endpoints import session_routes
+from app.interfaces.service_dependencies import get_agent_service
+from app.main import app
 
-@pytest.mark.xfail(
-    reason="N2 not yet landed: SSE frame id field not yet emitted by session_routes.py. "
-           "When N2 lands this test must pass — remove xfail marker.",
-    strict=True,
-)
-def test_sse_frame_id_equals_payload_event_id() -> None:
-    """当 N2 发 SSE frame `id:` 后, 该 id 必须与 payload 里 event_id 相等."""
-    # TODO (N2 PR): 通过 TestClient 访问 /sessions/{id}/events SSE endpoint,
-    # 解析 frame 的 `id:` 字段, 断言与 frame data 里的 payload.event_id 相等.
-    # 示例伪代码:
-    #   with client.stream("GET", f"/sessions/{session_id}/events") as response:
-    #       for frame in parse_sse_frames(response.iter_text()):
-    #           assert frame.id == json.loads(frame.data)["event_id"]
-    raise NotImplementedError(
-        "N2 implementation pending. Remove xfail marker when SSE frame id is emitted."
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+def _fake_user() -> User:
+    return User(
+        id="test-user",
+        username="tester",
+        role=UserRole.USER,
+        status=UserStatus.ACTIVE,
     )
+
+
+async def _noop_rate_limit() -> None:
+    return None
+
+
+class _FakeLease:
+    def start_heartbeat(self) -> None:
+        pass
+
+    async def release(self) -> None:
+        pass
+
+
+class _TwoFrameAgentService:
+    """yield 两帧: 一条 message + 一条 ToolEvent. 两者的 event.id 走 EventMapper 后
+    payload.event_id 相等, 验证 invariant 对多种 event 类型成立."""
+
+    async def chat(self, **kwargs: Any) -> AsyncGenerator[BaseEvent, None]:
+        msg = MessageEvent(
+            role="assistant",
+            message="hello",
+        )
+        msg.id = "1000-0"
+        yield msg
+
+        tool = ToolEvent(
+            tool_call_id="c_test",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={"command": "ls"},
+            status=ToolEventStatus.CALLED,
+            function_result=None,
+            artifact={
+                "tool_call_id": "c_test",
+                "tool_name": "shell_execute",
+                "tool_source": {
+                    "source": "native",
+                    "category": "shell",
+                    "canonical_name": "shell_execute",
+                },
+                "outcome": {"variant": "allow_success", "content": "ok", "data": None},
+            },
+        )
+        tool.id = "1000-1"
+        yield tool
+
+
+def _parse_sse_frames(body: str) -> list[dict[str, str]]:
+    frames: list[dict[str, str]] = []
+    for block in body.replace("\r\n", "\n").split("\n\n"):
+        if not block.strip():
+            continue
+        frame: dict[str, str] = {}
+        for line in block.split("\n"):
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            frame[key.strip()] = value.lstrip(" ").rstrip("\r")
+        if frame.get("data"):
+            frames.append(frame)
+    return frames
+
+
+async def test_chat_sse_frame_id_equals_payload_event_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /api/sessions/{id}/chat 的每一帧都满足 frame.id == payload.event_id."""
+
+    async def _fake_acquire_connection_limit(**kwargs: Any) -> _FakeLease:
+        return _FakeLease()
+
+    monkeypatch.setattr(
+        session_routes,
+        "acquire_connection_limit",
+        _fake_acquire_connection_limit,
+    )
+
+    app.dependency_overrides[get_current_user] = _fake_user
+    app.dependency_overrides[get_agent_service] = lambda: _TwoFrameAgentService()
+    app.dependency_overrides[rate_limit_chat] = _noop_rate_limit
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/sessions/test-session/chat",
+                json={"message": "hi"},
+            )
+            assert response.status_code == 200
+            frames = _parse_sse_frames(response.text)
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        app.dependency_overrides.pop(get_agent_service, None)
+        app.dependency_overrides.pop(rate_limit_chat, None)
+
+    assert frames, "expected at least one SSE frame in body"
+    for frame in frames:
+        assert "id" in frame, f"frame missing id: {frame}"
+        payload = json.loads(frame["data"])
+        assert frame["id"] == payload.get("event_id"), (
+            f"frame.id={frame['id']} != payload.event_id={payload.get('event_id')}"
+        )
