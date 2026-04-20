@@ -1303,14 +1303,14 @@ def build_react_graph(
                     trust_origin=_skill_meta.get("trust_origin", "user_installed"),
                 )
 
-                # P.1: ApprovalCache
+                # P.1: ApprovalStateReader (R5b-2: 取代 ApprovalCache 读路径)
                 cache_decision = "no_match"
-                approval_cache = configurable.get("approval_cache")
+                approval_state_reader = configurable.get("approval_state_reader")
                 _user_id = configurable.get("user_id") or ""
                 _session_id = configurable.get("session_id") or ""
-                if approval_cache and _user_id and _session_id:
+                if approval_state_reader and _user_id and _session_id:
                     try:
-                        cache_decision = await approval_cache.check(
+                        cache_decision = await approval_state_reader.check(
                             user_id=_user_id,
                             session_id=_session_id,
                             tool_name=tool_name,
@@ -1320,7 +1320,7 @@ def build_react_graph(
                         )
                     except Exception:
                         logger.warning(
-                            "Stage P.1 ApprovalCache crashed for skill %s (fail-open)",
+                            "Stage P.1 ApprovalStateReader crashed for skill %s (fail-open)",
                             tool_name,
                         )
                         cache_decision = "no_match"
@@ -1420,14 +1420,17 @@ def build_react_graph(
                 assessment = _risk_assessor.assess(tool_name, args)
 
                 if assessment.final_level >= RiskLevel.MEDIUM:
+                    # R5b-2: 读路径从 approval_cache 切到 approval_state_reader；
+                    # approval_cache 保留给下方 SmartApprove 的 write_session（R5b-3 删）
+                    approval_state_reader = configurable.get("approval_state_reader")
                     approval_cache = configurable.get("approval_cache")
                     _user_id = configurable.get("user_id") or ""
                     _session_id = configurable.get("session_id") or ""
 
                     cache_decision = "no_match"
-                    if approval_cache and _user_id and _session_id:
+                    if approval_state_reader and _user_id and _session_id:
                         try:
-                            cache_decision = await approval_cache.check(
+                            cache_decision = await approval_state_reader.check(
                                 user_id=_user_id,
                                 session_id=_session_id,
                                 tool_name=tool_name,
@@ -1437,7 +1440,7 @@ def build_react_graph(
                             )
                         except Exception:
                             logger.warning(
-                                "ApprovalCache.check failed for tool '%s', "
+                                "ApprovalStateReader.check failed for tool '%s', "
                                 "defaulting to no_match",
                                 tool_name,
                             )

@@ -277,6 +277,31 @@ class AgentService:
             except Exception:
                 logger.warning("Failed to build ApprovalCache, tool confirmations will always prompt")
 
+        # R5b-2: Build ApprovalStateReader (DB-only; I7: Redis 不可用时仍可 allow/deny)
+        approval_state_reader = None
+        try:
+            from app.application.services.approval_state_adapters import (
+                SessionLegacyRuleQuery,
+                UowApprovalGrantQuery,
+            )
+            from app.domain.services.approval_state_reader import ApprovalStateReader
+            from app.infrastructure.storage.postgres import get_postgres
+
+            grant_query = UowApprovalGrantQuery(uow_factory=self._uow_factory)
+            legacy_query = None
+            if snap.agent_config.tool_confirmation.legacy_rule_fallback:
+                legacy_query = SessionLegacyRuleQuery(
+                    session_factory=get_postgres().session_factory,
+                )
+            approval_state_reader = ApprovalStateReader(
+                query=grant_query, legacy_rule_query=legacy_query,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to build ApprovalStateReader; tool pre-check will "
+                "fall through to user confirmation (fail-open by design)"
+            )
+
         # Reuse the service-level ConfirmationManager (initialized in __init__)
         confirmation_manager_inst = self._confirmation_manager
 
@@ -331,6 +356,7 @@ class AgentService:
             memory_gate_batch_cap=snap.memory_gate_batch_cap,
             memory_notification_emitter=self._memory_notification_emitter,
             approval_cache=approval_cache,
+            approval_state_reader=approval_state_reader,
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,

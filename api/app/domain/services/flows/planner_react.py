@@ -111,7 +111,8 @@ class PlannerReActFlow(BaseFlow):
         memory_write_service=None,  # PR-3: memory_save routes writes here
         memory_session_redis=None,  # PR-3: per-session save counter
         memory_session_save_cap: int = 20,  # PR-3
-        approval_cache: Any = None,  # ApprovalCache | None
+        approval_cache: Any = None,  # ApprovalCache | None（R5b-3 移除；现仅承载 SmartApprove write_session）
+        approval_state_reader: Any = None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
         confirmation_manager: Any = None,  # ConfirmationManager | None
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
         _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
@@ -248,8 +249,9 @@ class PlannerReActFlow(BaseFlow):
         self._memory_gate_batch_cap = memory_gate_batch_cap
         self._memory_notification_emitter = memory_notification_emitter
 
-        # Dangerous tool approval cache (Task 17)
+        # Dangerous tool approval cache (Task 17) + R5b-2 reader
         self._approval_cache = approval_cache
+        self._approval_state_reader = approval_state_reader
         self._confirmation_manager = confirmation_manager
 
         # D5: Execution health monitoring — persist across invoke/resume
@@ -1007,6 +1009,7 @@ class PlannerReActFlow(BaseFlow):
                 "has_file_view": self._file_processor_lookup is not None,
                 "has_memory_tools": self._has_memory_tools,
                 "approval_cache": self._approval_cache,
+                "approval_state_reader": self._approval_state_reader,
                 "skill_tool": self._skill_tool,  # R3: for pre-Stage-P risk refresh
                 "confirmation_manager": self._confirmation_manager,
                 "user_id": self._user_id,
