@@ -629,3 +629,45 @@ async def get_memory_system_notification_repository(
     repo = DBMemorySystemNotificationRepository(db_session)
     yield repo
     await db_session.commit()
+
+
+# ----------------------------------------------------------------------
+# R5b-1: ApprovalState DI wiring
+# ----------------------------------------------------------------------
+#
+# Writer 和 Reader 的构造极轻：writer 只吃 ``uow_factory``；reader 吃两个
+# Protocol adapter（``UowApprovalGrantQuery`` 始终注入；``SessionLegacyRuleQuery``
+# 按 ``AppConfig.agent_config.tool_confirmation.legacy_rule_fallback`` 开关）。
+#
+# 这两个 factory **在 R5b-1 阶段不被任何 endpoint 直接消费**——R5b-1 只暴露
+# DI 入口；R5b-2/3/4 会把 AgentService / AgentTaskRunner / planner_react 切到
+# 这两条路径上。先落 factory 可以让后续 PR 只动 callsite 不动 DI 层。
+def get_approval_state_writer():
+    """R5 CS4 单一 Writer 工厂。无状态，per-request 构造。"""
+    from app.application.services.approval_state_writer import ApprovalStateWriter
+
+    return ApprovalStateWriter(uow_factory=get_uow)
+
+
+def get_approval_state_reader():
+    """R5 CS4 Reader 工厂。
+
+    ``legacy_rule_fallback=True`` 时注入 ``SessionLegacyRuleQuery``，Reader 在
+    grants miss 后查旧 ``tool_approval_rules`` 表。``False`` 时不注入，miss
+    直接返 ``no_match``。切断 fallback 的时机由运维通过 config 热刷控制，不走
+    环境变量旁路。
+    """
+    from app.application.services.approval_state_adapters import (
+        SessionLegacyRuleQuery,
+        UowApprovalGrantQuery,
+    )
+    from app.domain.services.approval_state_reader import ApprovalStateReader
+
+    app_config = _load_app_config()
+    grant_query = UowApprovalGrantQuery(uow_factory=get_uow)
+    legacy_query = None
+    if app_config.agent_config.tool_confirmation.legacy_rule_fallback:
+        legacy_query = SessionLegacyRuleQuery(
+            session_factory=get_postgres().session_factory,
+        )
+    return ApprovalStateReader(query=grant_query, legacy_rule_query=legacy_query)
