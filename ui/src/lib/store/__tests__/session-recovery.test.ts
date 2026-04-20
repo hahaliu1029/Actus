@@ -569,4 +569,162 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
 
     setMessageSpy.mockRestore();
   });
+
+  // R5b-5: tool_confirmation 提交收到 HTTP 409 → 自动走 /events?since=... 复播
+  it("auto-reconnects SSE via getEventsSince when tool_confirmation submit returns 409", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, false);
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [], session_status: "running", has_more: false,
+    });
+
+    const { useUIStore } = await import("../../store/ui-store");
+    const setMessageSpy = vi.spyOn(useUIStore.getState(), "setMessage");
+    const { ApiError } = await import("../../api/auth-utils");
+
+    await useSessionStore.getState().sendChat("s1", {
+      tool_confirmation: {
+        action: "approve",
+        scope: "session",
+        tool_call_id: "tc-r5b5",
+      },
+    });
+
+    // winner 已赢 claim / late-duplicate → ApiError(409)
+    cbs.onError(
+      new ApiError({
+        code: 409,
+        httpStatus: 409,
+        msg: "工具确认[tc-r5b5]已被处理完成，请通过 /events?since=... 重连 SSE",
+      }),
+    );
+
+    // recoverSession 是 setTimeout(0) 调度的，fake timer advance 让它跑
+    await vi.advanceTimersByTimeAsync(10);
+
+    // auto-reconnect 必达：getEventsSince 被调，不给用户弹错误 toast
+    expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", undefined);
+    expect(setMessageSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "error" }),
+    );
+
+    setMessageSpy.mockRestore();
+  });
+
+  // R5b-5 Codex round-8 HIGH: 409 恢复后要脱离 waiting
+  it("transitions out of waiting after 409 recovery when remote=running with zero events", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, false);
+    // winner 已 resume 但还没产出新事件 → 后端 running，events=[]
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],
+      session_status: "running",
+      has_more: false,
+    });
+
+    // 本地 session 停在 waiting（confirmation card 尚未消失）
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "waiting",
+        events: [],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+      _isRecovering: false,
+    });
+
+    const { ApiError } = await import("../../api/auth-utils");
+    await useSessionStore.getState().sendChat("s1", {
+      tool_confirmation: {
+        action: "approve",
+        scope: "session",
+        tool_call_id: "tc-r5b5-waiting",
+      },
+    });
+    cbs.onError(
+      new ApiError({ code: 409, httpStatus: 409, msg: "已被处理" }),
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Codex round-8 锁死：recoverSession 的 zero-event 分支必须让 remote=running
+    // 覆盖 local=waiting，否则用户看到的卡片停在 waiting 永不退出。
+    const status = useSessionStore.getState().currentSession?.status;
+    expect(status).toBe("running");
+  });
+
+  it("keeps local status when remote is unknown and events=[]", async () => {
+    // 防退：remoteStatus=null 时不能误踢 local waiting；只有 remote 明确非 waiting 才覆盖
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, false);
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],
+      session_status: null,
+      has_more: false,
+    });
+
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "waiting",
+        events: [],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+      _isRecovering: false,
+    });
+
+    const { ApiError } = await import("../../api/auth-utils");
+    await useSessionStore.getState().sendChat("s1", {
+      tool_confirmation: {
+        action: "approve",
+        scope: "session",
+        tool_call_id: "tc-r5b5-waiting",
+      },
+    });
+    cbs.onError(
+      new ApiError({ code: 409, httpStatus: 409, msg: "已被处理" }),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    // remote=null 时 zero-event 分支不动状态，local waiting 保留
+    const status = useSessionStore.getState().currentSession?.status;
+    expect(status).toBe("waiting");
+  });
+
+  it("does NOT auto-reconnect for 409 on non-tool_confirmation chat", async () => {
+    // 验证 409 guard 只对 tool_confirmation 生效——普通 chat 的 409 走普通错误路径
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, false);
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [], session_status: "running", has_more: false,
+    });
+
+    const { useUIStore } = await import("../../store/ui-store");
+    const setMessageSpy = vi.spyOn(useUIStore.getState(), "setMessage");
+    const { ApiError } = await import("../../api/auth-utils");
+
+    await useSessionStore.getState().sendChat("s1", { message: "hi" });
+
+    cbs.onError(
+      new ApiError({ code: 409, httpStatus: 409, msg: "会话冲突" }),
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // 非 tool_confirmation 的 409 不触发 auto-reconnect
+    expect(sessionApi.getEventsSince).not.toHaveBeenCalled();
+    expect(setMessageSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "error" }),
+    );
+
+    setMessageSpy.mockRestore();
+  });
 });

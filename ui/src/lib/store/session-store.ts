@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 
+import { ApiError } from "@/lib/api/auth-utils";
 import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
 import type {
@@ -849,9 +850,25 @@ export const useSessionStore = create<SessionStore>()(
           set((s) => {
             const local = s.currentSession;
             if (!local || local.session_id !== sessionId) return {};
-            const finalStatus =
-              pickMoreAdvancedStatus(remoteStatus, local.status) ??
-              local.status;
+
+            // R5b-5 Codex round-8 HIGH: winner 已赢 claim 并开始执行但尚未产出
+            // 新事件时，后端 session_status="running"，local 仍是 "waiting"。
+            // pickMoreAdvancedStatus 里 waiting > running，zero-event 分支下
+            // 会错误保留 waiting，UI 卡在 confirmation card 而非跳回聊天流。
+            // 显式处理：local=waiting 且 remote 是非 waiting 的 active 状态时，
+            // remote 胜出（winner 已跑完 claim→进入执行是合法恢复语义）。
+            let finalStatus: Session["status"];
+            if (
+              local.status === "waiting" &&
+              remoteStatus !== null &&
+              remoteStatus !== "waiting"
+            ) {
+              finalStatus = remoteStatus;
+            } else {
+              finalStatus =
+                pickMoreAdvancedStatus(remoteStatus, local.status) ??
+                local.status;
+            }
             if (finalStatus === local.status) return {};
             return { currentSession: { ...local, status: finalStatus } };
           });
@@ -1055,6 +1072,22 @@ export const useSessionStore = create<SessionStore>()(
           });
         },
         (error) => {
+          // R5b-5: tool_confirmation 提交收到 HTTP 409（losing-claim / late-duplicate
+          // / status=processing）→ 走 /events?since=<last_event_id> 自动 reconnect 复播
+          // 已完成的 tool result events，而不是给用户弹错误 toast。409 是"已被处理"
+          // 的合法契约信号，背面是 winner 已在跑或已跑完。
+          if (
+            requestParams.tool_confirmation &&
+            error instanceof ApiError &&
+            error.httpStatus === 409
+          ) {
+            clearChatState();
+            setTimeout(() => {
+              void get().recoverSession(sessionId);
+            }, 0);
+            return;
+          }
+
           // E2: 仅当 SSE 连接已建立且未收到终止事件时抑制错误（即将触发恢复）。
           // createSSEStream() 未成功时 streamConnected=false，必须报错。
           const isRecoverableDisconnect = streamConnected && !sawTerminalEvent;
