@@ -210,7 +210,6 @@ class AgentTaskRunner(TaskRunner):
         memory_gate_threshold: float = 0.7,
         memory_gate_batch_cap: int = 20,
         memory_notification_emitter=None,  # PR-4+8: MemoryNotificationEmitter
-        approval_cache=None,  # Task 17: ApprovalCache | None（R5b-4 删除；现仅残余）
         approval_state_reader=None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
         approval_state_writer=None,  # R5b-3: ApprovalStateWriter | None（写路径 single writer）
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
@@ -220,7 +219,6 @@ class AgentTaskRunner(TaskRunner):
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._on_session_complete = on_session_complete
-        self._approval_cache = approval_cache
         self._approval_state_reader = approval_state_reader
         self._approval_state_writer = approval_state_writer
         self._confirmation_manager = confirmation_manager
@@ -427,7 +425,6 @@ class AgentTaskRunner(TaskRunner):
             memory_gate_threshold=self._memory_gate_threshold,
             memory_gate_batch_cap=self._memory_gate_batch_cap,
             memory_notification_emitter=self._memory_notification_emitter,
-            approval_cache=self._approval_cache,
             approval_state_reader=self._approval_state_reader,
             approval_state_writer=self._approval_state_writer,
             confirmation_manager=self._confirmation_manager,

@@ -111,7 +111,6 @@ class PlannerReActFlow(BaseFlow):
         memory_write_service=None,  # PR-3: memory_save routes writes here
         memory_session_redis=None,  # PR-3: per-session save counter
         memory_session_save_cap: int = 20,  # PR-3
-        approval_cache: Any = None,  # ApprovalCache | None（R5b-4 删除；现仅残余）
         approval_state_reader: Any = None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
         approval_state_writer: Any = None,  # R5b-3: ApprovalStateWriter | None（写路径 single writer）
         confirmation_manager: Any = None,  # ConfirmationManager | None
@@ -250,8 +249,7 @@ class PlannerReActFlow(BaseFlow):
         self._memory_gate_batch_cap = memory_gate_batch_cap
         self._memory_notification_emitter = memory_notification_emitter
 
-        # Dangerous tool approval cache (Task 17) + R5b-2 reader
-        self._approval_cache = approval_cache
+        # R5b-2 Reader + R5b-3 Writer 接入；ApprovalCache 已于 R5b-4 移除
         self._approval_state_reader = approval_state_reader
         self._approval_state_writer = approval_state_writer
         self._confirmation_manager = confirmation_manager
@@ -1010,7 +1008,6 @@ class PlannerReActFlow(BaseFlow):
                 "skill_guide_injector": self._skill_guide_injector,
                 "has_file_view": self._file_processor_lookup is not None,
                 "has_memory_tools": self._has_memory_tools,
-                "approval_cache": self._approval_cache,
                 "approval_state_reader": self._approval_state_reader,
                 "approval_state_writer": self._approval_state_writer,
                 "skill_tool": self._skill_tool,  # R3: for pre-Stage-P risk refresh

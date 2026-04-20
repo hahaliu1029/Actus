@@ -227,7 +227,6 @@ def test_rule_2_no_tool_approval_log_create_outside_writer() -> None:
 # ===============================================================
 
 
-@pytest.mark.skip(reason="R5b 前置：approval_cache.py 仍在使用，R5b 删除后开启")
 def test_rule_3_no_approval_cache_import() -> None:
     violations: list[str] = []
     for py_path, rel in _iter_app_py_files():
@@ -248,7 +247,6 @@ def test_rule_3_no_approval_cache_import() -> None:
 # ===============================================================
 
 
-@pytest.mark.skip(reason="R5b 前置：planner_react / agent_task_runner 仍带 approval_cache key，R5b 清理后开启")
 def test_rule_4_no_approval_cache_configurable_key() -> None:
     targets = [
         APP_DIR / "domain" / "services" / "flows" / "planner_react.py",
@@ -276,7 +274,6 @@ def test_rule_4_no_approval_cache_configurable_key() -> None:
 _APPROVAL_KEY_RE = re.compile(r"""['"]approval:[^'"]*['"]""")
 
 
-@pytest.mark.skip(reason="R5b 前置：approval_cache.py 的 Redis key 尚未清理，R5b 删除后开启")
 def test_rule_5_no_approval_redis_key_literal() -> None:
     violations: list[str] = []
     for py_path, rel in _iter_app_py_files():
@@ -385,7 +382,6 @@ def test_rule_6_no_env_var_legacy_fallback() -> None:
 # ===============================================================
 
 
-@pytest.mark.skip(reason="R5b 前置：react_graph SmartApprove 分支仍走旧路径，R5b 改写后开启")
 def test_rule_7_smartapprove_writes_via_writer_only() -> None:
     """扫描 ``react_graph.py``：SmartApprove 分支不得直接 ``approval_grants.create`` 或
     ``tool_approval_log.create``，必须走 ``approval_state_writer.write(...)``。"""

@@ -1420,10 +1420,9 @@ def build_react_graph(
                 assessment = _risk_assessor.assess(tool_name, args)
 
                 if assessment.final_level >= RiskLevel.MEDIUM:
-                    # R5b-2: 读路径从 approval_cache 切到 approval_state_reader；
-                    # approval_cache 保留给下方 SmartApprove 的 write_session（R5b-3 删）
+                    # R5b-2 Reader 接入 + R5b-4 cleanup：ApprovalCache 已移除，
+                    # SmartApprove 写路径走 configurable["approval_state_writer"]（R5b-3）
                     approval_state_reader = configurable.get("approval_state_reader")
-                    approval_cache = configurable.get("approval_cache")
                     _user_id = configurable.get("user_id") or ""
                     _session_id = configurable.get("session_id") or ""
 

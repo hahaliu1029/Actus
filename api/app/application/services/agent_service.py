@@ -288,19 +288,9 @@ class AgentService:
                 video_config=snap.file_understanding_config.video,
             )
 
-        # Build ApprovalCache if Redis is available
-        approval_cache = None
-        if self._redis_client and hasattr(self._redis_client, "client"):
-            try:
-                from app.domain.services.approval_cache import ApprovalCache
-                from app.infrastructure.storage.postgres import get_postgres
-                approval_cache = ApprovalCache(
-                    redis=self._redis_client.client,
-                    session_factory=get_postgres().session_factory,
-                )
-            except Exception:
-                logger.warning("Failed to build ApprovalCache, tool confirmations will always prompt")
-
+        # R5b-4 (cleanup): ApprovalCache 已被 ApprovalStateReader (R5b-2) +
+        # ApprovalStateWriter (R5b-3) 完全替换；旧 Redis-based cache 构造移除。
+        #
         # R5b-2: Build ApprovalStateReader (DB-only; I7: Redis 不可用时仍可 allow/deny)
         approval_state_reader = None
         try:
@@ -394,7 +384,6 @@ class AgentService:
             memory_gate_threshold=snap.memory_gate_threshold,
             memory_gate_batch_cap=snap.memory_gate_batch_cap,
             memory_notification_emitter=self._memory_notification_emitter,
-            approval_cache=approval_cache,
             approval_state_reader=approval_state_reader,
             approval_state_writer=approval_state_writer,
             confirmation_manager=confirmation_manager_inst,
