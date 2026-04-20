@@ -13,6 +13,7 @@ from app.application.errors.exceptions import (
     ConflictError,
     ForbiddenError,
     NotFoundError,
+    ServiceUnavailableError,
 )
 from langchain_core.language_models import BaseChatModel
 
@@ -84,6 +85,29 @@ class _ConfigSnapshot:
     memory_gate_llm: BaseChatModel | None = None
     memory_gate_threshold: float = 0.7
     memory_gate_batch_cap: int = 20
+
+
+@dataclass
+class _ResumeToolConfirmationState:
+    """R5b-3 (Codex round-2 HIGH fix) preflight → drive 之间的上下文。
+
+    ``preflight_resume_tool_confirmation`` 阶段同步完成 claim / audit / 取建 task
+    （所有可能抛 HTTP 异常的工作都在这里做完）；随后 ``drive_...`` 只负责
+    ``task.resume`` + yield events。两段拆开使得 ConflictError/NotFoundError/
+    BadRequestError 能在 ``EventSourceResponse`` 创建**之前**抛到 FastAPI
+    exception handler → 映射为明确 HTTP 状态码（I4 对外合同）。
+    """
+
+    session: "Session"
+    detail: Any  # ConfirmationDetail（domain 层，此处 Any 避开循环 import）
+    task: Any
+    decision_id: Optional[str]
+    persistent_scope: bool
+    action: str
+    scope: str
+    tool_call_id: str
+    owner_user_id: str
+    session_id: str
 
 
 class AgentService:
@@ -302,6 +326,21 @@ class AgentService:
                 "fall through to user confirmation (fail-open by design)"
             )
 
+        # R5b-3: Build ApprovalStateWriter (CS4 单一 Writer；SmartApprove / 未来 callsite 统一出口)
+        approval_state_writer = None
+        try:
+            from app.application.services.approval_state_writer import (
+                ApprovalStateWriter,
+            )
+            approval_state_writer = ApprovalStateWriter(
+                uow_factory=self._uow_factory,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to build ApprovalStateWriter; SmartApprove persistence "
+                "will be skipped (fail-open) until next session init"
+            )
+
         # Reuse the service-level ConfirmationManager (initialized in __init__)
         confirmation_manager_inst = self._confirmation_manager
 
@@ -357,6 +396,7 @@ class AgentService:
             memory_notification_emitter=self._memory_notification_emitter,
             approval_cache=approval_cache,
             approval_state_reader=approval_state_reader,
+            approval_state_writer=approval_state_writer,
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
@@ -425,125 +465,196 @@ class AgentService:
         except Exception as e:
             logger.warning(f"会话[{session_id}]后台更新未读消息计数失败: {e}")
 
-    async def _resume_tool_confirmation(
+    async def preflight_resume_tool_confirmation(
         self,
         session_id: str,
         user_id: str,
         is_admin: bool,
         tool_confirmation: object,
-    ) -> AsyncGenerator[BaseEvent, None]:
-        """处理危险工具确认的恢复路径。
+    ) -> _ResumeToolConfirmationState:
+        """R5b-3 (Codex round-2 HIGH fix) preflight 阶段——同步完成所有可能抛
+        HTTP 异常的工作，返 drive 阶段所需的上下文。
 
-        1. 从 ConfirmationManager 读取确认详情
-        2. 标记为 PROCESSING
-        3. 获取/创建 task 并调用 task.resume(Command(resume=...))
-        4. 清理确认截止时间
-        5. 从 task 输出流中 yield 事件
+        **调用点约定**：HTTP 层（``session_routes.chat``）在 ``EventSourceResponse``
+        创建**之前** await 本方法。抛出的 ``ConflictError`` / ``NotFoundError`` /
+        ``BadRequestError`` / ``ForbiddenError`` 会被 FastAPI exception handler 映射到
+        明确 HTTP 状态码（409/404/400/403），满足 I4 对外合同。
+
+        生效步骤：
+        1. 校验会话访问权限
+        2. 读 ``ConfirmationDetail``（不存在/已清理 → 404；状态非 pending → 409
+           归一，不再因时序分叉成 400）
+        3. scope ∈ {session, always}: ``Writer.write()`` 赢 UNIQUE(confirmation_id)
+           claim；``newly_created=False`` → 409；``ValueError`` (scope/effect 冲突) → 400
+        4. scope="once": ``ConfirmationManager.mark_processing_if_pending`` CAS；
+           失败 → 409
+        5. 取/建 task；失败回滚 claim 并抛 ``ServiceUnavailableError`` (503)
+        6. once 路径立即写 audit 证据（赢 claim 后）
         """
         action: str = getattr(tool_confirmation, "action", "deny")
         scope: str = getattr(tool_confirmation, "scope", "once")
         tool_call_id: str = getattr(tool_confirmation, "tool_call_id", "")
 
-        try:
-            # 1. 校验会话访问权限
-            session = await self._get_accessible_session(session_id, user_id, is_admin)
+        # 1. 校验会话访问权限
+        session = await self._get_accessible_session(session_id, user_id, is_admin)
 
-            # 2. 从 Redis 读取确认详情（复用 __init__ 中初始化的单例）
-            if not self._confirmation_manager:
-                raise BadRequestError("ConfirmationManager 不可用，无法处理工具确认")
-            confirmation_mgr = self._confirmation_manager
-            detail = await confirmation_mgr.read(session_id, tool_call_id)
-            if not detail:
-                raise NotFoundError(
-                    f"工具确认请求[{tool_call_id}]不存在或已过期"
-                )
-            if detail.status != "pending":
-                raise BadRequestError(
-                    f"工具确认请求[{tool_call_id}]状态为{detail.status}，无法处理"
-                )
-
-            # 3. 标记为 PROCESSING，防止重复处理
-            await confirmation_mgr.mark_processing(session_id, tool_call_id)
-
-            # 4. 获取或创建 task + resume（失败时回退为 pending）
+        # 2. 读 confirmation detail
+        if not self._confirmation_manager:
+            raise BadRequestError("ConfirmationManager 不可用，无法处理工具确认")
+        confirmation_mgr = self._confirmation_manager
+        detail = await confirmation_mgr.read(session_id, tool_call_id)
+        if not detail:
+            # Codex round-6 HIGH: I4 late-duplicate 合同——winner 已完成并
+            # cleanup 了 confirmation_detail，但 grant 行（persistent scope）
+            # 持久保留；再次 /resume 同 confirmation_id 应返 409（前端凭此走
+            # /events?since=... 重连复播已完成的 tool event），**不是**当
+            # "已过期" 报 404。只有 detail 和 grant 都不存在才真正 404。
             try:
-                task = await self._get_task(session)
-                if task is None:
-                    task = await self._create_task(session)
-                    if not task:
-                        raise RuntimeError(f"会话[{session_id}]创建任务失败")
-
-                # 5. 构造 Command(resume=...) 并调用 task.resume()
-                resume_value = {"action": action, "scope": scope}
-                await task.resume(Command(resume=resume_value))
-            except Exception as _resume_err:
-                # 回退为 pending，允许用户重试或超时扫描接管
-                try:
-                    await confirmation_mgr.mark_pending(session_id, tool_call_id)
-                except Exception:
-                    logger.warning("回退确认状态为 pending 失败: %s:%s", session_id, tool_call_id)
-                raise _resume_err
-
-            logger.info(
-                "会话[%s] 工具确认恢复: tool_call_id=%s action=%s scope=%s",
-                session_id, tool_call_id, action, scope,
+                async with self._uow_factory() as _lookup_uow:
+                    existing_grant = await _lookup_uow.approval_grants.find_by_confirmation_id(
+                        tool_call_id
+                    )
+            except Exception as _lookup_err:
+                # Codex round-7 MEDIUM: 不再伪装成 404。真实 late-duplicate 但
+                # grant lookup 遭 DB/UoW 瞬时故障时，客户端必须知道这是基础设施
+                # 暂态错误（可重试），而不是 confirmation 永久丢失。
+                logger.warning(
+                    "R5b-3 late-duplicate grant lookup 失败 tool_call=%s: %s",
+                    tool_call_id, _lookup_err,
+                )
+                raise ServiceUnavailableError(
+                    f"工具确认[{tool_call_id}]状态查询暂时失败，请稍后重试"
+                ) from _lookup_err
+            if existing_grant is not None:
+                raise ConflictError(
+                    f"工具确认[{tool_call_id}]已被处理完成（grant 已持久）；"
+                    "请通过 /events?since=<last_event_id> 重连 SSE 复播结果"
+                )
+            raise NotFoundError(
+                f"工具确认请求[{tool_call_id}]不存在或已过期"
+            )
+        # Codex round-2 MEDIUM fix: 非 pending 归一成 ConflictError，不再根据时序
+        # 分叉成 400——"already claimed / reconnect" 是同一语义。
+        if detail.status != "pending":
+            raise ConflictError(
+                f"工具确认[{tool_call_id}]已被处理（status={detail.status}）"
             )
 
-            # 6. 根据 action + scope 写入 ApprovalCache / 创建永久规则，并记录审计日志
-            if action == "approve":
-                if scope == "session" and self._redis_client and hasattr(self._redis_client, "client"):
-                    try:
-                        from app.domain.services.approval_cache import ApprovalCache
-                        cache = ApprovalCache(redis=self._redis_client.client)
-                        await cache.write_session(
-                            session_id=session_id,
-                            tool_name=detail.tool_name,
-                            arg_digest=detail.arg_digest,
-                        )
-                        logger.info(
-                            "会话[%s] 写入 session-level ApprovalCache: tool=%s",
-                            session_id, detail.tool_name,
-                        )
-                    except Exception as _cache_err:
-                        logger.warning("写入 ApprovalCache 失败: %s", _cache_err)
+        owner_user_id = detail.user_id  # grant / audit owner = session owner，与请求者解耦
+        persistent_scope = scope in ("session", "always")
+        decision_id: Optional[str] = None
 
-                elif scope == "always":
-                    try:
-                        from app.domain.models.tool_approval_rule import ToolApprovalRule
-                        from app.infrastructure.repositories.db_tool_approval_rule_repository import (
-                            DBToolApprovalRuleRepository,
-                        )
-                        from app.infrastructure.storage.postgres import get_postgres
-                        async with get_postgres().session_factory() as _session:
-                            rule_repo = DBToolApprovalRuleRepository(_session)
-                            # Escape glob special chars so the rule is an exact match.
-                            # User can later broaden it in the settings page.
-                            import re as _re
-                            def _escape_glob(s: str) -> str:
-                                """Escape *, ?, [ for fnmatch literal matching."""
-                                return _re.sub(r'([\*\?\[\]])', r'[\1]', s)
+        # 3/4. Claim（persistent → Writer UNIQUE；once → ConfirmationManager CAS）
+        if persistent_scope:
+            from app.application.services.approval_state_writer import (
+                ApprovalStateWriter,
+            )
+            from app.domain.models.approval_grant import ApprovalDecision
+            from app.domain.services.approval_grant_policy import (
+                session_grant_expires_at,
+            )
+            from app.domain.services.tools.tool_source_resolver import (
+                ToolSourceUnknownError,
+                resolve_tool_source,
+            )
 
-                            rule = ToolApprovalRule(
-                                user_id=user_id,
-                                tool_name=detail.tool_name,
-                                rule="always_allow",
-                                command_pattern=_escape_glob(detail.primary_arg) if detail.primary_arg else "*",
-                                dir_pattern=_escape_glob(detail.dir_arg) if detail.dir_arg else "",
-                            )
-                            await rule_repo.create(rule)
-                            await _session.commit()
-                        logger.info(
-                            "会话[%s] 创建永久 always_allow 规则: tool=%s pattern=%s",
-                            session_id, detail.tool_name, detail.primary_arg,
-                        )
-                    except Exception as _rule_err:
-                        logger.warning("创建永久审批规则失败: %s", _rule_err)
+            try:
+                _tool_source = resolve_tool_source(detail.tool_name).source
+            except ToolSourceUnknownError:
+                _tool_source = "native"
 
-            # 记录审计日志
+            _effect = "approve" if action == "approve" else "deny"
+            _expires_at = (
+                session_grant_expires_at() if scope == "session" else None
+            )
+            decision = ApprovalDecision(
+                user_id=owner_user_id,
+                session_id=session_id if scope == "session" else None,
+                tool_name=detail.tool_name,
+                tool_source=_tool_source,
+                arg_digest=detail.arg_digest,
+                primary_arg=detail.primary_arg,
+                dir_arg=detail.dir_arg or "",
+                scope=scope,
+                effect=_effect,
+                source_type="user_click",
+                confirmation_id=tool_call_id,
+                expires_at=_expires_at,
+                risk_level=detail.risk_level,
+            )
+            writer = ApprovalStateWriter(uow_factory=self._uow_factory)
+
+            # Codex round-4 CRITICAL: shield claim + post-cancel rollback callback
+            async def _do_write() -> tuple[Optional[str], bool]:
+                return await writer.write(decision)
+
+            try:
+                decision_id, newly_created = await self._claim_with_post_cancel_rollback(
+                    _do_write,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    persistent_scope=True,
+                )
+            except ValueError as _claim_err:
+                raise BadRequestError(
+                    f"确认参数冲突: {_claim_err}"
+                ) from _claim_err
+            if not newly_created:
+                raise ConflictError(
+                    f"工具确认[{tool_call_id}]已被处理"
+                )
+        else:
+            # Codex round-4 CRITICAL: once 路径的 CAS 同样走 envelope
+            async def _do_cas() -> tuple[Optional[str], bool]:
+                claimed_local = await confirmation_mgr.mark_processing_if_pending(
+                    session_id, tool_call_id
+                )
+                # 统一 shape 成 (decision_id, newly_created)；once 无 decision_id
+                return None, claimed_local
+
+            _, claimed = await self._claim_with_post_cancel_rollback(
+                _do_cas,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                persistent_scope=False,
+            )
+            if not claimed:
+                raise ConflictError(
+                    f"工具确认[{tool_call_id}]已被处理"
+                )
+
+        # 5. 取/建 task（可能失败 → 回滚 claim 后抛 503）
+        try:
+            task = await self._get_task(session)
+            if task is None:
+                task = await self._create_task(session)
+                if not task:
+                    # Codex round-3 MEDIUM fix: 可预期的基础设施失败必须是 503
+                    # （裸 RuntimeError 会被 exception handler 映射成 500）
+                    raise ServiceUnavailableError(
+                        f"会话[{session_id}]创建任务失败，请稍后重试"
+                    )
+            if persistent_scope:
+                # persistent 赢 claim 后主动把状态推到 processing（once 已由 CAS 推过）
+                await confirmation_mgr.mark_processing(session_id, tool_call_id)
+        except BaseException:
+            # Codex round-4 CRITICAL: 独立 task 做 rollback，不在被 cancel 的 task
+            # 里直接 await（否则 delete_grant/mark_pending 会立刻被取消 → orphan
+            # claim 永久卡死；sweeper 又跳过 processing，前端只会持续 409）
+            self._spawn_background_rollback(
+                persistent_scope=persistent_scope,
+                decision_id=decision_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+            )
+            raise
+
+        # 6. once 路径立即写 audit（赢 claim 后持久化证据，不等 drive 完成）
+        if not persistent_scope:
             try:
                 async with self._uow_factory() as _audit_uow:
                     await _audit_uow.tool_approval_log.create(
-                        user_id=user_id,
+                        user_id=owner_user_id,
                         session_id=session_id,
                         tool_name=detail.tool_name,
                         tool_args=detail.tool_args,
@@ -553,19 +664,198 @@ class AgentService:
                         approved_by="user",
                     )
             except Exception as _log_err:
-                logger.warning("写入工具审批审计日志失败: %s", _log_err)
+                # 普通错误吞成 warning（audit 丢失可容忍，但不能阻塞 resume）
+                logger.warning(
+                    "R5b-3 once scope audit 写入失败: %s", _log_err
+                )
+            except BaseException:
+                # Codex round-5 CRITICAL: CancelledError 到 once audit 时 CAS 已把
+                # confirmation 推到 processing、task 已取建；此时 preflight 主任务
+                # 被取消，drive 根本不会开始，但 confirmation 卡在 processing →
+                # sweeper 跳过 processing → orphan 永久 409。必须在此窗口 spawn
+                # rollback 把 ConfirmationManager 状态 mark_pending 回来。
+                self._spawn_background_rollback(
+                    persistent_scope=False,
+                    decision_id=None,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                )
+                raise
 
-            # 7. 清理确认截止时间
-            await confirmation_mgr.cleanup(session_id, tool_call_id)
+        logger.info(
+            "会话[%s] 工具确认 preflight OK: tool_call_id=%s action=%s scope=%s decision_id=%s owner=%s",
+            session_id, tool_call_id, action, scope,
+            decision_id or "none", owner_user_id,
+        )
+        return _ResumeToolConfirmationState(
+            session=session,
+            detail=detail,
+            task=task,
+            decision_id=decision_id,
+            persistent_scope=persistent_scope,
+            action=action,
+            scope=scope,
+            tool_call_id=tool_call_id,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+        )
 
-            # 8. 从 task 输出流中读取事件并 yield
+    async def _rollback_resume_claim(
+        self,
+        *,
+        persistent_scope: bool,
+        decision_id: Optional[str],
+        session_id: str,
+        tool_call_id: str,
+    ) -> None:
+        """Resume claim 回滚：persistent 路径删 grant + audit；all 路径 mark_pending。"""
+        if persistent_scope and decision_id is not None:
+            try:
+                from app.application.services.approval_state_writer import (
+                    ApprovalStateWriter,
+                )
+                writer = ApprovalStateWriter(uow_factory=self._uow_factory)
+                await writer.delete_grant(decision_id)
+            except Exception as _del_err:
+                logger.warning(
+                    "R5b-3 claim 回滚 delete_grant 失败 decision_id=%s: %s",
+                    decision_id, _del_err,
+                )
+        if self._confirmation_manager is not None:
+            try:
+                await self._confirmation_manager.mark_pending(session_id, tool_call_id)
+            except Exception:
+                logger.warning(
+                    "回退确认状态为 pending 失败: %s:%s",
+                    session_id, tool_call_id,
+                )
+
+    def _spawn_background_rollback(
+        self,
+        *,
+        persistent_scope: bool,
+        decision_id: Optional[str],
+        session_id: str,
+        tool_call_id: str,
+    ) -> Optional[asyncio.Task]:
+        """Codex round-4 CRITICAL fix: 把 rollback 扔进独立 asyncio.Task 跑，
+        规避 SSE cancel scope 传播（同一 task 里 await rollback 会被立刻取消，
+        delete_grant/mark_pending 都跑不完 → orphan claim 永久卡死 processing）。
+
+        Pattern 对齐 ``_safe_update_unread_count``（line ~454）：
+        - 独立 task 不继承父 cancel scope
+        - ``uow_factory()`` 每次建新 UoW，不共享已被 close 的 session
+
+        返 ``asyncio.Task`` 方便测试 await 等待完成；生产路径 fire-and-forget。
+        """
+        try:
+            return asyncio.create_task(
+                self._rollback_resume_claim(
+                    persistent_scope=persistent_scope,
+                    decision_id=decision_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                )
+            )
+        except RuntimeError:
+            logger.warning(
+                "R5b-3 round-4: 无法创建后台 rollback task session=%s tool_call=%s",
+                session_id, tool_call_id,
+            )
+            return None
+
+    async def _claim_with_post_cancel_rollback(
+        self,
+        claim_factory,  # () -> Awaitable[tuple[Optional[str], bool]]
+        *,
+        session_id: str,
+        tool_call_id: str,
+        persistent_scope: bool,
+    ) -> tuple[Optional[str], bool]:
+        """Codex round-4 CRITICAL envelope for claim operations.
+
+        问题：``await writer.write(decision)`` / ``await mark_processing_if_pending(...)``
+        执行到 commit 一半时父 task 被 cancel → UoW __aexit__ 处理 CancelledError
+        吞掉，grant/Redis 状态可能 **partial 残留**，但调用方不知道 decision_id
+        → 无法 rollback → orphan。
+
+        方案：
+        1. claim 丢到独立 ``asyncio.Task``（不继承父 cancel scope）
+        2. 主路径 ``await asyncio.shield(task)`` —— 外部 cancel 时 shield 抛
+           CancelledError 给父，但内部 task 继续跑完 commit
+        3. ``add_done_callback`` 在 claim task 完成后：若 ``newly_created=True``
+           表示 claim 真写成功，spawn 独立 rollback task 清理
+
+        返 ``(decision_id, newly_created)``；decision_id 可能为 None（CAS 路径）。
+        """
+        task = asyncio.create_task(claim_factory())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            def _on_done(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                if t.exception() is not None:
+                    return  # claim 失败，没写任何 claim 状态
+                try:
+                    result = t.result()
+                    did, newly = result
+                except Exception as _extract_err:
+                    logger.warning(
+                        "R5b-3 round-4: 提取 claim 结果失败 tool_call=%s: %s",
+                        tool_call_id, _extract_err,
+                    )
+                    return
+                if not newly:
+                    return  # loser 分支，claim 没成功写
+                self._spawn_background_rollback(
+                    persistent_scope=persistent_scope,
+                    decision_id=did,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                )
+
+            task.add_done_callback(_on_done)
+            raise
+
+    async def drive_resume_tool_confirmation(
+        self, state: _ResumeToolConfirmationState,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """Drive 阶段：task.resume + cleanup + yield events。所有可能抛 HTTP
+        的错已在 ``preflight_...`` 阶段抛完；本函数进 SSE 后只产事件。
+
+        I2 kickoff 失败：``task.resume`` 抛异常 → 回滚 claim 并把异常转为
+        ``ErrorEvent`` yield（SSE 已建连，无法再发 HTTP 状态码）。
+        """
+        confirmation_mgr = self._confirmation_manager
+        try:
+            try:
+                resume_value = {"action": state.action, "scope": state.scope}
+                await state.task.resume(Command(resume=resume_value))
+            except BaseException:
+                # Codex round-3 CRITICAL + round-4 reinforcement：
+                # 客户端 SSE 断连会以 CancelledError 抵达这里；rollback 必须在
+                # 独立 asyncio.Task 里跑，否则和父 task 一起被取消，delete_grant /
+                # mark_pending 根本跑不完 → orphan claim 永远 processing。
+                # 独立 task 不继承父 cancel scope（_safe_update_unread_count pattern）。
+                self._spawn_background_rollback(
+                    persistent_scope=state.persistent_scope,
+                    decision_id=state.decision_id,
+                    session_id=state.session_id,
+                    tool_call_id=state.tool_call_id,
+                )
+                raise
+
+            if confirmation_mgr is not None:
+                await confirmation_mgr.cleanup(state.session_id, state.tool_call_id)
+
             latest_event_id = None
             while True:
-                event_id, event_str = await task.output_stream.get(
+                event_id, event_str = await state.task.output_stream.get(
                     start_id=latest_event_id, block_ms=OUTPUT_STREAM_POLL_BLOCK_MS
                 )
                 if event_str is None:
-                    if task.done:
+                    if state.task.done:
                         break
                     continue
                 latest_event_id = event_id
@@ -574,31 +864,57 @@ class AgentService:
                 event.id = event_id
 
                 async with self._uow_factory() as uow:
-                    await uow.session.update_unread_message_count(session_id, 0)
+                    await uow.session.update_unread_message_count(state.session_id, 0)
 
                 yield event
                 if isinstance(event, (DoneEvent, ErrorEvent, WaitEvent, ControlEvent)):
                     break
 
-            logger.info(f"会话[{session_id}]工具确认恢复完成")
-        except (BadRequestError, NotFoundError):
-            raise
+            logger.info(f"会话[{state.session_id}]工具确认恢复完成")
         except Exception as e:
-            logger.error(f"会话[{session_id}]工具确认恢复出错: {str(e)}")
+            logger.error(f"会话[{state.session_id}]工具确认驱动出错: {str(e)}")
             event = ErrorEvent(error=str(e))
             try:
                 async with self._uow_factory() as uow:
-                    await uow.session.add_event(session_id, event)
+                    await uow.session.add_event(state.session_id, event)
             except (asyncio.CancelledError, Exception) as add_err:
                 logger.warning(
-                    f"会话[{session_id}]添加错误事件失败: {add_err}"
+                    f"会话[{state.session_id}]添加错误事件失败: {add_err}"
                 )
             yield event
         finally:
             try:
-                asyncio.create_task(self._safe_update_unread_count(session_id))
+                asyncio.create_task(
+                    self._safe_update_unread_count(state.session_id)
+                )
             except RuntimeError:
-                logger.warning(f"会话[{session_id}]无法创建后台任务更新未读消息计数")
+                logger.warning(
+                    f"会话[{state.session_id}]无法创建后台任务更新未读消息计数"
+                )
+
+    async def _resume_tool_confirmation(
+        self,
+        session_id: str,
+        user_id: str,
+        is_admin: bool,
+        tool_confirmation: object,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """Backward-compat 组合入口：preflight → drive。
+
+        生产 SSE 路径在 ``session_routes.chat`` 里已改为**分开调用** preflight +
+        ``EventSourceResponse(drive(...))``，使得 HTTP 409/404/400 能在
+        ``EventSourceResponse`` 之前抛出。本方法保留给既有测试 / 其他非 SSE
+        caller 使用，preflight 异常会在 generator 第一次 ``__anext__`` 时抛出。
+        """
+        state = await self.preflight_resume_tool_confirmation(
+            session_id=session_id,
+            user_id=user_id,
+            is_admin=is_admin,
+            tool_confirmation=tool_confirmation,
+        )
+        async for event in self.drive_resume_tool_confirmation(state):
+            yield event
+        return
 
     async def _get_accessible_session(
         self, session_id: str, user_id: str, is_admin: bool = False

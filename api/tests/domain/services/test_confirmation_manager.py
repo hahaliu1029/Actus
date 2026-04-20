@@ -51,3 +51,26 @@ class TestConfirmationManager:
         _run(self.mgr.cleanup("s1", "tc1"))
         self.redis.zrem.assert_called_once()
         self.redis.delete.assert_called_once()
+
+    def test_mark_processing_if_pending_cas_true(self):
+        """Lua CAS 赢：返 1 → True；入参 KEYS/ARGV 按 'processing'/'pending' 传。"""
+        self.redis.eval = AsyncMock(return_value=1)
+        result = _run(self.mgr.mark_processing_if_pending("s1", "tc1"))
+        assert result is True
+        self.redis.eval.assert_awaited_once()
+        args, _ = self.redis.eval.call_args
+        # args = (script, numkeys, key, new_status, expected_status)
+        assert args[1] == 1
+        assert args[2] == "confirmation_detail:s1:tc1"
+        assert args[3] == "processing"
+        assert args[4] == "pending"
+
+    def test_mark_processing_if_pending_cas_false_on_mismatch(self):
+        """对手已把状态推成 processing → Lua 返 0 → False（losing 并发 resume）。"""
+        self.redis.eval = AsyncMock(return_value=0)
+        assert _run(self.mgr.mark_processing_if_pending("s1", "tc1")) is False
+
+    def test_mark_processing_if_pending_cas_false_on_missing_key(self):
+        """key 不存在（confirmation 已被 cleanup）→ Lua 返 None/0 → False。"""
+        self.redis.eval = AsyncMock(return_value=None)
+        assert _run(self.mgr.mark_processing_if_pending("s1", "tc1")) is False

@@ -210,8 +210,9 @@ class AgentTaskRunner(TaskRunner):
         memory_gate_threshold: float = 0.7,
         memory_gate_batch_cap: int = 20,
         memory_notification_emitter=None,  # PR-4+8: MemoryNotificationEmitter
-        approval_cache=None,  # Task 17: ApprovalCache | None（R5b-3 移除；仅 SmartApprove write_session）
+        approval_cache=None,  # Task 17: ApprovalCache | None（R5b-4 删除；现仅残余）
         approval_state_reader=None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
+        approval_state_writer=None,  # R5b-3: ApprovalStateWriter | None（写路径 single writer）
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
         initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
         tool_runtime: ToolRuntimeConfig | None = None,  # R2 CS2: wrapper cap + smart-approve timeout
@@ -221,6 +222,7 @@ class AgentTaskRunner(TaskRunner):
         self._on_session_complete = on_session_complete
         self._approval_cache = approval_cache
         self._approval_state_reader = approval_state_reader
+        self._approval_state_writer = approval_state_writer
         self._confirmation_manager = confirmation_manager
         self._memory_flusher = memory_flusher
         self._memory_embedding_provider = memory_embedding_provider
@@ -427,6 +429,7 @@ class AgentTaskRunner(TaskRunner):
             memory_notification_emitter=self._memory_notification_emitter,
             approval_cache=self._approval_cache,
             approval_state_reader=self._approval_state_reader,
+            approval_state_writer=self._approval_state_writer,
             confirmation_manager=self._confirmation_manager,
             prompt_assembler=prompt_assembler,
             tool_runtime=self._tool_runtime,

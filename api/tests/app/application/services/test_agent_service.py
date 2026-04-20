@@ -39,9 +39,24 @@ class _NoopSessionRepository:
         self.add_event_calls.append((session_id, event))
 
 
+class _NoopApprovalGrantsRepo:
+    """R5b-3 round-6: late-duplicate lookup 用。默认 ``find_by_confirmation_id``
+    返 None（无历史 grant）；测试需要模拟 winner cleanup 后的 409 时，可
+    monkeypatch 或替换成 AsyncMock 返实际 grant。"""
+
+    def __init__(self) -> None:
+        self.find_by_confirmation_id_calls: list[str] = []
+
+    async def find_by_confirmation_id(self, confirmation_id: str):
+        self.find_by_confirmation_id_calls.append(confirmation_id)
+        return None
+
+
 class _NoopUoW:
     def __init__(self) -> None:
         self.session = _NoopSessionRepository()
+        # R5b-3 round-6: preflight late-duplicate 分支会查此 repo（detail=None 时）
+        self.approval_grants = _NoopApprovalGrantsRepo()
 
     async def __aenter__(self) -> "_NoopUoW":
         return self

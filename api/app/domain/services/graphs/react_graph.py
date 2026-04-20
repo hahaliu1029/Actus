@@ -1524,12 +1524,46 @@ def build_react_graph(
                                     "granting session scope",
                                     tool_name,
                                 )
-                                if approval_cache and _session_id:
-                                    await approval_cache.write_session(
-                                        _session_id,
-                                        tool_name,
-                                        assessment.arg_digest,
-                                    )
+                                # R5b-3: SmartApprove 写路径从 ApprovalCache.write_session
+                                # 切到 ApprovalStateWriter（CS4 单一 Writer）。confirmation_id=None
+                                # 命中 partial UNIQUE (user, session, tool, arg_digest, effect)
+                                # WHERE confirmation_id IS NULL 做 SmartApprove 去重。
+                                _asw = configurable.get("approval_state_writer")
+                                if _asw and _session_id and _user_id:
+                                    try:
+                                        from app.domain.models.approval_grant import (
+                                            ApprovalDecision,
+                                        )
+                                        from app.domain.services.approval_grant_policy import (
+                                            session_grant_expires_at,
+                                        )
+                                        _sa_tool_source = (
+                                            tool_source.source
+                                            if tool_source is not None
+                                            else "native"
+                                        )
+                                        _sa_decision_obj = ApprovalDecision(
+                                            user_id=_user_id,
+                                            session_id=_session_id,
+                                            tool_name=tool_name,
+                                            tool_source=_sa_tool_source,
+                                            arg_digest=assessment.arg_digest,
+                                            primary_arg=assessment.primary_arg,
+                                            dir_arg=assessment.dir_arg or "",
+                                            scope="session",
+                                            effect="approve",
+                                            source_type="smart_approve",
+                                            confirmation_id=None,
+                                            expires_at=session_grant_expires_at(),
+                                            risk_level=assessment.final_level.name.lower(),
+                                        )
+                                        await _asw.write(_sa_decision_obj)
+                                    except Exception as _sa_write_err:
+                                        logger.warning(
+                                            "SmartApprove grant 写入失败 tool=%s: %s "
+                                            "(fail-open: 本次执行不受影响，下次同 arg 仍会走 SmartApprove)",
+                                            tool_name, _sa_write_err,
+                                        )
                                 outcome = await _invoke_wrapper(
                                     tool_fn,
                                     tc,

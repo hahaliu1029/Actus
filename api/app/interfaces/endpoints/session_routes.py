@@ -233,6 +233,12 @@ async def chat(
     redis_client: RedisClient = Depends(get_redis),
 ) -> EventSourceResponse:
     """根据传递的会话id+chat请求数据向指定会话发起聊天请求"""
+    # R5b-3 Codex round-2/3 修复：工具确认恢复必须在 EventSourceResponse 之前
+    # 完成 claim/404/409 判定（否则 sse_starlette 已发 200 OK）。同时，preflight
+    # 写 grant / 推 processing 之后到 drive 之间不能留下不可恢复的 claim 洞——
+    # 所以顺序是：① lease 先拿（失败走 rate_limit 的 503/429，不伤 grant），
+    # ② 再 preflight 拿 claim，preflight 失败立刻 release lease 避免泄漏，
+    # ③ 成功进入 EventSourceResponse；drive 里 CancelledError 会触发回滚（agent_service 端保证）。
     lease = await acquire_connection_limit(
         channel=RateLimitChannel.SSE,
         user_id=current_user.id,
@@ -240,25 +246,46 @@ async def chat(
     )
     lease.start_heartbeat()
 
-    async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
-        """定义事件生成器，用于配合EventSourceResponse生成流式响应数据"""
+    resume_state = None
+    if request.tool_confirmation is not None:
         try:
-            # 1.调用Agent服务发起聊天
-            async for event in agent_service.chat(
+            resume_state = await agent_service.preflight_resume_tool_confirmation(
                 session_id=session_id,
                 user_id=current_user.id,
                 is_admin=current_user.is_admin(),
-                message=request.message,
-                attachments=request.attachments,
-                skill_confirmation_action=request.skill_confirmation_action,
                 tool_confirmation=request.tool_confirmation,
-                latest_event_id=request.event_id,
-                timestamp=(
-                    datetime.fromtimestamp(request.timestamp)
-                    if request.timestamp
-                    else None
-                ),
-            ):
+            )
+        except BaseException:
+            # preflight 抛 ConflictError/NotFoundError/BadRequestError 或 CancelledError
+            # 都必须 release lease，否则连接配额泄漏；claim 回滚由 agent_service 负责。
+            await lease.release()
+            raise
+
+    async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
+        """定义事件生成器，用于配合EventSourceResponse生成流式响应数据"""
+        try:
+            # 1.分派：tool_confirmation 走 drive（preflight 已拿 claim）；否则正常 chat
+            if resume_state is not None:
+                event_stream = agent_service.drive_resume_tool_confirmation(
+                    resume_state
+                )
+            else:
+                event_stream = agent_service.chat(
+                    session_id=session_id,
+                    user_id=current_user.id,
+                    is_admin=current_user.is_admin(),
+                    message=request.message,
+                    attachments=request.attachments,
+                    skill_confirmation_action=request.skill_confirmation_action,
+                    tool_confirmation=request.tool_confirmation,
+                    latest_event_id=request.event_id,
+                    timestamp=(
+                        datetime.fromtimestamp(request.timestamp)
+                        if request.timestamp
+                        else None
+                    ),
+                )
+            async for event in event_stream:
                 # 2.将Agent事件转换为sse数据(因为普通的event没法通过流式事件传输)
                 sse_event = EventMapper.event_to_sse_event(event)
                 if sse_event:

@@ -79,7 +79,44 @@ class ConfirmationManager:
         )
 
     async def mark_processing(self, session_id: str, tool_call_id: str) -> None:
+        """Unconditionally set status=processing (legacy; no CAS semantics).
+
+        **Warning**: 无 CAS 保证。R5b-3 新代码请用 ``mark_processing_if_pending``
+        做原子 single-flight claim；此方法保留仅供向后兼容 / sweep 路径使用。
+        """
         await self._redis.hset(self._hash_key(session_id, tool_call_id), "status", "processing")
+
+    # R5b-3 fix (Codex CRIT): Redis Lua 原子 CAS——仅当 status=='pending' 时改写
+    # 成 'processing'。用于 scope='once' 的 single-flight claim：两个并发 /resume
+    # 只有一个能拿到 True，另一个拿 False → 上层返 409。
+    # KEYS[1] = hash_key；ARGV[1] = new_status；ARGV[2] = expected_status
+    # 返 1 表示 CAS 成功；0 表示 expected 不匹配或 key 不存在。
+    _MARK_PROCESSING_IF_PENDING_LUA = (
+        "local s = redis.call('HGET', KEYS[1], 'status') "
+        "if s == ARGV[2] then "
+        "    redis.call('HSET', KEYS[1], 'status', ARGV[1]) "
+        "    return 1 "
+        "end "
+        "return 0"
+    )
+
+    async def mark_processing_if_pending(
+        self, session_id: str, tool_call_id: str
+    ) -> bool:
+        """Atomic CAS: status='pending' → 'processing'. 返 True 表示本调用赢得了
+        single-flight claim；False 表示已被其他请求/worker 占用（or 不存在）。
+
+        scope='once' 的并发 /resume 防重依赖此方法；I1/I4 的 race invariant 由
+        这里的 Redis Lua 脚本原子性保证。
+        """
+        result = await self._redis.eval(
+            self._MARK_PROCESSING_IF_PENDING_LUA,
+            1,
+            self._hash_key(session_id, tool_call_id),
+            "processing",
+            "pending",
+        )
+        return bool(int(result or 0))
 
     async def mark_pending(self, session_id: str, tool_call_id: str) -> None:
         """Roll back from processing to pending (on resume failure)."""
