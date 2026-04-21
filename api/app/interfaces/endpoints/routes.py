@@ -12,6 +12,7 @@ from . import (
     session_routes,
     status_routes,
     user_routes,
+    user_tool_policies_routes,
     user_tools_v2_routes,
 )
 
@@ -34,6 +35,7 @@ def create_api_routes() -> APIRouter:
     # 用户路由
     api_router.include_router(user_routes.router)
     api_router.include_router(user_tools_v2_routes.router)
+    api_router.include_router(user_tool_policies_routes.router)
     api_router.include_router(memory_routes.router)
     api_router.include_router(notification_routes.router)
 

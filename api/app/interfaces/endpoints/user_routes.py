@@ -4,12 +4,12 @@ import asyncio
 import logging
 
 from app.application.services.app_config_service import AppConfigService
-from app.application.services.user_tool_preference_service import (
-    UserToolPreferenceService,
+from app.application.services.user_tool_enablement_service import (
+    UserToolEnablementService,
 )
-from app.domain.models.user_tool_preference import ToolType
-from app.infrastructure.repositories.db_user_tool_preference_repository import (
-    DBUserToolPreferenceRepository,
+from app.domain.models.user_tool_enablement import ToolType
+from app.infrastructure.repositories.db_user_tool_enablement_repository import (
+    DBUserToolEnablementRepository,
 )
 from app.infrastructure.storage.postgres import get_postgres
 from app.interfaces.dependencies import CurrentUser
@@ -39,10 +39,10 @@ async def get_mcp_tools(
     postgres = get_postgres()
     try:
         async with postgres.session_factory() as session:
-            pref_repo = DBUserToolPreferenceRepository(session)
-            pref_service = UserToolPreferenceService(pref_repo)
+            pref_repo = DBUserToolEnablementRepository(session)
+            pref_service = UserToolEnablementService(pref_repo)
 
-            user_prefs = await pref_service.get_user_preferences(
+            user_prefs = await pref_service.list_user_enablements(
                 current_user.id, ToolType.MCP
             )
             pref_map = {pref.tool_id: pref.enabled for pref in user_prefs}
@@ -88,8 +88,8 @@ async def set_mcp_tool_enabled(
     postgres = get_postgres()
 
     async with postgres.session_factory() as session:
-        pref_repo = DBUserToolPreferenceRepository(session)
-        pref_service = UserToolPreferenceService(pref_repo)
+        pref_repo = DBUserToolEnablementRepository(session)
+        pref_service = UserToolEnablementService(pref_repo)
 
         await pref_service.set_tool_enabled(
             current_user.id,
@@ -118,10 +118,10 @@ async def get_a2a_tools(
     postgres = get_postgres()
     try:
         async with postgres.session_factory() as session:
-            pref_repo = DBUserToolPreferenceRepository(session)
-            pref_service = UserToolPreferenceService(pref_repo)
+            pref_repo = DBUserToolEnablementRepository(session)
+            pref_service = UserToolEnablementService(pref_repo)
 
-            user_prefs = await pref_service.get_user_preferences(
+            user_prefs = await pref_service.list_user_enablements(
                 current_user.id, ToolType.A2A
             )
             pref_map = {pref.tool_id: pref.enabled for pref in user_prefs}
@@ -167,8 +167,8 @@ async def set_a2a_tool_enabled(
     postgres = get_postgres()
 
     async with postgres.session_factory() as session:
-        pref_repo = DBUserToolPreferenceRepository(session)
-        pref_service = UserToolPreferenceService(pref_repo)
+        pref_repo = DBUserToolEnablementRepository(session)
+        pref_service = UserToolEnablementService(pref_repo)
 
         await pref_service.set_tool_enabled(
             current_user.id,

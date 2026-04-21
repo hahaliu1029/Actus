@@ -25,7 +25,7 @@ from app.domain.models.event import (
 from app.domain.models.session import SessionStatus
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.tool_result import ToolResult
-from app.domain.models.user_tool_preference import ToolType
+from app.domain.models.user_tool_enablement import ToolType
 from app.domain.models.plan import Step
 from app.domain.services.agent_task_runner import AgentTaskRunner
 

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from app.application.services.skill_service import SkillService
-from app.application.services.user_tool_preference_service import UserToolPreferenceService
-from app.domain.models.user_tool_preference import ToolType
-from app.infrastructure.repositories.db_user_tool_preference_repository import (
-    DBUserToolPreferenceRepository,
+from app.application.services.user_tool_enablement_service import UserToolEnablementService
+from app.domain.models.user_tool_enablement import ToolType
+from app.infrastructure.repositories.db_user_tool_enablement_repository import (
+    DBUserToolEnablementRepository,
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.postgres import get_db_session
@@ -30,10 +30,10 @@ async def get_skill_tools(
     current_user: CurrentUser,
     db_session: AsyncSession = Depends(get_db_session),
 ) -> Response:
-    pref_service = UserToolPreferenceService(DBUserToolPreferenceRepository(db_session))
+    pref_service = UserToolEnablementService(DBUserToolEnablementRepository(db_session))
     skill_service = SkillService(FileSkillRepository(settings.skills_root_dir))
 
-    user_prefs = await pref_service.get_user_preferences(current_user.id, ToolType.SKILL)
+    user_prefs = await pref_service.list_user_enablements(current_user.id, ToolType.SKILL)
     pref_map = {pref.tool_id: pref.enabled for pref in user_prefs}
     skills = await skill_service.list_skills()
 
@@ -62,8 +62,8 @@ async def set_skill_tool_enabled(
     current_user: CurrentUser,
     db_session: AsyncSession = Depends(get_db_session),
 ) -> Response:
-    pref_repo = DBUserToolPreferenceRepository(db_session)
-    pref_service = UserToolPreferenceService(pref_repo)
+    pref_repo = DBUserToolEnablementRepository(db_session)
+    pref_service = UserToolEnablementService(pref_repo)
     await pref_service.set_tool_enabled(
         current_user.id,
         ToolType.SKILL,

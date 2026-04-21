@@ -6,8 +6,8 @@ from datetime import datetime
 from pathlib import Path
 
 from app.domain.models.skill import Skill, SkillSourceType, build_skill_key
-from app.domain.models.user_tool_preference import ToolType
-from app.infrastructure.models.user_tool_preference import UserToolPreferenceModel
+from app.domain.models.user_tool_enablement import ToolType
+from app.infrastructure.models.user_tool_enablement import UserToolEnablementModel
 from app.infrastructure.repositories.db_skill_repository import DBSkillRepository
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.postgres import get_postgres
@@ -46,8 +46,8 @@ async def migrate() -> None:
         fs_repo = FileSkillRepository(skills_root)
 
         skills = await db_repo.list()
-        prefs_stmt = select(UserToolPreferenceModel).where(
-            UserToolPreferenceModel.tool_type == ToolType.SKILL.value
+        prefs_stmt = select(UserToolEnablementModel).where(
+            UserToolEnablementModel.tool_type == ToolType.SKILL.value
         )
         prefs_result = await session.execute(prefs_stmt)
         prefs = list(prefs_result.scalars().all())

@@ -6,9 +6,9 @@ from datetime import datetime
 from pathlib import Path
 
 from app.domain.models.skill import Skill
-from app.domain.models.user_tool_preference import ToolType
+from app.domain.models.user_tool_enablement import ToolType
 from app.infrastructure.models.skill import SkillModel
-from app.infrastructure.models.user_tool_preference import UserToolPreferenceModel
+from app.infrastructure.models.user_tool_enablement import UserToolEnablementModel
 from app.infrastructure.storage.postgres import get_postgres
 from sqlalchemy import delete
 
@@ -48,8 +48,8 @@ async def rollback() -> None:
     async with postgres.session_factory() as session:
         await session.execute(delete(SkillModel))
         await session.execute(
-            delete(UserToolPreferenceModel).where(
-                UserToolPreferenceModel.tool_type == ToolType.SKILL.value
+            delete(UserToolEnablementModel).where(
+                UserToolEnablementModel.tool_type == ToolType.SKILL.value
             )
         )
 
@@ -61,7 +61,7 @@ async def rollback() -> None:
 
         for raw in prefs_data:
             session.add(
-                UserToolPreferenceModel(
+                UserToolEnablementModel(
                     id=raw["id"],
                     user_id=raw["user_id"],
                     tool_type=raw["tool_type"],

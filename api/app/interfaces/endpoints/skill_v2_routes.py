@@ -7,12 +7,12 @@ from typing import AsyncGenerator
 
 from app.application.services.app_config_service import AppConfigService
 from app.application.services.skill_service import SkillService
-from app.application.services.user_tool_preference_service import UserToolPreferenceService
+from app.application.services.user_tool_enablement_service import UserToolEnablementService
 from app.domain.models.app_config import SkillRiskPolicy
 from app.domain.models.skill_creator import SkillCreationResult
-from app.domain.models.user_tool_preference import ToolType
-from app.infrastructure.repositories.db_user_tool_preference_repository import (
-    DBUserToolPreferenceRepository,
+from app.domain.models.user_tool_enablement import ToolType
+from app.infrastructure.repositories.db_user_tool_enablement_repository import (
+    DBUserToolEnablementRepository,
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.postgres import get_db_session
@@ -196,10 +196,10 @@ async def delete_skill(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> Response[dict | None]:
     skill_service = _build_skill_service()
-    pref_service = UserToolPreferenceService(DBUserToolPreferenceRepository(db_session))
+    pref_service = UserToolEnablementService(DBUserToolEnablementRepository(db_session))
 
     await skill_service.delete_skill(skill_key)
-    await pref_service.delete_tool_preferences(ToolType.SKILL, skill_key)
+    await pref_service.delete_enablements_by_tool(ToolType.SKILL, skill_key)
     await db_session.commit()
     return Response.success(msg="Skill 删除成功")
 

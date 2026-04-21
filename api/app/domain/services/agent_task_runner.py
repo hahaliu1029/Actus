@@ -68,7 +68,7 @@ from app.domain.models.search import SearchResults
 from app.domain.models.session import SessionStatus
 from app.domain.models.skill import Skill
 from app.domain.models.tool_result import ToolResult
-from app.domain.models.user_tool_preference import ToolType
+from app.domain.models.user_tool_enablement import ToolType
 
 # from app.domain.repositories.file_repository import FileRepository
 # from app.domain.repositories.session_repository import SessionRepository
@@ -86,8 +86,8 @@ from app.domain.services.tools.skill_bundle_sync import SkillBundleSyncManager
 from app.domain.services.tools.tool_source_resolver import (
     resolve_tool_source_from_tool,
 )
-from app.infrastructure.repositories.db_user_tool_preference_repository import (
-    DBUserToolPreferenceRepository,
+from app.infrastructure.repositories.db_user_tool_enablement_repository import (
+    DBUserToolEnablementRepository,
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.postgres import get_postgres
@@ -2132,7 +2132,7 @@ class AgentTaskRunner(TaskRunner):
         try:
             postgres = get_postgres()
             async with postgres.session_factory() as session:
-                pref_repository = DBUserToolPreferenceRepository(session)
+                pref_repository = DBUserToolEnablementRepository(session)
                 preferences = await pref_repository.get_by_user_id(self._user_id, tool_type)
                 return {preference.tool_id: preference.enabled for preference in preferences}
         except asyncio.CancelledError:

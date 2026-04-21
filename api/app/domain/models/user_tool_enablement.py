@@ -1,4 +1,4 @@
-"""用户工具偏好领域模型"""
+"""用户工具扩展启用领域模型。"""
 
 from datetime import datetime
 from enum import Enum
@@ -15,10 +15,10 @@ class ToolType(str, Enum):
     SKILL = "skill"
 
 
-class UserToolPreference(BaseModel):
-    """用户工具偏好领域模型
+class UserToolEnablement(BaseModel):
+    """用户对扩展工具 (MCP/A2A/Skill) 的启用/禁用偏好。
 
-    记录每个用户对 MCP/A2A/Skill 工具的个人启用/禁用偏好
+    仅管"这个扩展是否进工具池"，不管审批。审批走 UserToolApprovalPolicy。
     """
 
     id: str = Field(default_factory=lambda: str(uuid4()))

@@ -1,9 +1,9 @@
-"""用户工具偏好 ORM 模型"""
+"""用户工具扩展启用 ORM 模型。"""
 
 import uuid
 from datetime import datetime
 
-from app.domain.models.user_tool_preference import ToolType, UserToolPreference
+from app.domain.models.user_tool_enablement import ToolType, UserToolEnablement
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -18,14 +18,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 
-class UserToolPreferenceModel(Base):
-    """用户工具偏好数据 ORM 模型"""
+class UserToolEnablementModel(Base):
+    """用户工具扩展启用数据 ORM 模型。"""
 
-    __tablename__ = "user_tool_preferences"
+    __tablename__ = "user_tool_enablements"
     __table_args__ = (
-        PrimaryKeyConstraint("id", name="pk_user_tool_preferences_id"),
+        PrimaryKeyConstraint("id", name="pk_user_tool_enablements_id"),
         UniqueConstraint(
-            "user_id", "tool_type", "tool_id", name="uq_user_tool_preferences_user_tool"
+            "user_id", "tool_type", "tool_id", name="uq_user_tool_enablements_user_tool"
         ),
     )
 
@@ -67,21 +67,21 @@ class UserToolPreferenceModel(Base):
     )
 
     @classmethod
-    def from_domain(cls, pref: UserToolPreference) -> "UserToolPreferenceModel":
-        """从领域模型创建 ORM 模型"""
+    def from_domain(cls, enablement: UserToolEnablement) -> "UserToolEnablementModel":
+        """从领域模型创建 ORM 模型。"""
         return cls(
-            id=pref.id,
-            user_id=pref.user_id,
-            tool_type=pref.tool_type.value,
-            tool_id=pref.tool_id,
-            enabled=pref.enabled,
-            created_at=pref.created_at,
-            updated_at=pref.updated_at,
+            id=enablement.id,
+            user_id=enablement.user_id,
+            tool_type=enablement.tool_type.value,
+            tool_id=enablement.tool_id,
+            enabled=enablement.enabled,
+            created_at=enablement.created_at,
+            updated_at=enablement.updated_at,
         )
 
-    def to_domain(self) -> UserToolPreference:
-        """将 ORM 模型转换为领域模型"""
-        return UserToolPreference(
+    def to_domain(self) -> UserToolEnablement:
+        """将 ORM 模型转换为领域模型。"""
+        return UserToolEnablement(
             id=self.id,
             user_id=self.user_id,
             tool_type=ToolType(self.tool_type),
@@ -91,7 +91,7 @@ class UserToolPreferenceModel(Base):
             updated_at=self.updated_at,
         )
 
-    def update_from_domain(self, pref: UserToolPreference) -> None:
-        """从领域模型更新数据"""
-        self.enabled = pref.enabled
+    def update_from_domain(self, enablement: UserToolEnablement) -> None:
+        """从领域模型更新数据。"""
+        self.enabled = enablement.enabled
         self.updated_at = datetime.now()

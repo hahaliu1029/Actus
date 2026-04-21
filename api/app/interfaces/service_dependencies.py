@@ -14,6 +14,9 @@ from app.application.services.skill_creator_service import SkillCreatorService
 from app.application.services.skill_export_service import SkillExportService
 from app.application.services.skill_service import SkillService
 from app.application.services.status_service import StatusService
+from app.application.services.user_tool_approval_policy_service import (
+    UserToolApprovalPolicyService,
+)
 
 # from app.domain.repositories.session_repository import SessionRepository
 from app.infrastructure.external.file_storage.minio_file_storage import MinioFileStorage
@@ -45,6 +48,9 @@ from app.infrastructure.repositories.file_app_config_repository import (
 from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
 from app.infrastructure.repositories.db_memory_system_notification_repository import (
     DBMemorySystemNotificationRepository,
+)
+from app.infrastructure.repositories.db_user_tool_approval_policy_repository import (
+    DBUserToolApprovalPolicyRepository,
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.storage.minio import MinioStore, get_minio
@@ -671,3 +677,13 @@ def get_approval_state_reader():
             session_factory=get_postgres().session_factory,
         )
     return ApprovalStateReader(query=grant_query, legacy_rule_query=legacy_query)
+
+
+def get_user_tool_approval_policy_service(
+    db_session: AsyncSession = Depends(get_db_session),
+) -> UserToolApprovalPolicyService:
+    """R6 §8.2 — DI factory for ApprovalPolicy service. Overridable via
+    `app.dependency_overrides` in tests (see Task 8 pattern)."""
+    return UserToolApprovalPolicyService(
+        DBUserToolApprovalPolicyRepository(db_session),
+    )

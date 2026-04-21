@@ -1,8 +1,11 @@
 """用户相关 Schema"""
 
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+from app.domain.models.user_tool_approval_policy import ApprovalPolicy
 
 
 class UserStatusUpdateRequest(BaseModel):
@@ -44,3 +47,17 @@ class A2AToolListResponse(BaseModel):
     """A2A 工具列表响应（带用户偏好）"""
 
     tools: list[ToolWithPreference] = Field(default_factory=list)
+
+
+class ToolPolicyRequest(BaseModel):
+    """工具审批 policy 请求体。"""
+
+    policy: ApprovalPolicy = Field(..., description="审批策略: auto / ask / deny")
+
+
+class ToolPolicyResponse(BaseModel):
+    """工具审批 policy 响应体。"""
+
+    tool_name: str = Field(..., description="工具 canonical 名")
+    policy: ApprovalPolicy = Field(..., description="审批策略")
+    updated_at: datetime = Field(..., description="最后更新时间")
