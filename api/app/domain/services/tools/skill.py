@@ -341,8 +341,46 @@ class SkillTool(BaseTool):
         command = str(entry.get("command") or "").strip()
         if not command:
             return ToolResult(success=False, message="native skill 缺少 entry.command")
+
+        # N1: AST validator runs first (per spec §4.5(c))
+        from app.domain.services.safety.shell_ast_validator import (
+            to_legacy_tool_result,
+            validate,
+        )
+        try:
+            ast_result = validate(command, effective_cwd=exec_dir)
+        except Exception as _ast_exc:  # defensive — validate() should never raise
+            logger.exception(
+                "SkillTool._invoke_native AST validator 兜底触发 (should not happen)"
+            )
+            return ToolResult(
+                success=False,
+                message=(
+                    f"native skill AST validator 内部异常 (fail-closed): "
+                    f"{type(_ast_exc).__name__}"
+                ),
+            )
+        if not ast_result.allowed:
+            # Interim telemetry for ast_block_rate_skill (spec §8.6);
+            # session_id not yet created here (runs before line ~349),
+            # so use skill.id + manifest_tool name. INFO level (not WARN) —
+            # denial is a normal decision event.
+            logger.info(
+                "skill_ast_deny skill_id=%s tool_name=%s code=%s category=%s",
+                skill.id,
+                manifest_tool.get("name", ""),
+                ast_result.code,
+                ast_result.category_zh,
+            )
+            return to_legacy_tool_result(ast_result, original_command=command)
+
+        # Belt-and-suspenders: legacy regex remains as secondary layer.
+        # DEPRECATED — retained during N1 narrow; remove in R5+CS4 cleanup.
         if self._contains_blocked_command(command):
-            return ToolResult(success=False, message="native skill 命令命中禁止规则")
+            return ToolResult(
+                success=False,
+                message="native skill 命令命中禁止规则 (legacy blocklist)",
+            )
 
         payload = json.dumps(kwargs, ensure_ascii=False) if kwargs else "{}"
         full_command = f"{command} {shlex.quote(payload)}"
@@ -479,6 +517,11 @@ class SkillTool(BaseTool):
         return bool(policy.get("model_invocable", True))
 
     def _contains_blocked_command(self, command: str) -> bool:
+        """DEPRECATED (N1): retained as belt-and-suspenders secondary layer.
+
+        Primary check is now ``shell_ast_validator.validate()``. Will be
+        removed in R5+CS4 cleanup once legacy_regex_block_rate reaches zero.
+        """
         for pattern in self._blocked_command_patterns:
             if re.search(pattern, command, flags=re.IGNORECASE):
                 return True

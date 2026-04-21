@@ -24,6 +24,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
 
+from core.config import get_settings  # N1 — read sandbox_default_cwd for AST validator
+
 from app.application.errors.exceptions import ServerRequestsError
 from app.domain.external.file_processor import FileProcessResult
 from app.domain.models.app_config import AgentConfig
@@ -205,13 +207,25 @@ def _smart_approve_applies(tool_source: ToolSource, tool_call: ToolCall) -> bool
 async def _stage_s_ast_validate(
     tool_call: ToolCall,
 ) -> ToolOutcome | None:
-    """Stage S: shell AST validator.
+    """Stage S: shell AST validator (N1).
 
-    Commit 1 stub returns None (allow). N1 will replace with real
-    ``shell_ast_validator.validate(tool_call.args)`` call that produces
-    a ``Denied(reason=ast_validator)`` on unsafe patterns.
+    Calls into the pure-sync ``shell_ast_validator.validate()``.
+    Returns ``Denied(reason.type="ast_validator")`` when validate() rejects,
+    ``None`` when allowed.
     """
-    return None
+    from app.domain.services.safety.shell_ast_validator import (
+        to_typed_denied,
+        validate,
+    )
+    from core.config import get_settings
+
+    args = tool_call.get("args", {}) or {}
+    command = args.get("command", "") or ""
+    exec_dir = args.get("exec_dir", "") or get_settings().sandbox_default_cwd
+    result = validate(command, effective_cwd=exec_dir)
+    if result.allowed:
+        return None
+    return to_typed_denied(result, original_command=command)
 
 
 async def _stage_p1_approval_cache_check(
@@ -1029,6 +1043,9 @@ def build_react_graph(
                 },
             )
 
+        # N1: read settings once for the shell AST validator gate below
+        _settings = get_settings()
+
         messages = state["messages"]
 
         # R2 CS2 (I-4.1): find the AIMessage carrying the active tool_calls
@@ -1207,6 +1224,61 @@ def build_react_graph(
                     category="unknown",
                     canonical_name=tool_name,
                 )
+
+            # N1 AST validator gate (shell_execute only, before legacy risk gate).
+            #
+            # Narrow scope — ``tool_source.category == "shell"`` also covers
+            # shell_read_output / shell_wait_process / shell_write_input /
+            # shell_kill_process, none of which carry a fresh ``command`` arg.
+            # Running ``validate("")`` on them inflated ``parser_failure_rate``
+            # denominator with empty-command successes and (for
+            # shell_write_input) masked the actually-dangerous ``input_text``
+            # payload as an AST pass. Scoping by tool_name keeps the metric
+            # meaningful; ``shell_write_input.input_text`` validation is a
+            # follow-up rather than being smuggled into this gate.
+            if tool_source.category == "shell" and tool_name == "shell_execute":
+                from app.domain.services.safety.shell_ast_validator import (
+                    to_typed_denied,
+                    validate,
+                )
+                try:
+                    ast_result = validate(
+                        command=args.get("command", ""),
+                        effective_cwd=(
+                            args.get("exec_dir", "") or _settings.sandbox_default_cwd
+                        ),
+                    )
+                except Exception as _ast_exc:  # noqa: BLE001 — defensive
+                    logger.exception(
+                        "tool_node AST validator 兜底触发 (should not happen)"
+                    )
+                    # P1-b: Layer-2 crash is a DISTINCT P0 signal (spec §6.5);
+                    # do NOT fold into parser_failure_rate. Use dedicated counter.
+                    if _metrics is not None:
+                        _metrics.record_ast_validator_crash()
+                    crash_outcome = AllowError(
+                        content=(
+                            f"[AST 拦截] validator 内部异常，出于安全原因拒绝本次调用\n"
+                            f"命令: {args.get('command', '')[:200]}"
+                        ),
+                        reason=DecisionReason(
+                            type="exception",
+                            code="ast_validator_crash",
+                            message=str(_ast_exc),
+                        ),
+                        retryable=False,
+                    )
+                    await _finalize_outcome(tc, args, tool_source, crash_outcome, _tool_start)
+                    continue
+
+                if _metrics is not None:
+                    _metrics.record_ast_validation(ast_result.code)
+
+                if not ast_result.allowed:
+                    denied = to_typed_denied(ast_result, original_command=args.get("command", ""))
+                    await _finalize_outcome(tc, args, tool_source, denied, _tool_start)
+                    continue
+            # — end N1 gate —
 
             # ---- D5 tracker: block signature with repeated failures ----
             if _tracker and _tracker.is_blocked(tool_name, args):

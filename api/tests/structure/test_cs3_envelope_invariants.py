@@ -31,6 +31,7 @@ TYPED_CLASSES = {
 RULE_1_WHITELIST = {
     "api/app/domain/models/tool_result.py",
     "api/app/domain/services/graphs/",
+    "api/app/domain/services/safety/",
     "api/app/domain/services/tools/",
     "api/app/application/services/tool_event_envelope_v1.py",
     "api/app/infrastructure/external/llm/_error_prefix.py",
