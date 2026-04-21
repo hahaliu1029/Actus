@@ -639,19 +639,24 @@ class AgentService:
             raise
 
         # 6. once 路径立即写 audit（赢 claim 后持久化证据，不等 drive 完成）
+        # CS4 single-writer contract: once audit 必须经 ApprovalStateWriter 入口，
+        # 不得在此处直写 tool_approval_log.create（详见 writer.write_audit_only docstring）。
         if not persistent_scope:
+            from app.application.services.approval_state_writer import (
+                ApprovalStateWriter,
+            )
+            once_audit_writer = ApprovalStateWriter(uow_factory=self._uow_factory)
             try:
-                async with self._uow_factory() as _audit_uow:
-                    await _audit_uow.tool_approval_log.create(
-                        user_id=owner_user_id,
-                        session_id=session_id,
-                        tool_name=detail.tool_name,
-                        tool_args=detail.tool_args,
-                        risk_level=detail.risk_level,
-                        action=action,
-                        scope=scope,
-                        approved_by="user",
-                    )
+                await once_audit_writer.write_audit_only(
+                    user_id=owner_user_id,
+                    session_id=session_id,
+                    tool_name=detail.tool_name,
+                    tool_args=detail.tool_args,
+                    risk_level=detail.risk_level,
+                    action=action,
+                    scope=scope,
+                    approved_by="user",
+                )
             except Exception as _log_err:
                 # 普通错误吞成 warning（audit 丢失可容忍，但不能阻塞 resume）
                 logger.warning(

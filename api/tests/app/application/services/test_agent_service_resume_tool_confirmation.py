@@ -58,18 +58,21 @@ class _StubDetail:
 
 
 class _FakeWriter:
-    """mock ``ApprovalStateWriter``; records .write / .delete_grant invocations."""
+    """mock ``ApprovalStateWriter``; records .write / .delete_grant / .write_audit_only invocations."""
 
     def __init__(
         self,
         *,
         write_return: tuple[str, bool] = ("dec-1", True),
         write_exc: Exception | None = None,
+        write_audit_only_exc: BaseException | None = None,
     ) -> None:
         self.write_return = write_return
         self.write_exc = write_exc
+        self.write_audit_only_exc = write_audit_only_exc
         self.write_calls: list = []
         self.delete_grant_calls: list[str] = []
+        self.write_audit_only_calls: list[dict] = []
 
     async def write(self, decision) -> tuple[str, bool]:
         self.write_calls.append(decision)
@@ -79,6 +82,11 @@ class _FakeWriter:
 
     async def delete_grant(self, decision_id: str) -> None:
         self.delete_grant_calls.append(decision_id)
+
+    async def write_audit_only(self, **kwargs) -> None:
+        self.write_audit_only_calls.append(kwargs)
+        if self.write_audit_only_exc is not None:
+            raise self.write_audit_only_exc
 
 
 class _ResumeTask:
@@ -444,8 +452,32 @@ def _make_service_with_uow(recorder: _RecordingUoW) -> AgentService:
     )
 
 
+class _OnceWriterGuard:
+    """2026-04-21 CS4 合同：once scope must NOT call Writer.write/delete_grant，
+    but MUST call ``write_audit_only`` (single-writer audit 入口)。
+
+    替代旧版 ``_BoomWriter`` —— 旧版 boom-on-any-call 是在 once audit 还直写
+    ``tool_approval_log.create`` 时的守卫；合同收口后 once audit 必须经
+    ``write_audit_only``，所以此 guard 允许并记录 audit 调用、同时仍对
+    grant 写入强回归守卫。
+    """
+
+    def __init__(self) -> None:
+        self.write_audit_only_calls: list[dict] = []
+
+    async def write(self, decision):
+        raise AssertionError("scope='once' must NOT call Writer.write")
+
+    async def delete_grant(self, _id):
+        raise AssertionError("scope='once' must NOT call delete_grant")
+
+    async def write_audit_only(self, **kwargs) -> None:
+        self.write_audit_only_calls.append(kwargs)
+
+
 async def test_once_scope_winning_resume_writes_audit(monkeypatch) -> None:
-    """once + CAS 赢家：task.resume 执行 + audit log 写入（owner = detail.user_id）。"""
+    """once + CAS 赢家：task.resume 执行 + audit log 走 write_audit_only
+    （owner = detail.user_id）。"""
     recorder = _RecordingUoW()
     service = _make_service_with_uow(recorder)
     task = _ResumeTask()
@@ -454,16 +486,10 @@ async def test_once_scope_winning_resume_writes_audit(monkeypatch) -> None:
         cas_outcomes=[True],
     )
 
-    class _BoomWriter:
-        async def write(self, decision):
-            raise AssertionError("scope='once' must NOT call Writer.write")
-
-        async def delete_grant(self, _id):
-            raise AssertionError("scope='once' must NOT call delete_grant")
-
+    once_guard = _OnceWriterGuard()
     monkeypatch.setattr(
         "app.application.services.approval_state_writer.ApprovalStateWriter",
-        lambda uow_factory: _BoomWriter(),
+        lambda uow_factory: once_guard,
     )
 
     conf = _Confirmation(action="deny", scope="once")  # deny once 也必须留 audit
@@ -478,14 +504,17 @@ async def test_once_scope_winning_resume_writes_audit(monkeypatch) -> None:
     assert mgr.mark_processing_calls == []  # once 路径不再调老 mark_processing
     assert len(task.resume_calls) == 1
     assert mgr.cleanup_calls == [("s1", "tc-1")]
-    # audit 必须写入（once 也留证据——Codex CRITICAL 回归）
-    recorder.tool_approval_log.create.assert_awaited_once()
-    kwargs = recorder.tool_approval_log.create.call_args.kwargs
+    # audit 必须经 writer.write_audit_only 写入（once 也留证据——Codex CRITICAL 回归）
+    # CS4 合同：不再直写 tool_approval_log.create（recorder 的 create mock 不被调）
+    assert len(once_guard.write_audit_only_calls) == 1
+    kwargs = once_guard.write_audit_only_calls[0]
     assert kwargs["user_id"] == "u1"  # owner = detail.user_id
     assert kwargs["tool_name"] == "shell_execute"
     assert kwargs["action"] == "deny"
     assert kwargs["scope"] == "once"
     assert kwargs["approved_by"] == "user"
+    # 合同面：agent_service 不再绕开 writer 直写底层 repo
+    recorder.tool_approval_log.create.assert_not_awaited()
 
 
 async def test_once_scope_losing_concurrent_claim_returns_409(monkeypatch) -> None:
@@ -498,16 +527,10 @@ async def test_once_scope_losing_concurrent_claim_returns_409(monkeypatch) -> No
         cas_outcomes=[False],  # 模拟对手赢了 CAS
     )
 
-    class _BoomWriter:
-        async def write(self, decision):
-            raise AssertionError("scope='once' must NOT call Writer.write")
-
-        async def delete_grant(self, _id):
-            raise AssertionError("scope='once' must NOT call delete_grant")
-
+    once_guard = _OnceWriterGuard()
     monkeypatch.setattr(
         "app.application.services.approval_state_writer.ApprovalStateWriter",
-        lambda uow_factory: _BoomWriter(),
+        lambda uow_factory: once_guard,
     )
 
     conf = _Confirmation(action="approve", scope="once")
@@ -521,6 +544,8 @@ async def test_once_scope_losing_concurrent_claim_returns_409(monkeypatch) -> No
     # 败者不得触发 resume / cleanup / audit（tool 不执行、无证据）
     assert task.resume_calls == []
     assert mgr.cleanup_calls == []
+    # CS4 合同：audit 必须经 writer；败者连 writer 都不调，底层 repo 也必然未被调
+    assert once_guard.write_audit_only_calls == []
     recorder.tool_approval_log.create.assert_not_awaited()
 
 

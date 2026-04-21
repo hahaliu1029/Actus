@@ -6,8 +6,9 @@ R5a 合同面强制项（现在就应该绿）：
 - Rule 1: ``ApprovalGrantRepository.create()`` / ``approval_grants.create()``
   仅在 ``application/services/approval_state_writer.py`` 调用
 - Rule 2: ``ToolApprovalLogRepository.create()`` / ``tool_approval_log.create()``
-  仅在 ``approval_state_writer.py`` 调用（``agent_service.py`` 的旧 callsite
-  临时白名单，R5b 实施时 **必须** 移出白名单）
+  仅在 ``approval_state_writer.py`` 调用（**无白名单**——once scope 的 audit
+  走 ``ApprovalStateWriter.write_audit_only()``，persistent scope 走
+  ``ApprovalStateWriter.write()``，两条路径共用同一 writer 入口）
 - Rule 6: 无 ``os.environ.get("APPROVAL_LEGACY_RULE_FALLBACK", ...)`` 旁路
   （v4 design 已禁；现仓库干净，立即生效作为防退化守卫）
 
@@ -191,24 +192,21 @@ def test_rule_1_no_approval_grant_create_outside_writer() -> None:
 # ===============================================================
 # Rule 2: tool_approval_log.create 只在 writer 调用
 # ===============================================================
-
-# R5a 临时白名单：旧 _resume_tool_confirmation 路径未拆解前仍调 tool_approval_log.create。
-# R5b 重构 _resume_tool_confirmation 后必须从白名单移除（design doc §R5b invariant I5）。
-RULE_2_LEGACY_WHITELIST = {
-    "api/app/application/services/agent_service.py",  # TODO(R5b): 移出白名单
-}
+#
+# 2026-04-21 R5 CS4 单一 writer 合同收口：白名单已删除。
+# once scope audit 通过 ``ApprovalStateWriter.write_audit_only()`` 入口写入，
+# 与 persistent scope 的 ``write()`` 共用同一 writer。任何
+# ``tool_approval_log.create`` 在 ``approval_state_writer.py`` 之外的调用都是违规。
 
 
 def test_rule_2_no_tool_approval_log_create_outside_writer() -> None:
-    """单写入路径：仅 writer 写 audit；``agent_service.py`` 旧路径临时白名单。
+    """单写入路径：``tool_approval_log.create`` 仅允许在 ``approval_state_writer.py``。
 
-    同 Rule 1，覆盖直接/裸/别名三种调用形式。
+    同 Rule 1，覆盖直接/裸/别名三种调用形式。无例外、无白名单。
     """
     violations: list[str] = []
     for py_path, rel in _iter_app_py_files():
         if _is_test_file(rel) or rel == WRITER_REL_PATH:
-            continue
-        if rel in RULE_2_LEGACY_WHITELIST:
             continue
         try:
             tree = ast.parse(py_path.read_text())
