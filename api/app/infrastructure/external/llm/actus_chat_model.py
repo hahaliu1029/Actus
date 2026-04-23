@@ -37,6 +37,8 @@ import httpx
 import openai
 from openai import AsyncOpenAI
 
+from pydantic import Field
+
 from app.application.errors.exceptions import ServerRequestsError
 from app.infrastructure.external.llm._timeout_helpers import (
     TRANSIENT_OPENAI_EXCEPTIONS,
@@ -45,6 +47,18 @@ from app.infrastructure.external.llm._timeout_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _default_generic_profile() -> Any:
+    """Default ProviderProfile factory — generic_openai.
+
+    Used by Pydantic Field(default_factory=...) when adapter is constructed
+    without explicit profile (e.g. existing test fixtures). _build_llm always
+    passes an explicit profile, so this default only fires in direct-
+    instantiation paths.
+    """
+    from app.domain.services.provider_profiles import get_profile
+    return get_profile("generic_openai")
 
 
 class ActusChatModel(BaseChatModel):
@@ -89,6 +103,11 @@ class ActusChatModel(BaseChatModel):
     # timeout_seconds because the SDK default 5s fires before the outer
     # asyncio.wait_for can rescue slow-handshake cases — see CHANGELOG.
     connect_timeout_seconds: float = 60.0
+    # A7 P0.1: profile injection with default_factory=generic_openai so
+    # existing test fixtures that construct ActusChatModel(...) without
+    # profile still work. _build_llm always passes an explicit profile.
+    # Typed Any to override LangChain BaseChatModel.profile (ModelProfile | None).
+    profile: Any = Field(default_factory=_default_generic_profile)
 
     # Tools bound via bind_tools() — None means no tools bound
     _bound_tools: Optional[list[dict[str, Any]]] = None
@@ -123,6 +142,26 @@ class ActusChatModel(BaseChatModel):
         )
 
         attach_telemetry(self, telemetry, lang=lang)
+
+    # ---- A7 P0.1: WARN emit (adapter-scoped dedup) ---------------------- #
+
+    def _emit_warnings(self, warnings: list) -> None:
+        """A7 adapter-scoped WARN dedup.
+
+        Dedup by w.code across adapter instance lifetime.
+        level='warning' → logger.warning; 'debug' → logger.debug.
+        """
+        if not warnings:
+            return
+        seen = self.__dict__.setdefault("_emitted_warning_codes", set())
+        for w in warnings:
+            if w.code in seen:
+                continue
+            seen.add(w.code)
+            if w.level == "debug":
+                logger.debug("[A7] %s", w.message or w.code)
+            else:
+                logger.warning("[A7] %s", w.message or w.code)
 
     # ---- Client factory -------------------------------------------------- #
 
@@ -201,6 +240,21 @@ class ActusChatModel(BaseChatModel):
                         }
                         for tc in msg.tool_calls
                     ]
+                # A7 P0.1: inject provider-specific reasoning key into wire entry.
+                # No-op when profile.supports_thinking=False (generic_openai default).
+                # Guard for ``__new__``-constructed test instances that skip
+                # Pydantic init (see test_actus_chat_model_error_prefix fixture).
+                _profile = getattr(self, "profile", None)
+                if _profile is not None:
+                    from app.domain.services.provider_profiles._wire import (
+                        inject_reasoning_into_wire_entry,
+                    )
+                    inject_reasoning_into_wire_entry(
+                        entry,
+                        msg.additional_kwargs or {},
+                        _profile,
+                        is_chat_completions_api=True,
+                    )
                 result.append(entry)
             elif isinstance(msg, ToolMessage):
                 content = msg.content or ""
@@ -519,25 +573,92 @@ class ActusChatModel(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Call AsyncOpenAI Chat Completions API and return ChatResult."""
+        """Call AsyncOpenAI Chat Completions API and return ChatResult.
+
+        A7 P0.1: routes through the 6-step pipeline (tool_choice resolve,
+        outbound rewrites, response_format resolve, WARN emit, wire serialize,
+        build_sdk_params). With the default ``generic_openai`` profile,
+        behavior is equivalent to the pre-A7 adapter.
+        """
+        from app.application.errors.exceptions import InternalError
+        from app.domain.services.provider_profiles._parse import (
+            parse_chat_completion_message,
+        )
+        from app.domain.services.provider_profiles._rewrites import (
+            apply_outbound_rewrites,
+            build_sdk_params,
+            resolve_response_format,
+            resolve_tool_choice,
+        )
+
         client = self._get_client()
-        openai_messages = self._to_openai_messages(messages)
+        profile = self.profile
 
-        # Build request params
-        params: dict[str, Any] = {
-            "model": self.model_name,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "messages": openai_messages,
-        }
+        # Step 1: tool_choice 归口 (per_call + bound)
+        per_call_tc = kwargs.pop("tool_choice", None)
+        resolved_tc, tc_warnings = resolve_tool_choice(
+            per_call_value=per_call_tc,
+            bound_value=self._bound_tool_choice,
+            profile=profile,
+            thinking_enabled=profile.thinking_always_on,
+        )
 
-        # Merge tools: bound tools + per-call tools from kwargs
+        # Step 2: 深拷贝 messages + 采样参数 strip + image URL assertion
+        try:
+            rewritten_messages, rewritten_kwargs, rewrite_warnings = (
+                apply_outbound_rewrites(
+                    messages, kwargs, profile, is_chat_completions_api=True,
+                )
+            )
+        except InternalError as e:
+            logger.error("[A7] rewrite invariant violated: %s", e)
+            raise
+
+        # Step 3: response_format shape 归一化
+        # Combine profile-level gate with adapter-level supports_response_format
+        # (legacy toggle — pre-A7 many tests rely on it). A7 resolve_response_format
+        # handles profile support/strip; we additionally respect the adapter
+        # toggle so supports_response_format=False still drops the key.
+        request_rf = rewritten_kwargs.pop("response_format", None)
+        if request_rf is not None and not self.supports_response_format:
+            resolved_rf, rf_warning = None, None
+        else:
+            resolved_rf, rf_warning = resolve_response_format(request_rf, profile)
+
+        # Step 4: WARN emit 唯一出口 (adapter-scoped dedup by code)
+        self._emit_warnings(
+            [*tc_warnings, *rewrite_warnings,
+             *([rf_warning] if rf_warning else [])]
+        )
+
+        # Step 5: wire 序列化 (inject_reasoning_into_wire_entry 已在 _to_openai_messages 内)
+        openai_messages = self._to_openai_messages(rewritten_messages)
+
+        # Step 6: build_sdk_params
+        params = build_sdk_params(
+            rewritten_kwargs,
+            profile,
+            adapter_defaults={
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            },
+            base_params={"model": self.model_name, "messages": openai_messages},
+            resolved_response_format=resolved_rf,
+            resolved_tool_choice=resolved_tc,
+        )
+
+        # tools: merge bound + per-call (kwargs-sourced) — params may already
+        # contain a ``tools`` key from rewritten_kwargs; merge instead of clobber.
         all_tools = list(self._bound_tools or [])
-        extra_tools = kwargs.get("tools")
+        extra_tools = params.pop("tools", None)
         if extra_tools:
             all_tools.extend(extra_tools)
         if all_tools:
             params["tools"] = all_tools
+
+        # stop sequences (not handled by the 6-step pipeline)
+        if stop:
+            params["stop"] = stop
 
         # B5 C11: emit telemetry (non-blocking — any failure is swallowed)
         from app.infrastructure.external.llm._telemetry_mixin import (
@@ -546,32 +667,16 @@ class ActusChatModel(BaseChatModel):
 
         emit_invocation_telemetry(self, messages, all_tools)
 
-        # tool_choice: per-call kwarg > bound value from bind_tools
-        # LangChain uses "any" internally (e.g. with_structured_output),
-        # but OpenAI API expects "required" for the same semantics.
-        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
-        if tool_choice == "any":
-            tool_choice = "required"
-        if tool_choice is not None:
-            params["tool_choice"] = tool_choice
-
-        # response_format: only pass if supported and provided
-        response_format = kwargs.get("response_format")
-        if response_format is not None and self.supports_response_format:
-            params["response_format"] = response_format
-
-        # stop sequences
-        if stop:
-            params["stop"] = stop
-
         # 统计多模态内容块数量用于调试
         multimodal_count = sum(
             1 for m in openai_messages
             if m.get("role") == "user" and isinstance(m.get("content"), list)
         )
         logger.info(
-            "ActusChatModel._agenerate: model=%s, tools=%d, tool_choice=%s, multimodal_messages=%d",
-            self.model_name, len(all_tools), tool_choice, multimodal_count,
+            "ActusChatModel._agenerate: model=%s, tools=%d, tool_choice=%s, "
+            "multimodal_messages=%d, provider=%s",
+            self.model_name, len(all_tools), resolved_tc, multimodal_count,
+            profile.provider_id,
         )
 
         response = await with_llm_timeout(
@@ -594,6 +699,10 @@ class ActusChatModel(BaseChatModel):
         content = message.content or ""
         tool_calls = self._parse_tool_calls(message.tool_calls)
 
+        # A7 P0.1: parse reasoning_content out of the provider-specific key.
+        # For generic_openai (supports_thinking=False) this returns {}.
+        ak = parse_chat_completion_message(message, profile)
+
         # Fallback: if no structured tool_calls, try extracting from content
         if not tool_calls and content:
             tool_calls, content = self._extract_tool_calls_from_content(content)
@@ -607,7 +716,11 @@ class ActusChatModel(BaseChatModel):
                 f"(no content, no tool_calls)"
             )
 
-        ai_message = AIMessage(content=content, tool_calls=tool_calls)
+        ai_message = AIMessage(
+            content=content,
+            tool_calls=tool_calls,
+            additional_kwargs=ak,
+        )
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 
     # ---- LangChain interface: _astream (async streaming) ----------------- #
@@ -619,26 +732,90 @@ class ActusChatModel(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        """Call AsyncOpenAI Chat Completions with stream=True, yield ChatGenerationChunk."""
+        """Call AsyncOpenAI Chat Completions with stream=True, yield ChatGenerationChunk.
+
+        A7 P0.1: routes through the 6-step pipeline (tool_choice resolve,
+        outbound rewrites, response_format resolve, WARN emit, wire serialize,
+        build_sdk_params) mirroring ``_agenerate``. Reasoning chunks are
+        parsed via ``parse_chat_completion_stream_chunk`` and aggregated on
+        the emitted AIMessageChunk's additional_kwargs.
+        """
+        from app.application.errors.exceptions import InternalError
+        from app.domain.services.provider_profiles._parse import (
+            parse_chat_completion_stream_chunk,
+        )
+        from app.domain.services.provider_profiles._rewrites import (
+            apply_outbound_rewrites,
+            build_sdk_params,
+            resolve_response_format,
+            resolve_tool_choice,
+        )
+
         client = self._get_client()
-        openai_messages = self._to_openai_messages(messages)
+        profile = self.profile
 
-        # Build request params
-        params: dict[str, Any] = {
-            "model": self.model_name,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "messages": openai_messages,
-            "stream": True,
-        }
+        # Step 1: tool_choice 归口 (per_call + bound)
+        per_call_tc = kwargs.pop("tool_choice", None)
+        resolved_tc, tc_warnings = resolve_tool_choice(
+            per_call_value=per_call_tc,
+            bound_value=self._bound_tool_choice,
+            profile=profile,
+            thinking_enabled=profile.thinking_always_on,
+        )
 
-        # Merge tools
+        # Step 2: deep-copy messages + sampling param strip + image URL assertion
+        try:
+            rewritten_messages, rewritten_kwargs, rewrite_warnings = (
+                apply_outbound_rewrites(
+                    messages, kwargs, profile, is_chat_completions_api=True,
+                )
+            )
+        except InternalError as e:
+            logger.error("[A7] rewrite invariant violated: %s", e)
+            raise
+
+        # Step 3: response_format shape normalization
+        request_rf = rewritten_kwargs.pop("response_format", None)
+        if request_rf is not None and not self.supports_response_format:
+            resolved_rf, rf_warning = None, None
+        else:
+            resolved_rf, rf_warning = resolve_response_format(request_rf, profile)
+
+        # Step 4: WARN emit (adapter-scoped dedup by code)
+        self._emit_warnings(
+            [*tc_warnings, *rewrite_warnings,
+             *([rf_warning] if rf_warning else [])]
+        )
+
+        # Step 5: wire serialization
+        openai_messages = self._to_openai_messages(rewritten_messages)
+
+        # Step 6: build_sdk_params
+        params = build_sdk_params(
+            rewritten_kwargs,
+            profile,
+            adapter_defaults={
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            },
+            base_params={"model": self.model_name, "messages": openai_messages,
+                         "stream": True},
+            resolved_response_format=resolved_rf,
+            resolved_tool_choice=resolved_tc,
+        )
+
+        # tools: merge bound + per-call — rewritten_kwargs may already carry
+        # a ``tools`` key which build_sdk_params copied onto params; merge
+        # instead of clobber so bind_tools + per-call combine correctly.
         all_tools = list(self._bound_tools or [])
-        extra_tools = kwargs.get("tools")
+        extra_tools = params.pop("tools", None)
         if extra_tools:
             all_tools.extend(extra_tools)
         if all_tools:
             params["tools"] = all_tools
+
+        if stop:
+            params["stop"] = stop
 
         # B5 C11: emit telemetry (non-blocking — any failure is swallowed)
         from app.infrastructure.external.llm._telemetry_mixin import (
@@ -647,29 +824,13 @@ class ActusChatModel(BaseChatModel):
 
         emit_invocation_telemetry(self, messages, all_tools)
 
-        # tool_choice: per-call kwarg > bound value from bind_tools
-        # LangChain uses "any" internally (e.g. with_structured_output),
-        # but OpenAI API expects "required" for the same semantics.
-        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
-        if tool_choice == "any":
-            tool_choice = "required"
-        if tool_choice is not None:
-            params["tool_choice"] = tool_choice
-
-        response_format = kwargs.get("response_format")
-        if response_format is not None and self.supports_response_format:
-            params["response_format"] = response_format
-
-        if stop:
-            params["stop"] = stop
-
         multimodal_count = sum(
             1 for m in openai_messages
             if m.get("role") == "user" and isinstance(m.get("content"), list)
         )
         logger.info(
-            "ActusChatModel._astream: model=%s, multimodal_messages=%d",
-            self.model_name, multimodal_count,
+            "ActusChatModel._astream: model=%s, multimodal_messages=%d, provider=%s",
+            self.model_name, multimodal_count, profile.provider_id,
         )
 
         # D5.1: Bound the "obtain stream object" step with a hard timeout.
@@ -746,12 +907,18 @@ class ActusChatModel(BaseChatModel):
                             "args": fn.arguments if fn and hasattr(fn, "arguments") else "",
                         })
 
-                if content or tool_call_chunks:
+                # A7 P0.1: parse reasoning_content out of the provider-specific
+                # key on the delta. For generic_openai (supports_thinking=False)
+                # this returns {} and the chunk passes through unchanged.
+                chunk_ak = parse_chat_completion_stream_chunk(delta, profile)
+
+                if content or tool_call_chunks or chunk_ak:
                     has_content = True
 
                 ai_chunk = AIMessageChunk(
                     content=content,
                     tool_call_chunks=tool_call_chunks if tool_call_chunks else [],
+                    additional_kwargs=chunk_ak,
                 )
                 gen_chunk = ChatGenerationChunk(message=ai_chunk)
 
@@ -809,6 +976,7 @@ class ActusChatModel(BaseChatModel):
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
             provider_name=self.provider_name,
+            profile=self.profile,  # A7 P0.1: propagate profile to clone
         )
         new_model._bound_tools = converted
         new_model._bound_tool_names = frozenset(

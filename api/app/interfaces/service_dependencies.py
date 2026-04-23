@@ -204,6 +204,10 @@ def _llm_fingerprint(llm_config: LLMConfig, supports_pdf_input: bool = False) ->
         # D5.2: connect_timeout_seconds likewise — configs differing only in
         # the connect budget must not share a cached adapter instance.
         str(llm_config.connect_timeout_seconds),
+        # A7 C2: 配置不同 provider 必须产生不同 adapter 实例。
+        # 归一化与 _build_llm() 保持一致 (strip whitespace) — 否则语义等价的
+        # " openai_official " / "openai_official" 会命中两个不同 cache entry。
+        (llm_config.provider or "").strip(),
     )
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
@@ -228,6 +232,51 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
 
         from app.infrastructure.external.llm.actus_fallback_chat_model import ActusFallbackChatModel
 
+        # A7 P0.1: resolve ProviderProfile from LLMConfig.provider, with
+        # heuristic base_url inference when provider is empty. _build_llm is
+        # the single production entry that injects the profile; direct-
+        # instantiation paths fall back to generic_openai via default_factory.
+        #
+        # P0.1 registry only contains generic_openai + openai_official.
+        # infer_provider_from_base_url may return ids (kimi_k2, deepseek_*,
+        # glm, gemini_compat, ...) that aren't registered yet — those land
+        # in later phases. For inferred unknown ids, fall back to
+        # generic_openai + WARN so the P0.1 "no regression" contract holds
+        # (spec §8 rollout).
+        #
+        # Explicit vs inferred distinction (Task 1.8 P2 fix):
+        # - Explicit ``llm_config.provider="<typo>"`` MUST fail-fast as
+        #   ConfigError — silently falling back would paper over a config
+        #   typo and route traffic against the wrong profile without
+        #   surfacing the bug.
+        # - Inferred ``base_url`` -> unregistered id silently falls back
+        #   because that id will land in a later phase (transitional).
+        from app.application.errors.exceptions import ConfigError
+        from app.domain.services.provider_profiles import (
+            get_profile,
+            infer_provider_from_base_url,
+        )
+
+        explicit_provider = (llm_config.provider or "").strip()
+        if explicit_provider:
+            # Fail-fast: a typo'd explicit provider id must surface, not be
+            # swallowed. Bubbles to caller as ConfigError.
+            profile = get_profile(explicit_provider)
+        else:
+            provider_id = infer_provider_from_base_url(
+                str(llm_config.base_url),
+                model_name=llm_config.model_name,
+            )
+            try:
+                profile = get_profile(provider_id)
+            except ConfigError:
+                logger.warning(
+                    "[A7] inferred provider_id=%s not registered in P0.1; "
+                    "falling back to generic_openai profile",
+                    provider_id,
+                )
+                profile = get_profile("generic_openai")
+
         timeout_seconds = llm_config.timeout_seconds
         connect_timeout_seconds = llm_config.connect_timeout_seconds
 
@@ -242,6 +291,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             supports_pdf_input=supports_pdf_input,
             timeout_seconds=timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
+            profile=profile,  # A7 P0.1: profile injection
         )
         responses = ActusResponsesModel(
             base_url=str(llm_config.base_url),
@@ -253,6 +303,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             supports_pdf_input=supports_pdf_input,
             timeout_seconds=timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
+            profile=profile,  # A7 P0.1: profile injection
         )
         if llm_config.api_type == "responses":
             llm = responses
@@ -274,7 +325,9 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
                     combined,
                     combined * 3,
                 )
-            llm = ActusFallbackChatModel(primary=chat, fallback=responses)
+            llm = ActusFallbackChatModel(
+                primary=chat, fallback=responses, profile=profile,
+            )
         else:
             llm = chat
 

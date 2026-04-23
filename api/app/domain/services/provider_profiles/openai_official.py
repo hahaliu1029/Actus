@@ -1,0 +1,13 @@
+"""OpenAI 官方 API profile。"""
+from __future__ import annotations
+
+from app.domain.services.provider_profiles._base import ProviderProfile
+
+OPENAI_OFFICIAL_PROFILE = ProviderProfile(
+    provider_id="openai_official",
+    human_name="OpenAI Official",
+    default_api_mode="chat_completions",
+    api_mode_fallback_enabled=True,
+    default_context_window=128_000,
+    default_max_output_tokens=8_192,
+)

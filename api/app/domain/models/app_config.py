@@ -14,6 +14,14 @@ class LLMConfig(BaseModel):
     model_name: str = (
         "deepseek-reasoner"  # 模型名字，默认使用deepseek-reasoner带推理的模型，传递tools会自动切换到deepseek-chat
     )
+    provider: str | None = None
+    """A7: provider_id (see provider_profiles/ constants: kimi_k2 / kimi_k2_6 /
+    deepseek_chat / deepseek_reasoner / dashscope / anthropic_compat /
+    gemini_compat / minimax / glm / openai_official / generic_openai).
+
+    Strictly separate from ActusChatModel.provider_name (B5 C0a, prompt rendering,
+    Literal['openai','anthropic']). The two fields do not infer from each other,
+    do not share a value space, and do not override each other (A7 C1)."""
     temperature: float = Field(0.7)  # 温度，默认设置为0.7
     max_tokens: int = Field(
         8192, ge=0

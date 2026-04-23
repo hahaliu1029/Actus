@@ -46,8 +46,20 @@ from langchain_core.callbacks import (
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from pydantic import Field
 
 logger = logging.getLogger(__name__)
+
+
+def _default_generic_profile() -> Any:
+    """Default ProviderProfile factory — generic_openai.
+
+    Used by Pydantic Field(default_factory=...) so existing test fixtures
+    constructing ActusFallbackChatModel(...) without profile still work.
+    _build_llm passes an explicit profile in the production path.
+    """
+    from app.domain.services.provider_profiles import get_profile
+    return get_profile("generic_openai")
 
 # Exception types that mean "primary does not accept this protocol/payload".
 # Only these trigger the cross-protocol escalation to fallback. Anything
@@ -71,6 +83,11 @@ class ActusFallbackChatModel(BaseChatModel):
     # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
     # introduce real Anthropic routing via LLMConfig.provider field.
     provider_name: Literal["openai", "anthropic"] = "openai"
+    # A7 P0.1: profile held on wrapper for symmetry with inner adapters. Inner
+    # primary/fallback each carry their own profile (propagated via their
+    # bind_tools), so this wrapper field is informational. Typed Any to
+    # override LangChain BaseChatModel.profile (ModelProfile | None).
+    profile: Any = Field(default_factory=_default_generic_profile)
 
     @property
     def _llm_type(self) -> str:
@@ -136,6 +153,26 @@ class ActusFallbackChatModel(BaseChatModel):
                 messages, stop=stop, run_manager=run_manager, **kwargs,
             )
         except _FALLBACK_TRIGGER_EXCEPTIONS as primary_exc:
+            # A7 P1: profile-driven gate. Providers without a Responses API
+            # (e.g. Kimi) declare api_mode_fallback_enabled=False; for those,
+            # a 400/422 from Chat Completions is a real payload error and
+            # must propagate — escalating to Responses will just produce a
+            # 404 and hide the original diagnostic. Re-raise the primary
+            # exception untouched so LangGraph RetryPolicy / upper layers
+            # see the real cause.
+            profile = getattr(self, "profile", None)
+            if profile is not None and not getattr(
+                profile, "api_mode_fallback_enabled", True
+            ):
+                logger.info(
+                    "Primary LLM (%s) raised %s but profile.provider_id=%s "
+                    "has api_mode_fallback_enabled=False; skipping Chat->"
+                    "Responses escalation and propagating original exception",
+                    self.primary._llm_type,
+                    type(primary_exc).__name__,
+                    getattr(profile, "provider_id", "?"),
+                )
+                raise
             logger.warning(
                 "Primary LLM (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,
@@ -157,6 +194,20 @@ class ActusFallbackChatModel(BaseChatModel):
             ):
                 yield chunk
         except _FALLBACK_TRIGGER_EXCEPTIONS as primary_exc:
+            # A7 P1: mirror _agenerate gate on streaming path.
+            profile = getattr(self, "profile", None)
+            if profile is not None and not getattr(
+                profile, "api_mode_fallback_enabled", True
+            ):
+                logger.info(
+                    "Primary LLM stream (%s) raised %s but profile.provider_id=%s "
+                    "has api_mode_fallback_enabled=False; skipping Chat->"
+                    "Responses escalation and propagating original exception",
+                    self.primary._llm_type,
+                    type(primary_exc).__name__,
+                    getattr(profile, "provider_id", "?"),
+                )
+                raise
             logger.warning(
                 "Primary LLM stream (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,
@@ -178,4 +229,5 @@ class ActusFallbackChatModel(BaseChatModel):
             primary=self.primary.bind_tools(tools, **kwargs),
             fallback=self.fallback.bind_tools(tools, **kwargs),
             provider_name=self.provider_name,
+            profile=self.profile,  # A7 P0.1: propagate profile to clone
         )

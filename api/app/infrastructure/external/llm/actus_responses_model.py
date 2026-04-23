@@ -42,10 +42,24 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 import httpx
 from openai import AsyncOpenAI
 
+from pydantic import Field
+
 from app.application.errors.exceptions import ServerRequestsError
 from app.infrastructure.external.llm._timeout_helpers import with_llm_timeout
 
 logger = logging.getLogger(__name__)
+
+
+def _default_generic_profile() -> Any:
+    """Default ProviderProfile factory — generic_openai.
+
+    Used by Pydantic Field(default_factory=...) when adapter is constructed
+    without explicit profile (e.g. existing test fixtures). _build_llm always
+    passes an explicit profile, so this default only fires in direct-
+    instantiation paths.
+    """
+    from app.domain.services.provider_profiles import get_profile
+    return get_profile("generic_openai")
 
 
 class ActusResponsesModel(BaseChatModel):
@@ -88,6 +102,12 @@ class ActusResponsesModel(BaseChatModel):
     # timeout_seconds because the SDK default 5s fires before the outer
     # asyncio.wait_for can rescue slow-handshake cases — see CHANGELOG.
     connect_timeout_seconds: float = 60.0
+    # A7 P0.1: profile injection with default_factory=generic_openai. In P0.1
+    # the Responses adapter's _agenerate / _astream bodies are unchanged
+    # (spec §8 rollout — "Responses 走 generic_openai 等价行为"); this field
+    # is set for P0.4 future use. Typed Any to override LangChain
+    # BaseChatModel.profile (ModelProfile | None).
+    profile: Any = Field(default_factory=_default_generic_profile)
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
@@ -115,6 +135,27 @@ class ActusResponsesModel(BaseChatModel):
         )
 
         attach_telemetry(self, telemetry, lang=lang)
+
+    # ---- A7 P0.1: WARN emit (adapter-scoped dedup) ---------------------- #
+
+    def _emit_warnings(self, warnings: list) -> None:
+        """A7 adapter-scoped WARN dedup.
+
+        Dedup by w.code across adapter instance lifetime.
+        level='warning' → logger.warning; 'debug' → logger.debug.
+        In P0.1 the Responses adapter does not call this; present for P0.4.
+        """
+        if not warnings:
+            return
+        seen = self.__dict__.setdefault("_emitted_warning_codes", set())
+        for w in warnings:
+            if w.code in seen:
+                continue
+            seen.add(w.code)
+            if w.level == "debug":
+                logger.debug("[A7] %s", w.message or w.code)
+            else:
+                logger.warning("[A7] %s", w.message or w.code)
 
     # ---- Client factory -------------------------------------------------- #
 
@@ -619,6 +660,7 @@ class ActusResponsesModel(BaseChatModel):
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
             provider_name=self.provider_name,
+            profile=self.profile,  # A7 P0.1: propagate profile to clone
         )
         new_model._bound_tools = responses_format
         # Preserve tool_choice from kwargs (critical for with_structured_output)

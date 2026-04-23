@@ -128,6 +128,35 @@ class ServerRequestsError(AppException):
         super().__init__(code=500, status_code=500, msg=msg)
 
 
+class InternalError(AppException):
+    """A7 / rewrite-layer invariant violation — HTTP 500.
+
+    Raised when downstream code receives data that should have been transformed
+    upstream (e.g. HTTPS image_url reaching _rewrites.py under a profile with
+    accepts_image_url=False). Represents a **developer bug** in the caller, not
+    a runtime condition to recover from. Adapter catches and logs .error, then
+    re-raises so LangGraph RetryPolicy / upper layers can surface the bug.
+
+    spec §4.3 item 6 / §4.6 "InternalError catch & log" / §9 R10.
+    """
+
+    def __init__(self, msg: str = "内部错误") -> None:
+        super().__init__(code=500, status_code=500, msg=msg)
+
+
+class ConfigError(AppException):
+    """A7 provider registry — unknown provider id or invalid profile config.
+
+    Raised by ``get_profile`` when a caller asks for a provider that is not
+    registered. Indicates either a programming error (hardcoded bad id) or
+    a misconfigured ``config.yaml``. HTTP 500 since the system cannot
+    service the request until the configuration is corrected.
+    """
+
+    def __init__(self, msg: str = "配置错误") -> None:
+        super().__init__(code=500, status_code=500, msg=msg)
+
+
 # ---- B5 prompt assembly errors (HTTP wrappers) -------------------------- #
 # The domain layer defines the canonical exceptions in
 # ``app.domain.services.prompts.errors``. These wrappers exist only so the
