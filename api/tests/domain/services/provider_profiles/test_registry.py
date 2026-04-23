@@ -41,3 +41,19 @@ def test_generic_fingerprints_auth() -> None:
     codes = [fp.error_class for fp in GENERIC_FINGERPRINTS
              if fp.status_code == 401]
     assert ErrorClass.TRANSIENT_AUTH in codes
+
+
+def test_infer_moonshot_maps_to_kimi_k2_not_k2_6() -> None:
+    """T13/T17: moonshot.ai 启发式只落 kimi_k2；K2.6 必须显式"""
+    assert infer_provider_from_base_url(
+        "https://api.moonshot.ai/v1", model_name="kimi-k2",
+    ) == "kimi_k2"
+    assert infer_provider_from_base_url(
+        "https://api.moonshot.ai/v1", model_name="kimi-k2.6",
+    ) == "kimi_k2"   # 即使 model_name 含 "k2.6" 也不自动识别；必须显式
+
+
+def test_infer_kimi_keyword() -> None:
+    assert infer_provider_from_base_url(
+        "https://kimi-api.example/v1", model_name="",
+    ) == "kimi_k2"

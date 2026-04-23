@@ -12,4 +12,9 @@ GENERIC_OPENAI_PROFILE = ProviderProfile(
     human_name="Generic OpenAI-compatible (fallback)",
     default_api_mode="chat_completions",
     api_mode_fallback_enabled=True,
+    # 3.75 MB raw ≈ 5 MB base64 — OpenAI Chat API hard limit on the encoded
+    # data URL payload. Matches the legacy ``_IMAGE_TARGET_RAW_SIZE`` guard
+    # in agent_task_runner so the base64 fallback path does not silently
+    # relax the ceiling relative to pre-A7 behavior.
+    image_max_bytes=3_932_160,
 )

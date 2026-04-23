@@ -1,0 +1,262 @@
+"""A7 P0.2 — ActusChatModel real Kimi profile integration tests (T25/T26/T27/T28b/T29).
+
+Covers:
+- T27: adapter WARN dedup by code
+- T28b: per-call + bound tool_choice rewrite to auto under Kimi
+- T29: streaming reasoning_content accumulation (K2 + K2.6)
+- T25/T26: wire serializer injects reasoning with provider-specific key
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+
+from app.domain.services.provider_profiles import get_profile
+from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
+
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def _mock_openai_response(content: str = "answer"):
+    """Build a fake OpenAI ChatCompletion response object."""
+    msg = MagicMock()
+    msg.content = content
+    msg.tool_calls = None
+    msg.model_dump = lambda exclude_none=False: {"content": content}
+    choice = MagicMock()
+    choice.message = msg
+    choice.finish_reason = "stop"
+    resp = MagicMock()
+    resp.choices = [choice]
+    return resp
+
+
+def _capture_create_params():
+    """Return (fake_create_async, captured_list)."""
+    captured: list[dict] = []
+
+    async def fake_create(**params):
+        captured.append(params)
+        return _mock_openai_response()
+
+    return fake_create, captured
+
+
+# ---------- T27 dedup ----------
+
+async def test_adapter_emit_warnings_dedup_by_code(caplog: pytest.LogCaptureFixture) -> None:
+    """T27: same warning code emits once per adapter instance lifetime."""
+    p = get_profile("kimi_k2")
+    p = replace(p, forbidden_sampling_params=frozenset({"logprobs"}))
+
+    model = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1",
+        api_key="k", model_name="kimi-k2",
+        profile=p,
+    )
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = AsyncMock(return_value=_mock_openai_response())
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        with caplog.at_level(
+            logging.WARNING,
+            logger="app.infrastructure.external.llm.actus_chat_model",
+        ):
+            await model._agenerate(
+                [HumanMessage("q")],
+                tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+                logprobs=True,
+            )
+            await model._agenerate(
+                [HumanMessage("q2")],
+                tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+                logprobs=True,
+            )
+
+    # _emit_warnings logs "[A7] <warning.message>" where warning.message is
+    # "{provider_id} forbids sampling param '{p}'; stripped". Dedup-by-code
+    # means the same code fires once per adapter lifetime — verify via the
+    # unique "'logprobs'" substring.
+    warn_records = [
+        r for r in caplog.records
+        if "'logprobs'" in r.message and r.levelno == logging.WARNING
+    ]
+    assert len(warn_records) == 1
+
+
+# ---------- T28b tool_choice rewrite ----------
+
+async def test_chat_adapter_per_call_required_rewrites_to_auto_for_kimi() -> None:
+    """T28b (a): per-call tool_choice='required' + Kimi → SDK receives 'auto'"""
+    p = get_profile("kimi_k2")
+    model = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2", profile=p,
+    )
+    fake_create, captured = _capture_create_params()
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = fake_create
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        await model._agenerate(
+            [HumanMessage("q")],
+            tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+            tool_choice="required",
+        )
+    assert captured[0]["tool_choice"] == "auto"
+
+
+async def test_chat_adapter_bound_required_also_rewrites_to_auto_for_kimi() -> None:
+    """T28b (b): bind_tools(tool_choice='required') + no per-call → SDK still 'auto'"""
+    p = get_profile("kimi_k2")
+    base = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2", profile=p,
+    )
+    bound = base.bind_tools(
+        [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        tool_choice="required",
+    )
+    fake_create, captured = _capture_create_params()
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = fake_create
+
+    with patch.object(bound, "_get_client", return_value=fake_client):
+        await bound._agenerate([HumanMessage("q")])
+    assert captured[0]["tool_choice"] == "auto"
+
+
+async def test_chat_adapter_per_call_wins_over_bound() -> None:
+    """T28b (c): per-call 'auto' + bound 'required' → SDK 'auto' no warning"""
+    p = get_profile("kimi_k2")
+    base = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2", profile=p,
+    )
+    bound = base.bind_tools(
+        [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        tool_choice="required",
+    )
+    fake_create, captured = _capture_create_params()
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = fake_create
+
+    with patch.object(bound, "_get_client", return_value=fake_client):
+        await bound._agenerate([HumanMessage("q")], tool_choice="auto")
+    assert captured[0]["tool_choice"] == "auto"
+
+
+# ---------- T29 streaming reasoning ----------
+
+async def test_chat_adapter_streaming_accumulates_reasoning_content_for_kimi() -> None:
+    """T29: Kimi streaming — reasoning_content accumulated into AIMessageChunk"""
+    p = get_profile("kimi_k2")
+    model = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2", profile=p,
+    )
+
+    deltas = [
+        SimpleNamespace(content=None, reasoning_content="think", tool_calls=None),
+        SimpleNamespace(content=None, reasoning_content="ing...", tool_calls=None),
+        SimpleNamespace(content="answer", reasoning_content=None, tool_calls=None),
+    ]
+
+    async def fake_stream(**params):
+        for d in deltas:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta = d
+            choice.finish_reason = None
+            chunk.choices = [choice]
+            yield chunk
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = fake_stream
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        chunks = []
+        async for c in model._astream([HumanMessage("q")]):
+            chunks.append(c)
+
+    accumulated = "".join(
+        c.message.additional_kwargs.get("reasoning_content", "") for c in chunks
+    )
+    assert accumulated == "thinking..."
+    final_content = "".join(c.message.content or "" for c in chunks)
+    assert "answer" in final_content
+
+
+async def test_chat_adapter_streaming_kimi_k2_6_uses_reasoning_field() -> None:
+    """T29 (d): K2.6 delta uses 'reasoning' key → normalized to internal 'reasoning_content'"""
+    p = get_profile("kimi_k2_6")
+    model = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2.6", profile=p,
+    )
+    deltas = [SimpleNamespace(content="a", reasoning="think", tool_calls=None)]
+
+    async def fake_stream(**params):
+        for d in deltas:
+            chunk = MagicMock()
+            choice = MagicMock()
+            choice.delta = d
+            choice.finish_reason = None
+            chunk.choices = [choice]
+            yield chunk
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = fake_stream
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        chunks = []
+        async for c in model._astream([HumanMessage("q")]):
+            chunks.append(c)
+
+    acc = "".join(c.message.additional_kwargs.get("reasoning_content", "") for c in chunks)
+    assert acc == "think"
+
+
+# ---------- T25/T26 wire serializer ----------
+
+def test_chat_model_serializer_injects_reasoning_for_kimi_k2() -> None:
+    """T25: Kimi K2 → entry['reasoning_content']"""
+    p = get_profile("kimi_k2")
+    model = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2", profile=p,
+    )
+    msgs = [
+        HumanMessage("q"),
+        AIMessage(content="a", additional_kwargs={"reasoning_content": "think"}),
+    ]
+    out = model._to_openai_messages(msgs)
+    assert out[-1].get("reasoning_content") == "think"
+
+
+def test_chat_model_serializer_maps_reasoning_for_kimi_k2_6() -> None:
+    """T26: K2.6 → entry['reasoning'], no 'reasoning_content'"""
+    p = get_profile("kimi_k2_6")
+    model = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2.6", profile=p,
+    )
+    msgs = [
+        HumanMessage("q"),
+        AIMessage(content="a", additional_kwargs={"reasoning_content": "think"}),
+    ]
+    out = model._to_openai_messages(msgs)
+    assert out[-1].get("reasoning") == "think"
+    assert "reasoning_content" not in out[-1]

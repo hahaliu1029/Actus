@@ -1,6 +1,7 @@
 import httpx
 import openai
 
+from app.domain.services.provider_profiles import get_profile
 from app.domain.services.provider_profiles._base import (
     ErrorClass,
     ErrorFingerprint,
@@ -71,3 +72,10 @@ def test_unknown_400_as_permanent_4xx() -> None:
 def test_completely_unknown_exception_returns_unknown() -> None:
     profile = _make_profile()
     assert classify_error(RuntimeError("weird"), profile) == ErrorClass.UNKNOWN
+
+
+def test_classify_kimi_missing_reasoning_content() -> None:
+    """T9: Kimi 400 'Missing reasoning_content' → COMPAT_QUIRK"""
+    profile = get_profile("kimi_k2")
+    exc = _make_bad_request("Missing reasoning_content in assistant message at index 2")
+    assert classify_error(exc, profile) == ErrorClass.COMPAT_QUIRK

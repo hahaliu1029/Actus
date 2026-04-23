@@ -1,3 +1,4 @@
+from app.domain.services.provider_profiles import get_profile
 from app.domain.services.provider_profiles._base import ProviderProfile
 from app.domain.services.provider_profiles._rewrites import resolve_tool_choice
 
@@ -82,3 +83,21 @@ def test_multiple_calls_same_warning_code_nondedup() -> None:
         _, w = resolve_tool_choice("required", None, _kimi(), thinking_enabled=True)
         assert len(w) == 1
         assert w[0].code == "tool_choice_forbidden/required"
+
+
+def test_resolve_tool_choice_with_real_kimi_profile_required() -> None:
+    """T1b (c): bound 'required' + 真实 Kimi profile → 触发 forbidden-when-thinking"""
+    profile = get_profile("kimi_k2")
+    v, w = resolve_tool_choice(None, "required", profile, thinking_enabled=True)
+    assert v == "auto"
+    assert len(w) == 1
+    assert w[0].code == "tool_choice_forbidden/required"
+    assert w[0].context == {"original": "required", "rewritten_to": "auto"}
+
+
+def test_resolve_tool_choice_with_real_k2_6_profile() -> None:
+    """K2.6 同规则"""
+    profile = get_profile("kimi_k2_6")
+    v, w = resolve_tool_choice(None, "required", profile, thinking_enabled=True)
+    assert v == "auto"
+    assert len(w) == 1

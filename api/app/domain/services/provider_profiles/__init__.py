@@ -9,3 +9,7 @@ __all__ = [
     "ProviderProfile", "ErrorClass", "ErrorFingerprint", "RewriteWarning",
     "get_profile", "infer_provider_from_base_url", "register_profile",
 ]
+
+# Side-effect: register Kimi profiles (P0.2)
+from app.domain.services.provider_profiles import kimi_k2 as _kimi_k2  # noqa: F401
+from app.domain.services.provider_profiles import kimi_k2_6 as _kimi_k2_6  # noqa: F401

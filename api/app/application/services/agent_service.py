@@ -390,6 +390,11 @@ class AgentService:
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
             on_session_complete=self._on_task_runner_complete,
+            # A7 Task 2.7: forward the LLM's ProviderProfile so
+            # ``_build_image_blocks`` can honor ``accepts_image_url``.
+            # ActusChatModel / ActusResponsesModel / ActusFallbackChatModel all
+            # expose ``.profile`` (see _build_llm in service_dependencies.py).
+            profile=getattr(snap.llm, "profile", None),
         )
 
         # 6.创建任务Task并更新会话中的信息

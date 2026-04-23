@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict,
 
 if TYPE_CHECKING:
     from app.domain.services.prompts.assembler import PromptAssembler
+    from app.domain.services.provider_profiles import ProviderProfile  # A7 Task 2.7
 
 from langchain_core.language_models import BaseChatModel
 
@@ -216,8 +217,12 @@ class AgentTaskRunner(TaskRunner):
         initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
         tool_runtime: ToolRuntimeConfig | None = None,  # R2 CS2: wrapper cap + smart-approve timeout
         on_session_complete=None,  # Callback: async (session_id) -> None, called after COMPLETED/TIMED_OUT
+        profile: "ProviderProfile | None" = None,  # A7 Task 2.7: provider capability profile (accepts_image_url, image_max_bytes, ...)
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        # A7 Task 2.7: provider capability profile. None = legacy behavior
+        # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
+        self.profile = profile
         self._on_session_complete = on_session_complete
         self._approval_state_reader = approval_state_reader
         self._approval_state_writer = approval_state_writer
@@ -704,8 +709,14 @@ class AgentTaskRunner(TaskRunner):
             logger.warning("Failed to upload sandbox file %s for MCP: %s", sandbox_path, e)
             return None
 
-    async def _build_image_content_blocks(self, attachments: list) -> list[dict]:
+    async def _build_image_blocks(self, attachments: list) -> list[dict]:
         """为图片附件构建 OpenAI multimodal content blocks + 元数据注入。
+
+        A7 profile-aware: honors ``profile.accepts_image_url``.
+        - accepts_image_url=True (OpenAI / generic) → use presigned URL when available
+        - accepts_image_url=False (Kimi) → force base64 data: URL
+        - On base64 I/O failure: degrade to ``text`` placeholder (§4.3b contract);
+          NEVER fall back to an unsupported URL.
 
         Vision mode (supports_vision=True): 嵌入图片 blocks + 元数据
         Tool mode (supports_vision=False): 不嵌入图片 blocks，只记录 URL 映射供 MCP 工具使用
@@ -714,23 +725,30 @@ class AgentTaskRunner(TaskRunner):
         self._image_url_map.clear()
 
         for attachment in attachments:
-            if not isinstance(attachment, File):
-                continue
-
             # Three-state multimodal eligibility check
             if attachment.multimodal_eligible is False:
                 continue
-            elif attachment.multimodal_eligible is True:
-                pass
-            else:
+            elif attachment.multimodal_eligible is None:
                 # None: non-image OR pre-migration image → fallback to mime_type
                 mime = attachment.mime_type or ""
                 if not any(mime.startswith(p) for p in self._IMAGE_MIME_PREFIXES):
                     continue
 
             try:
-                # Always capture URL mapping (needed for MCP path resolution in both modes)
-                presigned_url = await self._get_image_presigned_url(attachment)
+                # Always capture URL mapping (needed for MCP path resolution in both modes).
+                # Wrap in its own try so a storage misconfig doesn't blow up the
+                # entire image-block build (esp. on Kimi, where the URL is not
+                # used for the LLM payload anyway).
+                presigned_url = None
+                if hasattr(self, "_get_image_presigned_url"):
+                    try:
+                        presigned_url = await self._get_image_presigned_url(attachment)
+                    except Exception as _url_exc:
+                        logger.debug(
+                            "[A7] presigned URL fetch failed for attachment_id=%s: %s",
+                            getattr(attachment, "id", "?"), _url_exc,
+                        )
+                        presigned_url = None
                 if presigned_url and attachment.filepath:
                     self._image_url_map[attachment.filepath] = presigned_url
 
@@ -739,47 +757,69 @@ class AgentTaskRunner(TaskRunner):
                     continue
 
                 # Vision mode: embed image blocks
-                w = attachment.width
-                h = attachment.height
-                if w and h and w <= 512 and h <= 512:
-                    detail = "low"
-                else:
-                    detail = "high"
+                w, h = attachment.width, attachment.height
+                detail = "low" if (w and h and w <= 512 and h <= 512) else "high"
 
-                if presigned_url:
+                profile = getattr(self, "profile", None)
+                use_url = presigned_url and (profile is None or profile.accepts_image_url)
+
+                if use_url:
                     blocks.append({
                         "type": "image_url",
                         "image_url": {"url": presigned_url, "detail": detail},
                     })
                 else:
-                    # Base64 fallback with tightened guard
-                    file_data, _ = await self._file_storage.download_file(
-                        attachment.id
-                    )
-                    with file_data:
-                        raw_bytes = file_data.read()
-                    if len(raw_bytes) > self._IMAGE_TARGET_RAW_SIZE:
-                        logger.warning(
-                            "图片 %s 过大 (%d bytes)，base64 路径跳过多模态编码",
-                            attachment.id,
-                            len(raw_bytes),
+                    # profile forbids URL (or no presigned URL) → base64 or degrade to text
+                    try:
+                        file_data, _ = await self._file_storage.download_file(
+                            attachment.id
                         )
+                        with file_data:
+                            raw_bytes = file_data.read()
+                        # Profile-level size guard (A7) supersedes the hard-coded
+                        # _IMAGE_TARGET_RAW_SIZE when a profile is present.
+                        max_bytes = (
+                            profile.image_max_bytes
+                            if profile is not None
+                            else self._IMAGE_TARGET_RAW_SIZE
+                        )
+                        if len(raw_bytes) > max_bytes:
+                            raise ValueError(
+                                f"image {len(raw_bytes)}B exceeds "
+                                f"image_max_bytes={max_bytes}"
+                            )
+                        b64_data = base64.b64encode(raw_bytes).decode("ascii")
+                        mime = attachment.mime_type or "image/png"
+                        data_url = f"data:{mime};base64,{b64_data}"
+                        blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": detail},
+                        })
+                    except Exception as e:
+                        # A7 §4.3b degrade contract: do NOT fall back to URL;
+                        # emit text placeholder instead.
+                        filename = (
+                            getattr(attachment, "filename", None)
+                            or attachment.id
+                            or "unknown"
+                        )
+                        blocks.append({
+                            "type": "text",
+                            "text": f"[image unavailable: {filename}]",
+                        })
+                        logger.warning(
+                            "[A7] image base64 encode failed for attachment_id=%s "
+                            "filename=%s reason=%s; emitted text placeholder instead",
+                            attachment.id, filename, repr(e),
+                        )
+                        # Skip metadata injection for degraded path.
                         continue
-                    mime = attachment.mime_type or "image/png"
-                    b64_data = base64.b64encode(raw_bytes).decode("utf-8")
-                    blocks.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{b64_data}",
-                            "detail": detail,
-                        },
-                    })
 
                 # Metadata injection (skip for pre-migration images without dimensions)
                 if w and h:
-                    ow = attachment.original_width or w
-                    oh = attachment.original_height or h
-                    source = attachment.filepath or attachment.filename
+                    ow = getattr(attachment, "original_width", None) or w
+                    oh = getattr(attachment, "original_height", None) or h
+                    source = attachment.filepath or getattr(attachment, "filename", None)
                     if ow != w or oh != h:
                         scale = round(ow / w, 2)
                         meta_text = (
@@ -791,8 +831,12 @@ class AgentTaskRunner(TaskRunner):
                         meta_text = f"[Image: source: {source}, {w}x{h}]"
                     blocks.append({"type": "text", "text": meta_text})
 
-            except Exception as e:
-                logger.warning("构建图片内容块失败 (file_id=%s): %s", attachment.id, e)
+            except Exception as outer:
+                logger.error(
+                    "[A7] _build_image_blocks unexpected error for attachment_id=%s: %s",
+                    getattr(attachment, "id", "?"), outer,
+                )
+                continue
 
         return blocks
 
@@ -2769,15 +2813,21 @@ class AgentTaskRunner(TaskRunner):
                             await self._sync_message_attachments_to_sandbox(event)
                             # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
                             logger.debug(
-                                "before _build_image_content_blocks: attachments count=%d, types=%s, mimes=%s",
+                                "before _build_image_blocks: attachments count=%d, types=%s, mimes=%s",
                                 len(event.attachments),
                                 [type(a).__name__ for a in event.attachments],
                                 [getattr(a, "mime_type", "N/A") for a in event.attachments],
                             )
-                            image_content_blocks = await self._build_image_content_blocks(
-                                event.attachments
+                            # A7 Task 2.7: honor profile.accepts_image_url. Filter
+                            # non-File attachments upstream (legacy behavior that
+                            # lived inside the old method body).
+                            _image_attachments = [
+                                a for a in event.attachments if isinstance(a, File)
+                            ]
+                            image_content_blocks = await self._build_image_blocks(
+                                _image_attachments
                             )
-                            logger.debug("after _build_image_content_blocks: blocks=%d", len(image_content_blocks))
+                            logger.debug("after _build_image_blocks: blocks=%d", len(image_content_blocks))
                             logger.info(
                                 "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
                                 len(message),

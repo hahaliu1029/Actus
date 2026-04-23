@@ -77,13 +77,18 @@ class TestInferredProviderSilentFallback:
     def test_inferred_unknown_provider_falls_back_with_warn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """moonshot base_url -> heuristic returns 'kimi_k2' (not registered in P0.1)
+        """bigmodel.cn base_url -> heuristic returns 'glm' (not yet registered)
         -> silent fallback to generic_openai + WARN.
+
+        Originally used moonshot.ai -> kimi_k2 when kimi_k2 was still un-registered
+        in P0.1. Task 2.1 registered kimi_k2, so this test now exercises a still-
+        unregistered inferred id (glm, scheduled for a later PR) to keep the
+        inferred-silent-fallback contract covered.
         """
         cfg = LLMConfig(
-            base_url="https://moonshot.ai/v1",
+            base_url="https://open.bigmodel.cn/api/paas/v4",
             api_key="k",
-            model_name="m",
+            model_name="glm-4",
             # provider omitted -> inferred path
         )
         with caplog.at_level(

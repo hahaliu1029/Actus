@@ -132,3 +132,15 @@ def test_data_url_passes_assertion() -> None:
     ])
     messages, _, _ = apply_outbound_rewrites([msg], {}, p, is_chat_completions_api=True)
     assert messages is not None
+
+
+def test_kimi_profile_rejects_https_image_url() -> None:
+    """T3b with real profile"""
+    from app.domain.services.provider_profiles import get_profile
+
+    p = get_profile("kimi_k2")
+    msg = HumanMessage(content=[
+        {"type": "image_url", "image_url": {"url": "https://s3.example/pic.png"}},
+    ])
+    with pytest.raises(InternalError):
+        apply_outbound_rewrites([msg], {}, p, is_chat_completions_api=True)
