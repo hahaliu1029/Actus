@@ -60,3 +60,25 @@ def test_unknown_type_stripped() -> None:
     assert v is None
     assert w is not None
     assert "unknown" in w.code
+
+
+# ---------- Task 3.6 real DeepSeek profile ----------
+
+from app.domain.services.provider_profiles import get_profile  # noqa: E402
+
+
+def test_deepseek_reasoner_json_schema_stripped_real_profile() -> None:
+    p = get_profile("deepseek_reasoner")
+    rf = {"type": "json_schema", "json_schema": {"schema": {"a": 1}}}
+    v, w = resolve_response_format(rf, p)
+    assert v is None
+    assert "json_schema" in w.code
+    assert "deepseek_reasoner" in w.code
+
+
+def test_deepseek_reasoner_json_object_passthrough_real_profile() -> None:
+    p = get_profile("deepseek_reasoner")
+    rf = {"type": "json_object"}
+    v, w = resolve_response_format(rf, p)
+    assert v == rf
+    assert w is None

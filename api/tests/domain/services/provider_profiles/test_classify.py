@@ -79,3 +79,19 @@ def test_classify_kimi_missing_reasoning_content() -> None:
     profile = get_profile("kimi_k2")
     exc = _make_bad_request("Missing reasoning_content in assistant message at index 2")
     assert classify_error(exc, profile) == ErrorClass.COMPAT_QUIRK
+
+
+def test_classify_deepseek_reasoning_across_turns_compat_quirk() -> None:
+    """T10: DeepSeek 'Missing reasoning_content' OR 'reasoning_content' → COMPAT_QUIRK"""
+    profile = get_profile("deepseek_reasoner")
+    exc1 = _make_bad_request("Missing reasoning_content field at index 2")
+    assert classify_error(exc1, profile) == ErrorClass.COMPAT_QUIRK
+    exc2 = _make_bad_request("reasoning_content included in input messages is not allowed")
+    assert classify_error(exc2, profile) == ErrorClass.COMPAT_QUIRK
+
+
+def test_classify_unknown_400_as_permanent_4xx_deepseek() -> None:
+    """T11: DeepSeek profile — 未匹配任何指纹 → PERMANENT_4XX"""
+    profile = get_profile("deepseek_reasoner")
+    exc = _make_bad_request("unknown error cause xyz")
+    assert classify_error(exc, profile) == ErrorClass.PERMANENT_4XX

@@ -175,3 +175,78 @@ async def test_openai_profile_base64_caps_at_legacy_5mb_base64_ceiling(
         for r in caplog.records
         if r.levelno >= logging.WARNING
     )
+
+
+async def test_deepseek_profile_skips_image_blocks_when_supports_vision_false() -> None:
+    """P1: profile.supports_vision=False must skip image embedding entirely.
+
+    Even if the runner was constructed with supports_vision=True, the profile
+    ceiling must kick in: no image_url block produced, no base64 attempt.
+    """
+    deepseek = get_profile("deepseek_reasoner")
+    storage = MagicMock()
+    storage.download_file = AsyncMock(
+        side_effect=AssertionError("storage must not be touched when profile disables vision"),
+    )
+    runner = _make_runner_with_profile(deepseek, storage)
+    # Even if _supports_vision is True, the profile ceiling must override.
+    runner._supports_vision = True
+    runner._get_image_presigned_url = AsyncMock(return_value="https://s3.example/x")
+
+    attachment = MagicMock()
+    attachment.id = "att1"
+    attachment.mime_type = "image/png"
+    attachment.filepath = "f"
+    attachment.filename = "pic.png"
+    attachment.multimodal_eligible = True
+    attachment.width = attachment.height = None
+    attachment.original_width = attachment.original_height = None
+
+    blocks = await runner._build_image_blocks([attachment])
+    assert blocks == [] or all(b.get("type") != "image_url" for b in blocks)
+    storage.download_file.assert_not_called()
+
+
+async def test_profile_forbids_both_url_and_base64_emits_text_placeholder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P1: accepts_image_url=False AND accepts_image_base64=False -> text placeholder,
+    no download attempt.
+
+    DeepSeek Reasoner has this combination. Runner should NOT call storage.download_file.
+    """
+    import logging
+    deepseek = get_profile("deepseek_reasoner")
+    storage = MagicMock()
+    storage.download_file = AsyncMock(
+        side_effect=AssertionError("must not attempt download when base64 forbidden"),
+    )
+    runner = _make_runner_with_profile(deepseek, storage)
+    # Force vision on (bypass the separate supports_vision short-circuit),
+    # we want to test the accepts_image_base64=False specific path.
+    # The supports_vision profile ceiling check fires first, so temporarily
+    # patch profile.supports_vision to True via replace() to isolate this path.
+    from dataclasses import replace
+    runner.profile = replace(deepseek, supports_vision=True)
+    runner._supports_vision = True
+    runner._get_image_presigned_url = AsyncMock(return_value=None)  # no URL path
+
+    attachment = MagicMock()
+    attachment.id = "att1"
+    attachment.mime_type = "image/png"
+    attachment.filename = "pic.png"
+    attachment.filepath = None
+    attachment.multimodal_eligible = True
+    attachment.width = attachment.height = None
+    attachment.original_width = attachment.original_height = None
+
+    with caplog.at_level(logging.WARNING):
+        blocks = await runner._build_image_blocks([attachment])
+
+    text_blocks = [b for b in blocks if b.get("type") == "text"]
+    assert any("[image unavailable:" in b.get("text", "") for b in text_blocks)
+    storage.download_file.assert_not_called()
+    assert any(
+        "forbids both image URL and base64" in r.getMessage()
+        for r in caplog.records if r.levelno >= logging.WARNING
+    )

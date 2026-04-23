@@ -13,3 +13,7 @@ __all__ = [
 # Side-effect: register Kimi profiles (P0.2)
 from app.domain.services.provider_profiles import kimi_k2 as _kimi_k2  # noqa: F401
 from app.domain.services.provider_profiles import kimi_k2_6 as _kimi_k2_6  # noqa: F401
+
+# Side-effect: register DeepSeek profiles (P0.3)
+from app.domain.services.provider_profiles import deepseek_reasoner as _deepseek_reasoner  # noqa: F401
+from app.domain.services.provider_profiles import deepseek_chat as _deepseek_chat  # noqa: F401

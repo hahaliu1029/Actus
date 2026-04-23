@@ -756,12 +756,43 @@ class AgentTaskRunner(TaskRunner):
                 if not self._supports_vision:
                     continue
 
+                # A7 P1: profile.supports_vision acts as a hard ceiling. Even if
+                # the user's LLMConfig says supports_vision=True, a profile that
+                # declares no vision (e.g. DeepSeek Reasoner) must NOT embed
+                # image blocks end-to-end.
+                profile = getattr(self, "profile", None)
+                if profile is not None and not profile.supports_vision:
+                    continue
+
                 # Vision mode: embed image blocks
                 w, h = attachment.width, attachment.height
                 detail = "low" if (w and h and w <= 512 and h <= 512) else "high"
 
-                profile = getattr(self, "profile", None)
-                use_url = presigned_url and (profile is None or profile.accepts_image_url)
+                use_url = (
+                    presigned_url and profile.accepts_image_url
+                    if profile is not None
+                    else bool(presigned_url)
+                )
+
+                if not use_url and profile is not None and not profile.accepts_image_base64:
+                    # A7 P1: profile forbids both URL and base64 → no viable
+                    # embedding path. Emit text placeholder directly without
+                    # attempting download+encode.
+                    filename = (
+                        getattr(attachment, "filename", None)
+                        or attachment.id
+                        or "unknown"
+                    )
+                    blocks.append({
+                        "type": "text",
+                        "text": f"[image unavailable: {filename}]",
+                    })
+                    logger.warning(
+                        "[A7] profile %s forbids both image URL and base64; "
+                        "emitted text placeholder for attachment_id=%s",
+                        profile.provider_id, attachment.id,
+                    )
+                    continue
 
                 if use_url:
                     blocks.append({

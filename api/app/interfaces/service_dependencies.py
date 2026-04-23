@@ -280,6 +280,16 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
         timeout_seconds = llm_config.timeout_seconds
         connect_timeout_seconds = llm_config.connect_timeout_seconds
 
+        # A7 P1: profile.supports_vision acts as a hard ceiling. Even if the
+        # user's LLMConfig.supports_vision=True, a profile that declares no
+        # vision (e.g. DeepSeek Reasoner) must force the wrapped adapter's
+        # supports_vision=False so downstream image-block embedding is
+        # disabled end-to-end.
+        effective_supports_vision = bool(
+            getattr(llm_config, "supports_vision", True)
+            and profile.supports_vision
+        )
+
         chat = ActusChatModel(
             base_url=str(llm_config.base_url),
             api_key=llm_config.api_key,
@@ -287,7 +297,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
             supports_response_format=getattr(llm_config, 'supports_response_format', True),
-            supports_vision=getattr(llm_config, 'supports_vision', True),
+            supports_vision=effective_supports_vision,
             supports_pdf_input=supports_pdf_input,
             timeout_seconds=timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
@@ -299,7 +309,7 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             model_name=llm_config.model_name,
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
-            supports_vision=getattr(llm_config, 'supports_vision', True),
+            supports_vision=effective_supports_vision,
             supports_pdf_input=supports_pdf_input,
             timeout_seconds=timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
@@ -344,11 +354,22 @@ def _build_skill_service() -> SkillService:
 
 def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
     """Build an immutable config snapshot from app_config. Sub-deps use caches."""
-    effective_pdf_input = (
+    # Initial (user-config only) pdf_input for _build_llm; adapter-internal use.
+    naive_pdf_input = bool(
         getattr(app_config.llm_config, 'supports_pdf_input', False)
         and app_config.llm_config.supports_vision
     )
-    llm = _build_llm(app_config.llm_config, supports_pdf_input=effective_pdf_input)
+    llm = _build_llm(app_config.llm_config, supports_pdf_input=naive_pdf_input)
+
+    # A7 P1: profile.supports_vision is a hard ceiling for end-to-end vision.
+    # Apply the same AND to the AgentTaskRunner / AgentService supports_vision
+    # flag so image embedding is disabled when the profile declares no vision.
+    _profile = getattr(llm, "profile", None)
+    effective_supports_vision = bool(
+        app_config.llm_config.supports_vision
+        and getattr(_profile, "supports_vision", True)
+    )
+    effective_pdf_input = bool(naive_pdf_input and effective_supports_vision)
 
     summary_llm = None
     if app_config.agent_config.memory.summary_model:
@@ -421,7 +442,7 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
         summary_llm=summary_llm,
         vision_fallback_model=vision_fallback_model,
         skill_creator_service=skill_creator_service,
-        supports_vision=app_config.llm_config.supports_vision,
+        supports_vision=effective_supports_vision,
         supports_pdf_input=effective_pdf_input,
         file_understanding_config=app_config.file_understanding,
         tool_runtime=app_config.tool_runtime,

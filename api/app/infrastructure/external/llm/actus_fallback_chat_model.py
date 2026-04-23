@@ -173,6 +173,28 @@ class ActusFallbackChatModel(BaseChatModel):
                     getattr(profile, "provider_id", "?"),
                 )
                 raise
+            # A7 Task 3.8 (T12): even when api_mode_fallback_enabled=True, if
+            # the primary error classifies as COMPAT_QUIRK (provider-specific
+            # known quirk like DeepSeek 'Missing reasoning_content'), a Chat
+            # → Responses escalation will not help — the same payload shape
+            # would surface the same quirk on Responses. Re-raise so B2 /
+            # upper recovery can act on the typed signal.
+            if profile is not None:
+                from app.domain.services.provider_profiles._classify import (
+                    classify_error,
+                )
+                from app.domain.services.provider_profiles._base import ErrorClass
+                err_class = classify_error(primary_exc, profile)
+                if err_class == ErrorClass.COMPAT_QUIRK:
+                    logger.info(
+                        "Primary LLM (%s) raised %s classified as COMPAT_QUIRK "
+                        "for profile.provider_id=%s; skipping Chat->Responses "
+                        "escalation (B2/upper layer should consume)",
+                        self.primary._llm_type,
+                        type(primary_exc).__name__,
+                        getattr(profile, "provider_id", "?"),
+                    )
+                    raise
             logger.warning(
                 "Primary LLM (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,
@@ -208,6 +230,24 @@ class ActusFallbackChatModel(BaseChatModel):
                     getattr(profile, "provider_id", "?"),
                 )
                 raise
+            # A7 Task 3.8 (T12): mirror _agenerate COMPAT_QUIRK guard.
+            if profile is not None:
+                from app.domain.services.provider_profiles._classify import (
+                    classify_error,
+                )
+                from app.domain.services.provider_profiles._base import ErrorClass
+                err_class = classify_error(primary_exc, profile)
+                if err_class == ErrorClass.COMPAT_QUIRK:
+                    logger.info(
+                        "Primary LLM stream (%s) raised %s classified as "
+                        "COMPAT_QUIRK for profile.provider_id=%s; skipping "
+                        "Chat->Responses escalation (B2/upper layer should "
+                        "consume)",
+                        self.primary._llm_type,
+                        type(primary_exc).__name__,
+                        getattr(profile, "provider_id", "?"),
+                    )
+                    raise
             logger.warning(
                 "Primary LLM stream (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,

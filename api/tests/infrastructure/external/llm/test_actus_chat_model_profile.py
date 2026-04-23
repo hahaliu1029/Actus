@@ -260,3 +260,72 @@ def test_chat_model_serializer_maps_reasoning_for_kimi_k2_6() -> None:
     out = model._to_openai_messages(msgs)
     assert out[-1].get("reasoning") == "think"
     assert "reasoning_content" not in out[-1]
+
+
+# ---------- Task 3.7 DeepSeek SDK rewrites + cross-turn strip ----------
+
+
+async def test_chat_adapter_outbound_params_reflect_rewrites_for_deepseek() -> None:
+    """T28: DeepSeek → SDK params 全维度 strip + 字段规则抵达"""
+    p = get_profile("deepseek_reasoner")
+    model = ActusChatModel(
+        base_url="https://api.deepseek.com/", api_key="k",
+        model_name="deepseek-reasoner", profile=p,
+    )
+    fake_create, captured = _capture_create_params()
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = fake_create
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        await model._agenerate(
+            [HumanMessage("q")],
+            tool_choice="any",
+            logprobs=True,
+            top_logprobs=5,
+            temperature=0.7,
+            response_format={"type": "json_schema", "json_schema": {}},
+            tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        )
+    params = captured[0]
+    assert params["tool_choice"] == "required"
+    assert "logprobs" not in params
+    assert "top_logprobs" not in params
+    assert "temperature" not in params
+    assert "response_format" not in params
+
+
+async def test_chat_adapter_serializes_rewritten_messages_stripping_deepseek_cross_turn_reasoning() -> None:
+    """T30: DeepSeek 跨轮剥离真的抵达 SDK；对比 Kimi 保留。"""
+    history = [
+        HumanMessage("q1"),
+        AIMessage(content="a1", additional_kwargs={"reasoning_content": "think1"}),
+        HumanMessage("q2"),
+    ]
+
+    p_ds = get_profile("deepseek_reasoner")
+    model_ds = ActusChatModel(
+        base_url="https://api.deepseek.com/", api_key="k",
+        model_name="deepseek-reasoner", profile=p_ds,
+    )
+    fake_create_ds, captured_ds = _capture_create_params()
+    fake_client_ds = MagicMock()
+    fake_client_ds.chat.completions.create = fake_create_ds
+    with patch.object(model_ds, "_get_client", return_value=fake_client_ds):
+        await model_ds._agenerate(history)
+    ai_entry_ds = next(m for m in captured_ds[0]["messages"]
+                       if m["role"] == "assistant")
+    assert "reasoning_content" not in ai_entry_ds
+
+    p_kimi = get_profile("kimi_k2")
+    model_kimi = ActusChatModel(
+        base_url="https://api.moonshot.ai/v1", api_key="k",
+        model_name="kimi-k2", profile=p_kimi,
+    )
+    fake_create_k, captured_k = _capture_create_params()
+    fake_client_k = MagicMock()
+    fake_client_k.chat.completions.create = fake_create_k
+    with patch.object(model_kimi, "_get_client", return_value=fake_client_k):
+        await model_kimi._agenerate(history)
+    ai_entry_k = next(m for m in captured_k[0]["messages"]
+                      if m["role"] == "assistant")
+    assert ai_entry_k.get("reasoning_content") == "think1"
