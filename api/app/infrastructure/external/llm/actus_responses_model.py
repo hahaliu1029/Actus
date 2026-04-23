@@ -91,6 +91,11 @@ class ActusResponsesModel(BaseChatModel):
     max_tokens: int = 8192
     supports_vision: bool = True
     supports_pdf_input: bool = False
+    # Parity with ActusChatModel: a user-level gate that forces ``response_format``
+    # (and its Responses-API rename ``text.format``) to be stripped even if the
+    # profile would otherwise support it. Used when the caller knows the
+    # concrete deployment does not honor ``response_format`` / ``text.format``.
+    supports_response_format: bool = True
     # B5 C0a: provider identification for prompt rendering (system-reminder format etc.)
     # Currently all Actus LLM adapters target OpenAI-compatible endpoints; B5.1 may
     # introduce real Anthropic routing via LLMConfig.provider field.
@@ -522,6 +527,7 @@ class ActusResponsesModel(BaseChatModel):
         own reasoning shape (output items) handled by the SDK.
         """
         from app.application.errors.exceptions import InternalError
+        from app.domain.services.provider_profiles._base import RewriteWarning
         from app.domain.services.provider_profiles._classify import classify_error
         from app.domain.services.provider_profiles._rewrites import (
             apply_outbound_rewrites,
@@ -560,6 +566,25 @@ class ActusResponsesModel(BaseChatModel):
         # text.format below, after build_sdk_params).
         request_rf = rewritten_kwargs.pop("response_format", None)
         resolved_rf, rf_warning = resolve_response_format(request_rf, profile)
+        # User-level ``supports_response_format=False`` gate: even if the
+        # profile would accept the shape, the caller has opted out (e.g. the
+        # concrete deployment does not honor text.format). Strip after
+        # resolve_response_format so any profile-level warning is still
+        # surfaced for diagnostic parity with ActusChatModel.
+        if not self.supports_response_format and (
+            resolved_rf is not None or request_rf is not None
+        ):
+            resolved_rf = None
+            if rf_warning is None:
+                rf_warning = RewriteWarning(
+                    code="response_format_disabled_by_config",
+                    level="warning",
+                    message=(
+                        "response_format stripped because "
+                        "LLMConfig.supports_response_format=False "
+                        "(user-level gate, not profile-level)"
+                    ),
+                )
 
         # Step 4: WARN emit 唯一出口 (adapter-scoped dedup by code)
         self._emit_warnings(
@@ -742,6 +767,10 @@ class ActusResponsesModel(BaseChatModel):
             connect_timeout_seconds=self.connect_timeout_seconds,  # D5.2: must propagate
             supports_vision=self.supports_vision,
             supports_pdf_input=self.supports_pdf_input,
+            # User-level response_format gate: must propagate or a bound clone
+            # silently re-enables ``text.format`` even though the caller
+            # explicitly opted out on the base instance.
+            supports_response_format=self.supports_response_format,
             provider_name=self.provider_name,
             profile=self.profile,  # A7 P0.1: propagate profile to clone
         )

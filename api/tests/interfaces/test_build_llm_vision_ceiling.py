@@ -65,3 +65,63 @@ class TestProfileVisionCeiling:
         llm = _build_llm(cfg)
         primary = getattr(llm, "primary", llm)
         assert primary.supports_vision is False
+
+
+class TestProfilePdfCeiling:
+    """P2 — ProviderProfile.supports_pdf_input acts as a hard ceiling.
+
+    A profile that declares no native-PDF support (e.g. ``openai_official``
+    keeps the base default ``supports_pdf_input=False``) must force the
+    adapter's ``supports_pdf_input=False`` even when the user's LLMConfig
+    turns it on. Otherwise the message sanitizer and wire serialization
+    still admit native PDF payloads into requests the provider cannot accept.
+    """
+
+    def test_profile_pdf_false_forces_adapter_pdf_false(self) -> None:
+        cfg = LLMConfig(
+            base_url="https://api.openai.com/v1",
+            api_key="k",
+            model_name="gpt-4o",
+            provider="openai_official",  # profile.supports_pdf_input=False
+            supports_vision=True,
+            supports_pdf_input=True,  # user turns ON, profile says OFF
+        )
+        llm = _build_llm(cfg, supports_pdf_input=True)
+        primary = getattr(llm, "primary", llm)
+        assert primary.supports_pdf_input is False, (
+            "profile ceiling should force supports_pdf_input=False on the "
+            "adapter regardless of user config"
+        )
+
+    def test_profile_pdf_true_preserves_user_pdf_setting(self) -> None:
+        """Regression sibling: a profile that permits PDF does NOT strip
+        the user setting — the ceiling doesn't over-fire."""
+        from dataclasses import replace
+        from app.domain.services.provider_profiles import get_profile
+        from app.domain.services.provider_profiles._registry import (
+            _REGISTRY,
+            register_profile,
+        )
+
+        base = get_profile("openai_official")
+        synthetic_id = "openai_official_pdf_test_synthetic"
+        synthetic = replace(
+            base,
+            provider_id=synthetic_id,
+            supports_pdf_input=True,
+        )
+        register_profile(synthetic)
+        try:
+            cfg = LLMConfig(
+                base_url="https://api.openai.com/v1",
+                api_key="k",
+                model_name="gpt-4o",
+                provider=synthetic_id,
+                supports_vision=True,
+                supports_pdf_input=True,
+            )
+            llm = _build_llm(cfg, supports_pdf_input=True)
+            primary = getattr(llm, "primary", llm)
+            assert primary.supports_pdf_input is True
+        finally:
+            _REGISTRY.pop(synthetic_id, None)

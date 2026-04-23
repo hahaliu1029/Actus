@@ -298,19 +298,41 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
             max_tokens=llm_config.max_tokens,
             supports_response_format=getattr(llm_config, 'supports_response_format', True),
             supports_vision=effective_supports_vision,
-            supports_pdf_input=supports_pdf_input,
+            # Profile ceiling also applies to Chat adapter: profile that
+            # declares no native-PDF support forces supports_pdf_input=False.
+            # Computed once below the Chat adapter but reachable here via the
+            # later Responses block's ``effective_supports_pdf_input``; we
+            # recompute inline for locality.
+            supports_pdf_input=bool(
+                supports_pdf_input
+                and getattr(profile, "supports_pdf_input", True)
+            ),
             timeout_seconds=timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
             profile=profile,  # A7 P0.1: profile injection
         )
+        # A7 profile ceiling on supports_pdf_input: a profile that declares no
+        # native-PDF support (e.g. openai_official) must force
+        # supports_pdf_input=False on the adapter regardless of user config.
+        # Message sanitizer + adapter wire both read this field so the ceiling
+        # flows end-to-end — otherwise PDF blocks enter the wire payload even
+        # when the profile says the provider does not accept native PDFs.
+        effective_supports_pdf_input = bool(
+            supports_pdf_input
+            and getattr(profile, "supports_pdf_input", True)
+        )
+
         responses = ActusResponsesModel(
             base_url=str(llm_config.base_url),
             api_key=llm_config.api_key,
             model_name=llm_config.model_name,
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
+            supports_response_format=getattr(
+                llm_config, "supports_response_format", True,
+            ),
             supports_vision=effective_supports_vision,
-            supports_pdf_input=supports_pdf_input,
+            supports_pdf_input=effective_supports_pdf_input,
             timeout_seconds=timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
             profile=profile,  # A7 P0.1: profile injection
@@ -369,7 +391,16 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
         app_config.llm_config.supports_vision
         and getattr(_profile, "supports_vision", True)
     )
-    effective_pdf_input = bool(naive_pdf_input and effective_supports_vision)
+    # A7 capability ceiling on PDF: profile.supports_pdf_input=False forces PDF
+    # off end-to-end, even when user config + supports_vision would otherwise
+    # allow it. Sanitizer + both adapters read this downstream; the ceiling
+    # must land here too or AgentTaskRunner will still admit PDF blocks into
+    # HumanMessage content that then survives wire serialization.
+    effective_pdf_input = bool(
+        naive_pdf_input
+        and effective_supports_vision
+        and getattr(_profile, "supports_pdf_input", True)
+    )
 
     summary_llm = None
     if app_config.agent_config.memory.summary_model:

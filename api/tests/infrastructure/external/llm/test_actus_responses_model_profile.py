@@ -242,6 +242,102 @@ async def test_default_max_tokens_renamed_when_no_explicit_max_output_tokens() -
     assert "max_tokens" not in params
 
 
+# ---------- P1 supports_response_format gate on Responses path ----------
+
+async def test_supports_response_format_false_strips_text_format_on_responses() -> None:
+    """LLMConfig.supports_response_format=False must strip the Responses-side
+    ``text.format`` payload, parity with ActusChatModel's response_format gate.
+    """
+    p = get_profile("openai_official")
+    model = ActusResponsesModel(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model_name="gpt-4o",
+        profile=p,
+        supports_response_format=False,
+    )
+    fake_create, captured = _capture_responses_params()
+    fake_client = MagicMock()
+    fake_client.responses.create = fake_create
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        await model._agenerate(
+            [HumanMessage("q")],
+            response_format={"type": "json_object"},
+        )
+
+    params = captured[0]
+    # Neither the Chat-shape key nor the Responses-rename key may leak through.
+    assert "response_format" not in params
+    assert "text" not in params
+
+
+async def test_supports_response_format_true_keeps_text_format_on_responses() -> None:
+    """Regression sibling: when the gate is True (default), text.format IS
+    emitted — proves the strip path doesn't over-fire."""
+    p = get_profile("openai_official")
+    model = ActusResponsesModel(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model_name="gpt-4o",
+        profile=p,
+        supports_response_format=True,
+    )
+    fake_create, captured = _capture_responses_params()
+    fake_client = MagicMock()
+    fake_client.responses.create = fake_create
+
+    with patch.object(model, "_get_client", return_value=fake_client):
+        await model._agenerate(
+            [HumanMessage("q")],
+            response_format={"type": "json_object"},
+        )
+
+    params = captured[0]
+    assert params.get("text") == {"format": {"type": "json_object"}}
+
+
+async def test_supports_response_format_gate_propagates_to_bind_tools_clone() -> None:
+    """bind_tools() returns a new adapter instance. The
+    ``supports_response_format=False`` gate must flow to that clone too —
+    otherwise ``with_structured_output`` / any bound path silently
+    re-enables ``text.format`` even though the caller opted out on the base.
+    """
+    p = get_profile("openai_official")
+    base = ActusResponsesModel(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model_name="gpt-4o",
+        profile=p,
+        supports_response_format=False,  # opt-out on base
+    )
+    bound = base.bind_tools(
+        [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+    )
+
+    # Clone-level state must reflect the opt-out.
+    assert bound.supports_response_format is False, (
+        "bind_tools clone lost supports_response_format=False — the user's "
+        "explicit opt-out was silently reverted to the default True"
+    )
+
+    # Behavioral proof: invoking the clone with a response_format must still
+    # strip both ``response_format`` and the Responses-API ``text.format``.
+    fake_create, captured = _capture_responses_params()
+    fake_client = MagicMock()
+    fake_client.responses.create = fake_create
+
+    with patch.object(bound, "_get_client", return_value=fake_client):
+        await bound._agenerate(
+            [HumanMessage("q")],
+            response_format={"type": "json_object"},
+        )
+
+    params = captured[0]
+    assert "response_format" not in params
+    assert "text" not in params
+
+
 # ---------- T31(e) Kimi json_object → text.format ----------
 
 async def test_responses_adapter_kimi_json_object_maps_to_text_format() -> None:
