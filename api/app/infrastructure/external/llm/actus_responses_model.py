@@ -510,60 +510,143 @@ class ActusResponsesModel(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Call AsyncOpenAI Responses API and return ChatResult."""
+        """Call AsyncOpenAI Responses API and return ChatResult.
+
+        A7 P0.4: routes through the 6-step pipeline (tool_choice resolve,
+        outbound rewrites, response_format resolve, WARN emit, wire serialize,
+        build_sdk_params) plus Responses-specific field remap
+        (``messages → input``, ``max_tokens → max_output_tokens``,
+        ``response_format → text.format``). Q3 boundary: the rewrites pass
+        ``is_chat_completions_api=False`` so cross-turn reasoning strip +
+        wire reasoning injection are skipped — the Responses API has its
+        own reasoning shape (output items) handled by the SDK.
+        """
+        from app.application.errors.exceptions import InternalError
+        from app.domain.services.provider_profiles._classify import classify_error
+        from app.domain.services.provider_profiles._rewrites import (
+            apply_outbound_rewrites,
+            build_sdk_params,
+            resolve_response_format,
+            resolve_tool_choice,
+        )
+
         client = self._get_client()
-        input_items = self._convert_input_messages(messages)
+        profile = self.profile
 
-        # Build request params
-        params: dict[str, Any] = {
-            "model": self.model_name,
-            "temperature": self.temperature,
-            "max_output_tokens": self.max_tokens,
-            "input": input_items,
-        }
+        # Step 1: tool_choice 归口 (per_call + bound)
+        per_call_tc = kwargs.pop("tool_choice", None)
+        resolved_tc, tc_warnings = resolve_tool_choice(
+            per_call_value=per_call_tc,
+            bound_value=self._bound_tool_choice,
+            profile=profile,
+            thinking_enabled=profile.thinking_always_on,
+        )
 
-        # response_format -> text.format mapping
-        response_format = kwargs.get("response_format")
-        if response_format is not None:
-            params["text"] = {"format": response_format}
+        # Step 2: deep-copy messages + sampling param strip + image URL assertion
+        # Q3 boundary: is_chat_completions_api=False — Responses API has its
+        # own reasoning shape (output items), so cross-turn reasoning_content
+        # strip is a no-op for this path.
+        try:
+            rewritten_messages, rewritten_kwargs, rewrite_warnings = (
+                apply_outbound_rewrites(
+                    messages, kwargs, profile, is_chat_completions_api=False,
+                )
+            )
+        except InternalError as e:
+            logger.error("[A7] rewrite invariant violated: %s", e)
+            raise
 
-        # Merge tools: bound tools + per-call tools from kwargs
+        # Step 3: response_format shape normalization (will be remapped to
+        # text.format below, after build_sdk_params).
+        request_rf = rewritten_kwargs.pop("response_format", None)
+        resolved_rf, rf_warning = resolve_response_format(request_rf, profile)
+
+        # Step 4: WARN emit 唯一出口 (adapter-scoped dedup by code)
+        self._emit_warnings(
+            [*tc_warnings, *rewrite_warnings,
+             *([rf_warning] if rf_warning else [])]
+        )
+
+        # Step 5: wire serialization — convert BaseMessage to OpenAI Chat dicts.
+        # Responses-specific ``_convert_input_messages_from_dicts`` runs below
+        # on the built ``messages`` param (function_call / function_call_output
+        # items, multimodal blocks).
+        openai_messages = self._to_openai_messages(rewritten_messages)
+
+        # Step 6: build_sdk_params — produces Chat-shape dict (messages,
+        # max_tokens, response_format). Responses-specific field remap runs
+        # after this step.
+        params = build_sdk_params(
+            rewritten_kwargs,
+            profile,
+            adapter_defaults={
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            },
+            base_params={"model": self.model_name, "messages": openai_messages},
+            resolved_response_format=resolved_rf,
+            resolved_tool_choice=resolved_tc,
+        )
+
+        # Tools: merge bound + per-call (kwargs-sourced). Per-call tools come
+        # in Chat Completions format, so convert via ``_convert_tools`` before
+        # merging with already-converted ``_bound_tools``.
         all_tools = list(self._bound_tools or [])
-        extra_tools = kwargs.get("tools")
+        extra_tools = params.pop("tools", None)
         if extra_tools:
-            # Per-call tools come in Chat Completions format, convert them
             all_tools.extend(self._convert_tools(extra_tools))
         if all_tools:
             params["tools"] = all_tools
-            logger.info("调用Responses API并携带工具信息: %s", self.model_name)
-        else:
-            logger.info("调用Responses API未携带工具: %s", self.model_name)
+
+        if stop:
+            params["stop"] = stop
+
+        # --- Responses-specific field remap (runs AFTER build_sdk_params) --- #
+        # messages → input (Responses API uses input items, not chat messages)
+        chat_messages = params.pop("messages")
+        params["input"] = self._convert_input_messages_from_dicts(chat_messages)
+        # max_tokens → max_output_tokens rename.
+        # Precedence: an explicit caller-supplied ``max_output_tokens`` wins
+        # over the ``max_tokens`` that ``build_sdk_params`` injects from
+        # ``adapter_defaults``. Without this the caller's explicit value is
+        # silently overwritten by ``self.max_tokens``.
+        explicit_max_output = params.pop("max_output_tokens", None)
+        fallback_max_tokens = params.pop("max_tokens", None)
+        effective_max_output = (
+            explicit_max_output
+            if explicit_max_output is not None
+            else fallback_max_tokens
+        )
+        if effective_max_output is not None:
+            params["max_output_tokens"] = effective_max_output
+        # response_format → text = {"format": response_format}
+        if "response_format" in params:
+            params["text"] = {"format": params.pop("response_format")}
 
         # B5 C11: emit telemetry (non-blocking — any failure is swallowed).
-        # Note: Responses API tool format differs from Chat Completions —
-        # _extract_tool_names handles the nested ``function.name`` shape
-        # that both formats share.
         from app.infrastructure.external.llm._telemetry_mixin import (
             emit_invocation_telemetry,
         )
 
         emit_invocation_telemetry(self, messages, all_tools)
 
-        # tool_choice: per-call kwarg > bound value from bind_tools
-        # LangChain uses "any" internally (e.g. with_structured_output),
-        # but OpenAI API expects "required" for the same semantics.
-        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
-        if tool_choice == "any":
-            tool_choice = "required"
-        if tool_choice is not None:
-            params["tool_choice"] = tool_choice
-
-        logger.info("ActusResponsesModel._agenerate: model=%s, tools=%d",
-                     self.model_name, len(all_tools))
-
-        response = await with_llm_timeout(
-            self, client.responses.create(**params)
+        logger.info(
+            "ActusResponsesModel._agenerate: model=%s, tools=%d, tool_choice=%s, "
+            "provider=%s",
+            self.model_name, len(all_tools), resolved_tc, profile.provider_id,
         )
+
+        try:
+            response = await with_llm_timeout(
+                self, client.responses.create(**params)
+            )
+        except Exception as exc:
+            err_class = classify_error(exc, profile)
+            logger.debug(
+                "[A7] Responses adapter exception classified: provider=%s class=%s exc=%s",
+                profile.provider_id, err_class, type(exc).__name__,
+            )
+            raise
 
         # Validate response — proxies may return strings, ints, or other
         # non-object types instead of a proper Responses API object.

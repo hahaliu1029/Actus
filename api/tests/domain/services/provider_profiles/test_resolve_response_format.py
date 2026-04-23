@@ -82,3 +82,46 @@ def test_deepseek_reasoner_json_object_passthrough_real_profile() -> None:
     v, w = resolve_response_format(rf, p)
     assert v == rf
     assert w is None
+
+
+# ---------- Task 4.2 Responses-path shared helpers ----------
+
+
+def test_responses_api_rewrites_skip_reasoning_echo() -> None:
+    """T19: is_chat_completions_api=False → apply_outbound_rewrites preserves
+    cross-turn reasoning_content; only strips sampling params."""
+    from app.domain.services.provider_profiles._rewrites import apply_outbound_rewrites
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    p = get_profile("deepseek_reasoner")
+    msgs = [
+        HumanMessage("q1"),
+        AIMessage(content="a", additional_kwargs={"reasoning_content": "think"}),
+        HumanMessage("q2"),
+    ]
+    rewritten, kwargs, _ = apply_outbound_rewrites(
+        msgs, {"logprobs": True, "temperature": 0.5}, p,
+        is_chat_completions_api=False,
+    )
+    # Q3 boundary: cross-turn reasoning preserved (not handled by rewrites at all).
+    assert rewritten[1].additional_kwargs.get("reasoning_content") == "think"
+    # Sampling params still strip.
+    assert "logprobs" not in kwargs
+    assert "temperature" not in kwargs
+
+
+def test_responses_api_classify_error_shared_fingerprints() -> None:
+    """T20: Responses-path exceptions share the profile's error fingerprints."""
+    from app.domain.services.provider_profiles._classify import classify_error
+    import httpx
+    import openai
+    from app.domain.services.provider_profiles._base import ErrorClass
+
+    profile = get_profile("deepseek_reasoner")
+    req = httpx.Request("POST", "https://api.deepseek.com/responses")
+    resp = httpx.Response(400, request=req, text="Missing reasoning_content x")
+    exc = openai.BadRequestError(
+        "Missing reasoning_content x", response=resp,
+        body={"message": "Missing reasoning_content x"},
+    )
+    assert classify_error(exc, profile) == ErrorClass.COMPAT_QUIRK

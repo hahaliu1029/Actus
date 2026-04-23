@@ -6,6 +6,7 @@ llm_config:
   base_url: https://api.deepseek.com/    # LLM API 地址
   api_key: ''                             # 你的 LLM API Key
   model_name: deepseek-reasoner           # 模型名称
+  # provider: deepseek_reasoner          # A7: 显式声明 provider_id (kimi_k2 / kimi_k2_6 / deepseek_chat / deepseek_reasoner / dashscope / anthropic_compat / gemini_compat / minimax / glm / openai_official / generic_openai). 未填按 base_url 启发式推断，K2.6 必须显式声明不会被自动识别。
   temperature: 0.7
   max_tokens: 8192
   # api_type: chat_completions            # API 类型: chat_completions / responses / auto
