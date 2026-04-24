@@ -587,6 +587,7 @@ class ActusChatModel(BaseChatModel):
         from app.domain.services.provider_profiles._rewrites import (
             apply_outbound_rewrites,
             build_sdk_params,
+            detect_per_call_thinking,
             resolve_response_format,
             resolve_tool_choice,
         )
@@ -596,11 +597,16 @@ class ActusChatModel(BaseChatModel):
 
         # Step 1: tool_choice 归口 (per_call + bound)
         per_call_tc = kwargs.pop("tool_choice", None)
+        # A7 P1 fix: detect per-call thinking for opt-in profiles (Anthropic
+        # extra_body.thinking / DashScope enable_thinking / Gemini reasoning_effort)
+        # — profile.thinking_always_on is False for these, so the forbidden-
+        # when-thinking contract was dead without this OR.
+        thinking_enabled = profile.thinking_always_on or detect_per_call_thinking(kwargs, profile)
         resolved_tc, tc_warnings = resolve_tool_choice(
             per_call_value=per_call_tc,
             bound_value=self._bound_tool_choice,
             profile=profile,
-            thinking_enabled=profile.thinking_always_on,
+            thinking_enabled=thinking_enabled,
         )
 
         # Step 2: 深拷贝 messages + 采样参数 strip + image URL assertion
@@ -747,6 +753,7 @@ class ActusChatModel(BaseChatModel):
         from app.domain.services.provider_profiles._rewrites import (
             apply_outbound_rewrites,
             build_sdk_params,
+            detect_per_call_thinking,
             resolve_response_format,
             resolve_tool_choice,
         )
@@ -756,11 +763,16 @@ class ActusChatModel(BaseChatModel):
 
         # Step 1: tool_choice 归口 (per_call + bound)
         per_call_tc = kwargs.pop("tool_choice", None)
+        # A7 P1 fix: detect per-call thinking for opt-in profiles (Anthropic
+        # extra_body.thinking / DashScope enable_thinking / Gemini reasoning_effort)
+        # — profile.thinking_always_on is False for these, so the forbidden-
+        # when-thinking contract was dead without this OR.
+        thinking_enabled = profile.thinking_always_on or detect_per_call_thinking(kwargs, profile)
         resolved_tc, tc_warnings = resolve_tool_choice(
             per_call_value=per_call_tc,
             bound_value=self._bound_tool_choice,
             profile=profile,
-            thinking_enabled=profile.thinking_always_on,
+            thinking_enabled=thinking_enabled,
         )
 
         # Step 2: deep-copy messages + sampling param strip + image URL assertion

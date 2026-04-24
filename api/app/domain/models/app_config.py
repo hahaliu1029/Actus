@@ -16,8 +16,16 @@ class LLMConfig(BaseModel):
     )
     provider: str | None = None
     """A7: provider_id (see provider_profiles/ constants: kimi_k2 / kimi_k2_6 /
-    deepseek_chat / deepseek_reasoner / dashscope / anthropic_compat /
-    gemini_compat / minimax / glm / openai_official / generic_openai).
+    deepseek_chat / deepseek_reasoner / dashscope_qwen / dashscope_qwen_vl /
+    anthropic_compat / gemini_compat / minimax / glm / openai_official /
+    generic_openai).
+
+    A7 P1 (2026-04-23): DashScope 拆 text / vl 两个 profile；当 base_url 命中
+    DashScope / Anthropic / Gemini 但 model_name 不在 allowlist (例如
+    qwen-max / qwen-vl-max / qwen3.5-plus / claude-opus-4-7 / gemini-2.5-pro /
+    gemini-3-*) 时，heuristic 直接返回 generic_openai (= 今天行为)。显式
+    provider=<registered_id> 会绕过 allowlist 验证但不保证 profile 字段与真实
+    模型能力匹配，仅建议在用户明确对齐时使用；typo 直接抛 ConfigError.
 
     Strictly separate from ActusChatModel.provider_name (B5 C0a, prompt rendering,
     Literal['openai','anthropic']). The two fields do not infer from each other,

@@ -27,6 +27,70 @@ GENERIC_FINGERPRINTS: tuple[ErrorFingerprint, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# A7 P1 pure-allowlist heuristic helpers (Spec §7.2)
+#
+# 已知在 target 列表的模型 → 返回已注册 profile_id；未命中 → 直接返回
+# "generic_openai"（行为与今天等价，无 WARN 噪音）。不预写未来 sub-profile
+# 的字段值（codex Round 3 证明预测错的风险高）。
+# ---------------------------------------------------------------------------
+
+# Allowlist prefixes for DashScope Qwen text flagship (hybrid default-off, tool-capable).
+# Docs: https://www.alibabacloud.com/help/en/model-studio/deep-thinking
+# NOT qwen-max* (non-thinking only, Round 4 Fact #1);
+# NOT qwq-*, qwen3-*-thinking-* (always-on);
+# NOT qwen3.5-* (hybrid default-on).
+_DASHSCOPE_QWEN_TEXT_PREFIXES: tuple[str, ...] = (
+    "qwen-plus",      # qwen-plus, qwen-plus-latest, qwen-plus-YYYY-MM-DD
+    "qwen-turbo",     # qwen-turbo, qwen-turbo-latest
+    "qwen-flash",     # qwen-flash, qwen-flash-latest (Round 4 Fact #2)
+    "qwen3-max",      # qwen3-max, qwen3-max-preview
+)
+# Allowlist prefixes for DashScope VL models (Qwen3-VL: hybrid + tool-capable).
+# NOT qwen-vl-* (Qwen2.5-VL, no-thinking / no-tools, Round 4 Fact #3);
+# NOT qwen3-omni-* / qwen-omni-* / qwen3.5-omni-* / qwen3.5-plus/flash.
+_DASHSCOPE_QWEN_VL_PREFIXES: tuple[str, ...] = (
+    "qwen3-vl-",      # qwen3-vl-plus, qwen3-vl-flash
+)
+# Allowlist prefixes for Anthropic OpenAI-compat (thinking togglable models).
+# NOT claude-opus-4-7 (no manual thinking);
+# NOT claude-3-* / claude-4-0..4-5 (legacy, not yet in target).
+_ANTHROPIC_COMPAT_MODEL_PREFIXES: tuple[str, ...] = (
+    "claude-sonnet-4-6",    # covers -latest and dated variants
+    "claude-haiku-4-5",
+)
+# Only 2.5 Flash family (thinking togglable via reasoning_effort).
+# NOT gemini-2.5-pro (thinking always-on);
+# NOT gemini-3-* (Thinking MEDIUM bug).
+_GEMINI_COMPAT_MODEL_PREFIXES: tuple[str, ...] = (
+    "gemini-2.5-flash",   # -8b, -latest, dated variants
+)
+
+
+def _classify_dashscope_model(mn: str) -> str:
+    """Pure allowlist. Unknown models → 'generic_openai' (= today's behavior)."""
+    mn = (mn or "").lower().strip()
+    if any(mn.startswith(p) for p in _DASHSCOPE_QWEN_TEXT_PREFIXES):
+        return "dashscope_qwen"
+    if any(mn.startswith(p) for p in _DASHSCOPE_QWEN_VL_PREFIXES):
+        return "dashscope_qwen_vl"
+    return "generic_openai"
+
+
+def _classify_anthropic_model(mn: str) -> str:
+    mn = (mn or "").lower().strip()
+    if any(mn.startswith(p) for p in _ANTHROPIC_COMPAT_MODEL_PREFIXES):
+        return "anthropic_compat"
+    return "generic_openai"
+
+
+def _classify_gemini_model(mn: str) -> str:
+    mn = (mn or "").lower().strip()
+    if any(mn.startswith(p) for p in _GEMINI_COMPAT_MODEL_PREFIXES):
+        return "gemini_compat"
+    return "generic_openai"
+
+
 _REGISTRY: dict[str, ProviderProfile] = {
     GENERIC_OPENAI_PROFILE.provider_id: GENERIC_OPENAI_PROFILE,
     OPENAI_OFFICIAL_PROFILE.provider_id: OPENAI_OFFICIAL_PROFILE,
@@ -64,11 +128,12 @@ def infer_provider_from_base_url(
     if "deepseek" in bu:
         return "deepseek_reasoner" if "reasoner" in mn else "deepseek_chat"
     if "dashscope" in bu or "aliyuncs.com/dashscope" in bu:
-        return "dashscope"
+        return _classify_dashscope_model(mn)
     if "api.anthropic.com/v1" in bu:
-        return "anthropic_compat"
+        return _classify_anthropic_model(mn)
     if "generativelanguage.googleapis.com" in bu:
-        return "gemini_compat"
+        return _classify_gemini_model(mn)
+    # minimax / glm / openai_official 分支保持 base_url-only 匹配
     if "minimax" in bu or "minimaxi" in bu:
         return "minimax"
     if "bigmodel.cn" in bu or "zhipu" in bu:

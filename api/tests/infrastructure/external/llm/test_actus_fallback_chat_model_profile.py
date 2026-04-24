@@ -218,3 +218,30 @@ async def test_astream_reraises_on_compat_quirk_even_when_fallback_enabled() -> 
     assert fallback_iters == 0, (
         "_astream must not invoke fallback when primary error is COMPAT_QUIRK"
     )
+
+
+async def test_fallback_bypasses_when_profile_is_glm() -> None:
+    """T-P1-SMOKE-3: GLM profile api_mode_fallback_enabled=False 生效 (Spec §8.4).
+
+    验证 Finding 2 的 GLM 迁移路径：今天通过 _build_llm try/except silent-fallback
+    到 generic_openai (api_mode_fallback_enabled=True)，本 PR 之后切到 glm profile
+    (api_mode_fallback_enabled=False)。ActusFallbackChatModel 的 guard 把
+    previously-silent 404-on-fallback 转成 typed re-raise，不误升到 Responses API。
+    """
+    primary = MagicMock()
+    primary._llm_type = "primary-stub"
+    primary._agenerate = AsyncMock(side_effect=_bad_request())
+    fallback = MagicMock()
+    fallback._llm_type = "fallback-stub"
+    fallback._agenerate = AsyncMock()
+
+    wrapper = ActusFallbackChatModel.model_construct(
+        primary=primary,
+        fallback=fallback,
+        provider_name="openai",
+        profile=get_profile("glm"),   # A7 P1: api_mode_fallback_enabled=False
+    )
+
+    with pytest.raises(openai.BadRequestError):
+        await wrapper._agenerate([HumanMessage("q")])
+    fallback._agenerate.assert_not_called()

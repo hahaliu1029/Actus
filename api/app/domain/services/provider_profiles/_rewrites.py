@@ -10,12 +10,48 @@ resolve_response_format, §4.6a build_sdk_params.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, Mapping
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from app.application.errors.exceptions import InternalError
 from app.domain.services.provider_profiles._base import ProviderProfile, RewriteWarning
+
+
+# ========== detect_per_call_thinking ==========
+
+def detect_per_call_thinking(kwargs: Mapping[str, Any], profile: ProviderProfile) -> bool:
+    """Return True if per-call kwargs activate thinking mode for this profile.
+
+    Complements ``profile.thinking_always_on`` — adapters should OR the two:
+    ``thinking_enabled = profile.thinking_always_on or detect_per_call_thinking(kwargs, profile)``.
+
+    Detection keyed off ``profile.thinking_toggle_style``:
+    - ``"extra_body_thinking"`` (Anthropic OpenAI-compat): ``kwargs["extra_body"]["thinking"]``.
+      Accepts dict form (Anthropic's canonical shape: ``{"type": "enabled", ...}`` or ``{"type": "disabled"}``);
+      also treats any truthy non-dict value as enabled to tolerate callers that pass a bool.
+    - ``"extra_body_enable_thinking"`` (DashScope Qwen): ``kwargs["extra_body"]["enable_thinking"]`` truthy.
+    - ``"openai_reasoning_effort"`` (Gemini 2.5 Flash): ``kwargs["reasoning_effort"]`` present and != ``"none"``.
+    - ``"none"``: always False (the profile has no per-call toggle).
+    """
+    style = profile.thinking_toggle_style
+    if style == "extra_body_thinking":
+        eb = kwargs.get("extra_body") or {}
+        thinking = eb.get("thinking") if isinstance(eb, dict) else None
+        if isinstance(thinking, dict):
+            return thinking.get("type") == "enabled"
+        return bool(thinking)
+    if style == "extra_body_enable_thinking":
+        eb = kwargs.get("extra_body") or {}
+        if not isinstance(eb, dict):
+            return False
+        return bool(eb.get("enable_thinking"))
+    if style == "openai_reasoning_effort":
+        effort = kwargs.get("reasoning_effort")
+        if effort is None:
+            return False
+        return str(effort).strip().lower() != "none"
+    return False
 
 
 # ========== resolve_tool_choice ==========
