@@ -5,7 +5,11 @@ chat→responses 升级（因为未知 provider 可能真的实现两套 API）�
 """
 from __future__ import annotations
 
-from app.domain.services.provider_profiles._base import ProviderProfile
+from app.domain.services.provider_profiles._base import (
+    ErrorClass,
+    ErrorFingerprint,
+    ProviderProfile,
+)
 
 GENERIC_OPENAI_PROFILE = ProviderProfile(
     provider_id="generic_openai",
@@ -17,4 +21,24 @@ GENERIC_OPENAI_PROFILE = ProviderProfile(
     # in agent_task_runner so the base64 fallback path does not silently
     # relax the ceiling relative to pre-A7 behavior.
     image_max_bytes=3_932_160,
+    error_fingerprints=(
+        ErrorFingerprint(
+            code="context_length_exceeded",
+            status_code=400,
+            body_substring="context_length_exceeded",
+            error_class=ErrorClass.CONTEXT_OVERFLOW,
+        ),
+        ErrorFingerprint(
+            code="maximum_context_length",
+            status_code=400,
+            body_substring="maximum context length",
+            error_class=ErrorClass.CONTEXT_OVERFLOW,
+        ),
+        ErrorFingerprint(
+            code="rate_limit_exceeded",
+            status_code=429,
+            body_substring="rate_limit_exceeded",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
+    ),
 )

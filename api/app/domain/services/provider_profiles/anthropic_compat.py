@@ -69,15 +69,60 @@ ANTHROPIC_COMPAT_PROFILE = ProviderProfile(
     response_format_silently_ignored=True,       # T24 confirmed
     # Fingerprint 顺序优先匹配 (tuple-order): 更具体的 thinking/tool_choice 子模式
     # 放在宽 invalid_request_error 前 (codex Round 2 P2-2).
+    # Order requirement (Audit Round 1 P2 #6): more specific substring first.
+    # R3's F14 body contains BOTH "tool_choice" AND "thinking"; tool_choice
+    # must win, so it precedes the bare "thinking" fingerprint below.
     error_fingerprints=(
-        ErrorFingerprint(429, "rate_limit_error", ErrorClass.TRANSIENT_RATE_LIMIT),
-        ErrorFingerprint(529, "overloaded_error", ErrorClass.TRANSIENT_RATE_LIMIT),
-        ErrorFingerprint(504, "timeout_error", ErrorClass.TRANSIENT_CONNECTION),
-        ErrorFingerprint(401, "authentication_error", ErrorClass.TRANSIENT_AUTH),
-        ErrorFingerprint(413, "request_too_large", ErrorClass.CONTEXT_OVERFLOW),
-        ErrorFingerprint(400, "thinking", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(400, "tool_choice", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(400, "invalid_request_error", ErrorClass.PERMANENT_4XX),
+        ErrorFingerprint(
+            code="anthropic_rate_limit",
+            status_code=429,
+            body_substring="rate_limit_error",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
+        ErrorFingerprint(
+            code="anthropic_overloaded",
+            status_code=529,
+            body_substring="overloaded_error",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
+        ErrorFingerprint(
+            code="anthropic_timeout",
+            status_code=504,
+            body_substring="timeout_error",
+            error_class=ErrorClass.TRANSIENT_CONNECTION,
+        ),
+        ErrorFingerprint(
+            code="anthropic_authentication_error",
+            status_code=401,
+            body_substring="authentication_error",
+            error_class=ErrorClass.TRANSIENT_AUTH,
+        ),
+        ErrorFingerprint(
+            code="anthropic_request_too_large",
+            status_code=413,
+            body_substring="request_too_large",
+            error_class=ErrorClass.CONTEXT_OVERFLOW,
+        ),
+        # R3 target: matches bodies mentioning tool_choice — reordered before "thinking"
+        ErrorFingerprint(
+            code="thinking_forbidden_with_tool_choice",
+            status_code=400,
+            body_substring="tool_choice",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        # Pure thinking errors (no tool_choice token) fall through to this line
+        ErrorFingerprint(
+            code="anthropic_thinking_quirk",
+            status_code=400,
+            body_substring="thinking",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        ErrorFingerprint(
+            code="anthropic_invalid_request",
+            status_code=400,
+            body_substring="invalid_request_error",
+            error_class=ErrorClass.PERMANENT_4XX,
+        ),
     ),
     default_context_window=200_000,    # Haiku 4.5 floor; Sonnet/Opus reach 1M
     default_max_output_tokens=64_000,  # Sonnet/Haiku; Opus 4.7 allows 128k

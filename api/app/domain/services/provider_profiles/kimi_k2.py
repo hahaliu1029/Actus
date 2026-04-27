@@ -36,9 +36,18 @@ KIMI_K2_PROFILE = ProviderProfile(
     supports_response_format_json_object=True,
     supports_response_format_json_schema=True,
     error_fingerprints=(
-        ErrorFingerprint(400, "Missing reasoning_content", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(429, "rate_limit_reached_for_model",
-                         ErrorClass.TRANSIENT_RATE_LIMIT),
+        ErrorFingerprint(
+            code="kimi_missing_reasoning_content",
+            status_code=400,
+            body_substring="Missing reasoning_content",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        ErrorFingerprint(
+            code="kimi_rate_limit_reached",
+            status_code=429,
+            body_substring="rate_limit_reached_for_model",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
     ),
     default_context_window=128_000,
     default_max_output_tokens=32_768,

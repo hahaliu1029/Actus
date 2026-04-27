@@ -57,13 +57,48 @@ DASHSCOPE_QWEN_PROFILE = ProviderProfile(
     supports_response_format_json_schema=True,   # non-thinking mode only
     response_format_silently_ignored=False,      # thinking mode 返回 400 via F02, 非 silent
     error_fingerprints=(
-        ErrorFingerprint(400, "tool_choice is one of the strings", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(400, "Json mode response is not supported when enable_thinking is true", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(400, "Range of input length should be", ErrorClass.CONTEXT_OVERFLOW),
-        ErrorFingerprint(429, "Requests throttling triggered", ErrorClass.TRANSIENT_RATE_LIMIT),
-        ErrorFingerprint(429, "Allocated quota exceeded", ErrorClass.PERMANENT_4XX),
-        ErrorFingerprint(401, "Invalid API-key provided", ErrorClass.TRANSIENT_AUTH),
-        ErrorFingerprint(500, "An internal error has occured", ErrorClass.TRANSIENT_CONNECTION),
+        ErrorFingerprint(
+            code="tool_choice_string_forbidden",
+            status_code=400,
+            body_substring="tool_choice is one of the strings",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        ErrorFingerprint(
+            code="json_mode_with_thinking",
+            status_code=400,
+            body_substring="Json mode response is not supported when enable_thinking is true",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        ErrorFingerprint(
+            code="range_of_input_length",
+            status_code=400,
+            body_substring="Range of input length should be",
+            error_class=ErrorClass.CONTEXT_OVERFLOW,
+        ),
+        ErrorFingerprint(
+            code="dashscope_requests_throttling",
+            status_code=429,
+            body_substring="Requests throttling triggered",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
+        ErrorFingerprint(
+            code="dashscope_allocated_quota_exceeded",
+            status_code=429,
+            body_substring="Allocated quota exceeded",
+            error_class=ErrorClass.PERMANENT_4XX,
+        ),
+        ErrorFingerprint(
+            code="dashscope_invalid_api_key",
+            status_code=401,
+            body_substring="Invalid API-key provided",
+            error_class=ErrorClass.TRANSIENT_AUTH,
+        ),
+        ErrorFingerprint(
+            code="dashscope_internal_error",
+            status_code=500,
+            body_substring="An internal error has occured",
+            error_class=ErrorClass.TRANSIENT_CONNECTION,
+        ),
     ),
     default_context_window=131_072,
     default_max_output_tokens=8_192,

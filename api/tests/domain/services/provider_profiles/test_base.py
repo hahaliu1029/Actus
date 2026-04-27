@@ -62,7 +62,7 @@ def test_error_class_values() -> None:
 
 
 def test_error_fingerprint_frozen() -> None:
-    f = ErrorFingerprint(status_code=400, body_substring="Missing",
+    f = ErrorFingerprint(code="missing_test", status_code=400, body_substring="Missing",
                          error_class=ErrorClass.COMPAT_QUIRK)
     with pytest.raises(FrozenInstanceError):
         f.status_code = 500  # type: ignore[misc]

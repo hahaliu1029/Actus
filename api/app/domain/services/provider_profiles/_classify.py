@@ -10,6 +10,7 @@ import openai
 
 from app.domain.services.provider_profiles._base import (
     ErrorClass,
+    ErrorDiagnostic,
     ErrorFingerprint,
     ProviderProfile,
 )
@@ -20,13 +21,14 @@ def _match_fingerprint(
     status: int,
     body: str,
     fingerprints: tuple[ErrorFingerprint, ...],
-) -> ErrorClass | None:
+) -> ErrorFingerprint | None:
+    body_lower = body.lower()
     for fp in fingerprints:
         if fp.status_code and fp.status_code != status:
             continue
-        if fp.body_substring and fp.body_substring.lower() not in body.lower():
+        if fp.body_substring and fp.body_substring.lower() not in body_lower:
             continue
-        return fp.error_class
+        return fp
     return None
 
 
@@ -50,21 +52,8 @@ def _extract_status_body(exc: Exception) -> tuple[int, str]:
     return status, body
 
 
-def classify_error(exc: Exception, profile: ProviderProfile) -> ErrorClass:
-    """Classify exception into ErrorClass. Pure function, no side effects."""
-    status, body = _extract_status_body(exc)
-
-    # 1. profile-specific fingerprints
-    hit = _match_fingerprint(status, body, profile.error_fingerprints)
-    if hit is not None:
-        return hit
-
-    # 2. generic fingerprints
-    hit = _match_fingerprint(status, body, GENERIC_FINGERPRINTS)
-    if hit is not None:
-        return hit
-
-    # 3. exception-class fallback
+def _classify_fallback(exc: Exception, status: int) -> ErrorClass:
+    """Exception-class / status-based fallback when no fingerprint matched."""
     if isinstance(exc, openai.RateLimitError):
         return ErrorClass.TRANSIENT_RATE_LIMIT
     if isinstance(
@@ -88,5 +77,31 @@ def classify_error(exc: Exception, profile: ProviderProfile) -> ErrorClass:
         ),
     ):
         return ErrorClass.PERMANENT_4XX
-
     return ErrorClass.UNKNOWN
+
+
+def classify_error_diagnostic(
+    exc: Exception,
+    profile: ProviderProfile,
+) -> ErrorDiagnostic:
+    """Fine-grained classification: returns (error_class, fingerprint_code).
+
+    Priority: profile.error_fingerprints → GENERIC_FINGERPRINTS → exception-class fallback.
+    """
+    status, body = _extract_status_body(exc)
+
+    fp = _match_fingerprint(status, body, profile.error_fingerprints)
+    if fp is None:
+        fp = _match_fingerprint(status, body, GENERIC_FINGERPRINTS)
+    if fp is not None:
+        return ErrorDiagnostic(error_class=fp.error_class, fingerprint_code=fp.code)
+
+    return ErrorDiagnostic(
+        error_class=_classify_fallback(exc, status),
+        fingerprint_code=None,
+    )
+
+
+def classify_error(exc: Exception, profile: ProviderProfile) -> ErrorClass:
+    """Backward-compat shim. Canonical API is classify_error_diagnostic."""
+    return classify_error_diagnostic(exc, profile).error_class

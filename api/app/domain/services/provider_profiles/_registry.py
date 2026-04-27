@@ -21,9 +21,24 @@ logger = logging.getLogger(__name__)
 
 # Base fingerprints applied after profile-specific ones (see _classify.classify_error).
 GENERIC_FINGERPRINTS: tuple[ErrorFingerprint, ...] = (
-    ErrorFingerprint(429, None, ErrorClass.TRANSIENT_RATE_LIMIT),
-    ErrorFingerprint(503, None, ErrorClass.TRANSIENT_RATE_LIMIT),
-    ErrorFingerprint(401, None, ErrorClass.TRANSIENT_AUTH),
+    ErrorFingerprint(
+        code="generic_rate_limit_429",
+        status_code=429,
+        body_substring=None,
+        error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+    ),
+    ErrorFingerprint(
+        code="generic_server_5xx",
+        status_code=503,
+        body_substring=None,
+        error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+    ),
+    ErrorFingerprint(
+        code="generic_invalid_api_key",
+        status_code=401,
+        body_substring=None,
+        error_class=ErrorClass.TRANSIENT_AUTH,
+    ),
 )
 
 
@@ -147,3 +162,12 @@ def infer_provider_from_base_url(
         base_url,
     )
     return "generic_openai"
+
+
+def all_profiles() -> tuple[ProviderProfile, ...]:
+    """Snapshot of every registered profile.
+
+    Returns a tuple (not a view) so test iteration is stable even if
+    register_profile() is called concurrently.
+    """
+    return tuple(_REGISTRY.values())

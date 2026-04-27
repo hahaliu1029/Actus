@@ -54,11 +54,36 @@ GEMINI_COMPAT_PROFILE = ProviderProfile(
         # NOTE: Gemini 3 "Thinking level MEDIUM" fingerprint intentionally
         # removed (codex Fact #3) — model-specific, not 2.5 Flash. Reserved
         # for future gemini_3_compat sub-profile.
-        ErrorFingerprint(400, "Unknown name 'logprobs'", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(400, "exceeds the maximum number of tokens", ErrorClass.CONTEXT_OVERFLOW),
-        ErrorFingerprint(429, "RESOURCE_EXHAUSTED", ErrorClass.TRANSIENT_RATE_LIMIT),
-        ErrorFingerprint(503, "UNAVAILABLE", ErrorClass.TRANSIENT_CONNECTION),
-        ErrorFingerprint(400, "SAFETY", ErrorClass.PERMANENT_4XX),
+        ErrorFingerprint(
+            code="gemini_unknown_logprobs",
+            status_code=400,
+            body_substring="Unknown name 'logprobs'",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        ErrorFingerprint(
+            code="gemini_max_tokens_exceeded",
+            status_code=400,
+            body_substring="exceeds the maximum number of tokens",
+            error_class=ErrorClass.CONTEXT_OVERFLOW,
+        ),
+        ErrorFingerprint(
+            code="gemini_resource_exhausted",
+            status_code=429,
+            body_substring="RESOURCE_EXHAUSTED",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
+        ErrorFingerprint(
+            code="gemini_unavailable",
+            status_code=503,
+            body_substring="UNAVAILABLE",
+            error_class=ErrorClass.TRANSIENT_CONNECTION,
+        ),
+        ErrorFingerprint(
+            code="gemini_safety_block",
+            status_code=400,
+            body_substring="SAFETY",
+            error_class=ErrorClass.PERMANENT_4XX,
+        ),
     ),
     default_context_window=1_000_000,
     default_max_output_tokens=8_192,

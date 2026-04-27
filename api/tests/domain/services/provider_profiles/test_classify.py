@@ -34,7 +34,10 @@ def test_profile_fingerprint_takes_priority() -> None:
     profile = _make_profile(
         (
             ErrorFingerprint(
-                400, "Missing reasoning_content", ErrorClass.COMPAT_QUIRK
+                code="missing_reasoning_content",
+                status_code=400,
+                body_substring="Missing reasoning_content",
+                error_class=ErrorClass.COMPAT_QUIRK,
             ),
         )
     )

@@ -24,13 +24,30 @@ class ErrorClass(StrEnum):
     UNKNOWN = "unknown"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ErrorFingerprint:
-    """Match (status_code, body_substring) → error_class. status_code=0 = any status."""
+    """Match (status_code, body_substring) → error_class. status_code=0 = any status.
 
+    code: stable snake_case identifier, unique within the profile. Consumed by
+    B2 recovery rules as the finest-grained match key.
+    """
+
+    code: str
     status_code: int
     body_substring: str | None
     error_class: ErrorClass
+
+
+@dataclass(frozen=True)
+class ErrorDiagnostic:
+    """Fine-grained classification result returned by classify_error_diagnostic.
+
+    fingerprint_code is None when no concrete fingerprint matched — classification
+    fell back to exception-class / status-code rules.
+    """
+
+    error_class: ErrorClass
+    fingerprint_code: str | None
 
 
 @dataclass(frozen=True)

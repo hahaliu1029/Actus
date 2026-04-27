@@ -78,13 +78,38 @@ GLM_PROFILE = ProviderProfile(
     supports_response_format_json_schema=False,
     response_format_silently_ignored=False,
     error_fingerprints=(
-        ErrorFingerprint(401, "1002", ErrorClass.TRANSIENT_AUTH),
-        ErrorFingerprint(429, "1302", ErrorClass.TRANSIENT_RATE_LIMIT),
+        ErrorFingerprint(
+            code="glm_1002_invalid_auth",
+            status_code=401,
+            body_substring="1002",
+            error_class=ErrorClass.TRANSIENT_AUTH,
+        ),
+        ErrorFingerprint(
+            code="glm_1302_rate_limit",
+            status_code=429,
+            body_substring="1302",
+            error_class=ErrorClass.TRANSIENT_RATE_LIMIT,
+        ),
         # 1214 is a generic "invalid params" code, not response_format-specific
         # (codex Round 1 Fact #7). Categorize as PERMANENT_4XX.
-        ErrorFingerprint(400, "1214", ErrorClass.PERMANENT_4XX),
-        ErrorFingerprint(500, "internal_error", ErrorClass.TRANSIENT_CONNECTION),
-        ErrorFingerprint(504, "gateway_timeout", ErrorClass.TRANSIENT_CONNECTION),
+        ErrorFingerprint(
+            code="glm_1214_invalid_params",
+            status_code=400,
+            body_substring="1214",
+            error_class=ErrorClass.PERMANENT_4XX,
+        ),
+        ErrorFingerprint(
+            code="glm_internal_error",
+            status_code=500,
+            body_substring="internal_error",
+            error_class=ErrorClass.TRANSIENT_CONNECTION,
+        ),
+        ErrorFingerprint(
+            code="glm_gateway_timeout",
+            status_code=504,
+            body_substring="gateway_timeout",
+            error_class=ErrorClass.TRANSIENT_CONNECTION,
+        ),
     ),
     default_context_window=128_000,
     default_max_output_tokens=8_192,

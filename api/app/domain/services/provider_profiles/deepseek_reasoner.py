@@ -40,8 +40,18 @@ DEEPSEEK_REASONER_PROFILE = ProviderProfile(
     supports_response_format_json_object=True,
     supports_response_format_json_schema=False,
     error_fingerprints=(
-        ErrorFingerprint(400, "Missing reasoning_content", ErrorClass.COMPAT_QUIRK),
-        ErrorFingerprint(400, "reasoning_content", ErrorClass.COMPAT_QUIRK),
+        ErrorFingerprint(
+            code="deepseek_missing_reasoning_content",
+            status_code=400,
+            body_substring="Missing reasoning_content",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
+        ErrorFingerprint(
+            code="deepseek_reasoning_content_generic",
+            status_code=400,
+            body_substring="reasoning_content",
+            error_class=ErrorClass.COMPAT_QUIRK,
+        ),
     ),
     default_context_window=128_000,
     default_max_output_tokens=32_768,
