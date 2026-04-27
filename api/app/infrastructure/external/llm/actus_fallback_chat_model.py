@@ -296,13 +296,20 @@ class ActusFallbackChatModel(BaseChatModel):
                 )
                 from app.domain.services.provider_profiles._base import ErrorClass
                 err_class = classify_error(primary_exc, profile)
-                if err_class == ErrorClass.COMPAT_QUIRK:
+                # B2 PR-2 (T12 extension): COMPAT_QUIRK and CONTEXT_OVERFLOW
+                # both stay terminal at the Fallback layer — escalating to
+                # Responses can't help (same payload shape would re-trigger).
+                # B2 Recovery handles both via typed rules (R1-R3 for QUIRK,
+                # R4 for CONTEXT_OVERFLOW). LangGraph RetryPolicy still owns
+                # the TRANSIENT_* classes via the existing escalation path.
+                if err_class in (ErrorClass.COMPAT_QUIRK, ErrorClass.CONTEXT_OVERFLOW):
                     logger.info(
-                        "Primary LLM (%s) raised %s classified as COMPAT_QUIRK "
+                        "Primary LLM (%s) raised %s classified as %s "
                         "for profile.provider_id=%s; skipping Chat->Responses "
-                        "escalation (B2/upper layer should consume)",
+                        "escalation (B2 Recovery terminal)",
                         self.primary._llm_type,
                         type(primary_exc).__name__,
+                        err_class.name,
                         getattr(profile, "provider_id", "?"),
                     )
                     raise
@@ -322,13 +329,24 @@ class ActusFallbackChatModel(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        # B2 PR-2: peek-first-chunk semantics. Once the primary stream has
+        # yielded a chunk downstream, mid-stream errors propagate unchanged
+        # (B2 contract: cross-protocol escalation must not partial-replay).
+        # Only failures that occur BEFORE the first chunk trigger the
+        # Chat->Responses fallback path.
+        stream = self.primary._astream(
+            messages, stop=stop, run_manager=run_manager, **kwargs,
+        )
         try:
-            async for chunk in self.primary._astream(
-                messages, stop=stop, run_manager=run_manager, **kwargs,
-            ):
-                yield chunk
+            first_chunk = await stream.__anext__()
+        except StopAsyncIteration:
+            # Primary produced an empty stream — no chunks, no error.
+            return
         except _FALLBACK_TRIGGER_EXCEPTIONS as primary_exc:
-            # A7 P1: mirror _agenerate gate on streaming path.
+            # A7 P1 + B2 PR-2 T12: profile-driven gate. Mirror _agenerate's
+            # gate at lines ~274-308. Any class in (COMPAT_QUIRK,
+            # CONTEXT_OVERFLOW) → re-raise so B2 Recovery (one layer up)
+            # gets the typed signal; CHAT->Responses can't help.
             profile = getattr(self, "profile", None)
             if profile is not None and not getattr(
                 profile, "api_mode_fallback_enabled", True
@@ -342,21 +360,20 @@ class ActusFallbackChatModel(BaseChatModel):
                     getattr(profile, "provider_id", "?"),
                 )
                 raise
-            # A7 Task 3.8 (T12): mirror _agenerate COMPAT_QUIRK guard.
             if profile is not None:
                 from app.domain.services.provider_profiles._classify import (
                     classify_error,
                 )
                 from app.domain.services.provider_profiles._base import ErrorClass
                 err_class = classify_error(primary_exc, profile)
-                if err_class == ErrorClass.COMPAT_QUIRK:
+                if err_class in (ErrorClass.COMPAT_QUIRK, ErrorClass.CONTEXT_OVERFLOW):
                     logger.info(
-                        "Primary LLM stream (%s) raised %s classified as "
-                        "COMPAT_QUIRK for profile.provider_id=%s; skipping "
-                        "Chat->Responses escalation (B2/upper layer should "
-                        "consume)",
+                        "Primary LLM stream (%s) raised %s classified as %s "
+                        "for profile.provider_id=%s; skipping Chat->Responses "
+                        "escalation (B2 Recovery terminal)",
                         self.primary._llm_type,
                         type(primary_exc).__name__,
+                        err_class.name,
                         getattr(profile, "provider_id", "?"),
                     )
                     raise
@@ -364,13 +381,15 @@ class ActusFallbackChatModel(BaseChatModel):
                 "Primary LLM stream (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,
             )
+            # Audit Round 16 P1 #1 — preserve fallback escalation stamping.
             # Streaming path: ``BaseChatModel.astream`` (langchain-core
             # chat_models.py line 668) does NOT forward ``run_manager`` into
             # the subclass ``_astream``, so ``_notify_fallback_escalation``
-            # sees ``run_manager=None`` and can't reach the handler. We
-            # instead stamp the first fallback chunk's ``response_metadata``
+            # often sees ``run_manager=None`` and can't reach the handler. We
+            # also stamp the first fallback chunk's ``response_metadata``
             # with escalation info; the merged AIMessage on ``on_llm_end``
-            # carries it and the handler applies it to the pending entry.
+            # carries it and cost-ledger / telemetry attribute the call to
+            # the fallback adapter.
             _notify_fallback_escalation(run_manager, self.fallback)
             async for chunk in _stamp_fallback_escalation(
                 self.fallback._astream(
@@ -379,6 +398,13 @@ class ActusFallbackChatModel(BaseChatModel):
                 self.fallback,
             ):
                 yield chunk
+            return
+
+        # Primary produced first chunk: lock to primary stream. Mid-stream
+        # errors propagate unchanged (NO try/except below).
+        yield first_chunk
+        async for chunk in stream:
+            yield chunk
 
     # ---- bind_tools / with_structured_output ----------------------------- #
 

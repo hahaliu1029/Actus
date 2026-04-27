@@ -298,3 +298,76 @@ class TestSoftCompact:
         mock_llm = _make_mock_llm("x" * 30000)
         result = await c.try_compact(msgs, context_window=100, summary_llm=mock_llm)
         assert result.level_applied == 3
+
+
+@pytest.mark.anyio
+async def test_try_compact_threads_config_to_summary_llm_ainvoke():
+    """Audit Round 11 P1 #1 (Round 12 P1 #1 size-fix) regression-lock for B2.
+
+    B2's `_build_on_context_overflow_callback` (Task 2.6 Step 2) sends a
+    `config=` payload to `compactor.try_compact(...)` so the Level-2
+    summary LLM call lands in the B4 cost ledger. That depends on
+    `GradualCompactor` threading `config` all the way through
+    `_soft_compact` (`compaction.py:411-417`) into
+    `summary_llm.ainvoke(..., config=config)`.
+
+    Without this test, a future refactor that drops the `**ainvoke_kwargs`
+    splat in `_soft_compact` would silently break B2's cost-ledger path.
+
+    Routing math (must enter Level 2):
+        soft=0.85, hard=0.95, safety_factor=1.0 (via _make_compactor() defaults)
+        sys=_pad(10) + 20×_pad(4) = 10 + 80 = 90 tokens
+        ratio = 90 / 100 = 0.9  ∈ (0.85, 0.95)  → ENTERS _soft_compact
+
+    Audit Round 13 P1 #1: do NOT pin `result.level_applied == 2`. After
+    `_soft_compact`, `try_compact` may post-verify-escalate to Level 3 if
+    the post-summary ratio is still above target. The capture happens
+    INSIDE ainvoke (Level-2 path) before any escalation — that's the
+    authoritative routing proof.
+    """
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    captured: dict = {}
+
+    class _CapturingSummaryLLM(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return "capture-stub"
+
+        def _generate(self, *a, **kw):
+            raise NotImplementedError
+
+        async def ainvoke(self, prompt, **kwargs):
+            captured["config"] = kwargs.get("config")
+            return AIMessage(
+                content='{"summary":"ok","key_facts":[],"open_questions":[]}',
+            )
+
+        def with_structured_output(self, schema, **kwargs):
+            return self
+
+    sentinel = {
+        "callbacks": [object()],
+        "metadata": {"langgraph_node": "context_compaction"},
+    }
+
+    c = _make_compactor()
+    sys_msg = SystemMessage(content=_pad(10))
+    others = [HumanMessage(content=_pad(4)) for _ in range(20)]
+    msgs = [sys_msg] + others
+
+    await c.try_compact(
+        messages=msgs,
+        context_window=100,
+        summary_llm=_CapturingSummaryLLM(),
+        config=sentinel,
+    )
+
+    assert captured.get("config") is sentinel, (
+        "GradualCompactor must forward `config` to summary_llm.ainvoke. "
+        "B2 emergency-compact cost-ledger relies on this contract. "
+        "If captured is empty, _soft_compact was never entered — check "
+        "soft/hard trigger ratios and re-tune _pad sizing so "
+        "usage_ratio ∈ (soft_trigger_ratio, hard_trigger_ratio)."
+    )

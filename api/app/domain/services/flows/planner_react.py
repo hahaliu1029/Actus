@@ -49,6 +49,7 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
 from langgraph.types import Command
 
+from app.domain.services.context.model_context_window import resolve_context_window
 from app.domain.services.graphs.event_bridge import GraphEventBridge
 from app.domain.services.graphs.main_graph import build_main_graph
 from app.domain.services.graphs.message_utils import (
@@ -453,7 +454,6 @@ class PlannerReActFlow(BaseFlow):
 
         # Context assembler (B2)
         from app.domain.services.graphs.context_assembler import ContextAssembler
-        from app.domain.services.context.model_context_window import resolve_context_window
         from app.domain.services.prompts.budget import compute_effective_window
 
         assembler = None
@@ -490,9 +490,11 @@ class PlannerReActFlow(BaseFlow):
             from app.infrastructure.external.llm.actus_recovery_chat_model import (
                 wrap_with_recovery,
             )
-            # PR-1: no callback yet (None). PR-2 adds _build_on_context_overflow_callback().
+            callback = None
+            if self._compactor is not None and self._overflow_config is not None:
+                callback = self._build_on_context_overflow_callback()
             self._llm = wrap_with_recovery(
-                self._llm, profile=self._profile, on_context_overflow=None,
+                self._llm, profile=self._profile, on_context_overflow=callback,
             )
             self._recovery_wrapped = True
 
@@ -693,8 +695,6 @@ class PlannerReActFlow(BaseFlow):
         if not self._overflow_config or not self._overflow_config.context_overflow_guard_enabled:
             return None
         # _compactor is always non-None when _overflow_config is non-None (see __init__)
-        from app.domain.services.context.model_context_window import resolve_context_window
-
         msgs = dicts_to_messages(memory.messages)
         total_window = resolve_context_window(
             self._overflow_config.model_name, self._overflow_config
@@ -740,6 +740,57 @@ class PlannerReActFlow(BaseFlow):
 
         self._last_compaction_result = result
         return result
+
+    def _build_on_context_overflow_callback(self):
+        """Session-scoped OnContextOverflow closure consumed by ActusRecoveryChatModel
+        when R4 (TriggerRecompact) fires on a CONTEXT_OVERFLOW classification.
+
+        Mirrors `_check_overflow` exactly so the proactive (post-tool) and emergency
+        (provider-400) compact paths share contract:
+          - Audit Round 9 P2 #2: respect `context_overflow_guard_enabled`. When the
+            guard is disabled the proactive path is off; the emergency path must
+            obey the same switch so users see consistent behavior.
+          - Audit Round 9 P1 #1: forward the same `cost_handler` + `langgraph_node=
+            "context_compaction"` metadata so Level-2 summary LLM calls land in
+            the B4 cost ledger.
+          - Audit Round 11 P1 #1: B2 hard-depends on `GradualCompactor.try_compact`
+            threading `config=` through to `summary_llm.ainvoke`. That contract
+            shipped in B4 M0 (`compaction.py:153-160` / `:411-417`); the
+            regression-lock test in Step 5b protects it.
+        """
+        compactor = self._compactor
+        overflow_config = self._overflow_config
+        summary_llm = self._summary_llm
+        cost_handler = getattr(self, "_cost_callback_handler", None)
+
+        async def callback(messages, kwargs):
+            if not overflow_config.context_overflow_guard_enabled:
+                return None
+            # Module-scope binding (see Step 1) so monkeypatch.setattr(
+            # planner_react, "resolve_context_window", ...) takes effect here.
+            total_window = resolve_context_window(overflow_config.model_name, overflow_config)
+            compact_config: dict | None = None
+            if cost_handler is not None:
+                compact_config = {
+                    "callbacks": [cost_handler],
+                    "metadata": {
+                        "langgraph_node": "context_compaction",
+                        "langgraph_step": 0,
+                    },
+                }
+            result = await compactor.try_compact(
+                messages=messages,
+                context_window=total_window,
+                summary_llm=summary_llm,
+                config=compact_config,
+            )
+            if result.tokens_after >= result.tokens_before:
+                return None
+            if result.level_applied == 0:
+                return None
+            return list(result.messages)
+
+        return callback
 
     def _is_skill_graph_active(self) -> bool:
         return is_skill_graph_enabled(self._user_id, self._skill_graph_canary_percent)
