@@ -13,19 +13,24 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from app.domain.external.telemetry import PromptTelemetryPort
+
+if TYPE_CHECKING:
+    from app.domain.services.recovery._event import RecoveryEvent
 
 logger = logging.getLogger(__name__)
 
 
 class JsonlPromptTelemetry(PromptTelemetryPort):
-    """Append-only JSONL writer for prompt assembly + LLM invocation telemetry.
+    """Append-only JSONL writer for prompt assembly, LLM invocation, and
+    B2 Recovery telemetry.
 
-    Two log files (created on demand under ``log_dir``):
+    Three log files (created on demand under ``log_dir``):
     - ``assembly.jsonl`` — one record per ``PromptAssembler.assemble`` call
     - ``llm_invocation.jsonl`` — one record per LLM adapter invoke (C11)
+    - ``recovery_event.jsonl`` — one record per B2 ``RecoveryEvent`` emit (Round 22 P1 #1)
 
     All writes are best-effort. On failure the error is logged at WARN
     level and the call returns normally — never raises.
@@ -89,6 +94,32 @@ class JsonlPromptTelemetry(PromptTelemetryPort):
                 "tools_hash": tools_hash,
                 "lang": lang,
                 "provider": provider,
+            },
+        )
+
+    def emit_recovery_event(self, event: "RecoveryEvent") -> None:
+        """Append a RecoveryEvent to recovery_event.jsonl. Best-effort.
+
+        Round 22 P1 #1: implements the new PromptTelemetryPort hook so B2
+        Recovery telemetry actually lands on disk in production.
+        """
+        self._append(
+            "recovery_event.jsonl",
+            {
+                "ts": _now_iso(),
+                "call_id": event.call_id,
+                "attempt_index": event.attempt_index,
+                "provider_id": event.provider_id,
+                "api_mode": event.api_mode,
+                "model_name": event.model_name,
+                "error_class": (
+                    event.error_class.value if event.error_class is not None else None
+                ),
+                "fingerprint_code": event.fingerprint_code,
+                "action_code": event.action_code,
+                "rewrite_applied_keys": list(event.rewrite_applied_keys),
+                "outcome": event.outcome,
+                "latency_ms": event.latency_ms,
             },
         )
 

@@ -178,3 +178,29 @@ def emit_invocation_telemetry(
         logger.warning(
             "[LLM Telemetry] record_llm_invocation failed (swallowed): %s", exc
         )
+
+
+def emit_recovery_event(adapter, event) -> None:
+    """Dispatch a RecoveryEvent to the adapter's attached telemetry.
+
+    Matches `emit_invocation_telemetry`'s non-blocking contract (line 141):
+    any telemetry failure is swallowed and logged at WARNING level so the
+    LLM call path is never broken by a telemetry bug.
+
+    Round 22 P1 #1 update: `PromptTelemetryPort.emit_recovery_event` is now
+    a declared Protocol method (Step 1), so production telemetries
+    implement it. The `getattr(... None)` fallback below is only for
+    legacy / test stubs that haven't been migrated to the new Protocol.
+    """
+    telemetry = getattr(adapter, "_telemetry", None)
+    if telemetry is None:
+        return
+    try:
+        hook = getattr(telemetry, "emit_recovery_event", None)
+        if hook is None:
+            return
+        hook(event)
+    except Exception as exc:  # pragma: no cover — defensive only
+        logger.warning(
+            "[LLM Telemetry] emit_recovery_event failed (swallowed): %s", exc,
+        )

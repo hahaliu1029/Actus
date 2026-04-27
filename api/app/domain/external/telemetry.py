@@ -6,15 +6,19 @@ B5 C1: defines ``PromptTelemetryPort`` Protocol consumed by ``PromptAssembler``
 The port keeps file I/O out of the domain layer (Clean Architecture).
 
 Deferred design debt (B5 eng review, TODOS.md #28): the port currently has
-2 methods (``record_assembly`` / ``record_llm_invocation``). If a second
-consumer is added (Datadog / Langfuse / OTel adapter etc.), the port should
-be split into ``AssemblyTelemetryPort`` / ``InvocationTelemetryPort`` per
-ISP. **Blocked on**: a concrete second consumer being in flight. Do not
+3 methods (``record_assembly`` / ``record_llm_invocation`` /
+``emit_recovery_event``). If a second consumer is added (Datadog / Langfuse
+/ OTel adapter etc.), the port should be split into
+``AssemblyTelemetryPort`` / ``InvocationTelemetryPort`` per ISP.
+**Blocked on**: a concrete second consumer being in flight. Do not
 split preemptively — YAGNI.
 """
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.domain.services.recovery._event import RecoveryEvent
 
 
 class PromptTelemetryPort(Protocol):
@@ -59,5 +63,13 @@ class PromptTelemetryPort(Protocol):
 
         Used by B5.5 follow-up to compute hit-rate ceilings before deciding
         whether to enable Anthropic prompt caching.
+        """
+        ...
+
+    def emit_recovery_event(self, event: "RecoveryEvent") -> None:
+        """Called by ActusRecoveryChatModel when a Recovery outcome fires
+        (retry_sent / rule_missed / budget_exhausted / success).
+
+        Side-effect-only. Swallow internal errors and log; never raise.
         """
         ...

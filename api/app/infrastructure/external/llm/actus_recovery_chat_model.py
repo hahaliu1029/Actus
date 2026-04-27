@@ -556,21 +556,29 @@ class ActusRecoveryChatModel(BaseChatModel):
         rewrite_applied_keys: tuple[str, ...],
         outcome: str,
     ) -> None:
-        """PR-1: log only. PR-3 wires to telemetry.
-
-        Outcome labels (4 total):
-          - ``retry_sent``: a rewrite was applied and the next attempt is starting.
-          - ``success``: the inner call succeeded after at least one retry.
-          - ``rule_missed``: I9 pass-through, or no rule matched.
-          - ``budget_exhausted``: rule existed but exhausted (caller-cap or
-            candidate-list).
-        """
-        logger.info(
-            "RecoveryEvent(call_id=%s, attempt=%d, outcome=%s, action=%s, "
-            "error_class=%s, fingerprint=%s, latency_ms=%d, rewrite_keys=%s)",
-            call_id, attempt_index, outcome, action_code,
-            error_class, fingerprint_code, latency_ms, rewrite_applied_keys,
+        from app.domain.services.recovery._event import RecoveryEvent
+        from app.infrastructure.external.llm._telemetry_mixin import (
+            emit_recovery_event,
         )
+
+        event = RecoveryEvent(
+            call_id=call_id,
+            attempt_index=attempt_index,
+            provider_id=self.profile.provider_id,
+            api_mode=self.api_mode,
+            model_name=getattr(self.inner, "model_name", self._llm_type),
+            error_class=error_class,
+            fingerprint_code=fingerprint_code,
+            action_code=action_code,
+            rewrite_applied_keys=rewrite_applied_keys,
+            outcome=outcome,  # type: ignore[arg-type]
+            latency_ms=latency_ms,
+        )
+        logger.info(
+            "RecoveryEvent(call_id=%s, attempt=%d, outcome=%s, action=%s)",
+            call_id, attempt_index, outcome, action_code,
+        )
+        emit_recovery_event(self, event)
 
 
 # ---------------------------------------------------------------------------

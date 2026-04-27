@@ -75,20 +75,43 @@ class TestInferredProviderSilentFallback:
     """When provider is NOT explicitly configured, inference unknowns silent-fall."""
 
     def test_inferred_unknown_provider_falls_back_with_warn(
-        self, caplog: pytest.LogCaptureFixture
+        self,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """bigmodel.cn base_url -> heuristic returns 'glm' (not yet registered)
-        -> silent fallback to generic_openai + WARN.
+        """Defensive contract: when ``infer_provider_from_base_url`` returns an
+        id that isn't in the registry, ``_build_llm`` must:
+          (a) silently fall back to ``generic_openai`` (no ConfigError raised),
+          (b) emit a WARN at the ``app.interfaces.service_dependencies`` logger
+              naming the unregistered inferred id.
 
-        Originally used moonshot.ai -> kimi_k2 when kimi_k2 was still un-registered
-        in P0.1. Task 2.1 registered kimi_k2, so this test now exercises a still-
-        unregistered inferred id (glm, scheduled for a later PR) to keep the
-        inferred-silent-fallback contract covered.
+        History: this test originally used ``moonshot.ai → kimi_k2`` (P0.1 era,
+        before kimi_k2 was registered), then ``bigmodel.cn → glm`` (pre-A7 P1).
+        Both targets have since been registered, so the heuristic no longer
+        returns an unregistered id from any real base_url. The defensive
+        try/except in ``service_dependencies.py:270-278`` is now unreachable
+        from production paths but is kept as a fail-safe for the case where a
+        future heuristic returns a new id before its profile lands. We
+        monkeypatch the heuristic to return a synthetic unregistered id so the
+        contract is verified regardless of registry state — this also stops
+        the test from drifting every time a new profile is registered.
         """
+        # `service_dependencies._build_llm` does a LOCAL import
+        # (`from app.domain.services.provider_profiles import ...,
+        # infer_provider_from_base_url, ...`) on each call, so we have to
+        # patch the source-package binding rather than service_dependencies'.
+        from app.domain.services import provider_profiles as profiles_pkg
+
+        monkeypatch.setattr(
+            profiles_pkg,
+            "infer_provider_from_base_url",
+            lambda *_args, **_kwargs: "future_unregistered_provider",
+        )
+
         cfg = LLMConfig(
-            base_url="https://open.bigmodel.cn/api/paas/v4",
+            base_url="https://api.example.com/v1",
             api_key="k",
-            model_name="glm-4",
+            model_name="some-model",
             # provider omitted -> inferred path
         )
         with caplog.at_level(
@@ -102,5 +125,10 @@ class TestInferredProviderSilentFallback:
         warn_msgs = [
             r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
         ]
-        # Must WARN about the inferred id not being registered.
-        assert any("falling back to generic_openai" in m for m in warn_msgs)
+        assert any("falling back to generic_openai" in m for m in warn_msgs), (
+            f"expected 'falling back to generic_openai' WARN at "
+            f"app.interfaces.service_dependencies; got {warn_msgs!r}"
+        )
+        assert any("future_unregistered_provider" in m for m in warn_msgs), (
+            f"WARN must name the unregistered inferred id; got {warn_msgs!r}"
+        )
