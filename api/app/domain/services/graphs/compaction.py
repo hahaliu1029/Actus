@@ -155,6 +155,8 @@ class GradualCompactor:
         messages: list[BaseMessage],
         context_window: int,
         summary_llm: "BaseChatModel | None",
+        *,
+        config: dict | None = None,
     ) -> CompactionResult:
         """Route to the appropriate compaction level based on current token usage.
 
@@ -198,6 +200,7 @@ class GradualCompactor:
                 context_window=context_window,
                 summary_llm=summary_llm,
                 tokens_before=tokens_before,
+                config=config,
             )
             # Post-verify: if still above target + 3% tolerance → escalate
             post_verify_threshold = self._target + 0.03
@@ -320,6 +323,8 @@ class GradualCompactor:
         context_window: int,
         summary_llm: "BaseChatModel",
         tokens_before: int,
+        *,
+        config: dict | None = None,
     ) -> CompactionResult:
         """Level 2: LLM summary compaction.
 
@@ -402,9 +407,14 @@ class GradualCompactor:
             messages_to_summarize=serialized_msgs,
         )
 
-        # Invoke LLM, fall back to hard compact on failure
+        # Invoke LLM, fall back to hard compact on failure.
+        # B4 M0: thread caller's config (callbacks + metadata) so
+        # graph-external compaction LLM call lands in the cost ledger.
+        ainvoke_kwargs: dict[str, object] = {}
+        if config is not None:
+            ainvoke_kwargs["config"] = config
         try:
-            llm_response = await summary_llm.ainvoke(prompt)
+            llm_response = await summary_llm.ainvoke(prompt, **ainvoke_kwargs)
             summary_text = llm_response.content if isinstance(llm_response.content, str) else str(llm_response.content)
         except Exception as exc:
             logger.warning("_soft_compact: LLM invocation failed (%s), falling back to Level 3", exc)

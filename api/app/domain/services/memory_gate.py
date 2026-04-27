@@ -190,11 +190,19 @@ class MemoryGateClassifier:
     async def classify(
         self,
         chunks: list[MemoryGateInput],
+        *,
+        config: dict | None = None,
     ) -> list[MemoryGateDecision]:
         """Evaluate a batch. Returns decisions in **arbitrary** order—
         callers must resolve by ``chunk_index``.
 
         空 batch → 空列表（不调 LLM）。
+
+        ``config`` is threaded to ``ainvoke`` so B4's CostCallbackHandler can
+        observe this graph-external LLM call. Callers inject
+        ``{"callbacks": [cost_handler], "metadata": {"langgraph_node":
+        "memory_gate", "langgraph_step": 0}}`` — without it the gate's
+        tokens don't reach the ledger.
         """
         if not chunks:
             return []
@@ -202,11 +210,15 @@ class MemoryGateClassifier:
         # 避免 LangChain SystemMessage / HumanMessage 循环依赖：用
         # list[tuple] 调 with_structured_output 即可。
         structured = self._llm.with_structured_output(_MemoryGateBatchDecision)
+        ainvoke_kwargs: dict[str, object] = {}
+        if config is not None:
+            ainvoke_kwargs["config"] = config
         raw: _MemoryGateBatchDecision = await structured.ainvoke(
             [
                 ("system", self._system_prompt),
                 ("user", _build_user_prompt(chunks)),
-            ]
+            ],
+            **ainvoke_kwargs,
         )
         return [
             MemoryGateDecision(

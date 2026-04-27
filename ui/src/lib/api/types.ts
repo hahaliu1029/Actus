@@ -781,3 +781,40 @@ export interface ReindexResponse {
   warnings: string[];
   fs_synced: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// B4 M0: cost ledger
+// ---------------------------------------------------------------------------
+
+/**
+ * Aggregate-level confidence in the cost number.
+ *
+ * - `actual`: every row's usage came from the provider.
+ * - `unknown`: provider didn't report usage, or no rows yet.
+ * - `partial`: session mixes actual + unknown rows, or a degraded persist
+ *   marker landed → ledger is known-incomplete.
+ * - `estimated`: reserved (M0 does not produce; see backend
+ *   `CostStatus` docstring).
+ */
+export type CostStatus = "actual" | "unknown" | "partial" | "estimated";
+
+/**
+ * Response shape for `GET /api/sessions/{session_id}/cost`.
+ *
+ * `total_usd` and the breakdown maps are serialized as decimal strings
+ * (backend `Decimal → format(v, "f")`) so we don't lose precision on small
+ * cache-hit deltas. The UI is responsible for parsing if it needs math; for
+ * display, render the string verbatim.
+ */
+export interface CostAggregateResponse {
+  total_usd: string;
+  record_count: number;
+  by_node: Record<string, string>;
+  by_model: Record<string, string>;
+  by_provider: Record<string, string>;
+  pricing_version: string;
+  cost_status: CostStatus;
+  first_record_at: string | null;
+  last_record_at: string | null;
+  has_partial_records: boolean;
+}

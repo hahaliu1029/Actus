@@ -125,7 +125,11 @@ class PlannerReActFlow(BaseFlow):
         memory_gate_threshold: float = 0.7,
         memory_gate_batch_cap: int = 20,
         memory_notification_emitter: Any = None,  # MemoryNotificationEmitter | None
+        # B4 M0: session-scoped CostCallbackHandler. When set, attached to
+        # every LangGraph invoke so LLM calls generate CostRecord rows.
+        cost_callback_handler: Any = None,
     ) -> None:
+        self._cost_callback_handler = cost_callback_handler
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_processor_lookup = file_processor_lookup
@@ -637,7 +641,20 @@ class PlannerReActFlow(BaseFlow):
         )
         messages = [HumanMessage(content=prompt)]
         structured = self._summary_llm.with_structured_output(ConversationSummaryResponse)
-        parsed: ConversationSummaryResponse | None = await structured.ainvoke(messages)
+        # B4 M0: graph-external LLM call — must thread the session cost
+        # callback explicitly (LangGraph context doesn't apply here).
+        ainvoke_kwargs: dict[str, object] = {}
+        if self._cost_callback_handler is not None:
+            ainvoke_kwargs["config"] = {
+                "callbacks": [self._cost_callback_handler],
+                "metadata": {
+                    "langgraph_node": "conversation_summary",
+                    "langgraph_step": 0,
+                },
+            }
+        parsed: ConversationSummaryResponse | None = await structured.ainvoke(
+            messages, **ainvoke_kwargs
+        )
         if parsed is None:
             parsed = ConversationSummaryResponse()
         return ConversationSummary(
@@ -668,10 +685,25 @@ class PlannerReActFlow(BaseFlow):
         # The assembler still uses effective_window (see _build_graphs) —
         # both layers derive from the same config, but each uses the
         # appropriate input for its internal math.
+        # B4 M0: graph-external — pass cost callback so Level-2 compaction's
+        # summary LLM call lands in the cost ledger with
+        # node_name="context_compaction". ``getattr`` guards against
+        # bypass-init tests; production __init__ always sets the attribute.
+        _cost_handler = getattr(self, "_cost_callback_handler", None)
+        compact_config: dict | None = None
+        if _cost_handler is not None:
+            compact_config = {
+                "callbacks": [_cost_handler],
+                "metadata": {
+                    "langgraph_node": "context_compaction",
+                    "langgraph_step": 0,
+                },
+            }
         result = await self._compactor.try_compact(
             messages=msgs,
             context_window=total_window,
             summary_llm=self._summary_llm,
+            config=compact_config,
         )
 
         if result.level_applied > 0:
@@ -920,8 +952,28 @@ class PlannerReActFlow(BaseFlow):
             HumanMessage(content=prompt),
         ]
         structured = self._llm.with_structured_output(PlanResponse)
+        # B4 M0: graph-external LLM call. When skill tools route through the
+        # detection planner, the produced plan is reused and the in-graph
+        # planner_node is skipped (see _try_drive_skill_graph reuse path),
+        # so without this the entire planner cost vanishes from the ledger.
+        # Attribute to "planner_node" so by_node aggregation matches the
+        # in-graph planner bucket.
+        # ``getattr`` guards against bypass-init tests (object.__new__ /
+        # MagicMock); production __init__ always sets the attribute.
+        _cost_handler = getattr(self, "_cost_callback_handler", None)
+        ainvoke_kwargs: dict[str, object] = {}
+        if _cost_handler is not None:
+            ainvoke_kwargs["config"] = {
+                "callbacks": [_cost_handler],
+                "metadata": {
+                    "langgraph_node": "planner_node",
+                    "langgraph_step": 0,
+                },
+            }
         try:
-            parsed: PlanResponse | None = await structured.ainvoke(messages)
+            parsed: PlanResponse | None = await structured.ainvoke(
+                messages, **ainvoke_kwargs
+            )
         except Exception:
             logger.warning("Planner structured output failed in detection, using fallback plan")
             parsed = None
@@ -1000,7 +1052,7 @@ class PlannerReActFlow(BaseFlow):
         )
         control = ExecutionControl()
 
-        return {
+        cfg: dict = {
             "configurable": {
                 "thread_id": self._session_id,
                 "skill_context_refresher": self._skill_context_refresher,
@@ -1037,6 +1089,14 @@ class PlannerReActFlow(BaseFlow):
                 "language_callback": self._language_callback,
             }
         }
+        # B4 M0: attach the session-scoped CostCallbackHandler so every LLM
+        # call inside the graph (planner, executor, updater, summarizer)
+        # fires on_chat_model_start → on_llm_end and writes a CostRecord.
+        # LangGraph merges ``callbacks`` with the adapter's own callback
+        # list so telemetry + cost stacking is additive.
+        if self._cost_callback_handler is not None:
+            cfg["callbacks"] = [self._cost_callback_handler]
+        return cfg
 
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """Run the flow — delegates to LangGraph main_graph."""
@@ -1494,7 +1554,18 @@ class PlannerReActFlow(BaseFlow):
                 MemoryGateInput(chunk_index=i, text=c.content)
                 for i, c in enumerate(chunks)
             ]
-            decisions = await classifier.classify(inputs)
+            # B4 M0: graph-external — thread cost callback so gate tokens
+            # reach the ledger with node_name="memory_gate".
+            gate_config: dict | None = None
+            if self._cost_callback_handler is not None:
+                gate_config = {
+                    "callbacks": [self._cost_callback_handler],
+                    "metadata": {
+                        "langgraph_node": "memory_gate",
+                        "langgraph_step": 0,
+                    },
+                }
+            decisions = await classifier.classify(inputs, config=gate_config)
         except Exception as exc:
             just_opened = False
             if self._memory_gate_breaker is not None:

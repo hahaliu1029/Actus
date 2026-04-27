@@ -9,7 +9,7 @@ Preserves the original summarizer_node contract:
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from app.domain.models.event import BaseEvent, MessageEvent
@@ -27,6 +27,8 @@ async def run_background_summary(
     summary_llm: BaseChatModel,
     on_event: Callable[[BaseEvent], Awaitable[None]],
     lang: str = "zh",
+    *,
+    callbacks: list[Any] | None = None,
 ) -> str | None:
     """Generate a user-visible streaming summary, independent of the graph.
 
@@ -36,6 +38,13 @@ async def run_background_summary(
     3. Emit final MessageEvent with parsed text + File attachments
 
     Returns the parsed summary text, or None if LLM produced no content.
+
+    B4 M0: ``callbacks`` lets the runner plumb the session-scoped
+    CostCallbackHandler into this graph-external LLM call. Without it the
+    summary's tokens don't hit the cost ledger (LangGraph metadata can't
+    propagate via context when the call is outside the graph).
+    ``metadata.langgraph_node`` is stamped to ``"background_summary"`` so
+    the aggregate's ``by_node`` breakdown attributes this call correctly.
     """
     from app.domain.services.prompts import get_prompt_bundle
 
@@ -43,8 +52,19 @@ async def run_background_summary(
     chunks: list[str] = []
     stream_id = str(uuid4())
 
+    astream_kwargs: dict[str, Any] = {}
+    if callbacks:
+        astream_kwargs["config"] = {
+            "callbacks": callbacks,
+            "metadata": {
+                "langgraph_node": "background_summary",
+                "langgraph_step": 0,
+            },
+        }
+
     async for chunk in summary_llm.astream(
-        messages + [HumanMessage(content=bundle.SUMMARIZE_PROMPT)]
+        messages + [HumanMessage(content=bundle.SUMMARIZE_PROMPT)],
+        **astream_kwargs,
     ):
         if chunk.content:
             chunks.append(chunk.content)

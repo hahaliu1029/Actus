@@ -37,6 +37,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    UsageMetadata,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 import httpx
@@ -60,6 +61,77 @@ def _default_generic_profile() -> Any:
     """
     from app.domain.services.provider_profiles import get_profile
     return get_profile("generic_openai")
+
+
+def _resp_get(obj: Any, name: str) -> Any:
+    """Read ``name`` from either a pydantic-style SDK object or a dict.
+
+    ``_agenerate`` accepts both: the OpenAI SDK returns a pydantic model
+    (attribute access), while proxies and some test doubles hand back a
+    ``dict`` (mapping access). Without this shim the dict path silently
+    produced ``cost_status=unknown`` because ``getattr(dict, "usage")`` is
+    always None.
+    """
+    from collections.abc import Mapping
+
+    if isinstance(obj, Mapping):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _extract_responses_usage_metadata(usage: Any) -> Optional[UsageMetadata]:
+    """Translate an OpenAI Responses API ``ResponseUsage`` into LangChain ``UsageMetadata``.
+
+    Responses API surface (differs from Chat Completions):
+        input_tokens                                  -> input_tokens
+        output_tokens                                 -> output_tokens
+        total_tokens (or input+output if absent)      -> total_tokens
+        input_tokens_details.cached_tokens            -> input_token_details.cache_read
+        output_tokens_details.reasoning_tokens        -> output_token_details.reasoning
+
+    Returns ``None`` when the provider omitted the usage block so B4
+    ``CostCallbackHandler`` can flag the row as ``unknown``. Accepts both
+    pydantic SDK objects and dicts (proxies / test doubles routinely hand
+    back a dict; see ``_agenerate``'s ``isinstance(response, dict)``
+    branch).
+    """
+    if usage is None:
+        return None
+
+    # Require at least one authoritative token counter field to be
+    # present. An empty ``usage`` payload (``{}`` / ``SimpleNamespace()`` /
+    # every counter None) must return ``None`` so
+    # ``CostCallbackHandler`` stamps ``cost_status=unknown`` — otherwise
+    # a CostRecord would land as "actual $0" and under-report real cost.
+    raw_input = _resp_get(usage, "input_tokens")
+    raw_output = _resp_get(usage, "output_tokens")
+    raw_total = _resp_get(usage, "total_tokens")
+    if raw_input is None and raw_output is None and raw_total is None:
+        return None
+
+    input_tokens = int(raw_input or 0)
+    output_tokens = int(raw_output or 0)
+    total_tokens = int(raw_total or (input_tokens + output_tokens))
+
+    result: UsageMetadata = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+    input_details = _resp_get(usage, "input_tokens_details")
+    if input_details is not None:
+        cached = _resp_get(input_details, "cached_tokens")
+        if cached is not None:
+            result["input_token_details"] = {"cache_read": int(cached)}
+
+    output_details = _resp_get(usage, "output_tokens_details")
+    if output_details is not None:
+        reasoning = _resp_get(output_details, "reasoning_tokens")
+        if reasoning is not None:
+            result["output_token_details"] = {"reasoning": int(reasoning)}
+
+    return result
 
 
 class ActusResponsesModel(BaseChatModel):
@@ -127,6 +199,20 @@ class ActusResponsesModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "actus-responses"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """Expose ``model`` + ``provider_id`` to LangChain callbacks.
+
+        ``BaseChatModel._get_invocation_params`` merges this dict into the
+        payload given to ``on_chat_model_start(**kwargs).invocation_params``.
+        B4's ``CostCallbackHandler`` reads ``model`` / ``provider_id`` from
+        there; without this override it would see only ``{'_type': 'actus-responses'}``.
+        """
+        return {
+            "model": self.model_name,
+            "provider_id": getattr(self.profile, "provider_id", None) or "unknown",
+        }
 
     # ---- B5 C11: telemetry hook ----------------------------------------- #
 
@@ -702,7 +788,13 @@ class ActusResponsesModel(BaseChatModel):
                 f"(no content, no tool_calls)"
             )
 
-        ai_message = AIMessage(content=content, tool_calls=tool_calls)
+        ai_message = AIMessage(
+            content=content,
+            tool_calls=tool_calls,
+            usage_metadata=_extract_responses_usage_metadata(
+                _resp_get(response, "usage")
+            ),
+        )
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 
     # ---- LangChain interface: _astream (async streaming) ----------------- #
@@ -734,6 +826,7 @@ class ActusResponsesModel(BaseChatModel):
                 }
                 for i, tc in enumerate(msg.tool_calls)
             ] if msg.tool_calls else [],
+            usage_metadata=getattr(msg, "usage_metadata", None),
         )
         gen_chunk = ChatGenerationChunk(message=ai_chunk)
 

@@ -347,6 +347,20 @@ class AgentService:
         )
 
         # 6.创建AgentTaskRunner
+        # B4 M0: build the session-scoped CostCallbackHandler here (before
+        # runner construction) so every LLM call inside the graph emits a
+        # CostRecord. The factory closes over ``self._uow_factory`` so each
+        # persist opens its own short-lived UoW.
+        from app.application.services.cost_callback_factory import (
+            build_cost_callback_handler,
+        )
+
+        cost_callback_handler = build_cost_callback_handler(
+            session_id=session.id,
+            user_id=session.user_id,
+            uow_factory=self._uow_factory,
+        )
+
         task_runner = AgentTaskRunner(
             uow_factory=self._uow_factory,
             llm=snap.llm,
@@ -395,6 +409,7 @@ class AgentService:
             # ActusChatModel / ActusResponsesModel / ActusFallbackChatModel all
             # expose ``.profile`` (see _build_llm in service_dependencies.py).
             profile=getattr(snap.llm, "profile", None),
+            cost_callback_handler=cost_callback_handler,
         )
 
         # 6.创建任务Task并更新会话中的信息

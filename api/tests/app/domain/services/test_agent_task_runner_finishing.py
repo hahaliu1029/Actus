@@ -151,7 +151,10 @@ async def test_do_postprocess_calls_persist_then_flush_then_summary():
         new_callable=AsyncMock,
     ) as mock_summary:
         mock_summary.return_value = "summary text"
-        async def side_effect(msgs, llm, on_event, lang="zh"):
+        async def side_effect(msgs, llm, on_event, lang="zh", **kwargs):
+            # **kwargs tolerates the cost-handler ``callbacks=`` plumbing
+            # added in B4 M0 — keeps these mocks robust to future signature
+            # extensions on ``run_background_summary``.
             call_order.append("summary")
             return "summary text"
         mock_summary.side_effect = side_effect
@@ -198,7 +201,7 @@ async def test_do_postprocess_summary_partial_persist_false():
         "app.domain.services.agent_task_runner.run_background_summary",
         new_callable=AsyncMock,
     ) as mock_summary:
-        async def emit_events(msgs, llm, on_event, lang="zh"):
+        async def emit_events(msgs, llm, on_event, lang="zh", **kwargs):
             await on_event(MessageEvent(role="assistant", message="hi", partial=True))
             await on_event(MessageEvent(role="assistant", message="hi world", partial=False))
         mock_summary.side_effect = emit_events
@@ -221,7 +224,7 @@ async def test_do_postprocess_summary_updates_latest_message_and_unread():
         "app.domain.services.agent_task_runner.run_background_summary",
         new_callable=AsyncMock,
     ) as mock_summary:
-        async def emit_final(msgs, llm, on_event, lang="zh"):
+        async def emit_final(msgs, llm, on_event, lang="zh", **kwargs):
             await on_event(MessageEvent(role="assistant", message="Final summary", partial=False))
         mock_summary.side_effect = emit_final
 
@@ -247,7 +250,7 @@ async def test_do_postprocess_partial_summary_does_not_update_latest_message():
         "app.domain.services.agent_task_runner.run_background_summary",
         new_callable=AsyncMock,
     ) as mock_summary:
-        async def emit_partial_only(msgs, llm, on_event, lang="zh"):
+        async def emit_partial_only(msgs, llm, on_event, lang="zh", **kwargs):
             await on_event(MessageEvent(role="assistant", message="Partial...", partial=True))
         mock_summary.side_effect = emit_partial_only
 

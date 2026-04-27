@@ -4,6 +4,7 @@ from . import (
     admin_routes,
     app_config_routes,
     auth_routes,
+    cost_routes,
     file_routes,
     memory_routes,
     notification_routes,
@@ -43,6 +44,7 @@ def create_api_routes() -> APIRouter:
     api_router.include_router(admin_routes.router)
 
     api_router.include_router(session_routes.router)
+    api_router.include_router(cost_routes.router)
 
     return api_router
 

@@ -2,6 +2,7 @@ import { createSSEStream, get, parseSSEStream, post } from "./fetch";
 import { fileTransferClient } from "./axios-client";
 import type {
   ChatParams,
+  CostAggregateResponse,
   CreateSessionResponse,
   EndTakeoverParams,
   EndTakeoverResponse,
@@ -246,5 +247,16 @@ export const sessionApi = {
 
   reopenTakeover: (sessionId: string): Promise<ReopenTakeoverResponse> => {
     return post<ReopenTakeoverResponse>(`/sessions/${sessionId}/takeover/reopen`, {});
+  },
+
+  /**
+   * B4 M0: per-session LLM cost rollup.
+   *
+   * Returns aggregate `total_usd` + breakdowns + `cost_status` so the UI
+   * can show "partial / unknown" badges when the ledger is degraded.
+   * Decimal fields are strings — render verbatim.
+   */
+  getSessionCost: (sessionId: string): Promise<CostAggregateResponse> => {
+    return get<CostAggregateResponse>(`/sessions/${sessionId}/cost`);
   },
 };

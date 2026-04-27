@@ -218,11 +218,17 @@ class AgentTaskRunner(TaskRunner):
         tool_runtime: ToolRuntimeConfig | None = None,  # R2 CS2: wrapper cap + smart-approve timeout
         on_session_complete=None,  # Callback: async (session_id) -> None, called after COMPLETED/TIMED_OUT
         profile: "ProviderProfile | None" = None,  # A7 Task 2.7: provider capability profile (accepts_image_url, image_max_bytes, ...)
+        # B4 M0: session-scoped CostCallbackHandler. Built by agent_service
+        # via ``build_cost_callback_handler`` and forwarded into the flow so
+        # every LLM call inside the graph emits a CostRecord. None = disabled
+        # (legacy path / tests that bypass cost tracking).
+        cost_callback_handler: Any = None,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # A7 Task 2.7: provider capability profile. None = legacy behavior
         # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
         self.profile = profile
+        self._cost_callback_handler = cost_callback_handler
         self._on_session_complete = on_session_complete
         self._approval_state_reader = approval_state_reader
         self._approval_state_writer = approval_state_writer
@@ -435,6 +441,8 @@ class AgentTaskRunner(TaskRunner):
             confirmation_manager=self._confirmation_manager,
             prompt_assembler=prompt_assembler,
             tool_runtime=self._tool_runtime,
+            # B4 M0: session-scoped cost callback attached into every invoke.
+            cost_callback_handler=self._cost_callback_handler,
         )
 
     def _build_prompt_telemetry(self) -> Any:
@@ -1120,10 +1128,25 @@ class AgentTaskRunner(TaskRunner):
         if cached is not None:
             return cached, "llm", False, True, 0
 
+        # B4 M0: thread session-scoped cost callback into the continuation
+        # classifier (graph-external LLM call). ``getattr`` guards
+        # bypass-init test fixtures.
+        _cost_handler = getattr(self, "_cost_callback_handler", None)
+        classifier_config: dict | None = None
+        if _cost_handler is not None:
+            classifier_config = {
+                "callbacks": [_cost_handler],
+                "metadata": {
+                    "langgraph_node": "continuation_classifier",
+                    "langgraph_step": 0,
+                },
+            }
+
         started = time.perf_counter()
         decision = await self._continuation_classifier.classify(
             current_message=message,
             previous_substantive_message=self._last_substantive_user_message,
+            config=classifier_config,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         self._set_cached_continuation_decision(cache_key, decision)
@@ -2639,8 +2662,21 @@ class AgentTaskRunner(TaskRunner):
                             logger.warning("Summary latest_message update failed: %s", e)
 
                 _summary_lang = (flow._deferred_final_state or {}).get("language", "zh")
+                # B4 M0: thread the session-scoped cost callback into the
+                # graph-external summary call so its tokens reach the ledger
+                # with node_name="background_summary". Use ``getattr`` so
+                # tests that bypass ``__init__`` (``object.__new__``) still
+                # work — the attribute is simply absent → no callbacks.
+                _cost_handler = getattr(self, "_cost_callback_handler", None)
+                _cost_callbacks = (
+                    [_cost_handler] if _cost_handler is not None else None
+                )
                 await run_background_summary(
-                    messages, flow.summary_llm, _on_summary_event, lang=_summary_lang,
+                    messages,
+                    flow.summary_llm,
+                    _on_summary_event,
+                    lang=_summary_lang,
+                    callbacks=_cost_callbacks,
                 )
             except asyncio.CancelledError:
                 # Send a final non-partial message to clear the ghost partial
@@ -2695,7 +2731,27 @@ class AgentTaskRunner(TaskRunner):
         Consolidates the COMPLETED/TIMED_OUT write + lifecycle suspend notification
         so all completion paths (invoke, resume, CancelledError, Exception) go through
         one place.
+
+        B4 M0: before marking the session terminal, drain any in-flight
+        CostCallbackHandler persist tasks so the cost ledger is complete when
+        the UI first queries ``GET /cost``. A failing flush is logged but
+        does not block the terminal transition — the degraded-session marker
+        (design Issue 1D) will be added alongside the shield wrap in a
+        follow-up.
         """
+        if self._cost_callback_handler is not None:
+            try:
+                # Cap the drain at 3s so a stuck DB / connection pool doesn't
+                # wedge the session in FINISHING. Pending tasks keep running
+                # in the background; any failures are already logged by
+                # ``_persist_safely``.
+                await self._cost_callback_handler.flush_pending(timeout=3.0)
+            except Exception as exc:  # noqa: BLE001 — terminal path must not stall
+                logger.warning(
+                    "CostCallbackHandler.flush_pending failed on terminal "
+                    "transition (session_id=%s, status=%s): %s",
+                    self._session_id, status, exc,
+                )
         async with self._uow:
             await self._uow.session.update_status(self._session_id, status)
         if self._on_session_complete is not None:

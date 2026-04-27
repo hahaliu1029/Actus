@@ -30,6 +30,8 @@ class ContinuationIntentClassifier:
         self,
         current_message: str,
         previous_substantive_message: str,
+        *,
+        config: dict | None = None,
     ) -> bool:
         if not current_message or not previous_substantive_message:
             return False
@@ -44,12 +46,21 @@ class ContinuationIntentClassifier:
             ),
         ]
 
+        # B4 M0: ``config`` carries the session-scoped CostCallbackHandler
+        # plus metadata.langgraph_node="continuation_classifier" so this
+        # graph-external LLM call lands in the cost ledger. Caller is
+        # responsible for building it; default None preserves legacy paths.
+        ainvoke_kwargs: dict[str, object] = {
+            "response_format": {"type": "json_object"},
+            "tool_choice": "none",
+        }
+        if config is not None:
+            ainvoke_kwargs["config"] = config
+
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 response = await self._llm.ainvoke(
-                    messages,
-                    response_format={"type": "json_object"},
-                    tool_choice="none",
+                    messages, **ainvoke_kwargs
                 )
         except Exception as exc:
             logger.warning("续写意图LLM判定失败，回退false: %s", str(exc))

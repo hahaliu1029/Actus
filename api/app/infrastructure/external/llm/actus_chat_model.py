@@ -31,6 +31,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    UsageMetadata,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 import httpx
@@ -59,6 +60,60 @@ def _default_generic_profile() -> Any:
     """
     from app.domain.services.provider_profiles import get_profile
     return get_profile("generic_openai")
+
+
+def _extract_usage_metadata(usage: Any) -> Optional[UsageMetadata]:
+    """Translate an OpenAI SDK ``CompletionUsage`` into LangChain ``UsageMetadata``.
+
+    Returns ``None`` when the provider omitted the usage block, so callers
+    (e.g. B4 ``CostCallbackHandler``) can correctly distinguish actual usage
+    from a missing-data case and flag the row as ``estimated`` instead of
+    silently persisting zeros.
+
+    Mapping (OpenAI Chat Completions surface):
+        prompt_tokens                                    -> input_tokens
+        completion_tokens                                -> output_tokens
+        total_tokens (or input+output if absent)         -> total_tokens
+        prompt_tokens_details.cached_tokens              -> input_token_details.cache_read
+        completion_tokens_details.reasoning_tokens       -> output_token_details.reasoning
+    """
+    if usage is None:
+        return None
+
+    # Require at least one authoritative token counter field to be
+    # present. An empty ``usage`` object (``SimpleNamespace()`` /
+    # ``{}`` / ``usage=None-on-every-field``) must flow through as
+    # ``None`` so ``CostCallbackHandler`` stamps ``cost_status=unknown``
+    # instead of silently recording an "actual $0" row with zero tokens.
+    raw_prompt = getattr(usage, "prompt_tokens", None)
+    raw_completion = getattr(usage, "completion_tokens", None)
+    raw_total = getattr(usage, "total_tokens", None)
+    if raw_prompt is None and raw_completion is None and raw_total is None:
+        return None
+
+    input_tokens = int(raw_prompt or 0)
+    output_tokens = int(raw_completion or 0)
+    total_tokens = int(raw_total or (input_tokens + output_tokens))
+
+    result: UsageMetadata = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    if prompt_details is not None:
+        cached = getattr(prompt_details, "cached_tokens", None)
+        if cached is not None:
+            result["input_token_details"] = {"cache_read": int(cached)}
+
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    if completion_details is not None:
+        reasoning = getattr(completion_details, "reasoning_tokens", None)
+        if reasoning is not None:
+            result["output_token_details"] = {"reasoning": int(reasoning)}
+
+    return result
 
 
 class ActusChatModel(BaseChatModel):
@@ -124,6 +179,22 @@ class ActusChatModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "actus-chat"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """Expose ``model`` + ``provider_id`` to LangChain callbacks.
+
+        ``BaseChatModel._get_invocation_params`` merges this dict into the
+        payload handed to ``on_chat_model_start(**kwargs).invocation_params``.
+        B4's ``CostCallbackHandler`` reads ``model`` and ``provider_id``
+        from there to stamp the CostRecord — without this override it would
+        see only ``{'_type': 'actus-chat'}`` and fall back to
+        ``model='unknown'`` / heuristic provider inference.
+        """
+        return {
+            "model": self.model_name,
+            "provider_id": getattr(self.profile, "provider_id", None) or "unknown",
+        }
 
     # ---- B5 C11: telemetry hook ----------------------------------------- #
 
@@ -726,6 +797,7 @@ class ActusChatModel(BaseChatModel):
             content=content,
             tool_calls=tool_calls,
             additional_kwargs=ak,
+            usage_metadata=_extract_usage_metadata(getattr(response, "usage", None)),
         )
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 
@@ -829,6 +901,13 @@ class ActusChatModel(BaseChatModel):
         if stop:
             params["stop"] = stop
 
+        # B4 M0: opt into upstream usage reporting on streaming responses so
+        # CostCallbackHandler can read usage_metadata off the aggregated
+        # AIMessageChunk. Setdefault preserves any caller override.
+        stream_options = dict(params.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        params["stream_options"] = stream_options
+
         # B5 C11: emit telemetry (non-blocking — any failure is swallowed)
         from app.infrastructure.external.llm._telemetry_mixin import (
             emit_invocation_telemetry,
@@ -898,8 +977,26 @@ class ActusChatModel(BaseChatModel):
         has_content = False
         try:
             async for chunk in stream:
-                # Guard against proxies yielding raw strings or malformed chunks
+                # B4 M0: OpenAI with stream_options.include_usage=true sends a
+                # trailing chunk where choices=[] and usage is populated. Emit
+                # it as a terminal AIMessageChunk carrying usage_metadata so
+                # CostCallbackHandler (reading the aggregated message) sees
+                # provider-reported counters. Still continue — there is no
+                # content/tool delta on that chunk.
                 if not hasattr(chunk, "choices") or not chunk.choices:
+                    usage_meta = _extract_usage_metadata(
+                        getattr(chunk, "usage", None)
+                    )
+                    if usage_meta is not None:
+                        usage_msg = AIMessageChunk(
+                            content="", usage_metadata=usage_meta
+                        )
+                        usage_gen = ChatGenerationChunk(message=usage_msg)
+                        if run_manager:
+                            await run_manager.on_llm_new_token(
+                                "", chunk=usage_gen
+                            )
+                        yield usage_gen
                     continue
 
                 delta = chunk.choices[0].delta
@@ -927,10 +1024,17 @@ class ActusChatModel(BaseChatModel):
                 if content or tool_call_chunks or chunk_ak:
                     has_content = True
 
+                # Some providers attach usage to the final delta chunk (rather
+                # than a separate no-choices chunk). Pick it up here too.
+                chunk_usage_meta = _extract_usage_metadata(
+                    getattr(chunk, "usage", None)
+                )
+
                 ai_chunk = AIMessageChunk(
                     content=content,
                     tool_call_chunks=tool_call_chunks if tool_call_chunks else [],
                     additional_kwargs=chunk_ak,
+                    usage_metadata=chunk_usage_meta,
                 )
                 gen_chunk = ChatGenerationChunk(message=ai_chunk)
 

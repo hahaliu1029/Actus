@@ -6,6 +6,7 @@ import { useState } from "react";
 import { EllipsisVertical, House } from "lucide-react";
 
 import { ManusSettings } from "@/components/manus-settings";
+import { SessionCostSummary } from "@/components/session-cost-summary";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -83,7 +84,10 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
         <h1 className="text-base font-semibold text-foreground">
           {session?.title || "未命名任务"}
         </h1>
-        <p className="text-xs text-muted-foreground">会话 ID：{sessionId}</p>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <p className="text-xs text-muted-foreground">会话 ID：{sessionId}</p>
+          <SessionCostSummary sessionId={sessionId} />
+        </div>
       </div>
       {isMobile ? (
         <div className="flex items-center gap-2">

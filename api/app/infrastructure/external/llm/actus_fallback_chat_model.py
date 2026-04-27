@@ -71,6 +71,101 @@ _FALLBACK_TRIGGER_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+async def _stamp_fallback_escalation(
+    stream: AsyncIterator[ChatGenerationChunk],
+    fallback_adapter: BaseChatModel,
+) -> AsyncIterator[ChatGenerationChunk]:
+    """Tag the first chunk from fallback with escalation metadata.
+
+    Streaming path can't use ``_notify_fallback_escalation`` because
+    ``BaseChatModel.astream`` doesn't thread ``run_manager`` down to subclass
+    ``_astream`` (see ``langchain_core/language_models/chat_models.py``
+    line ~668). We encode ``attempt_ix`` / ``model`` / ``provider_id`` into
+    the chunk's ``response_metadata``; ``merge_chat_generation_chunks``
+    propagates that into the merged message passed to ``on_llm_end``, and
+    the handler applies it to the pending entry there.
+    """
+    try:
+        id_params = dict(fallback_adapter._identifying_params or {})
+    except Exception:  # noqa: BLE001
+        id_params = {}
+    stamped = False
+    async for chunk in stream:
+        if not stamped:
+            stamped = True
+            try:
+                msg = chunk.message
+                rm = dict(getattr(msg, "response_metadata", None) or {})
+                rm.setdefault("actus_fallback_attempt_ix", 1)
+                fb_model = id_params.get("model")
+                fb_provider = id_params.get("provider_id")
+                if fb_model:
+                    rm.setdefault("actus_fallback_model", fb_model)
+                if fb_provider:
+                    rm.setdefault("actus_fallback_provider", fb_provider)
+                msg.response_metadata = rm
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to stamp fallback escalation metadata: %s", exc
+                )
+        yield chunk
+
+
+def _notify_fallback_escalation(
+    run_manager: Optional[AsyncCallbackManagerForLLMRun],
+    fallback_adapter: BaseChatModel,
+) -> None:
+    """Duck-typed hook: tell cost/telemetry handlers that fallback engaged.
+
+    Any handler attached to this run that exposes
+    ``mark_fallback_escalation(run_id, *, attempt_ix=..., model=..., provider=...)``
+    gets notified. ``CostCallbackHandler`` uses this to stamp
+    ``attempt_ix=1`` on the CostRecord **and** to swap the pending entry's
+    ``model`` / ``provider`` over to the fallback adapter's identity — so
+    the CostRecord reflects the adapter that actually billed instead of the
+    primary whose ``_identifying_params`` was captured on start.
+
+    Errors from handlers are swallowed — a buggy handler must not break
+    the LLM call path (same invariant as ``_persist_safely``).
+    """
+    if run_manager is None:
+        return
+    # Extract fallback's model/provider so handlers can correct the
+    # attribution. ``_identifying_params`` is a property on BaseChatModel;
+    # Actus adapters override it to expose real values.
+    try:
+        id_params = dict(fallback_adapter._identifying_params or {})
+    except Exception:
+        id_params = {}
+    fb_model = id_params.get("model")
+    fb_provider = id_params.get("provider_id")
+
+    handlers = getattr(run_manager, "handlers", None) or []
+    inline_handlers = getattr(run_manager, "inheritable_handlers", None) or []
+    # Inheritable handlers may duplicate entries in ``handlers``; a set of
+    # ids avoids double-notification.
+    seen: set[int] = set()
+    for h in list(handlers) + list(inline_handlers):
+        if id(h) in seen:
+            continue
+        seen.add(id(h))
+        hook = getattr(h, "mark_fallback_escalation", None)
+        if hook is None:
+            continue
+        try:
+            hook(
+                run_manager.run_id,
+                attempt_ix=1,
+                model=fb_model,
+                provider=fb_provider,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Handler %r.mark_fallback_escalation failed: %s",
+                type(h).__name__, exc,
+            )
+
+
 class ActusFallbackChatModel(BaseChatModel):
     """BaseChatModel that tries *primary* first and falls back to *fallback*.
 
@@ -92,6 +187,22 @@ class ActusFallbackChatModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
         return "actus-fallback"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """Delegate ``model`` + ``provider_id`` to the primary adapter.
+
+        Fallback is transparent by design — the primary's model/provider is
+        what the caller "asked for", and since a successful primary
+        invocation is the common case, attributing cost to the primary is
+        the correct default. If fallback engages, ``attempt_ix`` should
+        reflect that (tracked separately as a post-M0 follow-up).
+        """
+        primary = self.primary
+        model = getattr(primary, "model_name", None) or "unknown"
+        profile = getattr(primary, "profile", None)
+        provider_id = getattr(profile, "provider_id", None) or "unknown"
+        return {"model": model, "provider_id": provider_id}
 
     # ---- B5 C11: telemetry hook ----------------------------------------- #
 
@@ -199,6 +310,7 @@ class ActusFallbackChatModel(BaseChatModel):
                 "Primary LLM (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,
             )
+            _notify_fallback_escalation(run_manager, self.fallback)
             return await self.fallback._agenerate(
                 messages, stop=stop, run_manager=run_manager, **kwargs,
             )
@@ -252,8 +364,19 @@ class ActusFallbackChatModel(BaseChatModel):
                 "Primary LLM stream (%s) protocol incompatible, escalating to %s: %s",
                 self.primary._llm_type, self.fallback._llm_type, primary_exc,
             )
-            async for chunk in self.fallback._astream(
-                messages, stop=stop, run_manager=run_manager, **kwargs,
+            # Streaming path: ``BaseChatModel.astream`` (langchain-core
+            # chat_models.py line 668) does NOT forward ``run_manager`` into
+            # the subclass ``_astream``, so ``_notify_fallback_escalation``
+            # sees ``run_manager=None`` and can't reach the handler. We
+            # instead stamp the first fallback chunk's ``response_metadata``
+            # with escalation info; the merged AIMessage on ``on_llm_end``
+            # carries it and the handler applies it to the pending entry.
+            _notify_fallback_escalation(run_manager, self.fallback)
+            async for chunk in _stamp_fallback_escalation(
+                self.fallback._astream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs,
+                ),
+                self.fallback,
             ):
                 yield chunk
 

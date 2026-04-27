@@ -321,7 +321,15 @@ class _FakeContinuationClassifier:
         self.decision = decision
         self.calls: list[tuple[str, str]] = []
 
-    async def classify(self, current_message: str, previous_substantive_message: str) -> bool:
+    async def classify(
+        self,
+        current_message: str,
+        previous_substantive_message: str,
+        **kwargs,
+    ) -> bool:
+        # **kwargs tolerates the cost-handler ``config=`` plumbing added
+        # in B4 M0 — keeps this fixture robust to future signature
+        # extensions on ``ContinuationIntentClassifier.classify``.
         self.calls.append((current_message, previous_substantive_message))
         return self.decision
 

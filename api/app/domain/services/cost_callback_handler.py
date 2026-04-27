@@ -1,0 +1,561 @@
+"""B4 M0 Phase E: CostCallbackHandler — turns LangChain callbacks into CostRecords.
+
+One handler is attached per session. It:
+
+- On ``on_chat_model_start``: caches the call's metadata (``langgraph_node``,
+  ``langgraph_step``) + invocation params (``model``) under ``run_id`` in a
+  bounded LRU (Issue 1C: maxsize=10_000 so missing-``on_llm_end`` paths can't
+  OOM the process over days of uptime).
+- On ``on_llm_end``: pops the cached entry, extracts ``usage_metadata`` off
+  the returned ``AIMessage``, computes ``total_usd`` via ``compute_cost``,
+  builds a ``CostRecord``, and schedules persistence via
+  ``asyncio.create_task`` so the callback returns in sync-path p99 < 2ms.
+
+Design notes:
+- The persister is injected so tests use a simple list-append and prod uses
+  a fresh ``DBUnitOfWork`` per call (cheap + avoids session leaks).
+- Persister exceptions are swallowed — a failing DB must not take down the
+  LLM call path. The circuit breaker (future extension) keeps the write
+  path short-circuited while DB is down.
+- ``flush_pending`` is exposed for tests and for FINISHING-drain safety.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Awaitable, Callable, List, Mapping, Optional
+from uuid import UUID
+
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import LLMResult
+
+from app.domain.models.cost_record import CostRecord, CostStatus
+from app.domain.services.pricing.static_pricing import (
+    PRICING_VERSION,
+    compute_cost,
+    get_price,
+)
+
+logger = logging.getLogger(__name__)
+
+
+Persister = Callable[[CostRecord], Awaitable[None]]
+
+
+@dataclass
+class _PendingEntry:
+    run_id: UUID
+    metadata: dict
+    model: str
+    provider: str
+    attempt_ix: int = 0
+
+
+# Translate internal LangGraph node names to stable product-level names.
+# by_node shows up in the UI, so we don't want a refactor that renames
+# ``planner_node`` → ``planner_v2`` to break downstream dashboards.
+# Unknown nodes pass through verbatim and get caught by the coverage test.
+_LANGGRAPH_NODE_MAP: dict[str, str] = {
+    # main_graph.py
+    "planner_node": "planner",
+    "executor_node": "executor",
+    "updater_node": "updater",
+    "summarizer_node": "summarizer",
+    "interrupt_node": "interrupt",
+    # react_graph.py
+    "pre_llm_node": "react_pre_llm",
+    "llm_node": "react_llm",
+    "tool_node": "react_tool",
+    "interrupt_helper": "interrupt",
+    # graph-external calls (set explicitly via metadata by the caller).
+    # Every string here matches a literal ``metadata.langgraph_node``
+    # value emitted from somewhere in the codebase — keeping the entry
+    # makes the bucket name stable across LangGraph internal renames
+    # and refactors. The node-mapping test enumerates these as the
+    # authoritative graph-external-bucket allowlist.
+    "background_summary": "background_summary",
+    "conversation_summary": "conversation_summary",
+    "memory_gate": "memory_gate",
+    "context_compaction": "context_compaction",
+    "continuation_classifier": "continuation_classifier",
+    # fallback attribution — LLM call outside any known node
+    "out_of_graph": "out_of_graph",
+    # internal marker written by _persist_safely's degraded retry
+    "persist_degraded": "persist_degraded",
+}
+
+
+def _map_node_name(raw: str | None) -> str:
+    if not raw:
+        return "out_of_graph"
+    return _LANGGRAPH_NODE_MAP.get(raw, raw)
+
+
+def _infer_provider(model: str) -> str:
+    """Best-effort provider tag from model name. Rough classifier; M0 only."""
+    m = (model or "").lower()
+    if m.startswith(("gpt-", "o1")):
+        return "openai"
+    if m.startswith("deepseek"):
+        return "deepseek"
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith("gemini"):
+        return "google"
+    if m.startswith(("kimi", "moonshot")):
+        return "moonshot"
+    if m.startswith("glm"):
+        return "zhipu"
+    if m.startswith(("qwen", "qwen-vl")):
+        return "dashscope"
+    return "unknown"
+
+
+class CostCallbackHandler(AsyncCallbackHandler):
+    """LangChain async handler that records one CostRecord per LLM invocation."""
+
+    def __init__(
+        self,
+        session_id: str,
+        user_id: str,
+        persister: Persister,
+        *,
+        max_pending: int = 10_000,
+    ) -> None:
+        super().__init__()
+        self.session_id = session_id
+        self.user_id = user_id
+        self._persister = persister
+        self._pending: "OrderedDict[UUID, _PendingEntry]" = OrderedDict()
+        self._max_pending = max_pending
+        self._active_tasks: set[asyncio.Task] = set()
+        # Count real-persist failures; each failure also triggers a
+        # best-effort degraded-marker insert so aggregation surfaces
+        # ``partial`` instead of silently reporting ``actual`` with missing
+        # rows. Consumers can also read this directly from memory (e.g.
+        # terminal-status code) to add a final session-level signal.
+        self._persist_failure_count: int = 0
+
+    # ---- LangChain callback surface ------------------------------------- #
+
+    async def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: List[List[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        invocation_params = kwargs.get("invocation_params") or {}
+        model = str(invocation_params.get("model") or "unknown")
+        # Prefer the authoritative provider_id plumbed from ProviderProfile
+        # (via adapter ``_identifying_params``); only fall back to the name-
+        # prefix heuristic when the adapter hasn't declared one.
+        provider_id = invocation_params.get("provider_id")
+        provider = (
+            str(provider_id)
+            if provider_id and provider_id != "unknown"
+            else _infer_provider(model)
+        )
+        entry = _PendingEntry(
+            run_id=run_id,
+            metadata=dict(metadata or {}),
+            model=model,
+            provider=provider,
+        )
+
+        # Bounded LRU — Issue 1C. Evict oldest BEFORE insert so the invariant
+        # `len(pending) <= max_pending` is preserved post-insert.
+        while len(self._pending) >= self._max_pending:
+            evicted_key, _ = self._pending.popitem(last=False)
+            logger.warning(
+                "CostCallbackHandler: LRU evicted pending run_id=%s "
+                "(session_id=%s, cap=%d) — missing on_llm_end path",
+                evicted_key,
+                self.session_id,
+                self._max_pending,
+            )
+
+        self._pending[run_id] = entry
+
+    async def on_llm_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Handle an errored/cancelled LLM run.
+
+        LangChain fires ``on_llm_error`` instead of ``on_llm_end`` on errors
+        and cancellations, and for streaming mid-flight failures it still
+        hands us the already-merged partial ``LLMResult`` via
+        ``kwargs["response"]`` (see langchain_core chat_models.py lines
+        ~712-722). Mid-flight failures matter for the ledger because the
+        provider may well have already billed tokens that streamed before
+        the error: user disconnected an SSE, a retryable upstream 5xx
+        arrived after half the tokens, etc.
+
+        Behavior:
+        - Early failure (no partial response) → just pop the pending entry;
+          nothing to bill.
+        - Partial response with usage_metadata → write a CostRecord with
+          ``cost_status=UNKNOWN`` + tokens/cost derived from the usage
+          (UNKNOWN signals "mid-flight error"; mixing with a downstream
+          successful row lets aggregation surface ``partial``).
+        - Partial response with content but no usage → write an UNKNOWN
+          record with zero tokens so the gap is visible in the ledger.
+        """
+        entry = self._pending.pop(run_id, None)
+        if entry is None:
+            logger.debug(
+                "CostCallbackHandler: on_llm_error without matching start "
+                "(session_id=%s run_id=%s)",
+                self.session_id, run_id,
+            )
+            return
+
+        response = kwargs.get("response")
+        if response is None:
+            logger.debug(
+                "CostCallbackHandler: LLM run errored before any response, "
+                "dropped pending run_id=%s (session_id=%s, error=%s)",
+                run_id, self.session_id, type(error).__name__,
+            )
+            return
+
+        usage_metadata = self._extract_usage_metadata(response)
+        if usage_metadata is None and not self._response_has_partial_payload(response):
+            # Empty shell — early failure dressed up in an LLMResult wrapper.
+            logger.debug(
+                "CostCallbackHandler: errored LLM run had no partial data, "
+                "dropped pending run_id=%s (session_id=%s, error=%s)",
+                run_id, self.session_id, type(error).__name__,
+            )
+            return
+
+        # Partial-stream fallback tags may also be present (streaming
+        # fallback could error after the stamp landed on the first chunk).
+        self._apply_stream_fallback_tags(response, entry)
+
+        # Build the record with normal pricing logic, then force
+        # ``cost_status=UNKNOWN`` so the aggregate flags this session as
+        # partial. Token counts + total_usd still reflect provider-reported
+        # usage so ops can see what the error actually cost.
+        record = self._build_record(entry, usage_metadata)
+        record = replace(record, cost_status=CostStatus.UNKNOWN)
+
+        task = asyncio.create_task(self._persist_safely(record))
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
+
+    @staticmethod
+    def _response_has_partial_payload(response: LLMResult) -> bool:
+        """Did anything that could cost tokens actually stream before the error?
+
+        Streaming providers bill for tool-call deltas and reasoning content
+        even when ``msg.content`` stays empty. If we only checked ``content``,
+        a run that emitted ``AIMessage(content="", tool_calls=[...])`` before
+        an upstream disconnect would drop silently out of the ledger.
+
+        Accept as "partial payload":
+        - any non-empty ``content``
+        - any ``tool_calls`` or ``tool_call_chunks`` (streaming tool_call)
+        - any ``additional_kwargs`` — Actus adapters stash
+          ``reasoning_content`` / ``reasoning_signature`` there for
+          thinking-capable providers (see provider_profiles/_parse.py).
+        """
+        try:
+            gen = response.generations[0][0]
+        except (IndexError, AttributeError):
+            return False
+        msg = getattr(gen, "message", None)
+        if msg is None:
+            return False
+        if getattr(msg, "content", None):
+            return True
+        if getattr(msg, "tool_calls", None):
+            return True
+        if getattr(msg, "tool_call_chunks", None):
+            return True
+        if getattr(msg, "additional_kwargs", None):
+            return True
+        return False
+
+    async def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        entry = self._pending.pop(run_id, None)
+        if entry is None:
+            logger.debug(
+                "CostCallbackHandler: on_llm_end without matching start "
+                "(session_id=%s run_id=%s)",
+                self.session_id,
+                run_id,
+            )
+            return
+
+        # Streaming fallback path stamps the merged message's
+        # ``response_metadata`` with ``actus_fallback_*`` fields because
+        # ``_notify_fallback_escalation`` can't reach handlers during
+        # streaming (LangChain doesn't forward run_manager into subclass
+        # ``_astream``). Apply those tags to the pending entry here.
+        self._apply_stream_fallback_tags(response, entry)
+
+        usage_metadata = self._extract_usage_metadata(response)
+        record = self._build_record(entry, usage_metadata)
+
+        task = asyncio.create_task(self._persist_safely(record))
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
+
+    # ---- Public helpers -------------------------------------------------- #
+
+    async def flush_pending(self, timeout: float | None = None) -> None:
+        """Wait for in-flight persist tasks to settle.
+
+        Used in tests and in the FINISHING drain to ensure cost records are
+        flushed before a session transitions to COMPLETED.
+
+        ``timeout`` caps the wait. On timeout, the still-pending tasks are
+        left running — they'll resolve later in the background; per-task
+        failures are already logged by ``_persist_safely``. ``None`` =
+        block indefinitely (test-only path).
+
+        Uses ``asyncio.wait`` (not ``asyncio.wait_for(gather(...))``) on
+        purpose: ``wait_for`` cancels its awaitable on timeout, which would
+        cancel the inner persist tasks and drop cost rows on the floor.
+        ``wait`` lets survivors keep running after we return.
+        """
+        if not self._active_tasks:
+            return
+        # Snapshot the set so concurrent task-done callbacks mutating
+        # ``_active_tasks`` don't race with ``asyncio.wait``'s iteration.
+        pending = set(self._active_tasks)
+        if timeout is None:
+            await asyncio.gather(*pending, return_exceptions=True)
+            return
+        done, not_done = await asyncio.wait(pending, timeout=timeout)
+        if not_done:
+            logger.warning(
+                "CostCallbackHandler.flush_pending timeout %.1fs — "
+                "%d task(s) still in flight for session_id=%s; leaving "
+                "them to run in background.",
+                timeout,
+                len(not_done),
+                self.session_id,
+            )
+
+    def pending_keys(self) -> frozenset[UUID]:
+        """Snapshot of pending run_ids — exposed for tests + diagnostics."""
+        return frozenset(self._pending.keys())
+
+    def mark_fallback_escalation(
+        self,
+        run_id: UUID,
+        *,
+        attempt_ix: int = 1,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> None:
+        """Record that the fallback wrapper escalated this run.
+
+        Called by ``ActusFallbackChatModel`` when the primary adapter raises
+        and fallback takes over. Updates the pending entry's ``attempt_ix``,
+        and — critically — its ``model`` / ``provider`` so the CostRecord
+        reflects the adapter that actually billed, not the primary whose
+        ``_identifying_params`` was captured at ``on_chat_model_start`` time.
+
+        The method is sync (pure in-memory dict update) so the fallback
+        wrapper can call it without awaiting. It's idempotent — a second
+        call with a higher attempt_ix wins; lower ones are ignored.
+        """
+        entry = self._pending.get(run_id)
+        if entry is None:
+            logger.debug(
+                "mark_fallback_escalation for unknown run_id=%s (session_id=%s)",
+                run_id, self.session_id,
+            )
+            return
+        if attempt_ix > entry.attempt_ix:
+            entry.attempt_ix = attempt_ix
+        if model:
+            entry.model = str(model)
+        if provider:
+            entry.provider = str(provider)
+
+    # ---- Internals ------------------------------------------------------- #
+
+    @staticmethod
+    def _apply_stream_fallback_tags(
+        response: LLMResult, entry: _PendingEntry
+    ) -> None:
+        """Mirror ``mark_fallback_escalation`` for the streaming fallback path.
+
+        Reads ``actus_fallback_attempt_ix`` / ``actus_fallback_model`` /
+        ``actus_fallback_provider`` off the merged message's
+        ``response_metadata``. No-op when those keys are absent (primary
+        succeeded, or non-fallback adapter).
+        """
+        try:
+            msg = response.generations[0][0].message
+        except (IndexError, AttributeError):
+            return
+        rm = getattr(msg, "response_metadata", None) or {}
+        if not rm:
+            return
+        fb_attempt = rm.get("actus_fallback_attempt_ix")
+        if fb_attempt is not None:
+            try:
+                fb_attempt_int = int(fb_attempt)
+            except (TypeError, ValueError):
+                fb_attempt_int = 0
+            if fb_attempt_int > entry.attempt_ix:
+                entry.attempt_ix = fb_attempt_int
+        fb_model = rm.get("actus_fallback_model")
+        if fb_model:
+            entry.model = str(fb_model)
+        fb_provider = rm.get("actus_fallback_provider")
+        if fb_provider:
+            entry.provider = str(fb_provider)
+
+    @staticmethod
+    def _extract_usage_metadata(response: LLMResult) -> Optional[Mapping[str, Any]]:
+        try:
+            gen = response.generations[0][0]
+        except (IndexError, AttributeError):
+            return None
+        msg = getattr(gen, "message", None)
+        if msg is None:
+            return None
+        return getattr(msg, "usage_metadata", None)
+
+    def _build_record(
+        self,
+        entry: _PendingEntry,
+        usage_metadata: Optional[Mapping[str, Any]],
+    ) -> CostRecord:
+        metadata = entry.metadata
+        node_name = _map_node_name(metadata.get("langgraph_node"))
+        step_ix = int(metadata.get("langgraph_step") or 0)
+
+        price = get_price(entry.model, entry.provider)
+
+        input_tokens = int((usage_metadata or {}).get("input_tokens", 0) or 0)
+        output_tokens = int((usage_metadata or {}).get("output_tokens", 0) or 0)
+        input_details = dict((usage_metadata or {}).get("input_token_details") or {})
+        output_details = dict((usage_metadata or {}).get("output_token_details") or {})
+        cache_read = int(input_details.get("cache_read", 0) or 0)
+        cache_write = int(
+            input_details.get("cache_creation", 0)
+            or input_details.get("cache_write", 0)
+            or 0
+        )
+        reasoning = int(output_details.get("reasoning", 0) or 0)
+
+        if usage_metadata is None:
+            # We do not compute a char-count estimate in M0, so calling this
+            # ``estimated`` would lie about the signal. ``unknown`` is the
+            # honest label: no usage observed, no cost derived. A future
+            # milestone may reintroduce ``ESTIMATED`` once real estimation
+            # lands — the enum value is kept in the domain for that.
+            status = CostStatus.UNKNOWN
+            total_usd = Decimal(0)
+        elif price is None:
+            status = CostStatus.UNKNOWN
+            total_usd = Decimal(0)
+        else:
+            status = CostStatus.ACTUAL
+            total_usd = compute_cost(usage_metadata, price) or Decimal(0)
+
+        return CostRecord(
+            id=str(uuid.uuid4()),
+            session_id=self.session_id,
+            user_id=self.user_id,
+            run_id=str(entry.run_id),
+            node_name=node_name,
+            step_ix=step_ix,
+            attempt_ix=entry.attempt_ix,
+            model=entry.model,
+            provider=entry.provider,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            reasoning_tokens=reasoning,
+            total_usd=total_usd,
+            pricing_version=PRICING_VERSION,
+            cost_status=status,
+            created_at=datetime.now(timezone.utc),
+        )
+
+    @property
+    def persist_failure_count(self) -> int:
+        """Count of real-persist failures seen by this handler.
+
+        Used by aggregation + callers that need a session-local signal to
+        distinguish "complete ledger" from "ledger known to be incomplete".
+        """
+        return self._persist_failure_count
+
+    async def _persist_safely(self, record: CostRecord) -> None:
+        try:
+            await self._persister(record)
+            return
+        except Exception as exc:  # noqa: BLE001 — fire-and-forget by design
+            self._persist_failure_count += 1
+            logger.warning(
+                "CostCallbackHandler: persister failed for session_id=%s "
+                "run_id=%s: %s",
+                self.session_id,
+                record.run_id,
+                exc,
+            )
+
+        # Best-effort degraded-marker insert. We write a CostRecord with
+        # the same ``run_id`` so the DB's unique index dedups the *original*
+        # row if it managed to partially land. Fields are zeroed out and
+        # ``cost_status`` is ``UNKNOWN`` so aggregation mixes with surviving
+        # ``actual`` rows → ``partial``. A second failure is logged but
+        # swallowed (degraded fallback is best-effort; the design doc
+        # acknowledges a total-DB-outage case cannot be covered without
+        # adding a side-channel).
+        try:
+            marker = replace(
+                record,
+                cost_status=CostStatus.UNKNOWN,
+                total_usd=Decimal(0),
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+                reasoning_tokens=0,
+                node_name="persist_degraded",
+            )
+            await self._persister(marker)
+        except Exception as marker_exc:  # noqa: BLE001
+            logger.warning(
+                "CostCallbackHandler: degraded marker insert also failed "
+                "for session_id=%s run_id=%s: %s",
+                self.session_id,
+                record.run_id,
+                marker_exc,
+            )

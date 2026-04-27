@@ -792,3 +792,48 @@ def get_user_tool_approval_policy_service(
     return UserToolApprovalPolicyService(
         DBUserToolApprovalPolicyRepository(db_session),
     )
+
+
+# ----------------------------------------------------------------------
+# B4 M0 Phase I: cost aggregation DI wiring
+# ----------------------------------------------------------------------
+
+
+def get_cost_record_repository(
+    db_session: AsyncSession = Depends(get_db_session),
+):
+    """Per-request cost record repository backed by the current DB session."""
+    from app.infrastructure.repositories.db_cost_record_repository import (
+        DbCostRecordRepository,
+    )
+
+    return DbCostRecordRepository(db_session)
+
+
+def get_cost_aggregation_service(
+    db_session: AsyncSession = Depends(get_db_session),
+):
+    """B4 M0: CostAggregationService for GET /sessions/{id}/cost."""
+    from app.application.services.cost_aggregation_service import (
+        CostAggregationService,
+    )
+    from app.infrastructure.repositories.db_cost_record_repository import (
+        DbCostRecordRepository,
+    )
+
+    return CostAggregationService(DbCostRecordRepository(db_session))
+
+
+def build_cost_callback_handler(session_id: str, user_id: str):
+    """B4 M0: thin wrapper around the application-layer factory.
+
+    Uses the global ``get_uow`` UoW factory; the real implementation (which
+    agent_service uses with ``self._uow_factory``) lives in
+    ``application/services/cost_callback_factory.py`` so the layering stays
+    clean (no interfaces → application reverse imports).
+    """
+    from app.application.services.cost_callback_factory import (
+        build_cost_callback_handler as _build,
+    )
+
+    return _build(session_id=session_id, user_id=user_id, uow_factory=get_uow)
