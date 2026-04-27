@@ -441,6 +441,9 @@ class AgentTaskRunner(TaskRunner):
             confirmation_manager=self._confirmation_manager,
             prompt_assembler=prompt_assembler,
             tool_runtime=self._tool_runtime,
+            # B2: forward provider profile so PlannerReActFlow can wrap
+            # ``self._llm`` in ActusRecoveryChatModel during _ensure_graphs.
+            profile=self.profile,
             # B4 M0: session-scoped cost callback attached into every invoke.
             cost_callback_handler=self._cost_callback_handler,
         )
@@ -1980,7 +1983,7 @@ class AgentTaskRunner(TaskRunner):
             # Phase 3: build the react_graph. If this raises, the outer
             # try/except restores all 4 snapshot fields before re-raising.
             step_react = build_react_graph(
-                llm=self._llm,
+                llm=self._flow._llm,  # B2: use Recovery-wrapped LLM from Flow
                 tools=lc_tools,
                 agent_config=self._agent_config,
                 tool_result_max_chars=(

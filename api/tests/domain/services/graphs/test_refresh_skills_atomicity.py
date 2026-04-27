@@ -153,6 +153,10 @@ def _make_runner(monkeypatch: pytest.MonkeyPatch) -> AgentTaskRunner:
     class _DummyFlow:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
+            # B2 Task 1.9: _build_step_react_graph reads self._flow._llm
+            # (Recovery-wrapped). DummyFlow exposes whatever llm the runner
+            # passed in so atomicity tests bypass the wrap path cleanly.
+            self._llm = kwargs.get("llm")
             self._overflow_config = SimpleNamespace(tool_result_max_chars=8000)
             self._assembler = None
             self._telemetry = None

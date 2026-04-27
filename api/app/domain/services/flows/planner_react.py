@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from app.domain.models.app_config import ToolRuntimeConfig
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.prompts.memory_snapshot import MemorySnapshot
+    from app.domain.services.provider_profiles._base import ProviderProfile
 
 
 from langchain_core.language_models import BaseChatModel
@@ -117,6 +118,10 @@ class PlannerReActFlow(BaseFlow):
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
         _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
         tool_runtime: "ToolRuntimeConfig | None" = None,  # R2 CS2
+        # B2 PR-1: typed LLM Recovery chain — when supplied, _ensure_graphs
+        # wraps self._llm with wrap_with_recovery once (idempotent guard via
+        # _recovery_wrapped). None = legacy path, no wrap.
+        profile: "ProviderProfile | None" = None,
         # M1 PR-4+8 LLM quality gate (all optional — None = gate disabled,
         # falls back to legacy size-only path)
         memory_gate_llm: BaseChatModel | None = None,
@@ -176,6 +181,12 @@ class PlannerReActFlow(BaseFlow):
         self._graphs_built = False
         self._react_graph = None
         self._main_graph = None
+
+        # B2 PR-1: typed LLM Recovery chain. When profile is provided,
+        # _ensure_graphs wraps self._llm with wrap_with_recovery on first
+        # call. The flag prevents nested wrapping on subsequent calls.
+        self._profile = profile
+        self._recovery_wrapped: bool = False
 
         # LangGraph checkpointer — 跨 graph 重建复用，支持 interrupt/resume
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
@@ -473,6 +484,17 @@ class PlannerReActFlow(BaseFlow):
                 tool_compress_trigger_ratio=self._overflow_config.tool_compress_trigger_ratio,
             )
         self._assembler = assembler
+
+        # B2 Recovery wrap — idempotent; safe to re-enter _ensure_graphs.
+        if self._profile is not None and not self._recovery_wrapped:
+            from app.infrastructure.external.llm.actus_recovery_chat_model import (
+                wrap_with_recovery,
+            )
+            # PR-1: no callback yet (None). PR-2 adds _build_on_context_overflow_callback().
+            self._llm = wrap_with_recovery(
+                self._llm, profile=self._profile, on_context_overflow=None,
+            )
+            self._recovery_wrapped = True
 
         self._react_graph = build_react_graph(
             llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
