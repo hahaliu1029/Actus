@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     # and tools across a session → cache_control is worth enabling).
     prompt_telemetry_log_dir: str = "/app/data/telemetry/prompt"
 
+    # B5 PR-S1-1 (A5): salt for hashing user_id when emitting telemetry.
+    # The canonical attribute ``user_id_hash`` is computed as
+    # ``sha256(salt + user_id).hexdigest()[:16]`` so downstream observability
+    # storage holds a stable but non-reversible identifier.
+    # Empty string DISABLES hashing — ``user_id_hash`` falls back to ``None``
+    # in the canonical attributes, which is contract-legal (the field is
+    # nullable). Production deployments should set a long random secret
+    # (e.g., 32-byte hex from ``secrets.token_hex(32)``) so the same user_id
+    # produces the same hash across pod restarts but cannot be reversed via
+    # rainbow-table attack on the UUID space.
+    user_id_hash_salt: str = ""
+
     # Checkpointer 连接池配置
     checkpointer_pool_min_size: int = 2
     checkpointer_pool_max_size: int = 10
