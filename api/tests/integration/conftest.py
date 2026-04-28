@@ -3,11 +3,11 @@
 Requires: SQLALCHEMY_DATABASE_URL env var pointing to pgvector-enabled PostgreSQL.
 
 Local: docker compose 默认库是 manus 且不映射宿主机端口（docker-compose.yml:15-31）。
-本地运行集成测试前需要：
-  1. 临时映射 postgres 端口，例如 docker compose port publish 或单独启动：
-     docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=manus pgvector/pgvector:pg17
+集成测试**禁止**指向 dev 库（manus）—— 会污染开发数据。本地跑集成测试要起独立 test-only 容器，库名固定为 manus_test：
+  1. 临时映射 postgres 端口（推荐 127.0.0.1:55432:5432 避免和 compose pg 冲突），独立起容器：
+     docker run -d --rm --name actus-pg-test -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=manus_test pgvector/pgvector:pg17
   2. 设置环境变量指向可达的数据库：
-     SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/manus
+     SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/manus_test
 
 CI: ci.yml:13-22 单独启动 postgres 容器，映射 5432，库名 manus_test。
     CI 会设置 SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test
