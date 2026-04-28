@@ -481,6 +481,126 @@ class TestHappyPath:
         assert row.created_at is not None
 
 
+class TestValueCheckConstraints:
+    """B4 M1 (b4m1_add_cost_records_value_checks): non-negative value bounds.
+
+    Locks the 6 CHECK constraints added by the b4m1 migration. Each token
+    column + total_usd must reject negative INSERTs at the DB level. The
+    handler-side clamp is unit-tested in test_cost_handler_clamp.py; these
+    tests are the safety net behind it — even raw SQL bypassing the handler
+    cannot pollute the ledger with negative values.
+    """
+
+    _NONNEG_CONSTRAINTS = (
+        "ck_cost_records_input_tokens_nonneg",
+        "ck_cost_records_output_tokens_nonneg",
+        "ck_cost_records_cache_read_tokens_nonneg",
+        "ck_cost_records_cache_write_tokens_nonneg",
+        "ck_cost_records_reasoning_tokens_nonneg",
+        "ck_cost_records_total_usd_nonneg",
+    )
+
+    async def test_constraints_exist_and_are_validated(self, db_session):
+        """All 6 named constraints exist AND have convalidated=true.
+
+        ``convalidated`` distinguishes ``NOT VALID`` from
+        ``NOT VALID + VALIDATE CONSTRAINT``. If the migration accidentally
+        skipped the VALIDATE step, NEW rows would still be checked but
+        the constraint would not be marked validated — and a future
+        ``ALTER TABLE ... VALIDATE`` could fail on dirty data we thought
+        was already enforced. Asserting both flags pins the migration's
+        full behavior, not just the existence half.
+        """
+        result = await db_session.execute(
+            text(
+                "SELECT conname, convalidated "
+                "FROM pg_constraint "
+                "WHERE conrelid = 'cost_records'::regclass AND contype = 'c'"
+            )
+        )
+        by_name = {row.conname: row.convalidated for row in result.all()}
+        for name in self._NONNEG_CONSTRAINTS:
+            assert name in by_name, (
+                f"missing CHECK constraint {name!r}; got {sorted(by_name)!r}"
+            )
+            assert by_name[name] is True, (
+                f"CHECK {name!r} exists but convalidated=False — migration "
+                f"appears to have skipped VALIDATE CONSTRAINT"
+            )
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+        ],
+    )
+    async def test_negative_token_count_rejected(self, db_session, column):
+        user_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        await _ensure_user(db_session, user_id)
+        await _ensure_session(db_session, session_id)
+        with pytest.raises(IntegrityError):
+            await _raw_insert_full(
+                db_session,
+                user_id=user_id,
+                session_id=session_id,
+                **{column: -1},
+            )
+
+    async def test_negative_total_usd_rejected(self, db_session):
+        user_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        await _ensure_user(db_session, user_id)
+        await _ensure_session(db_session, session_id)
+        with pytest.raises(IntegrityError):
+            await _raw_insert_full(
+                db_session,
+                user_id=user_id,
+                session_id=session_id,
+                total_usd=Decimal("-0.0000000001"),
+            )
+
+    async def test_zero_values_accepted(self, db_session):
+        """Boundary: 0 satisfies ``>= 0`` — no false-positive rejection."""
+        user_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        await _ensure_user(db_session, user_id)
+        await _ensure_session(db_session, session_id)
+        await _raw_insert_full(
+            db_session,
+            user_id=user_id,
+            session_id=session_id,
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            reasoning_tokens=0,
+            total_usd=Decimal("0"),
+        )
+
+    async def test_positive_values_accepted(self, db_session):
+        """Sanity check: realistic positive values pass all 6 checks."""
+        user_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        await _ensure_user(db_session, user_id)
+        await _ensure_session(db_session, session_id)
+        await _raw_insert_full(
+            db_session,
+            user_id=user_id,
+            session_id=session_id,
+            input_tokens=1234,
+            output_tokens=567,
+            cache_read_tokens=89,
+            cache_write_tokens=10,
+            reasoning_tokens=42,
+            total_usd=Decimal("0.0042000000"),
+        )
+
+
 class TestConsumerContracts:
     async def test_repository_insert_is_idempotent_on_run_id(self, db_session):
         """Two inserts, same run_id, different payload → first row wins."""

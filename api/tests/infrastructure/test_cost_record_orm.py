@@ -91,6 +91,45 @@ class TestCostRecordORM:
             "Naive timestamps break tuple-sort aggregation across DB restarts."
         )
 
+    def test_nonneg_check_constraints_mirror_b4m1_migration(self) -> None:
+        """B4 M1: 6 ``>= 0`` CHECKs on token cols + total_usd are declared
+        on the ORM so ``Base.metadata.create_all()`` (used by integration
+        tests that don't go through alembic) produces the same shape as a
+        migrated DB. Without this assertion the ORM mirror could silently
+        drift away from the migration and create_all-based fixtures would
+        accept negative values that real prod rejects.
+
+        Names use the bare form (e.g. ``input_tokens_nonneg``) which gets
+        wrapped by Base's naming_convention into the full name that
+        matches the migration's literal raw-SQL ``ADD CONSTRAINT`` name.
+        """
+        nonneg_checks = {
+            c.name: str(c.sqltext).lower()
+            for c in CostRecordModel.__table__.constraints
+            if isinstance(c, CheckConstraint)
+            and c.name
+            and c.name.endswith("_nonneg")
+        }
+        expected_columns = {
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "total_usd",
+        }
+        for column in expected_columns:
+            full_name = f"ck_cost_records_{column}_nonneg"
+            assert full_name in nonneg_checks, (
+                f"missing CHECK {full_name!r} in ORM __table_args__; "
+                f"got {sorted(nonneg_checks)!r}"
+            )
+            sqltext = nonneg_checks[full_name]
+            assert column in sqltext and ">= 0" in sqltext, (
+                f"CHECK {full_name!r} sqltext must reference {column!r} and "
+                f"'>= 0'; got {sqltext!r}"
+            )
+
     def test_metadata_fk_targets_resolve(self) -> None:
         """``Base.metadata.sorted_tables`` must not raise NoReferencedTableError.
 

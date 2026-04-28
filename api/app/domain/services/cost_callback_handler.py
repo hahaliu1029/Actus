@@ -65,6 +65,17 @@ _DRAIN_DEGRADED_NAMESPACE: uuid.UUID = uuid.UUID(
 # time — the abandoned task continues in the background.
 _MARKER_WRITE_TIMEOUT_SECONDS: float = 1.0
 
+# Schema bounds from cost_records (cost_record_orm.py:78-79 + migration
+# b4m0_add_cost_records.py:58-59). Without clamping in _build_record, an
+# overlong model/provider from a misbehaving adapter would (a) blow the
+# main INSERT with string-data-right-truncation, then (b) blow the
+# per-call degraded-marker insert too, because ``_persist_safely`` builds
+# the marker via ``replace(record, ...)`` which preserves the original
+# overlong values — leaving the ledger entirely missing that LLM call.
+# Clamping at ``_build_record`` is the single read-point that covers both.
+_MAX_MODEL_LEN: int = 128
+_MAX_PROVIDER_LEN: int = 64
+
 
 @dataclass
 class _PendingEntry:
@@ -204,6 +215,11 @@ class CostCallbackHandler(AsyncCallbackHandler):
         # rows. Consumers can also read this directly from memory (e.g.
         # terminal-status code) to add a final session-level signal.
         self._persist_failure_count: int = 0
+        # Dedup the WARNING fired by ``_clamp`` so a single misbehaving
+        # adapter doesn't flood logs once per LLM call. Per (session, kind)
+        # at most — ops only need to know "this session had an overlong
+        # value at least once for this kind", not the count.
+        self._seen_overlong: set[str] = set()
 
     # ---- LangChain callback surface ------------------------------------- #
 
@@ -527,6 +543,30 @@ class CostCallbackHandler(AsyncCallbackHandler):
             return None
         return getattr(msg, "usage_metadata", None)
 
+    def _clamp(self, value: str, max_len: int, kind: str) -> str:
+        """Truncate ``value`` to ``max_len``; log WARNING on first hit per kind.
+
+        ``kind`` is the field label ("model" / "provider") used both for
+        the dedup key and the log message. Dedup is per-handler-instance
+        (handler is per session) so the same overlong value seen on every
+        LLM call in one session logs once, not N times. Different sessions
+        get fresh handlers and log independently.
+        """
+        if len(value) <= max_len:
+            return value
+        if kind not in self._seen_overlong:
+            self._seen_overlong.add(kind)
+            logger.warning(
+                "CostCallbackHandler: %s exceeds %d chars for session_id=%s "
+                "(len=%d) — clamping to fit cost_records.%s",
+                kind,
+                max_len,
+                self.session_id,
+                len(value),
+                kind,
+            )
+        return value[:max_len]
+
     def _build_record(
         self,
         entry: _PendingEntry,
@@ -536,6 +576,10 @@ class CostCallbackHandler(AsyncCallbackHandler):
         node_name = _map_node_name(metadata.get("langgraph_node"))
         step_ix = int(metadata.get("langgraph_step") or 0)
 
+        # Pricing lookup uses the original (unclamped) names so an unknown
+        # adapter that just happens to use a >128-char model name doesn't
+        # flip from priced→unpriced just because we truncated the suffix.
+        # The truncated values land on the persisted CostRecord only.
         price = get_price(entry.model, entry.provider)
 
         input_tokens = int((usage_metadata or {}).get("input_tokens", 0) or 0)
@@ -573,8 +617,8 @@ class CostCallbackHandler(AsyncCallbackHandler):
             node_name=node_name,
             step_ix=step_ix,
             attempt_ix=entry.attempt_ix,
-            model=entry.model,
-            provider=entry.provider,
+            model=self._clamp(entry.model, _MAX_MODEL_LEN, "model"),
+            provider=self._clamp(entry.provider, _MAX_PROVIDER_LEN, "provider"),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read,

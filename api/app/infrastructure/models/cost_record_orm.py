@@ -32,6 +32,20 @@ _COST_STATUS_ALLOWED = (
     "cost_status IN ('actual', 'estimated', 'partial', 'unknown')"
 )
 
+# Mirror b4m1 migration constraint names. The bare ``name`` here gets
+# wrapped by Base's naming_convention (base.py:5-11 → ``ck`` template
+# ``ck_%(table_name)s_%(constraint_name)s``) into e.g.
+# ``ck_cost_records_input_tokens_nonneg`` — matching the literal name
+# emitted by the migration's raw SQL ``ADD CONSTRAINT`` call.
+_NONNEG_CHECKS: tuple[tuple[str, str], ...] = (
+    ("input_tokens >= 0", "input_tokens_nonneg"),
+    ("output_tokens >= 0", "output_tokens_nonneg"),
+    ("cache_read_tokens >= 0", "cache_read_tokens_nonneg"),
+    ("cache_write_tokens >= 0", "cache_write_tokens_nonneg"),
+    ("reasoning_tokens >= 0", "reasoning_tokens_nonneg"),
+    ("total_usd >= 0", "total_usd_nonneg"),
+)
+
 
 class CostRecordModel(Base):
     """SQLAlchemy ORM model for cost_records."""
@@ -43,6 +57,7 @@ class CostRecordModel(Base):
             _COST_STATUS_ALLOWED,
             name="ck_cost_records_cost_status_allowed",
         ),
+        *(CheckConstraint(expr, name=name) for expr, name in _NONNEG_CHECKS),
         Index(
             "uq_cost_records_run_id",
             "run_id",
