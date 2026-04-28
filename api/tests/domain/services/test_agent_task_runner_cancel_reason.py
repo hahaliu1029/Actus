@@ -29,9 +29,23 @@ class _NoopSessionRepository:
         self.add_event_calls.append((session_id, event))
 
 
+class _NoopDbSession:
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
 class _NoopUoW:
-    def __init__(self) -> None:
-        self.session = _NoopSessionRepository()
+    # B4 Issue 1D: _set_terminal_status now calls self._uow_factory() to get a
+    # fresh UoW for the terminal status write (not self._uow). All UoW instances
+    # created by _uow_factory share the same _shared_session so that
+    # status_updates are observable via runner._uow.session regardless of which
+    # factory call produced the write.
+    def __init__(self, shared_session: "_NoopSessionRepository | None" = None) -> None:
+        self.session = shared_session if shared_session is not None else _NoopSessionRepository()
+        self.db_session = _NoopDbSession()
 
     async def __aenter__(self) -> "_NoopUoW":
         return self
@@ -40,8 +54,15 @@ class _NoopUoW:
         return None
 
 
-def _uow_factory() -> _NoopUoW:
-    return _NoopUoW()
+def _make_uow_factory() -> tuple["_NoopUoW", "type[_NoopUoW]"]:
+    """Return (root_uow, factory_fn) sharing the same session repository."""
+    shared_session = _NoopSessionRepository()
+    root_uow = _NoopUoW(shared_session=shared_session)
+
+    def _factory() -> _NoopUoW:
+        return _NoopUoW(shared_session=shared_session)
+
+    return root_uow, _factory
 
 
 class _NoopSandbox:
@@ -84,8 +105,9 @@ class _DummyTask:
 
 
 def _build_runner(session_id: str = "session-cancel") -> AgentTaskRunner:
+    root_uow, factory = _make_uow_factory()
     runner = AgentTaskRunner(
-        uow_factory=_uow_factory,
+        uow_factory=factory,
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -97,6 +119,9 @@ def _build_runner(session_id: str = "session-cancel") -> AgentTaskRunner:
         search_engine=object(),
         sandbox=_NoopSandbox(),
     )
+    # Override runner._uow with the root instance so tests can observe all
+    # status_updates regardless of which factory call produced the write.
+    runner._uow = root_uow
     runner._mcp_tool = _NoopTool()
     runner._a2a_tool = _NoopTool()
     runner._skill_tool = _NoopTool()
@@ -131,6 +156,11 @@ async def test_cancel_reason_stop_emits_done_and_marks_completed() -> None:
     with pytest.raises(asyncio.CancelledError):
         await runner.invoke(task)
 
+    # B4 Issue 1D: _set_terminal_status spawns an asyncio.create_task for the
+    # terminal op. Yield to the event loop so the shielded task completes
+    # before we assert on status_updates.
+    await asyncio.sleep(0)
+
     assert runner._uow.session.status_updates == [
         ("session-stop", SessionStatus.RUNNING),
         ("session-stop", SessionStatus.COMPLETED),
@@ -147,6 +177,8 @@ async def test_cancel_reason_takeover_start_skips_done_event_and_completed_statu
     with pytest.raises(asyncio.CancelledError):
         await runner.invoke(task)
 
+    await asyncio.sleep(0)
+
     assert runner._uow.session.status_updates == [
         ("session-takeover-cancel", SessionStatus.RUNNING),
     ]
@@ -160,6 +192,8 @@ async def test_cancel_reason_session_delete_skips_done_and_completed_status() ->
 
     with pytest.raises(asyncio.CancelledError):
         await runner.invoke(task)
+
+    await asyncio.sleep(0)
 
     assert runner._uow.session.status_updates == [
         ("session-delete", SessionStatus.RUNNING),

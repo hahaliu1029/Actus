@@ -48,6 +48,23 @@ logger = logging.getLogger(__name__)
 
 Persister = Callable[[CostRecord], Awaitable[None]]
 
+# UUID5 namespace for session-level degraded sentinel rows. Constant on
+# purpose — implementation detail of write_session_degraded_marker, but
+# the deterministic key relies on this namespace being stable across
+# deploys so ON CONFLICT DO NOTHING dedups idempotent writes.
+# Generated 2026-04-27; do not change without a migration plan.
+_DRAIN_DEGRADED_NAMESPACE: uuid.UUID = uuid.UUID(
+    "d73a3bc4-deed-49bb-99c9-c4fbd4caaeae"
+)
+
+# Soft upper bound on marker write latency. Caller (terminal drain) cannot
+# afford to re-wedge for the full DB pool wait if the persister is the
+# source of degradation. ``write_session_degraded_marker`` uses
+# ``asyncio.create_task + asyncio.wait`` (NOT ``wait_for``) so this is a
+# bound on time-to-RETURN-False, not a hard upper bound on persister wall
+# time — the abandoned task continues in the background.
+_MARKER_WRITE_TIMEOUT_SECONDS: float = 1.0
+
 
 @dataclass
 class _PendingEntry:
@@ -56,6 +73,24 @@ class _PendingEntry:
     model: str
     provider: str
     attempt_ix: int = 0
+
+
+@dataclass(frozen=True)
+class FlushResult:
+    """Outcome of one ``flush_pending`` call.
+
+    - ``drained``: True iff every persist task pending at entry settled
+      within the timeout window.
+    - ``pending_count``: tasks still in flight at return (0 iff drained).
+    - ``persist_failures``: delta of ``_persist_failure_count`` observed
+      during this flush window only. Failures predating the call are NOT
+      counted; failures occurring AFTER return continue to be covered by
+      ``_persist_safely``'s per-task degraded-row path.
+    """
+
+    drained: bool
+    pending_count: int
+    persist_failures: int
 
 
 # Translate internal LangGraph node names to stable product-level names.
@@ -96,6 +131,33 @@ def _map_node_name(raw: str | None) -> str:
     if not raw:
         return "out_of_graph"
     return _LANGGRAPH_NODE_MAP.get(raw, raw)
+
+
+# Module-level GC anchor + observability for marker tasks abandoned by the
+# soft-bound timeout in write_session_degraded_marker. Without a hard
+# reference, asyncio could collect the task before it logs a late
+# completion / failure.
+_PENDING_MARKER_TASKS: set[asyncio.Task] = set()
+
+
+def _on_marker_task_done(task: asyncio.Task) -> None:
+    _PENDING_MARKER_TASKS.discard(task)
+    if task.cancelled():
+        # We never cancel marker tasks. Cancellation here means process
+        # shutdown caught the abandoned task — log at INFO, not ERROR.
+        logger.info(
+            "abandoned marker task %s cancelled at shutdown",
+            task.get_name(),
+        )
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "abandoned marker task %s eventually raised: %s",
+            task.get_name(),
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 def _infer_provider(model: str) -> str:
@@ -329,7 +391,9 @@ class CostCallbackHandler(AsyncCallbackHandler):
 
     # ---- Public helpers -------------------------------------------------- #
 
-    async def flush_pending(self, timeout: float | None = None) -> None:
+    async def flush_pending(
+        self, timeout: float | None = None
+    ) -> FlushResult:
         """Wait for in-flight persist tasks to settle.
 
         Used in tests and in the FINISHING drain to ensure cost records are
@@ -340,20 +404,30 @@ class CostCallbackHandler(AsyncCallbackHandler):
         failures are already logged by ``_persist_safely``. ``None`` =
         block indefinitely (test-only path).
 
+        Returns FlushResult so callers can dispatch a session-level degraded
+        marker on ``drained=False`` or ``persist_failures>0`` (Issue 1D).
+
         Uses ``asyncio.wait`` (not ``asyncio.wait_for(gather(...))``) on
         purpose: ``wait_for`` cancels its awaitable on timeout, which would
         cancel the inner persist tasks and drop cost rows on the floor.
         ``wait`` lets survivors keep running after we return.
         """
+        failures_at_entry = self._persist_failure_count
         if not self._active_tasks:
-            return
+            return FlushResult(
+                drained=True, pending_count=0, persist_failures=0
+            )
         # Snapshot the set so concurrent task-done callbacks mutating
         # ``_active_tasks`` don't race with ``asyncio.wait``'s iteration.
         pending = set(self._active_tasks)
         if timeout is None:
             await asyncio.gather(*pending, return_exceptions=True)
-            return
-        done, not_done = await asyncio.wait(pending, timeout=timeout)
+            return FlushResult(
+                drained=True,
+                pending_count=0,
+                persist_failures=self._persist_failure_count - failures_at_entry,
+            )
+        _, not_done = await asyncio.wait(pending, timeout=timeout)
         if not_done:
             logger.warning(
                 "CostCallbackHandler.flush_pending timeout %.1fs — "
@@ -363,6 +437,11 @@ class CostCallbackHandler(AsyncCallbackHandler):
                 len(not_done),
                 self.session_id,
             )
+        return FlushResult(
+            drained=not bool(not_done),
+            pending_count=len(not_done),
+            persist_failures=self._persist_failure_count - failures_at_entry,
+        )
 
     def pending_keys(self) -> frozenset[UUID]:
         """Snapshot of pending run_ids — exposed for tests + diagnostics."""
@@ -506,6 +585,112 @@ class CostCallbackHandler(AsyncCallbackHandler):
             cost_status=status,
             created_at=datetime.now(timezone.utc),
         )
+
+    def _build_session_degraded_record(self, reason: str) -> CostRecord:
+        """Build a session-level degraded sentinel CostRecord (Issue 1D).
+
+        Uses a deterministic uuid5 key over (session_id, reason) so the
+        DB's ON CONFLICT DO NOTHING dedups repeated writes for the same
+        (session, reason) pair. Different reasons collapse to the same
+        aggregation outcome but produce distinct rows for operator triage.
+        """
+        run_id = str(uuid.uuid5(
+            _DRAIN_DEGRADED_NAMESPACE,
+            f"{self.session_id}:terminal-drain:{reason}",
+        ))
+        return CostRecord(
+            id=str(uuid.uuid4()),
+            session_id=self.session_id,
+            user_id=self.user_id,
+            run_id=run_id,
+            node_name="persist_degraded",
+            step_ix=0,
+            attempt_ix=0,
+            # NOT empty strings: the aggregation service unconditionally
+            # rolls every row into by_model[r.model] / by_provider[r.provider]
+            # (see cost_aggregation_service.py). Empty strings would surface
+            # as ``{"": "0"}`` in GET /cost and leak through to the UI.
+            # Use stable internal sentinels — recognizable in API response
+            # as not-a-real-model and not-a-real-provider.
+            model="session_degraded_marker",
+            provider="internal",
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            reasoning_tokens=0,
+            total_usd=Decimal(0),
+            pricing_version=PRICING_VERSION,
+            cost_status=CostStatus.UNKNOWN,
+            created_at=datetime.now(timezone.utc),
+        )
+
+    async def write_session_degraded_marker(self, reason: str) -> bool:
+        """Best-effort session-level degraded sentinel (Issue 1D §3.2).
+
+        Writes one CostRecord with node_name="persist_degraded" so the
+        existing aggregation override forces cost_status=partial. The
+        run_id is a stable uuid5 over (session_id, "terminal-drain", reason).
+
+        Calls self._persister DIRECTLY (NOT _persist_safely) to avoid
+        marker-of-marker recursion.
+
+        Uses ``asyncio.create_task + asyncio.wait`` (NOT ``wait_for``):
+        ``wait_for`` would cancel the inner task on timeout AND await the
+        cancellation; if the DB driver is non-cooperative the outer caller
+        could re-wedge past the nominal bound. ``wait`` instead does NOT
+        touch the inner task on timeout — we abandon observation, park
+        the task in ``_PENDING_MARKER_TASKS`` for late-completion logging,
+        and return ``False``.
+
+        Returns True iff the persister completed within the soft bound
+        without raising; False on bound exceeded, persister exception, or
+        any other error.
+        """
+        marker = self._build_session_degraded_record(reason)
+        task = asyncio.create_task(
+            self._persister(marker),
+            name=f"cost-marker-{self.session_id}-{reason}",
+        )
+        done, _ = await asyncio.wait(
+            [task], timeout=_MARKER_WRITE_TIMEOUT_SECONDS
+        )
+        if not done:
+            # Abandon observation; park task for GC + late-completion logging.
+            _PENDING_MARKER_TASKS.add(task)
+            task.add_done_callback(_on_marker_task_done)
+            logger.warning(
+                "marker write soft-bound exceeded for session=%s reason=%s; "
+                "task abandoned to background",
+                self.session_id,
+                reason,
+            )
+            return False
+        # Cancellation guard: ``task.exception()`` re-raises CancelledError
+        # on a cancelled task instead of returning it. Without this check,
+        # a marker task that ends up cancelled (e.g., the persister itself
+        # raised CancelledError, or the underlying DB driver propagated
+        # cancellation) would crash out of write_session_degraded_marker
+        # via CancelledError — violating the documented "False on any
+        # other error" contract AND skipping the subsequent status write
+        # in ``_set_terminal_status._terminal_op``.
+        if task.cancelled():
+            logger.warning(
+                "marker write task cancelled for session=%s reason=%s",
+                self.session_id,
+                reason,
+            )
+            return False
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "marker write failed for session=%s reason=%s: %s",
+                self.session_id,
+                reason,
+                exc,
+            )
+            return False
+        return True
 
     @property
     def persist_failure_count(self) -> int:

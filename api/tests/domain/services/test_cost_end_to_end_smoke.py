@@ -12,13 +12,15 @@ works end-to-end."
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import Any, List, Optional
+from uuid import uuid4
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
@@ -26,6 +28,11 @@ from typing_extensions import TypedDict
 from app.application.services.cost_aggregation_service import CostAggregationService
 from app.domain.models.cost_record import CostRecord, CostStatus
 from app.domain.services.cost_callback_handler import CostCallbackHandler
+
+
+def _make_llm_result(usage_metadata: dict | None = None) -> LLMResult:
+    msg = AIMessage(content="ok", usage_metadata=usage_metadata)
+    return LLMResult(generations=[[ChatGeneration(message=msg)]])
 
 pytestmark = pytest.mark.anyio
 
@@ -178,3 +185,155 @@ async def test_graph_invoke_with_no_usage_marks_unknown() -> None:
     agg = await svc.get_aggregate("sess-est")
     assert agg.cost_status == CostStatus.UNKNOWN
     assert agg.has_partial_records is False
+
+
+class TestE2EDegradedMarkerVisible:
+    """B4 Issue 1D: end-to-end visibility of the degraded sentinel.
+
+    Spec: docs/superpowers/specs/2026-04-27-b4-1d-finishing-drain-design.md §5
+
+    Positive case: drain timeout + healthy marker persister → marker row
+    lands in DB → aggregation reports cost_status=partial.
+
+    Negative case: drain timeout + unhealthy marker persister → marker
+    dropped → aggregation reports cost_status=actual. This pins the
+    documented best-effort trade-off (§2 Non-goals + §8 ADR).
+    """
+
+    async def test_drain_timeout_with_healthy_marker_reports_partial(
+        self,
+    ) -> None:
+        from app.application.services.cost_aggregation_service import (
+            CostAggregationService,
+        )
+
+        # Use the same captured-records fixture pattern as elsewhere in
+        # this file: a list-backed persister stands in for the DB.
+        captured: List[CostRecord] = []
+
+        async def persist(record: CostRecord) -> None:
+            captured.append(record)
+
+        handler = CostCallbackHandler(
+            session_id="sess-Q", user_id="user-Q", persister=persist
+        )
+
+        # Drive one happy LLM call to land an ACTUAL row, then dispatch
+        # the marker (mirroring what _set_terminal_status would do on a
+        # drain timeout with healthy persister).
+        run_id = uuid4()
+        await handler.on_chat_model_start(
+            serialized={},
+            messages=[[HumanMessage(content="hi")]],
+            run_id=run_id,
+            metadata={"langgraph_node": "planner_node", "langgraph_step": 0},
+            invocation_params={"model": "gpt-4o", "provider_id": "openai_official"},
+        )
+        await handler.on_llm_end(
+            _make_llm_result(usage_metadata={
+                "input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500
+            }),
+            run_id=run_id,
+        )
+        await handler.flush_pending()
+        ok = await handler.write_session_degraded_marker(reason="drain_timeout")
+        assert ok is True
+
+        # Aggregation: build a fake repo backed by the captured list.
+        class _ListRepo:
+            async def find_by_session(self, session_id: str) -> List[CostRecord]:
+                return [r for r in captured if r.session_id == session_id]
+
+        service = CostAggregationService(repository=_ListRepo())
+        agg = await service.get_aggregate("sess-Q")
+
+        assert agg.cost_status == CostStatus.PARTIAL, (
+            "Aggregation must surface partial when a persist_degraded row "
+            "is present alongside actual rows."
+        )
+
+        # The marker row carries sentinel labels (model="session_degraded_marker",
+        # provider="internal") so it surfaces in by_model / by_provider as a
+        # recognizable internal entry — but MUST NOT introduce empty keys
+        # (which would happen if the marker used model="" / provider="").
+        assert "" not in (agg.by_model or {}), (
+            "by_model must not contain an empty-string key — would leak "
+            "as {'': '0'} in GET /cost. Marker rows must carry non-empty "
+            "sentinel labels (see _build_session_degraded_record)."
+        )
+        assert "" not in (agg.by_provider or {}), (
+            "by_provider must not contain an empty-string key (same "
+            "reason as by_model)."
+        )
+
+    async def test_marker_dropped_under_unhealthy_persister_reports_actual(
+        self,
+    ) -> None:
+        """Spec §5 negative case: drain timeout AND marker persister
+        exceeds soft bound → marker write returns False, no marker row in
+        DB, aggregation reports cost_status=actual.
+
+        This pins the documented best-effort trade-off (§2 Non-goals: 'Hard
+        guarantee of degraded marker presence'). A future implementer must
+        not silently upgrade this to a strict guarantee — that would
+        require a non-DB fallback channel (rejected; see §8 ADR).
+        """
+        from app.application.services.cost_aggregation_service import (
+            CostAggregationService,
+        )
+
+        captured: List[CostRecord] = []
+        block_event = asyncio.Event()  # never set → marker persist hangs
+
+        async def persist(record: CostRecord) -> None:
+            # Successful for cost rows, hanging for marker rows. Distinguish
+            # by node_name (markers carry "persist_degraded").
+            if record.node_name == "persist_degraded":
+                await block_event.wait()
+            captured.append(record)
+
+        handler = CostCallbackHandler(
+            session_id="sess-N", user_id="user-N", persister=persist
+        )
+
+        # Land one ACTUAL row.
+        run_id = uuid4()
+        await handler.on_chat_model_start(
+            serialized={},
+            messages=[[HumanMessage(content="hi")]],
+            run_id=run_id,
+            metadata={"langgraph_node": "planner_node", "langgraph_step": 0},
+            invocation_params={"model": "gpt-4o", "provider_id": "openai_official"},
+        )
+        await handler.on_llm_end(
+            _make_llm_result(usage_metadata={
+                "input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500
+            }),
+            run_id=run_id,
+        )
+        await handler.flush_pending()
+        # Marker write hangs past _MARKER_WRITE_TIMEOUT_SECONDS → False.
+        ok = await handler.write_session_degraded_marker(reason="drain_timeout")
+        assert ok is False  # documented best-effort trade-off
+
+        class _ListRepo:
+            async def find_by_session(self, session_id: str) -> List[CostRecord]:
+                return [r for r in captured if r.session_id == session_id]
+
+        service = CostAggregationService(repository=_ListRepo())
+        agg = await service.get_aggregate("sess-N")
+
+        # Negative trade-off: aggregation reports ACTUAL because no
+        # persist_degraded row reached the DB.
+        assert agg.cost_status == CostStatus.ACTUAL, (
+            "When marker write fails, aggregation reports actual — this is "
+            "the documented best-effort trade-off (§2 Non-goals + §8 ADR). "
+            "If you're tempted to 'fix' this assertion, you actually need a "
+            "non-DB fallback channel; please re-read the ADR first."
+        )
+
+        # Cleanup: release the parked marker task so the event loop is
+        # quiet at teardown.
+        block_event.set()
+        for _ in range(20):
+            await asyncio.sleep(0.05)

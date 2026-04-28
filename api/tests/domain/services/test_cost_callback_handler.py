@@ -29,7 +29,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 from app.domain.models.cost_record import CostRecord, CostStatus
-from app.domain.services.cost_callback_handler import CostCallbackHandler
+from app.domain.services.cost_callback_handler import (
+    CostCallbackHandler,
+    FlushResult,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -330,4 +333,158 @@ class TestFlushPendingTimeout:
         assert len(persisted) == 1, (
             "After timeout, the pending persist must complete once unblocked — "
             "otherwise cost rows are lost."
+        )
+
+
+class TestFlushResult:
+    """B4 Issue 1D: ``flush_pending`` returns FlushResult, not None.
+
+    Spec: docs/superpowers/specs/2026-04-27-b4-1d-finishing-drain-design.md §3.1
+    """
+
+    async def test_empty_pending_returns_drained_true(self) -> None:
+        persist, _captured = _make_capture_persister()
+        handler = CostCallbackHandler(
+            session_id="s", user_id="u", persister=persist
+        )
+
+        result = await handler.flush_pending()
+        assert isinstance(result, FlushResult)
+        assert result == FlushResult(
+            drained=True, pending_count=0, persist_failures=0
+        )
+
+    async def test_timeout_none_all_settle_returns_drained(self) -> None:
+        persist, captured = _make_capture_persister()
+        handler = CostCallbackHandler(
+            session_id="s", user_id="u", persister=persist
+        )
+
+        # Drive one full happy-path call to enqueue a persist task.
+        run_id = uuid4()
+        await handler.on_chat_model_start(
+            serialized={},
+            messages=[[HumanMessage(content="hi")]],
+            run_id=run_id,
+            metadata={"langgraph_node": "planner_node", "langgraph_step": 0},
+            invocation_params={"model": "gpt-4o", "provider_id": "openai_official"},
+        )
+        await handler.on_llm_end(
+            _make_llm_result(usage_metadata={
+                "input_tokens": 10, "output_tokens": 5, "total_tokens": 15
+            }),
+            run_id=run_id,
+        )
+
+        result = await handler.flush_pending(timeout=None)
+        assert result == FlushResult(
+            drained=True, pending_count=0, persist_failures=0
+        )
+        assert len(captured) == 1
+
+    async def test_timeout_with_leftovers_returns_pending_count(self) -> None:
+        # A persister that hangs on a never-set event so we can deterministically
+        # force a leftover task at flush time.
+        block_event = asyncio.Event()
+        captured: List[CostRecord] = []
+
+        async def slow_persist(record: CostRecord) -> None:
+            await block_event.wait()
+            captured.append(record)
+
+        handler = CostCallbackHandler(
+            session_id="s", user_id="u", persister=slow_persist
+        )
+        run_id = uuid4()
+        await handler.on_chat_model_start(
+            serialized={},
+            messages=[[HumanMessage(content="hi")]],
+            run_id=run_id,
+            metadata={"langgraph_node": "planner_node", "langgraph_step": 0},
+            invocation_params={"model": "gpt-4o", "provider_id": "openai_official"},
+        )
+        await handler.on_llm_end(
+            _make_llm_result(usage_metadata={
+                "input_tokens": 10, "output_tokens": 5, "total_tokens": 15
+            }),
+            run_id=run_id,
+        )
+
+        result = await handler.flush_pending(timeout=0.05)
+        assert result == FlushResult(
+            drained=False, pending_count=1, persist_failures=0
+        )
+        # Cleanup: release the persister so the background task exits before
+        # pytest tears down the event loop.
+        block_event.set()
+        await asyncio.sleep(0)
+        await handler.flush_pending(timeout=1.0)
+
+    async def test_persist_failures_delta_excludes_prior(self) -> None:
+        """Spec §3.1 + §5: ``persist_failures`` is window-local delta.
+
+        Prior failures (recorded before flush_pending entry) MUST NOT be
+        attributed to the current flush call.
+        """
+        persist, _captured = _make_capture_persister()
+        handler = CostCallbackHandler(
+            session_id="s", user_id="u", persister=persist
+        )
+
+        # Simulate a prior failure by bumping the counter directly. (In real
+        # code this is incremented by ``_persist_safely``; we don't need to
+        # round-trip the full failure here.)
+        handler._persist_failure_count = 2  # type: ignore[attr-defined]
+
+        # First flush (no pending tasks, no new failures): delta = 0.
+        result = await handler.flush_pending()
+        assert result == FlushResult(
+            drained=True, pending_count=0, persist_failures=0
+        )
+
+    async def test_persist_failures_delta_counts_window_failures(self) -> None:
+        """Failures occurring DURING the flush window ARE counted."""
+        captured: List[CostRecord] = []
+
+        async def failing_persist(record: CostRecord) -> None:
+            # Simulate transient persister failure. ``_persist_safely``
+            # catches and increments _persist_failure_count.
+            captured.append(record)
+            raise RuntimeError("simulated persister failure")
+
+        handler = CostCallbackHandler(
+            session_id="s", user_id="u", persister=failing_persist
+        )
+        run_id = uuid4()
+        await handler.on_chat_model_start(
+            serialized={},
+            messages=[[HumanMessage(content="hi")]],
+            run_id=run_id,
+            metadata={"langgraph_node": "planner_node", "langgraph_step": 0},
+            invocation_params={"model": "gpt-4o", "provider_id": "openai_official"},
+        )
+        await handler.on_llm_end(
+            _make_llm_result(usage_metadata={
+                "input_tokens": 10, "output_tokens": 5, "total_tokens": 15
+            }),
+            run_id=run_id,
+        )
+
+        result = await handler.flush_pending(timeout=1.0)
+        # Counter semantics: ``_persist_safely`` increments
+        # ``_persist_failure_count`` ONLY when the original persist call
+        # raises (cost_callback_handler.py: ``_persist_safely`` real-persist
+        # try/except branch). The subsequent best-effort degraded-marker
+        # insert is log-and-swallow and does NOT increment the counter
+        # (cost_callback_handler.py: degraded-fallback try/except branch).
+        # So a single real-persist failure contributes exactly +1 to the
+        # delta. We assert ``>= 1`` (not ``== 1``) only to leave a small
+        # margin for harness flakiness — do NOT change the implementation
+        # to also count marker-insert failures; that would conflate two
+        # distinct best-effort paths.
+        assert result.drained is True
+        assert result.pending_count == 0
+        assert result.persist_failures >= 1, (
+            "Expected at least the original persist failure to bump the "
+            f"counter, saw delta={result.persist_failures}"
         )

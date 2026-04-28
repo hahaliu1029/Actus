@@ -98,6 +98,36 @@ from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
 
+# B4 Issue 1D: GC anchor + observability for shielded terminal tasks.
+# Without a hard reference, asyncio could collect the task before its done
+# callback fires, swallowing exceptions raised inside the shielded body.
+_PENDING_TERMINAL_TASKS: set[asyncio.Task] = set()
+
+
+def _on_terminal_task_done(task: asyncio.Task) -> None:
+    _PENDING_TERMINAL_TASKS.discard(task)
+    if task.cancelled():
+        # Should not happen — the shield protects the inner task and we
+        # never cancel it directly.
+        logger.warning(
+            "terminal task %s was cancelled unexpectedly", task.get_name()
+        )
+        return
+    exc = task.exception()
+    if exc is not None:
+        # Use the explicit (type, value, traceback) tuple form rather than
+        # ``exc_info=exc``: even though CPython's logging accepts an
+        # exception instance, the explicit form is universally portable
+        # across logging configurations and guarantees the captured
+        # ``__traceback__`` is rendered into the formatter.
+        logger.error(
+            "terminal task %s raised: %s",
+            task.get_name(),
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
 MESSAGE_STREAM_CHUNK_SIZE = 24
 MESSAGE_STREAM_CHUNK_DELAY_SEC = 0.03
 SKILL_CONTEXT_MAX_SKILLS = 6
@@ -2729,42 +2759,100 @@ class AgentTaskRunner(TaskRunner):
             raise
 
     async def _set_terminal_status(self, status: SessionStatus) -> None:
-        """Set session to a terminal status and fire the on_session_complete callback.
+        """Set session to a terminal status and fire on_session_complete.
 
-        Consolidates the COMPLETED/TIMED_OUT write + lifecycle suspend notification
-        so all completion paths (invoke, resume, CancelledError, Exception) go through
-        one place.
+        B4 Issue 1D: drain + status write + completion callback are wrapped
+        in a single ``asyncio.shield``-protected task so outer cancellation
+        (SSE disconnect, admin abort) propagates to the caller while the
+        terminal body still runs to completion.
 
-        B4 M0: before marking the session terminal, drain any in-flight
-        CostCallbackHandler persist tasks so the cost ledger is complete when
-        the UI first queries ``GET /cost``. A failing flush is logged but
-        does not block the terminal transition — the degraded-session marker
-        (design Issue 1D) will be added alongside the shield wrap in a
-        follow-up.
+        Drain is bounded by ``flush_pending(timeout=3.0)``. Drain timeout or
+        drain-window persist failure dispatches a best-effort session-level
+        degraded sentinel via ``write_session_degraded_marker`` (also bounded
+        internally by the soft-bound pattern). Status write uses a fresh UoW
+        from ``self._uow_factory()`` with explicit ``commit()`` so DBUnitOfWork's
+        commit-swallow ergonomics don't hide failures from the terminal task's
+        done callback.
+
+        Outer ``CancelledError`` is re-raised to the caller AFTER the terminal
+        task is started; it is NOT used to drive the degraded marker (marking
+        on cancel would convert every SSE disconnect into a permanent
+        partial). See spec §3.3 + §3.5.
         """
-        if self._cost_callback_handler is not None:
-            try:
-                # Cap the drain at 3s so a stuck DB / connection pool doesn't
-                # wedge the session in FINISHING. Pending tasks keep running
-                # in the background; any failures are already logged by
-                # ``_persist_safely``.
-                await self._cost_callback_handler.flush_pending(timeout=3.0)
-            except Exception as exc:  # noqa: BLE001 — terminal path must not stall
-                logger.warning(
-                    "CostCallbackHandler.flush_pending failed on terminal "
-                    "transition (session_id=%s, status=%s): %s",
-                    self._session_id, status, exc,
-                )
-        async with self._uow:
-            await self._uow.session.update_status(self._session_id, status)
-        if self._on_session_complete is not None:
-            try:
-                await self._on_session_complete(self._session_id)
-            except Exception:
-                logger.debug(
-                    "on_session_complete callback failed for session %s",
-                    self._session_id,
-                )
+
+        async def _terminal_op() -> None:
+            cost_handler = getattr(self, "_cost_callback_handler", None)
+            if cost_handler is not None:
+                try:
+                    result = await cost_handler.flush_pending(timeout=3.0)
+                    if not result.drained:
+                        await cost_handler.write_session_degraded_marker(
+                            reason="drain_timeout"
+                        )
+                    elif result.persist_failures > 0:
+                        await cost_handler.write_session_degraded_marker(
+                            reason="drain_persist_failures"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    # flush_pending currently never raises non-Cancelled,
+                    # but keep the safety net + emit marker so an unexpected
+                    # raise is also surfaced as partial.
+                    logger.warning(
+                        "CostCallbackHandler.flush_pending raised on "
+                        "terminal drain (session_id=%s): %s",
+                        self._session_id, exc,
+                    )
+                    try:
+                        await cost_handler.write_session_degraded_marker(
+                            reason="drain_exception"
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Best-effort; marker writer already swallows its
+                        # own internals — this only fires if the contract
+                        # changes.
+                        pass
+
+            # Use a FRESH UoW from the factory: the shielded body may
+            # outlive the caller's request scope, and self._uow may be in
+            # a half-cleaned state. Commit EXPLICITLY inside the with block
+            # — DBUnitOfWork.__aexit__ swallows commit/rollback exceptions
+            # (logs only) for SSE-disconnect ergonomics, but for terminal
+            # status we want failure to be observed via the terminal task's
+            # done callback.
+            async with self._uow_factory() as uow:
+                await uow.session.update_status(self._session_id, status)
+                await uow.db_session.commit()  # raise on failure
+
+            on_complete = getattr(self, "_on_session_complete", None)
+            if on_complete is not None:
+                try:
+                    await on_complete(self._session_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "on_session_complete callback failed for session %s",
+                        self._session_id,
+                    )
+
+        # Create a NAMED task and register it so a) the asyncio debugger
+        # surfaces it usefully and b) any exception inside _terminal_op is
+        # observed via the done callback even when the outer caller is
+        # gone.
+        terminal_task = asyncio.create_task(
+            _terminal_op(),
+            name=f"cost-terminal-{self._session_id}-{status.value}",
+        )
+        _PENDING_TERMINAL_TASKS.add(terminal_task)
+        terminal_task.add_done_callback(_on_terminal_task_done)
+
+        try:
+            await asyncio.shield(terminal_task)
+        except asyncio.CancelledError:
+            # Outer cancel propagates to caller; the registered terminal
+            # task continues to completion. The done callback observes
+            # any exception via task.exception() and logs at ERROR level.
+            # We DO NOT mark the session degraded here — marker is driven
+            # exclusively by drain results inside _terminal_op.
+            raise
 
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放

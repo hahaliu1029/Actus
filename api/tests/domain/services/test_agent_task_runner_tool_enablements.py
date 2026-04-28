@@ -57,9 +57,21 @@ class _NoopSessionRepository:
         return None
 
 
+class _NoopDbSession:
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
 class _NoopUoW:
     def __init__(self) -> None:
         self.session = _NoopSessionRepository()
+        # B4 Issue 1D: _set_terminal_status now calls uow.db_session.commit()
+        # explicitly so commit failures surface via the terminal task's done
+        # callback. NoopUoW must expose db_session to match the new contract.
+        self.db_session = _NoopDbSession()
 
     async def __aenter__(self) -> "_NoopUoW":
         return self
