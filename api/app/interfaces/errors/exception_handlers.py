@@ -1,12 +1,67 @@
 import logging
 
 from app.application.errors.exceptions import AppException, TooManyRequestsError
+from app.infrastructure.observability.context import (
+    reset_trace_context,
+    set_trace_context,
+)
 from app.interfaces.schemas import Response
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
 logger = logging.getLogger(__name__)
+
+# B5 PR-S1-5: scope keys written by ``ObservabilityMiddleware`` so
+# this module — which runs *outside* that middleware whenever the
+# registered handler is for ``Exception`` / ``500`` (Starlette routes
+# those keys to ``ServerErrorMiddleware``) — can still (a) attach the
+# canonical ``X-Request-ID`` header on every JSON response, and
+# (b) re-bind the ``TraceContext`` for the catch-all handler's
+# ``logger.error`` call so the LogRecord factory injects the same
+# ``trace_id`` / ``request_id`` the response header carries.
+# The scope mapping is durable across the contextvar reset that fires
+# in ``ObservabilityMiddleware``'s ``finally`` block, so reading
+# from ``request.scope`` is safe even from the catch-all handler.
+_REQUEST_ID_SCOPE_KEY = "actus_request_id"
+_TRACE_CONTEXT_SCOPE_KEY = "actus_trace_context"
+
+
+def _request_id_headers(request: Request) -> dict[str, str]:
+    """Return ``{"X-Request-ID": <id>}`` if the middleware bound one.
+
+    Empty dict when the request never traversed
+    ``ObservabilityMiddleware`` (e.g., test scaffolds that mount the
+    handler on a bare app). The empty case is silent — the canonical
+    contract is "if a request_id exists, propagate it"; missing keys
+    are not an error.
+    """
+    request_id = request.scope.get(_REQUEST_ID_SCOPE_KEY)
+    if not request_id:
+        return {}
+    return {"X-Request-ID": str(request_id)}
+
+
+def _bind_scope_trace_context(request: Request):
+    """Temporarily re-bind the request's stashed ``TraceContext``.
+
+    Used by the catch-all 500 handler — which runs in
+    ``ServerErrorMiddleware`` (outside ``ObservabilityMiddleware``)
+    after the contextvar has been reset by the middleware's
+    ``finally`` block. Without re-binding, ``logger.error`` would
+    go through ``_actus_log_record_factory`` with no bound context
+    and emit ``trace_id="-"`` / ``request_id="-"``, breaking
+    ``trace_id``-keyed log join for every 500.
+
+    Returns the contextvar token to pass to
+    ``reset_trace_context`` (in a ``finally`` block), or ``None``
+    when no context was on scope (test scaffolds without the
+    middleware) — callers should skip the reset in that case.
+    """
+    ctx = request.scope.get(_TRACE_CONTEXT_SCOPE_KEY)
+    if ctx is None:
+        return None
+    return set_trace_context(ctx)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -20,7 +75,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
         logger.error(f"App exception: {exc.msg}")
 
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = _request_id_headers(request)
         if isinstance(exc, TooManyRequestsError):
             retry_after = (exc.data or {}).get("retry_after")
             if retry_after is not None:
@@ -40,18 +95,35 @@ def register_exception_handlers(app: FastAPI) -> None:
 
         logger.error(f"HTTP exception: {exc.detail}")
 
+        headers = _request_id_headers(request)
         return JSONResponse(
             status_code=exc.status_code,
             content=Response(code=exc.status_code, msg=exc.detail, data={}).model_dump(),
+            headers=headers or None,
         )
 
     @app.exception_handler(Exception)
     async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
         """通用异常处理器，捕获所有未处理的异常并返回标准化响应, 状态码500"""
-        # 这里可以添加日志记录等操作
-        logger.error(f"Unhandled exception: {exc}", exc_info=True)
+        # B5 PR-S1-5 (review-found P2): re-bind the request's
+        # TraceContext for the duration of the log emission so the
+        # crash line carries the same trace_id / request_id the
+        # response header carries. Without this, the LogRecord
+        # factory sees ``get_trace_context() is None`` (the outer
+        # ``ObservabilityMiddleware`` already reset the contextvar
+        # before this handler runs in ``ServerErrorMiddleware``)
+        # and pins both fields to ``"-"``, breaking trace-keyed log
+        # join on every 500.
+        token = _bind_scope_trace_context(request)
+        try:
+            logger.error(f"Unhandled exception: {exc}", exc_info=True)
+        finally:
+            if token is not None:
+                reset_trace_context(token)
 
+        headers = _request_id_headers(request)
         return JSONResponse(
             status_code=500,
             content=Response(code=500, msg="Internal Server Error", data={}).model_dump(),
+            headers=headers or None,
         )

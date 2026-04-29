@@ -12,6 +12,9 @@ from app.infrastructure.storage.postgres import get_postgres
 from app.infrastructure.storage.redis import get_redis
 from app.interfaces.endpoints.routes import router as api_router
 from app.interfaces.errors.exception_handlers import register_exception_handlers
+from app.interfaces.middlewares.observability_middleware import (
+    ObservabilityMiddleware,
+)
 
 from core.config import get_settings
 from fastapi import FastAPI
@@ -398,6 +401,15 @@ async def limit_request_body(request: Request, call_next):
                 content={"detail": "Request body too large"},
             )
     return await call_next(request)
+
+
+# B5 PR-S1-5: ObservabilityMiddleware 最后注册 → user_middleware[0]
+# → outermost frame，先于 CORS / body_limit / 异常处理器执行，使
+# 后续中间件、handler、lifespan 都能在 contextvar 上读到 trace_id /
+# request_id。Starlette 通过 ``user_middleware.insert(0, …)`` 实现
+# "最后 add → 最外层" 语义；测试 ``test_observability_middleware
+# _registration_outermost`` 锁死该顺序。
+app.add_middleware(ObservabilityMiddleware)
 
 # 注册全局异常处理器
 register_exception_handlers(app)
