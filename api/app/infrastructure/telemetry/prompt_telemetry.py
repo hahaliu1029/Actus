@@ -6,6 +6,18 @@ to the prompt assembly hot path.
 
 C1 only ships the implementation. DI wiring (constructing the instance and
 passing it to PromptAssembler) happens in C5a.
+
+B5 PR-S1-6 (A6): every emitted JSONL row now carries the canonical
+join keys ``trace_id`` / ``request_id`` / ``session_id`` read from
+the per-request ``TraceContext`` carrier. Schema is backward
+compatible — old keys keep their position and value; the three new
+keys are appended at the tail of every payload. Sprint 2 ships the
+real OTel spans with the same join keys, so an analyst can ``LEFT
+JOIN`` the JSONL files against span attributes via ``trace_id``.
+
+After Sprint 2, this writer schema is **FROZEN** — any new field
+goes on OTel attributes, not into the JSONL files (avoid divergent
+sources of truth on the same metric).
 """
 from __future__ import annotations
 
@@ -21,6 +33,48 @@ if TYPE_CHECKING:
     from app.domain.services.recovery._event import RecoveryEvent
 
 logger = logging.getLogger(__name__)
+
+
+def _trace_fields() -> dict[str, str | None]:
+    """Read canonical trace/request/session join keys for a JSONL row.
+
+    Per the v1 canonical attribute contract (PR-S1-1) ``trace_id``
+    and ``request_id`` are **NEVER null** on any emit — null values
+    would silently fail downstream ``validate_attributes`` checks
+    and leave 100% of CLI / scheduler emissions un-joinable against
+    future OTel span attributes.
+
+    Delegates to ``build_canonical_attributes()`` so the "no
+    request scope" fallback (``uuid4().hex`` for trace_id, ``str(
+    uuid4())`` for request_id) is shared with every other canonical
+    emit site — single source of truth for fallback semantics.
+    ``session_id`` may be ``None`` here (the canonical contract
+    marks it optional).
+
+    Defensive: telemetry must never propagate errors to the
+    prompt-assembly hot path (port contract). The outer
+    ``try/except`` guards against boot-time circular import or any
+    future change to ``build_canonical_attributes`` that could
+    raise — last-resort path generates the same uuid4 shapes
+    locally so the contract still holds.
+    """
+    try:
+        from app.domain.external.observability import build_canonical_attributes
+
+        attrs = build_canonical_attributes()
+        return {
+            "trace_id": attrs["trace_id"],
+            "request_id": attrs["request_id"],
+            "session_id": attrs.get("session_id"),
+        }
+    except Exception:
+        import uuid as _uuid
+
+        return {
+            "trace_id": _uuid.uuid4().hex,
+            "request_id": str(_uuid.uuid4()),
+            "session_id": None,
+        }
 
 
 class JsonlPromptTelemetry(PromptTelemetryPort):
@@ -73,6 +127,9 @@ class JsonlPromptTelemetry(PromptTelemetryPort):
                 "mode": mode,
                 "version_hash": version_hash,
                 "fallback_used": fallback_used,
+                # B5 PR-S1-6: canonical join keys appended at tail —
+                # old positions preserved for backward-compat consumers.
+                **_trace_fields(),
             },
         )
 
@@ -94,6 +151,7 @@ class JsonlPromptTelemetry(PromptTelemetryPort):
                 "tools_hash": tools_hash,
                 "lang": lang,
                 "provider": provider,
+                **_trace_fields(),
             },
         )
 
@@ -120,6 +178,7 @@ class JsonlPromptTelemetry(PromptTelemetryPort):
                 "rewrite_applied_keys": list(event.rewrite_applied_keys),
                 "outcome": event.outcome,
                 "latency_ms": event.latency_ms,
+                **_trace_fields(),
             },
         )
 
