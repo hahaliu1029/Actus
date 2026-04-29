@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -74,8 +75,11 @@ async def rollback() -> None:
 
         await session.commit()
 
-    print(f"[rollback] restored snapshot={snapshot}")
-    print(f"[rollback] skills={len(skills_data)} preferences={len(prefs_data)}")
+    sys.stdout.write(f"[rollback] restored snapshot={snapshot}\n")
+    sys.stdout.write(
+        f"[rollback] skills={len(skills_data)} preferences={len(prefs_data)}\n"
+    )
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

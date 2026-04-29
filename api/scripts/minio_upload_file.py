@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -61,7 +62,8 @@ async def main() -> None:
 
     result["size"] = size
     result["local_path"] = str(path)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    sys.stdout.flush()
 
     await store.shutdown()
 

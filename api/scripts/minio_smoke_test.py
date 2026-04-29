@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 
 from app.infrastructure.storage.minio import get_minio
 from core.config import get_settings
@@ -16,7 +17,8 @@ async def main() -> None:
         "smoke": await store.smoke_test(bucket_name=bucket_name),
     }
 
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    sys.stdout.flush()
     await store.shutdown()
 
 

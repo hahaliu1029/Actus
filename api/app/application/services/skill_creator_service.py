@@ -932,9 +932,14 @@ class SkillCreatorService:
         session_id = f"skill_creator_validate_{run_id}"
         skill_root = f"/tmp/skill_creator_validate_{run_id}"
 
-        print(
-            f"[沙箱验证] 开始: scripts={[s.path for s in files.scripts]}, "
-            f"deps={files.dependencies}, manifest_tools={len(files.manifest.get('tools', []))}"
+        # B5 PR-S1-7a (Q4 category a): runtime business path → logger.info
+        # so the line goes through RedactingFormatter + LogRecord factory
+        # and carries trace_id / request_id / session_id.
+        logger.info(
+            "[沙箱验证] 开始: scripts=%s, deps=%s, manifest_tools=%d",
+            [s.path for s in files.scripts],
+            files.dependencies,
+            len(files.manifest.get("tools", [])),
         )
 
         mkdir_result = await sandbox.exec_command(

@@ -355,6 +355,59 @@ def _install_component_filter(root_logger: logging.Logger) -> None:
 # ---------------------------------------------------------------------------
 # Public composer
 # ---------------------------------------------------------------------------
+def setup_cli_logging() -> None:
+    """Minimal logging setup for CLI scripts that need clean stdout.
+
+    Variant of ``setup_logging`` for one-shot CLI tools whose stdout
+    is the operator-facing channel (JSON output, status reports,
+    pipe-friendly text). Differences from the FastAPI-targeted
+    ``setup_logging``:
+
+    - Console handler writes to **stderr** instead of stdout. Stdout
+      stays reserved for the script's own ``sys.stdout.write``
+      output, so a downstream ``| jq`` or ``> result.json`` keeps
+      working — review-found P2 against ``app.cli.memory_reconcile``
+      whose JSON summary print was getting interleaved with
+      ``setup_logging``'s ``"日志记录器已初始化"`` bootstrap line and
+      the ``/app/data/logs`` write-failure warning.
+    - **No file handlers** — CLI scripts are short-lived; the
+      rotating-file handlers add IO + cleanup overhead with no
+      operational benefit.
+    - **No bootstrap log line** — keep CLI startup silent unless
+      the script itself wants to emit something.
+
+    Still installs the LogRecord factory (Q6 trace/request/session
+    fields), the RedactingFormatter (so any third-party log emitted
+    during the run still has secrets masked), the third-party
+    isolation chain (Q2 self-heal), and the component filter (noise
+    suppression) so anything the CLI run emits via ``logging``
+    behaves like the production stack — just routed to stderr.
+    """
+    settings = get_settings()
+    root_logger = logging.getLogger()
+    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    root_logger.setLevel(log_level)
+
+    _install_log_record_factory()
+
+    # Clear-and-reinstall single stderr handler. Idempotent: re-running
+    # ``setup_cli_logging`` (or running it after a prior ``setup_logging``)
+    # closes the old handlers cleanly before swapping the stream.
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(_build_formatter())
+    stderr_handler.setLevel(log_level)
+    root_logger.addHandler(stderr_handler)
+
+    _install_third_party_isolation()
+    _install_component_filter(root_logger)
+
+
 def setup_logging() -> None:
     """Initialise application-wide logging.
 

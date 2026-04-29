@@ -17,6 +17,13 @@ per-user fs-walk 走懒式（session 创建触发）。当 operator 怀疑数据
 
 **连接生命周期：** 一次性任务，连接池开成 min=1/max=2 即可；跑完手动 close。
 不走 FastAPI lifespan，直接用 ``asyncpg`` 的 async engine。
+
+B5 PR-S1-7a (Q4 category b): JSON summary writes via
+``sys.stdout.write`` (explicit operator-stdout API) so the
+``no_print_in_backend`` lint gate need not whitelist this file —
+``print()`` calls would now be a real regression. ``setup_cli_logging``
+keeps the redaction + LogRecord factory but routes log output to
+**stderr**, leaving stdout clean for ``| jq`` / ``> file.json``.
 """
 from __future__ import annotations
 
@@ -95,10 +102,24 @@ async def _run(args: argparse.Namespace) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # B5 PR-S1-7a (Q4) + review-found P2:
+    # 1. ``_parse_args`` runs FIRST so ``--help`` exits before any
+    #    logging side effects pollute stdout (argparse exits in-line
+    #    on --help and prints usage, which would otherwise interleave
+    #    with the bootstrap log line).
+    # 2. ``setup_cli_logging`` (not ``setup_logging``) keeps the
+    #    redacting formatter + LogRecord factory + Q2 self-heal but
+    #    routes the console handler to **stderr**, so the JSON
+    #    summary written to stdout below stays pipe-clean for tools
+    #    like ``jq``.
     args = _parse_args(argv)
+
+    from app.infrastructure.logging import setup_cli_logging
+
+    setup_cli_logging()
     summary = asyncio.run(_run(args))
-    print(json.dumps(summary, indent=2, default=str))
+    sys.stdout.write(json.dumps(summary, indent=2, default=str) + "\n")
+    sys.stdout.flush()
     return 0
 
 

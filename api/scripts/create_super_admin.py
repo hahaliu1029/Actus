@@ -6,6 +6,12 @@
     python scripts/create_super_admin.py
 
 脚本会交互式提示输入用户名、邮箱和密码，然后创建超级管理员账户。
+
+B5 PR-S1-7a (Q4 category b): operator-visible status / prompts use
+``sys.stdout.write`` (via the local ``_echo`` helper) instead of
+bare ``print()`` so the ``no_print_in_backend`` lint gate stays
+clean without needing a directory-level allowlist for
+``api/scripts/``.
 """
 
 import asyncio
@@ -24,6 +30,12 @@ from core.security import get_password_hash
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+
+
+def _echo(line: str = "") -> None:
+    """Write ``line`` + newline to stdout (PR-S1-7a explicit stdout API)."""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
 
 
 def validate_email(email: str) -> bool:
@@ -86,10 +98,10 @@ async def create_super_admin(
 
 
 async def main():
-    print("=" * 50)
-    print("  创建超级管理员账户")
-    print("=" * 50)
-    print()
+    _echo("=" * 50)
+    _echo("  创建超级管理员账户")
+    _echo("=" * 50)
+    _echo()
 
     # 创建数据库连接
     engine = create_async_engine(settings.sqlalchemy_database_url, echo=False)
@@ -98,18 +110,18 @@ async def main():
     async with async_session() as session:
         # 检查是否已存在超级管理员
         if await check_super_admin_exists(session):
-            print("❌ 错误: 系统中已存在超级管理员账户")
-            print("   如需重新创建，请先删除现有的超级管理员账户")
+            _echo("❌ 错误: 系统中已存在超级管理员账户")
+            _echo("   如需重新创建，请先删除现有的超级管理员账户")
             return 1
 
         # 输入用户名
         while True:
             username = input("请输入用户名 (3-50个字符，仅限字母数字下划线): ").strip()
             if not validate_username(username):
-                print("❌ 用户名格式不正确，请重新输入")
+                _echo("❌ 用户名格式不正确，请重新输入")
                 continue
             if await check_user_exists(session, username=username):
-                print("❌ 该用户名已被使用，请选择其他用户名")
+                _echo("❌ 该用户名已被使用，请选择其他用户名")
                 continue
             break
 
@@ -120,10 +132,10 @@ async def main():
                 email = None
                 break
             if not validate_email(email):
-                print("❌ 邮箱格式不正确，请重新输入")
+                _echo("❌ 邮箱格式不正确，请重新输入")
                 continue
             if await check_user_exists(session, email=email):
-                print("❌ 该邮箱已被使用，请使用其他邮箱")
+                _echo("❌ 该邮箱已被使用，请使用其他邮箱")
                 continue
             break
 
@@ -131,37 +143,37 @@ async def main():
         while True:
             password = getpass.getpass("请输入密码 (至少8个字符): ")
             if not validate_password(password):
-                print("❌ 密码长度至少8个字符，请重新输入")
+                _echo("❌ 密码长度至少8个字符，请重新输入")
                 continue
             password_confirm = getpass.getpass("请再次输入密码确认: ")
             if password != password_confirm:
-                print("❌ 两次输入的密码不一致，请重新输入")
+                _echo("❌ 两次输入的密码不一致，请重新输入")
                 continue
             break
 
         # 确认创建
-        print()
-        print("-" * 50)
-        print(f"用户名: {username}")
-        print(f"邮箱: {email or '(未设置)'}")
-        print(f"角色: 超级管理员 (super_admin)")
-        print("-" * 50)
+        _echo()
+        _echo("-" * 50)
+        _echo(f"用户名: {username}")
+        _echo(f"邮箱: {email or '(未设置)'}")
+        _echo("角色: 超级管理员 (super_admin)")
+        _echo("-" * 50)
 
         confirm = input("确认创建? (y/N): ").strip().lower()
         if confirm != "y":
-            print("已取消创建")
+            _echo("已取消创建")
             return 0
 
         # 创建超级管理员
         try:
             user = await create_super_admin(session, username, email, password)
-            print()
-            print("✅ 超级管理员账户创建成功!")
-            print(f"   用户ID: {user.id}")
-            print(f"   用户名: {user.username}")
+            _echo()
+            _echo("✅ 超级管理员账户创建成功!")
+            _echo(f"   用户ID: {user.id}")
+            _echo(f"   用户名: {user.username}")
             return 0
         except Exception as e:
-            print(f"❌ 创建失败: {e}")
+            _echo(f"❌ 创建失败: {e}")
             return 1
 
 

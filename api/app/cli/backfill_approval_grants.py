@@ -211,11 +211,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def main(argv: list[str] | None = None) -> int:
+    # B5 PR-S1-7a (Q4) + review-found P2: parse args FIRST so
+    # ``--help`` exits before any logging side effects; then use
+    # ``setup_cli_logging`` (stderr-only — no stdout pollution, no
+    # file handlers, no bootstrap line) so any stdout the CLI emits
+    # stays pipe-clean.
     args = _parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+
+    from app.infrastructure.logging import setup_cli_logging
+
+    setup_cli_logging()
+    # ``--log-level`` flag override (setup_cli_logging reads
+    # ``settings.log_level`` env, not the CLI arg).
+    cli_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(cli_level)
+    for handler in root_logger.handlers:
+        handler.setLevel(cli_level)
 
     settings = get_settings()
     engine = create_async_engine(

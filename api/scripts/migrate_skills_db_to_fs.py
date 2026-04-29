@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -108,8 +109,9 @@ async def migrate() -> None:
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"[migrate] snapshot={snapshot_root}")
-    print(f"[migrate] migrated_skills={len(mapping)}")
+    sys.stdout.write(f"[migrate] snapshot={snapshot_root}\n")
+    sys.stdout.write(f"[migrate] migrated_skills={len(mapping)}\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
