@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     # 项目基础配置
     env: str = "development"  # 应用环境，默认为'development'
     log_level: str = "INFO"  # 日志级别，默认为'INFO'
+    # B5 PR-S1-4 (A5): rotating file handler 输出目录。
+    # docker 路径 ``/app/data/logs`` 经 ``${LOG_ROOT_HOST}`` bind mount 到
+    # 宿主，沿用 ``MEMORY_ROOT_HOST`` 模式（UID 1000 ownership + bind）。
+    # 本地 dev/CI 没有该路径时，``_install_file_handlers`` 会捕获 OSError
+    # 并降级到仅 stdout，stdout handler 永远会装上。
+    log_dir: str = "/app/data/logs"
     app_config_filepath: str = "config.yaml"  # 应用配置文件路径
     cors_origins: str = "http://localhost:3000,http://localhost"  # 逗号分隔的允许来源列表
     max_request_body_size: int = 500 * 1024 * 1024  # 500MB 请求体限制

@@ -47,6 +47,7 @@ dependencies = [
     "langgraph-checkpoint-postgres>=2.0.0",
     "psycopg[binary]>=3.3.3",
     "pgvector>=0.3.6",
+    "concurrent-log-handler>=0.9.25",
 ]
 
 [project.optional-dependencies]
