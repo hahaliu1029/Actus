@@ -50,6 +50,16 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Run lint gates (B5 PR-S1-7b)
+        # AST scanners that block ``logging.basicConfig`` and bare
+        # ``print()`` from re-entering the backend tree. Runs before
+        # pytest so a fast lint failure short-circuits the slower
+        # test job — and so a regression cannot ride into ``main``
+        # even if no test happens to import the offending module.
+        run: |
+          uv run python api/tools/lint/no_logging_basicconfig.py
+          uv run python api/tools/lint/no_print_in_backend.py
+
       - name: Run tests
         env:
           SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test
