@@ -158,6 +158,7 @@ def build_main_graph(
     prompt_assembler: "PromptAssembler | None" = None,
     supports_vision: bool = True,
     memory_snapshot_provider: "Callable[[], Awaitable[MemorySnapshot | None]] | None" = None,
+    node_decorator: "Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]] | None" = None,
     _allow_default_prompt_assembler: bool = False,
 ) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
@@ -448,17 +449,22 @@ def build_main_graph(
         # NOT write skill_context back to state (enforced by the AST lint at
         # tests/domain/services/graphs/test_executor_no_skill_context_writeback.py).
         react_graph_provider = (config.get("configurable") or {}).get("react_graph_provider")
-        fresh_config = config
+        # B5 PR-S2-2 + FOLLOW-10: pin ``step_id`` into a fresh configurable
+        # so the downstream subgraph + tool callbacks read the canonical
+        # per-step identity. ``traced_node`` reads this slot for the
+        # executor span; ``OtelToolSpanCallback`` reads it for tool spans.
+        # Always build the fresh dict (even when ``react_graph_provider``
+        # is None or raises) so the contract holds for the legacy /
+        # fallback paths too.
+        fresh_configurable = dict(config.get("configurable") or {})
+        fresh_configurable["step_id"] = step.id
+        fresh_config = {**config, "configurable": fresh_configurable}
         if react_graph_provider:
             try:
                 step_react, step_meta = await react_graph_provider(step.description)
-                # Inject per-step bound_tool_names into a fresh configurable for
+                # Inject per-step bound_tool_names into the fresh configurable for
                 # downstream consumers (C5b PromptAssembler will read it).
-                fresh_configurable = {
-                    **(config.get("configurable") or {}),
-                    "bound_tool_names": step_meta.bound_tool_names,
-                }
-                fresh_config = {**config, "configurable": fresh_configurable}
+                fresh_configurable["bound_tool_names"] = step_meta.bound_tool_names
                 fresh_skill_context = step_meta.skill_context
                 fresh_skill_ids: list[str] = list(step_meta.skill_ids)
             except Exception:
@@ -1052,10 +1058,18 @@ def build_main_graph(
         retry_on=ServerRequestsError,
     )
 
-    g.add_node("planner_node", planner_node, retry_policy=planner_retry)
-    g.add_node("executor_node", executor_node)
-    g.add_node("updater_node", updater_node)
-    g.add_node("interrupt_node", interrupt_node)
+    # B5 PR-S2-2: optional infrastructure-supplied decorator wraps each
+    # registered node coroutine. Composition layer
+    # (``app/application/composition/graph_assembly.py``) passes
+    # ``traced_node(OtelTracer())`` so each invocation produces a
+    # ``graph.node.<name>`` span; ``None`` keeps the legacy behaviour.
+    # The decorator MUST preserve ``__name__`` (LangGraph introspects it)
+    # — ``functools.wraps`` is the standard tool.
+    _wrap = node_decorator if node_decorator is not None else (lambda fn: fn)
+    g.add_node("planner_node", _wrap(planner_node), retry_policy=planner_retry)
+    g.add_node("executor_node", _wrap(executor_node))
+    g.add_node("updater_node", _wrap(updater_node))
+    g.add_node("interrupt_node", _wrap(interrupt_node))
 
     g.add_conditional_edges(START, route_entry)
     g.add_edge("planner_node", "executor_node")

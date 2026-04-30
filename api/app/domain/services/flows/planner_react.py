@@ -509,6 +509,12 @@ class PlannerReActFlow(BaseFlow):
         )
         memory_snapshot_provider = self._build_memory_snapshot_provider()
 
+        # B5 PR-S2-2: hand the OTel-backed traced_node decorator to the
+        # graph builder so each registered LangGraph node emits a
+        # ``graph.node.<name>`` span. Composition layer is the only
+        # site that imports both the OTel SDK and the domain graph.
+        from app.application.composition import build_traced_node_decorator
+
         self._main_graph = build_main_graph(
             planner_llm=self._llm,
             react_graph=self._react_graph,
@@ -521,6 +527,7 @@ class PlannerReActFlow(BaseFlow):
             prompt_assembler=self._prompt_assembler,
             supports_vision=self._supports_vision,
             memory_snapshot_provider=memory_snapshot_provider,
+            node_decorator=build_traced_node_decorator(),
             _allow_default_prompt_assembler=self._allow_default_prompt_assembler,
         )
         self._graphs_built = True
@@ -1167,8 +1174,20 @@ class PlannerReActFlow(BaseFlow):
         # fires on_chat_model_start → on_llm_end and writes a CostRecord.
         # LangGraph merges ``callbacks`` with the adapter's own callback
         # list so telemetry + cost stacking is additive.
+        #
+        # B5 PR-S2-2: append the OTel-backed tool span handler so each
+        # tool invocation produces a ``tool.<name>`` span with
+        # ``tool_args_hash`` (sha256[:16]) + ``tool_args_size`` and the
+        # canonical join keys (trace_id / step_id from the contextvar
+        # ``traced_node`` binds). Raw args are NEVER on the span.
+        from app.application.composition import build_observability_callbacks
+
+        callbacks: list[Any] = []
         if self._cost_callback_handler is not None:
-            cfg["callbacks"] = [self._cost_callback_handler]
+            callbacks.append(self._cost_callback_handler)
+        callbacks.extend(build_observability_callbacks())
+        if callbacks:
+            cfg["callbacks"] = callbacks
         return cfg
 
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
