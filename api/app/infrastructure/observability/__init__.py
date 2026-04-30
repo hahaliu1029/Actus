@@ -8,7 +8,10 @@ PR-S2-1 adds the OTel SDK bootstrap (``setup_observability``) and the
 first ``LoggerPort`` impl (``OtelLogger``). PR-S2-2 adds the
 ``TracerPort`` impl (``OtelTracer``), the LangGraph node tracing
 decorator (``traced_node``), and the LangChain tool-span callback
-(``OtelToolSpanCallback``).
+(``OtelToolSpanCallback``). PR-S2-3 adds the ``MeterPort`` impl
+(``OtelMeter``) and the LangChain LLM metrics callback
+(``OtelLLMMetricsCallback`` — ``llm.latency_ms`` histogram +
+``cost_usd_micro`` counter).
 """
 
 from app.infrastructure.observability.init import (
@@ -17,14 +20,20 @@ from app.infrastructure.observability.init import (
     setup_observability,
     teardown_observability,
 )
+from app.infrastructure.observability.otel_llm_metrics import (
+    OtelLLMMetricsCallback,
+)
 from app.infrastructure.observability.otel_logger import OtelLogger
+from app.infrastructure.observability.otel_meter import OtelMeter
 from app.infrastructure.observability.otel_tool_span import OtelToolSpanCallback
 from app.infrastructure.observability.otel_tracer import OtelTracer
 from app.infrastructure.observability.traced_node import traced_node
 
 __all__ = (
     "ObservabilityProviders",
+    "OtelLLMMetricsCallback",
     "OtelLogger",
+    "OtelMeter",
     "OtelToolSpanCallback",
     "OtelTracer",
     "get_providers",
