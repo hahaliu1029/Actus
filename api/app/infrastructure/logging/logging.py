@@ -345,11 +345,23 @@ def _install_component_filter(root_logger: logging.Logger) -> None:
     fixtures so repeated ``setup_logging()`` calls don't stack
     multiple identical filters on the same handler.
     """
-    component_filter = _ComponentFilter()
     for handler in root_logger.handlers:
-        if any(isinstance(f, _ComponentFilter) for f in handler.filters):
-            continue
-        handler.addFilter(component_filter)
+        attach_component_filter(handler)
+
+
+def attach_component_filter(handler: logging.Handler) -> None:
+    """Attach the standard ``_ComponentFilter`` to a single handler.
+
+    Public helper so that handlers added AFTER ``setup_logging()`` (the
+    OTel ``LoggingHandler`` installed by ``setup_observability`` is the
+    motivating case) can opt in to the same noise suppression rules
+    (drop INFO/DEBUG records from ``_NOISY_COMPONENT_PREFIXES`` —
+    ``httpx`` / ``openai`` / ``langchain`` / ...). Idempotent: a handler
+    already carrying a ``_ComponentFilter`` is left alone.
+    """
+    if any(isinstance(f, _ComponentFilter) for f in handler.filters):
+        return
+    handler.addFilter(_ComponentFilter())
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from alembic import command
 from alembic.config import Config
 from app.infrastructure.logging import setup_logging
+from app.infrastructure.observability import setup_observability
 from app.infrastructure.storage.minio import get_minio
 from app.infrastructure.storage.postgres import get_postgres
 from app.infrastructure.storage.redis import get_redis
@@ -27,6 +28,10 @@ settings = get_settings()
 
 # 初始化日志记录
 setup_logging()
+# B5 PR-S2-1: 装载 OTel SDK（默认 no-op，零外发零本地输出）。setup_logging 必须先跑，
+# 这样 setup_observability 内部 ``LoggingHandler`` 就接到已经装好 RedactingFormatter
+# 的 root logger 上；任何 stdlib 日志在落 OTel pipeline 之前都已经走过 redaction。
+setup_observability()
 logger = logging.getLogger()
 
 logger.info("应用程序启动中...")

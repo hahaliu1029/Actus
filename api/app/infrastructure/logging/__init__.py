@@ -1,3 +1,3 @@
-from .logging import setup_cli_logging, setup_logging
+from .logging import attach_component_filter, setup_cli_logging, setup_logging
 
-__all__ = ["setup_cli_logging", "setup_logging"]
+__all__ = ["attach_component_filter", "setup_cli_logging", "setup_logging"]

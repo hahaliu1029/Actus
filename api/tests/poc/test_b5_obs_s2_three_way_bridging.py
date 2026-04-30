@@ -71,18 +71,28 @@ def _otel_trace_id_hex(span: trace.Span) -> str:
 
 @pytest.fixture(scope="module")
 def _module_otel_setup():
-    """Install ``TracerProvider`` once per module.
+    """Install a fresh SDK ``TracerProvider`` for the PoC module.
 
-    OTel's global ``set_tracer_provider`` rejects later overrides with a
-    warning; subsequent calls would silently leave the first provider in
-    place, so per-test installs are unsafe. Instead we install once here
-    and let each test reset the shared exporter via ``otel_exporter``.
+    PR-S2-1 ``teardown_observability`` resets OTel's set-once gates so
+    we can install our own provider here without fighting the
+    ``app.main`` bootstrap. We don't reuse the bootstrap's provider
+    because per-module test isolation is cleaner — and earlier obs
+    tests may have torn the global down to a ``ProxyTracerProvider``
+    which doesn't expose ``add_span_processor``.
     """
+    from app.infrastructure.observability import teardown_observability
+
+    teardown_observability()
+
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
-    return exporter
+
+    yield exporter
+
+    exporter.clear()
+    teardown_observability()
 
 
 @pytest.fixture

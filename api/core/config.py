@@ -189,6 +189,16 @@ class Settings(BaseSettings):
     wechat_redirect_uri: str = ""  # 微信授权后回调地址
     wechat_frontend_redirect_uri: str = ""  # 前端接收 token 的页面地址
 
+    # B5 PR-S2-1: OTel SDK 出口路由。
+    # 默认两条都为空字符串 = 装载 SDK 但不外发、不本地输出（spec line 436）。
+    # ``otel_exporter="stdout"`` 显式 opt-in：dev 调试场景下 ConsoleSpan/Log/
+    # Metric exporter 写本地 stdout，仍是零外发。
+    # ``otlp_endpoint`` 非空 = OTLP 出口（Sprint 3 PR-S3-1 才落，本 sprint
+    # 占位字段；setup_observability 在 Sprint 2 看到非空值会 raise
+    # NotImplementedError 提示 caller 走 stdout 或留空）。
+    otlp_endpoint: str = ""
+    otel_exporter: str = ""
+
     # 使用pydantic v2的写法来完成环境变量信息的告知
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
