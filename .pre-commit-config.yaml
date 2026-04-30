@@ -1,0 +1,44 @@
+# Bootstrapped by PR-S1-7b per design spec line 656:
+#   "如未有则在 PR-S1-7b 内同步 bootstrap 一个最小 .pre-commit-config.yaml,
+#    不再独立 follow-up"
+#
+# Both hooks ALSO run in CI (.github/workflows/ci.yml) — this file
+# duplicates the gate locally so a developer who has pre-commit
+# installed catches violations before pushing.
+#
+# Setup (one-time):
+#   uv tool install pre-commit && pre-commit install
+#
+# Manual run on the whole tree:
+#   pre-commit run --all-files
+#
+# Both scanners use the project's uv-managed venv (per CLAUDE.md hard
+# constraint "后端 Python 一律使用项目 venv"); they expect to run from
+# the repo root so the default targets (api/app, api/scripts,
+# api/tools) resolve correctly.
+repos:
+  - repo: local
+    hooks:
+      - id: no-logging-basicconfig
+        name: Forbid logging.basicConfig() in backend
+        entry: uv run python api/tools/lint/no_logging_basicconfig.py
+        language: system
+        types: [python]
+        files: ^api/(app|scripts|tools)/
+        pass_filenames: false
+        description: >-
+          AST scanner that rejects logging.basicConfig(...) and its
+          alias variants (import-as, from-import, walrus, tuple
+          unpack, etc.). See api/tools/lint/no_logging_basicconfig.py.
+      - id: no-print-in-backend
+        name: Forbid bare print() in backend
+        entry: uv run python api/tools/lint/no_print_in_backend.py
+        language: system
+        types: [python]
+        files: ^api/(app|scripts)/
+        pass_filenames: false
+        description: >-
+          AST scanner that rejects bare print() in api/app and
+          api/scripts. Allowlists tests/, api/tools/, and any file
+          with the marker "# noqa: NO-PRINT". See
+          api/tools/lint/no_print_in_backend.py.
