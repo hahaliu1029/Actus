@@ -1567,7 +1567,21 @@ def build_react_graph(
 
                         _summary_llm = configurable.get("summary_llm")
                         if _summary_llm:
-                            _smart = SmartApprove(llm=_summary_llm)
+                            # B5 PR-S3-2 reviewer round-2 P3: thread
+                            # the decision recorder from configurable
+                            # so SmartApprove (domain) doesn't import
+                            # the OTel helper directly. Composition
+                            # (planner_react._build_config) injects
+                            # the OTel-backed callable; tests pass
+                            # ``None`` and SmartApprove silently
+                            # skips the emit.
+                            _decision_recorder = configurable.get(
+                                "decision_recorder"
+                            )
+                            _smart = SmartApprove(
+                                llm=_summary_llm,
+                                decision_recorder=_decision_recorder,
+                            )
                             try:
                                 _sa_decision = await asyncio.wait_for(
                                     _smart.evaluate(

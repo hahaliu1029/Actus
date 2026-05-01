@@ -560,6 +560,9 @@ class ActusRecoveryChatModel(BaseChatModel):
         from app.infrastructure.external.llm._telemetry_mixin import (
             emit_recovery_event,
         )
+        from app.infrastructure.observability.decision_trace import (
+            record_decision,
+        )
 
         event = RecoveryEvent(
             call_id=call_id,
@@ -573,6 +576,28 @@ class ActusRecoveryChatModel(BaseChatModel):
             rewrite_applied_keys=rewrite_applied_keys,
             outcome=outcome,  # type: ignore[arg-type]
             latency_ms=latency_ms,
+        )
+        # B5 PR-S3-2: emit a ``decision.recovery`` span event on the
+        # currently-active span (typically the LLM call span). The
+        # event carries ``decision_outcome`` (success / retry /
+        # give_up / etc.) and ``decision_reason`` = ``action_code``
+        # (the recovery rule that fired — null on success path).
+        # Canonical attrs (``model`` / ``llm_provider`` /
+        # ``attempt_ix``) ride through so dashboards can slice
+        # recovery rates by adapter / provider / retry-tier. This
+        # is the single chokepoint for all 11+ recovery emit sites
+        # in this wrapper — wiring here covers them all.
+        record_decision(
+            "recovery",
+            outcome=outcome,
+            reason=action_code,
+            attrs={
+                "model": getattr(
+                    self.inner, "model_name", self._llm_type
+                ),
+                "llm_provider": self.profile.provider_id,
+                "attempt_ix": attempt_index,
+            },
         )
         logger.info(
             "RecoveryEvent(call_id=%s, attempt=%d, outcome=%s, action=%s)",

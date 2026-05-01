@@ -14,6 +14,7 @@ decorator (``traced_node``), and the LangChain tool-span callback
 ``cost_usd_micro`` counter).
 """
 
+from app.infrastructure.observability.decision_trace import record_decision
 from app.infrastructure.observability.init import (
     ObservabilityProviders,
     get_providers,
@@ -37,6 +38,7 @@ __all__ = (
     "OtelToolSpanCallback",
     "OtelTracer",
     "get_providers",
+    "record_decision",
     "setup_observability",
     "teardown_observability",
     "traced_node",

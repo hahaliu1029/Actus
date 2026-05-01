@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from app.domain.external.observability import MeterPort, TracerPort
+from app.infrastructure.observability.decision_trace import record_decision
 from app.infrastructure.observability.otel_llm_metrics import (
     OtelLLMMetricsCallback,
 )
@@ -71,3 +72,22 @@ def build_observability_callbacks(
         OtelToolSpanCallback(tracer),
         OtelLLMMetricsCallback(meter),
     ]
+
+
+def build_decision_recorder() -> Callable[..., None]:
+    """Return the OTel-backed ``decision_recorder`` callable.
+
+    PR-S3-2 reviewer round-2 P3: domain decision points
+    (``SmartApprove`` and any future ``PermissionEngine``) take an
+    optional ``decision_recorder: Callable[..., None] | None`` so they
+    don't import ``app.infrastructure.observability`` directly. The
+    composition layer is the single site that knows about the OTel
+    helper — it returns the ``record_decision`` function as the
+    injected callable. Tests can pass a fake callable directly, or
+    leave the recorder ``None`` to suppress emits.
+
+    Recovery records decisions inside the infrastructure-side
+    ``ActusRecoveryChatModel`` wrapper, so it has no domain-import
+    concern and doesn't need this factory.
+    """
+    return record_decision

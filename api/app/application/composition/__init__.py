@@ -6,11 +6,13 @@ imports both ``app.domain.services.graphs.*`` and
 """
 
 from app.application.composition.graph_assembly import (
+    build_decision_recorder,
     build_observability_callbacks,
     build_traced_node_decorator,
 )
 
 __all__ = (
+    "build_decision_recorder",
     "build_observability_callbacks",
     "build_traced_node_decorator",
 )

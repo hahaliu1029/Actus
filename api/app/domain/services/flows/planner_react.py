@@ -1169,6 +1169,16 @@ class PlannerReActFlow(BaseFlow):
                 "language_callback": self._language_callback,
             }
         }
+        # B5 PR-S3-2 reviewer round-2 P3: thread the OTel-backed
+        # ``decision_recorder`` through configurable so domain decision
+        # points (``SmartApprove`` constructed inside ``react_graph``)
+        # can call it without importing infrastructure directly.
+        # Composition layer owns the OTel wiring; domain receives only
+        # an opaque callable. Recovery records decisions inside its
+        # infrastructure wrapper and bypasses this hook.
+        from app.application.composition import build_decision_recorder
+
+        cfg["configurable"]["decision_recorder"] = build_decision_recorder()
         # B4 M0: attach the session-scoped CostCallbackHandler so every LLM
         # call inside the graph (planner, executor, updater, summarizer)
         # fires on_chat_model_start → on_llm_end and writes a CostRecord.
