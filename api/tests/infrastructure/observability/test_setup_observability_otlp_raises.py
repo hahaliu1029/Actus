@@ -1,12 +1,14 @@
-"""B5 PR-S2-1 acceptance: OTLP path is reserved for Sprint 3.
+"""B5 PR-S3-1: ``setup_observability`` validation surface.
 
-Spec line 707: Sprint 2 dep set introduces ``opentelemetry-api`` /
-``opentelemetry-sdk`` / ``opentelemetry-instrumentation-fastapi`` only
-— **not** ``opentelemetry-exporter-otlp``. Calling
-``setup_observability`` with ``OTLP_ENDPOINT=...`` set in Sprint 2
-must raise ``NotImplementedError`` with a clear message pointing at
-PR-S3-1, rather than silently no-oping or attempting an import that
-fails opaquely.
+PR-S2-1 reserved the OTLP path with a ``NotImplementedError``. PR-S3-1
+implements it: ``setup_observability`` accepts ``OTLP_ENDPOINT`` and
+wires OTLP exporters through ``BatchSpanProcessor`` /
+``BatchLogRecordProcessor`` / ``PeriodicExportingMetricReader`` per
+``OTLP_PROTOCOL`` (``"http/protobuf"`` default, or ``"grpc"``).
+
+This file pins the **validation** surface — ``ValueError`` paths only.
+End-to-end OTLP wiring (exporter shape, processor presence) lives in
+``test_setup_observability_otlp_mode.py``.
 """
 from __future__ import annotations
 
@@ -26,23 +28,30 @@ def _reset_provider_state():
     teardown_observability()
 
 
-def test_otlp_endpoint_raises_not_implemented(monkeypatch):
-    monkeypatch.setenv("OTLP_ENDPOINT", "http://collector.example.com:4317")
-    monkeypatch.delenv("OTEL_EXPORTER", raising=False)
+def test_unrecognised_otel_exporter_raises_value_error(monkeypatch):
+    """``OTEL_EXPORTER`` outside {"", "stdout"} → ``ValueError``."""
+    monkeypatch.delenv("OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER", "jaeger")
     get_settings.cache_clear()
     try:
-        with pytest.raises(NotImplementedError, match="Sprint 3 PR-S3-1"):
+        with pytest.raises(ValueError, match="not a recognised"):
             setup_observability()
     finally:
         get_settings.cache_clear()
 
 
-def test_unrecognised_otel_exporter_raises_value_error(monkeypatch):
-    monkeypatch.delenv("OTLP_ENDPOINT", raising=False)
-    monkeypatch.setenv("OTEL_EXPORTER", "jaeger")  # not in {"", "stdout"}
+def test_unrecognised_otlp_protocol_raises_value_error(monkeypatch):
+    """When ``OTLP_ENDPOINT`` is set, ``OTLP_PROTOCOL`` must be either
+    ``"http/protobuf"`` or ``"grpc"``. Anything else is rejected at
+    validate time so a misconfigured deployment fails fast at startup
+    rather than silently dropping spans.
+    """
+    monkeypatch.setenv("OTLP_ENDPOINT", "http://collector.example.com:4318")
+    monkeypatch.setenv("OTLP_PROTOCOL", "thrift")
+    monkeypatch.delenv("OTEL_EXPORTER", raising=False)
     get_settings.cache_clear()
     try:
-        with pytest.raises(ValueError, match="Sprint 2 mode"):
+        with pytest.raises(ValueError, match="OTLP transport"):
             setup_observability()
     finally:
         get_settings.cache_clear()

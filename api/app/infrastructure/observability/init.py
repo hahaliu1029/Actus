@@ -1,21 +1,25 @@
-"""B5 PR-S2-1: OTel SDK bootstrap.
+"""B5 PR-S2-1 / PR-S3-1: OTel SDK bootstrap.
 
 Idempotent setup that installs the three OTel providers
 (``TracerProvider`` / ``LoggerProvider`` / ``MeterProvider``) per
-``Settings.otlp_endpoint`` / ``Settings.otel_exporter``:
+``Settings.otlp_endpoint`` / ``Settings.otel_exporter`` /
+``Settings.otlp_protocol``:
 
-- **Default** (both empty) — install providers with **NO exporters**.
+- **Default** (all empty) — install providers with **NO exporters**.
   Signals are recorded in-process and dropped at provider shutdown.
   Zero outbound traffic, zero stdout pollution. This is the spec's
   ``OTLP_ENDPOINT="" = no-op exporter`` mode (spec line 436), verified
   by ``test_setup_observability_no_outbound_default.py``.
 - ``OTEL_EXPORTER=stdout`` — install Console exporters on all three
   providers. Dev / debugging mode; local-only output.
-- ``OTLP_ENDPOINT=http://...`` — Sprint 3 path. Sprint 2 deliberately
-  raises ``NotImplementedError`` because the OTLP exporter
-  (``opentelemetry-exporter-otlp``) is **not** in the Sprint 2 dep set
-  (spec line 707 — Sprint 2 introduces api / sdk / instrumentation-fastapi
-  only). Sprint 3 PR-S3-1 will land that dep + finish this branch.
+- ``OTLP_ENDPOINT=http://...`` (PR-S3-1) — install OTLP exporters on
+  all three providers (``BatchSpanProcessor`` /
+  ``BatchLogRecordProcessor`` / ``PeriodicExportingMetricReader``
+  each wrapping an OTLP variant). Protocol selected by
+  ``OTLP_PROTOCOL``: ``"http/protobuf"`` (default, Phoenix-compat,
+  port 4318) or ``"grpc"`` (Collector default, port 4317).
+  Backend-agnostic — Phoenix / Jaeger / Loki+Prometheus all consume
+  OTLP.
 
 Logger bridge (spec line 432 — "嵌入 RedactingFormatter"): a stock OTel
 ``LoggingHandler`` is attached to the root logger with
@@ -68,6 +72,11 @@ from opentelemetry.sdk.trace.export import (
 )
 from opentelemetry.util._once import Once
 
+# B5 PR-S3-1: OTLP exporter set. ``opentelemetry-exporter-otlp`` is a
+# meta-package bundling both gRPC and HTTP/protobuf transports. Imports
+# are deferred to ``_build_*_provider`` so the no-op / stdout modes
+# don't pay an import-time price for unused transport stacks.
+
 from app.infrastructure.logging import attach_component_filter
 from app.infrastructure.logging.redaction import RedactingFormatter
 
@@ -86,24 +95,145 @@ _INIT_LOCK = threading.Lock()
 _PROVIDERS: Optional[ObservabilityProviders] = None
 
 
-def _build_tracer_provider(otel_exporter: str) -> TracerProvider:
+_OTLP_HTTP_SIGNAL_SUFFIXES: tuple[str, ...] = (
+    "/v1/traces",
+    "/v1/logs",
+    "/v1/metrics",
+)
+
+
+def _derive_http_endpoint(base: str, signal_suffix: str) -> str:
+    """Append the OTLP/HTTP per-signal path to a base URL.
+
+    OTel/HTTP spec routes each signal to a distinct path:
+    ``/v1/traces`` / ``/v1/logs`` / ``/v1/metrics``. The Python SDK
+    only auto-derives these paths when ``endpoint`` is **not** passed
+    (it then falls back to ``OTEL_EXPORTER_OTLP_ENDPOINT`` env var +
+    suffix). When ``endpoint=`` is passed explicitly, the SDK uses
+    that URL **as-is** — no suffix appended (see
+    ``opentelemetry/exporter/otlp/proto/http/{trace,_log,metric}_exporter/__init__.py``
+    line ``self._endpoint = endpoint or environ.get(...)``).
+
+    Phoenix / Collector at ``http://localhost:4318`` only accept the
+    per-signal paths — POSTing to ``/`` returns 404. So when we pass
+    ``endpoint=`` explicitly (which we must, because we read it from
+    Actus's own ``OTLP_ENDPOINT`` setting), the per-signal suffix is
+    OUR responsibility to append.
+
+    Contract: ``base`` MUST be the OTLP base URL (without any signal
+    suffix). ``_validate_settings`` enforces this at startup —
+    rejects ``OTLP_ENDPOINT`` ending with ``/v1/{traces,logs,metrics}``
+    so a config like ``http://collector/v1/traces`` (which would only
+    be correct for one signal and produce broken paths like
+    ``/v1/traces/v1/logs`` for the other two) never reaches this
+    helper.
+
+    Behaviour: strip trailing ``/`` from base, then append
+    ``signal_suffix`` (always starts with ``/``).
+    """
+    return base.rstrip("/") + signal_suffix
+
+
+def _build_otlp_span_exporter(endpoint: str, protocol: str) -> Any:
+    """Construct an OTLP span exporter for the requested transport.
+
+    ``http/protobuf`` (default, Phoenix-compat, port 4318) and ``grpc``
+    (Collector default, port 4317) are the canonical OTLP transports.
+    Imports happen lazily so no-op / stdout deployments don't pay the
+    transport-stack import cost.
+
+    HTTP path: appends ``/v1/traces`` to the base URL (see
+    ``_derive_http_endpoint``). gRPC path: gRPC uses ``host:port``
+    routing internally, no path suffix needed.
+    """
+    if protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter as _GrpcSpan,
+        )
+        return _GrpcSpan(endpoint=endpoint)
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter as _HttpSpan,
+    )
+    return _HttpSpan(endpoint=_derive_http_endpoint(endpoint, "/v1/traces"))
+
+
+def _build_otlp_log_exporter(endpoint: str, protocol: str) -> Any:
+    if protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+            OTLPLogExporter as _GrpcLog,
+        )
+        return _GrpcLog(endpoint=endpoint)
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+        OTLPLogExporter as _HttpLog,
+    )
+    return _HttpLog(endpoint=_derive_http_endpoint(endpoint, "/v1/logs"))
+
+
+def _build_otlp_metric_exporter(endpoint: str, protocol: str) -> Any:
+    if protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+            OTLPMetricExporter as _GrpcMetric,
+        )
+        return _GrpcMetric(endpoint=endpoint)
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+        OTLPMetricExporter as _HttpMetric,
+    )
+    return _HttpMetric(
+        endpoint=_derive_http_endpoint(endpoint, "/v1/metrics")
+    )
+
+
+def _build_tracer_provider(
+    otel_exporter: str,
+    otlp_endpoint: str = "",
+    otlp_protocol: str = "http/protobuf",
+) -> TracerProvider:
     provider = TracerProvider()
-    if otel_exporter == "stdout":
+    if otlp_endpoint:
+        # OTLP wins — same processor type (BatchSpanProcessor) so the
+        # in-process behaviour matches stdout mode (batching, flush
+        # on shutdown), only the export destination changes.
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                _build_otlp_span_exporter(otlp_endpoint, otlp_protocol)
+            )
+        )
+    elif otel_exporter == "stdout":
         provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
     return provider
 
 
-def _build_logger_provider(otel_exporter: str) -> LoggerProvider:
+def _build_logger_provider(
+    otel_exporter: str,
+    otlp_endpoint: str = "",
+    otlp_protocol: str = "http/protobuf",
+) -> LoggerProvider:
     provider = LoggerProvider()
-    if otel_exporter == "stdout":
+    if otlp_endpoint:
+        provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                _build_otlp_log_exporter(otlp_endpoint, otlp_protocol)
+            )
+        )
+    elif otel_exporter == "stdout":
         provider.add_log_record_processor(
             BatchLogRecordProcessor(ConsoleLogExporter())
         )
     return provider
 
 
-def _build_meter_provider(otel_exporter: str) -> MeterProvider:
-    if otel_exporter == "stdout":
+def _build_meter_provider(
+    otel_exporter: str,
+    otlp_endpoint: str = "",
+    otlp_protocol: str = "http/protobuf",
+) -> MeterProvider:
+    if otlp_endpoint:
+        readers = [
+            PeriodicExportingMetricReader(
+                _build_otlp_metric_exporter(otlp_endpoint, otlp_protocol)
+            )
+        ]
+    elif otel_exporter == "stdout":
         readers = [PeriodicExportingMetricReader(ConsoleMetricExporter())]
     else:
         readers = []
@@ -227,29 +357,66 @@ def _detach_log_handler(handler: LoggingHandler) -> None:
         pass
 
 
-def _validate_settings(otlp_endpoint: str, otel_exporter: str) -> str:
+def _validate_settings(
+    otlp_endpoint: str,
+    otel_exporter: str,
+    otlp_protocol: str = "http/protobuf",
+) -> tuple[str, str, str]:
     """Pure validation of observability settings.
 
-    Returns the normalised ``otel_exporter`` value (lowercased). Raises
-    ``NotImplementedError`` for the OTLP path (Sprint 3 territory) and
-    ``ValueError`` for an unrecognised ``OTEL_EXPORTER`` value. Pulled
-    out as a free function so the raise paths can be tested without
-    touching OTel global state.
+    Returns ``(otel_exporter_normalised, otlp_endpoint_stripped,
+    otlp_protocol_normalised)``. Raises ``ValueError`` for an
+    unrecognised ``OTEL_EXPORTER`` or ``OTLP_PROTOCOL`` value. Pulled
+    out as a free function so the validation paths can be tested
+    without touching OTel global state.
+
+    Mode resolution rules:
+    - ``otlp_endpoint`` non-empty → OTLP mode (overrides
+      ``otel_exporter``); ``otlp_protocol`` decides transport.
+    - ``otel_exporter == "stdout"`` → Console exporters.
+    - Both empty → no-op (providers without exporters).
     """
-    if otlp_endpoint.strip():
-        raise NotImplementedError(
-            "OTLP_ENDPOINT export path is reserved for Sprint 3 "
-            "PR-S3-1 (depends on opentelemetry-exporter-otlp). "
-            "Sprint 2 supports OTEL_EXPORTER=stdout for local "
-            "debugging or both empty for no-op no-outbound."
-        )
-    normalised = otel_exporter.strip().lower()
-    if normalised not in ("", "stdout"):
+    endpoint_stripped = otlp_endpoint.strip()
+    exporter_normalised = otel_exporter.strip().lower()
+    protocol_normalised = (otlp_protocol or "").strip().lower()
+    if exporter_normalised not in ("", "stdout"):
         raise ValueError(
-            f"OTEL_EXPORTER={normalised!r} is not a recognised "
-            f"Sprint 2 mode. Use '' (no-op) or 'stdout' (dev console)."
+            f"OTEL_EXPORTER={exporter_normalised!r} is not a recognised "
+            f"mode. Use '' (no-op) or 'stdout' (dev console)."
         )
-    return normalised
+    if endpoint_stripped and protocol_normalised not in (
+        "",
+        "http/protobuf",
+        "grpc",
+    ):
+        raise ValueError(
+            f"OTLP_PROTOCOL={protocol_normalised!r} is not a recognised "
+            f"OTLP transport. Use 'http/protobuf' (default, Phoenix) "
+            f"or 'grpc' (Collector default)."
+        )
+    if endpoint_stripped and not protocol_normalised:
+        protocol_normalised = "http/protobuf"
+    # Reject signal-suffixed aggregate endpoints. ``OTLP_ENDPOINT`` is a
+    # SINGLE base URL — the three signal builders each append their own
+    # ``/v1/{traces,logs,metrics}``. Pre-suffixing would produce
+    # ``.../v1/traces/v1/logs`` for two of the three signals (only the
+    # matching signal would be correct). Fail-fast so operators see a
+    # clear error instead of debugging silent path-doubling at the
+    # exporter layer. Per-signal endpoints belong on the OTel-native
+    # env vars (``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` etc.), which
+    # Actus does not currently surface.
+    if endpoint_stripped and any(
+        endpoint_stripped.rstrip("/").endswith(s)
+        for s in _OTLP_HTTP_SIGNAL_SUFFIXES
+    ):
+        raise ValueError(
+            f"OTLP_ENDPOINT={endpoint_stripped!r} ends with a per-signal "
+            f"path (one of {list(_OTLP_HTTP_SIGNAL_SUFFIXES)}). Set the "
+            f"BASE URL only (e.g. 'http://localhost:4318') — Actus "
+            f"appends '/v1/traces' / '/v1/logs' / '/v1/metrics' per "
+            f"signal automatically."
+        )
+    return exporter_normalised, endpoint_stripped, protocol_normalised
 
 
 def setup_observability() -> ObservabilityProviders:
@@ -270,8 +437,9 @@ def setup_observability() -> ObservabilityProviders:
         idempotent test suites).
 
     Raises:
-        NotImplementedError: ``Settings.otlp_endpoint`` is non-empty.
-        ValueError: ``Settings.otel_exporter`` is not in {"", "stdout"}.
+        ValueError: ``Settings.otel_exporter`` is not in {"", "stdout"},
+            or ``Settings.otlp_protocol`` (when ``otlp_endpoint`` is
+            set) is not in {"http/protobuf", "grpc"}.
     """
     global _PROVIDERS
     with _INIT_LOCK:
@@ -300,13 +468,21 @@ def setup_observability() -> ObservabilityProviders:
         from core.config import get_settings
 
         settings = get_settings()
-        otel_exporter = _validate_settings(
-            settings.otlp_endpoint, settings.otel_exporter
+        otel_exporter, otlp_endpoint, otlp_protocol = _validate_settings(
+            settings.otlp_endpoint,
+            settings.otel_exporter,
+            settings.otlp_protocol,
         )
 
-        tracer_provider = _build_tracer_provider(otel_exporter)
-        logger_provider = _build_logger_provider(otel_exporter)
-        meter_provider = _build_meter_provider(otel_exporter)
+        tracer_provider = _build_tracer_provider(
+            otel_exporter, otlp_endpoint, otlp_protocol
+        )
+        logger_provider = _build_logger_provider(
+            otel_exporter, otlp_endpoint, otlp_protocol
+        )
+        meter_provider = _build_meter_provider(
+            otel_exporter, otlp_endpoint, otlp_protocol
+        )
 
         trace.set_tracer_provider(tracer_provider)
         otel_logs.set_logger_provider(logger_provider)
