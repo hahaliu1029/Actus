@@ -183,6 +183,23 @@ def _build_otlp_metric_exporter(endpoint: str, protocol: str) -> Any:
     )
 
 
+def _build_prometheus_metric_reader() -> Any:
+    """Construct a ``PrometheusMetricReader`` for in-process scrape.
+
+    Pull-based reader — sits in-memory only. The reader self-registers
+    a ``_CustomCollector`` with ``prometheus_client.REGISTRY`` at
+    construction; ``provider.shutdown()`` cascades to
+    ``reader.shutdown()`` which unregisters, so test teardown leaves
+    the global REGISTRY clean.
+
+    Lazy import keeps no-op / stdout / OTLP-only deployments from
+    paying the ``prometheus_client`` import cost (~600KB resident).
+    """
+    from opentelemetry.exporter.prometheus import PrometheusMetricReader
+
+    return PrometheusMetricReader()
+
+
 def _build_tracer_provider(
     otel_exporter: str,
     otlp_endpoint: str = "",
@@ -226,17 +243,33 @@ def _build_meter_provider(
     otel_exporter: str,
     otlp_endpoint: str = "",
     otlp_protocol: str = "http/protobuf",
+    metrics_endpoint_token: str = "",
 ) -> MeterProvider:
+    """Construct a ``MeterProvider`` with the requested readers.
+
+    Reader composition is additive — a deployment can run OTLP push
+    AND Prometheus pull simultaneously (e.g., push to a central
+    Phoenix instance for trace-correlated metric review while a local
+    Prometheus / VictoriaMetrics scrapes the per-instance endpoint
+    for alerting). The OTel SDK supports multiple readers on a single
+    ``MeterProvider``.
+
+    PR-S3-3: ``metrics_endpoint_token`` non-empty appends a
+    ``PrometheusMetricReader`` so ``GET /api/v1/metrics`` can serve
+    Prometheus exposition format. Empty token = no reader (zero
+    memory + zero registration with ``prometheus_client.REGISTRY``).
+    """
+    readers: list[Any] = []
     if otlp_endpoint:
-        readers = [
+        readers.append(
             PeriodicExportingMetricReader(
                 _build_otlp_metric_exporter(otlp_endpoint, otlp_protocol)
             )
-        ]
+        )
     elif otel_exporter == "stdout":
-        readers = [PeriodicExportingMetricReader(ConsoleMetricExporter())]
-    else:
-        readers = []
+        readers.append(PeriodicExportingMetricReader(ConsoleMetricExporter()))
+    if metrics_endpoint_token:
+        readers.append(_build_prometheus_metric_reader())
     return MeterProvider(metric_readers=readers)
 
 
@@ -481,7 +514,10 @@ def setup_observability() -> ObservabilityProviders:
             otel_exporter, otlp_endpoint, otlp_protocol
         )
         meter_provider = _build_meter_provider(
-            otel_exporter, otlp_endpoint, otlp_protocol
+            otel_exporter,
+            otlp_endpoint,
+            otlp_protocol,
+            metrics_endpoint_token=settings.metrics_endpoint_token,
         )
 
         trace.set_tracer_provider(tracer_provider)

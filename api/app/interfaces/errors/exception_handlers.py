@@ -91,11 +91,26 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def http_exception_handler(
         request: Request, exc: HTTPException
     ) -> JSONResponse:
-        """HTTP异常处理器，捕获HTTPException并返回标准化响应"""
+        """HTTP异常处理器，捕获HTTPException并返回标准化响应。
+
+        合并 ``exc.headers`` 到响应头：``HTTPException`` 携带的 ``headers``
+        承载协议级语义（``WWW-Authenticate`` for 401 / ``Retry-After``
+        for 503 / etc.），在标准化响应时丢掉就会让 ``auth.py`` 与
+        ``metrics_routes.py`` 等显式声明 ``headers={"WWW-Authenticate":
+        "Bearer"}`` 的 401 路径变成裸 401，破坏 RFC 7235 §3.1 契约
+        且让 Prometheus / curl / 浏览器无法识别认证方式。
+
+        合并顺序故意把 ``_request_id_headers`` 放最后，让系统级的
+        ``X-Request-ID`` 胜过 caller 同 key —— ``X-Request-ID`` 是
+        中间件维护的不变量，不允许被业务异常覆写。
+        """
 
         logger.error(f"HTTP exception: {exc.detail}")
 
-        headers = _request_id_headers(request)
+        headers: dict[str, str] = {
+            **(exc.headers or {}),
+            **_request_id_headers(request),
+        }
         return JSONResponse(
             status_code=exc.status_code,
             content=Response(code=exc.status_code, msg=exc.detail, data={}).model_dump(),

@@ -7,6 +7,7 @@ from . import (
     cost_routes,
     file_routes,
     memory_routes,
+    metrics_routes,
     notification_routes,
     skill_routes,
     skill_v2_routes,
@@ -45,6 +46,11 @@ def create_api_routes() -> APIRouter:
 
     api_router.include_router(session_routes.router)
     api_router.include_router(cost_routes.router)
+
+    # B5 PR-S3-3: Prometheus scrape (内部使用)。无 auth dependency
+    # —— 鉴权在 handler 内做 constant-time bearer compare，禁用时整体
+    # 404，对 OpenAPI 隐藏。
+    api_router.include_router(metrics_routes.router)
 
     return api_router
 

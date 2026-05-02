@@ -204,6 +204,16 @@ class Settings(BaseSettings):
     otel_exporter: str = ""
     otlp_protocol: str = "http/protobuf"
 
+    # B5 PR-S3-3: Prometheus scrape 端点 token。
+    # 空 = 端点禁用（GET /api/v1/metrics → 404，PrometheusMetricReader
+    # 不挂上 MeterProvider），零额外内存 + 零暴露面。
+    # 非空 = 端点开启，要求 ``Authorization: Bearer <token>``（constant-time
+    # 比对）；PrometheusMetricReader 注册到 OTel MeterProvider，把所有
+    # OtelMeter / OtelLLMMetricsCallback 写入的 instrument 暴露成
+    # Prometheus exposition format（``text/plain; version=0.0.4``）。
+    # 仅供内部 Prometheus / VictoriaMetrics 拉取，不暴露给终端用户。
+    metrics_endpoint_token: str = ""
+
     # 使用pydantic v2的写法来完成环境变量信息的告知
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
