@@ -1,4 +1,5 @@
 from .base import Base
+from .conversation_compaction import ConversationCompactionModel
 from .cost_record_orm import CostRecordModel
 from .file import FileModel
 from .memory_audit_log import MemoryAuditLogModel
@@ -13,6 +14,7 @@ from .user import UserModel
 
 __all__ = [
     "Base",
+    "ConversationCompactionModel",
     "CostRecordModel",
     "SessionModel",
     "FileModel",

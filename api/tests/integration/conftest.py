@@ -16,6 +16,7 @@ CI: ci.yml:13-22 单独启动 postgres 容器，映射 5432，库名 manus_test�
 """
 
 import os
+import uuid as _uuid
 from pathlib import Path
 
 import pytest
@@ -67,3 +68,191 @@ async def db_session(async_engine):
         async with session.begin():
             yield session
             await session.rollback()
+
+
+# ── B6 fixtures ──────────────────────────────────────────────────────────────
+#
+# All B6 integration tasks (T5, T10, T13-T16, T16a, T18) depend on the
+# fixtures below.  They are defined here once so all sub-packages can
+# request them through normal conftest resolution.
+
+
+@pytest.fixture
+async def async_session_factory(async_engine):
+    """[CXR2-P2-4] Build a session_factory from the test async_engine.
+
+    ``DBUnitOfWork.__init__`` expects ``session_factory: async_sessionmaker[AsyncSession]``
+    (api/app/infrastructure/repositories/db_uow.py:20).
+    """
+    return async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.fixture
+async def uow_factory(async_session_factory):
+    """Yields a callable that returns a fresh ``DBUnitOfWork`` bound to the test session_factory.
+
+    Usage::
+
+        async with uow_factory() as uow:
+            assert uow.db_session is not None
+    """
+    from app.infrastructure.repositories.db_uow import DBUnitOfWork
+
+    def _factory():
+        return DBUnitOfWork(session_factory=async_session_factory)
+
+    yield _factory
+
+
+@pytest.fixture
+async def seed_session(db_session):
+    """Insert a fresh ``UserModel`` + ``SessionModel`` row; yield the ORM SessionModel.
+
+    The yielded object exposes ``.id`` and ``.user_id`` for FK relationships.
+    Teardown is handled by the enclosing ``db_session`` rollback.
+    """
+    from app.infrastructure.models.user import UserModel
+    from app.infrastructure.models.session import SessionModel
+
+    uid = str(_uuid.uuid4())
+    sid = f"sess-b6-{_uuid.uuid4().hex[:12]}"
+
+    user = UserModel(
+        id=uid,
+        username=f"b6test_{uid[:8]}",
+        password_hash="x",
+    )
+    session_row = SessionModel(
+        id=sid,
+        user_id=uid,
+        status="pending",
+        title="b6 smoke session",
+    )
+    db_session.add(user)
+    db_session.add(session_row)
+    await db_session.flush()
+
+    yield session_row
+
+
+@pytest.fixture
+async def seed_other_user_session(db_session):
+    """Same as ``seed_session`` but with a *different* user — for cross-user 403 tests."""
+    from app.infrastructure.models.user import UserModel
+    from app.infrastructure.models.session import SessionModel
+
+    uid = str(_uuid.uuid4())
+    sid = f"sess-b6-other-{_uuid.uuid4().hex[:12]}"
+
+    user = UserModel(
+        id=uid,
+        username=f"b6other_{uid[:8]}",
+        password_hash="x",
+    )
+    session_row = SessionModel(
+        id=sid,
+        user_id=uid,
+        status="pending",
+        title="b6 other user session",
+    )
+    db_session.add(user)
+    db_session.add(session_row)
+    await db_session.flush()
+
+    yield session_row
+
+
+@pytest.fixture
+def messages_at_85_percent():
+    """A ``list[BaseMessage]`` whose token estimate exceeds 85 % of context_window=80_000.
+
+    With the char estimator (1 char ≈ 0.25 tokens, safety_factor 1.15):
+      20 × 16_000 chars × 0.25 × 1.15 ≈ 92_000 tokens > 68_000 (85% of 80_000).
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    return [SystemMessage(content="sys")] + [
+        HumanMessage(content="x" * 16_000) for _ in range(20)
+    ]
+
+
+@pytest.fixture
+def memory_at_85_percent(messages_at_85_percent):
+    """A ``Memory`` wrapping ``messages_at_85_percent`` as serialised dicts."""
+    from app.domain.models.memory import Memory
+    from app.domain.services.graphs.message_utils import messages_to_dicts
+
+    return Memory(messages=messages_to_dicts(messages_at_85_percent))
+
+
+@pytest.fixture
+def fake_summary_llm():
+    """A ``BaseChatModel`` stub whose ``ainvoke`` returns a fixed ``AIMessage``."""
+    from langchain_core.messages import AIMessage
+
+    class _FakeSummaryLLM:
+        async def ainvoke(self, prompt, **kw):  # noqa: ANN001,ANN201
+            return AIMessage(content="<test summary>")
+
+    return _FakeSummaryLLM()
+
+
+@pytest.fixture
+async def planner_react_with_compactor(uow_factory, fake_summary_llm, seed_session):
+    """Minimal ``PlannerReActFlow`` bypassing ``__init__``, wired to a real ``GradualCompactor`` + UoW.
+
+    Uses ``PlannerReActFlow.__new__`` to skip the heavy constructor; only the
+    fields that B6 tests touch are populated.
+
+    .. WARNING:: Transaction isolation gap.
+
+       ``seed_session`` flushes user/session rows through ``db_session``'s
+       ``begin()...rollback()`` block — they are visible to ``db_session``
+       but never committed.  ``uow_factory()`` opens an **independent**
+       connection with its own transaction; under PostgreSQL's read-committed
+       isolation it cannot see those uncommitted rows.
+
+       Tests that exercise compaction at ``level > 0`` (which calls
+       ``uow.session.save_memory(self._session_id, "react", memory)`` inside
+       ``_check_overflow``) will see a 0-row UPDATE or FK violation against
+       ``sessions.id``.  If your B6 test needs the persistence path, either:
+
+       (a) commit the seed data manually before invoking the flow (use a
+           separate UoW + ``await uow.db_session.commit()``), or
+       (b) replace ``flow._uow_factory`` with a no-op / mock that doesn't
+           hit the DB.
+    """
+    from app.domain.models.context_overflow_config import ContextOverflowConfig
+    from app.domain.services.flows.planner_react import PlannerReActFlow
+    from app.domain.services.graphs.compaction import GradualCompactor
+    from app.domain.services.graphs.token_estimator import TokenEstimator
+
+    estimator = TokenEstimator(strategy="char")
+    overflow_cfg = ContextOverflowConfig(
+        context_window=80_000,
+        context_overflow_guard_enabled=True,
+        soft_trigger_ratio=0.85,
+        hard_trigger_ratio=0.95,
+        target_ratio=0.65,
+        token_estimator="char",
+        model_name="test-model",
+    )
+    compactor = GradualCompactor(
+        token_estimator=estimator,
+        soft_trigger_ratio=overflow_cfg.soft_trigger_ratio,
+        hard_trigger_ratio=overflow_cfg.hard_trigger_ratio,
+        target_ratio=overflow_cfg.target_ratio,
+        summary_max_chars=overflow_cfg.summary_max_chars,
+        token_safety_factor=overflow_cfg.token_safety_factor,
+    )
+
+    flow = PlannerReActFlow.__new__(PlannerReActFlow)  # bypass heavy __init__
+    flow._compactor = compactor
+    flow._summary_llm = fake_summary_llm
+    flow._uow_factory = uow_factory
+    flow._session_id = seed_session.id
+    flow._overflow_config = overflow_cfg
+    flow._cost_callback_handler = None
+    flow._last_compaction_result = None
+
+    yield flow
