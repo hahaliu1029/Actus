@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { ChatInput } from "@/components/chat-input";
+import { CompactionFoldIndicator } from "@/components/session/compaction-fold-indicator";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
 import { ToolConfirmationCard } from "@/components/tool-confirmation-card";
@@ -32,7 +33,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { sessionApi } from "@/lib/api/session";
-import type { FileInfo } from "@/lib/api/types";
+import type { CompactionEventData, FileInfo } from "@/lib/api/types";
 import {
   deriveSessionProgressSummary,
   deriveWorkbenchSnapshots,
@@ -356,6 +357,7 @@ function extractEmbeddedJsonResult(message: string): {
 function renderEventItem(
   event: SessionEvent,
   index: number,
+  sessionId: string,
   sessionFiles: FileInfo[],
   onPreviewFile: (file: FileInfo) => void,
   onPreviewFilePath: (filepath: string) => void,
@@ -680,6 +682,16 @@ function renderEventItem(
           </div>
         ) : null}
       </div>
+    );
+  }
+
+  if (event.event === "compaction") {
+    return (
+      <CompactionFoldIndicator
+        key={eventKey}
+        sessionId={sessionId}
+        data={event.data as CompactionEventData}
+      />
     );
   }
 
@@ -1273,6 +1285,7 @@ export default function SessionPage() {
                 renderEventItem(
                   event,
                   index,
+                  sessionId,
                   currentSessionFiles,
                   (file) => {
                     void openFilePreview(file);

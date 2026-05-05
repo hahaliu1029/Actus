@@ -583,6 +583,17 @@ export type SandboxStateChangedEvent = {
   [key: string]: unknown;
 };
 
+export type CompactionEventData = {
+  event_id?: string;
+  created_at?: number | string;
+  compaction_id?: string | null;
+  level: number;             // 2 = llm_summary, 3 = hard_truncate
+  tokens_before: number;
+  tokens_after: number;
+  messages_removed: number;
+  usage_ratio_after?: number;
+};
+
 export type SSEEventType =
   | "message"
   | "title"
@@ -595,6 +606,7 @@ export type SSEEventType =
   | "finishing"
   | "health"
   | "sandbox_state_changed"
+  | "compaction"
   | "done"
   | "error"
   | "sessions";
@@ -625,6 +637,7 @@ export type SSEEventData =
   | { type: "finishing"; data: FinishingEvent }
   | { type: "health"; data: HealthEvent }
   | { type: "sandbox_state_changed"; data: SandboxStateChangedEvent }
+  | { type: "compaction"; data: CompactionEventData }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
   | { type: "sessions"; data: ListSessionResponse };

@@ -6,6 +6,7 @@ import { subscribeWithSelector } from "zustand/middleware";
 import { ApiError } from "@/lib/api/auth-utils";
 import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
+import { fetchCompactionList } from "@/lib/api/session-compaction";
 import type {
   ChatParams,
   FileInfo,
@@ -14,6 +15,7 @@ import type {
   Session,
   SSEEventData,
 } from "@/lib/api/types";
+import type { CompactionListItem } from "@/types/session-compaction";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
 import { normalizeSessionStatus } from "@/lib/utils/session-status";
@@ -70,6 +72,7 @@ type SessionActions = {
     options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }
   ) => Promise<Blob>;
   recoverSession: (sessionId: string) => Promise<void>;
+  mergeCompactionList: (items: CompactionListItem[]) => void;
 };
 
 type SessionStore = SessionState & SessionActions;
@@ -239,6 +242,11 @@ function applySSEToSession(session: Session, event: SSEEventData): Session {
   };
 }
 
+// [CXR2-P1-3] Test-only export so vitest can drive the real SSE merge path
+// without bypassing upsertSessionEvent / eventSemanticKey. Do not import from
+// production code — the `__test_` prefix marks this as a test-time API.
+export const __test_applySSEToSession = applySSEToSession;
+
 function eventSemanticKey(event: SessionEventRecord): string | null {
   if (event.event === "message") {
     const streamId = event.data?.stream_id;
@@ -274,6 +282,14 @@ function eventSemanticKey(event: SessionEventRecord): string | null {
     if (typeof eventId === "string" && eventId.trim()) {
       return `tool_confirmation:${eventId}`;
     }
+  }
+
+  if (event.event === "compaction") {
+    const compactionId = event.data?.compaction_id;
+    if (typeof compactionId === "string" && compactionId.trim()) {
+      return `compaction:${compactionId}`;
+    }
+    // Legacy pre-B6 event with no compaction_id — fall through to event_id
   }
 
   const eventId = eventIdOf(event);
@@ -786,6 +802,32 @@ export const useSessionStore = create<SessionStore>()(
         });
 
         const stateAfterFetch = get();
+
+        // [CXR4-P2-1] List-on-load: merge compaction list so reload-after-crash
+        // recovers fold indicators. Anchor HERE — currentSession is now written
+        // by the set(...) above, AND we hold the active-session guard so a user
+        // who navigated away mid-fetch doesn't get list rows merged into the
+        // wrong session.
+        if (
+          stateAfterFetch.currentSession?.session_id === sessionId &&
+          stateAfterFetch.activeSessionId === sessionId
+        ) {
+          try {
+            const items = await fetchCompactionList(sessionId);
+            // Re-check the guard after the await — user may have navigated during fetch
+            const stateAfterList = get();
+            if (
+              stateAfterList.currentSession?.session_id === sessionId &&
+              stateAfterList.activeSessionId === sessionId
+            ) {
+              stateAfterList.mergeCompactionList(items);
+            }
+          } catch (err) {
+            // Non-fatal — SSE will still drive live events
+            console.warn("compaction list-on-load failed:", err);
+          }
+        }
+
         const fetchedSession =
           stateAfterFetch.currentSession &&
           stateAfterFetch.currentSession.session_id === sessionId
@@ -846,6 +888,35 @@ export const useSessionStore = create<SessionStore>()(
         const remoteStatus = normalizeSessionStatus(response.session_status as Session["status"]);
         const eventDerivedStatus = deriveStatusFromEvents(recoveredEvents);
 
+        // [Codex holistic R3+R4 P2] Backend's `/sessions/{id}/events?since=...`
+        // returns persisted SSE events only — it does NOT include
+        // conversation_compactions rows. If a Path A compaction was missed
+        // (e.g., shielded background persist completed AFTER the cancelled
+        // FINISHING branch — see agent_task_runner.py NOTE), an SSE reconnect
+        // alone won't restore the fold indicator. Fire-and-forget the
+        // compaction list refresh so it runs independently of the
+        // events-branch status logic below — `mergeCompactionList` only
+        // mutates `events`, never `status`, so racing with the status `set()`
+        // is safe (idempotent dedup via `compaction:<id>` semantic key).
+        // Awaiting here would delay the existing zero-event status sync
+        // (breaking session-recovery tests' timing expectations).
+        void (async () => {
+          try {
+            const items = await fetchCompactionList(sessionId);
+            const stateAfterList = get();
+            if (
+              stateAfterList.currentSession?.session_id === sessionId &&
+              stateAfterList.activeSessionId === sessionId
+            ) {
+              stateAfterList.mergeCompactionList(items);
+            }
+          } catch (err) {
+            // Non-fatal — missing compactions will be recovered on next
+            // session activation via `fetchSessionById`'s list-on-load.
+            console.warn("compaction list-on-reconnect failed:", err);
+          }
+        })();
+
         if (recoveredEvents.length === 0) {
           set((s) => {
             const local = s.currentSession;
@@ -901,6 +972,40 @@ export const useSessionStore = create<SessionStore>()(
       } finally {
         set({ _isRecovering: false });
       }
+    },
+
+    mergeCompactionList: (items: CompactionListItem[]) => {
+      set((state) => {
+        if (!state.currentSession) return state;
+        const existing = (state.currentSession.events ?? []) as SessionEventRecord[];
+        let next: SessionEventRecord[] = existing;
+        for (const item of items) {
+          const synthetic: SessionEventRecord = {
+            event: "compaction",
+            data: {
+              compaction_id: item.compaction_id,
+              // P2 fix: synthetic events MUST NOT carry event_id.
+              // eventSemanticKey() already returns `compaction:<id>` for
+              // events that have compaction_id, so event_id is never read
+              // for dedup. A synthetic `list-${compaction_id}` id would
+              // become the `latestEventId` cursor and be sent as
+              // `?since=list-${id}` on reconnect — a backend-unknown id
+              // that breaks the SSE replay cursor contract.
+              level: item.kinds.includes("hard_truncate") ? 3 : 2,
+              tokens_before: item.tokens_before_total,
+              tokens_after: item.tokens_after_total,
+              messages_removed: item.messages_removed_total,
+              usage_ratio_after: 0,
+              created_at: item.created_at,
+            },
+          };
+          next = upsertSessionEvent(next, synthetic);  // reuses existing dedup path
+        }
+        return {
+          ...state,
+          currentSession: { ...state.currentSession, events: next },
+        };
+      });
     },
 
     fetchSessionFiles: async (sessionId: string, options = {}) => {

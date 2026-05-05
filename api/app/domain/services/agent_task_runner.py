@@ -2572,6 +2572,73 @@ class AgentTaskRunner(TaskRunner):
 
         return None
 
+    def _build_compaction_events_if_any(self) -> list[BaseEvent]:
+        """Build ContextStatusEvent + CompactionEvent based on flow._last_compaction_result.
+
+        Returns empty list if no compaction. After building, sets
+        _last_compaction_result=None to make this method idempotent (subsequent
+        calls return []).
+
+        Called from both _run_flow (interrupt path: compaction ran sync inside
+        invoke()) and the outer FINISHING postprocess (normal path: compaction
+        runs in _persist_after_graph after invoke() returned).
+        """
+        compaction_result = getattr(self._flow, "_last_compaction_result", None)
+        if compaction_result is None:
+            return []
+
+        overflow_config = getattr(self._flow, "_overflow_config", None)
+        context_window = 0
+        if overflow_config is not None:
+            try:
+                from app.domain.services.context.model_context_window import resolve_context_window
+                context_window = resolve_context_window(
+                    overflow_config.model_name, overflow_config
+                )
+            except Exception as exc:
+                logger.warning("Failed to resolve context window for SSE event: %s", exc)
+                context_window = overflow_config.context_window or 0
+
+        soft_threshold = overflow_config.soft_trigger_ratio if overflow_config else 0.85
+        hard_threshold = overflow_config.hard_trigger_ratio if overflow_config else 0.95
+
+        events: list[BaseEvent] = [
+            ContextStatusEvent(
+                used_tokens=compaction_result.tokens_after,
+                context_window=context_window,
+                usage_ratio=compaction_result.usage_ratio_after,
+                soft_threshold=soft_threshold,
+                hard_threshold=hard_threshold,
+            )
+        ]
+
+        if compaction_result.level_applied > 0:
+            events.append(CompactionEvent(
+                compaction_id=compaction_result.compaction_id,
+                level=compaction_result.level_applied,
+                tokens_before=compaction_result.tokens_before,
+                tokens_after=compaction_result.tokens_after,
+                messages_removed=compaction_result.messages_removed,
+                usage_ratio_after=compaction_result.usage_ratio_after,
+            ))
+            # D5: Track compaction count for metrics
+            if self._flow:
+                _em = getattr(self._flow, "_execution_metrics", None)
+                if _em:
+                    _em.compaction_count += 1
+                    _em.context_usage_ratio = compaction_result.usage_ratio_after
+
+        # Idempotency: clear so subsequent calls don't double-emit.
+        # SAFE because both call sites (interrupt + FINISHING) are mutually exclusive
+        # at the architectural level — interrupt path doesn't set _deferred_final_state,
+        # so the outer loop's Phase B is skipped.
+        try:
+            self._flow._last_compaction_result = None
+        except AttributeError:
+            pass  # _flow might be None in degenerate test paths
+
+        return events
+
     async def _run_flow(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """根据消息对象运行PlannerReActFlow"""
         # 1.判断传递的消息是否为空
@@ -2594,46 +2661,11 @@ class AgentTaskRunner(TaskRunner):
             # 5.将事件直接返回
             yield event
 
-        # 6.流消费完毕后，读取压缩结果并发送上下文状态/压缩事件（B3）
-        compaction_result = getattr(self._flow, "_last_compaction_result", None)
-        if compaction_result is not None:
-            overflow_config = getattr(self._flow, "_overflow_config", None)
-            context_window = 0
-            if overflow_config is not None:
-                try:
-                    from app.domain.services.context.model_context_window import resolve_context_window
-                    context_window = resolve_context_window(
-                        overflow_config.model_name, overflow_config
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to resolve context window for SSE event: %s", exc)
-                    context_window = overflow_config.context_window or 0
-
-            soft_threshold = overflow_config.soft_trigger_ratio if overflow_config else 0.85
-            hard_threshold = overflow_config.hard_trigger_ratio if overflow_config else 0.95
-
-            yield ContextStatusEvent(
-                used_tokens=compaction_result.tokens_after,
-                context_window=context_window,
-                usage_ratio=compaction_result.usage_ratio_after,
-                soft_threshold=soft_threshold,
-                hard_threshold=hard_threshold,
-            )
-
-            if compaction_result.level_applied > 0:
-                yield CompactionEvent(
-                    level=compaction_result.level_applied,
-                    tokens_before=compaction_result.tokens_before,
-                    tokens_after=compaction_result.tokens_after,
-                    messages_removed=compaction_result.messages_removed,
-                    usage_ratio_after=compaction_result.usage_ratio_after,
-                )
-                # D5: Track compaction count for metrics
-                if self._flow:
-                    _em = getattr(self._flow, "_execution_metrics", None)
-                    if _em:
-                        _em.compaction_count += 1
-                        _em.context_usage_ratio = compaction_result.usage_ratio_after
+        # 6.流消费完毕后，如果同步路径（interrupt）已设置 _last_compaction_result，
+        #   立即发送上下文状态/压缩事件（B3）。正常完成路径会在 outer loop FINISHING
+        #   postprocess 后再发；该 helper 是幂等的，两条路径互斥，无重复。
+        for ev in self._build_compaction_events_if_any():
+            yield ev
 
     async def _do_persist_and_flush(self) -> None:
         """Phase 1+2: persist state then submit flush.
@@ -3102,10 +3134,36 @@ class AgentTaskRunner(TaskRunner):
                             cancelled = await self._run_postprocess_or_cancel(task)
                         except Exception as e:
                             logger.error("后处理失败 (postprocess_incomplete): %s", e)
+                            # Emit any compaction events that landed before the exception.
+                            for ev in self._build_compaction_events_if_any():
+                                await self._put_and_add_event(task, ev)
                             await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                             break
 
                         if cancelled:
+                            # Postprocess cancelled mid-execution by a user follow-up
+                            # message. The shielded `_persist_after_graph` may already
+                            # have set `_last_compaction_result` before cancellation
+                            # reached the unshielded phase, so emit any pending compaction
+                            # events to the previous message's cycle BEFORE the deferred
+                            # state is cleared. (Helper is idempotent + clears the field
+                            # so the next cycle starts clean.)
+                            #
+                            # NOTE: The shielded `_persist_after_graph` may still be running
+                            # in the background when this point is reached
+                            # (asyncio.shield protects the inner task from cancellation,
+                            # but the outer awaiter receives CancelledError immediately).
+                            # So `_last_compaction_result` may not be set yet — in which
+                            # case the helper returns [] and no SSE compaction event fires
+                            # for THIS cycle. Acceptable degradation: the DB record IS
+                            # still written by the background task, and PR4's
+                            # `mergeCompactionList` recovers the missed event in both
+                            # paths the user can hit next: full session reload (via
+                            # `fetchSessionById` → `fetchCompactionList`) AND SSE reconnect
+                            # (via `recoverSession` → `fetchCompactionList`, wired in
+                            # the same store).
+                            for ev in self._build_compaction_events_if_any():
+                                await self._put_and_add_event(task, ev)
                             # Reset deferred state to prevent stale re-entry
                             self._flow._deferred_final_state = None
                             self._flow._deferred_summaries = None
@@ -3115,6 +3173,12 @@ class AgentTaskRunner(TaskRunner):
                                 )
                             continue
                         else:
+                            # Normal completion: FINISHING postprocess set _last_compaction_result;
+                            # emit ContextStatus + Compaction events BEFORE DoneEvent so frontend
+                            # sees the fold indicator update before the session marks done.
+                            # (Idempotent: helper clears _last_compaction_result after build.)
+                            for ev in self._build_compaction_events_if_any():
+                                await self._put_and_add_event(task, ev)
                             await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                             break
                     else:
@@ -3197,14 +3261,50 @@ class AgentTaskRunner(TaskRunner):
                     cancelled = await self._run_postprocess_or_cancel(task)
                 except Exception as e:
                     logger.error("resume 后处理失败 (postprocess_incomplete): %s", e)
+                    for ev in self._build_compaction_events_if_any():
+                        await self._put_and_add_event(task, ev)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                     await self._set_terminal_status(SessionStatus.COMPLETED)
                     return
 
                 if not cancelled:
+                    # Normal completion: emit any compaction events before DoneEvent.
+                    for ev in self._build_compaction_events_if_any():
+                        await self._put_and_add_event(task, ev)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                     _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
                     await self._set_terminal_status(_final_status)
+                else:
+                    # Resume postprocess cancelled mid-execution by a new user message.
+                    # Mirror invoke()'s cancelled branch exactly:
+                    #  1. Emit any compaction events the shielded _persist_after_graph
+                    #     set before cancellation reached the unshielded phase.
+                    #  2. Clear deferred state so the next invoke() cycle starts clean
+                    #     and doesn't attempt a stale re-entry into FINISHING.
+                    #  3. Restore session status to RUNNING so the queued follow-up
+                    #     message can be picked up by the next invoke() call.
+                    #
+                    # NOTE: The shielded `_persist_after_graph` may still be running
+                    # in the background when this point is reached
+                    # (asyncio.shield protects the inner task from cancellation,
+                    # but the outer awaiter receives CancelledError immediately).
+                    # So `_last_compaction_result` may not be set yet — in which
+                    # case the helper returns [] and no SSE compaction event fires
+                    # for THIS cycle. Acceptable degradation: the DB record IS
+                    # still written by the background task, and PR4's
+                    # `mergeCompactionList` list-on-load merge recovers the missed
+                    # event when the user reloads or SSE reconnects.
+                    for ev in self._build_compaction_events_if_any():
+                        await self._put_and_add_event(task, ev)
+                    # Reset deferred state to prevent stale re-entry
+                    self._flow._deferred_final_state = None
+                    self._flow._deferred_summaries = None
+                    async with self._uow:
+                        await self._uow.session.update_status(
+                            self._session_id, SessionStatus.RUNNING
+                        )
+                    # resume() is single-shot (no outer while loop), so the follow-up
+                    # message already enqueued will be picked up by the next invoke().
             else:
                 await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                 _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED

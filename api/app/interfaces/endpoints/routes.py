@@ -9,6 +9,7 @@ from . import (
     memory_routes,
     metrics_routes,
     notification_routes,
+    session_compaction_routes,
     skill_routes,
     skill_v2_routes,
     session_routes,
@@ -45,6 +46,7 @@ def create_api_routes() -> APIRouter:
     api_router.include_router(admin_routes.router)
 
     api_router.include_router(session_routes.router)
+    api_router.include_router(session_compaction_routes.router)
     api_router.include_router(cost_routes.router)
 
     # B5 PR-S3-3: Prometheus scrape (内部使用)。无 auth dependency

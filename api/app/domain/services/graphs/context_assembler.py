@@ -11,13 +11,36 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from .message_utils import truncate_tool_content
 from .token_estimator import TokenEstimator
 
+# Decision-recorder port — same Callable type alias as in smart_approve.py.
+# Composition layer injects the OTel-backed ``record_decision``; tests/callers
+# that don't care about observability pass ``None`` (no-op). Domain code MUST
+# NOT import ``app.infrastructure.observability.decision_trace`` directly.
+_DecisionRecorder = Callable[..., None] | None
+
 logger = logging.getLogger(__name__)
+
+
+def _safe_record_decision(
+    recorder: _DecisionRecorder,
+    name: str,
+    *,
+    outcome: str,
+) -> None:
+    """Call *recorder* swallowing any exception (port contract: observability
+    failure MUST NOT taint trimming). ``None`` recorder is a no-op."""
+    if recorder is None:
+        return
+    try:
+        recorder(name, outcome=outcome)
+    except Exception:  # noqa: BLE001
+        pass  # OTel hiccup must never abort context assembly
 
 
 # ── Data structures ────────────────────────────────────────────────────────────
@@ -134,6 +157,7 @@ class ContextAssembler:
         safety_factor: float = 1.15,
         tool_compress_trigger_ratio: float = 0.75,
         tool_compress_target_chars: int = 500,
+        decision_recorder: _DecisionRecorder = None,
     ) -> None:
         """Construct the context assembler.
 
@@ -151,6 +175,11 @@ class ContextAssembler:
         The ``context_window`` shim will be removed alongside other legacy
         cleanup in B5.5 / B5.6. Migrate callers to ``effective_window`` +
         ``compute_effective_window()``.
+
+        ``decision_recorder`` — optional OTel-backed callable injected by the
+        composition layer (``build_decision_recorder()``). ``None`` silently
+        skips all decision recording. Domain code MUST NOT import the
+        infrastructure ``record_decision`` directly; pass via DI instead.
         """
         if effective_window is None and context_window is None:
             raise ValueError(
@@ -161,6 +190,7 @@ class ContextAssembler:
         self._safety_factor = safety_factor
         self._tool_compress_trigger_ratio = tool_compress_trigger_ratio
         self._tool_compress_target_chars = tool_compress_target_chars
+        self._decision_recorder = decision_recorder
 
         if effective_window is not None:
             # New API: caller already applied system + reserved subtraction
@@ -220,6 +250,7 @@ class ContextAssembler:
                     f"phase1:compress_tool_content "
                     f"(target_chars={self._tool_compress_target_chars})"
                 )
+                _safe_record_decision(self._decision_recorder, "context_assembler_trim", outcome="phase_1")
 
         # ── Phase 2: remove oldest non-protected tool_call groups ──────────────
         current_tokens = self._estimate_groups(groups)
@@ -227,6 +258,7 @@ class ContextAssembler:
             groups, removed = self._phase2_remove_tool_groups(groups, budget)
             if removed:
                 actions.append(f"phase2:removed_tool_groups count={removed}")
+                _safe_record_decision(self._decision_recorder, "context_assembler_trim", outcome="phase_2")
 
         # ── Phase 3: remove oldest non-protected standalone turns ──────────────
         current_tokens = self._estimate_groups(groups)
@@ -234,6 +266,7 @@ class ContextAssembler:
             groups, removed = self._phase3_remove_turns(groups, budget)
             if removed:
                 actions.append(f"phase3:removed_turns count={removed}")
+                _safe_record_decision(self._decision_recorder, "context_assembler_trim", outcome="phase_3")
 
         # ── Fallback: still over budget ────────────────────────────────────────
         current_tokens = self._estimate_groups(groups)

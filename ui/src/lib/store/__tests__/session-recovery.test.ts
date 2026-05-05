@@ -34,6 +34,12 @@ vi.mock("../../api/session", () => ({
   },
 }));
 
+vi.mock("@/lib/api/session-compaction", () => ({
+  fetchCompactionList: vi.fn(async () => []),
+  fetchCompactionDetail: vi.fn(),
+  fetchCompactionOriginalContent: vi.fn(),
+}));
+
 describe("deriveStatusFromEvents", () => {
   it("returns timed_out for HealthEvent TERMINATED", () => {
     const events: SessionEventRecord[] = [
@@ -382,6 +388,29 @@ describe("recoverSession", () => {
     // 断言: 合并后 exactly 5 条, 无重复, 顺序正确
     expect(ids).toEqual(["1000-0", "1000-1", "1000-2", "1000-3", "1000-4"]);
     expect(new Set(ids).size).toBe(5);
+  });
+
+  it("[Codex holistic R3+R4+R5] fires fetchCompactionList on zero-event reconnect (regression test)", async () => {
+    // Locks the placement of the IIFE BEFORE the recoveredEvents.length===0
+    // early-return so a future refactor that moves it back below the early
+    // return is caught. Without this assertion, the 'keeps local status'
+    // test still passes because mergeCompactionList only mutates events,
+    // never status — so behavior is silent.
+    const { sessionApi } = await import("../../api/session");
+    const { fetchCompactionList } = await import("@/lib/api/session-compaction");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],
+      session_status: null,
+      has_more: false,
+    });
+    (fetchCompactionList as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    await useSessionStore.getState().recoverSession("s1");
+    // Wait for the fire-and-forget IIFE to complete its microtasks.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(fetchCompactionList).toHaveBeenCalledWith("s1");
   });
 });
 

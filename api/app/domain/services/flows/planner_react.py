@@ -471,6 +471,10 @@ class PlannerReActFlow(BaseFlow):
                 system_prompt_max_tokens=self._overflow_config.system_prompt_max_tokens,
                 reserved_output_tokens=self._overflow_config.reserved_output_tokens,
             )
+            # P1.2 fix: use composition-layer helper so domain code does NOT
+            # import infrastructure directly. Same DI pattern as
+            # _build_configurable() line ~1232.
+            from app.application.composition import build_decision_recorder as _bdr
             assembler = ContextAssembler(
                 estimator=TokenEstimator(
                     strategy=self._overflow_config.token_estimator,
@@ -482,6 +486,7 @@ class PlannerReActFlow(BaseFlow):
                 # it when deriving effective_window.
                 safety_factor=self._overflow_config.token_safety_factor,
                 tool_compress_trigger_ratio=self._overflow_config.tool_compress_trigger_ratio,
+                decision_recorder=_bdr(),
             )
         self._assembler = assembler
 
@@ -728,6 +733,10 @@ class PlannerReActFlow(BaseFlow):
                     "langgraph_step": 0,
                 },
             }
+        # Pre-compute messages_input_hash BEFORE try_compact (it may mutate messages reference)
+        from app.domain.services.graphs.compaction import compute_messages_input_hash
+        messages_input_hash = compute_messages_input_hash(msgs)
+
         result = await self._compactor.try_compact(
             messages=msgs,
             context_window=total_window,
@@ -737,12 +746,41 @@ class PlannerReActFlow(BaseFlow):
 
         if result.level_applied > 0:
             memory.messages = messages_to_dicts(result.messages)
+            from app.application.services.compaction_recorder import record_compaction
+            from dataclasses import replace
             async with self._uow_factory() as uow:
                 await uow.session.save_memory(self._session_id, "react", memory)
+                compaction_id = await record_compaction(
+                    uow=uow,
+                    session_id=self._session_id,
+                    result=result,
+                    messages_input_hash=messages_input_hash,
+                )
+                await uow.db_session.commit()  # [R2-P1-3] explicit commit-with-raise
+
+            # [VOK rec from CXR1] Use dataclasses.replace (codebase idiom) instead
+            # of object.__setattr__.
+            result = replace(result, compaction_id=compaction_id)
+
+            # [CXR1-P2-6] Path A OTel — fire AFTER successful commit so we don't
+            # emit an OTel event for a record that rolled back. NO attrs:
+            # CANONICAL_ATTRIBUTES is FROZEN per spec § Section 2 / [R2-P1-5];
+            # passing compaction_id here would be silently dropped.
+            try:
+                # Use composition-layer helper rather than direct infrastructure
+                # import, following the same DI pattern as _build_configurable()
+                # line ~1224. Domain code MUST NOT import infrastructure directly.
+                from app.application.composition import build_decision_recorder
+                _recorder = build_decision_recorder()
+                primary_kind = result.operations[-1]["kind"] if result.operations else "hard_truncate"
+                _recorder("compaction", outcome=primary_kind)
+            except Exception as exc:  # pragma: no cover — record_decision swallows OTel emit failures internally; this guards only programmer errors
+                logger.debug("OTel record_decision('compaction') unexpectedly raised: %s", exc)
+
             logger.info(
-                "compaction level=%d, %d→%d tokens, removed %d msgs",
+                "compaction level=%d, %d→%d tokens, removed %d msgs, id=%s",
                 result.level_applied, result.tokens_before,
-                result.tokens_after, result.messages_removed,
+                result.tokens_after, result.messages_removed, compaction_id,
             )
 
         self._last_compaction_result = result
@@ -795,6 +833,22 @@ class PlannerReActFlow(BaseFlow):
                 return None
             if result.level_applied == 0:
                 return None
+            # [R4-P2-3] Path B is fully SSE-silent + DB-silent. Only OTel decision
+            # fires so ops dashboards can count recovery-triggered compactions.
+            try:
+                # Use composition-layer helper rather than direct infrastructure
+                # import (same DI pattern as _build_configurable() line ~1224).
+                from app.application.composition import build_decision_recorder
+                _recorder = build_decision_recorder()
+                primary_kind = (
+                    result.operations[-1]["kind"] if result.operations else "hard_truncate"
+                )
+                _recorder(
+                    "compaction_recovery_callback",
+                    outcome=primary_kind,
+                )
+            except Exception:  # noqa: BLE001
+                pass  # OTel hiccup must never abort the compaction callback
             return list(result.messages)
 
         return callback

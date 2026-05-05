@@ -23,7 +23,6 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from app.domain.external.observability import MeterPort, TracerPort
-from app.infrastructure.observability.decision_trace import record_decision
 from app.infrastructure.observability.otel_llm_metrics import (
     OtelLLMMetricsCallback,
 )
@@ -89,5 +88,13 @@ def build_decision_recorder() -> Callable[..., None]:
     Recovery records decisions inside the infrastructure-side
     ``ActusRecoveryChatModel`` wrapper, so it has no domain-import
     concern and doesn't need this factory.
+
+    Import is intentionally lazy (inside function body) so that
+    ``mock.patch("app.infrastructure.observability.decision_trace.record_decision")``
+    intercepts correctly even after this composition module has already
+    been imported at test collection time. A module-level import would
+    cache the reference and bypass the patch.
     """
+    from app.infrastructure.observability.decision_trace import record_decision  # noqa: PLC0415
+
     return record_decision

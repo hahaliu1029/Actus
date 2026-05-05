@@ -1,0 +1,16 @@
+{
+  "loading": "Loading...",
+  "compaction": {
+    "indicator": {
+      "title": "History compacted",
+      "removed": "Removed {{count}} messages"
+    },
+    "detail": {
+      "viewSummary": "View summary",
+      "viewOriginal": "View original (best-effort)",
+      "originalExpired": "Original expired",
+      "checkpointerExpired": "Checkpointer expired, original unavailable",
+      "preB6Note": "Compaction occurred before B6 release; detail not recorded"
+    }
+  }
+}

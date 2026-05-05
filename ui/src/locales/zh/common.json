@@ -1,0 +1,16 @@
+{
+  "loading": "加载中...",
+  "compaction": {
+    "indicator": {
+      "title": "历史已压缩",
+      "removed": "移除 {{count}} 条消息"
+    },
+    "detail": {
+      "viewSummary": "查看摘要",
+      "viewOriginal": "查看原文 (尽力)",
+      "originalExpired": "原文已过期",
+      "checkpointerExpired": "checkpointer 已过期，原文不可恢复",
+      "preB6Note": "该压缩发生在 B6 上线前，详情未记录"
+    }
+  }
+}

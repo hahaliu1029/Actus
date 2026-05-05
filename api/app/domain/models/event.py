@@ -243,6 +243,7 @@ class CompactionEvent(BaseEvent):
     tokens_after: int = 0
     messages_removed: int = 0
     usage_ratio_after: float = 0.0
+    compaction_id: str | None = None  # B6: pointer to conversation_compactions row; None for legacy/Path-B events
 
 
 class FinishingEvent(BaseEvent):
