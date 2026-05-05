@@ -24,6 +24,7 @@ Working Language:
 {language}
 
 Reminders:
+- Execute only the current step. Do not execute later steps early or finish the whole plan. The user message is background; the current step is this run's boundary.
 - Tool analysis results take priority over task descriptions; return results in JSON format per the system prompt.
 - If the "Prior step outputs" section lists reusable files, prefer reading and consolidating them via file_read. Do not re-run searches or regenerate content unless strictly necessary.
 """

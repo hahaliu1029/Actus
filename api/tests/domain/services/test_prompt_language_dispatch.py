@@ -98,6 +98,17 @@ def test_execution_prompt_placeholders_match() -> None:
         assert "test message" in rendered
 
 
+def test_execution_prompt_enforces_current_step_boundary() -> None:
+    """Executor must not treat each step as permission to finish the whole plan."""
+    zh = get_prompt_bundle("zh").EXECUTION_PROMPT
+    en = get_prompt_bundle("en").EXECUTION_PROMPT
+
+    assert "只执行当前步骤" in zh
+    assert "不要提前执行后续步骤" in zh
+    assert "Execute only the current step" in en
+    assert "Do not execute later steps early" in en
+
+
 def test_create_plan_prompt_placeholders_match() -> None:
     args = {"message": "test msg", "attachments": "[]"}
     for lang in ("zh", "en"):

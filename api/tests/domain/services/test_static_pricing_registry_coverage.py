@@ -47,6 +47,15 @@ def test_kimi_models_are_priced() -> None:
     assert get_price("kimi-k2-6", "kimi_k2_6") is not None
 
 
+def test_glm_5v_turbo_is_priced() -> None:
+    """Regression: local GLM-5V-Turbo sessions must not stay unknown/$0."""
+    price = get_price("glm-5v-turbo", "glm")
+    assert price is not None
+    assert price["input"] > 0
+    assert price["output"] > 0
+    assert price["reasoning"] == price["output"]
+
+
 def test_registry_routable_prefixes_resolve_to_a_price() -> None:
     """Every prefix the registry routes to a priced provider must resolve.
 
@@ -74,6 +83,7 @@ def test_registry_routable_prefixes_resolve_to_a_price() -> None:
         "deepseek_chat": ("deepseek-chat",),
         "deepseek_reasoner": ("deepseek-reasoner",),
         "anthropic_compat": tuple(_ANTHROPIC_COMPAT_MODEL_PREFIXES),
+        "glm": ("glm-5v-turbo",),
         "kimi_k2": ("kimi-k2",),
         "kimi_k2_6": ("kimi-k2-6",),
     }

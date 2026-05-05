@@ -96,6 +96,13 @@ PRICING_TABLE: dict[str, dict[str, dict[str, Decimal]]] = {
     "kimi_k2_6": {
         "kimi-k2-6": _price("0.60", "2.50", cache_read="0.15"),
     },
+    "glm": {
+        # Z.AI official USD pricing as of 2026-05:
+        # https://docs.z.ai/guides/overview/pricing
+        "glm-5v-turbo": _price(
+            "1.2", "4.0", cache_read="0.24", reasoning="4.0"
+        ),
+    },
 }
 
 
@@ -109,7 +116,6 @@ UNPRICED_PROVIDER_ALLOWLIST: frozenset[str] = frozenset(
     {
         "generic_openai",    # fallback catch-all; forwards to real provider
         "gemini_compat",     # TODO: add Gemini prices in a later milestone
-        "glm",               # TODO: add Zhipu prices
         "dashscope_qwen",    # TODO: add DashScope prices
         "dashscope_qwen_vl",
         "minimax",           # TODO: add MiniMax prices
