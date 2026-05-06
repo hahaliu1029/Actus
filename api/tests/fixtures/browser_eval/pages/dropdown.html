@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Dropdown Test</title>
+<button role="combobox" aria-expanded="false" aria-controls="lang-list"
+        onclick="this.setAttribute('aria-expanded', this.getAttribute('aria-expanded') === 'true' ? 'false' : 'true')">语言</button>
+<ul id="lang-list" role="listbox" hidden>
+  <li role="option">中文</li>
+  <li role="option">English</li>
+  <li role="option">日本語</li>
+</ul>

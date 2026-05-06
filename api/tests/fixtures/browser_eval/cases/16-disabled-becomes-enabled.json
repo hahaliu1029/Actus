@@ -1,0 +1,11 @@
+{
+  "id": 16,
+  "category": "state",
+  "url": "file://{eval_root}/pages/disabled-becomes-enabled.html",
+  "intent": "点击表单字段后启用按钮",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "state_changed",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}

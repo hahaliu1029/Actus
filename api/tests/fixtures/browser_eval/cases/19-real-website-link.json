@@ -1,0 +1,11 @@
+{
+  "id": 19,
+  "category": "real-website",
+  "url": "https://github.com/",
+  "intent": "GitHub repo readme 链接",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "url_changed",
+  "timeout_s": 30,
+  "vision_required": false,
+  "network": true
+}

@@ -1,0 +1,11 @@
+{
+  "id": 7,
+  "category": "canvas",
+  "url": "file://{eval_root}/pages/canvas-button.html",
+  "intent": "点击 canvas 渲染的按钮",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "dom_mutated",
+  "timeout_s": 10,
+  "vision_required": true,
+  "html_pending": true
+}

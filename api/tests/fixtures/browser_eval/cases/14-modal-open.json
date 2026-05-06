@@ -1,0 +1,11 @@
+{
+  "id": 14,
+  "category": "modal",
+  "url": "file://{eval_root}/pages/modal-open.html",
+  "intent": "点击按钮打开模态框",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "modal_opened",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}

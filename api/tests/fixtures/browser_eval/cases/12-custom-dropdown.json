@@ -1,0 +1,11 @@
+{
+  "id": 12,
+  "category": "dropdown",
+  "url": "file://{eval_root}/pages/custom-dropdown.html",
+  "intent": "展开自定义下拉框",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "state_changed",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}

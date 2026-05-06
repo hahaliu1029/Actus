@@ -1,0 +1,11 @@
+{
+  "id": 11,
+  "category": "spa",
+  "url": "file://{eval_root}/pages/vue-spa-nav.html",
+  "intent": "点击 Vue SPA 导航",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "url_changed",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}

@@ -1,0 +1,11 @@
+{
+  "id": 8,
+  "category": "svg",
+  "url": "file://{eval_root}/pages/svg-chart.html",
+  "intent": "点击 SVG 图表中的扇形",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "dom_mutated",
+  "timeout_s": 10,
+  "vision_required": true,
+  "html_pending": true
+}

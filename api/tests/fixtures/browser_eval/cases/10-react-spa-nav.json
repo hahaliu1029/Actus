@@ -1,0 +1,11 @@
+{
+  "id": 10,
+  "category": "spa",
+  "url": "file://{eval_root}/pages/react-spa-nav.html",
+  "intent": "点击 React SPA 导航链接",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "url_changed",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}

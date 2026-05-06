@@ -1,0 +1,11 @@
+{
+  "id": 13,
+  "category": "dropdown",
+  "url": "file://{eval_root}/pages/native-select-variant.html",
+  "intent": "原生 select 多选变体",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "state_changed",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}

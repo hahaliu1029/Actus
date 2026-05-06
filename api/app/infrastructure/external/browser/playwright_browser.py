@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from app.domain.external.browser import Browser as BrowserProtocol
 from app.domain.models.tool_result import ToolResult
@@ -14,8 +14,16 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from app.infrastructure.external.browser.aria_extractor import (
+    parse_aria_snapshot,
+    format_descriptors_for_llm,
+)
+from app.infrastructure.external.browser.grounded_click import (
+    GroundedClickEngine,
+    resolve_bboxes_for_descriptors,
+)
+
 from .playwright_browser_fun import (
-    GET_INTERACTIVE_ELEMENTS_FUNC,
     GET_VISIBLE_CONTENT_FUNC,
     INJECT_CONSOLE_LOGS_FUNC,
 )
@@ -42,6 +50,9 @@ class PlaywrightBrowser(BrowserProtocol):
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
+
+        # GroundedClick 引擎：descriptor 缓存 + L1/L2/L3 fresh resolve
+        self._grounded = GroundedClickEngine()
 
     async def _ensure_browser(self) -> None:
         """确保浏览器存在，如果不存在则初始化"""
@@ -102,41 +113,19 @@ class PlaywrightBrowser(BrowserProtocol):
             return markdown_content[:max_content_length]
 
     async def _extract_interactive_elements(self) -> List[str]:
-        """提取当前页面上的可交互元素"""
-        # 1.确保页面存在
+        """ARIA-based extraction: locator('body').aria_snapshot() → descriptors → bbox 填充 → LLM 字符串。
+
+        Clears the engine descriptor cache up-front so a mid-extraction failure
+        (e.g. `aria_snapshot()` raises after navigation) cannot leave stale
+        descriptors from a previous page available to T12+ click(index=...) flows.
+        """
         await self._ensure_page()
-
-        # 2.清除当前页面上的缓存可交互元素列表
-        self.page.interactive_elements_cache = []
-
-        # 3.执行js脚本获取可交互的元素列表
-        interactive_elements = await self.page.evaluate(GET_INTERACTIVE_ELEMENTS_FUNC)
-
-        # 4.更新缓存的可交互元素列表
-        self.page.interactive_elements_cache = interactive_elements
-
-        # 5.格式化可交互元素为字符串
-        formatted_elements = []
-        for element in interactive_elements:
-            formatted_elements.append(
-                f"{element['index']}:<{element['tag']}>{element['text']}</{element['tag']}>"
-            )
-
-        return formatted_elements
-
-    async def _get_element_by_id(self, index: int) -> Optional[Any]:
-        """根据传递的索引/id获取对应的元素"""
-        # 1.判断也当前页面是否存在可交互元素缓存
-        if (
-            not hasattr(self.page, "interactive_elements_cache")
-            or not self.page.interactive_elements_cache
-            or index >= len(self.page.interactive_elements_cache)
-        ):
-            return None
-
-        # 2.构建选择器
-        selector = f'[data-manus-id="manus-element-{index}"]'
-        return await self.page.query_selector(selector)
+        self._grounded.set_descriptors([])
+        snapshot_text = await self.page.locator("body").aria_snapshot()
+        descriptors = parse_aria_snapshot(snapshot_text)
+        descriptors = await resolve_bboxes_for_descriptors(self.page, descriptors)
+        self._grounded.set_descriptors(descriptors)
+        return format_descriptors_for_llm(descriptors)
 
     async def click(
         self,
@@ -144,57 +133,52 @@ class PlaywrightBrowser(BrowserProtocol):
         coordinate_x: Optional[float] = None,
         coordinate_y: Optional[float] = None,
     ) -> ToolResult:
-        """根据传递的索引位置+xy坐标实现点击"""
-        # 1.确保页面存在
+        """index 路径走 GroundedClickEngine fresh resolve；coordinate 路径直接 mouse.click."""
         await self._ensure_page()
 
-        # 2.判断传递的是xy坐标还是index
         if coordinate_x is not None and coordinate_y is not None:
-            await self.page.mouse.click(coordinate_x, coordinate_y)
-        elif index is not None:
             try:
-                # 3.根据index获取元素
-                element = await self._get_element_by_id(index)
-                if not element:
-                    return ToolResult(
-                        success=False, message=f"使用索引{index}查找该元素无效, 未找到"
-                    )
+                await self.page.mouse.click(coordinate_x, coordinate_y)
+                return ToolResult(success=True)
+            except Exception as exc:
+                return ToolResult(success=False, message=f"坐标点击出错: {exc}")
 
-                # 4.检查元素是否是可见的
-                is_visible = await self.page.evaluate(
-                    """(element) => {
-                    if (!element) return false;
-                    const rect = element.getBoundingClientRect();
-                    const style = window.getComputedStyle(element);
-                    return !(
-                        rect.width === 0 ||
-                        rect.height === 0 ||
-                        style.display === 'none' ||
-                        style.visibility === 'hidden' ||
-                        style.opacity === '0'
-                    );
-                }""",
-                    element,
-                )
+        if index is None:
+            return ToolResult(success=False, message="必须提供 index 或 coordinate_x/y")
 
-                # 5.如果元素不可见则执行以下代码
-                if not is_visible:
-                    # 6.尝试将页面滚动到该元素的位置
-                    await self.page.evaluate(
-                        """(element) => {
-                        if (element) {
-                            element.scrollIntoView({behavior: 'smooth', block: 'center'})
-                        }
-                    }""",
-                        element,
-                    )
-                    await asyncio.sleep(1)
+        try:
+            descriptor = self._grounded.get_descriptor(index)
+        except IndexError:
+            return ToolResult(
+                success=False,
+                message=f"使用索引{index}查找该元素无效, 未找到",
+            )
 
-                # 7.点击元素
-                await element.click(timeout=5000)
-            except Exception as e:
-                return ToolResult(success=False, message=f"点击元素出错: {str(e)}")
+        before_url = self.page.url if isinstance(self.page.url, str) else ""
+        await self._grounded.install_mutation_observer(self.page)
+        trace = await self._grounded.resolve_and_click(
+            self.page,
+            intent=f"点击元素 {index}",
+            descriptor=descriptor,
+        )
 
+        if trace.success_level is None:
+            # explicit_failure trace recorded for eval harness to inspect.
+            self._grounded.record_trace(trace)
+            return ToolResult(success=False, message=trace.error or "定位失败")
+
+        postcondition = await self._grounded.verify_postcondition(
+            self.page,
+            before_url=before_url,
+        )
+        trace.postcondition = postcondition
+        self._grounded.record_trace(trace)
+
+        if postcondition == "no_observable_change":
+            return ToolResult(
+                success=True,
+                message="操作已执行，未检测到页面变化。如果预期应有变化，请重试或检查目标元素。",
+            )
         return ToolResult(success=True)
 
     async def initialize(self) -> bool:
@@ -312,10 +296,7 @@ class PlaywrightBrowser(BrowserProtocol):
         await self._ensure_page()
 
         try:
-            # 2.在跳转之前先将可交互元素的缓存清空
-            self.page.interactive_elements_cache = []
-
-            # 3.使用强等待策略进行跳转，提升SPA页面可见内容提取稳定性
+            # 2.使用强等待策略进行跳转，提升SPA页面可见内容提取稳定性
             await self.page.goto(url, wait_until="load", timeout=30000)
 
             warnings: list[str] = []
@@ -372,40 +353,38 @@ class PlaywrightBrowser(BrowserProtocol):
         coordinate_x: Optional[float] = None,
         coordinate_y: Optional[float] = None,
     ) -> ToolResult:
-        """根据传递的文本+换行标识+索引+xy位置实现输入框文本输入"""
-        # 1.确保页面存在
+        """index 路径走 GroundedClickEngine fresh resolve (L1+L2)；coordinate 路径走 mouse.click + keyboard.type。"""
         await self._ensure_page()
 
-        # 2.判断下是传递xy还是index
         if coordinate_x is not None and coordinate_y is not None:
-            # 3.点击指定位置后输入文本
             await self.page.mouse.click(coordinate_x, coordinate_y)
             await self.page.keyboard.type(text)
-        elif index is not None:
-            try:
-                # 4.根据索引查找元素
-                element = await self._get_element_by_id(index)
-                if not element:
-                    return ToolResult(
-                        success=False, message=f"输入文本失败, 该元素不存在"
-                    )
+            if press_enter:
+                await self.page.keyboard.press("Enter")
+            return ToolResult(success=True)
 
-                try:
-                    # 5.先清空原始输入框的内容然后再填充
-                    await element.fill("")
-                    await element.type(text)
-                except Exception as e:
-                    # 6.如果填充失败则尝试点击后输入文本，而不是直接清空
-                    await element.click()
-                    await element.type(text)
-            except Exception as e:
-                return ToolResult(success=False, message=f"输入文本失败: {str(e)}")
+        if index is None:
+            return ToolResult(success=False, message="必须提供 index 或 coordinate_x/y")
 
-        # 7.判断是否按Enter键
-        if press_enter:
-            await self.page.keyboard.press("Enter")
+        try:
+            descriptor = self._grounded.get_descriptor(index)
+        except IndexError:
+            return ToolResult(success=False, message=f"使用索引{index}查找该元素无效, 未找到")
 
-        return ToolResult(success=True)
+        # input 不走 L3 bbox 兜底：bbox.click + keyboard.type 在 coordinate 路径已覆盖。
+        locator = await self._grounded.fresh_resolve_l1(self.page, descriptor)
+        if locator is None:
+            locator = await self._grounded.fresh_resolve_l2(self.page, descriptor)
+        if locator is None:
+            return ToolResult(success=False, message=f"输入框 index={index} 定位失败")
+
+        try:
+            await locator.fill(text)
+            if press_enter:
+                await self.page.keyboard.press("Enter")
+            return ToolResult(success=True)
+        except Exception as exc:
+            return ToolResult(success=False, message=f"输入出错: {exc}")
 
     async def move_mouse(self, coordinate_x: float, coordinate_y: float) -> ToolResult:
         """传递xy坐标移动鼠标"""
@@ -420,23 +399,24 @@ class PlaywrightBrowser(BrowserProtocol):
         return ToolResult(success=True)
 
     async def select_option(self, index: int, option: int) -> ToolResult:
-        """传递索引+下拉菜单选项选择指定的菜单信息"""
-        # 1.确保页面存在
+        """index 路径走 GroundedClickEngine fresh resolve (L1+L2 only)。"""
         await self._ensure_page()
+        try:
+            descriptor = self._grounded.get_descriptor(index)
+        except IndexError:
+            return ToolResult(success=False, message=f"使用索引{index}查找该元素无效, 未找到")
+
+        locator = await self._grounded.fresh_resolve_l1(self.page, descriptor)
+        if locator is None:
+            locator = await self._grounded.fresh_resolve_l2(self.page, descriptor)
+        if locator is None:
+            return ToolResult(success=False, message=f"下拉框 index={index} 定位失败")
 
         try:
-            # 2.获取元素信息
-            element = await self._get_element_by_id(index)
-            if not element:
-                return ToolResult(
-                    success=False, message=f"使用索引[{index}]查找该下拉菜单元素不存在"
-                )
-
-            # 3.调用函数直接选择对应选项
-            await element.select_option(index=option)
+            await locator.select_option(index=option)
             return ToolResult(success=True)
-        except Exception as e:
-            return ToolResult(success=False, message=f"选择下拉菜单选项失败: {str(e)}")
+        except Exception as exc:
+            return ToolResult(success=False, message=f"选择选项出错: {exc}")
 
     async def restart(self, url: str) -> ToolResult:
         """重启并跳转到指定URL"""

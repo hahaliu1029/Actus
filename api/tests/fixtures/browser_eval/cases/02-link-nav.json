@@ -1,0 +1,10 @@
+{
+  "id": 2,
+  "category": "standard",
+  "url": "file://{eval_root}/pages/link-nav.html",
+  "intent": "点击导航链接",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "url_changed",
+  "timeout_s": 10,
+  "vision_required": false
+}

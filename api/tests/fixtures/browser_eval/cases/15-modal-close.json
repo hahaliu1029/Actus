@@ -1,0 +1,11 @@
+{
+  "id": 15,
+  "category": "modal",
+  "url": "file://{eval_root}/pages/modal-close.html",
+  "intent": "点击 X 关闭模态框",
+  "click_target_index_hint": 0,
+  "expected_postcondition": "dom_mutated",
+  "timeout_s": 10,
+  "vision_required": false,
+  "html_pending": true
+}
