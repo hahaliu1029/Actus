@@ -207,3 +207,47 @@ def test_parse_handles_multiple_bracket_attrs_and_trailing_colon() -> None:
         ("checkbox", "Toggle"),
         ("button", "Open"),
     ]
+
+
+def test_parse_drops_native_select_option_children() -> None:
+    """Codex audit finding #2: a native `<select>` emits its `<option>`
+    children as ARIA `option` lines indented under `combobox`. Those options
+    are NOT independently clickable (Playwright `select_option(index=N)` on
+    the parent is the only way), so the parser must not surface them as
+    standalone descriptors. Otherwise the LLM sees clickable indices that
+    silently fail, and downstream `select_option` falls back to a page-wide
+    option lookup that picks up unrelated options on the same page.
+    """
+    snapshot = (
+        '- combobox "Other":\n'
+        '  - option "Wrong A" [selected]\n'
+        '  - option "Wrong B"\n'
+        '- combobox "Language"'
+    )
+    out = parse_aria_snapshot(snapshot)
+    # Two combobox descriptors, ZERO standalone option descriptors.
+    assert [(d.role, d.name) for d in out] == [
+        ("combobox", "Other"),
+        ("combobox", "Language"),
+    ]
+
+
+def test_parse_keeps_options_under_listbox_for_custom_combobox() -> None:
+    """Custom comboboxes route options through a sibling `<listbox>` (the
+    `<button role="combobox" aria-controls="lang-list">` + `<ul role="listbox">`
+    pattern). Those options ARE independently clickable once the listbox is
+    visible, so they MUST stay in the descriptor list — only options indented
+    directly under `combobox` are dropped."""
+    snapshot = (
+        '- combobox "Language"\n'
+        '- listbox:\n'
+        '  - option "中文"\n'
+        '  - option "English"'
+    )
+    out = parse_aria_snapshot(snapshot)
+    assert [(d.role, d.name) for d in out] == [
+        ("combobox", "Language"),
+        ("listbox", ""),
+        ("option", "中文"),
+        ("option", "English"),
+    ]

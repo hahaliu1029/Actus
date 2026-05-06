@@ -98,6 +98,12 @@ def parse_aria_snapshot(snapshot: str) -> list[ElementDescriptor]:
     intermediate: list[dict] = []
     last_idx = -1
     last_indent = -1
+    # Stack of (indent, role) for ALL interactive descriptors seen so far,
+    # whether or not we emitted them. Used to detect "option indented directly
+    # under combobox" → native <select> child option, which can't be clicked
+    # independently in Playwright. Custom comboboxes route options through a
+    # separate <listbox> element, so option-under-listbox is kept.
+    interactive_ancestors: list[tuple[int, str]] = []
 
     for raw_line in snapshot.splitlines():
         if not raw_line.strip():
@@ -117,6 +123,13 @@ def parse_aria_snapshot(snapshot: str) -> list[ElementDescriptor]:
         if not desc_match:
             continue
         role = desc_match.group("role")
+        indent = len(desc_match.group("indent") or "")
+
+        # Drop ancestors at same/greater indent (no longer ancestors of
+        # the current line).
+        while interactive_ancestors and interactive_ancestors[-1][0] >= indent:
+            interactive_ancestors.pop()
+
         if role not in _INTERACTIVE_ROLES:
             # Don't update last_idx/last_indent — keeps any subsequent attribute
             # children from attaching to a non-interactive parent. But also
@@ -125,7 +138,26 @@ def parse_aria_snapshot(snapshot: str) -> list[ElementDescriptor]:
             last_indent = -1
             continue
 
-        indent = len(desc_match.group("indent") or "")
+        # Drop options indented directly under `combobox` (native <select>
+        # children — Playwright `select_option(index=N)` is the only way to
+        # pick them; standalone click on the option is a no-op or error).
+        # Options under `listbox` (custom combobox pattern) keep being emitted.
+        if (
+            role == "option"
+            and interactive_ancestors
+            and interactive_ancestors[-1][1] == "combobox"
+        ):
+            # Push self into ancestor stack so any deeper-nested children
+            # see the right context, but skip emission.
+            interactive_ancestors.append((indent, role))
+            last_idx = -1
+            last_indent = -1
+            continue
+
+        # Push self before emit — so children of this descriptor see it as
+        # their ancestor.
+        interactive_ancestors.append((indent, role))
+
         name = desc_match.group("name") or ""
         scalar = (desc_match.group("scalar") or "").strip()
         # text precedence: name > scalar > ""

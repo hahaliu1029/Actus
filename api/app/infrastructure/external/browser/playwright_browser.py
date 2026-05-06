@@ -1,6 +1,7 @@
 import asyncio
+import json
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from app.domain.external.browser import Browser as BrowserProtocol
 from app.domain.models.tool_result import ToolResult
@@ -378,13 +379,27 @@ class PlaywrightBrowser(BrowserProtocol):
         if locator is None:
             return ToolResult(success=False, message=f"输入框 index={index} 定位失败")
 
+        # `fill()` works for native `<input>` / `<textarea>` / `[contenteditable]`.
+        # ARIA textboxes (`<div role="textbox" tabindex="0">`) are not in that
+        # set — Playwright raises "Element is not an <input>, <textarea> or
+        # [contenteditable] element". Fall back to focus-via-click + keyboard
+        # typing, mirroring the coordinate path's strategy.
         try:
             await locator.fill(text)
-            if press_enter:
+        except Exception:
+            try:
+                await locator.click(timeout=5000)
+                await self.page.keyboard.type(text)
+            except Exception as exc:
+                return ToolResult(success=False, message=f"输入出错: {exc}")
+
+        if press_enter:
+            try:
                 await self.page.keyboard.press("Enter")
-            return ToolResult(success=True)
-        except Exception as exc:
-            return ToolResult(success=False, message=f"输入出错: {exc}")
+            except Exception as exc:
+                return ToolResult(success=False, message=f"按 Enter 出错: {exc}")
+
+        return ToolResult(success=True)
 
     async def move_mouse(self, coordinate_x: float, coordinate_y: float) -> ToolResult:
         """传递xy坐标移动鼠标"""
@@ -399,7 +414,18 @@ class PlaywrightBrowser(BrowserProtocol):
         return ToolResult(success=True)
 
     async def select_option(self, index: int, option: int) -> ToolResult:
-        """index 路径走 GroundedClickEngine fresh resolve (L1+L2 only)。"""
+        """index 路径走 GroundedClickEngine fresh resolve (L1+L2 only)。
+
+        Native `<select>` and ARIA combobox both surface as `role="combobox"`
+        in `aria_snapshot()`, so the LLM-facing tag is the same. We dispatch
+        per element type at runtime:
+
+        - **Native `<select>`**: use `locator.select_option(index=option)`.
+        - **Custom combobox (e.g. `<button role="combobox">`)**: click the
+          combobox to expand, then click the Nth visible `[role="option"]`.
+          Playwright `select_option()` raises "Element is not a <select>"
+          on these, so we must detect via `tagName` and fall back.
+        """
         await self._ensure_page()
         try:
             descriptor = self._grounded.get_descriptor(index)
@@ -413,10 +439,160 @@ class PlaywrightBrowser(BrowserProtocol):
             return ToolResult(success=False, message=f"下拉框 index={index} 定位失败")
 
         try:
-            await locator.select_option(index=option)
+            tag_name = await locator.evaluate("el => el.tagName")
+        except Exception:
+            tag_name = ""
+
+        if isinstance(tag_name, str) and tag_name.upper() == "SELECT":
+            try:
+                await locator.select_option(index=option)
+                return ToolResult(success=True)
+            except Exception as exc:
+                return ToolResult(success=False, message=f"选择选项出错: {exc}")
+
+        # Custom combobox: route via either aria-controls (deterministic) or a
+        # visibility-diff heuristic that detects the listbox/menu newly opened
+        # by the click. Naive "filter visible .first" was retired (codex audit)
+        # because it silently picks an unrelated already-visible listbox when
+        # one exists earlier in the DOM.
+        aria_scope = await self._scope_via_aria_controls(locator)
+        if aria_scope is not None:
+            try:
+                await locator.click(timeout=5000)
+                options = aria_scope.get_by_role("option")
+                await options.nth(option).click(timeout=5000)
+                return ToolResult(success=True)
+            except Exception as exc:
+                return ToolResult(success=False, message=f"自定义下拉选择出错: {exc}")
+
+        try:
+            diff_scope = await self._scope_via_visible_diff(locator)
+        except Exception as exc:
+            return ToolResult(success=False, message=f"自定义下拉选择出错: {exc}")
+        if diff_scope is None:
+            # Ambiguous — 0 or multiple newly-visible popups after the click.
+            # Failing loudly is safer than `.nth()` silently landing on an
+            # unrelated listbox elsewhere on the page.
+            return ToolResult(
+                success=False,
+                message=(
+                    "自定义下拉框作用域识别失败：点击后未检测到唯一新打开的弹窗 "
+                    "(0 或 ≥2 个 listbox/menu 同时可见)。请检查 combobox 是否声明 "
+                    "`aria-controls` 指向其 popup。"
+                ),
+            )
+        try:
+            options = diff_scope.get_by_role("option")
+            await options.nth(option).click(timeout=5000)
             return ToolResult(success=True)
         except Exception as exc:
-            return ToolResult(success=False, message=f"选择选项出错: {exc}")
+            return ToolResult(success=False, message=f"自定义下拉选择出错: {exc}")
+
+    async def _scope_via_aria_controls(self, combobox_locator: Any) -> Optional[Any]:
+        """Resolve the combobox's owned listbox via `aria-controls` / `aria-owns`.
+
+        Returns a `Locator` scoped to the referenced element, or `None` when
+        neither attribute exposes an ID. Uses CSS attribute-selector form
+        `[id="..."]` (with `json.dumps`-escaped value) rather than `#<id>`
+        because framework-generated ids like Radix UI's `radix-:r1:` contain
+        characters that break naive `#<id>` CSS parsing.
+        """
+        for attr in ("aria-controls", "aria-owns"):
+            try:
+                value = await combobox_locator.get_attribute(attr)
+            except Exception:
+                value = None
+            if value:
+                # `aria-controls` may carry a space-separated ID list; the
+                # owned listbox is conventionally the first one.
+                controls_id = value.split()[0] if isinstance(value, str) else None
+                if controls_id:
+                    return self.page.locator(f"css=[id={json.dumps(controls_id)}]")
+        return None
+
+    # Pre-click: tag every currently-visible `[role=listbox]` / `[role=menu]`
+    # with a stable marker attribute. Identity-based (not index-based) so a
+    # subsequent DOM mutation that inserts a new popup BEFORE existing visible
+    # popups won't be mistaken for "new index appeared at end" — which broke
+    # the prior set-of-indices diff (codex audit round 5 follow-up).
+    _LISTBOX_TAG_BASELINE_SCRIPT = """() => {
+        // Wipe any stale markers (from a prior call that crashed mid-flight)
+        // so the baseline is clean before tagging.
+        document.querySelectorAll('[data-br1-listbox-baseline]').forEach(el => {
+            el.removeAttribute('data-br1-listbox-baseline');
+        });
+        const isVisible = (el) =>
+            !el.hidden
+            && el.getClientRects().length > 0
+            && getComputedStyle(el).visibility !== 'hidden'
+            && getComputedStyle(el).visibility !== 'collapse';
+        document.querySelectorAll('[role="listbox"], [role="menu"]').forEach((el) => {
+            if (isVisible(el)) el.setAttribute('data-br1-listbox-baseline', '1');
+        });
+    }"""
+
+    # Post-click: enumerate current `[role=listbox]` / `[role=menu]` elements
+    # and return the DOM-order indices of those that are visible AND lack the
+    # baseline marker (= newly-visible since the pre-click tag). The indices
+    # describe the CURRENT DOM order, which matches `page.locator(...).nth()`
+    # semantics. Markers are wiped at the end so subsequent calls start clean.
+    _LISTBOX_NEWLY_VISIBLE_SCRIPT = """() => {
+        const isVisible = (el) =>
+            !el.hidden
+            && el.getClientRects().length > 0
+            && getComputedStyle(el).visibility !== 'hidden'
+            && getComputedStyle(el).visibility !== 'collapse';
+        const all = [...document.querySelectorAll('[role="listbox"], [role="menu"]')];
+        const newlyVisible = [];
+        all.forEach((el, i) => {
+            if (isVisible(el) && !el.hasAttribute('data-br1-listbox-baseline')) {
+                newlyVisible.push(i);
+            }
+        });
+        document.querySelectorAll('[data-br1-listbox-baseline]').forEach(el => {
+            el.removeAttribute('data-br1-listbox-baseline');
+        });
+        return newlyVisible;
+    }"""
+
+    async def _scope_via_visible_diff(self, combobox_locator: Any) -> Optional[Any]:
+        """Click `combobox_locator` and return a `Locator` scoped to the
+        listbox/menu the click newly revealed.
+
+        Side-effect: clicks the combobox. Caller MUST NOT click separately.
+
+        Algorithm (marker-based identity, not index-based set diff):
+        1. Pre-click: tag every currently-visible `[role=listbox]` /
+           `[role=menu]` element with `data-br1-listbox-baseline`.
+        2. Click the combobox.
+        3. Post-click: enumerate the current DOM and collect indices of
+           visible elements that LACK the marker. Markers travel with
+           elements through DOM mutations, so this correctly identifies
+           the new popup even when the click inserts it between existing
+           visible popups (which would shift index-based diff results).
+        4. If exactly one newly-visible index, scope to
+           `page.locator(LISTBOX_QUERY).nth(idx)`. Otherwise return `None`
+           to signal ambiguity — caller must fail loudly.
+        """
+        try:
+            await self.page.evaluate(self._LISTBOX_TAG_BASELINE_SCRIPT)
+        except Exception:
+            # Pre-tag failed → can't reliably diff; fail rather than guess.
+            return None
+
+        await combobox_locator.click(timeout=5000)
+
+        try:
+            newly_visible = await self.page.evaluate(self._LISTBOX_NEWLY_VISIBLE_SCRIPT)
+        except Exception:
+            newly_visible = []
+        if not isinstance(newly_visible, list):
+            newly_visible = []
+
+        if len(newly_visible) != 1:
+            return None
+        [idx] = newly_visible
+        return self.page.locator('[role="listbox"], [role="menu"]').nth(idx)
 
     async def restart(self, url: str) -> ToolResult:
         """重启并跳转到指定URL"""
