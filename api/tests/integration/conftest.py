@@ -256,3 +256,300 @@ async def planner_react_with_compactor(uow_factory, fake_summary_llm, seed_sessi
     flow._last_compaction_result = None
 
     yield flow
+
+
+# ── B3-core supervisor fixtures (db_session-keyed) ──────────────────────────
+#
+# Plan basis: docs/superpowers/plans/2026-05-07-b3-core-pr0-plan.md (Task 1,
+# P1-1 fix).  Fixtures here depend on ``db_session`` so they live with the
+# integration tree.
+#
+# Round-3 audit P1-NEW-1 fix: pytest only walks UP the directory tree, NOT
+# sideways across sibling trees.  The non-DB-keyed counterparts (redis_client,
+# asgi_client, app, sample_user_token, other_user_token, mock_runner,
+# _auth_dependency_overrides) used to live in a now-deleted app-tree conftest;
+# all fixtures are consolidated below in this file (line ~393 onward).
+
+
+@pytest.fixture
+async def sample_user(db_session):
+    """Persist a synthetic ``UserModel`` for FK references.
+
+    The ``sessions`` table has a FK on ``user_id`` → ``users.id``; supervisor
+    anchor tests need a real row to satisfy that constraint.
+    """
+    from app.infrastructure.models.user import UserModel
+
+    user_id = str(_uuid.uuid4())
+    user = UserModel(
+        id=user_id,
+        username=f"b3test_{user_id[:8]}",
+        password_hash="x",
+    )
+    db_session.add(user)
+    await db_session.flush()
+    yield user
+    # Cleanup is handled by the enclosing ``db_session`` rollback.
+
+
+@pytest.fixture
+async def sample_session(db_session, sample_user):
+    """Persist a synthetic ``Session`` — PR-0 baseline (pre-PR-2 schema only).
+
+    NOTE (P1-4): Supervisor-only kwargs (execution_mode, execution_phase,
+    retry_budget_remaining, was_background) DO NOT exist on the ``sessions``
+    table until PR-2 ``b3p2`` migration ships.  This fixture will be EXTENDED
+    at the PR-2 boundary to set those columns; at PR-0 we only persist what
+    the current ORM schema allows.
+    """
+    from app.domain.models.session import Session, SessionStatus
+    from app.infrastructure.models.session import SessionModel
+
+    sid = f"sess-b3-{_uuid.uuid4().hex[:12]}"
+    orm = SessionModel(
+        id=sid,
+        user_id=sample_user.id,
+        status=SessionStatus.RUNNING.value,
+        title="b3 supervisor anchor session",
+        # supervisor kwargs (execution_mode, execution_phase, retry_budget_remaining,
+        # was_background) added by PR-2 fixture extension once b3p2 migration ships
+        # these columns. Do NOT set them here at PR-0.
+    )
+    db_session.add(orm)
+    await db_session.flush()
+    yield Session(  # convert ORM → domain (domain may default supervisor fields)
+        id=sid,
+        user_id=sample_user.id,
+        status=SessionStatus.RUNNING,
+    )
+
+
+@pytest.fixture
+async def session_repo(db_session):
+    """``DBSessionRepository`` for FSM/Restart/Repo/PG/FINISHING/Notif anchors.
+
+    Used 6+ times across C-FSM-*, C-Restart-*, C-Repo-*, C-PG-*,
+    C-FINISHING-1, C-Notif-*.
+    """
+    from app.infrastructure.repositories.db_session_repository import DBSessionRepository
+
+    yield DBSessionRepository(db_session=db_session)
+
+
+@pytest.fixture
+async def notification_repo(db_session):
+    """``DBMemorySystemNotificationRepository`` per spec v3 §6.8 reuse decision.
+
+    P3-2 verified: ctor signature is ``__init__(self, db_session: AsyncSession)``
+    at api/app/infrastructure/repositories/db_memory_system_notification_repository.py:29.
+    """
+    from app.infrastructure.repositories.db_memory_system_notification_repository import (
+        DBMemorySystemNotificationRepository,
+    )
+
+    yield DBMemorySystemNotificationRepository(db_session=db_session)
+
+
+async def _no_op_callback(session_id: str) -> None:
+    """Default callback: matches positional signature at agent_task_runner.py:2861."""
+    return None
+
+
+@pytest.fixture
+async def runner_factory(db_session, sample_user):
+    """Factory that constructs ``AgentTaskRunner`` instances with realistic deps.
+
+    Used by C-FINISHING-1 / C-Callback-Compose anchors.  At PR-0 the factory
+    body raises ``NotImplementedError`` because constructing a real
+    ``AgentTaskRunner`` requires the full ExecutionSupervisor surface that
+    PR-2 builds.  Anchor tests are xfail until then.
+    """
+    constructed: list = []
+
+    def _factory(*, session_id: str, user_id: str | None = None, **overrides):
+        from app.domain.services.agent_task_runner import AgentTaskRunner  # noqa: F401
+
+        raise NotImplementedError(
+            "PR-2 wires real AgentTaskRunner construction; PR-0 anchor tests are xfail"
+        )
+
+    yield _factory
+    # Optional cleanup — cancel any still-running runners
+    for runner in constructed:
+        try:
+            await runner.cancel(reason="test_teardown")
+        except Exception:
+            pass
+
+
+@pytest.fixture
+async def agent_service_with_redis(db_session):
+    """``AgentService`` instance wired with real DB session + real Redis.
+
+    Used by anchor tests that exercise PG↔Redis cross-store contracts.
+    PR-2 fills this in; PR-0 raises so dependent anchor tests xfail.
+    """
+    raise NotImplementedError(
+        "PR-2 wires real ExecutionSupervisor + repos; PR-0 anchor tests are xfail"
+    )
+
+
+# ── B3-core supervisor fixtures (non-DB-keyed) ──────────────────────────────
+#
+# Round-3 audit P1-NEW-1 fix: pytest only walks UP the directory tree, NOT
+# sideways across sibling trees.  Anchors live in ``api/tests/integration/``
+# so all fixtures they consume must also live in (or be importable from)
+# this conftest.  Round-2's app-tree conftest (now deleted) was invisible to
+# integration anchors — fixtures consolidated here.
+
+
+@pytest.fixture
+async def redis_client():
+    """Real Redis client connected to local test instance.
+
+    Spec v3 §3.2 — supervisor:hot, supervisor:owner, supervisor:bg,
+    supervisor:user, supervisor:system keys.
+    """
+    import redis.asyncio as redis_asyncio
+
+    client = redis_asyncio.from_url(
+        "redis://localhost:6379/15",  # DB 15 for tests; isolate from app DB 0
+        decode_responses=False,
+    )
+    # Flush before each test for isolation
+    await client.flushdb()
+    yield client
+    await client.flushdb()
+    await client.aclose()
+
+
+@pytest.fixture
+def mock_runner():
+    """Lightweight ``MagicMock`` for tests that don't need a real runner."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    runner = MagicMock()
+    runner.session_id = str(_uuid.uuid4())
+    runner.cancel_reason = None
+    runner.request_cancel = MagicMock(return_value=asyncio.sleep(0))  # awaitable no-op
+    return runner
+
+
+@pytest.fixture
+def app():
+    """FastAPI app for ASGI test client — imported from main module.
+
+    Round-3 audit P2-NEW-1 caveat: this fixture returns the app singleton
+    WITHOUT running its ``lifespan`` startup.  Tests that need ``app.state.X``
+    populated by lifespan (e.g. C-Redis-2 referencing ``app.state.idle_watchdog``)
+    must either install ``asgi-lifespan`` and use ``LifespanManager`` OR
+    construct the supervisor/watchdog manually.  Most PR-0 anchors stay xfail
+    until PR-2 ships lifespan integration.
+    """
+    from app.main import app as fastapi_app
+
+    return fastapi_app
+
+
+@pytest.fixture
+async def asgi_client(app, _auth_dependency_overrides):
+    """httpx AsyncClient for endpoint tests — uses ASGITransport + DI override.
+
+    Round-2 audit P1-C fix: ``sample_user`` only ``flush()``-es inside the
+    rolled-back integration transaction; the real ``get_current_user`` opens
+    an independent DB session and would 401 against a fresh test user.
+    ``_auth_dependency_overrides`` installs a JWT-subject-aware shim so
+    PR-3c endpoint anchors reach the contract under test instead of bouncing
+    on auth.
+
+    Mirrors ``api/tests/integration/endpoints/conftest.py:45-60`` (asgi-lifespan
+    NOT in pyproject.toml).
+    """
+    import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        yield client
+
+
+@pytest.fixture
+def _auth_dependency_overrides(app, sample_user):
+    """JWT-subject-aware ``get_current_user`` shim for endpoint anchor tests.
+
+    Round-3 audit P1-NEW-2 fix: previous override unconditionally returned
+    ``sample_user``, breaking C-Auth-1 (cross-user 403 anchor) — `other_user_token`
+    was silently authenticated as `sample_user`.
+
+    Fix: decode the JWT ``sub`` claim from the ``Authorization`` header.
+    - sub == sample_user.id → return real sample_user (DB-backed)
+    - sub == any other UUID → return a SimpleNamespace stub with .id=sub
+      (sufficient for endpoint owner-comparison: ``sess.user_id != current_user.id``
+      yields 403)
+    - missing/malformed token → raise HTTPException(401)
+
+    Decode is unverified (testing only — no secret check).
+    """
+    try:
+        from app.interfaces.dependencies.auth import get_current_user  # type: ignore
+    except ImportError:
+        # Auth dep not on import path; endpoint anchors will xfail naturally.
+        yield
+        return
+
+    import base64
+    import json
+    from types import SimpleNamespace
+
+    from fastapi import Header, HTTPException
+
+    sample_user_id = str(sample_user.id)
+
+    async def _override_get_current_user(authorization: str = Header(default="")):
+        token = authorization.removeprefix("Bearer ").strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="missing token")
+        try:
+            # JWT structure: header.payload.signature; we read payload only.
+            payload_b64 = token.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception:
+            raise HTTPException(status_code=401, detail="malformed token")
+
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="no sub claim")
+
+        if sub == sample_user_id:
+            return sample_user
+        # Synthetic "other" user — has .id matching JWT sub.  Used by C-Auth-1
+        # to drive `sess.user_id != current_user.id` → 403.
+        return SimpleNamespace(id=sub, username=f"other-{sub[:8]}")
+
+    app.dependency_overrides[get_current_user] = _override_get_current_user
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.fixture
+def sample_user_token(sample_user) -> str:
+    """Synthetic JWT for sample_user.  Used by C-Cancel-1 / C-MultiTab-1."""
+    from core.security import create_access_token
+
+    return create_access_token({"sub": str(sample_user.id)})
+
+
+@pytest.fixture
+def other_user_token() -> str:
+    """JWT for a different user_id — used by C-Auth-1 (cross-user 403 anchor).
+
+    Round-3 audit P1-NEW-2 fix: with the JWT-aware override, this token's
+    ``sub`` claim resolves to a SimpleNamespace stub user (NOT sample_user),
+    so the endpoint's owner check correctly returns 403.
+    """
+    from core.security import create_access_token
+
+    return create_access_token({"sub": str(_uuid.uuid4())})
