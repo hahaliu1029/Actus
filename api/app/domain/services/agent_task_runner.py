@@ -97,6 +97,7 @@ from fastapi import UploadFile
 from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
+_EVENT_SEQ_TTL_SECONDS = 86400
 
 # B4 Issue 1D: GC anchor + observability for shielded terminal tasks.
 # Without a hard reference, asyncio could collect the task before its done
@@ -253,12 +254,16 @@ class AgentTaskRunner(TaskRunner):
         # every LLM call inside the graph emits a CostRecord. None = disabled
         # (legacy path / tests that bypass cost tracking).
         cost_callback_handler: Any = None,
+        event_seq_client: Any = None,  # B3-core PR-1: Redis client for session:seq:{sid}
+        event_seq_ttl_seconds: int = _EVENT_SEQ_TTL_SECONDS,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # A7 Task 2.7: provider capability profile. None = legacy behavior
         # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
         self.profile = profile
         self._cost_callback_handler = cost_callback_handler
+        self._event_seq_client = event_seq_client
+        self._event_seq_ttl_seconds = event_seq_ttl_seconds
         self._on_session_complete = on_session_complete
         self._approval_state_reader = approval_state_reader
         self._approval_state_writer = approval_state_writer
@@ -601,6 +606,7 @@ class AgentTaskRunner(TaskRunner):
         self, task: Task, event: Event, persist: bool = True
     ) -> None:
         """往指定任务的消息队列中添加事件"""
+        await self._stamp_event_seq(event)
         # 1.往任务的输出消息队列中新增事件
         event_id = await task.output_stream.put(event.model_dump_json())
         event.id = event_id
@@ -609,6 +615,33 @@ class AgentTaskRunner(TaskRunner):
         if persist:
             async with self._uow:
                 await self._uow.session.add_event(self._session_id, event)
+
+    async def _stamp_event_seq(self, event: Event) -> None:
+        if getattr(event, "seq", None) is not None:
+            return
+        client = getattr(self, "_event_seq_client", None)
+        if client is None:
+            return
+
+        seq_key = f"session:seq:{self._session_id}"
+        try:
+            new_seq = await client.incr(seq_key)
+            if new_seq == 1:
+                try:
+                    await client.expire(seq_key, self._event_seq_ttl_seconds)
+                except Exception:
+                    logger.warning(
+                        "first-write EXPIRE for %s failed",
+                        seq_key,
+                        exc_info=True,
+                    )
+            event.seq = int(new_seq)
+        except Exception:
+            logger.warning(
+                "seq stamp failed for session=%s",
+                self._session_id,
+                exc_info=True,
+            )
 
     async def _stream_assistant_message_event(
         self, event: MessageEvent

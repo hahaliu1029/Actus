@@ -69,6 +69,7 @@ class BaseEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 事件id
     type: Literal[""] = ""  # 事件的类型
     created_at: datetime = Field(default_factory=datetime.now)  # 事件创建时间
+    seq: Optional[int] = None  # B3-core PR-1 §3.3: producer-side monotonic stamp via INCR session:seq:{sid}
 
 
 class PlanEvent(BaseEvent):
@@ -307,6 +308,48 @@ class SandboxStateChangedEvent(BaseEvent):
     reason: Optional[str] = None  # DestroyReason.value or free-text
 
 
+class ExecutionStatePayload(BaseModel):
+    """B3-core supervisor execution state snapshot (spec v3 §3.3)."""
+
+    execution_mode: Literal["foreground", "background"]
+    execution_phase: Literal[
+        "running", "recovering", "idle", "suspended", "terminating", "terminated"
+    ]
+    background_reason: Optional[Literal["explicit", "auto_degrade"]] = None
+    expires_at: Optional[datetime] = None
+    retry_budget_remaining: int
+    suspended_reason: Optional[
+        Literal["bg_idle_timeout", "bg_explicit_expired", "server_restart"]
+    ] = None
+    terminal_reason: Optional[
+        Literal["user_cancel", "server_restart", "resume_state_lost", "watchdog_timeout"]
+    ] = None
+    transition_reason: str = ""
+
+
+class ExecutionStateChangedEvent(BaseEvent):
+    """B3-core supervisor: execution mode/phase transition (spec v3 §3.3, T1-T11)."""
+
+    type: Literal["execution_state_changed"] = "execution_state_changed"
+    payload: ExecutionStatePayload
+
+
+class OwnerConflictPayload(BaseModel):
+    """B3-core supervisor multi-tab CAS lease conflict (spec v3 §3.3, §4.7)."""
+
+    current_owner_connection_id: str
+    conflicting_connection_id: str
+    session_id: str
+    suggested_action: Literal["wait_lease_expire", "request_takeover"] = "wait_lease_expire"
+
+
+class OwnerConflictEvent(BaseEvent):
+    """B3-core supervisor: Tab2 attempted to claim CAS lease but Tab1 holds it."""
+
+    type: Literal["owner_conflict"] = "owner_conflict"
+    payload: OwnerConflictPayload
+
+
 # 定义应用事件类型声明
 Event = Annotated[
     Union[
@@ -324,6 +367,8 @@ Event = Annotated[
         HealthEvent,
         ToolConfirmationEvent,
         SandboxStateChangedEvent,
+        ExecutionStateChangedEvent,  # B3-core PR-1
+        OwnerConflictEvent,           # B3-core PR-1
         DoneEvent,
     ],
     Field(discriminator="type"),

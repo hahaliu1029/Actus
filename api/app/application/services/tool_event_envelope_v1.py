@@ -89,6 +89,10 @@ def _project_common_top_fields(
     return {
         "event_id": event.id,
         "created_at": event.created_at,
+        # B3-core PR-1 §3.3 — propagate seq from domain event to wire envelope.
+        # ToolEventEnvelopeV1 inherits seq from BaseEventData; without this line
+        # the projector silently drops it and the SSE wire payload misses seq.
+        "seq": getattr(event, "seq", None),
         "envelope_version": 1,
         "tool_call_id": event.tool_call_id,
         "tool_name": event.tool_name,              # wire alias → "name"

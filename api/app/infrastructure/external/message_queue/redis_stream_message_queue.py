@@ -8,15 +8,42 @@ from app.infrastructure.storage.redis import get_redis
 
 logger = logging.getLogger(__name__)
 
+# B3-core PR-1 §3.2: governance for SSE event streams.
+# - MAXLEN ~2000: approximate trim with `~` for ~10x speedup vs exact trim.
+#   Keeps about 2000-2050 entries (Redis trims in 100-entry-radix-tree chunks).
+# - EXPIRE 86400 (24h): defensive upper bound on session output streams.
+#   Set on first write; subsequent writes do NOT refresh TTL (we want abandoned
+#   streams to age out, not be re-armed by the producer's writes).
+_DEFAULT_STREAM_MAXLEN: int = 2000
+_DEFAULT_STREAM_TTL_SECONDS: int = 86400  # 24h
+
 
 class RedisStreamMessageQueue(MessageQueue):
     """基于RedisStream的消息队列"""
 
-    def __init__(self, stream_name: str) -> None:
-        """构造函数，完成Redis-Stream的初始化，涵盖名字、锁的时间"""
+    def __init__(self, stream_name: str, *, meter: object | None = None) -> None:
+        """构造函数，完成Redis-Stream的初始化，涵盖名字、锁的时间。
+
+        B3-core PR-1 §6.3: optional ``meter`` (MeterPort) for the
+        ``actus_supervisor_event_stream_size_bytes`` histogram. When None,
+        observability is skipped (legacy callers in tests / standalone scripts).
+
+        Histogram cached on the instance (not the class), avoiding cross-test
+        state leakage and explicit reset boilerplate.
+        """
         self._stream_name = stream_name
         self._redis = get_redis()
         self._lock_expire_seconds = 10
+        self._meter = meter
+        self._stream_size_histogram = (
+            meter.create_histogram(
+                name="actus_supervisor_event_stream_size_bytes",
+                unit="By",
+                description="B3-core: SSE event stream size after MAXLEN trim",
+            )
+            if meter is not None
+            else None
+        )
 
     async def _acquire_lock(
         self, lock_key: str, timeout_seconds: int = 5
@@ -69,10 +96,71 @@ class RedisStreamMessageQueue(MessageQueue):
             return False
 
     async def put(self, message: Any) -> str:
-        """往redis-stream中添加一条消息并返回id"""
+        """往redis-stream中添加一条消息并返回id。
+
+        B3-core PR-1 §3.2:
+        - `maxlen=2000, approximate=True` caps Stream growth (~10x faster than exact trim).
+        - First-write `EXPIRE 86400` (24h) defensively bounds abandoned streams.
+          Detected via `EXISTS` *before* XADD because XADD itself creates the key
+          when missing — a post-XADD `TTL` check would race with concurrent XADDs.
+        """
         logger.debug(f"往消息队列[{self._stream_name}]中添加一条消息: {message}")
 
-        return await self._redis.client.xadd(self._stream_name, {"data": message})
+        # First-write detection MUST precede XADD; once XADD creates the key,
+        # we can no longer distinguish "we just made it" from "someone else made it".
+        existed_before = await self._redis.client.exists(self._stream_name)
+
+        message_id = await self._redis.client.xadd(
+            self._stream_name,
+            {"data": message},
+            maxlen=_DEFAULT_STREAM_MAXLEN,
+            approximate=True,
+        )
+
+        should_arm_expire = not existed_before
+        if existed_before:
+            try:
+                should_arm_expire = (
+                    await self._redis.client.ttl(self._stream_name)
+                ) == -1
+            except Exception:
+                logger.warning(
+                    "TTL check failed for stream=%s",
+                    self._stream_name,
+                    exc_info=True,
+                )
+
+        if should_arm_expire:
+            try:
+                await self._redis.client.expire(
+                    self._stream_name, _DEFAULT_STREAM_TTL_SECONDS
+                )
+            except Exception:
+                # EXPIRE failure is non-fatal; the next producer write observes
+                # TTL=-1 and re-arms if needed. Worst case: stream lingers past
+                # 24h until the next write, manual cleanup, or LRU eviction.
+                logger.warning(
+                    "first-write EXPIRE failed for stream=%s",
+                    self._stream_name,
+                    exc_info=True,
+                )
+
+        # B3-core PR-1 §6.3 — sampled stream-size observation (~1% sample).
+        if (
+            self._stream_size_histogram is not None
+            and uuid.uuid4().int % 100 == 0
+        ):
+            try:
+                length = await self._redis.client.xlen(self._stream_name)
+                # Rough byte-cost estimate (Stream entry overhead ~150B + payload).
+                approx_bytes = length * 200
+                self._stream_size_histogram.record(
+                    approx_bytes, attributes={"stream_kind": "task_output"}
+                )
+            except Exception:
+                pass  # observability is non-load-bearing
+
+        return message_id
 
     async def get(self, start_id: str = None, block_ms: int = None) -> Tuple[str, Any]:
         """从redis-stream获取一条数据"""

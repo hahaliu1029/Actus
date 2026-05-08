@@ -141,6 +141,7 @@ async def test_get_events_since_no_since_with_redis_supplements():
     event_recovery.get_recent_events.assert_called_once_with(
         task_id="task-abc",
         after_event_id=None,
+        after_seq=None,  # B3-core PR-1 §3.3 — additive kwarg, default None on legacy paths
     )
 
 
@@ -178,6 +179,7 @@ async def test_get_events_since_redis_supplements_pg():
     event_recovery.get_recent_events.assert_called_once_with(
         task_id="task-abc",
         after_event_id=None,
+        after_seq=None,  # B3-core PR-1 §3.3
     )
 
 
@@ -209,7 +211,128 @@ async def test_get_events_since_prefers_last_valid_redis_stream_id():
     event_recovery.get_recent_events.assert_called_once_with(
         task_id="task-abc",
         after_event_id="1713264000000-0",
+        after_seq=None,  # B3-core PR-1 §3.3
     )
+
+
+async def test_get_events_since_seq_does_not_let_pg_tail_skip_redis_gap():
+    """since_seq must recover Redis-only gaps before a later PG-persisted tail."""
+    from app.application.services.agent_service import AgentService
+
+    cursor = _make_event(event_id="1000-2", message="cursor")
+    cursor.seq = 2
+    pg_tail = _make_event(event_id="1000-6", message="pg-tail")
+    pg_tail.seq = 6
+    session = _make_session(events=[cursor, pg_tail], task_id="task-abc")
+
+    redis_gap = []
+    for seq in range(3, 6):
+        event = _make_event(event_id=f"1000-{seq}", message=f"gap-{seq}")
+        event.seq = seq
+        redis_gap.append(event)
+    redis_duplicate_tail = _make_event(event_id="1000-6", message="pg-tail")
+    redis_duplicate_tail.seq = 6
+    redis_events = redis_gap + [redis_duplicate_tail]
+
+    def _stream_id_gt(left: str, right: str | None) -> bool:
+        if right is None:
+            return True
+        left_ms, left_seq = (int(part) for part in left.split("-", 1))
+        right_ms, right_seq = (int(part) for part in right.split("-", 1))
+        return (left_ms, left_seq) > (right_ms, right_seq)
+
+    async def recover(task_id: str, after_event_id: str | None, after_seq: int | None):
+        return EventRecoveryResult(
+            events=[
+                event
+                for event in redis_events
+                if _stream_id_gt(event.id, after_event_id)
+                and after_seq is not None
+                and event.seq is not None
+                and event.seq > after_seq
+            ],
+            has_more=False,
+        )
+
+    uow_mock = AsyncMock()
+    uow_mock.session.get_by_id = AsyncMock(return_value=session)
+    uow_factory = AsyncMock(return_value=uow_mock)
+    uow_factory.__aenter__ = AsyncMock(return_value=uow_mock)
+    uow_factory.__aexit__ = AsyncMock(return_value=False)
+
+    event_recovery = AsyncMock()
+    event_recovery.get_recent_events = AsyncMock(side_effect=recover)
+
+    svc = AgentService.__new__(AgentService)
+    svc._uow_factory = lambda: uow_factory
+    svc._event_recovery = event_recovery
+
+    result = await svc.get_events_since(
+        "session-1",
+        "1000-2",
+        "user-1",
+        since_seq=2,
+    )
+
+    assert [event.id for event in result["events"]] == [
+        "1000-3",
+        "1000-4",
+        "1000-5",
+        "1000-6",
+    ]
+    event_recovery.get_recent_events.assert_called_once_with(
+        task_id="task-abc",
+        after_event_id="1000-2",
+        after_seq=2,
+    )
+
+
+async def test_get_events_since_seq_sorts_non_stream_pg_event_by_seq():
+    """Recovered sequenced events are ordered by seq even if PG ids are UUIDs."""
+    from app.application.services.agent_service import AgentService
+
+    cursor = _make_event(event_id="1000-2", message="cursor")
+    cursor.seq = 2
+    pg_middle = _make_event(event_id="uuid-pg-4", message="pg-middle")
+    pg_middle.seq = 4
+    session = _make_session(events=[cursor, pg_middle], task_id="task-abc")
+
+    redis_before = _make_event(event_id="1000-3", message="redis-before")
+    redis_before.seq = 3
+    redis_after = _make_event(event_id="1000-5", message="redis-after")
+    redis_after.seq = 5
+
+    async def recover(task_id: str, after_event_id: str | None, after_seq: int | None):
+        return EventRecoveryResult(
+            events=[redis_before, redis_after],
+            has_more=False,
+        )
+
+    uow_mock = AsyncMock()
+    uow_mock.session.get_by_id = AsyncMock(return_value=session)
+    uow_factory = AsyncMock(return_value=uow_mock)
+    uow_factory.__aenter__ = AsyncMock(return_value=uow_mock)
+    uow_factory.__aexit__ = AsyncMock(return_value=False)
+
+    event_recovery = AsyncMock()
+    event_recovery.get_recent_events = AsyncMock(side_effect=recover)
+
+    svc = AgentService.__new__(AgentService)
+    svc._uow_factory = lambda: uow_factory
+    svc._event_recovery = event_recovery
+
+    result = await svc.get_events_since(
+        "session-1",
+        "1000-2",
+        "user-1",
+        since_seq=2,
+    )
+
+    assert [(event.id, event.seq) for event in result["events"]] == [
+        ("1000-3", 3),
+        ("uuid-pg-4", 4),
+        ("1000-5", 5),
+    ]
 
 
 async def test_get_events_since_invalid_since_id_does_not_reach_redis():
@@ -238,4 +361,5 @@ async def test_get_events_since_invalid_since_id_does_not_reach_redis():
     event_recovery.get_recent_events.assert_called_once_with(
         task_id="task-abc",
         after_event_id=None,
+        after_seq=None,  # B3-core PR-1 §3.3
     )

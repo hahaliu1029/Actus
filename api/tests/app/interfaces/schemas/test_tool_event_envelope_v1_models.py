@@ -171,3 +171,40 @@ class TestToolSSEEventIntegration:
         assert "tool_name" not in wire
         assert "function_name" not in wire
         assert "function_args" not in wire
+
+    def test_from_event_propagates_seq_to_wire_envelope(self) -> None:
+        """B3-core PR-1 §3.3: ToolEvent.seq propagates through the projector to
+        the SSE wire envelope (was silently dropped before the projector was
+        updated to forward seq into ToolEventEnvelopeV1)."""
+        evt = ToolEvent(
+            tool_call_id="c2",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={"command": "echo"},
+            status=ToolEventStatus.CALLING,
+            seq=42,
+        )
+        sse_evt = ToolSSEEvent.from_event(evt)
+        assert sse_evt.data.seq == 42
+
+        wire_json = sse_evt.to_sse_data_json()
+        wire = json.loads(wire_json)
+        assert wire.get("seq") == 42
+
+    def test_from_event_legacy_event_without_seq_keeps_none(self) -> None:
+        """B3-core PR-1 §3.3 backward compat: legacy ToolEvent (seq=None default)
+        round-trips with `data.seq is None` and the wire payload includes
+        `"seq": null` (consistent with other SSE event types)."""
+        evt = ToolEvent(
+            tool_call_id="c3",
+            tool_name="shell",
+            function_name="shell_execute",
+            function_args={"command": "noop"},
+            status=ToolEventStatus.CALLING,
+        )
+        sse_evt = ToolSSEEvent.from_event(evt)
+        assert sse_evt.data.seq is None
+
+        wire_json = sse_evt.to_sse_data_json()
+        wire = json.loads(wire_json)
+        assert wire.get("seq") is None

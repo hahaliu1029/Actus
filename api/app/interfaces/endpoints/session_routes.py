@@ -335,21 +335,28 @@ async def get_session(
     path="/{session_id}/events",
     response_model=Response[EventsSinceResponse],
     summary="获取会话增量事件",
-    description="获取指定 event_id 之后的增量事件，用于断线重连后的状态恢复",
+    description="获取指定 event_id (or seq) 之后的增量事件，用于断线重连后的状态恢复",
     dependencies=[Depends(rate_limit_read)],
 )
 async def get_events_since(
     session_id: str,
     current_user: CurrentUser,
     since: Optional[str] = None,
+    since_seq: Optional[int] = None,  # B3-core PR-1 §3.3 — preferred cursor
     agent_service: AgentService = Depends(get_agent_service),
 ) -> Response[EventsSinceResponse]:
-    """获取 session 在 since 之后的增量事件 + 当前状态"""
+    """获取 session 在 since (or since_seq) 之后的增量事件 + 当前状态。
+
+    B3-core PR-1 §3.3: ``since_seq`` is the preferred monotonic cursor for
+    sequenced events. When both are provided, agent_service keeps ``since`` as
+    the legacy-event fallback.
+    """
     result = await agent_service.get_events_since(
         session_id=session_id,
         since_event_id=since,
         user_id=current_user.id,
         is_admin=current_user.is_admin(),
+        since_seq=since_seq,
     )
     return Response.success(
         msg="获取增量事件成功",
@@ -357,6 +364,8 @@ async def get_events_since(
             events=EventMapper.events_to_sse_events(result["events"]),
             session_status=result["session_status"],
             has_more=result["has_more"],
+            last_seq=result["last_seq"],
+            supervisor_snapshot=result["supervisor_snapshot"],
         ),
     )
 

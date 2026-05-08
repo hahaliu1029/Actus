@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  __test_applySSEToSession,
   deriveStatusFromEvents,
   pickMoreAdvancedStatus,
   useSessionStore,
@@ -273,7 +274,7 @@ describe("recoverSession", () => {
 
     await useSessionStore.getState().recoverSession("s1");
 
-    expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", undefined);
+    expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", undefined, undefined);
     const session = useSessionStore.getState().currentSession;
     expect(session!.status).toBe("completed");
     expect((session!.events as SessionEventRecord[]).length).toBeGreaterThan(0);
@@ -321,6 +322,84 @@ describe("recoverSession", () => {
 
     const session = useSessionStore.getState().currentSession;
     expect(session!.status).toBe("timed_out");
+  });
+
+  it("fetchSessionById derives last_seq from returned event seqs", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: null,
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      events: [
+        { event: "message", data: { role: "assistant", event_id: "1000-3", seq: 3 } },
+        { event: "message", data: { role: "assistant", event_id: "1000-9", seq: 9 } },
+      ],
+    });
+
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(useSessionStore.getState().currentSession?.last_seq).toBe(9);
+  });
+
+  it("fetchSessionById preserves a higher local last_seq when merging live events", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-7", seq: 7 } },
+        ],
+      },
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      last_seq: 3,
+      events: [
+        { event: "message", data: { role: "assistant", event_id: "1000-3", seq: 3 } },
+      ],
+    });
+
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(useSessionStore.getState().currentSession?.last_seq).toBe(7);
+  });
+
+  it("fetchSessionById stores remote last_seq when only the cursor advances", async () => {
+    const events: SessionEventRecord[] = [
+      { event: "message", data: { role: "assistant", event_id: "1000-3", seq: 3 } },
+    ];
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 3,
+        events,
+      },
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      last_seq: 9,
+      events,
+    });
+
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(useSessionStore.getState().currentSession?.last_seq).toBe(9);
   });
 
   it("does not regress status on empty events", async () => {
@@ -388,6 +467,47 @@ describe("recoverSession", () => {
     // 断言: 合并后 exactly 5 条, 无重复, 顺序正确
     expect(ids).toEqual(["1000-0", "1000-1", "1000-2", "1000-3", "1000-4"]);
     expect(new Set(ids).size).toBe(5);
+  });
+
+  it("uses live SSE seq as the next recovery cursor", async () => {
+    const liveSession = __test_applySSEToSession(
+      {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        events: [],
+      },
+      {
+        type: "message",
+        data: {
+          role: "assistant",
+          message: "live",
+          event_id: "1000-7",
+          seq: 7,
+          attachments: [],
+        },
+      },
+    );
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: liveSession,
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],
+      session_status: "running",
+      has_more: false,
+      last_seq: 7,
+      supervisor_snapshot: null,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", "1000-7", 7);
   });
 
   it("[Codex holistic R3+R4+R5] fires fetchCompactionList on zero-event reconnect (regression test)", async () => {
@@ -632,7 +752,7 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
     await vi.advanceTimersByTimeAsync(10);
 
     // auto-reconnect 必达：getEventsSince 被调，不给用户弹错误 toast
-    expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", undefined);
+    expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", undefined, undefined);
     expect(setMessageSpy).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "error" }),
     );

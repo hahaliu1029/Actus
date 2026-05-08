@@ -205,15 +205,20 @@ function resolveStatusFromEvent(
 }
 
 function applySSEToSession(session: Session, event: SSEEventData): Session {
+  const sessionWithSeq = advanceSessionLastSeq(session, eventSeqOf({
+    event: event.type,
+    data: event.data as Record<string, unknown>,
+  }));
+
   if (event.type === "done") {
-    return session;
+    return sessionWithSeq;
   }
 
   if (event.type === "title") {
     const nextTitle =
-      typeof event.data.title === "string" ? event.data.title : session.title;
+      typeof event.data.title === "string" ? event.data.title : sessionWithSeq.title;
     return {
-      ...session,
+      ...sessionWithSeq,
       title: nextTitle,
     };
   }
@@ -237,7 +242,7 @@ function applySSEToSession(session: Session, event: SSEEventData): Session {
       : withPlanStepSynced;
 
   return {
-    ...session,
+    ...sessionWithSeq,
     events: withRecoveredErrorsPruned,
   };
 }
@@ -403,6 +408,40 @@ function eventIdOf(event: SessionEventRecord): string | null {
   return null;
 }
 
+function eventSeqOf(event: SessionEventRecord): number | null {
+  const rawSeq = event.data?.seq;
+  if (typeof rawSeq === "number" && Number.isFinite(rawSeq) && rawSeq > 0) {
+    return rawSeq;
+  }
+  if (typeof rawSeq === "string" && rawSeq.trim()) {
+    const parsed = Number(rawSeq);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+function maxSeqFromEvents(events: SessionEventRecord[]): number {
+  return events.reduce((max, event) => {
+    const seq = eventSeqOf(event);
+    return seq === null ? max : Math.max(max, seq);
+  }, 0);
+}
+
+function advanceSessionLastSeq(session: Session, seq: number | null): Session {
+  if (seq === null) {
+    return session;
+  }
+  const currentLastSeq = session.last_seq ?? 0;
+  const nextLastSeq = Math.max(currentLastSeq, seq);
+  if (nextLastSeq === currentLastSeq) {
+    return session;
+  }
+  return {
+    ...session,
+    last_seq: nextLastSeq,
+  };
+}
+
 function getLatestEventId(events: SessionEventRecord[]): string | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
@@ -548,11 +587,22 @@ function isSameSessionSnapshot(left: Session, right: Session): boolean {
     left.session_id === right.session_id &&
     left.status === right.status &&
     left.title === right.title &&
+    (left.last_seq ?? 0) === (right.last_seq ?? 0) &&
+    stringifySnapshot(left.supervisor_snapshot) ===
+      stringifySnapshot(right.supervisor_snapshot) &&
     isSameEvents(
       (left.events || []) as SessionEventRecord[],
       (right.events || []) as SessionEventRecord[]
     )
   );
+}
+
+function stringifySnapshot(snapshot: unknown): string {
+  try {
+    return JSON.stringify(snapshot ?? null);
+  } catch {
+    return String(snapshot);
+  }
 }
 
 function isSameFileList(left: FileInfo[], right: FileInfo[]): boolean {
@@ -760,11 +810,13 @@ export const useSessionStore = create<SessionStore>()(
       }
       try {
         const session = await sessionApi.getSession(sessionId);
+        const normalizedEvents = normalizeSessionEvents(session.events as SessionEventRecord[]);
         const normalizedRemote: Session = {
           ...session,
           status: normalizeSessionStatus(session.status),
           title: pickTitle(session),
-          events: normalizeSessionEvents(session.events as SessionEventRecord[]),
+          events: normalizedEvents,
+          last_seq: Math.max(session.last_seq ?? 0, maxSeqFromEvents(normalizedEvents)),
         };
 
         set((state) => {
@@ -781,10 +833,20 @@ export const useSessionStore = create<SessionStore>()(
             normalizedRemote.events as SessionEventRecord[],
             localSession.events as SessionEventRecord[]
           );
+          const nextLastSeq = Math.max(
+            normalizedRemote.last_seq ?? 0,
+            localSession.last_seq ?? 0,
+            maxSeqFromEvents(mergedEvents)
+          );
           const nextSession: Session = {
             ...normalizedRemote,
             title: normalizedRemote.title || localSession.title,
             events: mergedEvents,
+            last_seq: nextLastSeq,
+            supervisor_snapshot:
+              normalizedRemote.supervisor_snapshot ??
+              localSession.supervisor_snapshot ??
+              null,
             // E2: 防止远端滞后 status 覆盖本地已推导的更晚状态（如 timed_out）
             status: pickMoreAdvancedStatus(
               normalizedRemote.status,
@@ -879,14 +941,26 @@ export const useSessionStore = create<SessionStore>()(
         const lastEventId = getLatestEventId(
           localSession.events as SessionEventRecord[]
         );
+        // B3-core PR-1 §3.3 — pass seq cursor for sequenced events while keeping
+        // event_id as the backend's legacy-event fallback.
+        const sinceSeq =
+          typeof localSession.last_seq === "number" && localSession.last_seq > 0
+            ? localSession.last_seq
+            : undefined;
         const response = await sessionApi.getEventsSince(
           sessionId,
-          lastEventId
+          lastEventId,
+          sinceSeq,
         );
 
         const recoveredEvents = (response.events ?? []) as SessionEventRecord[];
         const remoteStatus = normalizeSessionStatus(response.session_status as Session["status"]);
         const eventDerivedStatus = deriveStatusFromEvents(recoveredEvents);
+
+        // B3-core PR-1 §3.3 — capture supervisor cursor + snapshot for next reconnect.
+        const remoteLastSeq =
+          typeof response.last_seq === "number" ? response.last_seq : 0;
+        const remoteSnapshot = response.supervisor_snapshot ?? null;
 
         // [Codex holistic R3+R4 P2] Backend's `/sessions/{id}/events?since=...`
         // returns persisted SSE events only — it does NOT include
@@ -940,8 +1014,29 @@ export const useSessionStore = create<SessionStore>()(
                 pickMoreAdvancedStatus(remoteStatus, local.status) ??
                 local.status;
             }
-            if (finalStatus === local.status) return {};
-            return { currentSession: { ...local, status: finalStatus } };
+            // B3-core PR-1 — only short-circuit when nothing actually changes.
+            const nextLastSeq = Math.max(remoteLastSeq, local.last_seq ?? 0);
+            const nextSnapshot =
+              remoteSnapshot ?? local.supervisor_snapshot ?? null;
+            if (
+              finalStatus === local.status &&
+              local.last_seq === nextLastSeq &&
+              local.supervisor_snapshot === nextSnapshot
+            ) {
+              return {};
+            }
+            return {
+              currentSession: {
+                ...local,
+                status: finalStatus,
+                // B3-core PR-1 — advance cursor monotonically; preserve local
+                // snapshot when remote returns null. Mirrors the precomputed
+                // values above so the equality short-circuit and the persisted
+                // values agree.
+                last_seq: nextLastSeq,
+                supervisor_snapshot: nextSnapshot,
+              },
+            };
           });
           return;
         }
@@ -962,7 +1057,16 @@ export const useSessionStore = create<SessionStore>()(
               local.status
             ) ?? local.status;
           return {
-            currentSession: { ...local, events: merged, status: finalStatus },
+            currentSession: {
+              ...local,
+              events: merged,
+              status: finalStatus,
+              // B3-core PR-1 — advance cursor monotonically; preserve local snapshot
+              // when remote returns null (avoids stomping good cursor on transient
+              // backend that hasn't populated supervisor_snapshot yet).
+              last_seq: Math.max(remoteLastSeq, local.last_seq ?? 0),
+              supervisor_snapshot: remoteSnapshot ?? local.supervisor_snapshot ?? null,
+            },
           };
         });
 

@@ -25,12 +25,27 @@ class RedisEventRecovery(EventRecoveryPort):
         self._max_count = max_count
 
     async def get_recent_events(
-        self, task_id: str, after_event_id: str | None
+        self,
+        task_id: str,
+        after_event_id: str | None,
+        after_seq: int | None = None,
     ) -> EventRecoveryResult:
+        """B3-core PR-1 §3.3:
+        - When ``after_seq`` is provided, filter sequenced events to
+          ``event.seq > after_seq``.
+        - When ``after_event_id`` is also provided, use it as the Redis Stream
+          floor for legacy ``event.seq is None`` entries so mixed streams do not
+          drop events written by old/direct producers after the client's cursor.
+        - When only ``after_event_id`` is provided, use the cursor (legacy path).
+        """
         stream_name = f"task:output:{task_id}"
         queue = RedisStreamMessageQueue(stream_name)
 
-        start_id = after_event_id if after_event_id else "-"
+        if after_seq is not None:
+            start_id = after_event_id if after_event_id else "-"
+        else:
+            start_id = after_event_id if after_event_id else "-"
+
         events: List[Event] = []
 
         try:
@@ -47,7 +62,6 @@ class RedisEventRecovery(EventRecoveryPort):
                     event = _event_adapter.validate_json(event_str)
                     # 回填 Redis Stream ID（关键！与 agent_service.py:616 同模式）
                     event.id = message_id
-                    events.append(event)
                 except Exception:
                     logger.warning(
                         "event_recovery: 反序列化失败 stream=%s id=%s",
@@ -55,6 +69,16 @@ class RedisEventRecovery(EventRecoveryPort):
                         message_id,
                     )
                     continue
+
+                # B3-core PR-1 §3.3 — seq filter (preferred cursor)
+                if after_seq is not None:
+                    if event.seq is None:
+                        if not after_event_id:
+                            continue
+                    elif event.seq <= after_seq:
+                        continue
+
+                events.append(event)
         except Exception:
             logger.warning(
                 "event_recovery: 读取 stream 失败 stream=%s", stream_name

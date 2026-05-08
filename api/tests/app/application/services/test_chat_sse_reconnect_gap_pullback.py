@@ -45,7 +45,10 @@ class _SpyEventRecovery(EventRecoveryPort):
         self.last_after_event_id: str | None = "__unset__"
 
     async def get_recent_events(
-        self, task_id: str, after_event_id: str | None
+        self,
+        task_id: str,
+        after_event_id: str | None,
+        after_seq: int | None = None,  # B3-core PR-1 §3.3 — additive kwarg
     ) -> EventRecoveryResult:
         self.call_count += 1
         self.last_after_event_id = after_event_id

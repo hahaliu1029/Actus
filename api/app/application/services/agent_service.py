@@ -51,6 +51,7 @@ from app.domain.models.session import Session, SessionStatus
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.confirmation_manager import ConfirmationManager
+from app.infrastructure.external.message_queue import STREAM_TTL_SECONDS
 from core.config import get_settings
 from langgraph.types import Command
 from pydantic import TypeAdapter
@@ -410,6 +411,11 @@ class AgentService:
             # expose ``.profile`` (see _build_llm in service_dependencies.py).
             profile=getattr(snap.llm, "profile", None),
             cost_callback_handler=cost_callback_handler,
+            event_seq_client=(
+                self._redis_client.client
+                if self._redis_client and hasattr(self._redis_client, "client")
+                else None
+            ),
         )
 
         # 6.创建任务Task并更新会话中的信息
@@ -944,22 +950,175 @@ class AgentService:
             raise ForbiddenError("无权访问此会话")
         return session
 
+    # ----- B3-core PR-1: producer-side seq stamping + helpers -----
+
+    async def get_session(self, session_id: str) -> Optional["Session"]:
+        """B3-core PR-1 §6.5: thin wrapper around ``uow.session.get_by_id``.
+
+        For callers that don't need authorization (e.g. supervisor lifespan
+        reconciler, auto-degrade detached task in PR-3c/PR-4). Authorization
+        paths must keep using ``_get_accessible_session``.
+
+        Returns ``None`` if not found (NOT raises) — supervisor callers handle
+        absent sessions gracefully (race with delete).
+        """
+        async with self._uow_factory() as uow:
+            return await uow.session.get_by_id(session_id)
+
+    async def _emit_event(self, session_id: str, event: BaseEvent) -> Optional[str]:
+        """B3-core PR-1 §3.2 / §6.6: producer-side event emit.
+
+        Stamps ``event.seq`` via INCR ``session:seq:{sid}`` (24h TTL on first set),
+        then XADDs to ``task:output:{task_id}`` of the session's running task.
+
+        Returns the Redis Stream message_id (so callers can correlate) or ``None``
+        if no live task exists OR the redis client is not wired (test fallback).
+
+        **Single-writer-per-session invariant:**
+        The INCR ↔ XADD pair is NOT atomic — there are intervening awaits for
+        the uow.session lookup. Two concurrent ``_emit_event`` calls on the
+        same session_id may interleave such that Stream order diverges from
+        ``event.seq`` order (consumer always sorts by message_id). Callers
+        MUST ensure single-writer discipline per session.
+
+        Intended call sites (PR-3c/PR-4 will land these): the per-session
+        ``agent_task_runner`` event bridge plus detached tasks for
+        ``_do_auto_degrade`` and explicit cancel emit, all of which run in a
+        single asyncio task per session. PR-1 ships ``_emit_event`` itself;
+        production hot-path callers wire in PR-3c/PR-4. If multi-writer becomes
+        possible later, add a per-session ``asyncio.Lock`` registry here.
+        """
+        if not self._redis_client:
+            logger.debug("_emit_event: no redis_client — skip emit for %s", session_id)
+            return None
+        client = (
+            self._redis_client.client
+            if hasattr(self._redis_client, "client")
+            else self._redis_client
+        )
+
+        # 1. Stamp seq (atomic INCR; 24h TTL on first set — first INCR returns 1).
+        seq_key = f"session:seq:{session_id}"
+        try:
+            new_seq = await client.incr(seq_key)
+            if new_seq == 1:
+                # First emit for this session — arm 24h TTL.
+                try:
+                    await client.expire(seq_key, STREAM_TTL_SECONDS)
+                except Exception:
+                    logger.warning(
+                        "first-write EXPIRE for %s failed", seq_key, exc_info=True
+                    )
+            event.seq = int(new_seq)
+        except Exception:
+            logger.warning(
+                "seq stamp failed for session=%s", session_id, exc_info=True
+            )
+            # Fall through — emit without seq (degrades to legacy resume path).
+
+        # 2. XADD to task:output stream via the existing task's output_stream.
+        async with self._uow_factory() as uow:
+            session = await uow.session.get_by_id(session_id)
+        if session is None or not session.task_id:
+            logger.debug("_emit_event: no task for %s — backlog skip", session_id)
+            return None
+
+        task = (
+            self._task_cls.get(session.task_id)
+            if hasattr(self._task_cls, "get")
+            else None
+        )
+        if task is None:
+            # Task object isn't in the in-process registry (e.g., another worker
+            # owns it, or it already finished). Backlog emit by writing directly
+            # to the Stream key — auto-degrade still wants the event in the
+            # durable backlog so the reconnecting client sees it.
+            #
+            # Note: ``RedisStreamMessageQueue.put`` runs the EXISTS-before-XADD
+            # branch (§3.2) so for backlog emits on already-existing streams
+            # the EXPIRE re-arm is skipped — abandoned streams age out as
+            # designed.
+            stream_name = f"task:output:{session.task_id}"
+            try:
+                from app.infrastructure.external.message_queue.redis_stream_message_queue import (
+                    RedisStreamMessageQueue,
+                )
+                fallback_queue = RedisStreamMessageQueue(stream_name)
+                return await fallback_queue.put(event.model_dump_json())
+            except Exception:
+                logger.warning(
+                    "_emit_event fallback put failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
+                return None
+
+        try:
+            return await task.output_stream.put(event.model_dump_json())
+        except Exception:
+            logger.warning(
+                "_emit_event task.output_stream.put failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
     async def get_events_since(
         self,
         session_id: str,
         since_event_id: str | None,
         user_id: str,
         is_admin: bool = False,
+        since_seq: int | None = None,  # B3-core PR-1 §3.3
     ) -> dict:
-        """获取 session 在 since_event_id 之后的增量事件。
+        """获取 session 在 since_event_id (or since_seq) 之后的增量事件。
 
         PG 为主（跨 invoke 权威来源），Redis 补充当前 task 的 in-flight 事件。
+
+        B3-core PR-1 §3.3:
+        - When both ``since_seq`` and ``since_event_id`` are provided,
+          ``since_seq`` filters sequenced events, while ``since_event_id`` is
+          retained as the legacy ``seq is None`` floor (logged at WARNING).
+        - Result dict gains ``last_seq`` (max event.seq seen, or since_seq fallback)
+          and ``supervisor_snapshot`` (None placeholder; PR-3c/PR-4 fill).
         """
+        if since_seq is not None and since_event_id is not None:
+            logger.warning(
+                "get_events_since: both since_seq=%s and since_event_id=%s given — using since_seq with event-id fallback (B3 §3.3)",
+                since_seq,
+                since_event_id,
+            )
+
         session = await self._get_accessible_session(session_id, user_id, is_admin)
 
-        # 1. PG 主路径：找到 since_event_id 位置，取其后所有事件
+        # 1. PG 主路径：按 since_seq 或 since_event_id 切片
         pg_events = session.events or []
-        if since_event_id:
+        if since_seq is not None:
+            # B3-core PR-1 §3.3 — seq cursor filters sequenced events.
+            # If the client also provides an event-id cursor, use it as the
+            # legacy floor so seq=None events written by old/direct producers
+            # after the cursor are still recovered.
+            legacy_floor_available = since_event_id is not None
+            if since_event_id:
+                found_idx = None
+                for i, evt in enumerate(pg_events):
+                    if getattr(evt, "id", None) == since_event_id:
+                        found_idx = i
+                        break
+                if found_idx is not None:
+                    pg_events = pg_events[found_idx + 1:]
+
+            filtered_pg_events = []
+            for evt in pg_events:
+                event_seq = getattr(evt, "seq", None)
+                if event_seq is None:
+                    if legacy_floor_available:
+                        filtered_pg_events.append(evt)
+                    continue
+                if int(event_seq) > since_seq:
+                    filtered_pg_events.append(evt)
+            pg_events = filtered_pg_events
+        elif since_event_id:
             found_idx = None
             for i, evt in enumerate(pg_events):
                 if getattr(evt, "id", None) == since_event_id:
@@ -973,24 +1132,38 @@ class AgentService:
         redis_only_events = []
         redis_has_more = False
         if session.task_id and self._event_recovery:
-            # 取 PG 增量中最后一个有 id 的事件作为 Redis 起始点
             redis_start_id = None
-            for evt in reversed(pg_events):
-                candidate_id = getattr(evt, "id", None)
-                if self._is_valid_redis_stream_id(candidate_id):
-                    redis_start_id = candidate_id
-                    break
-            if not redis_start_id:
+            if since_seq is not None:
+                # since_seq already removes duplicates for sequenced events.
+                # Keep the client's event-id cursor as the legacy floor instead
+                # of advancing to the PG tail; otherwise Redis-only gaps before
+                # a later PG-persisted event are skipped.
                 redis_start_id = (
                     since_event_id
                     if self._is_valid_redis_stream_id(since_event_id)
                     else None
                 )
+            else:
+                # Legacy event-id path: use the last PG stream id as Redis
+                # start to avoid replaying already persisted PG events.
+                for evt in reversed(pg_events):
+                    candidate_id = getattr(evt, "id", None)
+                    if self._is_valid_redis_stream_id(candidate_id):
+                        redis_start_id = candidate_id
+                        break
+                if not redis_start_id:
+                    redis_start_id = (
+                        since_event_id
+                        if self._is_valid_redis_stream_id(since_event_id)
+                        else None
+                    )
 
             try:
+                # B3-core PR-1: pass through after_seq when provided.
                 recovery_result = await self._event_recovery.get_recent_events(
                     task_id=session.task_id,
                     after_event_id=redis_start_id,
+                    after_seq=since_seq,
                 )
                 # 过滤掉 PG 中已有的 event_id
                 pg_event_ids = {
@@ -1012,10 +1185,24 @@ class AgentService:
                 )
 
         merged = list(pg_events) + redis_only_events
+        if since_seq is not None and redis_only_events:
+            merged = self._sort_recovered_events(merged)
+
+        # B3-core PR-1 §3.3: derive last_seq.
+        seqs_seen = [
+            int(getattr(e, "seq", None))
+            for e in merged
+            if getattr(e, "seq", None) is not None
+        ]
+        last_seq = max(seqs_seen) if seqs_seen else (since_seq or 0)
+
         return {
             "events": merged,
             "session_status": session.status,
             "has_more": redis_has_more,
+            # B3-core PR-1 additions:
+            "last_seq": last_seq,
+            "supervisor_snapshot": None,  # PR-3c/PR-4 will populate
         }
 
     @staticmethod
@@ -1023,6 +1210,29 @@ class AgentService:
         if not isinstance(event_id, str):
             return False
         return bool(_REDIS_STREAM_ID_RE.match(event_id.strip()))
+
+    @staticmethod
+    def _redis_stream_id_tuple(event_id: object) -> tuple[int, int] | None:
+        if not AgentService._is_valid_redis_stream_id(event_id):
+            return None
+        left, right = str(event_id).split("-", 1)
+        return int(left), int(right)
+
+    @staticmethod
+    def _sort_recovered_events(events: list[BaseEvent]) -> list[BaseEvent]:
+        def sort_key(indexed_event: tuple[int, BaseEvent]) -> tuple[int, int, int, int]:
+            index, event = indexed_event
+            event_seq = getattr(event, "seq", None)
+            if event_seq is not None:
+                return (0, int(event_seq), 0, index)
+
+            stream_id = AgentService._redis_stream_id_tuple(getattr(event, "id", None))
+            if stream_id is not None:
+                return (1, stream_id[0], stream_id[1], index)
+
+            return (2, index, 0, 0)
+
+        return [event for _, event in sorted(enumerate(events), key=sort_key)]
 
     async def _check_attachments_access(
         self, attachments: Optional[List[str]], user_id: str, is_admin: bool = False

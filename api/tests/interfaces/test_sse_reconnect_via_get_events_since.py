@@ -96,6 +96,7 @@ class _StatefulAgentService:
         since_event_id: str | None,
         user_id: str,
         is_admin: bool = False,
+        since_seq: int | None = None,  # B3-core PR-1 §3.3 — additive kwarg
     ) -> dict[str, Any]:
         if since_event_id is None:
             missed = list(self._events)
@@ -110,10 +111,19 @@ class _StatefulAgentService:
                 if found_idx is not None
                 else list(self._events)
             )
+        # B3-core PR-1 §3.3 — derive last_seq from missed events' .seq, or fall back.
+        seqs_seen = [
+            int(getattr(e, "seq", None))
+            for e in missed
+            if getattr(e, "seq", None) is not None
+        ]
+        last_seq = max(seqs_seen) if seqs_seen else (since_seq or 0)
         return {
             "events": missed,
             "session_status": "running",
             "has_more": False,
+            "last_seq": last_seq,
+            "supervisor_snapshot": None,  # PR-3c/PR-4 populates
         }
 
 

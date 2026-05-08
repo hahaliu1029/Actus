@@ -40,6 +40,9 @@ class _FakeAgentService:
             "events": [],
             "session_status": SessionStatus.RUNNING,
             "has_more": False,
+            # B3-core PR-1 §3.3 — endpoint reads these new keys
+            "last_seq": 0,
+            "supervisor_snapshot": None,
         }
 
     async def get_events_since(self, **kwargs: Any) -> dict[str, Any]:
@@ -77,6 +80,9 @@ async def test_get_events_since_with_since_param() -> None:
         "events": [e],
         "session_status": SessionStatus.RUNNING,
         "has_more": False,
+        # B3-core PR-1 §3.3 — endpoint reads these new keys
+        "last_seq": 0,
+        "supervisor_snapshot": None,
     }
 
     response = await _request(
@@ -99,6 +105,7 @@ async def test_get_events_since_with_since_param() -> None:
                 "since_event_id": "evt-1",
                 "user_id": "test-user",
                 "is_admin": False,
+                "since_seq": None,  # B3-core PR-1 §3.3 — additive kwarg
             },
         )
     ]
@@ -125,6 +132,7 @@ async def test_get_events_since_without_since_param() -> None:
                 "since_event_id": None,
                 "user_id": "test-user",
                 "is_admin": False,
+                "since_seq": None,  # B3-core PR-1 §3.3 — additive kwarg
             },
         )
     ]

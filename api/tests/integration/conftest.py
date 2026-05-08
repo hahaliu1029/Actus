@@ -311,6 +311,7 @@ async def sample_session(db_session, sample_user):
         user_id=sample_user.id,
         status=SessionStatus.RUNNING.value,
         title="b3 supervisor anchor session",
+        task_id=sid,
         # supervisor kwargs (execution_mode, execution_phase, retry_budget_remaining,
         # was_background) added by PR-2 fixture extension once b3p2 migration ships
         # these columns. Do NOT set them here at PR-0.
@@ -321,6 +322,7 @@ async def sample_session(db_session, sample_user):
         id=sid,
         user_id=sample_user.id,
         status=SessionStatus.RUNNING,
+        task_id=sid,
     )
 
 
@@ -383,15 +385,81 @@ async def runner_factory(db_session, sample_user):
 
 
 @pytest.fixture
-async def agent_service_with_redis(db_session):
-    """``AgentService`` instance wired with real DB session + real Redis.
+async def agent_service_with_redis(db_session, redis_client, app):
+    """``AgentService`` instance wired with real DB UoW + Redis event recovery.
 
-    Used by anchor tests that exercise PG↔Redis cross-store contracts.
-    PR-2 fills this in; PR-0 raises so dependent anchor tests xfail.
+    PR-1 only needs the producer/recovery/route path for seq cursor anchors.
+    This deliberately does not construct PR-2's ExecutionSupervisor, repositories,
+    watchdog, or Lua admission components.
     """
-    raise NotImplementedError(
-        "PR-2 wires real ExecutionSupervisor + repos; PR-0 anchor tests are xfail"
+    from app.application.services.agent_service import AgentService, _ConfigSnapshot
+    from app.domain.models.app_config import (
+        A2AConfig,
+        AgentConfig,
+        MCPConfig,
+        SkillRiskPolicy,
     )
+    from app.domain.models.context_overflow_config import ContextOverflowConfig
+    from app.infrastructure.external.event_recovery.redis_event_recovery import (
+        RedisEventRecovery,
+    )
+    from app.infrastructure.repositories.db_session_repository import DBSessionRepository
+    from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
+    from app.interfaces.dependencies.rate_limit import rate_limit_read
+    from app.interfaces.service_dependencies import get_agent_service
+
+    async def _noop_rate_limit() -> None:
+        return None
+
+    class _SameSessionUow:
+        def __init__(self):
+            self.db_session = db_session
+            self.session = DBSessionRepository(db_session=db_session)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+    def _uow_factory():
+        return _SameSessionUow()
+
+    snapshot = _ConfigSnapshot(
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        mcp_config=MCPConfig(),
+        a2a_config=A2AConfig(),
+        skill_risk_policy=SkillRiskPolicy(),
+        overflow_config=ContextOverflowConfig(),
+        summary_llm=None,
+        vision_fallback_model=None,
+        skill_creator_service=None,
+        supports_vision=True,
+        supports_pdf_input=False,
+        file_understanding_config=None,
+    )
+    service = AgentService(
+        uow_factory=_uow_factory,
+        config_snapshot=snapshot,
+        sandbox_cls=object,
+        task_cls=RedisStreamTask,
+        search_engine=object(),
+        file_storage=object(),
+        redis_client=redis_client,
+        event_recovery=RedisEventRecovery(max_count=10000),
+    )
+    app.dependency_overrides[get_agent_service] = lambda: service
+    app.dependency_overrides[rate_limit_read] = _noop_rate_limit
+    try:
+        yield service
+    finally:
+        app.dependency_overrides.pop(get_agent_service, None)
+        app.dependency_overrides.pop(rate_limit_read, None)
 
 
 # ── B3-core supervisor fixtures (non-DB-keyed) ──────────────────────────────
@@ -404,21 +472,31 @@ async def agent_service_with_redis(db_session):
 
 
 @pytest.fixture
-async def redis_client():
+async def redis_client(monkeypatch):
     """Real Redis client connected to local test instance.
 
     Spec v3 §3.2 — supervisor:hot, supervisor:owner, supervisor:bg,
     supervisor:user, supervisor:system keys.
     """
     import redis.asyncio as redis_asyncio
+    from app.infrastructure.external.message_queue import redis_stream_message_queue
 
     client = redis_asyncio.from_url(
         "redis://localhost:6379/15",  # DB 15 for tests; isolate from app DB 0
-        decode_responses=False,
+        decode_responses=True,
     )
+    class _RedisClientWrapper:
+        def __init__(self, inner):
+            self.client = inner
+
+        def __getattr__(self, name: str):
+            return getattr(self.client, name)
+
+    wrapper = _RedisClientWrapper(client)
+    monkeypatch.setattr(redis_stream_message_queue, "get_redis", lambda: wrapper)
     # Flush before each test for isolation
     await client.flushdb()
-    yield client
+    yield wrapper
     await client.flushdb()
     await client.aclose()
 
@@ -522,10 +600,14 @@ def _auth_dependency_overrides(app, sample_user):
             raise HTTPException(status_code=401, detail="no sub claim")
 
         if sub == sample_user_id:
-            return sample_user
+            return sample_user.to_domain()
         # Synthetic "other" user — has .id matching JWT sub.  Used by C-Auth-1
         # to drive `sess.user_id != current_user.id` → 403.
-        return SimpleNamespace(id=sub, username=f"other-{sub[:8]}")
+        return SimpleNamespace(
+            id=sub,
+            username=f"other-{sub[:8]}",
+            is_admin=lambda: False,
+        )
 
     app.dependency_overrides[get_current_user] = _override_get_current_user
     try:

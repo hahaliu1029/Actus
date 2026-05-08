@@ -27,7 +27,7 @@ pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
 # -- C-Wire-1: ExecutionStateChangedEvent uses `type` discriminator ---------------------
-@pytest.mark.xfail(strict=False, reason="PR-1: new event types not yet shipped")
+# B3-core PR-1: anchor flipped (xfail → pass) — ExecutionStateChangedEvent shipped in event.py.
 def test_C_Wire_1_execution_state_changed_event_schema():
     from app.domain.models.event import ExecutionStateChangedEvent, ExecutionStatePayload
     evt = ExecutionStateChangedEvent(payload=ExecutionStatePayload(
@@ -80,31 +80,74 @@ async def test_C_Wire_3_intentional_eof_auto_degrade(
 
 
 # -- C-Wire-4: since_seq query param wins over since=<stream_id> ------------------------
-@pytest.mark.xfail(strict=False, reason="PR-1: since_seq param not yet shipped")
-async def test_C_Wire_4_since_seq_precedence(asgi_client, sample_session, sample_user_token):
-    # Round-5 audit P2 fix: prior body's `all(s > 5 for s in seqs)` is vacuously
-    # True on an empty list — endpoint exists in PR-0 but returns no events for
-    # a freshly-created session, so seqs=[] and test XPASSes.  Converted to
-    # explicit placeholder so PR-1 author writes the real assertion.
-    pytest.fail(
-        "placeholder — flip when PR-1 ships `since_seq` query param + precedence. "
-        "Implementation must:\n"
-        "  (1) seed the session with ≥2 events (seq=1, seq=2, seq=3, ..., seq=N)\n"
-        "  (2) GET /api/sessions/{sid}/events?since_seq=5&since=stream-id-foo\n"
-        "  (3) assert response 200 + `last_seq` field present in body\n"
-        "  (4) assert returned events list is non-empty AND all seqs > 5\n"
-        "  (5) confirm `since_seq=5` precedence: server logged warning that\n"
-        "      `since=stream-id-foo` was ignored when both given\n"
-        "Per spec v3 §3.3 + plan PR-1 Task 7."
+# B3-core PR-1 ships the wire shape (since_seq query param + last_seq response field +
+# agent_service.get_events_since since_seq precedence). The integration fixture wires
+# only PR-1's DB UoW + Redis recovery path; PR-2's supervisor/repo/Lua surface remains
+# out of scope.
+async def test_C_Wire_4_since_seq_precedence(
+    asgi_client, agent_service_with_redis, sample_session, sample_user_token
+):
+    """C-Wire-4 (per spec v3 §3.3): seq cursor wins over event_id cursor.
+
+    Seeds session with 8 events stamped via _emit_event (seq 1..8), then
+    requests with both `since=<bogus>` and `since_seq=5`. Endpoint must
+    return only events with seq > 5 (3 events: seq 6, 7, 8) and include
+    `last_seq` in the response body.
+
+    PR-1 has shipped:
+      - agent_service._emit_event (T5) — stamps INCR session:seq:{sid}
+      - /sessions/{id}/events ?since_seq=N (T8) — endpoint param + response.last_seq
+      - get_events_since(since_seq=...) (T7) — service-layer precedence + dict shape
+    The fixture intentionally avoids PR-2's ExecutionSupervisor surface; this
+    anchor only needs the producer/recovery/route path.
+    """
+    from app.domain.models.event import MessageEvent
+
+    sid = sample_session.id
+
+    # Seed 8 events through producer; producer stamps event.seq via INCR.
+    for i in range(8):
+        evt = MessageEvent(role="assistant", message=f"msg-{i}")
+        await agent_service_with_redis._emit_event(sid, evt)
+
+    # since=<bogus stream-id> + since_seq=5 → since_seq wins; expect seq 6, 7, 8.
+    resp = await asgi_client.get(
+        f"/api/sessions/{sid}/events?since_seq=5&since=stream-id-foo",
+        headers={"Authorization": f"Bearer {sample_user_token}"},
     )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["data"]
+    # last_seq field present + reflects max seq (8) seen
+    assert "last_seq" in body
+    assert body["last_seq"] == 8
+
+    # Returned events: SSE wire wrapper has shape `{event, data}` with `seq` inside `data`.
+    seqs = [
+        evt.get("data", {}).get("seq")
+        for evt in body["events"]
+        if isinstance(evt.get("data"), dict) and evt["data"].get("seq") is not None
+    ]
+    assert seqs, "since_seq returned no events — filter applied incorrectly?"
+    assert all(s > 5 for s in seqs), f"seq filter leaked: {seqs}"
+    assert sorted(seqs) == [6, 7, 8], f"unexpected seq tail: {sorted(seqs)}"
 
 
 # -- C-Redis-1: task:output Stream has MAXLEN ~2000 trim --------------------------------
 # Round-3 audit P1#4 fix: test through producer path (`agent_service._emit_event`),
 # not bare `redis_client.xadd(maxlen=2000)`. The bare-XADD form was a false positive —
 # it tested Redis command parameters, not the contract that the production producer
-# applies MAXLEN. PR-1 ships `_emit_event` that internally uses MAXLEN.
-@pytest.mark.xfail(strict=False, reason="PR-1: agent_service._emit_event with MAXLEN not yet shipped")
+# applies MAXLEN.
+#
+# B3-core PR-1 ships:
+#   - RedisStreamMessageQueue.put with MAXLEN + first-write EXPIRE (T4)
+#   - agent_service._emit_event using output_stream.put (T5, falls back to
+#     RedisStreamMessageQueue.put via the in-process registry miss path)
+# Unit-level coverage for MAXLEN is in
+# api/tests/app/infrastructure/external/message_queue/test_redis_stream_message_queue_maxlen.py
+# (5 mock-based tests verifying the call shape).
+#
+# The integration fixture wires only PR-1's producer path. PR-2's supervisor/repo
+# fixture expansion is not required for this Stream MAXLEN contract.
 async def test_C_Redis_1_stream_has_maxlen_2000(redis_client, agent_service_with_redis, sample_session):
     sid = sample_session.id
     key = f"task:output:{sid}"

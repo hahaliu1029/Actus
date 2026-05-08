@@ -299,17 +299,46 @@ export type ListSessionResponse = {
   sessions: ListSessionItem[];
 };
 
+// B3-core PR-1 §3.3 — supervisor snapshot mirror of api/app/interfaces/schemas/session.py:SupervisorSnapshot
+export type SupervisorExecutionMode = "foreground" | "background";
+export type SupervisorExecutionPhase =
+  | "running"
+  | "recovering"
+  | "idle"
+  | "suspended"
+  | "terminating"
+  | "terminated";
+
+export type SupervisorSnapshot = {
+  execution_mode: SupervisorExecutionMode;
+  execution_phase: SupervisorExecutionPhase;
+  background_reason?: "explicit" | "auto_degrade" | null;
+  expires_at?: string | null;
+  retry_budget_remaining: number;
+  suspended_reason?: string | null;
+  terminal_reason?: string | null;
+  last_progress_at?: string | null;
+  is_alive: boolean;
+  cancellation_state: "none" | "cancelling" | "cancelled";
+};
+
 export type Session = {
   session_id: string;
   title: string | null;
   status: SessionStatus;
   events: AgentSSEEvent[];
+  // B3-core PR-1 — null/0 when backend hasn't populated yet
+  last_seq?: number;
+  supervisor_snapshot?: SupervisorSnapshot | null;
 };
 
 export type EventsSinceResponse = {
   events: AgentSSEEvent[];
   session_status: SessionStatus;
   has_more: boolean;
+  // B3-core PR-1 §3.3 additions
+  last_seq: number;
+  supervisor_snapshot: SupervisorSnapshot | null;
 };
 
 export type CreateSessionParams = {

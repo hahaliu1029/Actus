@@ -71,22 +71,32 @@ def test_b3_core_anchor_count_is_34():
     )
 
 
-def test_anchor_files_have_exactly_34_xfail_decorators():
+def test_anchor_files_have_expected_xfail_decorator_count():
     """Round-3 audit P1#3 fix: count `@pytest.mark.xfail` decorators across the
-    3 anchor files; assert exactly 34.
+    3 anchor files; assert the per-PR expected count.
 
     Prior gate only verified ``"pytest.mark.xfail" in content`` (substring match
     once per file), which would PASS even if 33 of 34 xfails were silently
     deleted.  This stricter count locks the contract: any future PR that flips
-    a single xfail → xpass MUST remove that decorator AND simultaneously remove
-    the corresponding test (or convert to a non-xfail PASS), keeping the count
-    drift visible.
+    a single xfail → xpass MUST remove that decorator AND simultaneously update
+    the EXPECTED_XFAIL_COUNT below — keeping the drift consciously visible.
+
+    Per-PR ledger (anchors flipped from xfail → unmarked):
+      - PR-0 ship: 34 xfail decorators, 0 anchors flipped.
+      - PR-1 ship: 31 xfail decorators, 3 anchors flipped
+        (C-Wire-1, C-Wire-4, C-Redis-1).
+      - PR-2 ship: TBD (~16 more anchors)
+      - PR-3a/3b/3c ship: TBD
+      - PR-4 ship: TBD
 
     Decorator forms covered:
       - ``@pytest.mark.xfail(strict=False, reason=...)`` (canonical)
       - ``@pytest.mark.xfail(...)``  (any form starting with ``@pytest.mark.xfail``)
     """
     import re
+
+    # PR-1 ship: 31 = 34 (PR-0 baseline) - 3 (C-Wire-1/4 + C-Redis-1).
+    EXPECTED_XFAIL_COUNT = 31
 
     repo_root = _find_repo_root()
     total = 0
@@ -100,11 +110,12 @@ def test_anchor_files_have_exactly_34_xfail_decorators():
         per_file[relpath] = count
         total += count
 
-    assert total == 34, (
-        f"Expected exactly 34 @pytest.mark.xfail decorators across anchor files; "
+    assert total == EXPECTED_XFAIL_COUNT, (
+        f"Expected exactly {EXPECTED_XFAIL_COUNT} @pytest.mark.xfail decorators across anchor files; "
         f"got {total}.\n"
         f"Per-file breakdown: {per_file}\n"
-        f"Spec §8.1 anchor groups must sum to 34 (5 PG + 3 FSM + 2 Admission + "
-        f"2 Lua + 3 Restart + 2 Repo + 4 Wire + 2 Redis + 1 FINISHING + "
-        f"1 Callback + 2 Inflight + 1 Cancel + 1 Auth + 1 MultiTab + 4 Notif)."
+        f"If your PR flipped an anchor, update EXPECTED_XFAIL_COUNT and document in the per-PR ledger.\n"
+        f"Spec §8.1 anchor groups (collection count must stay at 34): "
+        f"5 PG + 3 FSM + 2 Admission + 2 Lua + 3 Restart + 2 Repo + 4 Wire + 2 Redis + 1 FINISHING + "
+        f"1 Callback + 2 Inflight + 1 Cancel + 1 Auth + 1 MultiTab + 4 Notif."
     )

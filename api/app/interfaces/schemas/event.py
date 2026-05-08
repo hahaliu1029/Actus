@@ -29,6 +29,9 @@ class BaseEventData(BaseModel):
 
     event_id: Optional[str] = None  # 事件id
     created_at: datetime = Field(default_factory=datetime.now)  # 事件时间
+    # B3-core PR-1 §3.3 — producer-side monotonic cursor stamped via INCR session:seq:{sid}.
+    # Optional/None for legacy events that pre-date PR-1.
+    seq: Optional[int] = None
 
     # pydantic v2写法，序列化时将datetime转换为时间戳
     model_config = ConfigDict(json_encoders={datetime: lambda v: int(v.timestamp())})
@@ -39,14 +42,22 @@ class BaseEventData(BaseModel):
         return {
             "event_id": event.id,
             "created_at": int(event.created_at.timestamp()),
+            # B3-core PR-1 §3.3 — propagate seq from domain event to SSE wire envelope.
+            "seq": getattr(event, "seq", None),
         }
 
     @classmethod
     def from_event(cls, event: Event) -> Self:
-        """从事件Domain模型中构建基础事件数据"""
+        """从事件Domain模型中构建基础事件数据.
+
+        ``base_event_data`` already supplies ``event_id``/``created_at``/``seq``;
+        the second spread must exclude the same domain-level fields to avoid
+        ``TypeError: multiple values for keyword argument`` (B3-core PR-1 §3.3
+        added ``seq`` to both sides of the spread).
+        """
         return cls(
             **cls.base_event_data(event),
-            **event.model_dump(mode="json", exclude={"id", "type", "created_at"}),
+            **event.model_dump(mode="json", exclude={"id", "type", "created_at", "seq"}),
         )
 
 

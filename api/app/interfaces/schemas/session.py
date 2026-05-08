@@ -61,12 +61,36 @@ class GetSessionResponse(BaseModel):
     events: List[AgentSSEEvent] = Field(default_factory=list)
 
 
+class SupervisorSnapshot(BaseModel):
+    """B3-core PR-1 §3.3 — supervisor snapshot for resume responses.
+
+    PR-1 ships the SHAPE; PR-3c/PR-4 wire the producer side (currently always None
+    in ``agent_service.get_events_since``).
+    """
+
+    execution_mode: Literal["foreground", "background"]
+    execution_phase: Literal[
+        "running", "recovering", "idle", "suspended", "terminating", "terminated"
+    ]
+    background_reason: Optional[Literal["explicit", "auto_degrade"]] = None
+    expires_at: Optional[datetime] = None
+    retry_budget_remaining: int
+    suspended_reason: Optional[str] = None
+    terminal_reason: Optional[str] = None
+    last_progress_at: Optional[datetime] = None
+    is_alive: bool
+    cancellation_state: Literal["none", "cancelling", "cancelled"] = "none"
+
+
 class EventsSinceResponse(BaseModel):
     """增量事件恢复响应"""
 
     events: List[AgentSSEEvent] = Field(default_factory=list)
-    session_status: SessionStatus
+    session_status: SessionStatus  # KEEP — frontend at session-store.ts:888 reads this
     has_more: bool = False
+    # B3-core PR-1 §3.3 additions:
+    last_seq: int = 0
+    supervisor_snapshot: Optional[SupervisorSnapshot] = None
 
 
 class GetSessionFilesResponse(BaseModel):

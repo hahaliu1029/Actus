@@ -90,11 +90,15 @@ export const sessionApi = {
 
   getEventsSince: (
     sessionId: string,
-    sinceEventId?: string
+    sinceEventId?: string,
+    sinceSeq?: number, // B3-core PR-1 §3.3 — preferred monotonic cursor
   ): Promise<EventsSinceResponse> => {
     const params: Record<string, string> = {};
     if (sinceEventId) {
       params.since = sinceEventId;
+    }
+    if (sinceSeq !== undefined && sinceSeq !== null) {
+      params.since_seq = String(sinceSeq);
     }
     return get<EventsSinceResponse>(`/sessions/${sessionId}/events`, params);
   },
