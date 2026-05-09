@@ -84,6 +84,9 @@ from app.domain.services.tools.create_skill import CreateSkillTool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
 from app.domain.services.tools.skill_bundle_sync import SkillBundleSyncManager
+from app.domain.services.tools._supervisor_tool_wrapper import (
+    wrap_tool_list_for_supervisor,
+)
 from app.domain.services.tools.tool_source_resolver import (
     resolve_tool_source_from_tool,
 )
@@ -256,12 +259,14 @@ class AgentTaskRunner(TaskRunner):
         cost_callback_handler: Any = None,
         event_seq_client: Any = None,  # B3-core PR-1: Redis client for session:seq:{sid}
         event_seq_ttl_seconds: int = _EVENT_SEQ_TTL_SECONDS,
+        execution_supervisor: Any = None,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # A7 Task 2.7: provider capability profile. None = legacy behavior
         # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
         self.profile = profile
         self._cost_callback_handler = cost_callback_handler
+        self._execution_supervisor = execution_supervisor
         self._event_seq_client = event_seq_client
         self._event_seq_ttl_seconds = event_seq_ttl_seconds
         self._on_session_complete = on_session_complete
@@ -481,6 +486,7 @@ class AgentTaskRunner(TaskRunner):
             profile=self.profile,
             # B4 M0: session-scoped cost callback attached into every invoke.
             cost_callback_handler=self._cost_callback_handler,
+            execution_supervisor=self._execution_supervisor,
         )
 
     def _build_prompt_telemetry(self) -> Any:
@@ -1839,6 +1845,7 @@ class AgentTaskRunner(TaskRunner):
                 # codex fix P0 round-2：step graph 每次 rebuild 都要带守卫，
                 # 否则 planner 阶段守护拦了，实际 tool call 路径还是裸透传。
                 memory_mount_scope=self._build_memory_mount_scope(),
+                supervisor=self._execution_supervisor,
             )
         )
 
@@ -1917,7 +1924,7 @@ class AgentTaskRunner(TaskRunner):
                 )
             )
 
-        return lc_tools
+        return wrap_tool_list_for_supervisor(lc_tools, self._execution_supervisor)
 
     def _build_lc_tools_for_step(self) -> list[Any]:
         """Normal-path lc_tools construction with per-step cache.

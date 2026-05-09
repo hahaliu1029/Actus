@@ -38,6 +38,9 @@ from app.domain.services.graphs.react_graph import (
     _SessionContext,
     _translate_outcome,
 )
+from app.domain.services.tools._supervisor_tool_wrapper import (
+    SupervisorAwareToolWrapper,
+)
 from app.domain.services.tools.tool_source_resolver import ToolSource
 
 
@@ -341,6 +344,67 @@ class TestInvokeWrapperCommit2:
         for source in (_make_mcp_source(), _make_native_shell_source()):
             outcome = _run(_invoke_wrapper(fake_tool, tc, source))
             assert isinstance(outcome, AllowSuccess)
+
+
+class _FakeSupervisor:
+    def __init__(self) -> None:
+        self.inc_calls: list[tuple[str, str]] = []
+        self.dec_calls: list[tuple[str, str]] = []
+
+    async def inflight_inc(self, *, session_id: str, kind: str) -> None:
+        self.inc_calls.append((session_id, kind))
+
+    async def inflight_dec(self, *, session_id: str, kind: str) -> None:
+        self.dec_calls.append((session_id, kind))
+
+
+class TestInvokeWrapperSessionConfig:
+    def test_passes_session_id_to_wrapped_typed_tool(self):
+        @lc_tool(response_format="content_and_artifact")
+        async def typed_tool(x: str) -> tuple[str, AllowSuccess]:
+            """Typed tool for supervisor config propagation."""
+            outcome = AllowSuccess(content=f"ok:{x}")
+            return outcome.content, outcome
+
+        supervisor = _FakeSupervisor()
+        wrapper = SupervisorAwareToolWrapper(
+            inner=typed_tool,
+            supervisor=supervisor,
+        )
+        tc = _make_tool_call("c-session", "typed_tool", {"x": "v"})
+
+        outcome = _run(
+            _invoke_wrapper(
+                wrapper,
+                tc,
+                _make_mcp_source(),
+                session_id="sess-X",
+            )
+        )
+
+        assert isinstance(outcome, AllowSuccess)
+        assert supervisor.inc_calls == [("sess-X", "tool")]
+        assert supervisor.dec_calls == [("sess-X", "tool")]
+
+    def test_without_session_id_keeps_wrapped_tool_passthrough_behavior(self):
+        @lc_tool(response_format="content_and_artifact")
+        async def typed_tool(x: str) -> tuple[str, AllowSuccess]:
+            """Typed tool for supervisor passthrough behavior."""
+            outcome = AllowSuccess(content=f"ok:{x}")
+            return outcome.content, outcome
+
+        supervisor = _FakeSupervisor()
+        wrapper = SupervisorAwareToolWrapper(
+            inner=typed_tool,
+            supervisor=supervisor,
+        )
+        tc = _make_tool_call("c-no-session", "typed_tool", {"x": "v"})
+
+        outcome = _run(_invoke_wrapper(wrapper, tc, _make_mcp_source()))
+
+        assert isinstance(outcome, AllowSuccess)
+        assert supervisor.inc_calls == []
+        assert supervisor.dec_calls == []
 
 
 # ============================================================

@@ -689,6 +689,7 @@ async def _invoke_wrapper(
     tool_call: ToolCall,
     tool_source: ToolSource,
     *,
+    session_id: str = "",
     max_wrapper_output_bytes: int | None = None,
 ) -> ToolOutcome:
     """Layer 2: invoke wrapper via ``content_and_artifact`` and return typed outcome.
@@ -709,6 +710,7 @@ async def _invoke_wrapper(
         else _MAX_WRAPPER_OUTPUT_BYTES
     )
     del tool_source
+    config = {"configurable": {"session_id": session_id}} if session_id else None
 
     legacy_response_format = (
         getattr(tool, "response_format", "content") != "content_and_artifact"
@@ -720,7 +722,7 @@ async def _invoke_wrapper(
     # multimodal path under the new dispatcher.
     if legacy_response_format:
         try:
-            raw = await tool.ainvoke(tool_call["args"])
+            raw = await tool.ainvoke(tool_call["args"], config=config)
         except asyncio.TimeoutError as exc:
             return AllowError(
                 content=f"工具 '{tool.name}' 执行超时: {exc}",
@@ -758,7 +760,8 @@ async def _invoke_wrapper(
                 "id": tool_call["id"],
                 "name": tool_call["name"],
                 "type": "tool_call",
-            }
+            },
+            config=config,
         )
     except asyncio.TimeoutError as exc:
         return AllowError(
@@ -1330,6 +1333,7 @@ def build_react_graph(
             # Chunk 4's LLM adapter prefix injection.
             risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
             _tc_enabled = configurable.get("tool_confirmation_enabled", True)
+            _session_id = configurable.get("session_id") or ""
             _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
 
             # R3: Pre-Stage-P risk refresh for skill tools.
@@ -1379,7 +1383,6 @@ def build_react_graph(
                 cache_decision = "no_match"
                 approval_state_reader = configurable.get("approval_state_reader")
                 _user_id = configurable.get("user_id") or ""
-                _session_id = configurable.get("session_id") or ""
                 if approval_state_reader and _user_id and _session_id:
                     try:
                         cache_decision = await approval_state_reader.check(
@@ -1496,7 +1499,6 @@ def build_react_graph(
                     # SmartApprove 写路径走 configurable["approval_state_writer"]（R5b-3）
                     approval_state_reader = configurable.get("approval_state_reader")
                     _user_id = configurable.get("user_id") or ""
-                    _session_id = configurable.get("session_id") or ""
 
                     cache_decision = "no_match"
                     if approval_state_reader and _user_id and _session_id:
@@ -1522,6 +1524,7 @@ def build_react_graph(
                             tool_fn,
                             tc,
                             tool_source,
+                            session_id=_session_id,
                             max_wrapper_output_bytes=_runtime_max_bytes,
                         )
                         outcome = _maybe_convert_shell_outcome_with_images(
@@ -1653,6 +1656,7 @@ def build_react_graph(
                                     tool_fn,
                                     tc,
                                     tool_source,
+                                    session_id=_session_id,
                                     max_wrapper_output_bytes=_runtime_max_bytes,
                                 )
                                 outcome = _maybe_convert_shell_outcome_with_images(
@@ -1773,6 +1777,7 @@ def build_react_graph(
                     tool_fn,
                     tc,
                     tool_source,
+                    session_id=_session_id,
                     max_wrapper_output_bytes=_runtime_max_bytes,
                 )
                 outcome = _maybe_convert_shell_outcome_with_images(
@@ -1788,6 +1793,7 @@ def build_react_graph(
                 tool_fn,
                 tc,
                 tool_source,
+                session_id=_session_id,
                 max_wrapper_output_bytes=_runtime_max_bytes,
             )
             outcome = _maybe_convert_shell_outcome_with_images(

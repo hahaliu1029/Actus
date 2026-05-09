@@ -14,7 +14,7 @@ import json
 import shlex
 from typing import Any, Awaitable, List, Literal, Optional, Union
 
-from langchain_core.tools import StructuredTool, tool as lc_tool
+from langchain_core.tools import BaseTool, StructuredTool, tool as lc_tool
 from pydantic import BaseModel
 
 from app.domain.external.browser import Browser
@@ -34,6 +34,9 @@ from app.domain.models.tool_result import (
     MultimodalPayload,
 )
 from app.domain.services.tools.memory_mount_scope import MemoryMountScope
+from app.domain.services.tools._supervisor_tool_wrapper import (
+    wrap_tool_list_for_supervisor,
+)
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
@@ -843,7 +846,8 @@ def create_native_tools(
     supports_vision: bool = True,
     supports_pdf_input: bool = False,
     memory_mount_scope: MemoryMountScope | None = None,
-) -> list[StructuredTool]:
+    supervisor: Any | None = None,
+) -> list[BaseTool]:
     """Create all native LangChain tools.
 
     ``memory_mount_scope``（codex fix P0）透传到 ``_make_file_tools`` 打开
@@ -860,4 +864,4 @@ def create_native_tools(
     tools.extend(_make_shell_tools(sandbox))
     tools.extend(_make_browser_tools(browser))
     tools.extend(_make_search_tools(search_engine))
-    return tools
+    return wrap_tool_list_for_supervisor(tools, supervisor)

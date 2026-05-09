@@ -66,6 +66,9 @@ from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
 from app.domain.services.tools.langchain_skill_tools import create_skill_langchain_tools
 from app.domain.services.tools.langchain_tools import create_native_tools
+from app.domain.services.tools._supervisor_tool_wrapper import (
+    wrap_tool_list_for_supervisor,
+)
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
 
@@ -134,8 +137,10 @@ class PlannerReActFlow(BaseFlow):
         # B4 M0: session-scoped CostCallbackHandler. When set, attached to
         # every LangGraph invoke so LLM calls generate CostRecord rows.
         cost_callback_handler: Any = None,
+        execution_supervisor: Any = None,
     ) -> None:
         self._cost_callback_handler = cost_callback_handler
+        self._execution_supervisor = execution_supervisor
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_processor_lookup = file_processor_lookup
@@ -326,6 +331,7 @@ class PlannerReActFlow(BaseFlow):
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
+            supervisor=self._execution_supervisor,
         )
 
     def _build_memory_mount_scope(self):
@@ -427,7 +433,7 @@ class PlannerReActFlow(BaseFlow):
         self._has_memory_tools = any(
             t.name in ("memory_search", "memory_get", "memory_save") for t in tools
         )
-        return tools
+        return wrap_tool_list_for_supervisor(tools, self._execution_supervisor)
 
     # -- Graph construction ---------------------------------------------------
 

@@ -420,6 +420,7 @@ class AgentService:
                 if self._redis_client and hasattr(self._redis_client, "client")
                 else None
             ),
+            execution_supervisor=self._supervisor,
         )
 
         # 6.创建任务Task并更新会话中的信息

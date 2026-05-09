@@ -3,7 +3,13 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel
+
 from app.domain.services.flows.planner_react import PlannerReActFlow
+from app.domain.services.tools._supervisor_tool_wrapper import (
+    SupervisorAwareToolWrapper,
+)
 
 
 def _make_flow(**overrides):
@@ -25,6 +31,22 @@ def _make_flow(**overrides):
     return PlannerReActFlow(**defaults)
 
 
+class _ToolArgs(BaseModel):
+    value: str
+
+
+def _make_tool(name: str):
+    async def _run(value: str) -> str:
+        return value
+
+    return StructuredTool.from_function(
+        coroutine=_run,
+        name=name,
+        description=f"{name} desc",
+        args_schema=_ToolArgs,
+    )
+
+
 class TestCollectNativeTools:
     def test_returns_native_tool_names(self):
         flow = _make_flow()
@@ -37,6 +59,25 @@ class TestCollectNativeTools:
         assert "message_notify_user" in names
         assert "search_web" in names
         assert len(tools) > 10  # native tools are ~24 total
+
+    def test_passes_execution_supervisor_to_native_factory(self, monkeypatch):
+        flow = _make_flow()
+        supervisor = object()
+        flow._execution_supervisor = supervisor
+        captured = {}
+
+        def _fake_create_native_tools(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        monkeypatch.setattr(
+            "app.domain.services.flows.planner_react.create_native_tools",
+            _fake_create_native_tools,
+        )
+
+        flow._collect_native_tools()
+
+        assert captured["supervisor"] is supervisor
 
 
 class TestCollectMcpTools:
@@ -166,6 +207,40 @@ class TestCollectAllTools:
         assert a2a_last < skill_first, (
             f"A2A should come before skill creation: a2a_last={a2a_last}, skill_first={skill_first}"
         )
+
+    @pytest.mark.anyio
+    async def test_wraps_aggregate_tools_without_double_wrapping(self, monkeypatch):
+        """Aggregate wrapping covers non-native tools and keeps native wrappers idempotent."""
+        flow = _make_flow()
+        supervisor = object()
+        flow._execution_supervisor = supervisor
+        already_wrapped = SupervisorAwareToolWrapper(
+            inner=_make_tool("native_wrapped"),
+            supervisor=supervisor,
+        )
+        raw_mcp = _make_tool("mcp_raw")
+        raw_memory = _make_tool("memory_search")
+
+        monkeypatch.setattr(flow, "_collect_native_tools", lambda: [already_wrapped])
+        monkeypatch.setattr(
+            flow,
+            "_collect_mcp_tools",
+            AsyncMock(return_value=[raw_mcp]),
+        )
+        monkeypatch.setattr(flow, "_collect_a2a_tools", lambda: [])
+        monkeypatch.setattr(flow, "_collect_skill_creation_tools", lambda: [])
+        monkeypatch.setattr(flow, "_collect_memory_tools", lambda: [raw_memory])
+
+        tools = await flow._collect_all_tools()
+
+        assert tools[0] is already_wrapped
+        assert all(isinstance(tool, SupervisorAwareToolWrapper) for tool in tools)
+        assert [tool.name for tool in tools] == [
+            "native_wrapped",
+            "mcp_raw",
+            "memory_search",
+        ]
+        assert flow._has_memory_tools is True
 
 
 class TestCollectMemoryTools:
