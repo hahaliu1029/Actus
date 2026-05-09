@@ -61,3 +61,44 @@ def build_cost_callback_handler(
     return CostCallbackHandler(
         session_id=session_id, user_id=user_id, persister=_persist
     )
+
+
+def build_supervisor_aware_callback_handler(
+    supervisor,
+    session_id: str,
+    user_id: str,
+    uow_factory: Callable[[], "IUnitOfWork"],
+):
+    """Build a cost handler that also mirrors LLM inflight state.
+
+    The DB persister semantics intentionally match
+    ``build_cost_callback_handler``: each write gets a short-lived UoW and
+    commit failures propagate into ``CostCallbackHandler._persist_safely``.
+    """
+    from app.domain.models.cost_record import CostRecord
+    from app.domain.services.cost_callback_handler import (
+        SupervisorAwareCallbackHandler,
+    )
+    from app.infrastructure.repositories.db_cost_record_repository import (
+        DbCostRecordRepository,
+    )
+
+    async def _persist(record: CostRecord) -> None:
+        async with uow_factory() as uow:
+            repo = DbCostRecordRepository(uow.db_session)
+            await repo.insert(record)
+            try:
+                await uow.db_session.commit()
+            except Exception:
+                try:
+                    await uow.db_session.rollback()
+                except Exception:
+                    pass
+                raise
+
+    return SupervisorAwareCallbackHandler(
+        supervisor=supervisor,
+        session_id=session_id,
+        user_id=user_id,
+        persister=_persist,
+    )

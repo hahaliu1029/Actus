@@ -152,10 +152,14 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
     )
     import app.application.services.cost_callback_factory as cost_callback_factory
 
+    cost_callback_handler = object()
+    callback_builder_calls: list[dict[str, object]] = []
+
     monkeypatch.setattr(
         cost_callback_factory,
-        "build_cost_callback_handler",
-        lambda **_kwargs: None,
+        "build_supervisor_aware_callback_handler",
+        lambda **kwargs: callback_builder_calls.append(kwargs)
+        or cost_callback_handler,
     )
 
     session = Session(
@@ -208,6 +212,15 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
     assert task is _TaskClass.task
     assert created_runners == [_TaskClass.created_with]
     assert callable(task.cancel)
+    assert created_runners[0].kwargs["cost_callback_handler"] is cost_callback_handler
+    assert callback_builder_calls == [
+        {
+            "supervisor": service._supervisor,
+            "session_id": "session-1",
+            "user_id": "user-1",
+            "uow_factory": service._uow_factory,
+        }
+    ]
     assert service._supervisor.calls == [
         {"session_id": "session-1", "runner": task}
     ]

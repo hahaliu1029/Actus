@@ -128,6 +128,7 @@ async def test_create_task_with_lifecycle_does_not_overwrite_new_binding(monkeyp
         file_storage=MagicMock(),
         sandbox_lifecycle_service=lifecycle,
     )
+    service._supervisor = MagicMock()
 
     monkeypatch.setattr(
         "app.application.services.agent_service.AgentTaskRunner",

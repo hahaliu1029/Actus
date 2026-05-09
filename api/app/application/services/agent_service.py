@@ -348,15 +348,15 @@ class AgentService:
         )
 
         # 6.创建AgentTaskRunner
-        # B4 M0: build the session-scoped CostCallbackHandler here (before
-        # runner construction) so every LLM call inside the graph emits a
-        # CostRecord. The factory closes over ``self._uow_factory`` so each
-        # persist opens its own short-lived UoW.
+        # B4 M0 / B3-core PR-3b: build the session-scoped cost callback here
+        # so every LLM call emits a CostRecord and mirrors LLM inflight state
+        # through ExecutionSupervisor.
         from app.application.services.cost_callback_factory import (
-            build_cost_callback_handler,
+            build_supervisor_aware_callback_handler,
         )
 
-        cost_callback_handler = build_cost_callback_handler(
+        cost_callback_handler = build_supervisor_aware_callback_handler(
+            supervisor=self._supervisor,
             session_id=session.id,
             user_id=session.user_id,
             uow_factory=self._uow_factory,
