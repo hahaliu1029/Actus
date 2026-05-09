@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional, Protocol
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Protocol
 
 from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
+from app.domain.repositories._sentinel import _UNSET, UnsetType
 
 if TYPE_CHECKING:
     from app.domain.models.conversation_summary import ConversationSummary
     from app.domain.models.skill_creation_state import SkillCreationState
     from app.domain.models.skill_graph_state import SkillGraphState
+
+
+class BgSessionRow(NamedTuple):
+    """Lightweight row used by supervisor restart reconciliation."""
+
+    session_id: str
+    task_id: str | None
+    user_id: str
+    status: SessionStatus
 
 
 class SessionRepository(Protocol):
@@ -64,7 +74,48 @@ class SessionRepository(Protocol):
         ...
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
-        """根据传递的会话id更新会话状态"""
+        """Update non-terminal status; terminal writes use update_to_terminal."""
+        ...
+
+    async def find_running_background(self) -> list[BgSessionRow]:
+        """Return background sessions in running/recovering supervisor phases."""
+        ...
+
+    async def update_supervisor_fields(
+        self,
+        session_id: str,
+        *,
+        execution_mode: str | UnsetType = _UNSET,
+        background_reason: str | None | UnsetType = _UNSET,
+        expires_at: datetime | None | UnsetType = _UNSET,
+        execution_phase: str | UnsetType = _UNSET,
+        retry_budget_remaining: int | UnsetType = _UNSET,
+        terminal_reason: str | None | UnsetType = _UNSET,
+        suspended_reason: str | None | UnsetType = _UNSET,
+        was_background: bool | UnsetType = _UNSET,
+    ) -> None:
+        """Patch supervisor fields; _UNSET skips, None writes NULL."""
+        ...
+
+    async def update_to_terminal(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+    ) -> None:
+        """Atomically write terminal status, phase and reason."""
+        ...
+
+    async def update_terminal_reason(
+        self,
+        session_id: str,
+        terminal_reason: str,
+    ) -> None:
+        """Late-bind terminal_reason for existing terminal rows."""
+        ...
+
+    async def distinct_user_ids_with_running_bg(self) -> list[str]:
+        """Return user ids with sweepable background sessions."""
         ...
 
     async def add_event(self, session_id: str, event: BaseEvent) -> None:
@@ -134,4 +185,3 @@ class SessionRepository(Protocol):
     async def clear_skill_graph_state(self, session_id: str) -> None:
         """清理 Skill 创建子图的持久化状态"""
         ...
-

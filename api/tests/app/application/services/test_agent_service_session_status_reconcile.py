@@ -17,11 +17,20 @@ def anyio_backend() -> str:
 class _SessionRepo:
     def __init__(self) -> None:
         self.update_status_calls: list[tuple[str, SessionStatus]] = []
+        self.update_to_terminal_calls: list[tuple[str, SessionStatus, str]] = []
         self.update_latest_message_calls: list[tuple[str, str]] = []
         self.add_event_calls: list[tuple[str, object]] = []
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
         self.update_status_calls.append((session_id, status))
+
+    async def update_to_terminal(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+    ) -> None:
+        self.update_to_terminal_calls.append((session_id, status, terminal_reason))
 
     async def update_latest_message(self, session_id: str, message: str, timestamp) -> None:
         self.update_latest_message_calls.append((session_id, message))
@@ -124,8 +133,8 @@ async def test_chat_without_message_reconciles_running_status_when_task_missing(
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)
 
-    assert uow.session.update_status_calls == [
-        ("session-1", SessionStatus.COMPLETED),
+    assert uow.session.update_to_terminal_calls == [
+        ("session-1", SessionStatus.COMPLETED, "resume_state_lost"),
     ]
 
 

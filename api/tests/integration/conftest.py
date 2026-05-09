@@ -294,14 +294,7 @@ async def sample_user(db_session):
 
 @pytest.fixture
 async def sample_session(db_session, sample_user):
-    """Persist a synthetic ``Session`` — PR-0 baseline (pre-PR-2 schema only).
-
-    NOTE (P1-4): Supervisor-only kwargs (execution_mode, execution_phase,
-    retry_budget_remaining, was_background) DO NOT exist on the ``sessions``
-    table until PR-2 ``b3p2`` migration ships.  This fixture will be EXTENDED
-    at the PR-2 boundary to set those columns; at PR-0 we only persist what
-    the current ORM schema allows.
-    """
+    """Persist a synthetic ``Session`` with PR-2 supervisor defaults."""
     from app.domain.models.session import Session, SessionStatus
     from app.infrastructure.models.session import SessionModel
 
@@ -312,9 +305,10 @@ async def sample_session(db_session, sample_user):
         status=SessionStatus.RUNNING.value,
         title="b3 supervisor anchor session",
         task_id=sid,
-        # supervisor kwargs (execution_mode, execution_phase, retry_budget_remaining,
-        # was_background) added by PR-2 fixture extension once b3p2 migration ships
-        # these columns. Do NOT set them here at PR-0.
+        execution_mode="foreground",
+        execution_phase="running",
+        retry_budget_remaining=3,
+        was_background=False,
     )
     db_session.add(orm)
     await db_session.flush()
@@ -323,7 +317,64 @@ async def sample_session(db_session, sample_user):
         user_id=sample_user.id,
         status=SessionStatus.RUNNING,
         task_id=sid,
+        execution_mode="foreground",
+        execution_phase="running",
+        retry_budget_remaining=3,
+        was_background=False,
     )
+
+
+@pytest.fixture
+def make_session(db_session, sample_user):
+    """Factory for sessions with arbitrary supervisor-field overrides."""
+
+    async def _factory(**overrides):
+        from app.domain.models.session import SessionStatus
+        from app.infrastructure.models.session import SessionModel
+
+        sid = overrides.pop("id", f"sess-b3-{_uuid.uuid4().hex[:12]}")
+        defaults = {
+            "id": sid,
+            "user_id": sample_user.id,
+            "status": SessionStatus.RUNNING.value,
+            "title": "b3 supervisor factory session",
+            "task_id": sid,
+            "execution_mode": "foreground",
+            "execution_phase": "running",
+            "retry_budget_remaining": 3,
+            "was_background": False,
+        }
+        defaults.update(overrides)
+        orm = SessionModel(**defaults)
+        db_session.add(orm)
+        await db_session.flush()
+        return orm
+
+    return _factory
+
+
+class MockRequest:
+    """Lightweight stand-in for FastAPI Request in dependency tests."""
+
+    def __init__(self, app, headers=None):
+        self.app = app
+        self.headers = headers or {}
+
+
+@pytest.fixture
+def asgi_client_factory(app):
+    """Build httpx AsyncClient instances with optional headers."""
+    import httpx
+
+    def _factory(headers=None):
+        transport = httpx.ASGITransport(app=app)
+        return httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=headers or {},
+        )
+
+    return _factory
 
 
 @pytest.fixture
@@ -404,6 +455,8 @@ async def agent_service_with_redis(db_session, redis_client, app):
         RedisEventRecovery,
     )
     from app.infrastructure.repositories.db_session_repository import DBSessionRepository
+    from app.domain.services.execution_supervisor import ExecutionSupervisor
+    from app.domain.services.idle_watchdog import IdleWatchdog
     from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
     from app.interfaces.dependencies.rate_limit import rate_limit_read
     from app.interfaces.service_dependencies import get_agent_service
@@ -453,6 +506,18 @@ async def agent_service_with_redis(db_session, redis_client, app):
         redis_client=redis_client,
         event_recovery=RedisEventRecovery(max_count=10000),
     )
+    supervisor = ExecutionSupervisor(
+        redis_client=redis_client,
+        session_repository=DBSessionRepository(db_session=db_session),
+    )
+    service._supervisor = supervisor
+    app.state.supervisor = supervisor
+    app.state.idle_watchdog = IdleWatchdog(
+        redis_client=redis_client,
+        supervisor=supervisor,
+        session_repository=DBSessionRepository(db_session=db_session),
+    )
+    service._idle_watchdog = app.state.idle_watchdog
     app.dependency_overrides[get_agent_service] = lambda: service
     app.dependency_overrides[rate_limit_read] = _noop_rate_limit
     try:
@@ -460,6 +525,10 @@ async def agent_service_with_redis(db_session, redis_client, app):
     finally:
         app.dependency_overrides.pop(get_agent_service, None)
         app.dependency_overrides.pop(rate_limit_read, None)
+        if getattr(app.state, "supervisor", None) is supervisor:
+            delattr(app.state, "supervisor")
+        if getattr(app.state, "idle_watchdog", None) is not None:
+            delattr(app.state, "idle_watchdog")
 
 
 # ── B3-core supervisor fixtures (non-DB-keyed) ──────────────────────────────
@@ -479,6 +548,8 @@ async def redis_client(monkeypatch):
     supervisor:user, supervisor:system keys.
     """
     import redis.asyncio as redis_asyncio
+    from app.domain.services.idle_watchdog import IdleWatchdog
+    from app.main import app as fastapi_app
     from app.infrastructure.external.message_queue import redis_stream_message_queue
 
     client = redis_asyncio.from_url(
@@ -494,10 +565,13 @@ async def redis_client(monkeypatch):
 
     wrapper = _RedisClientWrapper(client)
     monkeypatch.setattr(redis_stream_message_queue, "get_redis", lambda: wrapper)
+    fastapi_app.state.idle_watchdog = IdleWatchdog(redis_client=wrapper)
     # Flush before each test for isolation
     await client.flushdb()
     yield wrapper
     await client.flushdb()
+    if getattr(fastapi_app.state, "idle_watchdog", None) is not None:
+        delattr(fastapi_app.state, "idle_watchdog")
     await client.aclose()
 
 

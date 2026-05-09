@@ -2823,7 +2823,11 @@ class AgentTaskRunner(TaskRunner):
                 pass
             raise
 
-    async def _set_terminal_status(self, status: SessionStatus) -> None:
+    async def _set_terminal_status(
+        self,
+        status: SessionStatus,
+        terminal_reason: str | None = None,
+    ) -> None:
         """Set session to a terminal status and fire on_session_complete.
 
         B4 Issue 1D: drain + status write + completion callback are wrapped
@@ -2885,7 +2889,11 @@ class AgentTaskRunner(TaskRunner):
             # status we want failure to be observed via the terminal task's
             # done callback.
             async with self._uow_factory() as uow:
-                await uow.session.update_status(self._session_id, status)
+                await uow.session.update_to_terminal(
+                    self._session_id,
+                    status,
+                    terminal_reason or self._default_terminal_reason(status),
+                )
                 await uow.db_session.commit()  # raise on failure
 
             on_complete = getattr(self, "_on_session_complete", None)
@@ -2918,6 +2926,18 @@ class AgentTaskRunner(TaskRunner):
             # We DO NOT mark the session degraded here — marker is driven
             # exclusively by drain results inside _terminal_op.
             raise
+
+    @staticmethod
+    def _default_terminal_reason(status: SessionStatus) -> str:
+        if status == SessionStatus.TIMED_OUT:
+            return "watchdog_timeout"
+        return "natural"
+
+    @staticmethod
+    def _terminal_reason_for_cancel(cancel_reason: str) -> str:
+        if cancel_reason == "stop":
+            return "user_cancel"
+        return "natural"
 
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
@@ -3241,7 +3261,10 @@ class AgentTaskRunner(TaskRunner):
                     raise
 
                 await self._put_and_add_event(task, DoneEvent())
-                await self._set_terminal_status(SessionStatus.COMPLETED)
+                await self._set_terminal_status(
+                    SessionStatus.COMPLETED,
+                    self._terminal_reason_for_cancel(cancel_reason),
+                )
                 raise
 
             except Exception as e:

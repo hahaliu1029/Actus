@@ -9,7 +9,8 @@ from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
 from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.models.skill_graph_state import SkillGraphState
-from app.domain.repositories.session_repository import SessionRepository
+from app.domain.repositories._sentinel import _UNSET, UnsetType
+from app.domain.repositories.session_repository import BgSessionRow, SessionRepository
 from app.infrastructure.models import SessionModel
 from pydantic import ValidationError
 from sqlalchemy import cast, delete, func, select, update
@@ -229,11 +230,12 @@ class DBSessionRepository(SessionRepository):
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
         """更新会话状态"""
+        if status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
+            raise ValueError("terminal statuses must use update_to_terminal")
+
         # 1.构建更新值
         values = {"status": status.value, "updated_at": datetime.now()}
-        if status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
-            values["completed_at"] = datetime.now()
-        elif status == SessionStatus.TAKEOVER_PENDING:
+        if status == SessionStatus.TAKEOVER_PENDING:
             # reopen 场景：从 completed 恢复时清空 completed_at，
             # 避免统计逻辑误判"非空即完成过"
             values["completed_at"] = None
@@ -249,6 +251,141 @@ class DBSessionRepository(SessionRepository):
         # 2.检查是否更新成功
         if result.rowcount == 0:
             raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def find_running_background(self) -> list[BgSessionRow]:
+        """Return background sessions that may need restart reconciliation."""
+        stmt = (
+            select(
+                SessionModel.id,
+                SessionModel.task_id,
+                SessionModel.user_id,
+                SessionModel.status,
+            )
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase.in_(("running", "recovering")))
+            .where(
+                SessionModel.status.in_(
+                    (SessionStatus.RUNNING.value, SessionStatus.FINISHING.value)
+                )
+            )
+        )
+        result = await self.db_session.execute(stmt)
+        return [
+            BgSessionRow(
+                session_id=str(row.id),
+                task_id=str(row.task_id) if row.task_id is not None else None,
+                user_id=str(row.user_id),
+                status=SessionStatus(row.status),
+            )
+            for row in result.all()
+        ]
+
+    async def update_supervisor_fields(
+        self,
+        session_id: str,
+        *,
+        execution_mode: str | UnsetType = _UNSET,
+        background_reason: str | None | UnsetType = _UNSET,
+        expires_at: datetime | None | UnsetType = _UNSET,
+        execution_phase: str | UnsetType = _UNSET,
+        retry_budget_remaining: int | UnsetType = _UNSET,
+        terminal_reason: str | None | UnsetType = _UNSET,
+        suspended_reason: str | None | UnsetType = _UNSET,
+        was_background: bool | UnsetType = _UNSET,
+    ) -> None:
+        values: dict[str, object | None] = {}
+        if execution_mode is not _UNSET:
+            values["execution_mode"] = execution_mode
+        if background_reason is not _UNSET:
+            values["background_reason"] = background_reason
+        if expires_at is not _UNSET:
+            values["expires_at"] = expires_at
+        if execution_phase is not _UNSET:
+            values["execution_phase"] = execution_phase
+        if retry_budget_remaining is not _UNSET:
+            values["retry_budget_remaining"] = retry_budget_remaining
+        if terminal_reason is not _UNSET:
+            values["terminal_reason"] = terminal_reason
+        if suspended_reason is not _UNSET:
+            values["suspended_reason"] = suspended_reason
+        if was_background is not _UNSET:
+            values["was_background"] = was_background
+        if not values:
+            return
+        values["last_activity_at"] = func.now()
+
+        result = await self.db_session.execute(
+            update(SessionModel).where(SessionModel.id == session_id).values(**values)
+        )
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def update_to_terminal(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+    ) -> None:
+        if status not in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
+            raise ValueError(f"non-terminal status: {status}")
+
+        now = datetime.now()
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(
+                ~SessionModel.status.in_(
+                    (SessionStatus.COMPLETED.value, SessionStatus.TIMED_OUT.value)
+                )
+            )
+            .where(~SessionModel.execution_phase.in_(("terminating", "terminated")))
+            .values(
+                status=status.value,
+                completed_at=now,
+                terminal_reason=terminal_reason,
+                execution_phase="terminated",
+                last_activity_at=now,
+                updated_at=now,
+            )
+        )
+        if result.rowcount == 0:
+            existing = await self.db_session.execute(
+                select(SessionModel.status, SessionModel.execution_phase).where(
+                    SessionModel.id == session_id
+                )
+            )
+            row = existing.one_or_none()
+            if row is None:
+                raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+            if row.status in (
+                SessionStatus.COMPLETED.value,
+                SessionStatus.TIMED_OUT.value,
+            ) or row.execution_phase in ("terminating", "terminated"):
+                return
+            raise ValueError(f"会话[{session_id}]终态写入失败，请重试")
+
+    async def update_terminal_reason(
+        self,
+        session_id: str,
+        terminal_reason: str,
+    ) -> None:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(terminal_reason=terminal_reason, last_activity_at=func.now())
+        )
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def distinct_user_ids_with_running_bg(self) -> list[str]:
+        result = await self.db_session.execute(
+            select(SessionModel.user_id)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase.in_(("running", "suspended")))
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .distinct()
+        )
+        return [str(row.user_id) for row in result.all()]
 
     async def update_unread_message_count(self, session_id: str, count: int) -> None:
         """更新会话的未读消息数"""
@@ -499,4 +636,3 @@ class DBSessionRepository(SessionRepository):
 
         if result.rowcount == 0:
             raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
-

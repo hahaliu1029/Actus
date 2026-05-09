@@ -73,6 +73,7 @@ def _make_uow_factory(commit_succeeds: bool = True) -> Any:
         uow = MagicMock(name=f"fresh-uow-{len(yielded_uows)}")
         uow.session = MagicMock()
         uow.session.update_status = AsyncMock(return_value=None)
+        uow.session.update_to_terminal = AsyncMock(return_value=None)
         uow.db_session = MagicMock()
         if commit_succeeds:
             uow.db_session.commit = AsyncMock(return_value=None)
@@ -115,7 +116,9 @@ class TestHappyPath:
         cost_handler.write_session_degraded_marker.assert_not_awaited()
         # Status write hit a fresh UoW with explicit commit.
         assert len(factory.yielded_uows) == 1
-        factory.yielded_uows[0].session.update_status.assert_awaited_once()
+        factory.yielded_uows[0].session.update_to_terminal.assert_awaited_once_with(
+            "sess-T", SessionStatus.COMPLETED, "natural"
+        )
         factory.yielded_uows[0].db_session.commit.assert_awaited_once()
         # Completion callback fired with the session id.
         assert callback_seen == ["sess-T"]
@@ -312,7 +315,9 @@ class TestDrainTimeout:
             "Status write must still happen when marker writer returns "
             "False — otherwise the session would be stuck in prior status."
         )
-        factory.yielded_uows[0].session.update_status.assert_awaited_once()
+        factory.yielded_uows[0].session.update_to_terminal.assert_awaited_once_with(
+            "sess-T", SessionStatus.COMPLETED, "natural"
+        )
         factory.yielded_uows[0].db_session.commit.assert_awaited_once()
 
 
@@ -347,8 +352,8 @@ class TestFreshUoW:
             "Status write must use a UoW from self._uow_factory(), not "
             "the stale self._uow."
         )
-        fresh.session.update_status.assert_awaited_once_with(
-            "sess-T", SessionStatus.COMPLETED
+        fresh.session.update_to_terminal.assert_awaited_once_with(
+            "sess-T", SessionStatus.COMPLETED, "natural"
         )
 
 

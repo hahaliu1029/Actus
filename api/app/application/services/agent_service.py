@@ -1385,8 +1385,10 @@ class AgentService:
                     session_id,
                 )
                 async with self._uow_factory() as uow:
-                    await uow.session.update_status(
-                        session_id, SessionStatus.COMPLETED
+                    await uow.session.update_to_terminal(
+                        session_id,
+                        SessionStatus.COMPLETED,
+                        "resume_state_lost",
                     )
                 # Sync sandbox binding: ACTIVE → SUSPENDED (same as normal completion)
                 if self._sandbox_lifecycle_service:
@@ -1487,7 +1489,11 @@ class AgentService:
 
         # 3.更新会话任务状态
         async with self._uow_factory() as uow:
-            await uow.session.update_status(session_id, SessionStatus.COMPLETED)
+            await uow.session.update_to_terminal(
+                session_id,
+                SessionStatus.COMPLETED,
+                "user_cancel",
+            )
 
         # 4. Suspend sandbox binding (I2: ACTIVE → SUSPENDED, container stays alive)
         if self._sandbox_lifecycle_service:
@@ -1773,7 +1779,11 @@ end
                         takeover_id=takeover_id,
                     ),
                 )
-                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
+                await uow.session.update_to_terminal(
+                    session_id,
+                    SessionStatus.COMPLETED,
+                    "watchdog_timeout",
+                )
             await self._force_release_takeover_lease(session_id)
         except asyncio.CancelledError:
             raise
@@ -1946,7 +1956,11 @@ end
         )
         uow = self._uow_factory()
         async with uow:
-            await uow.session.update_status(session_id, SessionStatus.COMPLETED)
+            await uow.session.update_to_terminal(
+                session_id,
+                SessionStatus.COMPLETED,
+                "resume_state_lost",
+            )
         await self._append_control_event(
             session_id,
             action=ControlAction.ENDED,
@@ -2332,7 +2346,11 @@ end
 
         if decision_normalized == "terminate":
             async with self._uow_factory() as uow:
-                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
+                await uow.session.update_to_terminal(
+                    session_id,
+                    SessionStatus.COMPLETED,
+                    "user_cancel",
+                )
             await self._append_control_event(
                 session_id,
                 action=ControlAction.REJECTED,
@@ -2416,7 +2434,11 @@ end
 
         if mode == "complete":
             async with self._uow_factory() as uow:
-                await uow.session.update_status(session_id, SessionStatus.COMPLETED)
+                await uow.session.update_to_terminal(
+                    session_id,
+                    SessionStatus.COMPLETED,
+                    "natural",
+                )
             await self._append_control_event(
                 session_id,
                 action=ControlAction.ENDED,

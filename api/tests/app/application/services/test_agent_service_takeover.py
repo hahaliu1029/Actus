@@ -21,6 +21,7 @@ def anyio_backend() -> str:
 class _SessionRepo:
     def __init__(self, session: Session | None = None) -> None:
         self.update_status_calls: list[tuple[str, SessionStatus]] = []
+        self.update_to_terminal_calls: list[tuple[str, SessionStatus, str]] = []
         self.add_event_calls: list[tuple[str, object]] = []
         self.get_by_id_for_update_calls: list[str] = []
         self._session = session
@@ -33,6 +34,18 @@ class _SessionRepo:
                 self._session.completed_at = datetime.now()
             elif status == SessionStatus.TAKEOVER_PENDING:
                 self._session.completed_at = None
+
+    async def update_to_terminal(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+    ) -> None:
+        self.update_to_terminal_calls.append((session_id, status, terminal_reason))
+        if self._session and self._session.id == session_id:
+            self._session.status = status
+            self._session.completed_at = datetime.now()
+            self._session.terminal_reason = terminal_reason
 
     async def add_event(self, session_id: str, event) -> None:
         self.add_event_calls.append((session_id, event))
@@ -308,7 +321,9 @@ async def test_reject_takeover_terminate_marks_completed_and_releases_lease(
     result = await service.reject_takeover("s1", "u1", decision="terminate")
 
     assert result == {"status": SessionStatus.COMPLETED, "reason": "terminate"}
-    assert uow.session.update_status_calls == [("s1", SessionStatus.COMPLETED)]
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "user_cancel")
+    ]
     assert append_calls[0]["action"] == ControlAction.REJECTED
     assert append_calls[0]["reason"] == "terminate"
     assert append_calls[0]["takeover_id"] == "tk_pending_terminate"
@@ -354,7 +369,9 @@ async def test_end_takeover_complete_marks_completed(
     result = await service.end_takeover("s1", "u1", handoff_mode="complete")
 
     assert result == {"status": SessionStatus.COMPLETED, "handoff_mode": "complete"}
-    assert uow.session.update_status_calls == [("s1", SessionStatus.COMPLETED)]
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "natural")
+    ]
     assert append_calls[0]["action"] == ControlAction.ENDED
     assert append_calls[0]["handoff_mode"] == "complete"
     assert append_calls[0]["takeover_id"] == "tk_ended_1"
@@ -483,7 +500,9 @@ async def test_end_takeover_continue_resume_failed_rolls_back_to_completed(
     result = await service.end_takeover("s1", "u1", handoff_mode="continue")
 
     assert result == {"status": SessionStatus.COMPLETED, "handoff_mode": "complete"}
-    assert uow.session.update_status_calls == [("s1", SessionStatus.COMPLETED)]
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "resume_state_lost")
+    ]
     assert append_error_calls
     assert "恢复执行失败" in append_error_calls[0]["error"]
     assert append_control_calls[0]["action"] == ControlAction.ENDED
@@ -785,7 +804,9 @@ async def test_pending_timeout_expires_takeover_pending_session(
     assert timeout_event.reason == "pending_timeout"
     assert timeout_event.request_status == "expired"
     assert timeout_event.takeover_id == "tk_pending_1"
-    assert uow.session.update_status_calls == [("s1", SessionStatus.COMPLETED)]
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "watchdog_timeout")
+    ]
     assert uow.session.get_by_id_for_update_calls == ["s1"]
     assert release_calls == ["s1"]
 
@@ -1047,10 +1068,10 @@ async def test_shutdown_cancels_background_tasks() -> None:
     assert _DummyTaskCls.destroyed is True
 
 
-async def test_update_status_completed_sets_completed_at(
+async def test_update_to_terminal_completed_sets_completed_at(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """当 reject_takeover(terminate) 触发 update_status(COMPLETED) 时，
+    """当 reject_takeover(terminate) 触发 update_to_terminal(COMPLETED) 时，
     mock 的 _SessionRepo 应模拟设置 completed_at。"""
     session = Session(
         id="s1",
@@ -1084,6 +1105,9 @@ async def test_update_status_completed_sets_completed_at(
     assert session.completed_at is None
     await service.reject_takeover("s1", "u1", decision="terminate")
     assert session.completed_at is not None
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "user_cancel")
+    ]
 
 
 async def test_reopen_takeover_success_schedules_pending_timeout(

@@ -178,7 +178,6 @@ async def test_C_Redis_1_stream_has_maxlen_2000(redis_client, agent_service_with
 # lifespan integration AND the test fixture invokes lifespan (via asgi-lifespan
 # `LifespanManager` or manual startup call), `app.state.idle_watchdog` will be
 # absent — `AttributeError` is a stable xfail signal pointing at PR-2 work.
-@pytest.mark.xfail(strict=False, reason="PR-2: IdleWatchdog.touch_activity + lifespan wiring not yet shipped")
 async def test_C_Redis_2_hot_hash_300s_ttl(redis_client, app, sample_session):
     from app.domain.services.idle_watchdog import IdleWatchdog  # PR-2
 

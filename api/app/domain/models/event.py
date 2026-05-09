@@ -319,10 +319,16 @@ class ExecutionStatePayload(BaseModel):
     expires_at: Optional[datetime] = None
     retry_budget_remaining: int
     suspended_reason: Optional[
-        Literal["bg_idle_timeout", "bg_explicit_expired", "server_restart"]
+        Literal["bg_idle_timeout", "server_restart"]
     ] = None
     terminal_reason: Optional[
-        Literal["user_cancel", "server_restart", "resume_state_lost", "watchdog_timeout"]
+        Literal[
+            "natural",
+            "user_cancel",
+            "server_restart",
+            "resume_state_lost",
+            "watchdog_timeout",
+        ]
     ] = None
     transition_reason: str = ""
 

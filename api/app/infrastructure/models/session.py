@@ -3,10 +3,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
     PrimaryKeyConstraint,
+    SmallInteger,
     String,
     Text,
     text,
@@ -106,6 +108,45 @@ class SessionModel(Base):
         DateTime,
         nullable=True,
     )  # 完成时间
+    execution_mode: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="foreground",
+        server_default="foreground",
+    )
+    background_reason: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True, default=None
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    execution_phase: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="running",
+        server_default="running",
+    )
+    retry_budget_remaining: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+        default=3,
+        server_default="3",
+    )
+    terminal_reason: Mapped[Optional[str]] = mapped_column(
+        String(40), nullable=True, default=None
+    )
+    suspended_reason: Mapped[Optional[str]] = mapped_column(
+        String(40), nullable=True, default=None
+    )
+    was_background: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,

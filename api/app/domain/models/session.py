@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -95,6 +95,28 @@ class Session(BaseModel):
     status: SessionStatus = SessionStatus.PENDING  # 状态
     user_id: Optional[str] = None  # 会话所属用户ID
     completed_at: Optional[datetime] = None  # 完成时间
+    execution_mode: Literal["foreground", "background"] = "foreground"
+    background_reason: Literal["explicit", "auto_degrade"] | None = None
+    expires_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
+    execution_phase: Literal[
+        "running", "recovering", "idle", "suspended", "terminating", "terminated"
+    ] = "running"
+    retry_budget_remaining: int = 3
+    terminal_reason: (
+        Literal[
+            "natural",
+            "user_cancel",
+            "server_restart",
+            "resume_state_lost",
+            "watchdog_timeout",
+        ]
+        | None
+    ) = None
+    suspended_reason: (
+        Literal["bg_idle_timeout", "server_restart"] | None
+    ) = None
+    was_background: bool = False
     updated_at: datetime = Field(default_factory=datetime.now)  # 更新时间
     created_at: datetime = Field(default_factory=datetime.now)  # 创建时间
 

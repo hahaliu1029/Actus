@@ -1,12 +1,12 @@
-"""B3-core PR-0: 23 contract anchors (xfail).
+"""B3-core supervisor contract anchors.
 
 These tests assert the contracts defined in spec v3 §3-§7. They fail at
-PR-0 ship (supervisor not yet implemented) and flip to PASS as PR-1..PR-4
-land their respective features.
+PR-0 shipped them as xfail; PR-1..PR-4 flip anchors to PASS as their
+respective features land.
 
 Anchor groups (per spec v3 §8.1):
 
-- C-FSM-1..3 (3): FSM transitions T1/T2 admit, T3 promote, T6/T8 suspend
+- C-FSM-1..3 (3): FSM transitions T1/T2 admit, T3 promote, T8 suspend
 - C-Admission-1..2 (2): Lua 4-key admit; user/system slot enforcement
 - C-Lua-Revoke-Idempotent (1): double revoke = no-op
 - C-Lua-NoScript (1): EVALSHA NOSCRIPT fallback to EVAL
@@ -39,7 +39,6 @@ pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
 # -- C-FSM-1: T1 admit foreground sets execution_mode='foreground' atomically --
-@pytest.mark.xfail(strict=False, reason="PR-2: ExecutionSupervisor.admit not yet implemented")
 async def test_C_FSM_1_admit_foreground_marks_session_fg_running(
     agent_service_with_redis, sample_user, session_repo,
 ):
@@ -54,7 +53,6 @@ async def test_C_FSM_1_admit_foreground_marks_session_fg_running(
 
 
 # -- C-FSM-2: T3 promote FG → BG sets background_reason='auto_degrade' ---------
-@pytest.mark.xfail(strict=False, reason="PR-2: ExecutionSupervisor.promote not yet implemented")
 async def test_C_FSM_2_promote_t3_fg_to_bg(
     agent_service_with_redis, sample_user, session_repo,
 ):
@@ -71,8 +69,7 @@ async def test_C_FSM_2_promote_t3_fg_to_bg(
     assert fresh.was_background is True
 
 
-# -- C-FSM-3: T6 / T8 suspend transitions --------------------------------------
-@pytest.mark.xfail(strict=False, reason="PR-2: suspend transitions not yet implemented")
+# -- C-FSM-3: T8 suspend transition -------------------------------------------
 async def test_C_FSM_3_suspend_idle_marks_phase_suspended(
     agent_service_with_redis, sample_user, session_repo,
 ):
@@ -92,7 +89,6 @@ async def test_C_FSM_3_suspend_idle_marks_phase_suspended(
 
 
 # -- C-Admission-1: 4-key Lua admission enforces system+user budgets -----------
-@pytest.mark.xfail(strict=False, reason="PR-2: LUA_ADMIT not yet shipped")
 async def test_C_Admission_1_lua_admit_4_key_returns_correct_codes(redis_client):
     from app.domain.services._lua_scripts import (
         LUA_ADMIT_SHA, LUA_ADMIT_SOURCE, run_lua_with_fallback,
@@ -146,7 +142,6 @@ async def test_C_Admission_1_lua_admit_4_key_returns_correct_codes(redis_client)
 
 
 # -- C-Admission-2: User slot exhausted returns 2 (user_full) ------------------
-@pytest.mark.xfail(strict=False, reason="PR-2: LUA_ADMIT user_full path not yet shipped")
 async def test_C_Admission_2_user_slot_exhausted(redis_client):
     from app.domain.services._lua_scripts import (
         LUA_ADMIT_SHA, LUA_ADMIT_SOURCE, run_lua_with_fallback,
@@ -180,7 +175,6 @@ async def test_C_Admission_2_user_slot_exhausted(redis_client):
 
 
 # -- C-Lua-Revoke-Idempotent: Double revoke returns 0 the second time ----------
-@pytest.mark.xfail(strict=False, reason="PR-2: LUA_REVOKE not yet shipped")
 async def test_C_Lua_Revoke_Idempotent(redis_client):
     from app.domain.services._lua_scripts import (
         LUA_ADMIT_SHA, LUA_ADMIT_SOURCE, LUA_REVOKE_SHA, LUA_REVOKE_SOURCE,
@@ -256,7 +250,6 @@ async def test_C_Lua_Revoke_Idempotent(redis_client):
 
 
 # -- C-Lua-NoScript: EVALSHA cache miss falls back to SCRIPT LOAD + EVAL -------
-@pytest.mark.xfail(strict=False, reason="PR-2: NOSCRIPT fallback not yet shipped")
 async def test_C_Lua_NoScript_fallback_after_script_flush(redis_client):
     from app.domain.services._lua_scripts import (
         LUA_ADMIT_SHA, LUA_ADMIT_SOURCE, run_lua_with_fallback,
@@ -283,63 +276,161 @@ async def test_C_Lua_NoScript_fallback_after_script_flush(redis_client):
     assert rc == 0
 
 
+class _RepoNotificationEmitter:
+    def __init__(self, repo) -> None:
+        self._repo = repo
+
+    async def emit(self, *, user_id: str, event_type: str, payload: dict) -> None:
+        await self._repo.create(
+            notification_id=str(uuid.uuid4()),
+            user_id=user_id,
+            event_type=event_type,
+            payload=payload,
+        )
+
+
+async def _seed_bg_slot(
+    redis_client,
+    *,
+    user_id: str,
+    session_id: str,
+    expires_at: datetime,
+) -> None:
+    expires_unix = expires_at.timestamp()
+    await redis_client.hset(f"supervisor:user:{user_id}", session_id, f"{expires_unix:.6f}")
+    await redis_client.incr("supervisor:system:bg_count")
+    await redis_client.zadd(f"supervisor:bg:{user_id}", {session_id: expires_unix})
+
+
 # -- C-Restart-1: Reconciler FINISHING → terminal + LUA_REVOKE + bg_terminal_server_restart
-# Round-5 audit P2 fix: prior body created a fresh UUID against a live DB but
-# never inserted the FINISHING row + never triggered the lifespan/reconciler.
-# `session_repo.get_by_id(sid)` would return None → AttributeError on
-# `fresh.terminal_reason`, an erratic xfail signal.  Converted to explicit
-# placeholder matching C-Wire-2 / C-Notif-Reuse pattern.
-@pytest.mark.xfail(strict=False, reason="PR-2: reconciler not yet wired")
 async def test_C_Restart_1_finishing_reconciles_to_terminal(
-    agent_service_with_redis, sample_user, session_repo, notification_repo,
+    agent_service_with_redis,
+    sample_user,
+    session_repo,
+    notification_repo,
+    make_session,
+    redis_client,
 ):
-    pytest.fail(
-        "placeholder — flip when PR-2 ships lifespan reconciler. "
-        "Implementation must:\n"
-        "  (1) pre-seed a FINISHING BG session row (status=FINISHING, "
-        "execution_mode=background, expires_at=NOW+2h)\n"
-        "  (2) restart the app process OR explicitly invoke "
-        "`reconcile_supervisor_state_quiescent` to simulate boot\n"
-        "  (3) assert post-reconcile: status terminal, terminal_reason='server_restart'\n"
-        "  (4) assert LUA_REVOKE was called (Redis sys/user/bg keys cleared)\n"
-        "  (5) assert notification row emitted with "
-        "event_type='bg_terminal_server_restart'\n"
-        "Per spec v3 §5.5 + decision 5 (round-2 P0-2 fix)."
+    from app.domain.models.session import SessionStatus
+
+    expires = datetime.now(timezone.utc) + timedelta(hours=2)
+    session = await make_session(
+        status=SessionStatus.FINISHING.value,
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=expires,
+        execution_phase="running",
+    )
+    await _seed_bg_slot(
+        redis_client,
+        user_id=sample_user.id,
+        session_id=session.id,
+        expires_at=expires,
+    )
+
+    summary = await agent_service_with_redis._supervisor.reconcile_running_background_at_boot(
+        notification_emitter=_RepoNotificationEmitter(notification_repo)
+    )
+
+    fresh = await session_repo.get_by_id(session.id)
+    assert summary == {"finishing": 1, "suspended": 0, "total": 1}
+    assert fresh.status == SessionStatus.TIMED_OUT
+    assert fresh.terminal_reason == "server_restart"
+    assert fresh.execution_phase == "terminated"
+    assert await redis_client.hexists(f"supervisor:user:{sample_user.id}", session.id) == 0
+    assert await redis_client.zscore(f"supervisor:bg:{sample_user.id}", session.id) is None
+    assert int(await redis_client.get("supervisor:system:bg_count") or 0) == 0
+    notifications = await notification_repo.list_unread(sample_user.id)
+    assert any(
+        n.event_type == "bg_terminal_server_restart"
+        and n.payload.get("session_id") == session.id
+        for n in notifications
     )
 
 
 # -- C-Restart-2: Reconciler running BG → suspended (no LUA_REVOKE; slot stays)
-# Round-5 audit P2 fix: same hollow-body issue as C-Restart-1.  Converted to
-# explicit placeholder.
-@pytest.mark.xfail(strict=False, reason="PR-2: reconciler running-BG path not yet wired")
 async def test_C_Restart_2_running_bg_reconciles_to_suspended(
-    agent_service_with_redis, sample_user, session_repo, notification_repo, redis_client,
+    agent_service_with_redis,
+    sample_user,
+    session_repo,
+    notification_repo,
+    redis_client,
+    make_session,
 ):
-    pytest.fail(
-        "placeholder — flip when PR-2 ships lifespan reconciler running-BG path. "
-        "Implementation must:\n"
-        "  (1) pre-seed a running BG session row (status=running, "
-        "execution_mode=background, execution_phase=running)\n"
-        "  (2) seed Redis: HSET supervisor:user:{uid} {sid} {expires_at_unix}\n"
-        "  (3) restart app OR invoke `reconcile_supervisor_state_quiescent`\n"
-        "  (4) assert post-reconcile: execution_phase='suspended', "
-        "suspended_reason='server_restart'\n"
-        "  (5) assert slot stays in supervisor:user (no LUA_REVOKE — slot held "
-        "for T9 resume per spec v3 §5.5 + round-2 P0-2 distinction)\n"
-        "  (6) assert notification row with event_type='bg_suspended_server_restart'\n"
-        "Per spec v3 §5.5."
+    from app.domain.models.session import SessionStatus
+
+    expires = datetime.now(timezone.utc) + timedelta(hours=2)
+    session = await make_session(
+        status=SessionStatus.RUNNING.value,
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=expires,
+        execution_phase="running",
+    )
+    await _seed_bg_slot(
+        redis_client,
+        user_id=sample_user.id,
+        session_id=session.id,
+        expires_at=expires,
+    )
+
+    summary = await agent_service_with_redis._supervisor.reconcile_running_background_at_boot(
+        notification_emitter=_RepoNotificationEmitter(notification_repo)
+    )
+
+    fresh = await session_repo.get_by_id(session.id)
+    assert summary == {"finishing": 0, "suspended": 1, "total": 1}
+    assert fresh.status == SessionStatus.RUNNING
+    assert fresh.execution_phase == "suspended"
+    assert fresh.suspended_reason == "server_restart"
+    assert await redis_client.hexists(f"supervisor:user:{sample_user.id}", session.id) == 1
+    assert await redis_client.zscore(f"supervisor:bg:{sample_user.id}", session.id) is not None
+    assert int(await redis_client.get("supervisor:system:bg_count") or 0) == 1
+    notifications = await notification_repo.list_unread(sample_user.id)
+    assert any(
+        n.event_type == "bg_suspended_server_restart"
+        and n.payload.get("session_id") == session.id
+        for n in notifications
     )
 
 
 # -- C-Restart-NEW: New FINISHING transitions correctly mid-flight -------------
-@pytest.mark.xfail(strict=False, reason="PR-2: reconciler new-FINISHING path not yet wired")
-async def test_C_Restart_NEW_new_finishing_path(agent_service_with_redis, sample_user):
-    # Placeholder — exact contract per spec v3 §5.5; flesh out as PR-2 lands
-    pytest.fail("placeholder — flip when PR-2 ships C-Restart-NEW contract test")
+async def test_C_Restart_NEW_new_finishing_path(
+    agent_service_with_redis,
+    sample_user,
+    session_repo,
+    make_session,
+    redis_client,
+):
+    from app.domain.models.session import SessionStatus
+
+    expires = datetime.now(timezone.utc) + timedelta(hours=2)
+    session = await make_session(
+        status=SessionStatus.FINISHING.value,
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=expires,
+        execution_phase="running",
+    )
+    await _seed_bg_slot(
+        redis_client,
+        user_id=sample_user.id,
+        session_id=session.id,
+        expires_at=expires,
+    )
+
+    first = await agent_service_with_redis._supervisor.reconcile_running_background_at_boot()
+    second = await agent_service_with_redis._supervisor.reconcile_running_background_at_boot()
+
+    fresh = await session_repo.get_by_id(session.id)
+    assert first == {"finishing": 1, "suspended": 0, "total": 1}
+    assert second == {"finishing": 0, "suspended": 0, "total": 0}
+    assert fresh.status == SessionStatus.TIMED_OUT
+    assert fresh.terminal_reason == "server_restart"
+    assert int(await redis_client.get("supervisor:system:bg_count") or 0) == 0
 
 
 # -- C-Repo-Atomic-Terminal: update_to_terminal writes status+reason+phase atomically
-@pytest.mark.xfail(strict=False, reason="PR-2: SessionRepository.update_to_terminal not yet implemented")
 async def test_C_Repo_Atomic_Terminal(session_repo, sample_session):
     from app.domain.models.session import SessionStatus
 
@@ -355,24 +446,33 @@ async def test_C_Repo_Atomic_Terminal(session_repo, sample_session):
 
 
 # -- C-Repo-Find-NamedTuple: find_running_background returns BgSessionRow(4 fields)
-# Round-6 audit P1 fix: prior body had `if rows:` guard — when
-# `find_running_background()` returns [] (PR-0 baseline: no BG sessions seeded),
-# every assertion is skipped, producing silent XPASS.  Converted to explicit
-# placeholder pattern matching C-Restart-1/2 / C-Notif-Reuse.
-@pytest.mark.xfail(strict=False, reason="PR-2: find_running_background not yet implemented")
-async def test_C_Repo_Find_NamedTuple(session_repo, sample_user):
-    pytest.fail(
-        "placeholder — flip when PR-2 ships SessionRepository.find_running_background. "
-        "Implementation must:\n"
-        "  (1) pre-seed at least 1 BG running session row for sample_user "
-        "(execution_mode='background', execution_phase='running')\n"
-        "  (2) call `rows = await session_repo.find_running_background()` "
-        "(NO user_id param per spec v3 §7.1)\n"
-        "  (3) assert rows is non-empty (len >= 1) — guards against silent XPASS\n"
-        "  (4) assert `isinstance(row, BgSessionRow)` for each row\n"
-        "  (5) assert each row has 4 fields: session_id (str), task_id "
-        "(str | None), user_id (str), status (SessionStatus)\n"
-        "Per spec v3 §7.1 + round-2 P1#5 (4-field NamedTuple with task_id)."
+async def test_C_Repo_Find_NamedTuple(session_repo, make_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.domain.models.session import SessionStatus
+    from app.domain.repositories.session_repository import BgSessionRow
+
+    session = await make_session(
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        execution_phase="running",
+        task_id=None,
+    )
+    rows = await session_repo.find_running_background()
+    assert rows
+    row = next(row for row in rows if row.session_id == session.id)
+    assert isinstance(row, BgSessionRow)
+    assert row.session_id == session.id
+    assert row.task_id is None
+    assert row.user_id == session.user_id
+    assert row.status == SessionStatus.RUNNING
+    sid, task_id, uid, status = row
+    assert (sid, task_id, uid, status) == (
+        session.id,
+        None,
+        session.user_id,
+        SessionStatus.RUNNING,
     )
 
 

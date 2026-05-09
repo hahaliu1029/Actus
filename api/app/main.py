@@ -260,32 +260,64 @@ async def lifespan(app: FastAPI):
         )
         logger.info("AgentService 单例初始化完成")
 
+        from app.domain.services.idle_watchdog import IdleWatchdog
+
+        app.state.supervisor = app.state.agent_service._supervisor
+        app.state.idle_watchdog = IdleWatchdog(
+            redis_client=redis_client,
+            supervisor=app.state.supervisor,
+            uow_factory=get_uow,
+        )
+        app.state.agent_service._idle_watchdog = app.state.idle_watchdog
+        await app.state.supervisor.script_load_all()
+        await app.state.supervisor.reconcile_running_background_at_boot(
+            notification_emitter=getattr(
+                app.state.agent_service,
+                "_memory_notification_emitter",
+                None,
+            )
+        )
+        app.state.idle_watchdog.start()
+        logger.info("ExecutionSupervisor / IdleWatchdog 单例初始化完成")
+
         # 11. 启动 Confirmation Sweep 后台任务（扫描超时的危险工具确认）
         app.state.agent_service.start_sweep_task()
         logger.info("Confirmation sweep task 已启动")
 
         # Clean stale FINISHING sessions (best-effort: deferred_final_state lost on restart)
         try:
-            from sqlalchemy import update
-            from app.infrastructure.models.session import SessionModel
             from datetime import datetime, timedelta
+
+            from sqlalchemy import select
+
+            from app.domain.models.session import SessionStatus
+            from app.infrastructure.models.session import SessionModel
+            from app.infrastructure.repositories.db_session_repository import (
+                DBSessionRepository,
+            )
 
             stale_threshold = datetime.now() - timedelta(seconds=120)
             async with postgres_client.session_factory() as db_session:
                 stmt = (
-                    update(SessionModel)
-                    .where(
+                    select(SessionModel.id).where(
                         SessionModel.status == "finishing",
                         SessionModel.updated_at < stale_threshold,
                     )
-                    .values(status="completed", completed_at=datetime.now())
                 )
                 result = await db_session.execute(stmt)
+                session_ids = [str(row.id) for row in result.all()]
+                repo = DBSessionRepository(db_session=db_session)
+                for session_id in session_ids:
+                    await repo.update_to_terminal(
+                        session_id,
+                        SessionStatus.COMPLETED,
+                        "server_restart",
+                    )
                 await db_session.commit()
-                if result.rowcount > 0:
+                if session_ids:
                     logger.warning(
                         "postprocess_skipped_on_restart: cleaned %d stale FINISHING sessions",
-                        result.rowcount,
+                        len(session_ids),
                     )
         except Exception as e:
             logger.warning("Failed to clean stale FINISHING sessions: %s", e)
@@ -331,6 +363,9 @@ async def lifespan(app: FastAPI):
     finally:
         try:
             logger.info("Manus应用正在关闭")
+            idle_watchdog = getattr(app.state, "idle_watchdog", None)
+            if idle_watchdog is not None:
+                await idle_watchdog.stop()
             agent_svc = getattr(app.state, "agent_service", None)
             if agent_svc:
                 await asyncio.wait_for(agent_svc.shutdown(), timeout=30.0)

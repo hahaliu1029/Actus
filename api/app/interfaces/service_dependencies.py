@@ -571,6 +571,14 @@ def _build_agent_service(
         return (breaker, daily_cap)
 
     memory_gate_breaker, memory_gate_daily_cap = _build_memory_gate_deps(snapshot)
+    from app.domain.services.execution_supervisor import ExecutionSupervisor
+    from app.infrastructure.observability import OtelMeter
+
+    supervisor = ExecutionSupervisor(
+        redis_client=redis_client,
+        uow_factory=get_uow,
+        meter=OtelMeter(),
+    )
     # Notification emitter is always constructible (DB-only, no Redis
     # dep); gate-off deployments just never call it.
     agent_svc = AgentService(
@@ -599,6 +607,7 @@ def _build_agent_service(
         event_recovery=RedisEventRecovery(),
         sandbox_lifecycle_service=sandbox_lifecycle_service,
     )
+    agent_svc._supervisor = supervisor
     _last_refresh_generation = _config_generation
     return agent_svc
 
@@ -658,6 +667,16 @@ def get_agent_service(request: HTTPConnection) -> AgentService:
         logger.info("AgentService config refreshed (generation=%d)", gen)
 
     return agent_svc
+
+
+def get_supervisor(request: HTTPConnection):
+    """Return the lifespan-scoped ExecutionSupervisor singleton."""
+    return request.app.state.supervisor
+
+
+def get_idle_watchdog(request: HTTPConnection):
+    """Return the lifespan-scoped IdleWatchdog singleton."""
+    return request.app.state.idle_watchdog
 
 
 def get_skill_export_service() -> SkillExportService:

@@ -519,6 +519,14 @@ def test_build_agent_service_passes_memory_deps(monkeypatch) -> None:
     """_build_agent_service passes memory deps through to AgentService."""
     from app.infrastructure.repositories.db_memory_chunk_repository import DBMemoryChunkRepository
 
+    class _FakeMeter:
+        def __init__(self) -> None:
+            self.created_counters: list[str] = []
+
+        def create_counter(self, name: str):
+            self.created_counters.append(name)
+            return MagicMock()
+
     app_config = AppConfig(
         llm_config=LLMConfig(
             base_url="https://api.openai.com/v1",
@@ -540,6 +548,11 @@ def test_build_agent_service_passes_memory_deps(monkeypatch) -> None:
     monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
     monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
+    fake_meter = _FakeMeter()
+
+    import app.infrastructure.observability as observability
+
+    monkeypatch.setattr(observability, "OtelMeter", lambda: fake_meter)
 
     mock_session_factory = MagicMock()
     mock_postgres = MagicMock()
@@ -564,6 +577,7 @@ def test_build_agent_service_passes_memory_deps(monkeypatch) -> None:
     assert service.kwargs["memory_embedding_provider"] is mock_provider
     assert service.kwargs["memory_session_factory"] is mock_session_factory
     assert service.kwargs["memory_repo_factory"] is DBMemoryChunkRepository
+    assert "actus_supervisor_admit_total" in fake_meter.created_counters
 
 
 # ── PR-2 regression: get_memory_management_service handles uninitialized Redis ──

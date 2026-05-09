@@ -1,10 +1,8 @@
-"""B3-core PR-0: 5 PG schema/CHECK/index anchors (xfail).
+"""B3-core PR-2: 5 PG schema/CHECK/index anchors.
 
 Spec v3 §3.1 + §8.1 (group C-PG-*).
 
-PR-2 ``b3p2_add_session_supervisor_columns`` migration ships the schema.
-These anchors flip from ``xfail`` → ``xpass`` when the migration is
-applied.
+PR-2 ``b3p2_supervisor_columns`` migration ships the schema.
 
 Spec basis: docs/superpowers/specs/2026-05-07-b3-core-design.md
 Plan basis: docs/superpowers/plans/2026-05-07-b3-core-pr0-plan.md (Task 4).
@@ -18,7 +16,6 @@ pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
 # -- C-PG-1: 9 supervisor columns exist on `sessions` table --------------------
-@pytest.mark.xfail(strict=False, reason="PR-2 b3p2 migration not yet applied")
 async def test_C_PG_1_supervisor_columns_exist(db_session):
     expected = {
         "execution_mode", "background_reason", "expires_at", "last_activity_at",
@@ -37,7 +34,6 @@ async def test_C_PG_1_supervisor_columns_exist(db_session):
 # Round-3 audit P1#7 fix: assert all 11 supervisor CHECK constraints, not 6.
 # Spec v3 §3.1 lines 67-82 enumerates 11 CHECKs.  Using subset tolerated only
 # 6 — could silently miss the 5 mode/phase coupling CHECKs.
-@pytest.mark.xfail(strict=False, reason="PR-2 CHECK constraints not yet applied")
 async def test_C_PG_2_eleven_check_constraints(db_session):
     result = await db_session.execute(text(
         "SELECT conname FROM pg_constraint "
@@ -78,7 +74,6 @@ async def test_C_PG_2_eleven_check_constraints(db_session):
 # not just index names.  Prior version verified names but left WHERE clause
 # correctness uncovered — a future migration could land an index with the
 # right name but the wrong predicate and pass.
-@pytest.mark.xfail(strict=False, reason="PR-2 partial indexes not yet applied")
 async def test_C_PG_3_three_partial_indexes(db_session):
     result = await db_session.execute(text(
         "SELECT indexname, indexdef FROM pg_indexes "
@@ -110,34 +105,34 @@ async def test_C_PG_3_three_partial_indexes(db_session):
 
 
 # -- C-PG-4: T7 transition does NOT clear was_background -----------------------
-# Round-6 audit P2 fix: prior body had `# ... (full setup) ...` placeholder
-# without ever inserting a real session row.  `update_supervisor_fields` on a
-# non-existent UUID would silently affect 0 rows; subsequent `get_by_id` returns
-# None, leading to AttributeError on `fresh.execution_mode` — erratic xfail
-# signal.  Converted to explicit placeholder.
-@pytest.mark.xfail(strict=False, reason="PR-2 T7 reconnect path not yet implemented")
-async def test_C_PG_4_t7_preserves_was_background(session_repo, sample_user):
-    import pytest as _pytest
+# Round-6 audit P2 fix: this seeds a real background row before testing the
+# T7 field update, so the assertion covers durable `was_background` retention.
+async def test_C_PG_4_t7_preserves_was_background(
+    session_repo, make_session
+):
+    from datetime import datetime, timedelta, timezone
 
-    _pytest.fail(
-        "placeholder — flip when PR-2 ships T7 reconnect path. "
-        "Implementation must:\n"
-        "  (1) INSERT a real session row for sample_user (status=running, "
-        "execution_mode=background, was_background=True, "
-        "expires_at=NOW+2h, background_reason='explicit')\n"
-        "  (2) invoke T7 transition: `update_supervisor_fields(sid, "
-        "execution_mode='foreground', background_reason=None, expires_at=None)` "
-        "(was_background NOT passed → stays True)\n"
-        "  (3) re-read row: assert execution_mode='foreground'\n"
-        "  (4) assert was_background is True (PERSISTENT flag survives T7 — "
-        "spec v3 §3.1 + round-2 P0-2 fix)\n"
-        "  (5) optionally assert background_reason is None and expires_at is None\n"
-        "Per spec v3 §3.1 + round-2 P0-2."
+    session = await make_session(
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        was_background=True,
     )
+    await session_repo.update_supervisor_fields(
+        session.id,
+        execution_mode="foreground",
+        background_reason=None,
+        expires_at=None,
+    )
+    fresh = await session_repo.get_by_id(session.id)
+    assert fresh is not None
+    assert fresh.execution_mode == "foreground"
+    assert fresh.background_reason is None
+    assert fresh.expires_at is None
+    assert fresh.was_background is True
 
 
 # -- C-PG-5: Terminal status implies execution_phase='terminated' --------------
-@pytest.mark.xfail(strict=False, reason="PR-2 update_to_terminal not yet implemented")
 async def test_C_PG_5_terminal_status_phase_invariant(session_repo, sample_session):
     from app.domain.models.session import SessionStatus
 
