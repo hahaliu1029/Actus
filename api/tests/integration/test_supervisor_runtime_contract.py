@@ -7,6 +7,15 @@ import pytest
 pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
+class _CancelableTask:
+    def __init__(self) -> None:
+        self.cancel_calls: list[str] = []
+
+    def cancel(self, reason: str = "stop") -> bool:
+        self.cancel_calls.append(reason)
+        return True
+
+
 async def test_update_status_rejects_terminal_status(session_repo, sample_session):
     from app.domain.models.session import SessionStatus
 
@@ -48,13 +57,24 @@ async def test_idle_watchdog_scan_suspends_stale_background_session(
 ):
     from app.domain.models.session import SessionStatus
 
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
     session = await make_session(
         status=SessionStatus.RUNNING.value,
         execution_mode="background",
         background_reason="explicit",
-        expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        expires_at=expires_at,
         execution_phase="running",
     )
+    supervisor = agent_service_with_redis._supervisor
+    await supervisor.admit(
+        session_id=session.id,
+        user_id=sample_user.id,
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=expires_at,
+    )
+    task = _CancelableTask()
+    supervisor._register_runner(session.id, task)
     await redis_client.hset(
         f"supervisor:hot:{session.id}",
         mapping={
@@ -70,6 +90,10 @@ async def test_idle_watchdog_scan_suspends_stale_background_session(
     assert fresh.status == SessionStatus.RUNNING
     assert fresh.execution_phase == "suspended"
     assert fresh.suspended_reason == "bg_idle_timeout"
+    assert task.cancel_calls == ["supervisor_suspend"]
+    assert session.id not in supervisor._runners
+    assert await redis_client.zscore(f"supervisor:bg:{sample_user.id}", session.id)
+    assert int(await redis_client.get("supervisor:system:bg_count") or 0) == 1
 
 
 async def test_idle_watchdog_expired_sweep_terminates_and_revokes_slots(

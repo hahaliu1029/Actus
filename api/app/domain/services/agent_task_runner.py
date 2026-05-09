@@ -3254,7 +3254,11 @@ class AgentTaskRunner(TaskRunner):
                 cancel_reason = getattr(task, "cancel_reason", "stop")
                 logger.info("AgentTaskRunner任务运行取消，reason=%s", cancel_reason)
 
-                if cancel_reason in {"takeover_start", "takeover_timeout"}:
+                if cancel_reason in {
+                    "takeover_start",
+                    "takeover_timeout",
+                    "supervisor_suspend",
+                }:
                     raise
 
                 if cancel_reason == "session_delete":

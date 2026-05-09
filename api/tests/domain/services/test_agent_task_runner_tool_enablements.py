@@ -40,9 +40,18 @@ def anyio_backend() -> str:
 class _NoopSessionRepository:
     def __init__(self) -> None:
         self.status_updates: list[tuple[str, object]] = []
+        self.terminal_updates: list[tuple[str, object, str]] = []
 
     async def update_status(self, session_id: str, status) -> None:
         self.status_updates.append((session_id, status))
+
+    async def update_to_terminal(
+        self,
+        session_id: str,
+        status,
+        terminal_reason: str,
+    ) -> None:
+        self.terminal_updates.append((session_id, status, terminal_reason))
 
     async def add_event(self, session_id: str, event) -> None:
         return None

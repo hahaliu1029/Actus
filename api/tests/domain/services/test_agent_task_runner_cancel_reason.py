@@ -196,6 +196,22 @@ async def test_cancel_reason_takeover_start_skips_done_event_and_completed_statu
     assert task.output_stream.events == []
 
 
+async def test_cancel_reason_supervisor_suspend_skips_done_event_and_completed_status() -> None:
+    runner = _build_runner("session-supervisor-suspend")
+    task = _DummyTask(cancel_reason="supervisor_suspend")
+    _prime_runner_for_loop_cancellation(runner, task)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.invoke(task)
+
+    await asyncio.sleep(0)
+
+    assert runner._uow.session.status_updates == [
+        ("session-supervisor-suspend", SessionStatus.RUNNING),
+    ]
+    assert task.output_stream.events == []
+
+
 async def test_cancel_reason_session_delete_skips_done_and_completed_status() -> None:
     runner = _build_runner("session-delete")
     task = _DummyTask(cancel_reason="session_delete")

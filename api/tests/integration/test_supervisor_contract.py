@@ -30,8 +30,10 @@ Plan basis: docs/superpowers/plans/2026-05-07-b3-core-pr0-plan.md (Task 3).
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -476,16 +478,70 @@ async def test_C_Repo_Find_NamedTuple(session_repo, make_session):
     )
 
 
+class _CancelInputStream:
+    def __init__(self) -> None:
+        self._calls = 0
+
+    async def is_empty(self) -> bool:
+        self._calls += 1
+        return self._calls > 1
+
+    async def pop(self):
+        return None, None
+
+
+class _CancelOutputStream:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    async def put(self, event_json: str) -> str:
+        self.events.append(event_json)
+        return f"event-{len(self.events)}"
+
+
+class _CancelTask:
+    def __init__(self, cancel_reason: str) -> None:
+        self.cancel_reason = cancel_reason
+        self.input_stream = _CancelInputStream()
+        self.output_stream = _CancelOutputStream()
+
+
+async def _cancel_flow(_message):
+    raise asyncio.CancelledError
+    if False:
+        yield None
+
+
+def _prime_runner_for_cancel(runner) -> None:
+    from app.domain.models.event import MessageEvent
+    from app.domain.models.user_tool_enablement import ToolType
+
+    async def _empty_preferences(_tool_type: ToolType):
+        return {}
+
+    runner._pop_event = AsyncMock(return_value=MessageEvent(message="hello"))
+    runner._run_flow = _cancel_flow
+    runner._load_user_preferences_map = AsyncMock(side_effect=_empty_preferences)
+    runner._load_enabled_skills = AsyncMock(return_value=[])
+    runner._apply_preselected_skills = AsyncMock()
+    runner._skill_bundle_sync.prepare_startup_sync = AsyncMock()
+    runner._skill_bundle_sync.await_initial_sync = AsyncMock()
+    runner._skill_bundle_sync.start_background_sync = MagicMock()
+    runner._select_skills_from_pool = MagicMock(return_value=[])
+    runner._select_skills_for_message = AsyncMock(return_value=([], None))
+
+
 # -- C-FINISHING-1: cancel_reason='supervisor_suspend' bypasses _set_terminal_status
-@pytest.mark.xfail(strict=False, reason="PR-3a: bypass tuple extension not yet shipped")
 async def test_C_FINISHING_1_supervisor_suspend_bypasses_terminal(
-    runner_factory, session_repo, sample_user,
+    runner_factory, session_repo, sample_user, make_session,
 ):
     from app.domain.models.session import SessionStatus
 
     sid = str(uuid.uuid4())
+    await make_session(id=sid, status=SessionStatus.RUNNING.value)
     runner = runner_factory(session_id=sid, user_id=sample_user.id)
-    runner.cancel_reason = "supervisor_suspend"
+    task = _CancelTask(cancel_reason="supervisor_suspend")
+    _prime_runner_for_cancel(runner)
 
     called = []
     original_set_terminal = runner._set_terminal_status
@@ -495,14 +551,17 @@ async def test_C_FINISHING_1_supervisor_suspend_bypasses_terminal(
         return await original_set_terminal(*a, **kw)
     runner._set_terminal_status = tracked
 
-    await runner._handle_cancel()  # exact method name per actual runner
+    with pytest.raises(asyncio.CancelledError):
+        await runner.invoke(task)
+    await asyncio.sleep(0)
+
     assert not called, f"_set_terminal_status was called for supervisor_suspend: {called}"
+    assert task.output_stream.events == []
     fresh = await session_repo.get_by_id(sid)
     assert fresh.status == SessionStatus.RUNNING
 
 
 # -- C-Callback-Compose: try/finally — supervisor cleanup runs even when original raises
-@pytest.mark.xfail(strict=False, reason="PR-3a: composed callback not yet shipped")
 async def test_C_Callback_Compose_supervisor_cleanup_on_original_raise(
     agent_service_with_redis, sample_user, redis_client,
 ):

@@ -412,19 +412,68 @@ async def _no_op_callback(session_id: str) -> None:
 async def runner_factory(db_session, sample_user):
     """Factory that constructs ``AgentTaskRunner`` instances with realistic deps.
 
-    Used by C-FINISHING-1 / C-Callback-Compose anchors.  At PR-0 the factory
-    body raises ``NotImplementedError`` because constructing a real
-    ``AgentTaskRunner`` requires the full ExecutionSupervisor surface that
-    PR-2 builds.  Anchor tests are xfail until then.
+    Used by C-FINISHING-1 / C-Notif-Watchdog anchors.
     """
+    from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
+    from app.infrastructure.repositories.db_session_repository import (
+        DBSessionRepository,
+    )
+
+    class _SameSessionUow:
+        def __init__(self):
+            self.db_session = db_session
+            self.session = DBSessionRepository(db_session=db_session)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+    class _NoopSandbox:
+        async def ensure_sandbox(self) -> None:
+            return None
+
+    class _NoopTool:
+        manager = None
+
+        async def initialize(self, *_args, **_kwargs) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            return None
+
+    def _uow_factory():
+        return _SameSessionUow()
+
     constructed: list = []
 
     def _factory(*, session_id: str, user_id: str | None = None, **overrides):
-        from app.domain.services.agent_task_runner import AgentTaskRunner  # noqa: F401
+        from app.domain.services.agent_task_runner import AgentTaskRunner
 
-        raise NotImplementedError(
-            "PR-2 wires real AgentTaskRunner construction; PR-0 anchor tests are xfail"
+        runner = AgentTaskRunner(
+            uow_factory=_uow_factory,
+            llm=object(),
+            agent_config=AgentConfig(
+                max_iterations=100,
+                max_retries=3,
+                max_search_results=10,
+            ),
+            mcp_config=MCPConfig(mcpServers={}),
+            a2a_config=A2AConfig(a2a_servers=[]),
+            session_id=session_id,
+            user_id=user_id or sample_user.id,
+            file_storage=object(),
+            browser=object(),
+            search_engine=object(),
+            sandbox=_NoopSandbox(),
+            **overrides,
         )
+        runner._mcp_tool = _NoopTool()
+        runner._a2a_tool = _NoopTool()
+        runner._skill_tool = _NoopTool()
+        constructed.append(runner)
+        return runner
 
     yield _factory
     # Optional cleanup — cancel any still-running runners

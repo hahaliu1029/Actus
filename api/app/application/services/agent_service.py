@@ -404,7 +404,11 @@ class AgentService:
             confirmation_manager=confirmation_manager_inst,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
-            on_session_complete=self._on_task_runner_complete,
+            on_session_complete=self._compose_completion_callbacks(
+                original=self._on_task_runner_complete,
+                session_id=session.id,
+                user_id=str(session.user_id),
+            ),
             # A7 Task 2.7: forward the LLM's ProviderProfile so
             # ``_build_image_blocks`` can honor ``accepts_image_url``.
             # ActusChatModel / ActusResponsesModel / ActusFallbackChatModel all
@@ -430,6 +434,13 @@ class AgentService:
                 await uow.session.save(persisted_session)
             else:
                 await uow.session.save(session)
+
+        supervisor = getattr(self, "_supervisor", None)
+        if supervisor is not None:
+            supervisor._register_runner(
+                session_id=session.id,
+                runner=task,
+            )
 
         # PR2 §10: register a live event sink so lifecycle events reach the SSE
         # stream in real-time (not just PG recovery poll).
@@ -465,6 +476,63 @@ class AgentService:
             self._sandbox_lifecycle_service.registry.release_live_event_sink(
                 session_id
             )
+
+    def _compose_completion_callbacks(
+        self,
+        *,
+        original: Callable[[str], Any],
+        session_id: str,
+        user_id: str,
+    ) -> Callable[[str], Any]:
+        async def composed(passed_session_id: str) -> None:
+            if passed_session_id != session_id:
+                raise AssertionError(
+                    "composed callback session_id mismatch: "
+                    f"expected={session_id} got={passed_session_id}"
+                )
+
+            cancel_reason: str | None = None
+            redis_client = getattr(self, "_redis_client", None)
+            redis = (
+                redis_client.client
+                if redis_client is not None and hasattr(redis_client, "client")
+                else redis_client
+            )
+            if redis is not None:
+                try:
+                    hot = await redis.hgetall(f"supervisor:hot:{session_id}")
+                    raw = hot.get("pending_terminal_reason") or hot.get(
+                        b"pending_terminal_reason"
+                    )
+                    if raw is not None:
+                        cancel_reason = (
+                            raw.decode() if isinstance(raw, bytes) else raw
+                        )
+                except Exception:
+                    logger.warning(
+                        "compose: failed to read pending_terminal_reason for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+
+            try:
+                await original(passed_session_id)
+            finally:
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    try:
+                        await supervisor._on_runner_session_complete(
+                            session_id=session_id,
+                            user_id=user_id,
+                            cancel_reason=cancel_reason,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "supervisor cleanup failed for session=%s",
+                            session_id,
+                        )
+
+        return composed
 
     async def _safe_update_unread_count(self, session_id: str) -> None:
         """在独立的后台任务中安全地更新未读消息计数

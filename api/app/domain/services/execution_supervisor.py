@@ -155,12 +155,20 @@ class ExecutionSupervisor:
         self._meter_inc("auto_degrade")
 
     async def suspend_idle(self, *, session_id: str, user_id: str) -> None:
-        del user_id
         async with self._repo_context() as repo:
             await repo.update_supervisor_fields(
                 session_id,
                 execution_phase="suspended",
                 suspended_reason="bg_idle_timeout",
+            )
+        if self._cancel_registered_runner(
+            session_id,
+            reason="supervisor_suspend",
+        ):
+            await self._on_runner_session_complete(
+                session_id=session_id,
+                user_id=user_id,
+                cancel_reason="supervisor_suspend",
             )
         self._meter_inc("idle_suspend")
 
@@ -371,14 +379,57 @@ class ExecutionSupervisor:
     def _register_runner(self, session_id: str, runner: object) -> None:
         self._runners[session_id] = runner
 
+    def _unregister_runner(self, session_id: str) -> None:
+        self._runners.pop(session_id, None)
+
+    def _cancel_registered_runner(self, session_id: str, *, reason: str) -> bool:
+        runner = self._runners.get(session_id)
+        if runner is None:
+            return False
+        cancel = getattr(runner, "cancel", None)
+        if cancel is None:
+            logger.warning(
+                "supervisor suspend found non-cancelable runner for session=%s",
+                session_id,
+            )
+            return False
+        try:
+            return bool(cancel(reason=reason))
+        except Exception:
+            logger.exception(
+                "supervisor failed to cancel live runner for session=%s",
+                session_id,
+            )
+            return False
+
     async def _on_runner_session_complete(
         self,
         *,
         session_id: str,
         user_id: str,
+        cancel_reason: str | None = None,
     ) -> None:
-        await self._lua_revoke(session_id=session_id, user_id=user_id, reason="natural")
-        self._runners.pop(session_id, None)
+        try:
+            self._unregister_runner(session_id)
+            if cancel_reason == "supervisor_suspend":
+                logger.info(
+                    "supervisor cleanup: skip LUA_REVOKE for supervisor_suspend session=%s",
+                    session_id,
+                )
+                self._meter_inc("revoke", reason="supervisor_suspend_skip")
+                return
+
+            await self._lua_revoke(
+                session_id=session_id,
+                user_id=user_id,
+                reason=cancel_reason or "natural",
+            )
+        except Exception:
+            logger.exception(
+                "supervisor cleanup hook failed for session=%s reason=%s",
+                session_id,
+                cancel_reason,
+            )
 
     async def _lua_revoke(self, *, session_id: str, user_id: str, reason: str) -> int:
         rc = await run_lua_with_fallback(
