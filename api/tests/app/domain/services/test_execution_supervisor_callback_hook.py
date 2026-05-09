@@ -16,6 +16,29 @@ def _build_supervisor() -> ExecutionSupervisor:
     return ExecutionSupervisor(redis_client=object(), session_repository=object())
 
 
+class _RecordingRedis:
+    def __init__(self, *, hincrby_value: int = 1) -> None:
+        self.hincrby_value = hincrby_value
+        self.hincrby_calls: list[tuple[str, str, int]] = []
+        self.expire_calls: list[tuple[str, int]] = []
+        self.hset_calls: list[tuple[str, str, int]] = []
+
+    async def hincrby(self, key: str, field: str, amount: int) -> int:
+        self.hincrby_calls.append((key, field, amount))
+        return self.hincrby_value
+
+    async def expire(self, key: str, seconds: int) -> None:
+        self.expire_calls.append((key, seconds))
+
+    async def hset(self, key: str, field: str, value: int) -> None:
+        self.hset_calls.append((key, field, value))
+
+
+class _BrokenRedis:
+    async def hincrby(self, key: str, field: str, amount: int) -> int:
+        raise RuntimeError("redis bounced")
+
+
 class _Repo:
     def __init__(self) -> None:
         self.updates: list[tuple[str, dict[str, str]]] = []
@@ -31,6 +54,50 @@ class _CancelableTask:
     def cancel(self, reason: str = "stop") -> bool:
         self.cancel_calls.append(reason)
         return True
+
+
+async def test_inflight_inc_swallow_redis_error() -> None:
+    supervisor = ExecutionSupervisor(
+        redis_client=_BrokenRedis(), session_repository=object()
+    )
+
+    value = await supervisor.inflight_inc(session_id="session-1", kind="llm")
+
+    assert value == 0
+
+
+async def test_inflight_dec_swallow_redis_error() -> None:
+    supervisor = ExecutionSupervisor(
+        redis_client=_BrokenRedis(), session_repository=object()
+    )
+
+    value = await supervisor.inflight_dec(session_id="session-1", kind="llm")
+
+    assert value == 0
+
+
+async def test_inflight_dec_does_not_refresh_hot_hash_ttl() -> None:
+    redis = _RecordingRedis(hincrby_value=2)
+    supervisor = ExecutionSupervisor(redis_client=redis, session_repository=object())
+
+    value = await supervisor.inflight_dec(session_id="session-1", kind="llm")
+
+    assert value == 2
+    assert redis.hincrby_calls == [
+        ("supervisor:hot:session-1", "inflight_llm_count", -1)
+    ]
+    assert redis.expire_calls == []
+
+
+async def test_inflight_dec_preserves_negative_value_for_drift_observation() -> None:
+    redis = _RecordingRedis(hincrby_value=-1)
+    supervisor = ExecutionSupervisor(redis_client=redis, session_repository=object())
+
+    value = await supervisor.inflight_dec(session_id="session-1", kind="llm")
+
+    assert value == -1
+    assert redis.hset_calls == []
+    assert redis.expire_calls == []
 
 
 async def test_suspend_idle_cancels_live_task_with_supervisor_suspend(

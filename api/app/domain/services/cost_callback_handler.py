@@ -788,3 +788,134 @@ class CostCallbackHandler(AsyncCallbackHandler):
                 record.run_id,
                 marker_exc,
             )
+
+
+class SupervisorAwareCallbackHandler(CostCallbackHandler):
+    """Cost handler extension that mirrors LLM in-flight work to supervisor."""
+
+    def __init__(
+        self,
+        *,
+        supervisor: Any,
+        session_id: str,
+        user_id: str,
+        persister: Persister,
+        max_pending: int = 10_000,
+    ) -> None:
+        super().__init__(
+            session_id=session_id,
+            user_id=user_id,
+            persister=persister,
+            max_pending=max_pending,
+        )
+        self._supervisor = supervisor
+
+    async def _inflight_inc(self) -> None:
+        try:
+            await self._supervisor.inflight_inc(
+                session_id=self.session_id, kind="llm"
+            )
+        except Exception:
+            logger.warning(
+                "SupervisorAwareCallbackHandler: inflight_inc failed "
+                "for session_id=%s",
+                self.session_id,
+                exc_info=True,
+            )
+
+    async def _inflight_dec(self) -> None:
+        try:
+            await self._supervisor.inflight_dec(
+                session_id=self.session_id, kind="llm"
+            )
+        except Exception:
+            logger.warning(
+                "SupervisorAwareCallbackHandler: inflight_dec failed "
+                "for session_id=%s",
+                self.session_id,
+                exc_info=True,
+            )
+
+    async def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: List[List[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        await self._inflight_inc()
+        await super().on_chat_model_start(
+            serialized,
+            messages,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            tags=tags,
+            metadata=metadata,
+            **kwargs,
+        )
+
+    async def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: List[str],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        await self._inflight_inc()
+        await super().on_llm_start(
+            serialized,
+            prompts,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            tags=tags,
+            metadata=metadata,
+            **kwargs,
+        )
+
+    async def on_llm_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            await super().on_llm_error(
+                error,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                tags=tags,
+                **kwargs,
+            )
+        finally:
+            await self._inflight_dec()
+
+    async def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            await super().on_llm_end(
+                response,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                tags=tags,
+                **kwargs,
+            )
+        finally:
+            await self._inflight_dec()

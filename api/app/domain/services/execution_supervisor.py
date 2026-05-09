@@ -348,9 +348,18 @@ class ExecutionSupervisor:
         kind: Literal["llm", "tool"],
     ) -> int:
         field = f"inflight_{kind}_count"
-        value = await self._redis.hincrby(self._hot_key(session_id), field, 1)
-        await self._redis.expire(self._hot_key(session_id), _HOT_TTL_SECONDS)
-        return int(value)
+        try:
+            value = await self._redis.hincrby(self._hot_key(session_id), field, 1)
+            await self._redis.expire(self._hot_key(session_id), _HOT_TTL_SECONDS)
+            return int(value)
+        except Exception:
+            logger.warning(
+                "inflight_inc failed for %s/%s",
+                session_id,
+                kind,
+                exc_info=True,
+            )
+            return 0
 
     async def inflight_dec(
         self,
@@ -360,13 +369,19 @@ class ExecutionSupervisor:
     ) -> int:
         field = f"inflight_{kind}_count"
         key = self._hot_key(session_id)
-        value = int(await self._redis.hincrby(key, field, -1))
-        if value < 0:
-            await self._redis.hset(key, field, 0)
-            self._meter_inc("inflight_negative")
-            value = 0
-        await self._redis.expire(key, _HOT_TTL_SECONDS)
-        return value
+        try:
+            value = int(await self._redis.hincrby(key, field, -1))
+            if value < 0:
+                self._meter_inc("inflight_negative", kind=kind)
+            return value
+        except Exception:
+            logger.warning(
+                "inflight_dec failed for %s/%s",
+                session_id,
+                kind,
+                exc_info=True,
+            )
+            return 0
 
     async def get_inflight_counts(self, *, session_id: str) -> tuple[int, int]:
         values = await self._redis.hmget(
