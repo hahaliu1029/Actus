@@ -7,7 +7,7 @@ import {
 } from "../session-store";
 import type { SessionEventRecord } from "../session-store";
 import type { sessionApi } from "../../api/session";
-import type { ChatParams, SSEEventHandler } from "../../api/types";
+import type { ChatParams, SSEEventData, SSEEventHandler } from "../../api/types";
 
 type SessionApi = typeof sessionApi;
 
@@ -689,6 +689,48 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
 
     await vi.advanceTimersByTimeAsync(3000);
     expect(sessionApi.getEventsSince).not.toHaveBeenCalled();
+  });
+
+  it("does NOT trigger recovery when stream ends after OwnerConflictEvent", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+    useSessionStore.setState({
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "waiting",
+        events: [],
+      },
+    });
+
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "owner_conflict",
+      data: {
+        event_id: "evt-owner-conflict",
+        payload: {
+          current_owner_connection_id: "user-1:tab-1",
+          conflicting_connection_id: "user-1:tab-2",
+          session_id: "s1",
+          suggested_action: "wait_lease_expire",
+        },
+      },
+    } as SSEEventData);
+    cbs.onClose();
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(sessionApi.getEventsSince).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().currentSession?.status).toBe("waiting");
+    expect(useSessionStore.getState().currentSession?.events.at(-1)).toMatchObject({
+      event: "owner_conflict",
+      data: {
+        payload: {
+          current_owner_connection_id: "user-1:tab-1",
+          conflicting_connection_id: "user-1:tab-2",
+          session_id: "s1",
+        },
+      },
+    });
   });
 
   it("shows error and does NOT trigger recovery when stream never connected", async () => {

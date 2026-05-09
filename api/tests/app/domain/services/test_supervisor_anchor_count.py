@@ -27,12 +27,17 @@ B3_CORE_ANCHOR_FILES = [
 
 
 def _find_repo_root() -> Path:
-    """Walk up until the CLAUDE.md marker is reached (P3-1 fix).
+    """Walk up until the current checkout root is reached (P3-1 fix).
 
-    Avoids the brittle ``parents[N]`` depth count if test files move.
+    Prefer the git marker so nested worktrees under another checkout do not
+    accidentally resolve to the outer repository's CLAUDE.md.
     """
     cur = Path(__file__).resolve()
-    while cur.parent != cur and not (cur / "CLAUDE.md").exists():
+    while (
+        cur.parent != cur
+        and not (cur / ".git").exists()
+        and not (cur / "CLAUDE.md").exists()
+    ):
         cur = cur.parent
     return cur
 
@@ -90,7 +95,9 @@ def test_anchor_files_have_expected_xfail_decorator_count():
          C-Restart-1/2/NEW, C-Repo-*, C-Redis-2).
       - PR-3a ship: 11 xfail decorators, 23 anchors flipped
         (C-FINISHING-1, C-Callback-Compose).
-      - PR-3b/3c ship: TBD
+      - PR-3b ship: 11 xfail decorators, 23 anchors flipped (no anchor flip).
+      - PR-3c ship: 8 xfail decorators, 26 anchors flipped
+        (C-Cancel-1, C-Auth-1, C-MultiTab-1).
       - PR-4 ship: TBD
 
     Decorator forms covered:
@@ -99,8 +106,8 @@ def test_anchor_files_have_expected_xfail_decorator_count():
     """
     import re
 
-    # PR-3a ship: 11 = 34 - 23 flipped anchors.
-    EXPECTED_XFAIL_COUNT = 11
+    # PR-3c ship: 8 = 34 - 26 flipped anchors.
+    EXPECTED_XFAIL_COUNT = 8
 
     repo_root = _find_repo_root()
     total = 0

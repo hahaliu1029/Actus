@@ -163,7 +163,7 @@ export const sessionApi = {
   },
 
   stopSession: (sessionId: string): Promise<void> => {
-    return post<void>(`/sessions/${sessionId}/stop`, {});
+    return post<void>(`/sessions/${sessionId}/cancel`, {});
   },
 
   deleteSession: (sessionId: string): Promise<void> => {

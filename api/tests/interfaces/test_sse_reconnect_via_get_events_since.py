@@ -19,6 +19,7 @@ Spec: docs/superpowers/specs/2026-04-17-n2-sse-transport-repair-design.md §5.3 
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
 from typing import Any, AsyncGenerator
 
@@ -30,7 +31,11 @@ from app.domain.models.user import User, UserRole, UserStatus
 from app.interfaces.dependencies import rate_limit_chat, rate_limit_read
 from app.interfaces.dependencies.auth import get_current_user
 from app.interfaces.endpoints import session_routes
-from app.interfaces.service_dependencies import get_agent_service
+from app.interfaces.service_dependencies import (
+    get_agent_service,
+    get_session_service,
+    get_supervisor,
+)
 from app.main import app
 
 pytestmark = pytest.mark.anyio
@@ -127,6 +132,22 @@ class _StatefulAgentService:
         }
 
 
+class _NoConflictScope:
+    is_conflict = False
+    current_owner = None
+
+
+class _NoConflictSupervisor:
+    @asynccontextmanager
+    async def subscriber_scope(self, **kwargs: Any):
+        yield _NoConflictScope()
+
+
+class _AllowSessionService:
+    async def get_session(self, **kwargs: Any) -> object:
+        return object()
+
+
 def _parse_sse_chunk(buffer: str) -> tuple[list[dict[str, str]], str]:
     """从 running buffer 切出完整 frame, 返回 (frames, leftover_buffer).
 
@@ -171,6 +192,8 @@ async def test_truncated_read_then_get_events_since_returns_gap(
 
     app.dependency_overrides[get_current_user] = _fake_user
     app.dependency_overrides[get_agent_service] = lambda: service
+    app.dependency_overrides[get_session_service] = lambda: _AllowSessionService()
+    app.dependency_overrides[get_supervisor] = lambda: _NoConflictSupervisor()
     app.dependency_overrides[rate_limit_chat] = _noop_rate_limit
     app.dependency_overrides[rate_limit_read] = _noop_rate_limit
 
@@ -222,6 +245,8 @@ async def test_truncated_read_then_get_events_since_returns_gap(
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         app.dependency_overrides.pop(get_agent_service, None)
+        app.dependency_overrides.pop(get_session_service, None)
+        app.dependency_overrides.pop(get_supervisor, None)
         app.dependency_overrides.pop(rate_limit_chat, None)
         app.dependency_overrides.pop(rate_limit_read, None)
 

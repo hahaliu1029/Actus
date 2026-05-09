@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Dict, Optional
 from urllib.parse import quote
@@ -16,6 +17,8 @@ from app.application.errors.exceptions import (
 )
 from app.application.services.agent_service import AgentService
 from app.application.services.session_service import SessionService
+from app.domain.models.event import OwnerConflictEvent, OwnerConflictPayload
+from app.domain.services.execution_supervisor import ExecutionSupervisor
 from app.interfaces.dependencies import (
     CurrentUser,
     RateLimitBucket,
@@ -30,6 +33,7 @@ from app.interfaces.dependencies import (
 from app.interfaces.schemas import Response
 from app.interfaces.schemas.event import EventMapper
 from app.interfaces.schemas.session import (
+    CancelSessionRequest,
     ChatRequest,
     CreateSessionResponse,
     EndTakeoverRequest,
@@ -52,10 +56,14 @@ from app.interfaces.schemas.session import (
     StartTakeoverRequest,
     StartTakeoverResponse,
 )
-from app.interfaces.service_dependencies import get_agent_service, get_session_service
+from app.interfaces.service_dependencies import (
+    get_agent_service,
+    get_session_service,
+    get_supervisor,
+)
 from app.infrastructure.storage.redis import RedisClient, get_redis
 from core.config import get_settings
-from fastapi import APIRouter, Depends, Response as FastAPIResponse
+from fastapi import APIRouter, Body, Depends, Request, Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -228,23 +236,68 @@ async def delete_session(
 async def chat(
     session_id: str,
     request: ChatRequest,
+    fastapi_request: Request,
     current_user: CurrentUser,
     agent_service: AgentService = Depends(get_agent_service),
+    session_service: SessionService = Depends(get_session_service),
+    supervisor: ExecutionSupervisor = Depends(get_supervisor),
     redis_client: RedisClient = Depends(get_redis),
 ) -> EventSourceResponse:
     """根据传递的会话id+chat请求数据向指定会话发起聊天请求"""
-    # R5b-3 Codex round-2/3 修复：工具确认恢复必须在 EventSourceResponse 之前
-    # 完成 claim/404/409 判定（否则 sse_starlette 已发 200 OK）。同时，preflight
-    # 写 grant / 推 processing 之后到 drive 之间不能留下不可恢复的 claim 洞——
-    # 所以顺序是：① lease 先拿（失败走 rate_limit 的 503/429，不伤 grant），
-    # ② 再 preflight 拿 claim，preflight 失败立刻 release lease 避免泄漏，
-    # ③ 成功进入 EventSourceResponse；drive 里 CancelledError 会触发回滚（agent_service 端保证）。
+    await session_service.get_session(
+        session_id=session_id,
+        user_id=current_user.id,
+        is_admin=current_user.is_admin(),
+    )
+
+    # R5b-3 + B3-core PR-3c: 访问校验通过后、response 前必须先拿连接
+    # lease，再做 owner conflict gate，最后才允许 tool-confirmation preflight
+    # 产生 claim/mark processing/audit 等副作用。非冲突路径仍在
+    # EventSourceResponse 之前完成 preflight 的 404/409/400 判定，避免退化成
+    # 200 后的 SSE 异常。
     lease = await acquire_connection_limit(
         channel=RateLimitChannel.SSE,
         user_id=current_user.id,
         redis_client=redis_client,
     )
     lease.start_heartbeat()
+
+    raw_connection_id = fastapi_request.headers.get("X-Connection-Id")
+    connection_id = f"{current_user.id}:{raw_connection_id or uuid.uuid4()}"
+    subscriber_scope = supervisor.subscriber_scope(
+        session_id=session_id,
+        connection_id=connection_id,
+    )
+    try:
+        scope = await subscriber_scope.__aenter__()
+    except BaseException:
+        await lease.release()
+        raise
+
+    if scope.is_conflict:
+        async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
+            """定义事件生成器，用于配合EventSourceResponse生成流式响应数据"""
+            try:
+                event = OwnerConflictEvent(
+                    payload=OwnerConflictPayload(
+                        current_owner_connection_id=scope.current_owner or "",
+                        conflicting_connection_id=connection_id,
+                        session_id=session_id,
+                    )
+                )
+                sse_event = EventMapper.event_to_sse_event(event)
+                yield ServerSentEvent(
+                    id=event.id,
+                    event=sse_event.event,
+                    data=sse_event.to_sse_data_json(),
+                )
+            finally:
+                try:
+                    await subscriber_scope.__aexit__(None, None, None)
+                finally:
+                    await lease.release()
+
+        return EventSourceResponse(event_generator(), headers=SSE_HEADERS)
 
     resume_state = None
     if request.tool_confirmation is not None:
@@ -256,9 +309,10 @@ async def chat(
                 tool_confirmation=request.tool_confirmation,
             )
         except BaseException:
-            # preflight 抛 ConflictError/NotFoundError/BadRequestError 或 CancelledError
-            # 都必须 release lease，否则连接配额泄漏；claim 回滚由 agent_service 负责。
-            await lease.release()
+            try:
+                await subscriber_scope.__aexit__(None, None, None)
+            finally:
+                await lease.release()
             raise
 
     async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
@@ -295,9 +349,77 @@ async def chat(
                         data=sse_event.to_sse_data_json(),
                     )
         finally:
-            await lease.release()
+            try:
+                await subscriber_scope.__aexit__(None, None, None)
+            finally:
+                await lease.release()
 
     return EventSourceResponse(event_generator(), headers=SSE_HEADERS)
+
+
+@router.post(
+    path="/{session_id}/cancel",
+    response_model=Response[Dict[str, str]],
+    summary="取消指定任务会话",
+    description="请求取消当前用户指定任务会话",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def cancel_session(
+    session_id: str,
+    current_user: CurrentUser,
+    body: CancelSessionRequest = Body(default_factory=CancelSessionRequest),
+    agent_service: AgentService = Depends(get_agent_service),
+    session_service: SessionService = Depends(get_session_service),
+    supervisor: ExecutionSupervisor = Depends(get_supervisor),
+) -> Response[Dict[str, str]]:
+    """请求取消指定任务会话，并由 supervisor 统一标记热状态。"""
+    await _request_user_cancel(
+        session_id=session_id,
+        current_user=current_user,
+        reason=body.reason,
+        agent_service=agent_service,
+        session_service=session_service,
+        supervisor=supervisor,
+    )
+
+    return Response.success(
+        msg="取消任务会话请求已提交",
+        data={
+            "status": "cancel_requested",
+            "session_id": session_id,
+            "reason": body.reason,
+        },
+    )
+
+
+async def _request_user_cancel(
+    *,
+    session_id: str,
+    current_user: CurrentUser,
+    reason: str,
+    agent_service: AgentService,
+    session_service: SessionService,
+    supervisor: ExecutionSupervisor,
+) -> None:
+    await session_service.get_session(
+        session_id=session_id,
+        user_id=current_user.id,
+        is_admin=False,
+    )
+
+    async def _stop_session(*, session_id: str, user_id: str) -> None:
+        await agent_service.stop_session(
+            session_id=session_id,
+            user_id=user_id,
+            is_admin=False,
+        )
+
+    await supervisor.request_cancel(
+        session_id=session_id,
+        user_id=str(current_user.id),
+        reason=reason,
+        stop_session=_stop_session,
+    )
 
 
 @router.get(
@@ -542,12 +664,17 @@ async def stop_session(
     session_id: str,
     current_user: CurrentUser,
     agent_service: AgentService = Depends(get_agent_service),
+    session_service: SessionService = Depends(get_session_service),
+    supervisor: ExecutionSupervisor = Depends(get_supervisor),
 ) -> Response[Optional[Dict]]:
     """根据传递的指定会话id停止对应任务会话"""
-    await agent_service.stop_session(
+    await _request_user_cancel(
         session_id=session_id,
-        user_id=current_user.id,
-        is_admin=current_user.is_admin(),
+        current_user=current_user,
+        reason="user_cancel",
+        agent_service=agent_service,
+        session_service=session_service,
+        supervisor=supervisor,
     )
     return Response.success(msg="停止任务会话成功")
 

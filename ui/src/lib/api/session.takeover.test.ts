@@ -14,6 +14,14 @@ vi.mock("./fetch", () => ({
 import { sessionApi } from "./session";
 
 describe("sessionApi takeover", () => {
+  it("stopSession 应走 PR-3c cancel endpoint", async () => {
+    mockPost.mockResolvedValue(undefined);
+
+    await sessionApi.stopSession("sid-cancel");
+
+    expect(mockPost).toHaveBeenCalledWith("/sessions/sid-cancel/cancel", {});
+  });
+
   it("endTakeover 默认 handoff_mode 应为 continue", async () => {
     mockPost.mockResolvedValue({
       status: "running",

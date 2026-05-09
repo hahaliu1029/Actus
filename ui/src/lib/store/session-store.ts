@@ -190,6 +190,9 @@ function resolveStatusFromEvent(
     }
     return "completed";
   }
+  if (event.type === "owner_conflict") {
+    return currentStatus;
+  }
   if (event.type === "control") {
     return resolveControlStatus(currentStatus, asRecord(event.data));
   }
@@ -1201,6 +1204,7 @@ export const useSessionStore = create<SessionStore>()(
             event.type === "wait" ||
             event.type === "tool_confirmation" ||
             event.type === "control" ||
+            event.type === "owner_conflict" ||
             event.type === "sandbox_state_changed"
           ) {
             sawTerminalEvent = true;
@@ -1246,6 +1250,7 @@ export const useSessionStore = create<SessionStore>()(
               event.type === "tool_confirmation" ||
               event.type === "error" ||
               event.type === "control" ||
+              event.type === "owner_conflict" ||
               event.type === "finishing" ||
               event.type === "health" ||
               event.type === "sandbox_state_changed"

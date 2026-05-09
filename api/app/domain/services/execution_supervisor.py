@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import AsyncIterator, Callable, Literal
+from typing import AsyncIterator, Awaitable, Callable, Literal
 
 from app.domain.errors.supervisor import SupervisorContractError
 from app.domain.models.session import Session, SessionStatus
@@ -24,6 +26,38 @@ from app.domain.services._lua_scripts import (
 logger = logging.getLogger(__name__)
 
 _HOT_TTL_SECONDS = 300
+_OWNER_TTL_SECONDS = 10
+_OWNER_RENEW_SECONDS = 5
+_LUA_RELEASE_OWNER_IF_EQUAL = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+_LUA_RENEW_OWNER_IF_EQUAL = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return 0
+"""
+_LUA_DECREMENT_SUBSCRIBER_COUNT_IF_PRESENT = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return 0
+end
+local count = redis.call('HINCRBY', KEYS[1], 'subscriber_count', -1)
+if count < 0 then
+    redis.call('HSET', KEYS[1], 'subscriber_count', 0)
+    count = 0
+end
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+return count
+"""
+
+
+@dataclass(frozen=True)
+class SubscriberScopeContext:
+    is_conflict: bool
+    current_owner: str | None
 
 
 class ExecutionSupervisor:
@@ -391,6 +425,100 @@ class ExecutionSupervisor:
         )
         return (int(values[0] or 0), int(values[1] or 0))
 
+    @asynccontextmanager
+    async def subscriber_scope(
+        self,
+        session_id: str,
+        connection_id: str,
+    ) -> AsyncIterator[SubscriberScopeContext]:
+        hot_key = self._hot_key(session_id)
+        owner_key = self._owner_key(session_id)
+        renew_task: asyncio.Task[None] | None = None
+        lease_acquired = False
+        entered_count = False
+
+        try:
+            count_task = asyncio.create_task(self._enter_subscriber_count(hot_key))
+            try:
+                await asyncio.shield(count_task)
+            except asyncio.CancelledError:
+                count_task.add_done_callback(
+                    lambda task: self._cleanup_subscriber_count_after_enter(
+                        task,
+                        hot_key=hot_key,
+                    )
+                )
+                raise
+            entered_count = True
+
+            acquired = await self._redis.set(
+                owner_key,
+                connection_id,
+                nx=True,
+                ex=_OWNER_TTL_SECONDS,
+            )
+            lease_acquired = bool(acquired)
+            if lease_acquired:
+                renew_task = asyncio.create_task(
+                    self._renew_owner_lease(
+                        owner_key=owner_key,
+                        connection_id=connection_id,
+                    )
+                )
+                context = SubscriberScopeContext(
+                    is_conflict=False,
+                    current_owner=connection_id,
+                )
+            else:
+                current_owner = self._decode_redis_value(
+                    await self._redis.get(owner_key)
+                )
+                context = SubscriberScopeContext(
+                    is_conflict=True,
+                    current_owner=current_owner,
+                )
+        except BaseException:
+            if entered_count:
+                await self._await_or_detach_subscriber_cleanup(
+                    hot_key=hot_key,
+                    owner_key=owner_key,
+                    connection_id=connection_id,
+                    lease_acquired=lease_acquired,
+                    renew_task=renew_task,
+                )
+            raise
+
+        try:
+            yield context
+        finally:
+            await self._await_or_detach_subscriber_cleanup(
+                hot_key=hot_key,
+                owner_key=owner_key,
+                connection_id=connection_id,
+                lease_acquired=lease_acquired,
+                renew_task=renew_task,
+            )
+
+    async def request_cancel(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        reason: str = "user_cancel",
+        stop_session: Callable[..., Awaitable[None]] | None = None,
+    ) -> None:
+        hot_key = self._hot_key(session_id)
+        await self._redis.hset(
+            hot_key,
+            mapping={
+                "cancellation_pending": "1",
+                "pending_terminal_reason": reason,
+            },
+        )
+        await self._redis.expire(hot_key, _HOT_TTL_SECONDS)
+        if stop_session is not None:
+            await stop_session(session_id=session_id, user_id=user_id)
+
     def _register_runner(self, session_id: str, runner: object) -> None:
         self._runners[session_id] = runner
 
@@ -445,6 +573,181 @@ class ExecutionSupervisor:
                 session_id,
                 cancel_reason,
             )
+
+    async def _renew_owner_lease(
+        self,
+        *,
+        owner_key: str,
+        connection_id: str,
+    ) -> None:
+        while True:
+            await asyncio.sleep(_OWNER_RENEW_SECONDS)
+            if not await self._renew_owner_if_equal(
+                owner_key=owner_key,
+                connection_id=connection_id,
+            ):
+                return
+
+    async def _enter_subscriber_count(self, hot_key: str) -> None:
+        entered_count = False
+        try:
+            await self._redis.hincrby(hot_key, "subscriber_count", 1)
+            entered_count = True
+            await self._redis.expire(hot_key, _HOT_TTL_SECONDS)
+        except BaseException:
+            if entered_count:
+                await self._await_or_detach_subscriber_cleanup(
+                    hot_key=hot_key,
+                    owner_key="",
+                    connection_id="",
+                    lease_acquired=False,
+                    renew_task=None,
+                )
+            raise
+
+    def _cleanup_subscriber_count_after_enter(
+        self,
+        task: asyncio.Task[None],
+        *,
+        hot_key: str,
+    ) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning(
+                "subscriber scope enter count task failed for %s",
+                hot_key,
+                exc_info=True,
+            )
+            return
+
+        cleanup_task = asyncio.create_task(
+            self._cleanup_subscriber_scope(
+                hot_key=hot_key,
+                owner_key="",
+                connection_id="",
+                lease_acquired=False,
+                renew_task=None,
+            )
+        )
+        cleanup_task.add_done_callback(self._log_subscriber_cleanup_result)
+
+    async def _await_or_detach_subscriber_cleanup(
+        self,
+        *,
+        hot_key: str,
+        owner_key: str,
+        connection_id: str,
+        lease_acquired: bool,
+        renew_task: asyncio.Task[None] | None,
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            self._cleanup_subscriber_scope(
+                hot_key=hot_key,
+                owner_key=owner_key,
+                connection_id=connection_id,
+                lease_acquired=lease_acquired,
+                renew_task=renew_task,
+            )
+        )
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cleanup_task.add_done_callback(self._log_subscriber_cleanup_result)
+            raise
+
+    async def _cleanup_subscriber_scope(
+        self,
+        *,
+        hot_key: str,
+        owner_key: str,
+        connection_id: str,
+        lease_acquired: bool,
+        renew_task: asyncio.Task[None] | None,
+    ) -> None:
+        if renew_task is not None:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "subscriber scope owner renew task failed before cleanup",
+                    exc_info=True,
+                )
+
+        try:
+            await self._decrement_subscriber_count_if_present(hot_key)
+        except Exception:
+            logger.warning(
+                "subscriber scope decrement failed for %s",
+                hot_key,
+                exc_info=True,
+            )
+
+        if lease_acquired:
+            try:
+                await self._release_owner_if_equal(
+                    owner_key=owner_key,
+                    connection_id=connection_id,
+                )
+            except Exception:
+                logger.warning(
+                    "subscriber scope owner release failed for %s",
+                    owner_key,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _log_subscriber_cleanup_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning(
+                "detached subscriber scope cleanup failed",
+                exc_info=True,
+            )
+
+    async def _renew_owner_if_equal(
+        self,
+        *,
+        owner_key: str,
+        connection_id: str,
+    ) -> bool:
+        renewed = await self._redis.eval(
+            _LUA_RENEW_OWNER_IF_EQUAL,
+            1,
+            owner_key,
+            connection_id,
+            _OWNER_TTL_SECONDS,
+        )
+        return int(renewed or 0) == 1
+
+    async def _decrement_subscriber_count_if_present(self, hot_key: str) -> None:
+        await self._redis.eval(
+            _LUA_DECREMENT_SUBSCRIBER_COUNT_IF_PRESENT,
+            1,
+            hot_key,
+            _HOT_TTL_SECONDS,
+        )
+
+    async def _release_owner_if_equal(
+        self,
+        *,
+        owner_key: str,
+        connection_id: str,
+    ) -> None:
+        await self._redis.eval(
+            _LUA_RELEASE_OWNER_IF_EQUAL,
+            1,
+            owner_key,
+            connection_id,
+        )
 
     async def _lua_revoke(self, *, session_id: str, user_id: str, reason: str) -> int:
         rc = await run_lua_with_fallback(
@@ -613,5 +916,17 @@ class ExecutionSupervisor:
         return f"supervisor:hot:{session_id}"
 
     @staticmethod
+    def _owner_key(session_id: str) -> str:
+        return f"supervisor:owner:{session_id}"
+
+    @staticmethod
     def _bg_key(user_id: str) -> str:
         return f"supervisor:bg:{user_id}"
+
+    @staticmethod
+    def _decode_redis_value(value: object) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (bytes, bytearray)):
+            return value.decode()
+        return str(value)

@@ -493,6 +493,7 @@ async def agent_service_with_redis(db_session, redis_client, app):
     watchdog, or Lua admission components.
     """
     from app.application.services.agent_service import AgentService, _ConfigSnapshot
+    from app.application.services.session_service import SessionService
     from app.domain.models.app_config import (
         A2AConfig,
         AgentConfig,
@@ -508,7 +509,7 @@ async def agent_service_with_redis(db_session, redis_client, app):
     from app.domain.services.idle_watchdog import IdleWatchdog
     from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
     from app.interfaces.dependencies.rate_limit import rate_limit_read
-    from app.interfaces.service_dependencies import get_agent_service
+    from app.interfaces.service_dependencies import get_agent_service, get_session_service
 
     async def _noop_rate_limit() -> None:
         return None
@@ -555,6 +556,7 @@ async def agent_service_with_redis(db_session, redis_client, app):
         redis_client=redis_client,
         event_recovery=RedisEventRecovery(max_count=10000),
     )
+    session_service = SessionService(uow_factory=_uow_factory)
     supervisor = ExecutionSupervisor(
         redis_client=redis_client,
         session_repository=DBSessionRepository(db_session=db_session),
@@ -568,11 +570,13 @@ async def agent_service_with_redis(db_session, redis_client, app):
     )
     service._idle_watchdog = app.state.idle_watchdog
     app.dependency_overrides[get_agent_service] = lambda: service
+    app.dependency_overrides[get_session_service] = lambda: session_service
     app.dependency_overrides[rate_limit_read] = _noop_rate_limit
     try:
         yield service
     finally:
         app.dependency_overrides.pop(get_agent_service, None)
+        app.dependency_overrides.pop(get_session_service, None)
         app.dependency_overrides.pop(rate_limit_read, None)
         if getattr(app.state, "supervisor", None) is supervisor:
             delattr(app.state, "supervisor")

@@ -13,6 +13,7 @@ monkeypatch session_routes.acquire_connection_limit + FastAPI TestClient。
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -27,7 +28,11 @@ from app.domain.models.user import User, UserRole, UserStatus
 from app.interfaces.dependencies import rate_limit_chat
 from app.interfaces.dependencies.auth import get_current_user
 from app.interfaces.endpoints import session_routes
-from app.interfaces.service_dependencies import get_agent_service
+from app.interfaces.service_dependencies import (
+    get_agent_service,
+    get_session_service,
+    get_supervisor,
+)
 from app.main import app
 
 pytestmark = pytest.mark.anyio
@@ -82,6 +87,22 @@ class _PreflightFailingAgent:
             yield  # type: ignore[unreachable]
 
 
+class _NoConflictScope:
+    is_conflict = False
+    current_owner = None
+
+
+class _NoConflictSupervisor:
+    @asynccontextmanager
+    async def subscriber_scope(self, **kwargs: Any):
+        yield _NoConflictScope()
+
+
+class _AllowSessionService:
+    async def get_session(self, **kwargs: Any) -> object:
+        return object()
+
+
 def _tool_confirmation_payload() -> dict:
     return {
         "message": None,
@@ -108,6 +129,8 @@ async def _send_chat_with_confirmation(
     )
     app.dependency_overrides[get_current_user] = _fake_user
     app.dependency_overrides[get_agent_service] = lambda: agent
+    app.dependency_overrides[get_session_service] = lambda: _AllowSessionService()
+    app.dependency_overrides[get_supervisor] = lambda: _NoConflictSupervisor()
     app.dependency_overrides[rate_limit_chat] = _noop_rate_limit
 
     try:

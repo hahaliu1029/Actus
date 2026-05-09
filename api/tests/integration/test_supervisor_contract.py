@@ -668,22 +668,34 @@ def _make_test_supervisor(redis_client):
 
 
 # -- C-Cancel-1: POST /cancel routes through agent_service.stop_session --------
-@pytest.mark.xfail(strict=False, reason="PR-3c: cancel endpoint not yet shipped")
 async def test_C_Cancel_1_routes_through_stop_session(
-    asgi_client, sample_session, sample_user_token,
+    asgi_client, sample_session, sample_user_token, agent_service_with_redis,
+    app, redis_client,
 ):
     from unittest.mock import AsyncMock, patch
+    from app.infrastructure.storage.redis import get_redis
+    from app.interfaces.dependencies import rate_limit_write
 
     sid = sample_session.id
+
+    async def _noop_rate_limit() -> None:
+        return None
+
+    app.dependency_overrides[get_redis] = lambda: redis_client
+    app.dependency_overrides[rate_limit_write] = _noop_rate_limit
     with patch(
         "app.application.services.agent_service.AgentService.stop_session",
         new_callable=AsyncMock,
     ) as mock_stop:
-        resp = await asgi_client.post(
-            f"/api/sessions/{sid}/cancel",
-            json={"reason": "user_cancel"},
-            headers={"Authorization": f"Bearer {sample_user_token}"},
-        )
+        try:
+            resp = await asgi_client.post(
+                f"/api/sessions/{sid}/cancel",
+                json={"reason": "user_cancel"},
+                headers={"Authorization": f"Bearer {sample_user_token}"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_redis, None)
+            app.dependency_overrides.pop(rate_limit_write, None)
         assert resp.status_code == 200
         # Verify signature: stop_session(session_id, user_id) — round-2 fix P0-5
         mock_stop.assert_awaited_once()
@@ -717,26 +729,66 @@ async def test_C_Cancel_1_routes_through_stop_session(
 
 
 # -- C-Auth-1: Cross-user cancel returns 403 -----------------------------------
-@pytest.mark.xfail(strict=False, reason="PR-3c: auth check not yet shipped")
 async def test_C_Auth_1_cross_user_cancel_403(
-    asgi_client, sample_session, other_user_token,
+    asgi_client, sample_session, other_user_token, agent_service_with_redis,
+    app, redis_client,
 ):
+    from app.infrastructure.storage.redis import get_redis
+    from app.interfaces.dependencies import rate_limit_write
+
+    async def _noop_rate_limit() -> None:
+        return None
+
     sid = sample_session.id
-    resp = await asgi_client.post(
-        f"/api/sessions/{sid}/cancel",
-        json={"reason": "user_cancel"},
-        headers={"Authorization": f"Bearer {other_user_token}"},
-    )
+    app.dependency_overrides[get_redis] = lambda: redis_client
+    app.dependency_overrides[rate_limit_write] = _noop_rate_limit
+    try:
+        resp = await asgi_client.post(
+            f"/api/sessions/{sid}/cancel",
+            json={"reason": "user_cancel"},
+            headers={"Authorization": f"Bearer {other_user_token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_redis, None)
+        app.dependency_overrides.pop(rate_limit_write, None)
     assert resp.status_code == 403
 
 
 # -- C-MultiTab-1: Tab2 receives OwnerConflictEvent on SSE ---------------------
-@pytest.mark.xfail(strict=False, reason="PR-3c: subscriber_scope CAS not yet shipped")
 async def test_C_MultiTab_1_owner_conflict_event(
-    asgi_client, sample_session, sample_user_token,
+    asgi_client, sample_session, sample_user_token, agent_service_with_redis,
+    app, redis_client,
 ):
-    # Tab1 holds CAS lease via subscriber_scope; Tab2 receives OwnerConflictEvent
-    pytest.fail("placeholder — flip when PR-3c subscriber_scope lands")
+    from app.infrastructure.storage.redis import get_redis
+    from app.interfaces.dependencies import rate_limit_chat
+
+    async def _noop_rate_limit() -> None:
+        return None
+
+    sid = sample_session.id
+    owner = f"{sample_session.user_id}:tab1"
+    tab2 = "tab2"
+    await redis_client.set(f"supervisor:owner:{sid}", owner, ex=10)
+
+    app.dependency_overrides[get_redis] = lambda: redis_client
+    app.dependency_overrides[rate_limit_chat] = _noop_rate_limit
+    try:
+        resp = await asgi_client.post(
+            f"/api/sessions/{sid}/chat",
+            json={"message": "hello"},
+            headers={
+                "Authorization": f"Bearer {sample_user_token}",
+                "X-Connection-Id": tab2,
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_redis, None)
+        app.dependency_overrides.pop(rate_limit_chat, None)
+
+    assert resp.status_code == 200
+    assert "owner_conflict" in resp.text
+    assert owner in resp.text
+    assert f"{sample_session.user_id}:{tab2}" in resp.text
 
 
 # -- C-Notif-Types: 8 typed event_type values valid via existing repo ----------

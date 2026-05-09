@@ -5,7 +5,7 @@ from app.domain.models.file import File
 from app.domain.models.message import SkillConfirmationAction
 from app.domain.models.session import SessionStatus
 from app.interfaces.schemas.event import AgentSSEEvent
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CreateSessionResponse(BaseModel):
@@ -50,6 +50,14 @@ class ChatRequest(BaseModel):
     tool_confirmation: Optional[ToolConfirmationAction] = None
     event_id: Optional[str] = None  # 最新事件id
     timestamp: Optional[int] = None  # 当前时间戳
+
+
+class CancelSessionRequest(BaseModel):
+    """取消会话请求结构"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Literal["user_cancel"] = "user_cancel"
 
 
 class GetSessionResponse(BaseModel):

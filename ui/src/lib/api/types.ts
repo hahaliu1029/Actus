@@ -612,6 +612,19 @@ export type SandboxStateChangedEvent = {
   [key: string]: unknown;
 };
 
+export type OwnerConflictEventData = {
+  event_id?: string;
+  created_at?: number;
+  seq?: number | null;
+  payload: {
+    current_owner_connection_id: string;
+    conflicting_connection_id: string;
+    session_id: string;
+    suggested_action: "wait_lease_expire" | "request_takeover";
+  };
+  [key: string]: unknown;
+};
+
 export type CompactionEventData = {
   event_id?: string;
   created_at?: number | string;
@@ -635,6 +648,7 @@ export type SSEEventType =
   | "finishing"
   | "health"
   | "sandbox_state_changed"
+  | "owner_conflict"
   | "compaction"
   | "done"
   | "error"
@@ -666,6 +680,7 @@ export type SSEEventData =
   | { type: "finishing"; data: FinishingEvent }
   | { type: "health"; data: HealthEvent }
   | { type: "sandbox_state_changed"; data: SandboxStateChangedEvent }
+  | { type: "owner_conflict"; data: OwnerConflictEventData }
   | { type: "compaction"; data: CompactionEventData }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
