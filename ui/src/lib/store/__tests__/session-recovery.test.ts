@@ -7,7 +7,12 @@ import {
 } from "../session-store";
 import type { SessionEventRecord } from "../session-store";
 import type { sessionApi } from "../../api/session";
-import type { ChatParams, SSEEventData, SSEEventHandler } from "../../api/types";
+import type {
+  ChatParams,
+  SSEEventData,
+  SSEEventHandler,
+  SupervisorSnapshot,
+} from "../../api/types";
 
 type SessionApi = typeof sessionApi;
 
@@ -508,6 +513,53 @@ describe("recoverSession", () => {
     await useSessionStore.getState().recoverSession("s1");
 
     expect(sessionApi.getEventsSince).toHaveBeenCalledWith("s1", "1000-7", 7);
+  });
+
+  it("updates cursor and supervisor snapshot on zero-event reconnect", async () => {
+    const supervisorSnapshot: SupervisorSnapshot = {
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "explicit",
+      expires_at: "2026-05-11T08:00:00Z",
+      retry_budget_remaining: 2,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T07:59:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        supervisor_snapshot: null,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-7", seq: 7 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],
+      session_status: "running",
+      has_more: false,
+      last_seq: 12,
+      supervisor_snapshot: supervisorSnapshot,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const session = useSessionStore.getState().currentSession;
+    expect(session?.status).toBe("running");
+    expect(session?.last_seq).toBe(12);
+    expect(session?.supervisor_snapshot).toEqual(supervisorSnapshot);
   });
 
   it("[Codex holistic R3+R4+R5] fires fetchCompactionList on zero-event reconnect (regression test)", async () => {

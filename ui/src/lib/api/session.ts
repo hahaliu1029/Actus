@@ -166,6 +166,10 @@ export const sessionApi = {
     return post<void>(`/sessions/${sessionId}/cancel`, {});
   },
 
+  cancelSession: (sessionId: string): Promise<void> => {
+    return post<void>(`/sessions/${sessionId}/cancel`, {});
+  },
+
   deleteSession: (sessionId: string): Promise<void> => {
     return post<void>(`/sessions/${sessionId}/delete`, {});
   },

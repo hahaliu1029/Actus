@@ -260,6 +260,7 @@ class AgentTaskRunner(TaskRunner):
         event_seq_client: Any = None,  # B3-core PR-1: Redis client for session:seq:{sid}
         event_seq_ttl_seconds: int = _EVENT_SEQ_TTL_SECONDS,
         execution_supervisor: Any = None,
+        was_background: bool = False,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # A7 Task 2.7: provider capability profile. None = legacy behavior
@@ -270,6 +271,7 @@ class AgentTaskRunner(TaskRunner):
         self._event_seq_client = event_seq_client
         self._event_seq_ttl_seconds = event_seq_ttl_seconds
         self._on_session_complete = on_session_complete
+        self._was_background = was_background
         self._approval_state_reader = approval_state_reader
         self._approval_state_writer = approval_state_writer
         self._confirmation_manager = confirmation_manager
@@ -2834,7 +2836,7 @@ class AgentTaskRunner(TaskRunner):
         self,
         status: SessionStatus,
         terminal_reason: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Set session to a terminal status and fire on_session_complete.
 
         B4 Issue 1D: drain + status write + completion callback are wrapped
@@ -2856,7 +2858,7 @@ class AgentTaskRunner(TaskRunner):
         partial). See spec §3.3 + §3.5.
         """
 
-        async def _terminal_op() -> None:
+        async def _terminal_op() -> bool:
             cost_handler = getattr(self, "_cost_callback_handler", None)
             if cost_handler is not None:
                 try:
@@ -2896,7 +2898,7 @@ class AgentTaskRunner(TaskRunner):
             # status we want failure to be observed via the terminal task's
             # done callback.
             async with self._uow_factory() as uow:
-                await uow.session.update_to_terminal(
+                transitioned = await uow.session.update_to_terminal(
                     self._session_id,
                     status,
                     terminal_reason or self._default_terminal_reason(status),
@@ -2912,6 +2914,7 @@ class AgentTaskRunner(TaskRunner):
                         "on_session_complete callback failed for session %s",
                         self._session_id,
                     )
+            return transitioned is not False
 
         # Create a NAMED task and register it so a) the asyncio debugger
         # surfaces it usefully and b) any exception inside _terminal_op is
@@ -2925,7 +2928,7 @@ class AgentTaskRunner(TaskRunner):
         terminal_task.add_done_callback(_on_terminal_task_done)
 
         try:
-            await asyncio.shield(terminal_task)
+            return await asyncio.shield(terminal_task)
         except asyncio.CancelledError:
             # Outer cancel propagates to caller; the registered terminal
             # task continues to completion. The done callback observes
@@ -2933,6 +2936,130 @@ class AgentTaskRunner(TaskRunner):
             # We DO NOT mark the session degraded here — marker is driven
             # exclusively by drain results inside _terminal_op.
             raise
+
+    async def _set_terminal_status_with_notifications(
+        self,
+        status: SessionStatus,
+        terminal_reason: str | None = None,
+    ) -> None:
+        transitioned = await self._set_terminal_status(status, terminal_reason)
+        if transitioned is False:
+            return
+        await self._emit_bg_terminal_notification(status, terminal_reason)
+
+    async def _get_notification_session_state(self) -> tuple[bool, int | None]:
+        was_background = bool(getattr(self, "_was_background", False))
+        retry_budget_remaining: int | None = None
+        uow_factory = getattr(self, "_uow_factory", None)
+        if uow_factory is None:
+            return was_background, retry_budget_remaining
+
+        try:
+            async with uow_factory() as uow:
+                session = await uow.session.get_by_id(self._session_id)
+        except Exception:
+            logger.debug(
+                "notification session state lookup failed for %s",
+                self._session_id,
+                exc_info=True,
+            )
+            return was_background, retry_budget_remaining
+
+        if session is None:
+            return was_background, retry_budget_remaining
+
+        was_background = was_background or bool(
+            getattr(session, "was_background", False)
+        )
+        retry_budget_remaining = getattr(session, "retry_budget_remaining", None)
+        return was_background, retry_budget_remaining
+
+    @staticmethod
+    def _is_retry_exhausted(retry_budget_remaining: int | None) -> bool:
+        if retry_budget_remaining is None:
+            return False
+        try:
+            return int(retry_budget_remaining) <= 0
+        except (TypeError, ValueError):
+            return False
+
+    def _bg_terminal_event_type(
+        self,
+        status: SessionStatus,
+        terminal_reason: str | None,
+        retry_budget_remaining: int | None,
+    ) -> str | None:
+        reason = terminal_reason or self._default_terminal_reason(status)
+        if status == SessionStatus.TIMED_OUT and reason == "watchdog_timeout":
+            return "bg_failed_watchdog"
+        if reason == "user_cancel":
+            return "bg_cancelled"
+        if reason == "resume_state_lost":
+            return "bg_failed_resume"
+        if self._is_retry_exhausted(retry_budget_remaining):
+            return "bg_retry_exhausted"
+        if status == SessionStatus.COMPLETED and reason == "natural":
+            return "bg_completed"
+        return None
+
+    async def _emit_bg_terminal_notification(
+        self,
+        status: SessionStatus,
+        terminal_reason: str | None,
+    ) -> None:
+        emitter = getattr(self, "_memory_notification_emitter", None)
+        if emitter is None or self._user_id is None:
+            return
+
+        was_background, retry_budget_remaining = (
+            await self._get_notification_session_state()
+        )
+        if not was_background:
+            return
+
+        event_type = self._bg_terminal_event_type(
+            status,
+            terminal_reason,
+            retry_budget_remaining,
+        )
+        if event_type is None:
+            return
+
+        try:
+            await emitter.emit(
+                user_id=str(self._user_id),
+                event_type=event_type,
+                payload={"session_id": self._session_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "%s emit failed: session=%s err=%s",
+                event_type,
+                self._session_id,
+                exc,
+            )
+
+    async def _emit_bg_suspended_timeout(self) -> None:
+        emitter = getattr(self, "_memory_notification_emitter", None)
+        if emitter is None or self._user_id is None:
+            return
+
+        was_background, _ = await self._get_notification_session_state()
+        if not was_background:
+            return
+
+        try:
+            await emitter.emit(
+                user_id=str(self._user_id),
+                event_type="bg_suspended_timeout",
+                payload={"session_id": self._session_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "bg_suspended_timeout emit failed: session=%s err=%s",
+                self._session_id,
+                exc,
+            )
 
     @staticmethod
     def _default_terminal_reason(status: SessionStatus) -> str:
@@ -3253,26 +3380,30 @@ class AgentTaskRunner(TaskRunner):
                         action="terminated",
                         metrics=self._snapshot_metrics(),
                     ))
-                    await self._set_terminal_status(SessionStatus.TIMED_OUT)
+                    await self._set_terminal_status_with_notifications(
+                        SessionStatus.TIMED_OUT
+                    )
                 else:
-                    await self._set_terminal_status(SessionStatus.COMPLETED)
+                    await self._set_terminal_status_with_notifications(
+                        SessionStatus.COMPLETED
+                    )
 
             except asyncio.CancelledError:
                 cancel_reason = getattr(task, "cancel_reason", "stop")
                 logger.info("AgentTaskRunner任务运行取消，reason=%s", cancel_reason)
 
-                if cancel_reason in {
-                    "takeover_start",
-                    "takeover_timeout",
-                    "supervisor_suspend",
-                }:
+                if cancel_reason == "supervisor_suspend":
+                    await self._emit_bg_suspended_timeout()
+                    raise
+
+                if cancel_reason in {"takeover_start", "takeover_timeout"}:
                     raise
 
                 if cancel_reason == "session_delete":
                     raise
 
                 await self._put_and_add_event(task, DoneEvent())
-                await self._set_terminal_status(
+                await self._set_terminal_status_with_notifications(
                     SessionStatus.COMPLETED,
                     self._terminal_reason_for_cancel(cancel_reason),
                 )
@@ -3283,7 +3414,9 @@ class AgentTaskRunner(TaskRunner):
                 await self._put_and_add_event(
                     task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
                 )
-                await self._set_terminal_status(SessionStatus.COMPLETED)
+                await self._set_terminal_status_with_notifications(
+                    SessionStatus.COMPLETED
+                )
         finally:
             # 17.在同一个asyncio Task上下文中清理MCP/A2A工具资源
             # 这是关键：streamablehttp_client内部使用anyio.create_task_group()，
@@ -3331,7 +3464,9 @@ class AgentTaskRunner(TaskRunner):
                     for ev in self._build_compaction_events_if_any():
                         await self._put_and_add_event(task, ev)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
-                    await self._set_terminal_status(SessionStatus.COMPLETED)
+                    await self._set_terminal_status_with_notifications(
+                        SessionStatus.COMPLETED
+                    )
                     return
 
                 if not cancelled:
@@ -3340,7 +3475,7 @@ class AgentTaskRunner(TaskRunner):
                         await self._put_and_add_event(task, ev)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                     _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
-                    await self._set_terminal_status(_final_status)
+                    await self._set_terminal_status_with_notifications(_final_status)
                 else:
                     # Resume postprocess cancelled mid-execution by a new user message.
                     # Mirror invoke()'s cancelled branch exactly:
@@ -3375,7 +3510,7 @@ class AgentTaskRunner(TaskRunner):
             else:
                 await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                 _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
-                await self._set_terminal_status(_final_status)
+                await self._set_terminal_status_with_notifications(_final_status)
 
         except Exception as e:
             logger.exception(f"AgentTaskRunner.resume 运行出错: {str(e)}")

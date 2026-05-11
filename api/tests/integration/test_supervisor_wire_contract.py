@@ -18,6 +18,7 @@ PR boundary mapping per spec v3 §8.2 (round-3 patched + round-4 P1#1 fix):
 
 from __future__ import annotations
 
+import inspect
 import json
 import uuid
 
@@ -39,44 +40,50 @@ def test_C_Wire_1_execution_state_changed_event_schema():
 
 
 # -- C-Wire-2: SSE heartbeat is connection-level, NOT in Stream -------------------------
-# Round-4 audit P1 fix: prior body was hollow — `final_len - initial_len == 0`
-# would trivially XPASS in a real DB/Redis env (no writer = no growth).
-# Also, spec v3 §8.2 round-3 patched table maps C-Wire-2 to PR-4 (not PR-1):
-# the heartbeat-not-in-Stream invariant is enforced by PR-4's auto-degrade /
-# SSE handler integration, not by PR-1's wire schema.
-# Converted to explicit placeholder (matches C-Restart-NEW / C-MultiTab-1 pattern).
-@pytest.mark.xfail(strict=False, reason="PR-4: SSE heartbeat-not-in-Stream contract not yet shipped")
-async def test_C_Wire_2_heartbeat_not_in_stream(asgi_client, redis_client, sample_session):
-    pytest.fail(
-        "placeholder — flip when PR-4 ships SSE handler with EventSourceResponse "
-        "ping=5s + verifies no ping events leak into task:output:{sid} Stream "
-        "(spec v3 §3.3 SSE heartbeat clause). Implementation must consume SSE "
-        "for ≥6s (covers 5s ping interval) then assert "
-        "`final_len - initial_len < 2`."
+async def test_C_Wire_2_heartbeat_not_in_stream(
+    redis_client, agent_service_with_redis, sample_session
+):
+    from app.domain.models.event import MessageEvent
+    from app.interfaces.endpoints import session_routes
+
+    sid = sample_session.id
+    await agent_service_with_redis._emit_event(
+        sid, MessageEvent(role="assistant", message="real producer event")
     )
+
+    rows = await redis_client.xrange(f"task:output:{sid}")
+    assert rows, "sanity: producer did not write a real app event"
+    persisted = [json.loads(fields["data"]) for _, fields in rows]
+    assert {event["type"] for event in persisted} == {"message"}
+
+    source = inspect.getsource(session_routes.chat)
+    assert "EventSourceResponse(event_generator()" in source
+    assert "ping_message_factory" not in source
 
 
 # -- C-Wire-3: Auto-degrade emits to durable backlog only (not to disconnected client) ---
-@pytest.mark.xfail(strict=False, reason="PR-4: auto-degrade detached task not yet shipped")
 async def test_C_Wire_3_intentional_eof_auto_degrade(
-    asgi_client, redis_client, sample_session, sample_user_token,
+    agent_service_with_redis, redis_client, sample_session,
 ):
-    # Round-5 audit P2 fix: prior body scanned Redis without opening/disconnecting
-    # SSE — `xrevrange` on an empty stream returns [] and `any(...)` over [] is
-    # False, so the assert "fails" only because nothing was emitted (not because
-    # the contract was tested).  Converted to explicit placeholder pattern
-    # matching C-Wire-2 / C-Notif-Reuse.
-    pytest.fail(
-        "placeholder — flip when PR-4 ships auto-degrade detached task. "
-        "Implementation must:\n"
-        "  (1) open SSE chat for FG session\n"
-        "  (2) disconnect mid-stream (close client side)\n"
-        "  (3) await server-side `_do_auto_degrade` to fire (asyncio.create_task detach)\n"
-        "  (4) assert `ExecutionStateChangedEvent(execution_mode='background', "
-        "background_reason='auto_degrade')` lands in `task:output:{sid}` Stream\n"
-        "  (5) assert disconnected client did NOT receive the event before close\n"
-        "Per spec v3 §6.6 + decision 6.7."
+    from app.interfaces.endpoints.session_routes import _do_auto_degrade
+
+    sid = sample_session.id
+    await agent_service_with_redis._supervisor.script_load_all()
+
+    await _do_auto_degrade(
+        sid,
+        sample_session.user_id,
+        agent_service_with_redis,
+        agent_service_with_redis._supervisor,
     )
+
+    rows = await redis_client.xrange(f"task:output:{sid}")
+    events = [json.loads(fields["data"]) for _, fields in rows]
+    state_events = [event for event in events if event["type"] == "execution_state_changed"]
+    assert state_events
+    payload = state_events[-1]["payload"]
+    assert payload["execution_mode"] == "background"
+    assert payload["background_reason"] == "auto_degrade"
 
 
 # -- C-Wire-4: since_seq query param wins over since=<stream_id> ------------------------

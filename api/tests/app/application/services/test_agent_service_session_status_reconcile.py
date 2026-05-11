@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from app.application.services.agent_service import AgentService
@@ -15,11 +17,12 @@ def anyio_backend() -> str:
 
 
 class _SessionRepo:
-    def __init__(self) -> None:
+    def __init__(self, session: Session | None = None) -> None:
         self.update_status_calls: list[tuple[str, SessionStatus]] = []
         self.update_to_terminal_calls: list[tuple[str, SessionStatus, str]] = []
         self.update_latest_message_calls: list[tuple[str, str]] = []
         self.add_event_calls: list[tuple[str, object]] = []
+        self._session = session
 
     async def update_status(self, session_id: str, status: SessionStatus) -> None:
         self.update_status_calls.append((session_id, status))
@@ -31,6 +34,10 @@ class _SessionRepo:
         terminal_reason: str,
     ) -> None:
         self.update_to_terminal_calls.append((session_id, status, terminal_reason))
+        if self._session and self._session.id == session_id:
+            self._session.status = status
+            self._session.terminal_reason = terminal_reason
+            self._session.completed_at = datetime.now()
 
     async def update_latest_message(self, session_id: str, message: str, timestamp) -> None:
         self.update_latest_message_calls.append((session_id, message))
@@ -41,10 +48,15 @@ class _SessionRepo:
     async def update_unread_message_count(self, session_id: str, count: int) -> None:
         return None
 
+    async def get_by_id(self, session_id: str) -> Session | None:
+        if self._session is None or self._session.id != session_id:
+            return None
+        return self._session
+
 
 class _Uow:
-    def __init__(self) -> None:
-        self.session = _SessionRepo()
+    def __init__(self, session: Session | None = None) -> None:
+        self.session = _SessionRepo(session=session)
 
     async def __aenter__(self) -> "_Uow":
         return self
@@ -101,11 +113,19 @@ def _make_service(uow: _Uow) -> AgentService:
 async def test_chat_without_message_reconciles_running_status_when_task_missing(
     monkeypatch,
 ) -> None:
-    uow = _Uow()
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        was_background=True,
+    )
+    uow = _Uow(session=session)
     service = _make_service(uow)
+    emitter = AsyncMock()
+    service._memory_notification_emitter = emitter
 
     async def fake_get_accessible_session(*args, **kwargs) -> Session:
-        return Session(id="session-1", user_id="user-1", status=SessionStatus.RUNNING)
+        return session
 
     async def fake_check_attachments_access(*args, **kwargs) -> None:
         return None
@@ -136,6 +156,11 @@ async def test_chat_without_message_reconciles_running_status_when_task_missing(
     assert uow.session.update_to_terminal_calls == [
         ("session-1", SessionStatus.COMPLETED, "resume_state_lost"),
     ]
+    emitter.emit.assert_awaited_once_with(
+        user_id="user-1",
+        event_type="bg_failed_resume",
+        payload={"session_id": "session-1"},
+    )
 
 
 async def test_chat_with_message_does_not_trigger_running_status_reconcile(

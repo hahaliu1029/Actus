@@ -143,6 +143,12 @@ async def _cancel_flow(_message):
         yield None
 
 
+async def _failing_flow(_message):
+    raise RuntimeError("flow failed")
+    if False:
+        yield None
+
+
 def _prime_runner_for_loop_cancellation(runner: AgentTaskRunner, task: _DummyTask) -> None:
     task.input_stream.is_empty = AsyncMock(side_effect=[False, True])
     runner._pop_event = AsyncMock(return_value=MessageEvent(message="hello"))
@@ -155,6 +161,11 @@ def _prime_runner_for_loop_cancellation(runner: AgentTaskRunner, task: _DummyTas
     runner._skill_bundle_sync.start_background_sync = MagicMock()
     runner._select_skills_from_pool = MagicMock(return_value=[])
     runner._select_skills_for_message = AsyncMock(return_value=([], None))
+
+
+def _prime_runner_for_loop_failure(runner: AgentTaskRunner, task: _DummyTask) -> None:
+    _prime_runner_for_loop_cancellation(runner, task)
+    runner._run_flow = _failing_flow
 
 
 async def test_cancel_reason_stop_emits_done_and_marks_completed() -> None:
@@ -199,6 +210,9 @@ async def test_cancel_reason_takeover_start_skips_done_event_and_completed_statu
 async def test_cancel_reason_supervisor_suspend_skips_done_event_and_completed_status() -> None:
     runner = _build_runner("session-supervisor-suspend")
     task = _DummyTask(cancel_reason="supervisor_suspend")
+    emitter = AsyncMock()
+    runner._memory_notification_emitter = emitter
+    runner._was_background = True
     _prime_runner_for_loop_cancellation(runner, task)
 
     with pytest.raises(asyncio.CancelledError):
@@ -210,6 +224,32 @@ async def test_cancel_reason_supervisor_suspend_skips_done_event_and_completed_s
         ("session-supervisor-suspend", SessionStatus.RUNNING),
     ]
     assert task.output_stream.events == []
+    emitter.emit.assert_awaited_once_with(
+        user_id="user-1",
+        event_type="bg_suspended_timeout",
+        payload={"session_id": "session-supervisor-suspend"},
+    )
+
+
+async def test_background_invoke_exception_emits_bg_completed() -> None:
+    runner = _build_runner("session-exception-completed")
+    task = _DummyTask(cancel_reason="stop")
+    emitter = AsyncMock()
+    runner._memory_notification_emitter = emitter
+    runner._was_background = True
+    _prime_runner_for_loop_failure(runner, task)
+
+    await runner.invoke(task)
+    await asyncio.sleep(0)
+
+    assert runner._uow.session.terminal_updates == [
+        ("session-exception-completed", SessionStatus.COMPLETED, "natural"),
+    ]
+    emitter.emit.assert_awaited_once_with(
+        user_id="user-1",
+        event_type="bg_completed",
+        payload={"session_id": "session-exception-completed"},
+    )
 
 
 async def test_cancel_reason_session_delete_skips_done_and_completed_status() -> None:

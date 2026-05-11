@@ -267,6 +267,11 @@ async def lifespan(app: FastAPI):
             redis_client=redis_client,
             supervisor=app.state.supervisor,
             uow_factory=get_uow,
+            notification_emitter=getattr(
+                app.state.agent_service,
+                "_memory_notification_emitter",
+                None,
+            ),
         )
         app.state.agent_service._idle_watchdog = app.state.idle_watchdog
         await app.state.supervisor.script_load_all()

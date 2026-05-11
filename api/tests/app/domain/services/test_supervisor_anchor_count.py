@@ -99,7 +99,9 @@ def test_anchor_files_have_expected_xfail_decorator_count():
         (C-Inflight-1, C-Inflight-2).
       - PR-3c ship: 6 xfail decorators, 28 anchors flipped
         (C-Cancel-1, C-Auth-1, C-MultiTab-1).
-      - PR-4 ship: TBD
+      - PR-4 ship: 0 xfail decorators, 34 anchors flipped
+        (C-Wire-2, C-Wire-3, C-Notif-Types, C-Notif-Reuse,
+         C-Notif-Reconcile, C-Notif-Watchdog).
 
     Decorator forms covered:
       - ``@pytest.mark.xfail(strict=False, reason=...)`` (canonical)
@@ -107,8 +109,8 @@ def test_anchor_files_have_expected_xfail_decorator_count():
     """
     import re
 
-    # PR-3c ship after PR-3b cleanup: 6 = 34 - 28 flipped anchors.
-    EXPECTED_XFAIL_COUNT = 6
+    # PR-4 ship: 0 = 34 - 34 flipped anchors.
+    EXPECTED_XFAIL_COUNT = 0
 
     repo_root = _find_repo_root()
     total = 0

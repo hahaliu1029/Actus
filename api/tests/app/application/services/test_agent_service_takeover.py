@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from app.application.services.agent_service import AgentService
@@ -240,6 +241,7 @@ async def test_reject_takeover_continue_switches_back_to_running(
         id="s1",
         user_id="u1",
         status=SessionStatus.TAKEOVER_PENDING,
+        was_background=True,
         events=[
             ControlEvent(
                 action=ControlAction.REQUESTED,
@@ -285,12 +287,11 @@ async def test_reject_takeover_continue_switches_back_to_running(
 async def test_reject_takeover_terminate_marks_completed_and_releases_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    uow = _Uow()
-    service = _make_service(uow)
     session = Session(
         id="s1",
         user_id="u1",
         status=SessionStatus.TAKEOVER_PENDING,
+        was_background=True,
         events=[
             ControlEvent(
                 action=ControlAction.REQUESTED,
@@ -300,6 +301,10 @@ async def test_reject_takeover_terminate_marks_completed_and_releases_lease(
             )
         ],
     )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    emitter = AsyncMock()
+    service._memory_notification_emitter = emitter
     append_calls: list[dict] = []
     release_calls: list[str] = []
 
@@ -328,17 +333,21 @@ async def test_reject_takeover_terminate_marks_completed_and_releases_lease(
     assert append_calls[0]["reason"] == "terminate"
     assert append_calls[0]["takeover_id"] == "tk_pending_terminate"
     assert release_calls == ["s1"]
+    emitter.emit.assert_awaited_once_with(
+        user_id="u1",
+        event_type="bg_cancelled",
+        payload={"session_id": "s1"},
+    )
 
 
 async def test_end_takeover_complete_marks_completed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    uow = _Uow()
-    service = _make_service(uow)
     session = Session(
         id="s1",
         user_id="u1",
         status=SessionStatus.TAKEOVER,
+        was_background=True,
         events=[
             ControlEvent(
                 action=ControlAction.STARTED,
@@ -348,6 +357,10 @@ async def test_end_takeover_complete_marks_completed(
             )
         ],
     )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    emitter = AsyncMock()
+    service._memory_notification_emitter = emitter
     append_calls: list[dict] = []
     release_calls: list[dict] = []
 
@@ -379,6 +392,46 @@ async def test_end_takeover_complete_marks_completed(
     assert release_calls == [
         {"takeover_id": "tk_ended_1", "operator_user_id": "u1"}
     ]
+    emitter.emit.assert_awaited_once_with(
+        user_id="u1",
+        event_type="bg_completed",
+        payload={"session_id": "s1"},
+    )
+
+
+async def test_stop_session_emits_bg_cancelled_for_background_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.RUNNING,
+        was_background=True,
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    emitter = AsyncMock()
+    service._memory_notification_emitter = emitter
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    await service.stop_session("s1", "u1")
+
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "user_cancel")
+    ]
+    emitter.emit.assert_awaited_once_with(
+        user_id="u1",
+        event_type="bg_cancelled",
+        payload={"session_id": "s1"},
+    )
 
 
 async def test_end_takeover_continue_passes_takeover_id_and_releases_lease(
@@ -472,9 +525,16 @@ async def test_start_takeover_when_already_takeover_returns_latest_takeover_data
 async def test_end_takeover_continue_resume_failed_rolls_back_to_completed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    uow = _Uow()
+    session = Session(
+        id="s1",
+        user_id="u1",
+        status=SessionStatus.TAKEOVER,
+        was_background=True,
+    )
+    uow = _Uow(session=session)
     service = _make_service(uow)
-    session = Session(id="s1", user_id="u1", status=SessionStatus.TAKEOVER)
+    emitter = AsyncMock()
+    service._memory_notification_emitter = emitter
     append_control_calls: list[dict] = []
     append_error_calls: list[dict] = []
 
@@ -509,6 +569,11 @@ async def test_end_takeover_continue_resume_failed_rolls_back_to_completed(
     assert append_control_calls[0]["source"] == ControlSource.SYSTEM
     assert append_control_calls[0]["handoff_mode"] == "complete"
     assert append_control_calls[0]["reason"] == "resume_failed"
+    emitter.emit.assert_awaited_once_with(
+        user_id="u1",
+        event_type="bg_failed_resume",
+        payload={"session_id": "s1"},
+    )
 
 
 async def test_complete_takeover_after_cancel_timeout_emits_rejected_and_releases_lease(

@@ -188,7 +188,12 @@ class ExecutionSupervisor:
         self._meter_inc("admit", result="success")
         self._meter_inc("auto_degrade")
 
-    async def suspend_idle(self, *, session_id: str, user_id: str) -> None:
+    async def suspend_idle(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+    ) -> None:
         async with self._repo_context() as repo:
             await repo.update_supervisor_fields(
                 session_id,
@@ -305,7 +310,9 @@ class ExecutionSupervisor:
             "watchdog_timeout",
         ],
         status: SessionStatus = SessionStatus.COMPLETED,
+        notification_emitter=None,
     ) -> None:
+        emit_bg_failed_watchdog = False
         async with self._repo_context() as repo:
             session = await repo.get_by_id(session_id)
             if (
@@ -315,7 +322,30 @@ class ExecutionSupervisor:
                 and session.execution_mode == "background"
                 and session.execution_phase in ("running", "suspended")
             ):
-                await repo.update_to_terminal(session_id, status, terminal_reason)
+                transitioned = await repo.update_to_terminal(
+                    session_id,
+                    status,
+                    terminal_reason,
+                )
+                emit_bg_failed_watchdog = (
+                    transitioned is not False
+                    and terminal_reason == "watchdog_timeout"
+                    and bool(getattr(session, "was_background", False))
+                    and getattr(session, "user_id", None) is not None
+                )
+        if notification_emitter is not None and emit_bg_failed_watchdog:
+            try:
+                await notification_emitter.emit(
+                    user_id=str(session.user_id),
+                    event_type="bg_failed_watchdog",
+                    payload={"session_id": session_id},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "bg_failed_watchdog emit failed: session=%s err=%s",
+                    session_id,
+                    exc,
+                )
         await self._lua_revoke(
             session_id=session_id,
             user_id=user_id,
@@ -334,7 +364,7 @@ class ExecutionSupervisor:
             for row in rows:
                 try:
                     if row.status == SessionStatus.FINISHING:
-                        await repo.update_to_terminal(
+                        transitioned = await repo.update_to_terminal(
                             row.session_id,
                             SessionStatus.TIMED_OUT,
                             "server_restart",
@@ -344,7 +374,10 @@ class ExecutionSupervisor:
                             user_id=row.user_id,
                             reason="server_restart",
                         )
-                        if notification_emitter is not None:
+                        if (
+                            transitioned is not False
+                            and notification_emitter is not None
+                        ):
                             await notification_emitter.emit(
                                 user_id=row.user_id,
                                 event_type="bg_terminal_server_restart",

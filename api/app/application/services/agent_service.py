@@ -52,6 +52,7 @@ from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.confirmation_manager import ConfirmationManager
 from app.infrastructure.external.message_queue import STREAM_TTL_SECONDS
+from app.interfaces.schemas.session import SupervisorSnapshot
 from core.config import get_settings
 from langgraph.types import Command
 from pydantic import TypeAdapter
@@ -421,6 +422,7 @@ class AgentService:
                 else None
             ),
             execution_supervisor=self._supervisor,
+            was_background=session.was_background,
         )
 
         # 6.创建任务Task并更新会话中的信息
@@ -1144,12 +1146,12 @@ class AgentService:
 
         PG 为主（跨 invoke 权威来源），Redis 补充当前 task 的 in-flight 事件。
 
-        B3-core PR-1 §3.3:
+        B3-core PR-1 §3.3 / PR-4:
         - When both ``since_seq`` and ``since_event_id`` are provided,
           ``since_seq`` filters sequenced events, while ``since_event_id`` is
           retained as the legacy ``seq is None`` floor (logged at WARNING).
         - Result dict gains ``last_seq`` (max event.seq seen, or since_seq fallback)
-          and ``supervisor_snapshot`` (None placeholder; PR-3c/PR-4 fill).
+          and ``supervisor_snapshot``.
         """
         if since_seq is not None and since_event_id is not None:
             logger.warning(
@@ -1264,6 +1266,7 @@ class AgentService:
             if getattr(e, "seq", None) is not None
         ]
         last_seq = max(seqs_seen) if seqs_seen else (since_seq or 0)
+        supervisor_snapshot = await self._build_supervisor_snapshot(session)
 
         return {
             "events": merged,
@@ -1271,8 +1274,96 @@ class AgentService:
             "has_more": redis_has_more,
             # B3-core PR-1 additions:
             "last_seq": last_seq,
-            "supervisor_snapshot": None,  # PR-3c/PR-4 will populate
+            "supervisor_snapshot": supervisor_snapshot,
         }
+
+    async def _build_supervisor_snapshot(self, session: Session) -> SupervisorSnapshot:
+        hot_hash = await self._read_supervisor_hot_hash(session.id)
+        last_progress_at = self._parse_hot_unix_timestamp(
+            self._redis_hash_get(hot_hash, "last_activity_at")
+        )
+        age_seconds = (
+            (datetime.now(timezone.utc) - last_progress_at).total_seconds()
+            if last_progress_at is not None
+            else -1
+        )
+        is_alive = last_progress_at is not None and 0 <= age_seconds < 60
+
+        if session.terminal_reason == "user_cancel":
+            cancellation_state = "cancelled"
+        elif self._redis_hash_value_is_one(
+            self._redis_hash_get(hot_hash, "cancellation_pending")
+        ):
+            cancellation_state = "cancelling"
+        else:
+            cancellation_state = "none"
+
+        return SupervisorSnapshot(
+            execution_mode=session.execution_mode,
+            execution_phase=session.execution_phase,
+            background_reason=session.background_reason,
+            expires_at=session.expires_at,
+            retry_budget_remaining=session.retry_budget_remaining,
+            suspended_reason=session.suspended_reason,
+            terminal_reason=session.terminal_reason,
+            last_progress_at=last_progress_at,
+            is_alive=is_alive,
+            cancellation_state=cancellation_state,
+        )
+
+    async def _read_supervisor_hot_hash(self, session_id: str) -> dict[Any, Any]:
+        redis_client = getattr(self, "_redis_client", None)
+        if redis_client is None:
+            return {}
+
+        try:
+            redis = getattr(redis_client, "client", redis_client)
+            if redis is None:
+                return {}
+            hot_hash = await redis.hgetall(f"supervisor:hot:{session_id}")
+        except Exception:
+            logger.warning(
+                "get_events_since: failed to read supervisor hot hash for %s",
+                session_id,
+                exc_info=True,
+            )
+            return {}
+
+        return hot_hash if isinstance(hot_hash, dict) else {}
+
+    @staticmethod
+    def _redis_hash_get(hot_hash: dict[Any, Any], field: str) -> Any:
+        if field in hot_hash:
+            return hot_hash[field]
+        encoded_field = field.encode("utf-8")
+        if encoded_field in hot_hash:
+            return hot_hash[encoded_field]
+        return None
+
+    @staticmethod
+    def _decode_redis_value(value: Any) -> Any:
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        return value
+
+    @classmethod
+    def _parse_hot_unix_timestamp(cls, value: Any) -> datetime | None:
+        value = cls._decode_redis_value(value)
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if timestamp <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp, timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    @classmethod
+    def _redis_hash_value_is_one(cls, value: Any) -> bool:
+        value = cls._decode_redis_value(value)
+        return str(value).strip() == "1"
 
     @staticmethod
     def _is_valid_redis_stream_id(event_id: object) -> bool:
@@ -1454,7 +1545,13 @@ class AgentService:
                     session_id,
                 )
                 async with self._uow_factory() as uow:
-                    await uow.session.update_to_terminal(
+                    transitioned = await uow.session.update_to_terminal(
+                        session_id,
+                        SessionStatus.COMPLETED,
+                        "resume_state_lost",
+                    )
+                if transitioned is not False:
+                    await self._emit_bg_terminal_notification_if_background(
                         session_id,
                         SessionStatus.COMPLETED,
                         "resume_state_lost",
@@ -1558,7 +1655,13 @@ class AgentService:
 
         # 3.更新会话任务状态
         async with self._uow_factory() as uow:
-            await uow.session.update_to_terminal(
+            transitioned = await uow.session.update_to_terminal(
+                session_id,
+                SessionStatus.COMPLETED,
+                "user_cancel",
+            )
+        if transitioned is not False:
+            await self._emit_bg_terminal_notification_if_background(
                 session_id,
                 SessionStatus.COMPLETED,
                 "user_cancel",
@@ -1829,6 +1932,7 @@ end
     ) -> None:
         try:
             await asyncio.sleep(max(ttl_seconds, 1))
+            transitioned = False
             uow = self._uow_factory()
             async with uow:
                 # 读取时加行锁，避免与 reject_takeover 等并发状态迁移发生 TOCTOU 竞态。
@@ -1848,7 +1952,13 @@ end
                         takeover_id=takeover_id,
                     ),
                 )
-                await uow.session.update_to_terminal(
+                transitioned = await uow.session.update_to_terminal(
+                    session_id,
+                    SessionStatus.COMPLETED,
+                    "watchdog_timeout",
+                )
+            if transitioned is not False:
+                await self._emit_bg_terminal_notification_if_background(
                     session_id,
                     SessionStatus.COMPLETED,
                     "watchdog_timeout",
@@ -1990,6 +2100,73 @@ end
             await uow.session.add_event(session_id, error_event)
         return error_event
 
+    async def _emit_bg_notification_if_background(
+        self,
+        session_id: str,
+        event_type: str,
+    ) -> None:
+        emitter = getattr(self, "_memory_notification_emitter", None)
+        if emitter is None:
+            return
+
+        try:
+            async with self._uow_factory() as uow:
+                session = await uow.session.get_by_id(session_id)
+        except Exception:
+            logger.debug(
+                "background notification session lookup failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            return
+
+        if (
+            session is None
+            or not getattr(session, "was_background", False)
+            or not getattr(session, "user_id", None)
+        ):
+            return
+
+        try:
+            await emitter.emit(
+                user_id=str(session.user_id),
+                event_type=event_type,
+                payload={"session_id": session_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "%s emit failed: session=%s err=%s",
+                event_type,
+                session_id,
+                exc,
+            )
+
+    @staticmethod
+    def _bg_event_type_for_terminal(
+        status: SessionStatus,
+        terminal_reason: str,
+    ) -> str | None:
+        if terminal_reason == "user_cancel":
+            return "bg_cancelled"
+        if terminal_reason == "resume_state_lost":
+            return "bg_failed_resume"
+        if terminal_reason == "watchdog_timeout":
+            return "bg_failed_watchdog"
+        if status == SessionStatus.COMPLETED and terminal_reason == "natural":
+            return "bg_completed"
+        return None
+
+    async def _emit_bg_terminal_notification_if_background(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+    ) -> None:
+        event_type = self._bg_event_type_for_terminal(status, terminal_reason)
+        if event_type is None:
+            return
+        await self._emit_bg_notification_if_background(session_id, event_type)
+
     async def _inject_handoff_message(self, task: Task, text: str) -> str:
         """向任务输入流注入一条handoff消息，用于恢复执行上下文。"""
         handoff_event = MessageEvent(
@@ -2025,7 +2202,13 @@ end
         )
         uow = self._uow_factory()
         async with uow:
-            await uow.session.update_to_terminal(
+            transitioned = await uow.session.update_to_terminal(
+                session_id,
+                SessionStatus.COMPLETED,
+                "resume_state_lost",
+            )
+        if transitioned is not False:
+            await self._emit_bg_terminal_notification_if_background(
                 session_id,
                 SessionStatus.COMPLETED,
                 "resume_state_lost",
@@ -2415,7 +2598,13 @@ end
 
         if decision_normalized == "terminate":
             async with self._uow_factory() as uow:
-                await uow.session.update_to_terminal(
+                transitioned = await uow.session.update_to_terminal(
+                    session_id,
+                    SessionStatus.COMPLETED,
+                    "user_cancel",
+                )
+            if transitioned is not False:
+                await self._emit_bg_terminal_notification_if_background(
                     session_id,
                     SessionStatus.COMPLETED,
                     "user_cancel",
@@ -2503,7 +2692,13 @@ end
 
         if mode == "complete":
             async with self._uow_factory() as uow:
-                await uow.session.update_to_terminal(
+                transitioned = await uow.session.update_to_terminal(
+                    session_id,
+                    SessionStatus.COMPLETED,
+                    "natural",
+                )
+            if transitioned is not False:
+                await self._emit_bg_terminal_notification_if_background(
                     session_id,
                     SessionStatus.COMPLETED,
                     "natural",

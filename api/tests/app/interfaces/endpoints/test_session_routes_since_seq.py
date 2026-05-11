@@ -41,6 +41,21 @@ async def _noop_rate_limit() -> None:
     return None
 
 
+def _fake_supervisor_snapshot() -> dict[str, Any]:
+    return {
+        "execution_mode": "background",
+        "execution_phase": "running",
+        "background_reason": "explicit",
+        "expires_at": None,
+        "retry_budget_remaining": 1,
+        "suspended_reason": None,
+        "terminal_reason": None,
+        "last_progress_at": None,
+        "is_alive": True,
+        "cancellation_state": "none",
+    }
+
+
 class _FakeAgentService:
     def __init__(self, *, last_seq: int = 0) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -53,7 +68,7 @@ class _FakeAgentService:
             "session_status": SessionStatus.RUNNING,
             "has_more": False,
             "last_seq": self._last_seq,
-            "supervisor_snapshot": None,
+            "supervisor_snapshot": _fake_supervisor_snapshot(),
         }
 
 
@@ -80,7 +95,7 @@ async def test_get_events_since_accepts_since_seq_query() -> None:
     assert resp.status_code == 200
     body = resp.json()["data"]
     assert body["last_seq"] == 5
-    assert body["supervisor_snapshot"] is None
+    assert body["supervisor_snapshot"] == _fake_supervisor_snapshot()
     # Service received since_seq=5
     assert fake.calls[0]["since_seq"] == 5
     assert fake.calls[0]["since_event_id"] is None

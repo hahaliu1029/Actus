@@ -1,19 +1,50 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockPost } = vi.hoisted(() => ({
+const { mockGet, mockPost } = vi.hoisted(() => ({
+  mockGet: vi.fn(),
   mockPost: vi.fn(),
 }));
 
 vi.mock("./fetch", () => ({
   createSSEStream: vi.fn(),
   parseSSEStream: vi.fn(),
-  get: vi.fn(),
+  get: mockGet,
   post: mockPost,
 }));
 
 import { sessionApi } from "./session";
 
 describe("sessionApi takeover", () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+    mockPost.mockReset();
+  });
+
+  it("getEventsSince 应序列化 since 与 since_seq 参数", async () => {
+    mockGet.mockResolvedValue({
+      events: [],
+      session_status: "running",
+      has_more: false,
+      last_seq: 7,
+      supervisor_snapshot: null,
+    });
+
+    await sessionApi.getEventsSince("sid", "evt-1", 7);
+
+    expect(mockGet).toHaveBeenCalledWith("/sessions/sid/events", {
+      since: "evt-1",
+      since_seq: "7",
+    });
+  });
+
+  it("cancelSession 应走 PR-3c cancel endpoint", async () => {
+    mockPost.mockResolvedValue(undefined);
+
+    await sessionApi.cancelSession("sid-cancel");
+
+    expect(mockPost).toHaveBeenCalledWith("/sessions/sid-cancel/cancel", {});
+  });
+
   it("stopSession 应走 PR-3c cancel endpoint", async () => {
     mockPost.mockResolvedValue(undefined);
 

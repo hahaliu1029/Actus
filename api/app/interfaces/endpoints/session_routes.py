@@ -2,10 +2,11 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Dict, Optional
 from urllib.parse import quote
 
+import anyio
 import websockets
 from app.application.errors.exceptions import (
     BadRequestError,
@@ -17,7 +18,14 @@ from app.application.errors.exceptions import (
 )
 from app.application.services.agent_service import AgentService
 from app.application.services.session_service import SessionService
-from app.domain.models.event import OwnerConflictEvent, OwnerConflictPayload
+from app.domain.errors.supervisor import SupervisorContractError
+from app.domain.models.event import (
+    ExecutionStateChangedEvent,
+    ExecutionStatePayload,
+    OwnerConflictEvent,
+    OwnerConflictPayload,
+)
+from app.domain.models.session import SessionStatus
 from app.domain.services.execution_supervisor import ExecutionSupervisor
 from app.interfaces.dependencies import (
     CurrentUser,
@@ -79,6 +87,56 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+_PENDING_AUTO_DEGRADE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _track_auto_degrade_task(task: asyncio.Task[None]) -> None:
+    _PENDING_AUTO_DEGRADE_TASKS.add(task)
+    task.add_done_callback(_PENDING_AUTO_DEGRADE_TASKS.discard)
+
+
+async def _do_auto_degrade(
+    session_id: str,
+    user_id: str,
+    agent_service: AgentService,
+    supervisor: ExecutionSupervisor,
+) -> None:
+    try:
+        sess = await agent_service.get_session(session_id)
+        if (
+            sess is None
+            or sess.execution_mode != "foreground"
+            or sess.status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT)
+            or sess.execution_phase in ("terminating", "terminated")
+        ):
+            return
+
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+        try:
+            await supervisor.promote(
+                session_id=session_id,
+                user_id=user_id,
+                expires_at=expires_at,
+            )
+        except SupervisorContractError:
+            logger.info("auto-degrade rejected for session %s", session_id)
+            return
+
+        await agent_service._emit_event(
+            session_id,
+            ExecutionStateChangedEvent(
+                payload=ExecutionStatePayload(
+                    execution_mode="background",
+                    execution_phase="running",
+                    transition_reason="auto_degrade_sse_disconnect",
+                    background_reason="auto_degrade",
+                    expires_at=expires_at,
+                    retry_budget_remaining=3,
+                )
+            ),
+        )
+    except Exception:
+        logger.exception("auto-degrade failed for session %s", session_id)
 
 
 @router.post(
@@ -348,6 +406,22 @@ async def chat(
                         event=sse_event.event,
                         data=sse_event.to_sse_data_json(),
                     )
+        except (
+            asyncio.CancelledError,
+            ConnectionResetError,
+            GeneratorExit,
+            anyio.EndOfStream,
+        ):
+            task = asyncio.create_task(
+                _do_auto_degrade(
+                    session_id,
+                    current_user.id,
+                    agent_service,
+                    supervisor,
+                )
+            )
+            _track_auto_degrade_task(task)
+            raise
         finally:
             try:
                 await subscriber_scope.__aexit__(None, None, None)

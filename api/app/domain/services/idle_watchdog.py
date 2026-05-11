@@ -29,6 +29,7 @@ class IdleWatchdog:
         supervisor=None,
         session_repository: SessionRepository | None = None,
         uow_factory: Callable[[], IUnitOfWork] | None = None,
+        notification_emitter=None,
         idle_timeout_seconds: float = _DEFAULT_IDLE_TIMEOUT_SECONDS,
         scan_interval_seconds: float = _DEFAULT_SCAN_INTERVAL_SECONDS,
     ) -> None:
@@ -38,6 +39,7 @@ class IdleWatchdog:
         self._supervisor = supervisor
         self._repo = session_repository
         self._uow_factory = uow_factory
+        self._notification_emitter = notification_emitter
         self._idle_timeout_seconds = idle_timeout_seconds
         self._scan_interval_seconds = scan_interval_seconds
         self._task: asyncio.Task[None] | None = None
@@ -124,6 +126,7 @@ class IdleWatchdog:
                         user_id=user_id,
                         terminal_reason="watchdog_timeout",
                         status=SessionStatus.TIMED_OUT,
+                        notification_emitter=self._notification_emitter,
                     )
                 except Exception:
                     logger.exception(

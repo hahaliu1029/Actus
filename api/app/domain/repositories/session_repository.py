@@ -102,8 +102,12 @@ class SessionRepository(Protocol):
         session_id: str,
         status: SessionStatus,
         terminal_reason: str,
-    ) -> None:
-        """Atomically write terminal status, phase and reason."""
+    ) -> bool:
+        """Atomically write terminal status, phase and reason.
+
+        Returns True when this call performed the terminal transition and
+        False when the row was already terminal/terminating.
+        """
         ...
 
     async def update_terminal_reason(

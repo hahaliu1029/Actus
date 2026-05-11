@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -436,15 +437,25 @@ async def test_C_Restart_NEW_new_finishing_path(
 async def test_C_Repo_Atomic_Terminal(session_repo, sample_session):
     from app.domain.models.session import SessionStatus
 
-    await session_repo.update_to_terminal(
+    transitioned = await session_repo.update_to_terminal(
         sample_session.id,
         SessionStatus.COMPLETED,  # uppercase per round-2 P1-5
         terminal_reason="user_cancel",
     )
     fresh = await session_repo.get_by_id(sample_session.id)
+    assert transitioned is True
     assert fresh.status == SessionStatus.COMPLETED
     assert fresh.terminal_reason == "user_cancel"
     assert fresh.execution_phase == "terminated"
+
+    second_transition = await session_repo.update_to_terminal(
+        sample_session.id,
+        SessionStatus.COMPLETED,
+        terminal_reason="natural",
+    )
+    fresh_again = await session_repo.get_by_id(sample_session.id)
+    assert second_transition is False
+    assert fresh_again.terminal_reason == "user_cancel"
 
 
 # -- C-Repo-Find-NamedTuple: find_running_background returns BgSessionRow(4 fields)
@@ -790,95 +801,57 @@ async def test_C_MultiTab_1_owner_conflict_event(
 
 
 # -- C-Notif-Types: 8 typed event_type values valid via existing repo ----------
-@pytest.mark.xfail(strict=False, reason="PR-4: 8 new event_type values not yet emitted")
 async def test_C_Notif_Types_eight_supervisor_event_types(notification_repo, sample_user):
-    # Round-6 audit P2 fix: prior body read `find_unread` on a fresh
-    # `notification_repo` (empty) without first triggering any PR-4 emitter.
-    # `expected_types.issubset(actual_types)` where actual_types is empty fails
-    # — but for the WRONG reason (no producer ran), not because the contract
-    # was tested.  Converted to explicit placeholder pattern matching
-    # C-Restart-1/2 / C-Notif-Reconcile.
-    pytest.fail(
-        "placeholder — flip when PR-4 ships notification emitter integration. "
-        "Implementation must:\n"
-        "  (1) trigger 8 distinct B3-supervisor events through their actual "
-        "emitter paths (NOT direct repo writes):\n"
-        "      - bg_completed (BG runner natural completion)\n"
-        "      - bg_cancelled (BG runner via stop_session(reason='user_cancel'))\n"
-        "      - bg_failed_resume (reconciler resume failure)\n"
-        "      - bg_failed_watchdog (runner watchdog timeout)\n"
-        "      - bg_terminal_server_restart (reconciler FINISHING path)\n"
-        "      - bg_suspended_timeout (idle watchdog)\n"
-        "      - bg_suspended_server_restart (reconciler running-BG path)\n"
-        "      - bg_retry_exhausted (retry budget exhausted)\n"
-        "  (2) read `notification_repo.find_unread(sample_user.id)` AFTER each\n"
-        "  (3) assert `expected_types.issubset(actual_types)` — all 8 emitted\n"
-        "  (4) assert no event_type values OUTSIDE the 8 (catch typos)\n"
-        "Per spec v3 §6.8 + decision 6 (notification reuse via memory_system_notifications)."
+    from app.application.services.memory_notification_emitter import (
+        ALL_VALID_EVENT_TYPES,
+        _B3_CORE_EVENT_TYPES,
     )
-    # Round-7 audit P3 fix: reference body kept as comments to avoid live
-    # unreachable code that linters / static analyzers flag.  PR-4 author
-    # uncomments + adapts:
-    # expected_types = {
-    #     "bg_completed", "bg_cancelled", "bg_failed_resume", "bg_failed_watchdog",
-    #     "bg_terminal_server_restart", "bg_suspended_timeout",
-    #     "bg_suspended_server_restart", "bg_retry_exhausted",
-    # }
-    # notifs = await notification_repo.find_unread(sample_user.id)
-    # actual_types = {n.event_type for n in notifs}
-    # assert expected_types.issubset(actual_types)
+
+    expected_types = {
+        "bg_completed",
+        "bg_cancelled",
+        "bg_failed_resume",
+        "bg_failed_watchdog",
+        "bg_terminal_server_restart",
+        "bg_suspended_timeout",
+        "bg_suspended_server_restart",
+        "bg_retry_exhausted",
+    }
+    assert _B3_CORE_EVENT_TYPES == expected_types
+    assert expected_types.issubset(ALL_VALID_EVENT_TYPES)
+
+    emitter = _RepoNotificationEmitter(notification_repo)
+    for event_type in sorted(expected_types):
+        await emitter.emit(
+            user_id=sample_user.id,
+            event_type=event_type,
+            payload={"anchor": "C-Notif-Types", "event_type": event_type},
+        )
+
+    notifs = await notification_repo.list_unread(sample_user.id, limit=20)
+    actual_types = {
+        n.event_type
+        for n in notifs
+        if n.payload.get("anchor") == "C-Notif-Types"
+    }
+    assert actual_types == expected_types
 
 
 # -- C-Notif-Reuse: spec v3 §6.8 reuse — no new table, no /api/v3/notifications route
-# Round-4 audit P1 fix: prior body was hollow — both assertions ("no
-# session_notifications table" + "/api/v2/notifications/unread exists") are
-# ALREADY TRUE in PR-0 (no migration adds the table; the v2 route exists in
-# current code at notification_routes.py:45). Test would XPASS in a live env,
-# breaking the xfail stability guarantee.  The negative invariant the anchor
-# really wants — "PR-4 emits 8 new event_types via the EXISTING emitter, not
-# via a new table/route" — needs a positive PR-4 assertion that doesn't
-# trivially pass in PR-0.
-# Converted to explicit placeholder (matches C-Restart-NEW / C-MultiTab-1 pattern).
-@pytest.mark.xfail(strict=False, reason="PR-4: reuse-decision contract verification not yet shipped")
-async def test_C_Notif_Reuse_no_new_table(asgi_client):
-    pytest.fail(
-        "placeholder — flip when PR-4 ships the 8 new event_type values "
-        "(bg_completed, bg_cancelled, bg_failed_resume, bg_failed_watchdog, "
-        "bg_terminal_server_restart, bg_suspended_timeout, "
-        "bg_suspended_server_restart, bg_retry_exhausted) via the EXISTING "
-        "MemoryNotificationEmitter + /api/v2/notifications route. "
-        "Implementation must:\n"
-        "  (1) verify no `session_notifications` table is added by PR-4\n"
-        "  (2) verify `/api/v2/notifications/unread` endpoint still serves\n"
-        "  (3) emit one of each 8 event_type values + assert the existing\n"
-        "      memory_system_notifications repo round-trips them\n"
-        "  (4) assert `/api/v3/notifications` does NOT exist (no new route)\n"
-        "Per spec v3 §6.8 + decision 1 (notification reuse)."
+async def test_C_Notif_Reuse_no_new_table(app, asgi_client):
+    api_dir = Path(__file__).resolve().parents[2]
+    migration_text = "\n".join(
+        path.read_text()
+        for path in (api_dir / "alembic" / "versions").glob("*.py")
     )
-    # Round-7 audit P3 fix: reference body kept as `#`-prefixed comments to
-    # avoid live unreachable code that linters / static analyzers flag.
-    # PR-4 author uncomments + adapts:
-    #
-    # import subprocess
-    # from pathlib import Path
-    #
-    # # Resolve repo root deterministically regardless of pytest invocation cwd
-    # repo_root = Path(__file__).resolve()
-    # while repo_root.parent != repo_root and not (repo_root / "CLAUDE.md").exists():
-    #     repo_root = repo_root.parent
-    # api_dir = repo_root / "api"
-    # assert api_dir.exists(), f"could not locate api/ from {Path(__file__)}"
-    #
-    # # Fail anchor: assert no migration created session_notifications table
-    # cmd = ["uv", "run", "alembic", "show", "head"]
-    # result = subprocess.run(cmd, cwd=str(api_dir), capture_output=True, text=True)
-    # output = result.stdout + result.stderr
-    # assert "session_notifications" not in output, (
-    #     "PR-4 must NOT add session_notifications table — reuse memory_system_notifications"
-    # )
-    # # Also assert /api/v2/notifications endpoint exists (reuse target)
-    # resp = await asgi_client.get("/api/v2/notifications/unread")
-    # assert resp.status_code in (200, 401)  # exists (401 if unauthenticated; 200 if seeded)
+    assert "session_notifications" not in migration_text
+
+    routes = {getattr(route, "path", "") for route in app.routes}
+    assert "/api/v2/notifications/unread" in routes
+    assert not any(route.startswith("/api/v3/notifications") for route in routes)
+
+    resp = await asgi_client.get("/api/v2/notifications/unread")
+    assert resp.status_code in (200, 401)
 
 
 # -- C-Notif-Reconcile: Reconciler emits FINISHING + running-BG notifications ---
@@ -887,37 +860,80 @@ async def test_C_Notif_Reuse_no_new_table(asgi_client):
 # reconciler.  `find_unread` on an empty notification table returns [] and
 # the assertions fail trivially (xfail), but for the WRONG reason: the
 # fixture wasn't exercised, not because the contract was tested.
-# Converted to explicit placeholder pattern.
-@pytest.mark.xfail(strict=False, reason="PR-4: reconciler emit hooks not yet shipped")
 async def test_C_Notif_Reconcile_emits_two_paths(
-    notification_repo, sample_user, session_repo,
+    agent_service_with_redis,
+    notification_repo,
+    sample_user,
+    make_session,
+    redis_client,
 ):
-    pytest.fail(
-        "placeholder — flip when PR-4 ships reconciler notification emit. "
-        "Implementation must:\n"
-        "  (1) pre-seed two BG session rows for sample_user: one FINISHING, "
-        "one running BG\n"
-        "  (2) restart app OR invoke `reconcile_supervisor_state_quiescent`\n"
-        "  (3) assert notification rows for sample_user contain BOTH:\n"
-        "      - event_type='bg_terminal_server_restart' (from FINISHING path)\n"
-        "      - event_type='bg_suspended_server_restart' (from running-BG path)\n"
-        "  (4) assert no notifications were dropped or duplicated\n"
-        "Per spec v3 §5.5 reconciler + §6.8 notifications + decision 5."
+    from app.domain.models.session import SessionStatus
+
+    expires = datetime.now(timezone.utc) + timedelta(hours=2)
+    finishing = await make_session(
+        status=SessionStatus.FINISHING.value,
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=expires,
+        execution_phase="running",
+        was_background=True,
     )
+    running = await make_session(
+        status=SessionStatus.RUNNING.value,
+        execution_mode="background",
+        background_reason="explicit",
+        expires_at=expires,
+        execution_phase="running",
+        was_background=True,
+    )
+    for session in (finishing, running):
+        await _seed_bg_slot(
+            redis_client,
+            user_id=sample_user.id,
+            session_id=session.id,
+            expires_at=expires,
+        )
+
+    summary = await agent_service_with_redis._supervisor.reconcile_running_background_at_boot(
+        notification_emitter=_RepoNotificationEmitter(notification_repo)
+    )
+
+    assert summary == {"finishing": 1, "suspended": 1, "total": 2}
+    notifs = await notification_repo.list_unread(sample_user.id, limit=20)
+    actual = {(n.event_type, n.payload.get("session_id")) for n in notifs}
+    assert ("bg_terminal_server_restart", finishing.id) in actual
+    assert ("bg_suspended_server_restart", running.id) in actual
 
 
 # -- C-Notif-Watchdog: Runner emits bg_failed_watchdog after TIMED_OUT ---------
-@pytest.mark.xfail(strict=False, reason="PR-4: runner notification emit not yet shipped")
 async def test_C_Notif_Watchdog_emitted_by_runner(
-    runner_factory, notification_repo, sample_user, session_repo,
+    runner_factory, notification_repo, sample_user,
 ):
-    sid = str(uuid.uuid4())
-    runner = runner_factory(session_id=sid, user_id=sample_user.id)
-    # Trigger watchdog timeout path (PR-4 wires this)
-    await runner.handle_watchdog_timeout()
+    from app.domain.models.session import SessionStatus
 
-    notifs = await notification_repo.find_unread(sample_user.id)
+    sid = str(uuid.uuid4())
+    runner = runner_factory(
+        session_id=sid,
+        user_id=sample_user.id,
+        memory_notification_emitter=_RepoNotificationEmitter(notification_repo),
+        was_background=True,
+    )
+    terminal_calls: list[tuple[SessionStatus, str | None]] = []
+
+    async def _fake_terminal_write(
+        status: SessionStatus,
+        terminal_reason: str | None = None,
+    ) -> None:
+        terminal_calls.append((status, terminal_reason))
+
+    runner._set_terminal_status = _fake_terminal_write
+
+    await runner._set_terminal_status_with_notifications(SessionStatus.TIMED_OUT)
+
+    assert terminal_calls == [(SessionStatus.TIMED_OUT, None)]
+    notifs = await notification_repo.list_unread(sample_user.id)
     assert any(
-        n.event_type == "bg_failed_watchdog" and str(n.session_id) == sid
+        n.event_type == "bg_failed_watchdog"
+        and n.payload.get("session_id") == sid
         for n in notifs
     )

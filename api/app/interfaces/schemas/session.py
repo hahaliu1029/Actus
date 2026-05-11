@@ -72,8 +72,8 @@ class GetSessionResponse(BaseModel):
 class SupervisorSnapshot(BaseModel):
     """B3-core PR-1 §3.3 — supervisor snapshot for resume responses.
 
-    PR-1 ships the SHAPE; PR-3c/PR-4 wire the producer side (currently always None
-    in ``agent_service.get_events_since``).
+    PR-1 shipped the response shape; PR-4 wires producer-side snapshots from
+    ``agent_service.get_events_since``.
     """
 
     execution_mode: Literal["foreground", "background"]

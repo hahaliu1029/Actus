@@ -325,7 +325,7 @@ class DBSessionRepository(SessionRepository):
         session_id: str,
         status: SessionStatus,
         terminal_reason: str,
-    ) -> None:
+    ) -> bool:
         if status not in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
             raise ValueError(f"non-terminal status: {status}")
 
@@ -361,8 +361,9 @@ class DBSessionRepository(SessionRepository):
                 SessionStatus.COMPLETED.value,
                 SessionStatus.TIMED_OUT.value,
             ) or row.execution_phase in ("terminating", "terminated"):
-                return
+                return False
             raise ValueError(f"会话[{session_id}]终态写入失败，请重试")
+        return True
 
     async def update_terminal_reason(
         self,
