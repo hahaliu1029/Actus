@@ -95,8 +95,9 @@ def test_anchor_files_have_expected_xfail_decorator_count():
          C-Restart-1/2/NEW, C-Repo-*, C-Redis-2).
       - PR-3a ship: 11 xfail decorators, 23 anchors flipped
         (C-FINISHING-1, C-Callback-Compose).
-      - PR-3b ship: 11 xfail decorators, 23 anchors flipped (no anchor flip).
-      - PR-3c ship: 8 xfail decorators, 26 anchors flipped
+      - PR-3b ship: 9 xfail decorators, 25 anchors flipped
+        (C-Inflight-1, C-Inflight-2).
+      - PR-3c ship: 6 xfail decorators, 28 anchors flipped
         (C-Cancel-1, C-Auth-1, C-MultiTab-1).
       - PR-4 ship: TBD
 
@@ -106,8 +107,8 @@ def test_anchor_files_have_expected_xfail_decorator_count():
     """
     import re
 
-    # PR-3c ship: 8 = 34 - 26 flipped anchors.
-    EXPECTED_XFAIL_COUNT = 8
+    # PR-3c ship after PR-3b cleanup: 6 = 34 - 28 flipped anchors.
+    EXPECTED_XFAIL_COUNT = 6
 
     repo_root = _find_repo_root()
     total = 0

@@ -595,7 +595,6 @@ async def test_C_Callback_Compose_supervisor_cleanup_on_original_raise(
 
 
 # -- C-Inflight-1: on_llm_end decrements supervisor:hot.inflight_llm_count -----
-@pytest.mark.xfail(strict=False, reason="PR-3b: SupervisorAwareCallbackHandler not yet shipped")
 async def test_C_Inflight_1_on_llm_end_decrements_counter(redis_client):
     from unittest.mock import MagicMock
 
@@ -616,7 +615,6 @@ async def test_C_Inflight_1_on_llm_end_decrements_counter(redis_client):
 
 
 # -- C-Inflight-2: ainvoke wrap covers Pydantic validation errors --------------
-@pytest.mark.xfail(strict=False, reason="PR-3b: SupervisorAwareToolWrapper not yet shipped")
 async def test_C_Inflight_2_ainvoke_wrap_covers_validation_errors(redis_client):
     from langchain_core.tools import StructuredTool
     from pydantic import BaseModel
