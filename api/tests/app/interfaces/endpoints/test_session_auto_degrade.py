@@ -238,6 +238,12 @@ class _EndOfStreamChatAgentService:
         yield  # type: ignore[unreachable]
 
 
+class _IdleChatAgentService:
+    async def chat(self, **kwargs: Any) -> AsyncGenerator[BaseEvent, None]:
+        await asyncio.Event().wait()
+        yield  # type: ignore[unreachable]
+
+
 def _fake_request() -> Request:
     return Request(
         {
@@ -247,6 +253,83 @@ def _fake_request() -> Request:
             "headers": [(b"x-connection-id", b"conn-1")],
         }
     )
+
+
+async def test_chat_http_disconnect_callback_detaches_auto_degrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _RecordingLease()
+    agent = _IdleChatAgentService()
+    supervisor = _RecordingSupervisor()
+    auto_degrade_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    created_tasks: list[Any] = []
+    pending_tasks: set[Any] = set()
+
+    class _FakeTask:
+        def __init__(self, coro: Any) -> None:
+            self.coro = coro
+            self.done_callbacks: list[Any] = []
+
+        def add_done_callback(self, callback: Any) -> None:
+            self.done_callbacks.append(callback)
+
+    async def fake_acquire_connection_limit(**kwargs: Any) -> _RecordingLease:
+        return lease
+
+    def fake_auto_degrade(*args: Any, **kwargs: Any):
+        auto_degrade_calls.append((args, dict(kwargs)))
+
+        async def _noop() -> None:
+            return None
+
+        return _noop()
+
+    def fake_create_task(coro):
+        task = _FakeTask(coro)
+        created_tasks.append(task)
+        coro.close()
+        return task
+
+    monkeypatch.setattr(
+        session_routes,
+        "acquire_connection_limit",
+        fake_acquire_connection_limit,
+    )
+    monkeypatch.setattr(
+        session_routes,
+        "_do_auto_degrade",
+        fake_auto_degrade,
+        raising=False,
+    )
+    monkeypatch.setattr(session_routes.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        session_routes,
+        "_PENDING_AUTO_DEGRADE_TASKS",
+        pending_tasks,
+        raising=False,
+    )
+
+    response = await session_routes.chat(
+        session_id="s1",
+        request=ChatRequest(message="hi"),
+        fastapi_request=_fake_request(),
+        current_user=_fake_user(),
+        agent_service=agent,
+        session_service=_AllowSessionService(),
+        supervisor=supervisor,
+        redis_client=object(),
+    )
+
+    assert response.client_close_handler_callable is not None
+    await response.client_close_handler_callable({"type": "http.disconnect"})
+
+    assert auto_degrade_calls == [(("s1", "test-user", agent, supervisor), {})]
+    assert len(created_tasks) == 1
+    task = created_tasks[0]
+    assert task in pending_tasks
+    assert len(task.done_callbacks) == 1
+    task.done_callbacks[0](task)
+    assert pending_tasks == set()
 
 
 async def test_chat_cancelled_stream_detaches_auto_degrade_and_cleans_up(

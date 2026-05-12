@@ -373,6 +373,26 @@ async def chat(
                 await lease.release()
             raise
 
+    auto_degrade_scheduled = False
+
+    def schedule_auto_degrade() -> None:
+        nonlocal auto_degrade_scheduled
+        if auto_degrade_scheduled:
+            return
+        auto_degrade_scheduled = True
+        task = asyncio.create_task(
+            _do_auto_degrade(
+                session_id,
+                current_user.id,
+                agent_service,
+                supervisor,
+            )
+        )
+        _track_auto_degrade_task(task)
+
+    async def handle_client_close(_message: dict[str, object]) -> None:
+        schedule_auto_degrade()
+
     async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
         """定义事件生成器，用于配合EventSourceResponse生成流式响应数据"""
         try:
@@ -412,15 +432,7 @@ async def chat(
             GeneratorExit,
             anyio.EndOfStream,
         ):
-            task = asyncio.create_task(
-                _do_auto_degrade(
-                    session_id,
-                    current_user.id,
-                    agent_service,
-                    supervisor,
-                )
-            )
-            _track_auto_degrade_task(task)
+            schedule_auto_degrade()
             raise
         finally:
             try:
@@ -428,7 +440,11 @@ async def chat(
             finally:
                 await lease.release()
 
-    return EventSourceResponse(event_generator(), headers=SSE_HEADERS)
+    return EventSourceResponse(
+        event_generator(),
+        headers=SSE_HEADERS,
+        client_close_handler_callable=handle_client_close,
+    )
 
 
 @router.post(
