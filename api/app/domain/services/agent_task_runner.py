@@ -260,6 +260,7 @@ class AgentTaskRunner(TaskRunner):
         event_seq_client: Any = None,  # B3-core PR-1: Redis client for session:seq:{sid}
         event_seq_ttl_seconds: int = _EVENT_SEQ_TTL_SECONDS,
         execution_supervisor: Any = None,
+        idle_watchdog: Any = None,
         was_background: bool = False,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
@@ -268,6 +269,7 @@ class AgentTaskRunner(TaskRunner):
         self.profile = profile
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
+        self._idle_watchdog = idle_watchdog
         self._event_seq_client = event_seq_client
         self._event_seq_ttl_seconds = event_seq_ttl_seconds
         self._on_session_complete = on_session_complete
@@ -618,11 +620,25 @@ class AgentTaskRunner(TaskRunner):
         # 1.往任务的输出消息队列中新增事件
         event_id = await task.output_stream.put(event.model_dump_json())
         event.id = event_id
+        await self._touch_idle_activity()
 
         # 2.按需将事件添加到会话中（流式中间片段不落库）
         if persist:
             async with self._uow:
                 await self._uow.session.add_event(self._session_id, event)
+
+    async def _touch_idle_activity(self) -> None:
+        watchdog = getattr(self, "_idle_watchdog", None)
+        if watchdog is None:
+            return
+        try:
+            await watchdog.touch_activity(session_id=self._session_id)
+        except Exception:
+            logger.debug(
+                "failed to touch idle activity for session=%s",
+                self._session_id,
+                exc_info=True,
+            )
 
     async def _stamp_event_seq(self, event: Event) -> None:
         if getattr(event, "seq", None) is not None:

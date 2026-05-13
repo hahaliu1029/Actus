@@ -78,6 +78,14 @@ class _Uow:
         return None
 
 
+class _Supervisor:
+    def __init__(self) -> None:
+        self.cleanup_calls: list[dict[str, str]] = []
+
+    async def cleanup_background_slot(self, **kwargs: str) -> None:
+        self.cleanup_calls.append(kwargs)
+
+
 class _DummyOutputStream:
     def __init__(self) -> None:
         self.put_payloads: list[str] = []
@@ -432,6 +440,42 @@ async def test_stop_session_emits_bg_cancelled_for_background_session(
         event_type="bg_cancelled",
         payload={"session_id": "s1"},
     )
+
+
+async def test_stop_session_releases_suspended_background_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        id="s1",
+        user_id="owner",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="suspended",
+        was_background=True,
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    supervisor = _Supervisor()
+    service._supervisor = supervisor
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    await service.stop_session("s1", "admin-user", is_admin=True)
+
+    assert supervisor.cleanup_calls == [
+        {
+            "session_id": "s1",
+            "user_id": "owner",
+            "reason": "user_cancel",
+        }
+    ]
 
 
 async def test_end_takeover_continue_passes_takeover_id_and_releases_lease(

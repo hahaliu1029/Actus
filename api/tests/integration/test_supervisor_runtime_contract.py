@@ -211,11 +211,17 @@ async def test_background_resume_refreshes_existing_redis_slot_score(
         {session.id: old_score},
     )
 
-    await agent_service_with_redis._supervisor.resume(
+    claimed_retry_budget = await session_repo.claim_background_retry_from_suspend(
+        session.id,
+        expires_at=new_expires_at,
+    )
+
+    admission_rc = await agent_service_with_redis._supervisor.resume(
         session_id=session.id,
         user_id=sample_user.id,
         execution_mode="background",
         expires_at=new_expires_at,
+        retry_budget_remaining=claimed_retry_budget,
     )
 
     fresh = await session_repo.get_by_id(session.id)
@@ -227,8 +233,11 @@ async def test_background_resume_refreshes_existing_redis_slot_score(
         f"supervisor:user:{sample_user.id}",
         session.id,
     )
+    assert claimed_retry_budget == 2
+    assert admission_rc == 3
     assert fresh.execution_phase == "running"
     assert fresh.suspended_reason is None
+    assert fresh.retry_budget_remaining == 2
     assert int(float(refreshed_score)) == int(new_expires_at.timestamp())
     assert int(float(user_hash_value)) == int(new_expires_at.timestamp())
     assert int(await redis_client.get("supervisor:system:bg_count") or 0) == 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator
 
@@ -45,14 +46,21 @@ class _AutoDegradeAgentService:
 
 
 class _AutoDegradeSupervisor:
-    def __init__(self, exc: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        exc: BaseException | None = None,
+        *,
+        retry_budget_remaining: int | None = 3,
+    ) -> None:
         self.exc = exc
+        self.retry_budget_remaining = retry_budget_remaining
         self.promote_calls: list[dict[str, Any]] = []
 
-    async def promote(self, **kwargs: Any) -> None:
+    async def promote(self, **kwargs: Any) -> int | None:
         self.promote_calls.append(dict(kwargs))
         if self.exc is not None:
             raise self.exc
+        return self.retry_budget_remaining
 
 
 async def test_do_auto_degrade_promotes_foreground_session_and_emits_state() -> None:
@@ -89,6 +97,23 @@ async def test_do_auto_degrade_promotes_foreground_session_and_emits_state() -> 
     assert event.payload.background_reason == "auto_degrade"
     assert event.payload.expires_at == expires_at
     assert event.payload.retry_budget_remaining == 3
+
+
+async def test_do_auto_degrade_uses_session_owner_for_supervisor_quota() -> None:
+    agent = _AutoDegradeAgentService(
+        Session(id="s1", user_id="session-owner", execution_mode="foreground")
+    )
+    supervisor = _AutoDegradeSupervisor()
+
+    await session_routes._do_auto_degrade(
+        "s1",
+        "admin-user",
+        agent,
+        supervisor,
+    )
+
+    assert len(supervisor.promote_calls) == 1
+    assert supervisor.promote_calls[0]["user_id"] == "session-owner"
 
 
 async def test_do_auto_degrade_skips_background_session() -> None:
@@ -181,6 +206,23 @@ async def test_do_auto_degrade_promote_rejection_does_not_emit() -> None:
     assert agent.emitted == []
 
 
+async def test_do_auto_degrade_stale_promote_does_not_emit() -> None:
+    agent = _AutoDegradeAgentService(
+        Session(id="s1", user_id="test-user", execution_mode="foreground")
+    )
+    supervisor = _AutoDegradeSupervisor(retry_budget_remaining=None)
+
+    await session_routes._do_auto_degrade(
+        "s1",
+        "test-user",
+        agent,
+        supervisor,
+    )
+
+    assert len(supervisor.promote_calls) == 1
+    assert agent.emitted == []
+
+
 class _RecordingLease:
     def __init__(self) -> None:
         self.started = False
@@ -221,6 +263,30 @@ class _RecordingSupervisor:
         return self.scope
 
 
+class _ConflictScope:
+    is_conflict = True
+    current_owner = "test-user:conn-a"
+
+
+class _RecordingConflictSubscriberScope:
+    def __init__(self) -> None:
+        self.exited = False
+
+    async def __aenter__(self) -> _ConflictScope:
+        return _ConflictScope()
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.exited = True
+
+
+class _ConflictSupervisor:
+    def __init__(self) -> None:
+        self.scope = _RecordingConflictSubscriberScope()
+
+    def subscriber_scope(self, **kwargs: Any) -> _RecordingConflictSubscriberScope:
+        return self.scope
+
+
 class _AllowSessionService:
     async def get_session(self, **kwargs: Any) -> object:
         return object()
@@ -253,6 +319,42 @@ def _fake_request() -> Request:
             "headers": [(b"x-connection-id", b"conn-1")],
         }
     )
+
+
+async def test_chat_owner_conflict_suggests_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _RecordingLease()
+    supervisor = _ConflictSupervisor()
+
+    async def fake_acquire_connection_limit(**kwargs: Any) -> _RecordingLease:
+        return lease
+
+    monkeypatch.setattr(
+        session_routes,
+        "acquire_connection_limit",
+        fake_acquire_connection_limit,
+    )
+
+    response = await session_routes.chat(
+        session_id="s1",
+        request=ChatRequest(message="hi"),
+        fastapi_request=_fake_request(),
+        current_user=_fake_user(),
+        agent_service=_IdleChatAgentService(),
+        session_service=_AllowSessionService(),
+        supervisor=supervisor,
+        redis_client=object(),
+    )
+
+    frame = await response.body_iterator.__anext__()
+    payload = json.loads(frame.data)
+
+    assert frame.event == "owner_conflict"
+    assert payload["payload"]["suggested_action"] == "request_takeover"
+    await response.body_iterator.aclose()
+    assert supervisor.scope.exited is True
+    assert lease.released is True
 
 
 async def test_chat_http_disconnect_callback_detaches_auto_degrade(

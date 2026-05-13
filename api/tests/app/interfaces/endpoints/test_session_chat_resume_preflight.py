@@ -24,6 +24,7 @@ from app.application.errors.exceptions import (
     NotFoundError,
     ServiceUnavailableError,
 )
+from app.domain.models.session import Session, SessionStatus
 from app.domain.models.user import User, UserRole, UserStatus
 from app.interfaces.dependencies import rate_limit_chat
 from app.interfaces.dependencies.auth import get_current_user
@@ -101,6 +102,27 @@ class _NoConflictSupervisor:
 class _AllowSessionService:
     async def get_session(self, **kwargs: Any) -> object:
         return object()
+
+
+class _SuspendedBackgroundSessionService:
+    async def get_session(self, **kwargs: Any) -> Session:
+        return Session(
+            id="s1",
+            user_id="test-user",
+            status=SessionStatus.RUNNING,
+            execution_mode="background",
+            execution_phase="suspended",
+        )
+
+
+class _UnexpectedChatAgent:
+    def __init__(self) -> None:
+        self.chat_called = False
+
+    async def chat(self, **kwargs: Any):  # noqa: ASYNC101 — generator stub
+        self.chat_called = True
+        if False:
+            yield  # type: ignore[unreachable]
 
 
 def _tool_confirmation_payload() -> dict:
@@ -226,3 +248,89 @@ async def test_preflight_late_duplicate_after_winner_cleanup_maps_to_409(
     # 不误报 SSE 200
     assert "event:" not in response.text[:200]
     assert lease.released
+
+
+async def test_suspended_background_message_preflight_maps_to_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _UnexpectedChatAgent()
+    lease = _RecordingLease()
+    acquire_calls = 0
+
+    async def _fake_acquire(**kwargs: Any) -> _RecordingLease:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        return lease
+
+    monkeypatch.setattr(
+        session_routes,
+        "acquire_connection_limit",
+        _fake_acquire,
+    )
+    app.dependency_overrides[get_current_user] = _fake_user
+    app.dependency_overrides[get_agent_service] = lambda: agent
+    app.dependency_overrides[get_session_service] = (
+        lambda: _SuspendedBackgroundSessionService()
+    )
+    app.dependency_overrides[get_supervisor] = lambda: _NoConflictSupervisor()
+    app.dependency_overrides[rate_limit_chat] = _noop_rate_limit
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/sessions/s1/chat",
+                json={"message": "continue"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "event:" not in response.text[:200]
+    assert agent.chat_called is False
+    assert acquire_calls == 0
+
+
+async def test_suspended_background_attachments_only_preflight_maps_to_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _UnexpectedChatAgent()
+    lease = _RecordingLease()
+    acquire_calls = 0
+
+    async def _fake_acquire(**kwargs: Any) -> _RecordingLease:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        return lease
+
+    monkeypatch.setattr(
+        session_routes,
+        "acquire_connection_limit",
+        _fake_acquire,
+    )
+    app.dependency_overrides[get_current_user] = _fake_user
+    app.dependency_overrides[get_agent_service] = lambda: agent
+    app.dependency_overrides[get_session_service] = (
+        lambda: _SuspendedBackgroundSessionService()
+    )
+    app.dependency_overrides[get_supervisor] = lambda: _NoConflictSupervisor()
+    app.dependency_overrides[rate_limit_chat] = _noop_rate_limit
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/sessions/s1/chat",
+                json={"attachments": ["file-1"]},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "event:" not in response.text[:200]
+    assert agent.chat_called is False
+    assert acquire_calls == 0

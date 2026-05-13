@@ -53,6 +53,22 @@ describe("sessionApi takeover", () => {
     expect(mockPost).toHaveBeenCalledWith("/sessions/sid-cancel/cancel", {});
   });
 
+  it("retryFromSuspend 应调用后台挂起重试 endpoint", async () => {
+    mockPost.mockResolvedValue({
+      status: "running",
+      request_status: "resumed",
+      retry_budget_remaining: 1,
+      expires_at: null,
+    });
+
+    await sessionApi.retryFromSuspend("sid-bg");
+
+    expect(mockPost).toHaveBeenCalledWith(
+      "/sessions/sid-bg/retry-from-suspend",
+      {}
+    );
+  });
+
   it("endTakeover 默认 handoff_mode 应为 continue", async () => {
     mockPost.mockResolvedValue({
       status: "running",

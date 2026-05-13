@@ -1,6 +1,7 @@
 import { createSSEStream, get, parseSSEStream, post } from "./fetch";
 import { fileTransferClient } from "./axios-client";
 import type {
+  BackgroundQuotaResponse,
   ChatParams,
   CostAggregateResponse,
   CreateSessionResponse,
@@ -17,6 +18,7 @@ import type {
   RenewTakeoverParams,
   RenewTakeoverResponse,
   ReopenTakeoverResponse,
+  RetryFromSuspendResponse,
   Session,
   ShellReadResponse,
   SSEEventData,
@@ -31,6 +33,17 @@ export const sessionApi = {
   getSessions: async (): Promise<ListSessionItem[]> => {
     const data = await get<ListSessionResponse>("/sessions");
     return data.sessions;
+  },
+
+  getBackgroundQuota: (): Promise<BackgroundQuotaResponse> => {
+    return get<BackgroundQuotaResponse>("/sessions/background-quota");
+  },
+
+  retryFromSuspend: (sessionId: string): Promise<RetryFromSuspendResponse> => {
+    return post<RetryFromSuspendResponse>(
+      `/sessions/${sessionId}/retry-from-suspend`,
+      {}
+    );
   },
 
   createSession: (): Promise<CreateSessionResponse> => {

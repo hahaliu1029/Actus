@@ -11,6 +11,7 @@ import {
   MessageCircleQuestion,
   PanelRightClose,
   PanelRightOpen,
+  RotateCcw,
   XCircle,
 } from "lucide-react";
 
@@ -76,6 +77,10 @@ type TakeoverMeta = {
   takeoverExpiresAt: number | null;
 };
 
+type OwnerConflictMeta = {
+  suggestedAction: "wait_lease_expire" | "request_takeover";
+};
+
 function renderMessageAttachments(
   attachments: FileInfo[] | undefined,
   onPreviewFile: (file: FileInfo) => void
@@ -117,6 +122,17 @@ function getEventTime(eventData: Record<string, unknown>) {
   return formatRelativeTime(eventData.created_at);
 }
 
+function formatAutoDegradeExpiry(value: string): string {
+  const match = value.match(
+    /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})?/
+  );
+  if (match) {
+    const zone = match[3] === "Z" ? " UTC" : match[3] ? ` ${match[3]}` : "";
+    return `${match[1]} ${match[2]}${zone}`;
+  }
+  return value;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null
     ? (value as Record<string, unknown>)
@@ -131,6 +147,26 @@ function getPathTail(path: string): string {
 
 function shouldUseSandboxFile(file: FileInfo): boolean {
   return !file.key && Boolean(file.filepath);
+}
+
+function deriveLatestOwnerConflict(events: SessionEvent[]): OwnerConflictMeta | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.event === "control") {
+      return null;
+    }
+    if (!event || event.event !== "owner_conflict") {
+      continue;
+    }
+    const payload = asRecord(event.data.payload);
+    return {
+      suggestedAction:
+        payload.suggested_action === "request_takeover"
+          ? "request_takeover"
+          : "wait_lease_expire",
+    };
+  }
+  return null;
 }
 
 function toSearchThumbnail(url: string, width: number): string {
@@ -721,6 +757,7 @@ export default function SessionPage() {
   const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
   const fetchSessionFiles = useSessionStore((state) => state.fetchSessionFiles);
   const recoverSession = useSessionStore((state) => state.recoverSession);
+  const retryFromSuspend = useSessionStore((state) => state.retryFromSuspend);
   const downloadFile = useSessionStore((state) => state.downloadFile);
   const downloadSandboxFile = useSessionStore((state) => state.downloadSandboxFile);
   const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
@@ -742,6 +779,8 @@ export default function SessionPage() {
   const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
   const [sandboxDownloadPath, setSandboxDownloadPath] = useState<string | null>(null);
+  const [ownerConflictSubmitting, setOwnerConflictSubmitting] = useState(false);
+  const [retryFromSuspendSubmitting, setRetryFromSuspendSubmitting] = useState(false);
   const [imagePreview, setImagePreview] = useState<{
     src: string;
     title: string;
@@ -800,6 +839,10 @@ export default function SessionPage() {
     () => deriveTakeoverMeta(eventList),
     [eventList]
   );
+  const ownerConflictMeta = useMemo(
+    () => deriveLatestOwnerConflict(eventList),
+    [eventList]
+  );
   const progressSummary = useMemo(
     () => deriveSessionProgressSummary(eventList),
     [eventList]
@@ -822,10 +865,26 @@ export default function SessionPage() {
   );
   const workbenchVisible = (!isMobile && desktopWorkbenchVisible) || (isMobile && mobileWorkbenchOpen);
   const isCurrentSessionStreaming = Boolean(sessionId) && isChatting && chatSessionId === sessionId;
+  const isBackgroundSuspended =
+    visibleSession?.supervisor_snapshot?.execution_mode === "background" &&
+    visibleSession.supervisor_snapshot.execution_phase === "suspended";
   const sessionRunning =
-    isCurrentSessionStreaming ||
-    visibleSession?.status === "running" ||
-    visibleSession?.status === "waiting";
+    !isBackgroundSuspended &&
+    (isCurrentSessionStreaming ||
+      visibleSession?.status === "running" ||
+      visibleSession?.status === "waiting");
+  const autoDegradeSnapshot =
+    visibleSession?.supervisor_snapshot?.execution_mode === "background" &&
+    visibleSession.supervisor_snapshot.background_reason === "auto_degrade"
+      ? visibleSession.supervisor_snapshot
+      : null;
+  const backgroundSnapshot =
+    visibleSession?.supervisor_snapshot?.execution_mode === "background"
+      ? visibleSession.supervisor_snapshot
+      : null;
+  const canRetryFromSuspend =
+    backgroundSnapshot?.execution_phase === "suspended" &&
+    backgroundSnapshot.retry_budget_remaining > 0;
 
   useEffect(() => {
     if (!isMobile) {
@@ -1210,6 +1269,42 @@ export default function SessionPage() {
     []
   );
 
+  const handleOwnerConflictTakeover = useCallback(async () => {
+    if (!sessionId) {
+      return;
+    }
+    setOwnerConflictSubmitting(true);
+    try {
+      await sessionApi.startTakeover(sessionId, { scope: "shell" });
+      await fetchSessionById(sessionId, { silent: true });
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "发起接管失败",
+      });
+    } finally {
+      setOwnerConflictSubmitting(false);
+    }
+  }, [fetchSessionById, sessionId, setMessage]);
+
+  const handleRetryFromSuspend = useCallback(async () => {
+    if (!sessionId) {
+      return;
+    }
+    setRetryFromSuspendSubmitting(true);
+    try {
+      await retryFromSuspend(sessionId);
+      await fetchSessionFiles(sessionId, { silent: true });
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "重试后台任务失败",
+      });
+    } finally {
+      setRetryFromSuspendSubmitting(false);
+    }
+  }, [fetchSessionFiles, retryFromSuspend, sessionId, setMessage]);
+
   const handleTaskDockPreviewFile = useCallback(
     (file: FileInfo) => {
       void openFilePreview(file);
@@ -1235,7 +1330,7 @@ export default function SessionPage() {
       <div className="mx-auto flex w-full max-w-[1700px] flex-1 gap-4 px-4 py-4">
         <main className="flex min-w-0 flex-1 flex-col">
           <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span className="inline-flex items-center gap-1">
                 <span>当前状态：</span>
                 <StatusIndicator meta={currentStatusMeta} />
@@ -1245,6 +1340,37 @@ export default function SessionPage() {
                   <Loader2 size={12} className="animate-spin" />
                   正在执行中
                 </span>
+              ) : null}
+              {autoDegradeSnapshot ? (
+                <span className="inline-flex max-w-full flex-wrap items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+                  <AlertCircle size={12} />
+                  <span>已自动转入后台</span>
+                  {autoDegradeSnapshot.expires_at ? (
+                    <span className="text-amber-700/80 dark:text-amber-300/80">
+                      到期 {formatAutoDegradeExpiry(autoDegradeSnapshot.expires_at)}
+                    </span>
+                  ) : null}
+                  {typeof autoDegradeSnapshot.retry_budget_remaining === "number" ? (
+                    <span className="text-amber-700/80 dark:text-amber-300/80">
+                      剩余重试 {autoDegradeSnapshot.retry_budget_remaining}
+                    </span>
+                  ) : null}
+                </span>
+              ) : null}
+              {canRetryFromSuspend ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 rounded-full border-amber-300 bg-amber-50 px-2 text-xs text-amber-800 hover:bg-amber-100 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100 dark:hover:bg-amber-500/20"
+                  disabled={retryFromSuspendSubmitting}
+                  onClick={() => {
+                    void handleRetryFromSuspend();
+                  }}
+                >
+                  <RotateCcw size={12} />
+                  重试后台任务
+                </Button>
               ) : null}
             </div>
             <div className="flex items-center gap-2">
@@ -1272,6 +1398,30 @@ export default function SessionPage() {
           {isLoadingCurrentSession ? (
             <div className="mb-4 rounded-2xl border border-border bg-card p-3 text-sm text-muted-foreground">
               正在加载会话内容...
+            </div>
+          ) : null}
+
+          {ownerConflictMeta ? (
+            <div className="mb-3 flex flex-wrap items-center gap-3 border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+              <AlertCircle size={16} className="shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p className="font-medium">此会话已在另一个窗口连接</p>
+                <p className="text-xs text-amber-700/80 dark:text-amber-200/75">
+                  当前窗口已停止接收执行流，避免多个窗口同时驱动同一会话。
+                </p>
+              </div>
+              {ownerConflictMeta.suggestedAction === "request_takeover" ? (
+                <Button
+                  variant="outline"
+                  className="rounded-xl border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100 dark:hover:bg-amber-500/20"
+                  disabled={ownerConflictSubmitting}
+                  onClick={() => {
+                    void handleOwnerConflictTakeover();
+                  }}
+                >
+                  发起接管
+                </Button>
+              ) : null}
             </div>
           ) : null}
 

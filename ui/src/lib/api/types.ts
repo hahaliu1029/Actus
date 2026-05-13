@@ -293,10 +293,25 @@ export type ListSessionItem = {
   latest_message_at: string | null;
   status: SessionStatus;
   unread_message_count: number;
+  supervisor_snapshot?: SupervisorSnapshot | null;
 };
 
 export type ListSessionResponse = {
   sessions: ListSessionItem[];
+};
+
+export type BackgroundQuotaResponse = {
+  system_used: number;
+  system_limit: number;
+  user_used: number;
+  user_limit: number;
+};
+
+export type RetryFromSuspendResponse = {
+  status: SessionStatus;
+  request_status: "resumed";
+  retry_budget_remaining: number;
+  expires_at?: number | null;
 };
 
 // B3-core PR-1 §3.3 — supervisor snapshot mirror of api/app/interfaces/schemas/session.py:SupervisorSnapshot
@@ -320,6 +335,24 @@ export type SupervisorSnapshot = {
   last_progress_at?: string | null;
   is_alive: boolean;
   cancellation_state: "none" | "cancelling" | "cancelled";
+};
+
+export type ExecutionStateChangedPayload = {
+  execution_mode: SupervisorExecutionMode;
+  execution_phase: SupervisorExecutionPhase;
+  background_reason?: SupervisorSnapshot["background_reason"];
+  expires_at?: string | null;
+  retry_budget_remaining?: number | null;
+  suspended_reason?: string | null;
+  terminal_reason?: string | null;
+  transition_reason?: string | null;
+};
+
+export type ExecutionStateChangedEvent = {
+  event_id?: string;
+  created_at?: number | string;
+  seq?: number | string | null;
+  payload: ExecutionStateChangedPayload;
 };
 
 export type Session = {
@@ -648,6 +681,7 @@ export type SSEEventType =
   | "finishing"
   | "health"
   | "sandbox_state_changed"
+  | "execution_state_changed"
   | "owner_conflict"
   | "compaction"
   | "done"
@@ -680,6 +714,7 @@ export type SSEEventData =
   | { type: "finishing"; data: FinishingEvent }
   | { type: "health"; data: HealthEvent }
   | { type: "sandbox_state_changed"; data: SandboxStateChangedEvent }
+  | { type: "execution_state_changed"; data: ExecutionStateChangedEvent }
   | { type: "owner_conflict"; data: OwnerConflictEventData }
   | { type: "compaction"; data: CompactionEventData }
   | { type: "done"; data: DoneEvent }

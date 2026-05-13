@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
-from app.domain.models.session import Session, SessionStatus
+from app.domain.models.session import SandboxBindingState, Session, SessionStatus
 from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.models.skill_graph_state import SkillGraphState
 from app.domain.repositories._sentinel import _UNSET, UnsetType
@@ -319,6 +319,104 @@ class DBSessionRepository(SessionRepository):
         )
         if result.rowcount == 0:
             raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def suspend_running_background_if_active(self, session_id: str) -> bool:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase.in_(("running", "recovering")))
+            .values(
+                execution_phase="suspended",
+                suspended_reason="bg_idle_timeout",
+                last_activity_at=func.now(),
+            )
+        )
+        return bool(result.rowcount)
+
+    async def promote_foreground_to_background(
+        self,
+        session_id: str,
+        *,
+        expires_at: datetime,
+        retry_budget_remaining: int,
+    ) -> int | None:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "foreground")
+            .where(SessionModel.execution_phase.in_(("running", "recovering", "idle")))
+            .values(
+                execution_mode="background",
+                background_reason="auto_degrade",
+                expires_at=expires_at,
+                execution_phase="running",
+                suspended_reason=None,
+                was_background=True,
+                retry_budget_remaining=retry_budget_remaining,
+                last_activity_at=func.now(),
+            )
+            .returning(SessionModel.retry_budget_remaining)
+        )
+        return result.scalar_one_or_none()
+
+    async def claim_background_retry_from_suspend(
+        self,
+        session_id: str,
+        *,
+        expires_at: datetime,
+    ) -> int | None:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase == "suspended")
+            .where(SessionModel.retry_budget_remaining > 0)
+            .where(
+                SessionModel.sandbox_state.in_(
+                    (
+                        SandboxBindingState.ACTIVE.value,
+                        SandboxBindingState.SUSPENDED.value,
+                    )
+                )
+            )
+            .values(
+                execution_phase="running",
+                suspended_reason=None,
+                expires_at=expires_at,
+                retry_budget_remaining=SessionModel.retry_budget_remaining - 1,
+                last_activity_at=func.now(),
+            )
+            .returning(SessionModel.retry_budget_remaining)
+        )
+        return result.scalar_one_or_none()
+
+    async def rollback_background_retry_claim_if_active(
+        self,
+        session_id: str,
+        *,
+        retry_budget_remaining: int,
+        expires_at: datetime | None,
+        suspended_reason: str | None,
+    ) -> bool:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase == "running")
+            .values(
+                execution_phase="suspended",
+                suspended_reason=suspended_reason,
+                retry_budget_remaining=retry_budget_remaining,
+                expires_at=expires_at,
+                last_activity_at=func.now(),
+            )
+        )
+        return bool(result.rowcount)
 
     async def update_to_terminal(
         self,

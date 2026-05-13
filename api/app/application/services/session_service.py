@@ -25,6 +25,7 @@ from core.config import get_settings
 
 if TYPE_CHECKING:
     from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
+    from app.domain.services.execution_supervisor import ExecutionSupervisor
     from app.infrastructure.external.memory.fs_reconciler import FsReconciler
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class SessionService:
         task_cls: Optional[Type[Task]] = None,
         sandbox_lifecycle_service: Optional["SandboxLifecycleService"] = None,
         fs_reconciler: Optional["FsReconciler"] = None,
+        execution_supervisor: Optional["ExecutionSupervisor"] = None,
     ) -> None:
         """构造函数，完成会话服务初始化"""
         self._uow_factory = uow_factory
@@ -46,6 +48,7 @@ class SessionService:
         self._task_cls = task_cls
         self._lifecycle = sandbox_lifecycle_service
         self._fs_reconciler = fs_reconciler
+        self._supervisor = execution_supervisor
 
     async def create_session(self, user_id: str) -> Session:
         """创建一个空白的新任务会话"""
@@ -131,11 +134,43 @@ class SessionService:
                     session_id,
                     exc_info=True,
                 )
+        await self._cleanup_background_slot_if_needed(
+            session,
+            reason="session_delete",
+        )
 
         # 4.根据传递的会话id删除会话
         async with self._uow:
             await self._uow.session.delete_by_id(session_id)
         logger.info(f"删除会话[{session_id}]成功")
+
+    async def _cleanup_background_slot_if_needed(
+        self,
+        session: Session,
+        *,
+        reason: str,
+    ) -> None:
+        if (
+            session.execution_mode != "background"
+            and not getattr(session, "was_background", False)
+        ):
+            return
+        if not getattr(session, "user_id", None):
+            return
+        if self._supervisor is None:
+            return
+        try:
+            await self._supervisor.cleanup_background_slot(
+                session_id=session.id,
+                user_id=str(session.user_id),
+                reason=reason,
+            )
+        except Exception:
+            logger.warning(
+                "background slot cleanup failed for deleted session %s",
+                session.id,
+                exc_info=True,
+            )
 
     async def _cleanup_task(self, task_id: Optional[str]) -> None:
         """清理会话关联任务，避免删除会话后后台任务继续运行。"""

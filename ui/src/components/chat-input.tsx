@@ -260,6 +260,10 @@ export function ChatInput({
     ? isSessionStreaming(sessionId)
     : false;
   const isCurrentSessionRunning = sessionStatus === "running";
+  const isBackgroundSuspended =
+    currentSession?.session_id === sessionId &&
+    currentSession.supervisor_snapshot?.execution_mode === "background" &&
+    currentSession.supervisor_snapshot.execution_phase === "suspended";
   const isTakeoverActive = sessionStatus === "takeover" || sessionStatus === "takeover_pending";
   // Check if waiting for tool confirmation — disable input so users must use the confirmation card
   const hasToolConfirmationPending = useMemo(() => {
@@ -273,8 +277,16 @@ export function ChatInput({
     }
     return false;
   }, [sessionStatus, currentSession?.events]);
-  const showStopAction = Boolean(sessionId) && (isCurrentSessionStreaming || isCurrentSessionRunning);
-  const disableInput = uploading || showStopAction || isTakeoverActive || hasToolConfirmationPending;
+  const showStopAction =
+    Boolean(sessionId) &&
+    !isBackgroundSuspended &&
+    (isCurrentSessionStreaming || isCurrentSessionRunning);
+  const disableInput =
+    uploading ||
+    showStopAction ||
+    isBackgroundSuspended ||
+    isTakeoverActive ||
+    hasToolConfirmationPending;
   const canSubmit = Boolean(text.trim()) || pendingFiles.length > 0;
 
   const handleStopTask = async () => {
@@ -431,7 +443,13 @@ export function ChatInput({
           }
           void handleSubmit();
         }}
-        placeholder={isTakeoverActive ? "接管中，暂不支持发送消息" : "分配一个任务或提问任何问题..."}
+        placeholder={
+          isBackgroundSuspended
+            ? "后台任务已挂起，请先重试后台任务"
+            : isTakeoverActive
+              ? "接管中，暂不支持发送消息"
+              : "分配一个任务或提问任何问题..."
+        }
         className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
       />
 

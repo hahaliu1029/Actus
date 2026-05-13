@@ -8,6 +8,7 @@ vi.mock("@/lib/api/session", () => ({
     getSession: vi.fn(),
     getSessionFiles: vi.fn(),
     chat: vi.fn(),
+    retryFromSuspend: vi.fn(),
     stopSession: vi.fn(),
     deleteSession: vi.fn(),
     clearUnreadMessageCount: vi.fn(),
@@ -24,9 +25,13 @@ vi.mock("@/lib/api/file", () => ({
   },
 }));
 
+vi.mock("@/lib/api/session-compaction", () => ({
+  fetchCompactionList: vi.fn(async () => []),
+}));
+
 import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
-import type { Session } from "@/lib/api/types";
+import type { ListSessionItem, Session, SupervisorSnapshot } from "@/lib/api/types";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
@@ -43,6 +48,31 @@ function buildSession(overrides?: Partial<Session>): Session {
   };
 }
 
+const backgroundSnapshot: SupervisorSnapshot = {
+  execution_mode: "background",
+  execution_phase: "running",
+  background_reason: "explicit",
+  expires_at: null,
+  retry_budget_remaining: 2,
+  suspended_reason: null,
+  terminal_reason: null,
+  last_progress_at: null,
+  is_alive: true,
+  cancellation_state: "none",
+};
+
+function buildListSession(overrides?: Partial<ListSessionItem>): ListSessionItem {
+  return {
+    session_id: "s-list",
+    title: "列表会话",
+    latest_message: "处理中",
+    latest_message_at: "2026-05-12T00:00:00.000Z",
+    status: "running",
+    unread_message_count: 0,
+    ...overrides,
+  };
+}
+
 describe("session-store", () => {
   beforeEach(() => {
     useSessionStore.getState().reset();
@@ -55,6 +85,12 @@ describe("session-store", () => {
     mockedSessionApi.getSession.mockResolvedValue(buildSession());
     mockedSessionApi.getSessionFiles.mockResolvedValue({ files: [] });
     mockedSessionApi.chat.mockReturnValue(() => {});
+    mockedSessionApi.retryFromSuspend.mockResolvedValue({
+      status: "running",
+      request_status: "resumed",
+      retry_budget_remaining: 1,
+      expires_at: null,
+    });
     mockedSessionApi.stopSession.mockResolvedValue();
     mockedSessionApi.deleteSession.mockResolvedValue();
     mockedSessionApi.clearUnreadMessageCount.mockResolvedValue();
@@ -67,6 +103,36 @@ describe("session-store", () => {
       type: "success",
       text: "新任务已创建",
     });
+  });
+
+  it("fetchSessions 保留列表项 supervisor_snapshot", async () => {
+    mockedSessionApi.getSessions.mockResolvedValue([
+      buildListSession({ supervisor_snapshot: backgroundSnapshot }),
+    ]);
+
+    await useSessionStore.getState().fetchSessions();
+
+    expect(useSessionStore.getState().sessions[0]?.supervisor_snapshot).toEqual(
+      backgroundSnapshot
+    );
+  });
+
+  it("streamSessions 保留列表项 supervisor_snapshot", () => {
+    mockedSessionApi.streamSessions.mockImplementation((onEvent) => {
+      onEvent({
+        type: "sessions",
+        data: {
+          sessions: [buildListSession({ supervisor_snapshot: backgroundSnapshot })],
+        },
+      });
+      return () => {};
+    });
+
+    useSessionStore.getState().streamSessions();
+
+    expect(useSessionStore.getState().sessions[0]?.supervisor_snapshot).toEqual(
+      backgroundSnapshot
+    );
   });
 
   it("fetchSessionById 不会覆盖本地已流式追加的事件", async () => {
@@ -377,6 +443,197 @@ describe("session-store", () => {
     });
   });
 
+  it("fetchSessionById 对挂起后台会话不应自动续流", async () => {
+    mockedSessionApi.getSession.mockResolvedValue(
+      buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        supervisor_snapshot: {
+          ...backgroundSnapshot,
+          execution_phase: "suspended",
+          is_alive: false,
+        },
+        events: [
+          {
+            event: "message",
+            data: { event_id: "evt-100", role: "assistant", message: "old" },
+          },
+        ],
+      })
+    );
+
+    await useSessionStore.getState().fetchSessionById("s-bg-suspended");
+
+    expect(mockedSessionApi.chat).not.toHaveBeenCalled();
+  });
+
+  it("fetchSessionById 应信任详情接口返回的当前 supervisor_snapshot", async () => {
+    mockedSessionApi.getSession.mockResolvedValue(
+      buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        supervisor_snapshot: {
+          ...backgroundSnapshot,
+          execution_phase: "suspended",
+          suspended_reason: "bg_idle_timeout",
+          is_alive: false,
+        },
+        events: [
+          {
+            event: "execution_state_changed",
+            data: {
+              event_id: "evt-auto-degrade",
+              seq: 10,
+              payload: {
+                execution_mode: "background",
+                execution_phase: "running",
+                background_reason: "auto_degrade",
+                expires_at: "2026-05-11T08:30:00Z",
+                retry_budget_remaining: 2,
+                suspended_reason: null,
+                terminal_reason: null,
+              },
+            },
+          },
+        ],
+      })
+    );
+
+    await useSessionStore.getState().fetchSessionById("s-bg-suspended");
+
+    expect(
+      useSessionStore.getState().currentSession?.supervisor_snapshot
+        ?.execution_phase
+    ).toBe("suspended");
+    expect(
+      useSessionStore.getState().currentSession?.supervisor_snapshot
+        ?.suspended_reason
+    ).toBe("bg_idle_timeout");
+    expect(mockedSessionApi.chat).not.toHaveBeenCalled();
+  });
+
+  it("fetchSessionById 应让详情 snapshot 越过本地更高事件游标", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s-bg-suspended",
+      currentSession: buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        last_seq: 99,
+        supervisor_snapshot: backgroundSnapshot,
+        events: [
+          {
+            event: "message",
+            data: {
+              event_id: "evt-local-partial",
+              seq: 99,
+              role: "assistant",
+            },
+          },
+        ],
+      }),
+    });
+    mockedSessionApi.getSession.mockResolvedValue(
+      buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        last_seq: 98,
+        supervisor_snapshot: {
+          ...backgroundSnapshot,
+          execution_phase: "suspended",
+          suspended_reason: "bg_idle_timeout",
+          is_alive: false,
+        },
+        events: [
+          {
+            event: "message",
+            data: { event_id: "evt-persisted", seq: 98, role: "assistant" },
+          },
+        ],
+      })
+    );
+
+    await useSessionStore.getState().fetchSessionById("s-bg-suspended");
+
+    expect(useSessionStore.getState().currentSession?.last_seq).toBe(99);
+    expect(
+      useSessionStore.getState().currentSession?.supervisor_snapshot
+        ?.execution_phase
+    ).toBe("suspended");
+    expect(mockedSessionApi.chat).not.toHaveBeenCalled();
+  });
+
+  it("retryFromSuspend 成功后刷新列表和当前详情", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s-bg-suspended",
+      currentSession: buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        supervisor_snapshot: {
+          ...backgroundSnapshot,
+          execution_phase: "suspended",
+          is_alive: false,
+        },
+      }),
+      isChatting: true,
+      chatSessionId: "other-session",
+    });
+    mockedSessionApi.getSessions.mockResolvedValue([
+      buildListSession({ session_id: "s-bg-suspended" }),
+    ]);
+    mockedSessionApi.getSession.mockResolvedValue(
+      buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        supervisor_snapshot: backgroundSnapshot,
+      })
+    );
+
+    await useSessionStore.getState().retryFromSuspend("s-bg-suspended");
+
+    expect(mockedSessionApi.retryFromSuspend).toHaveBeenCalledWith(
+      "s-bg-suspended"
+    );
+    expect(mockedSessionApi.getSessions).toHaveBeenCalled();
+    expect(mockedSessionApi.getSession).toHaveBeenCalledWith("s-bg-suspended");
+  });
+
+  it("retryFromSuspend 成功后立即用接口结果恢复当前详情 snapshot", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s-bg-suspended",
+      currentSession: buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        last_seq: 99,
+        supervisor_snapshot: {
+          ...backgroundSnapshot,
+          execution_phase: "suspended",
+          is_alive: false,
+        },
+      }),
+    });
+    mockedSessionApi.getSessions.mockResolvedValue([
+      buildListSession({ session_id: "s-bg-suspended" }),
+    ]);
+    mockedSessionApi.getSession.mockResolvedValue(
+      buildSession({
+        session_id: "s-bg-suspended",
+        status: "running",
+        last_seq: 1,
+        supervisor_snapshot: backgroundSnapshot,
+      })
+    );
+
+    await useSessionStore.getState().retryFromSuspend("s-bg-suspended");
+
+    expect(
+      useSessionStore.getState().currentSession?.supervisor_snapshot
+        ?.execution_phase
+    ).toBe("running");
+    expect(
+      useSessionStore.getState().currentSession?.supervisor_snapshot?.is_alive
+    ).toBe(true);
+  });
+
   it("fetchSessionById 对 takeover 会话不应自动续流", async () => {
     mockedSessionApi.getSession.mockResolvedValue(
       buildSession({
@@ -592,7 +849,7 @@ describe("session-store", () => {
     const current = buildSession({
       session_id: "s1",
       title: "same",
-      status: "running",
+      status: "completed",
       events: [
         {
           event: "message",
@@ -614,7 +871,7 @@ describe("session-store", () => {
       buildSession({
         session_id: "s1",
         title: "same",
-        status: "running",
+        status: "completed",
         events: [
           {
             event: "message",

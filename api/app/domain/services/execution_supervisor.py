@@ -25,6 +25,8 @@ from app.domain.services._lua_scripts import (
 
 logger = logging.getLogger(__name__)
 
+_BACKGROUND_RETRY_BUDGET = 3
+_BG_SLOT_TTL_SECONDS = 86400
 _HOT_TTL_SECONDS = 300
 _OWNER_TTL_SECONDS = 10
 _OWNER_RENEW_SECONDS = 5
@@ -159,7 +161,7 @@ class ExecutionSupervisor:
         session_id: str,
         user_id: str,
         expires_at: datetime,
-    ) -> None:
+    ) -> int | None:
         await self._admit_background_slot(
             session_id=session_id,
             user_id=user_id,
@@ -168,14 +170,10 @@ class ExecutionSupervisor:
         )
         try:
             async with self._repo_context() as repo:
-                await repo.update_supervisor_fields(
+                promoted = await repo.promote_foreground_to_background(
                     session_id,
-                    execution_mode="background",
-                    background_reason="auto_degrade",
                     expires_at=expires_at,
-                    execution_phase="running",
-                    suspended_reason=None,
-                    was_background=True,
+                    retry_budget_remaining=_BACKGROUND_RETRY_BUDGET,
                 )
         except Exception:
             logger.exception("promote PG write failed; revoking slot")
@@ -185,8 +183,16 @@ class ExecutionSupervisor:
                 reason="promote_pg_fail",
             )
             raise
+        if not promoted:
+            await self._lua_revoke(
+                session_id=session_id,
+                user_id=user_id,
+                reason="promote_stale",
+            )
+            return None
         self._meter_inc("admit", result="success")
         self._meter_inc("auto_degrade")
+        return promoted
 
     async def suspend_idle(
         self,
@@ -195,11 +201,10 @@ class ExecutionSupervisor:
         user_id: str,
     ) -> None:
         async with self._repo_context() as repo:
-            await repo.update_supervisor_fields(
-                session_id,
-                execution_phase="suspended",
-                suspended_reason="bg_idle_timeout",
-            )
+            transitioned = await repo.suspend_running_background_if_active(session_id)
+        if not transitioned:
+            logger.info("idle suspend skipped stale session=%s", session_id)
+            return
         if self._cancel_registered_runner(
             session_id,
             reason="supervisor_suspend",
@@ -238,6 +243,16 @@ class ExecutionSupervisor:
                 user_ids.add(key[len(prefix):])
         return sorted(user_ids)
 
+    async def get_background_quota(self, user_id: str) -> dict[str, int]:
+        raw_system_used = await self._redis.get(self._system_key())
+        raw_user_used = await self._redis.hlen(self._user_key(user_id))
+        return {
+            "system_used": self._parse_count(raw_system_used),
+            "system_limit": self._max_system_bg,
+            "user_used": self._parse_count(raw_user_used),
+            "user_limit": self._max_user_bg,
+        }
+
     async def resume(
         self,
         *,
@@ -246,7 +261,8 @@ class ExecutionSupervisor:
         execution_mode: Literal["foreground", "background"] | None = None,
         mode: Literal["foreground", "background"] | None = None,
         expires_at: datetime | None = None,
-    ) -> None:
+        retry_budget_remaining: int | None = None,
+    ) -> int | None:
         target_mode = execution_mode or mode
         if target_mode == "foreground":
             async with self._repo_context() as repo:
@@ -263,7 +279,7 @@ class ExecutionSupervisor:
                 user_id=user_id,
                 reason="t7_reconnect",
             )
-            return
+            return None
 
         if target_mode != "background":
             raise ValueError("execution_mode must be foreground or background")
@@ -289,13 +305,70 @@ class ExecutionSupervisor:
                 "background",
                 "user bg slots exhausted",
             )
-        async with self._repo_context() as repo:
-            await repo.update_supervisor_fields(
-                session_id,
-                execution_phase="running",
-                suspended_reason=None,
-                expires_at=expires_at,
+        # Retry claim already persisted phase/expires/retry budget. Keep this
+        # path Redis-only so a stale retry cannot reopen a terminal PG row.
+        if rc == 3:
+            await self._reset_inflight_counts(session_id=session_id)
+        return rc
+
+    async def rollback_background_resume_admission(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        admission_rc: int,
+        previous_expires_at: datetime | None,
+    ) -> None:
+        if admission_rc == 0:
+            await self._lua_revoke(
+                session_id=session_id,
+                user_id=user_id,
+                reason="resume_retry_rollback",
             )
+            return
+        if admission_rc != 3:
+            return
+        if previous_expires_at is None:
+            await self._lua_revoke(
+                session_id=session_id,
+                user_id=user_id,
+                reason="resume_retry_rollback_missing_expiry",
+            )
+            return
+        expires_at_unix = previous_expires_at.astimezone(timezone.utc).timestamp()
+        expires_at_value = f"{expires_at_unix:.6f}"
+        await self._redis.hset(self._user_key(user_id), session_id, expires_at_value)
+        await self._redis.expire(self._user_key(user_id), _BG_SLOT_TTL_SECONDS)
+        await self._redis.zadd(self._bg_key(user_id), {session_id: expires_at_unix})
+        await self._redis.expire(self._bg_key(user_id), _BG_SLOT_TTL_SECONDS)
+
+    async def revoke_background_resume_admission(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        admission_rc: int,
+    ) -> None:
+        if admission_rc not in (0, 3):
+            return
+        await self._lua_revoke(
+            session_id=session_id,
+            user_id=user_id,
+            reason="resume_retry_terminal",
+        )
+
+    async def cleanup_background_slot(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        reason: str,
+    ) -> None:
+        await self._lua_revoke(
+            session_id=session_id,
+            user_id=user_id,
+            reason=reason,
+        )
 
     async def terminate(
         self,
@@ -457,6 +530,22 @@ class ExecutionSupervisor:
             "inflight_tool_count",
         )
         return (int(values[0] or 0), int(values[1] or 0))
+
+    async def _reset_inflight_counts(self, *, session_id: str) -> None:
+        try:
+            await self._redis.hset(
+                self._hot_key(session_id),
+                mapping={
+                    "inflight_llm_count": 0,
+                    "inflight_tool_count": 0,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "reset inflight counts failed for %s",
+                session_id,
+                exc_info=True,
+            )
 
     @asynccontextmanager
     async def subscriber_scope(
@@ -840,6 +929,7 @@ class ExecutionSupervisor:
         expires_at: datetime,
     ) -> int:
         expires_at_unix = expires_at.astimezone(timezone.utc).timestamp()
+        activity_at_unix = datetime.now(timezone.utc).timestamp()
         rc = await run_lua_with_fallback(
             self._redis,
             source=LUA_ADMIT,
@@ -855,6 +945,7 @@ class ExecutionSupervisor:
                 f"{expires_at_unix:.6f}",
                 str(self._max_system_bg),
                 str(self._max_user_bg),
+                f"{activity_at_unix:.6f}",
             ],
             meter=self._meter,
         )
@@ -963,3 +1054,13 @@ class ExecutionSupervisor:
         if isinstance(value, (bytes, bytearray)):
             return value.decode()
         return str(value)
+
+    @classmethod
+    def _parse_count(cls, value: object) -> int:
+        decoded = cls._decode_redis_value(value)
+        if decoded is None:
+            return 0
+        try:
+            return max(int(decoded), 0)
+        except (TypeError, ValueError):
+            return 0

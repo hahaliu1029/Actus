@@ -97,6 +97,44 @@ class SessionRepository(Protocol):
         """Patch supervisor fields; _UNSET skips, None writes NULL."""
         ...
 
+    async def suspend_running_background_if_active(self, session_id: str) -> bool:
+        """Atomically suspend an active background session.
+
+        Returns False when a stale watchdog scan raced with terminalization or
+        another phase transition.
+        """
+        ...
+
+    async def promote_foreground_to_background(
+        self,
+        session_id: str,
+        *,
+        expires_at: datetime,
+        retry_budget_remaining: int,
+    ) -> int | None:
+        """Atomically promote and return the persisted retry budget."""
+        ...
+
+    async def claim_background_retry_from_suspend(
+        self,
+        session_id: str,
+        *,
+        expires_at,
+    ) -> int | None:
+        """Atomically claim a suspended background retry and return remaining budget."""
+        ...
+
+    async def rollback_background_retry_claim_if_active(
+        self,
+        session_id: str,
+        *,
+        retry_budget_remaining: int,
+        expires_at: datetime | None,
+        suspended_reason: str | None,
+    ) -> bool:
+        """Restore a claimed retry only while it is still the active running phase."""
+        ...
+
     async def update_to_terminal(
         self,
         session_id: str,

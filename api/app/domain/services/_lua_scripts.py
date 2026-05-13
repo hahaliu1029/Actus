@@ -20,10 +20,15 @@ local session_id = ARGV[1]
 local expires_at = ARGV[2]
 local max_sys = tonumber(ARGV[3])
 local max_user = tonumber(ARGV[4])
+local activity_at = ARGV[5] or expires_at
 
 local expires_score = tonumber(expires_at)
 if expires_score == nil then
     return redis.error_reply('LUA_ADMIT: invalid ARGV[2] expires_at_unix')
+end
+
+if tonumber(activity_at) == nil then
+    return redis.error_reply('LUA_ADMIT: invalid ARGV[5] activity_at_unix')
 end
 
 if redis.call('HEXISTS', user_key, session_id) == 1 then
@@ -32,6 +37,7 @@ if redis.call('HEXISTS', user_key, session_id) == 1 then
     redis.call('ZADD', bg_zset_key, expires_score, session_id)
     redis.call('EXPIRE', bg_zset_key, 86400)
     redis.call('HSETNX', hot_key, 'admitted_at', expires_at)
+    redis.call('HSET', hot_key, 'last_activity_at', activity_at)
     redis.call('EXPIRE', hot_key, 300)
     return 3
 end
@@ -52,6 +58,7 @@ redis.call('INCR', sys_key)
 redis.call('ZADD', bg_zset_key, expires_score, session_id)
 redis.call('EXPIRE', bg_zset_key, 86400)
 redis.call('HSETNX', hot_key, 'admitted_at', expires_at)
+redis.call('HSET', hot_key, 'last_activity_at', activity_at)
 redis.call('EXPIRE', hot_key, 300)
 return 0
 """

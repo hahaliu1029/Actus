@@ -14,6 +14,27 @@ class CreateSessionResponse(BaseModel):
     session_id: str  # 会话id
 
 
+class SupervisorSnapshot(BaseModel):
+    """B3-core PR-1 §3.3 — supervisor snapshot for resume responses.
+
+    PR-1 shipped the response shape; PR-4 wires producer-side snapshots from
+    ``agent_service.get_events_since``.
+    """
+
+    execution_mode: Literal["foreground", "background"]
+    execution_phase: Literal[
+        "running", "recovering", "idle", "suspended", "terminating", "terminated"
+    ]
+    background_reason: Optional[Literal["explicit", "auto_degrade"]] = None
+    expires_at: Optional[datetime] = None
+    retry_budget_remaining: int
+    suspended_reason: Optional[str] = None
+    terminal_reason: Optional[str] = None
+    last_progress_at: Optional[datetime] = None
+    is_alive: bool
+    cancellation_state: Literal["none", "cancelling", "cancelled"] = "none"
+
+
 class ListSessionItem(BaseModel):
     """会话列表条目基础信息"""
 
@@ -23,12 +44,22 @@ class ListSessionItem(BaseModel):
     latest_message_at: Optional[datetime] = Field(default_factory=datetime.now)
     status: SessionStatus = SessionStatus.PENDING
     unread_message_count: int = 0
+    supervisor_snapshot: Optional[SupervisorSnapshot] = None
 
 
 class ListSessionResponse(BaseModel):
     """获取会话列表基础信息响应结构"""
 
     sessions: List[ListSessionItem]
+
+
+class BackgroundQuotaResponse(BaseModel):
+    """后台任务额度读模型"""
+
+    system_used: int
+    system_limit: int
+    user_used: int
+    user_limit: int
 
 
 class ToolConfirmationAction(BaseModel):
@@ -67,27 +98,7 @@ class GetSessionResponse(BaseModel):
     title: Optional[str] = None
     status: SessionStatus
     events: List[AgentSSEEvent] = Field(default_factory=list)
-
-
-class SupervisorSnapshot(BaseModel):
-    """B3-core PR-1 §3.3 — supervisor snapshot for resume responses.
-
-    PR-1 shipped the response shape; PR-4 wires producer-side snapshots from
-    ``agent_service.get_events_since``.
-    """
-
-    execution_mode: Literal["foreground", "background"]
-    execution_phase: Literal[
-        "running", "recovering", "idle", "suspended", "terminating", "terminated"
-    ]
-    background_reason: Optional[Literal["explicit", "auto_degrade"]] = None
-    expires_at: Optional[datetime] = None
-    retry_budget_remaining: int
-    suspended_reason: Optional[str] = None
-    terminal_reason: Optional[str] = None
-    last_progress_at: Optional[datetime] = None
-    is_alive: bool
-    cancellation_state: Literal["none", "cancelling", "cancelled"] = "none"
+    supervisor_snapshot: Optional[SupervisorSnapshot] = None
 
 
 class EventsSinceResponse(BaseModel):
@@ -204,6 +215,15 @@ class ReopenTakeoverResponse(BaseModel):
     request_status: str
     reason: Optional[str] = None
     remaining_seconds: Optional[float] = None
+
+
+class RetryFromSuspendResponse(BaseModel):
+    """后台挂起任务重试响应结构"""
+
+    status: SessionStatus
+    request_status: Literal["resumed"]
+    retry_budget_remaining: int
+    expires_at: Optional[int] = None
 
 
 class RenewTakeoverRequest(BaseModel):

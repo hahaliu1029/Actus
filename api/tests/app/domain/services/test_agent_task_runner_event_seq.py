@@ -45,3 +45,30 @@ async def test_put_and_add_event_stamps_seq_on_real_output_path() -> None:
     assert event.seq == 7
     assert event.id == "1000-7"
     uow.session.add_event.assert_awaited_once_with("sess-1", event)
+
+
+async def test_put_and_add_event_touches_idle_watchdog_activity() -> None:
+    runner = object.__new__(AgentTaskRunner)
+    runner._session_id = "sess-1"
+    runner._event_seq_client = None
+    runner._idle_watchdog = MagicMock()
+    runner._idle_watchdog.touch_activity = AsyncMock()
+
+    uow = MagicMock()
+    uow.__aenter__ = AsyncMock(return_value=uow)
+    uow.__aexit__ = AsyncMock(return_value=False)
+    uow.session = MagicMock()
+    uow.session.add_event = AsyncMock()
+    runner._uow = uow
+
+    task = MagicMock()
+    task.output_stream = MagicMock()
+    task.output_stream.put = AsyncMock(return_value="1000-7")
+
+    event = MessageEvent(role="assistant", message="activity")
+
+    await runner._put_and_add_event(task, event, persist=False)
+
+    runner._idle_watchdog.touch_activity.assert_awaited_once_with(
+        session_id="sess-1"
+    )

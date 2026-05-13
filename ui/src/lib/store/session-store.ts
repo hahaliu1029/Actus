@@ -14,6 +14,7 @@ import type {
   ListSessionItem,
   Session,
   SSEEventData,
+  SupervisorSnapshot,
 } from "@/lib/api/types";
 import type { CompactionListItem } from "@/types/session-compaction";
 import { registerStoreResetter } from "@/lib/store/reset";
@@ -72,6 +73,7 @@ type SessionActions = {
     options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }
   ) => Promise<Blob>;
   recoverSession: (sessionId: string) => Promise<void>;
+  retryFromSuspend: (sessionId: string) => Promise<void>;
   mergeCompactionList: (items: CompactionListItem[]) => void;
 };
 
@@ -207,11 +209,163 @@ function resolveStatusFromEvent(
   return "running";
 }
 
+function optionalNullableString(
+  record: Record<string, unknown>,
+  key: string,
+  fallback: string | null | undefined
+): string | null {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    return fallback ?? null;
+  }
+  const value = record[key];
+  return typeof value === "string" ? value : null;
+}
+
+function isSupervisorExecutionMode(
+  value: unknown
+): value is SupervisorSnapshot["execution_mode"] {
+  return value === "foreground" || value === "background";
+}
+
+function isSupervisorExecutionPhase(
+  value: unknown
+): value is SupervisorSnapshot["execution_phase"] {
+  return (
+    value === "running" ||
+    value === "recovering" ||
+    value === "idle" ||
+    value === "suspended" ||
+    value === "terminating" ||
+    value === "terminated"
+  );
+}
+
+function isSupervisorBackgroundReason(
+  value: unknown
+): value is NonNullable<SupervisorSnapshot["background_reason"]> {
+  return value === "explicit" || value === "auto_degrade";
+}
+
+function isBackgroundSuspendedSession(
+  session: Session | ListSessionItem | null | undefined
+): boolean {
+  return (
+    session?.supervisor_snapshot?.execution_mode === "background" &&
+    session.supervisor_snapshot.execution_phase === "suspended"
+  );
+}
+
+function retryExpiresAtToSnapshotValue(
+  expiresAt: number | null | undefined
+): string | null {
+  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
+    return null;
+  }
+  return new Date(expiresAt * 1000).toISOString();
+}
+
+function supervisorSnapshotFromExecutionStateEvent(
+  event: SessionEventRecord,
+  base: SupervisorSnapshot | null | undefined
+): SupervisorSnapshot | null {
+  if (event.event !== "execution_state_changed") {
+    return base ?? null;
+  }
+
+  const payload = asRecord(event.data?.payload);
+  const executionMode = payload.execution_mode;
+  const executionPhase = payload.execution_phase;
+  if (
+    !isSupervisorExecutionMode(executionMode) ||
+    !isSupervisorExecutionPhase(executionPhase)
+  ) {
+    return base ?? null;
+  }
+
+  const rawBackgroundReason = payload.background_reason;
+  const backgroundReason =
+    rawBackgroundReason == null
+      ? null
+      : isSupervisorBackgroundReason(rawBackgroundReason)
+        ? rawBackgroundReason
+        : base?.background_reason ?? null;
+  const retryBudget =
+    typeof payload.retry_budget_remaining === "number" &&
+    Number.isFinite(payload.retry_budget_remaining)
+      ? payload.retry_budget_remaining
+      : base?.retry_budget_remaining ?? 0;
+
+  return {
+    execution_mode: executionMode,
+    execution_phase: executionPhase,
+    background_reason: backgroundReason,
+    expires_at: optionalNullableString(payload, "expires_at", base?.expires_at),
+    retry_budget_remaining: retryBudget,
+    suspended_reason: optionalNullableString(
+      payload,
+      "suspended_reason",
+      base?.suspended_reason
+    ),
+    terminal_reason: optionalNullableString(
+      payload,
+      "terminal_reason",
+      base?.terminal_reason
+    ),
+    last_progress_at: base?.last_progress_at ?? null,
+    is_alive: base?.is_alive ?? executionPhase === "running",
+    cancellation_state: base?.cancellation_state ?? "none",
+  };
+}
+
+function supervisorSnapshotFromEvents(
+  events: SessionEventRecord[],
+  base: SupervisorSnapshot | null | undefined
+): SupervisorSnapshot | null {
+  return events.reduce<SupervisorSnapshot | null>(
+    (snapshot, event) => supervisorSnapshotFromExecutionStateEvent(event, snapshot),
+    base ?? null
+  );
+}
+
+function mergeSupervisorSnapshotByCursor(
+  remoteSnapshot: SupervisorSnapshot | null | undefined,
+  remoteLastSeq: number,
+  localSnapshot: SupervisorSnapshot | null | undefined,
+  localLastSeq: number | null | undefined
+): SupervisorSnapshot | null {
+  if (!remoteSnapshot) {
+    return localSnapshot ?? null;
+  }
+  const localCursor =
+    typeof localLastSeq === "number" && Number.isFinite(localLastSeq)
+      ? localLastSeq
+      : 0;
+  return remoteLastSeq >= localCursor ? remoteSnapshot : localSnapshot ?? null;
+}
+
 function applySSEToSession(session: Session, event: SSEEventData): Session {
   const sessionWithSeq = advanceSessionLastSeq(session, eventSeqOf({
     event: event.type,
     data: event.data as Record<string, unknown>,
   }));
+
+  if (event.type === "execution_state_changed") {
+    const nextEvent: SessionEventRecord = {
+      event: event.type,
+      data: event.data as Record<string, unknown>,
+    };
+    return {
+      ...sessionWithSeq,
+      supervisor_snapshot: supervisorSnapshotFromExecutionStateEvent(
+        nextEvent,
+        sessionWithSeq.supervisor_snapshot
+      ),
+      events: upsertSessionEvent(
+        sessionWithSeq.events as SessionEventRecord[],
+        nextEvent
+      ),
+    };
+  }
 
   if (event.type === "done") {
     return sessionWithSeq;
@@ -817,10 +971,11 @@ export const useSessionStore = create<SessionStore>()(
         const normalizedRemote: Session = {
           ...session,
           status: normalizeSessionStatus(session.status),
-          title: pickTitle(session),
-          events: normalizedEvents,
-          last_seq: Math.max(session.last_seq ?? 0, maxSeqFromEvents(normalizedEvents)),
-        };
+            title: pickTitle(session),
+            events: normalizedEvents,
+            last_seq: Math.max(session.last_seq ?? 0, maxSeqFromEvents(normalizedEvents)),
+            supervisor_snapshot: session.supervisor_snapshot ?? null,
+          };
 
         set((state) => {
           if (state.activeSessionId && state.activeSessionId !== sessionId) {
@@ -841,18 +996,15 @@ export const useSessionStore = create<SessionStore>()(
             localSession.last_seq ?? 0,
             maxSeqFromEvents(mergedEvents)
           );
-          const nextSession: Session = {
-            ...normalizedRemote,
-            title: normalizedRemote.title || localSession.title,
-            events: mergedEvents,
-            last_seq: nextLastSeq,
-            supervisor_snapshot:
-              normalizedRemote.supervisor_snapshot ??
-              localSession.supervisor_snapshot ??
-              null,
-            // E2: 防止远端滞后 status 覆盖本地已推导的更晚状态（如 timed_out）
-            status: pickMoreAdvancedStatus(
-              normalizedRemote.status,
+            const nextSession: Session = {
+              ...normalizedRemote,
+              title: normalizedRemote.title || localSession.title,
+              events: mergedEvents,
+              last_seq: nextLastSeq,
+              supervisor_snapshot: normalizedRemote.supervisor_snapshot ?? null,
+              // E2: 防止远端滞后 status 覆盖本地已推导的更晚状态（如 timed_out）
+              status: pickMoreAdvancedStatus(
+                normalizedRemote.status,
               localSession.status
             ) ?? normalizedRemote.status,
           };
@@ -900,6 +1052,7 @@ export const useSessionStore = create<SessionStore>()(
             : null;
         const shouldResumeStream =
           fetchedSession?.status === "running" &&
+          !isBackgroundSuspendedSession(fetchedSession) &&
           !stateAfterFetch.isChatting &&
           !stateAfterFetch.chatAbort;
 
@@ -961,9 +1114,14 @@ export const useSessionStore = create<SessionStore>()(
         const eventDerivedStatus = deriveStatusFromEvents(recoveredEvents);
 
         // B3-core PR-1 §3.3 — capture supervisor cursor + snapshot for next reconnect.
-        const remoteLastSeq =
-          typeof response.last_seq === "number" ? response.last_seq : 0;
-        const remoteSnapshot = response.supervisor_snapshot ?? null;
+        const remoteLastSeq = Math.max(
+          typeof response.last_seq === "number" ? response.last_seq : 0,
+          maxSeqFromEvents(recoveredEvents)
+        );
+        const remoteSnapshot = supervisorSnapshotFromEvents(
+          recoveredEvents,
+          response.supervisor_snapshot ?? null
+        );
 
         // [Codex holistic R3+R4 P2] Backend's `/sessions/{id}/events?since=...`
         // returns persisted SSE events only — it does NOT include
@@ -1019,8 +1177,12 @@ export const useSessionStore = create<SessionStore>()(
             }
             // B3-core PR-1 — only short-circuit when nothing actually changes.
             const nextLastSeq = Math.max(remoteLastSeq, local.last_seq ?? 0);
-            const nextSnapshot =
-              remoteSnapshot ?? local.supervisor_snapshot ?? null;
+            const nextSnapshot = mergeSupervisorSnapshotByCursor(
+              remoteSnapshot,
+              remoteLastSeq,
+              local.supervisor_snapshot,
+              local.last_seq
+            );
             if (
               finalStatus === local.status &&
               local.last_seq === nextLastSeq &&
@@ -1059,6 +1221,13 @@ export const useSessionStore = create<SessionStore>()(
               eventDerivedStatus,
               local.status
             ) ?? local.status;
+          const nextLastSeq = Math.max(remoteLastSeq, local.last_seq ?? 0);
+          const nextSnapshot = mergeSupervisorSnapshotByCursor(
+            remoteSnapshot,
+            remoteLastSeq,
+            local.supervisor_snapshot,
+            local.last_seq
+          );
           return {
             currentSession: {
               ...local,
@@ -1067,8 +1236,8 @@ export const useSessionStore = create<SessionStore>()(
               // B3-core PR-1 — advance cursor monotonically; preserve local snapshot
               // when remote returns null (avoids stomping good cursor on transient
               // backend that hasn't populated supervisor_snapshot yet).
-              last_seq: Math.max(remoteLastSeq, local.last_seq ?? 0),
-              supervisor_snapshot: remoteSnapshot ?? local.supervisor_snapshot ?? null,
+              last_seq: nextLastSeq,
+              supervisor_snapshot: nextSnapshot,
             },
           };
         });
@@ -1081,9 +1250,44 @@ export const useSessionStore = create<SessionStore>()(
       }
     },
 
+    retryFromSuspend: async (sessionId: string) => {
+      const result = await sessionApi.retryFromSuspend(sessionId);
+      set((state) => {
+        const current = state.currentSession;
+        if (!current || current.session_id !== sessionId) {
+          return {};
+        }
+        const previousSnapshot = current.supervisor_snapshot;
+        return {
+          currentSession: {
+            ...current,
+            status: normalizeSessionStatus(result.status),
+            supervisor_snapshot: {
+              execution_mode: "background",
+              execution_phase: "running",
+              background_reason: previousSnapshot?.background_reason ?? null,
+              expires_at: retryExpiresAtToSnapshotValue(result.expires_at),
+              retry_budget_remaining: result.retry_budget_remaining,
+              suspended_reason: null,
+              terminal_reason: null,
+              last_progress_at: previousSnapshot?.last_progress_at ?? null,
+              is_alive: true,
+              cancellation_state: "none",
+            },
+          },
+        };
+      });
+      const refreshes = [get().fetchSessions()];
+      if (get().currentSession?.session_id === sessionId) {
+        refreshes.push(get().fetchSessionById(sessionId, { silent: true }));
+      }
+      await Promise.all(refreshes);
+    },
+
     mergeCompactionList: (items: CompactionListItem[]) => {
       set((state) => {
         if (!state.currentSession) return state;
+        if (items.length === 0) return {};
         const existing = (state.currentSession.events ?? []) as SessionEventRecord[];
         let next: SessionEventRecord[] = existing;
         for (const item of items) {
@@ -1108,6 +1312,7 @@ export const useSessionStore = create<SessionStore>()(
           };
           next = upsertSessionEvent(next, synthetic);  // reuses existing dedup path
         }
+        if (next === existing) return {};
         return {
           ...state,
           currentSession: { ...state.currentSession, events: next },

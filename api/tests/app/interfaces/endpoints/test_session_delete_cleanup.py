@@ -56,6 +56,14 @@ class _FakeLifecycle:
         self.destroy_calls.append((session_id, reason))
 
 
+class _FakeSupervisor:
+    def __init__(self) -> None:
+        self.cleanup_calls: list[dict[str, str]] = []
+
+    async def cleanup_background_slot(self, **kwargs: str) -> None:
+        self.cleanup_calls.append(kwargs)
+
+
 class _FakeTask:
     def __init__(self) -> None:
         self.cancel_called = False
@@ -134,3 +142,37 @@ def test_delete_session_skips_sandbox_destroy_when_lifecycle_absent() -> None:
     asyncio.run(service.delete_session("s-delete-2", user_id="owner", is_admin=False))
 
     assert repo.deleted_ids == ["s-delete-2"]
+
+
+def test_delete_session_releases_suspended_background_quota() -> None:
+    _FakeTaskCls.registry.clear()
+
+    session = Session(
+        id="s-delete-bg",
+        title="demo",
+        user_id="owner",
+        task_id=None,
+        execution_mode="background",
+        execution_phase="suspended",
+        was_background=True,
+    )
+    repo = _FakeSessionRepo(session=session)
+    supervisor = _FakeSupervisor()
+
+    service = SessionService(
+        uow_factory=_make_uow_factory(repo),
+        task_cls=_FakeTaskCls,
+        sandbox_lifecycle_service=None,
+        execution_supervisor=supervisor,
+    )
+
+    asyncio.run(service.delete_session("s-delete-bg", user_id="admin", is_admin=True))
+
+    assert supervisor.cleanup_calls == [
+        {
+            "session_id": "s-delete-bg",
+            "user_id": "owner",
+            "reason": "session_delete",
+        }
+    ]
+    assert repo.deleted_ids == ["s-delete-bg"]

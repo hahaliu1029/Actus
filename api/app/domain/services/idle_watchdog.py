@@ -106,10 +106,26 @@ class IdleWatchdog:
                 continue
             if now - last_activity <= self._idle_timeout_seconds:
                 continue
+            if await self._has_inflight_work(row.session_id):
+                continue
             await self._supervisor.suspend_idle(
                 session_id=row.session_id,
                 user_id=row.user_id,
             )
+
+    async def _has_inflight_work(self, session_id: str) -> bool:
+        try:
+            llm_count, tool_count = await self._supervisor.get_inflight_counts(
+                session_id=session_id
+            )
+        except Exception:
+            logger.warning(
+                "idle watchdog failed to read inflight counts for %s",
+                session_id,
+                exc_info=True,
+            )
+            return True
+        return max(llm_count, 0) + max(tool_count, 0) > 0
 
     async def _sweep_expired_once(self) -> None:
         if self._supervisor is None:

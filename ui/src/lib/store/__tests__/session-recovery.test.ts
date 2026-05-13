@@ -379,6 +379,63 @@ describe("recoverSession", () => {
     expect(useSessionStore.getState().currentSession?.last_seq).toBe(7);
   });
 
+    it("fetchSessionById keeps local cursor but trusts remote supervisor snapshot", async () => {
+    const localSnapshot: SupervisorSnapshot = {
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "auto_degrade",
+      expires_at: "2026-05-11T08:30:00Z",
+      retry_budget_remaining: 2,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:29:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+    const staleRemoteSnapshot: SupervisorSnapshot = {
+      execution_mode: "foreground",
+      execution_phase: "running",
+      background_reason: null,
+      expires_at: null,
+      retry_budget_remaining: 3,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:00:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 12,
+        supervisor_snapshot: localSnapshot,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-12", seq: 12 } },
+        ],
+      },
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      last_seq: 7,
+      supervisor_snapshot: staleRemoteSnapshot,
+      events: [
+        { event: "message", data: { role: "assistant", event_id: "1000-7", seq: 7 } },
+      ],
+    });
+
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+      const session = useSessionStore.getState().currentSession;
+      expect(session?.last_seq).toBe(12);
+      expect(session?.supervisor_snapshot).toEqual(staleRemoteSnapshot);
+    });
+
   it("fetchSessionById stores remote last_seq when only the cursor advances", async () => {
     const events: SessionEventRecord[] = [
       { event: "message", data: { role: "assistant", event_id: "1000-3", seq: 3 } },
@@ -562,6 +619,230 @@ describe("recoverSession", () => {
     expect(session?.supervisor_snapshot).toEqual(supervisorSnapshot);
   });
 
+  it("keeps newer local supervisor snapshot when zero-event reconnect returns a stale cursor", async () => {
+    const localSnapshot: SupervisorSnapshot = {
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "auto_degrade",
+      expires_at: "2026-05-11T08:30:00Z",
+      retry_budget_remaining: 2,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:29:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+    const staleRemoteSnapshot: SupervisorSnapshot = {
+      execution_mode: "foreground",
+      execution_phase: "running",
+      background_reason: null,
+      expires_at: null,
+      retry_budget_remaining: 3,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:00:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 12,
+        supervisor_snapshot: localSnapshot,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-12", seq: 12 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],
+      session_status: "running",
+      has_more: false,
+      last_seq: 7,
+      supervisor_snapshot: staleRemoteSnapshot,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const session = useSessionStore.getState().currentSession;
+    expect(session?.last_seq).toBe(12);
+    expect(session?.supervisor_snapshot).toEqual(localSnapshot);
+  });
+
+  it("updates supervisor snapshot from live execution_state_changed event", () => {
+    const session = __test_applySSEToSession(
+      {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        supervisor_snapshot: null,
+        events: [],
+      },
+      {
+        type: "execution_state_changed",
+        data: {
+          event_id: "1000-12",
+          created_at: "2026-05-11T08:00:00Z",
+          seq: 12,
+          payload: {
+            execution_mode: "background",
+            execution_phase: "running",
+            background_reason: "auto_degrade",
+            transition_reason: "auto_degrade_sse_disconnect",
+            expires_at: "2026-05-11T08:30:00Z",
+            retry_budget_remaining: 2,
+            suspended_reason: null,
+            terminal_reason: null,
+          },
+        },
+      },
+    );
+
+    expect(session.status).toBe("running");
+    expect(session.last_seq).toBe(12);
+    expect(session.supervisor_snapshot).toMatchObject({
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "auto_degrade",
+      expires_at: "2026-05-11T08:30:00Z",
+      retry_budget_remaining: 2,
+      suspended_reason: null,
+      terminal_reason: null,
+    });
+  });
+
+  it("updates supervisor snapshot from recovered execution_state_changed event", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        supervisor_snapshot: null,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-7", seq: 7 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        {
+          event: "execution_state_changed",
+          data: {
+            event_id: "1000-12",
+            created_at: "2026-05-11T08:00:00Z",
+            seq: 12,
+            payload: {
+              execution_mode: "background",
+              execution_phase: "running",
+              background_reason: "auto_degrade",
+              transition_reason: "auto_degrade_sse_disconnect",
+              expires_at: "2026-05-11T08:30:00Z",
+              retry_budget_remaining: 1,
+              suspended_reason: null,
+              terminal_reason: null,
+            },
+          },
+        },
+      ],
+      session_status: "running",
+      has_more: false,
+      last_seq: 12,
+      supervisor_snapshot: null,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const session = useSessionStore.getState().currentSession;
+    expect(session?.status).toBe("running");
+    expect(session?.last_seq).toBe(12);
+    expect(session?.supervisor_snapshot).toMatchObject({
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "auto_degrade",
+      expires_at: "2026-05-11T08:30:00Z",
+      retry_budget_remaining: 1,
+      suspended_reason: null,
+      terminal_reason: null,
+    });
+  });
+
+  it("keeps newer local supervisor snapshot when recovered events do not advance cursor", async () => {
+    const localSnapshot: SupervisorSnapshot = {
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "auto_degrade",
+      expires_at: "2026-05-11T08:30:00Z",
+      retry_budget_remaining: 2,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:29:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+    const staleRemoteSnapshot: SupervisorSnapshot = {
+      execution_mode: "foreground",
+      execution_phase: "running",
+      background_reason: null,
+      expires_at: null,
+      retry_budget_remaining: 3,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:00:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 12,
+        supervisor_snapshot: localSnapshot,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-12", seq: 12 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        { event: "message", data: { role: "assistant", event_id: "1000-8", seq: 8 } },
+      ],
+      session_status: "running",
+      has_more: false,
+      last_seq: 8,
+      supervisor_snapshot: staleRemoteSnapshot,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const session = useSessionStore.getState().currentSession;
+    expect(session?.last_seq).toBe(12);
+    expect(session?.supervisor_snapshot).toEqual(localSnapshot);
+  });
+
   it("[Codex holistic R3+R4+R5] fires fetchCompactionList on zero-event reconnect (regression test)", async () => {
     // Locks the placement of the IIFE BEFORE the recoveredEvents.length===0
     // early-return so a future refactor that moves it back below the early
@@ -638,6 +919,43 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("keeps live streaming state after execution_state_changed event", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "execution_state_changed",
+      data: {
+        event_id: "1000-12",
+        created_at: "2026-05-11T08:00:00Z",
+        seq: 12,
+        payload: {
+          execution_mode: "background",
+          execution_phase: "running",
+          background_reason: "auto_degrade",
+          transition_reason: "auto_degrade_sse_disconnect",
+          expires_at: "2026-05-11T08:30:00Z",
+          retry_budget_remaining: 2,
+          suspended_reason: null,
+          terminal_reason: null,
+        },
+      },
+    });
+
+    const state = useSessionStore.getState();
+    expect(state.currentSession?.supervisor_snapshot).toMatchObject({
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "auto_degrade",
+      expires_at: "2026-05-11T08:30:00Z",
+      retry_budget_remaining: 2,
+    });
+    expect(state.currentSession?.last_seq).toBe(12);
+    expect(state.isChatting).toBe(true);
+    expect(state.chatSessionId).toBe("s1");
   });
 
   it("does NOT trigger recovery when stream ends after DoneEvent", async () => {

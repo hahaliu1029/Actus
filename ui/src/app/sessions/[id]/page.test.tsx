@@ -1,10 +1,17 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 type MockSession = {
   session_id: string;
   title: string | null;
   status: "pending" | "running" | "waiting" | "completed" | "timed_out";
+  supervisor_snapshot?: {
+    execution_mode: "foreground" | "background";
+    execution_phase: string;
+    background_reason?: string | null;
+    expires_at?: string | null;
+    retry_budget_remaining?: number | null;
+  } | null;
   events: Array<{ event: string; data: Record<string, unknown> }>;
 };
 
@@ -17,6 +24,7 @@ type SessionStoreState = {
   downloadFile: ReturnType<typeof vi.fn>;
   downloadSandboxFile: ReturnType<typeof vi.fn>;
   recoverSession: ReturnType<typeof vi.fn>;
+  retryFromSuspend: ReturnType<typeof vi.fn>;
   createSession: ReturnType<typeof vi.fn>;
   isLoadingCurrentSession: boolean;
   isChatting: boolean;
@@ -32,6 +40,7 @@ const sessionStoreState: SessionStoreState = {
   downloadFile: vi.fn(async () => new Blob()),
   downloadSandboxFile: vi.fn(async () => new Blob()),
   recoverSession: vi.fn(async () => {}),
+  retryFromSuspend: vi.fn(async () => {}),
   createSession: vi.fn(async () => "new-session-id"),
   isLoadingCurrentSession: false,
   isChatting: false,
@@ -40,6 +49,14 @@ const sessionStoreState: SessionStoreState = {
 const markdownRendererMock = vi.fn(({ content }: { content: string }) => (
   <div data-testid="markdown-renderer">{content}</div>
 ));
+const sessionApiMocks = vi.hoisted(() => ({
+  startTakeover: vi.fn(async () => ({
+    status: "takeover_pending",
+    request_status: "starting",
+    scope: "shell",
+  })),
+  viewFile: vi.fn(async () => ({ filepath: "/tmp/file.txt", content: "" })),
+}));
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ id: "s-b" }),
@@ -64,6 +81,10 @@ vi.mock("@/components/session-task-dock", () => ({
 
 vi.mock("@/components/workbench-panel", () => ({
   WorkbenchPanel: () => <div data-testid="workbench-panel" />,
+}));
+
+vi.mock("@/lib/api/session", () => ({
+  sessionApi: sessionApiMocks,
 }));
 
 vi.mock("@/hooks/use-mobile", () => ({
@@ -158,10 +179,13 @@ describe("SessionPage", () => {
     sessionStoreState.fetchSessionFiles.mockClear();
     sessionStoreState.downloadFile.mockClear();
     sessionStoreState.downloadSandboxFile.mockClear();
+    sessionStoreState.retryFromSuspend.mockClear();
     sessionStoreState.isLoadingCurrentSession = false;
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;
     markdownRendererMock.mockClear();
+    sessionApiMocks.startTakeover.mockClear();
+    sessionApiMocks.viewFile.mockClear();
   });
 
   it("历史附件缺少正式文件记录时，预览应回退到沙箱文件下载", async () => {
@@ -245,6 +269,146 @@ describe("SessionPage", () => {
         silent: true,
       });
     });
+  });
+
+  it("挂起后台会话不应触发详情轮询续流", async () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      supervisor_snapshot: {
+        execution_mode: "background",
+        execution_phase: "suspended",
+        background_reason: "explicit",
+        expires_at: null,
+        retry_budget_remaining: 2,
+      },
+      events: [],
+    };
+
+    render(<SessionPage />);
+
+    await waitFor(() => {
+      expect(sessionStoreState.fetchSessionById).toHaveBeenCalledWith("s-b");
+    });
+    expect(sessionStoreState.fetchSessionById).not.toHaveBeenCalledWith("s-b", {
+      silent: true,
+    });
+  });
+
+  it("自动降级到后台时，在状态行显示紧凑提示", () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      supervisor_snapshot: {
+        execution_mode: "background",
+        execution_phase: "running",
+        background_reason: "auto_degrade",
+        expires_at: "2026-05-11T08:30:00Z",
+        retry_budget_remaining: 2,
+      },
+      events: [],
+    };
+
+    render(<SessionPage />);
+
+    expect(screen.getByText("已自动转入后台")).toBeInTheDocument();
+    expect(screen.getByText(/到期/)).toHaveTextContent("2026-05-11 08:30 UTC");
+    expect(screen.getByText("剩余重试 2")).toBeInTheDocument();
+  });
+
+  it("挂起后台任务详情页应显示重试入口并刷新当前详情", async () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      supervisor_snapshot: {
+        execution_mode: "background",
+        execution_phase: "suspended",
+        background_reason: "auto_degrade",
+        expires_at: "2026-05-11T08:30:00Z",
+        retry_budget_remaining: 2,
+      },
+      events: [],
+    };
+
+    render(<SessionPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /重试后台任务/ }));
+
+    await waitFor(() => {
+      expect(sessionStoreState.retryFromSuspend).toHaveBeenCalledWith("s-b");
+      expect(sessionStoreState.fetchSessionFiles).toHaveBeenCalledWith("s-b", {
+        silent: true,
+      });
+    });
+  });
+
+  it("owner_conflict 事件应显示可见提示并允许发起接管", async () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      events: [
+        {
+          event: "owner_conflict",
+          data: {
+            payload: {
+              current_owner_connection_id: "u1:tab-a",
+              conflicting_connection_id: "u1:tab-b",
+              session_id: "s-b",
+              suggested_action: "request_takeover",
+            },
+          },
+        },
+      ],
+    };
+
+    render(<SessionPage />);
+
+    expect(screen.getByText("此会话已在另一个窗口连接")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "发起接管" }));
+
+    await waitFor(() => {
+      expect(sessionApiMocks.startTakeover).toHaveBeenCalledWith("s-b", {
+        scope: "shell",
+      });
+    });
+  });
+
+  it("owner_conflict 之后已有控制事件时不应继续显示接管提示", () => {
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      events: [
+        {
+          event: "owner_conflict",
+          data: {
+            payload: {
+              current_owner_connection_id: "u1:tab-a",
+              conflicting_connection_id: "u1:tab-b",
+              session_id: "s-b",
+              suggested_action: "request_takeover",
+            },
+          },
+        },
+        {
+          event: "control",
+          data: {
+            action: "started",
+            source: "user",
+            scope: "shell",
+          },
+        },
+      ],
+    };
+
+    render(<SessionPage />);
+
+    expect(screen.queryByText("此会话已在另一个窗口连接")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "发起接管" })).not.toBeInTheDocument();
   });
 
   it("message_ask_user 应渲染为提问样式并显示标题", () => {

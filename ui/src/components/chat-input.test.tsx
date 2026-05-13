@@ -11,7 +11,14 @@ type SessionStoreState = {
   isSessionStreaming: ReturnType<typeof vi.fn>;
   isChatting: boolean;
   chatSessionId: string | null;
-  currentSession: { session_id: string; status: string } | null;
+  currentSession: {
+    session_id: string;
+    status: string;
+    supervisor_snapshot?: {
+      execution_mode: "foreground" | "background";
+      execution_phase: string;
+    } | null;
+  } | null;
   sessions: Array<{ session_id: string; status: string }>;
 };
 
@@ -130,6 +137,26 @@ describe("ChatInput", () => {
     fireEvent.click(stopButton);
 
     expect(sessionStoreState.stopSession).toHaveBeenCalledWith("s-current");
+  });
+
+  it("挂起后台任务不应显示停止按钮", () => {
+    sessionStoreState.sessions = [{ session_id: "s-current", status: "running" }];
+    sessionStoreState.currentSession = {
+      session_id: "s-current",
+      status: "running",
+      supervisor_snapshot: {
+        execution_mode: "background",
+        execution_phase: "suspended",
+      },
+    };
+
+    render(<ChatInput sessionId="s-current" />);
+
+    expect(screen.queryByRole("button", { name: "停止任务" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    expect(
+      screen.getByPlaceholderText("后台任务已挂起，请先重试后台任务")
+    ).toBeDisabled();
   });
 
   it("currentSession 未对齐时，列表 running 不应禁用输入", () => {

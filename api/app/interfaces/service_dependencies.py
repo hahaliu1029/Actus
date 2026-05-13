@@ -135,11 +135,13 @@ def get_file_service(
 def get_session_service(request: HTTPConnection) -> SessionService:
     lifecycle_service = getattr(request.app.state, "sandbox_lifecycle_service", None)
     fs_reconciler = getattr(request.app.state, "fs_reconciler", None)
+    supervisor = getattr(request.app.state, "supervisor", None)
     return SessionService(
         uow_factory=get_uow,
         task_cls=RedisStreamTask,
         sandbox_lifecycle_service=lifecycle_service,
         fs_reconciler=fs_reconciler,
+        execution_supervisor=supervisor,
     )
 
 

@@ -22,6 +22,7 @@ from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task
+from app.domain.errors.supervisor import SupervisorContractError
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
@@ -44,7 +45,7 @@ from app.domain.models.event import (
 )
 from app.domain.models.file import File
 from app.domain.models.message import SkillConfirmationAction
-from app.domain.models.session import Session, SessionStatus
+from app.domain.models.session import SandboxBindingState, Session, SessionStatus
 
 # from app.domain.repositories.file_repository import FileRepository
 # from app.domain.repositories.session_repository import SessionRepository
@@ -422,6 +423,7 @@ class AgentService:
                 else None
             ),
             execution_supervisor=self._supervisor,
+            idle_watchdog=getattr(self, "_idle_watchdog", None),
             was_background=session.was_background,
         )
 
@@ -1266,7 +1268,7 @@ class AgentService:
             if getattr(e, "seq", None) is not None
         ]
         last_seq = max(seqs_seen) if seqs_seen else (since_seq or 0)
-        supervisor_snapshot = await self._build_supervisor_snapshot(session)
+        supervisor_snapshot = await self.build_supervisor_snapshot(session)
 
         return {
             "events": merged,
@@ -1276,6 +1278,9 @@ class AgentService:
             "last_seq": last_seq,
             "supervisor_snapshot": supervisor_snapshot,
         }
+
+    async def build_supervisor_snapshot(self, session: Session) -> SupervisorSnapshot:
+        return await self._build_supervisor_snapshot(session)
 
     async def _build_supervisor_snapshot(self, session: Session) -> SupervisorSnapshot:
         hot_hash = await self._read_supervisor_hot_hash(session.id)
@@ -1451,6 +1456,20 @@ class AgentService:
                 task is not None,
                 session.status.value,
             )
+            is_suspended_background = (
+                session.status == SessionStatus.RUNNING
+                and session.execution_mode == "background"
+                and session.execution_phase == "suspended"
+                and task is None
+            )
+            if is_suspended_background:
+                if message or attachments:
+                    raise ConflictError("后台任务已挂起，请先重试后台任务")
+                logger.info(
+                    "会话[%s]后台任务已挂起，空 chat 续流保持 suspended 状态",
+                    session_id,
+                )
+                return
 
             # 3.判断是否传递了message
             if message:
@@ -1609,7 +1628,7 @@ class AgentService:
             # 17.循环外面表示这次任务AI端的已结束
             # (suspend 由 task_runner._set_terminal_status → _on_task_runner_complete 统一处理)
             logger.info(f"会话[{session_id}]本轮运行结束")
-        except BadRequestError:
+        except (BadRequestError, ConflictError):
             raise
         except Exception as e:
             # 18.记录日志并返回错误事件
@@ -1666,6 +1685,7 @@ class AgentService:
                 SessionStatus.COMPLETED,
                 "user_cancel",
             )
+        await self._cleanup_background_slot_if_needed(session, reason="user_cancel")
 
         # 4. Suspend sandbox binding (I2: ACTIVE → SUSPENDED, container stays alive)
         if self._sandbox_lifecycle_service:
@@ -2141,6 +2161,35 @@ end
                 exc,
             )
 
+    async def _cleanup_background_slot_if_needed(
+        self,
+        session: Session,
+        *,
+        reason: str,
+    ) -> None:
+        if (
+            session.execution_mode != "background"
+            and not getattr(session, "was_background", False)
+        ):
+            return
+        if not getattr(session, "user_id", None):
+            return
+        supervisor = getattr(self, "_supervisor", None)
+        if supervisor is None:
+            return
+        try:
+            await supervisor.cleanup_background_slot(
+                session_id=session.id,
+                user_id=str(session.user_id),
+                reason=reason,
+            )
+        except Exception:
+            logger.warning(
+                "background slot cleanup failed for session %s",
+                session.id,
+                exc_info=True,
+            )
+
     @staticmethod
     def _bg_event_type_for_terminal(
         status: SessionStatus,
@@ -2181,6 +2230,283 @@ end
         await self._inject_handoff_message(task, text)
         await task.invoke()
         return task
+
+    async def retry_from_suspend(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        is_admin: bool = False,
+        user_role: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Retry a suspended background task without changing ownership."""
+        session = await self._get_accessible_session(session_id, user_id, is_admin)
+        if session.status != SessionStatus.RUNNING:
+            raise BadRequestError("当前会话状态不支持后台重试")
+        if session.execution_mode != "background":
+            raise BadRequestError("当前会话不是后台任务")
+        if session.execution_phase != "suspended":
+            raise ConflictError("后台任务状态已变化，请刷新后重试")
+        if session.retry_budget_remaining <= 0:
+            raise ConflictError("后台任务重试次数已用尽")
+
+        if session.sandbox_binding.state in (
+            SandboxBindingState.DESTROYING,
+            SandboxBindingState.DESTROYED,
+        ):
+            raise ConflictError("沙箱已终止，无法重试")
+        if session.sandbox_binding.state not in (
+            SandboxBindingState.ACTIVE,
+            SandboxBindingState.SUSPENDED,
+        ):
+            raise ConflictError("沙箱状态不支持重试")
+
+        if self._sandbox_lifecycle_service is None:
+            raise ServiceUnavailableError("沙箱生命周期服务暂不可用，请稍后重试")
+        supervisor = getattr(self, "_supervisor", None)
+        if supervisor is None:
+            raise ServiceUnavailableError("后台执行服务暂不可用，请稍后重试")
+
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+        original_retry_budget = session.retry_budget_remaining
+        original_expires_at = session.expires_at
+        original_suspended_reason = session.suspended_reason
+
+        async with self._uow_factory() as uow:
+            claimed_retry_budget = await uow.session.claim_background_retry_from_suspend(
+                session.id,
+                expires_at=expires_at,
+            )
+        if claimed_retry_budget is None:
+            raise ConflictError("后台任务状态已变化，请刷新后重试")
+
+        from app.domain.errors.sandbox_lifecycle import (
+            SandboxLifecycleError,
+            SessionDestroyingError,
+            SessionFinalizedError,
+        )
+
+        resume_user_id = str(session.user_id or user_id)
+        try:
+            admission_rc = await supervisor.resume(
+                session_id=session.id,
+                user_id=resume_user_id,
+                execution_mode="background",
+                expires_at=expires_at,
+                retry_budget_remaining=claimed_retry_budget,
+            )
+        except SupervisorContractError as exc:
+            await self._rollback_background_retry_claim(
+                session,
+                retry_budget_remaining=original_retry_budget,
+                expires_at=original_expires_at,
+                suspended_reason=original_suspended_reason,
+            )
+            raise ConflictError("后台执行名额已满，请稍后重试") from exc
+        except Exception:
+            await self._rollback_background_retry_claim(
+                session,
+                retry_budget_remaining=original_retry_budget,
+                expires_at=original_expires_at,
+                suspended_reason=original_suspended_reason,
+            )
+            raise
+
+        try:
+            await self._sandbox_lifecycle_service.resume(session.id)
+            session.execution_phase = "running"
+            session.suspended_reason = None
+            session.expires_at = expires_at
+            session.retry_budget_remaining = claimed_retry_budget
+            await self._resume_task_with_handoff(
+                session,
+                "用户请求重试挂起的后台任务，请从上次中断处继续执行。",
+            )
+        except (SessionDestroyingError, SessionFinalizedError) as exc:
+            await self._finalize_lost_background_retry(
+                session,
+                user_id=resume_user_id,
+                supervisor=supervisor,
+                admission_rc=admission_rc,
+            )
+            raise ConflictError("沙箱已终止，无法重试") from exc
+        except SandboxLifecycleError as exc:
+            await self._rollback_background_retry_claim(
+                session,
+                retry_budget_remaining=original_retry_budget,
+                expires_at=original_expires_at,
+                suspended_reason=original_suspended_reason,
+            )
+            await self._rollback_background_resume_admission(
+                session,
+                user_id=resume_user_id,
+                supervisor=supervisor,
+                admission_rc=admission_rc,
+                previous_expires_at=original_expires_at,
+            )
+            raise ConflictError("沙箱状态不支持重试") from exc
+        except Exception:
+            await self._rollback_background_retry_claim(
+                session,
+                retry_budget_remaining=original_retry_budget,
+                expires_at=original_expires_at,
+                suspended_reason=original_suspended_reason,
+            )
+            await self._rollback_background_resume_admission(
+                session,
+                user_id=resume_user_id,
+                supervisor=supervisor,
+                admission_rc=admission_rc,
+                previous_expires_at=original_expires_at,
+            )
+            if session.sandbox_binding.state == SandboxBindingState.SUSPENDED:
+                try:
+                    await self._sandbox_lifecycle_service.suspend(session.id)
+                except Exception:
+                    logger.warning(
+                        "retry_from_suspend rollback failed to suspend sandbox %s",
+                        session.id,
+                        exc_info=True,
+                    )
+            raise
+
+        return {
+            "status": SessionStatus.RUNNING,
+            "request_status": "resumed",
+            "retry_budget_remaining": claimed_retry_budget,
+            "expires_at": self._to_unix_seconds(expires_at),
+        }
+
+    async def _finalize_lost_background_retry(
+        self,
+        session: Session,
+        *,
+        user_id: str,
+        supervisor,
+        admission_rc: int | None,
+    ) -> None:
+        try:
+            await supervisor.terminate(
+                session_id=session.id,
+                user_id=str(session.user_id or user_id),
+                terminal_reason="resume_state_lost",
+                status=SessionStatus.TIMED_OUT,
+            )
+            return
+        except Exception:
+            logger.warning(
+                "retry_from_suspend failed to terminate lost sandbox session %s",
+                session.id,
+                exc_info=True,
+            )
+
+        try:
+            async with self._uow_factory() as uow:
+                await uow.session.update_to_terminal(
+                    session.id,
+                    SessionStatus.TIMED_OUT,
+                    "resume_state_lost",
+                )
+        except Exception:
+            logger.warning(
+                "retry_from_suspend fallback terminal update failed for session %s",
+                session.id,
+                exc_info=True,
+            )
+            return
+
+        try:
+            async with self._uow_factory() as uow:
+                await uow.session.update_supervisor_fields(
+                    session.id,
+                    retry_budget_remaining=0,
+                    expires_at=None,
+                    suspended_reason=None,
+                )
+        except Exception:
+            logger.warning(
+                "retry_from_suspend fallback terminal cleanup failed for session %s",
+                session.id,
+                exc_info=True,
+            )
+
+        await self._revoke_background_resume_admission(
+            session,
+            user_id=user_id,
+            supervisor=supervisor,
+            admission_rc=admission_rc,
+        )
+
+    async def _revoke_background_resume_admission(
+        self,
+        session: Session,
+        *,
+        user_id: str,
+        supervisor,
+        admission_rc: int | None,
+    ) -> None:
+        if admission_rc is None:
+            return
+        try:
+            await supervisor.revoke_background_resume_admission(
+                session_id=session.id,
+                user_id=user_id,
+                admission_rc=admission_rc,
+            )
+        except Exception:
+            logger.warning(
+                "retry_from_suspend Redis admission revoke failed for session %s",
+                session.id,
+                exc_info=True,
+            )
+
+    async def _rollback_background_resume_admission(
+        self,
+        session: Session,
+        *,
+        user_id: str,
+        supervisor,
+        admission_rc: int | None,
+        previous_expires_at: Optional[datetime],
+    ) -> None:
+        if admission_rc is None:
+            return
+        try:
+            await supervisor.rollback_background_resume_admission(
+                session_id=session.id,
+                user_id=user_id,
+                admission_rc=admission_rc,
+                previous_expires_at=previous_expires_at,
+            )
+        except Exception:
+            logger.warning(
+                "retry_from_suspend Redis admission rollback failed for session %s",
+                session.id,
+                exc_info=True,
+            )
+
+    async def _rollback_background_retry_claim(
+        self,
+        session: Session,
+        *,
+        retry_budget_remaining: int,
+        expires_at: Optional[datetime],
+        suspended_reason: Optional[str],
+    ) -> None:
+        try:
+            async with self._uow_factory() as uow:
+                await uow.session.rollback_background_retry_claim_if_active(
+                    session.id,
+                    retry_budget_remaining=retry_budget_remaining,
+                    expires_at=expires_at,
+                    suspended_reason=suspended_reason,
+                )
+        except Exception:
+            logger.warning(
+                "retry_from_suspend rollback failed for session %s",
+                session.id,
+                exc_info=True,
+            )
 
     async def _rollback_resume_failed(
         self,

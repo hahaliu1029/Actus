@@ -25,7 +25,7 @@ from app.domain.models.event import (
     OwnerConflictEvent,
     OwnerConflictPayload,
 )
-from app.domain.models.session import SessionStatus
+from app.domain.models.session import Session, SessionStatus
 from app.domain.services.execution_supervisor import ExecutionSupervisor
 from app.interfaces.dependencies import (
     CurrentUser,
@@ -41,6 +41,7 @@ from app.interfaces.dependencies import (
 from app.interfaces.schemas import Response
 from app.interfaces.schemas.event import EventMapper
 from app.interfaces.schemas.session import (
+    BackgroundQuotaResponse,
     CancelSessionRequest,
     ChatRequest,
     CreateSessionResponse,
@@ -59,6 +60,7 @@ from app.interfaces.schemas.session import (
     RenewTakeoverRequest,
     RenewTakeoverResponse,
     ReopenTakeoverResponse,
+    RetryFromSuspendResponse,
     ShellReadRequest,
     ShellReadResponse,
     StartTakeoverRequest,
@@ -112,14 +114,18 @@ async def _do_auto_degrade(
             return
 
         expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+        supervisor_user_id = str(sess.user_id or user_id)
         try:
-            await supervisor.promote(
+            retry_budget_remaining = await supervisor.promote(
                 session_id=session_id,
-                user_id=user_id,
+                user_id=supervisor_user_id,
                 expires_at=expires_at,
             )
         except SupervisorContractError:
             logger.info("auto-degrade rejected for session %s", session_id)
+            return
+        if retry_budget_remaining is None:
+            logger.info("auto-degrade skipped stale session %s", session_id)
             return
 
         await agent_service._emit_event(
@@ -131,12 +137,31 @@ async def _do_auto_degrade(
                     transition_reason="auto_degrade_sse_disconnect",
                     background_reason="auto_degrade",
                     expires_at=expires_at,
-                    retry_budget_remaining=3,
+                    retry_budget_remaining=retry_budget_remaining,
                 )
             ),
         )
     except Exception:
         logger.exception("auto-degrade failed for session %s", session_id)
+
+
+async def _build_list_session_item(
+    session: Session,
+    agent_service: AgentService,
+) -> ListSessionItem:
+    supervisor_snapshot = None
+    if session.execution_mode == "background":
+        supervisor_snapshot = await agent_service.build_supervisor_snapshot(session)
+
+    return ListSessionItem(
+        session_id=session.id,
+        title=session.title,
+        latest_message=session.latest_message,
+        latest_message_at=session.latest_message_at,
+        status=session.status,
+        unread_message_count=session.unread_message_count,
+        supervisor_snapshot=supervisor_snapshot,
+    )
 
 
 @router.post(
@@ -166,6 +191,7 @@ async def create_session(
 async def stream_sessions(
     current_user: CurrentUser,
     session_service: SessionService = Depends(get_session_service),
+    agent_service: AgentService = Depends(get_agent_service),
     redis_client: RedisClient = Depends(get_redis),
 ) -> EventSourceResponse:
     """间隔指定时间流式获取所有会话基础信息列表"""
@@ -187,14 +213,7 @@ async def stream_sessions(
 
                 # 2.循环遍历并组装数据
                 session_items = [
-                    ListSessionItem(
-                        session_id=session.id,
-                        title=session.title,
-                        latest_message=session.latest_message,
-                        latest_message_at=session.latest_message_at,
-                        status=session.status,
-                        unread_message_count=session.unread_message_count,
-                    )
+                    await _build_list_session_item(session, agent_service)
                     for session in sessions
                 ]
 
@@ -222,24 +241,36 @@ async def stream_sessions(
 async def get_all_sessions(
     current_user: CurrentUser,
     session_service: SessionService = Depends(get_session_service),
+    agent_service: AgentService = Depends(get_agent_service),
 ) -> Response[ListSessionResponse]:
     """获取当前用户的任务会话基础信息列表"""
     sessions = await session_service.get_all_sessions(
         current_user.id, current_user.is_admin()
     )
     session_items = [
-        ListSessionItem(
-            session_id=session.id,
-            title=session.title,
-            latest_message=session.latest_message,
-            latest_message_at=session.latest_message_at,
-            status=session.status,
-            unread_message_count=session.unread_message_count,
-        )
-        for session in sessions
+        await _build_list_session_item(session, agent_service) for session in sessions
     ]
     return Response.success(
         msg="获取任务会话列表成功", data=ListSessionResponse(sessions=session_items)
+    )
+
+
+@router.get(
+    path="/background-quota",
+    response_model=Response[BackgroundQuotaResponse],
+    summary="获取后台任务额度",
+    description="获取当前用户和系统后台任务额度使用情况",
+    dependencies=[Depends(rate_limit_read)],
+)
+async def get_background_quota(
+    current_user: CurrentUser,
+    supervisor: ExecutionSupervisor = Depends(get_supervisor),
+) -> Response[BackgroundQuotaResponse]:
+    """获取后台任务额度读模型"""
+    quota = await supervisor.get_background_quota(str(current_user.id))
+    return Response.success(
+        msg="获取后台任务额度成功",
+        data=BackgroundQuotaResponse.model_validate(quota),
     )
 
 
@@ -302,11 +333,19 @@ async def chat(
     redis_client: RedisClient = Depends(get_redis),
 ) -> EventSourceResponse:
     """根据传递的会话id+chat请求数据向指定会话发起聊天请求"""
-    await session_service.get_session(
+    session = await session_service.get_session(
         session_id=session_id,
         user_id=current_user.id,
         is_admin=current_user.is_admin(),
     )
+    has_user_input = bool(request.message) or bool(request.attachments)
+    if (
+        has_user_input
+        and getattr(session, "status", None) == SessionStatus.RUNNING
+        and getattr(session, "execution_mode", None) == "background"
+        and getattr(session, "execution_phase", None) == "suspended"
+    ):
+        raise ConflictError("后台任务已挂起，请先重试后台任务")
 
     # R5b-3 + B3-core PR-3c: 访问校验通过后、response 前必须先拿连接
     # lease，再做 owner conflict gate，最后才允许 tool-confirmation preflight
@@ -341,6 +380,7 @@ async def chat(
                         current_owner_connection_id=scope.current_owner or "",
                         conflicting_connection_id=connection_id,
                         session_id=session_id,
+                        suggested_action="request_takeover",
                     )
                 )
                 sse_event = EventMapper.event_to_sse_event(event)
@@ -523,6 +563,7 @@ async def get_session(
     session_id: str,
     current_user: CurrentUser,
     session_service: SessionService = Depends(get_session_service),
+    agent_service: AgentService = Depends(get_agent_service),
 ) -> Response[GetSessionResponse]:
     """传递指定会话id获取该会话的对话详情"""
     session = await session_service.get_session(
@@ -532,6 +573,9 @@ async def get_session(
     )
     if not session:
         raise NotFoundError("该会话不存在，请核实后重试")
+    supervisor_snapshot = None
+    if session.execution_mode == "background":
+        supervisor_snapshot = await agent_service.build_supervisor_snapshot(session)
     return Response.success(
         msg="获取会话详情成功",
         data=GetSessionResponse(
@@ -539,6 +583,7 @@ async def get_session(
             title=session.title,
             status=session.status,
             events=EventMapper.events_to_sse_events(session.events),
+            supervisor_snapshot=supervisor_snapshot,
         ),
     )
 
@@ -740,6 +785,31 @@ async def reopen_takeover(
     return Response.success(
         msg="补救接管成功",
         data=ReopenTakeoverResponse.model_validate(result),
+    )
+
+
+@router.post(
+    path="/{session_id}/retry-from-suspend",
+    response_model=Response[RetryFromSuspendResponse],
+    summary="重试挂起的后台任务",
+    description="将可恢复的后台挂起任务重新加入后台执行",
+    dependencies=[Depends(rate_limit_write)],
+)
+async def retry_from_suspend(
+    session_id: str,
+    current_user: CurrentUser,
+    agent_service: AgentService = Depends(get_agent_service),
+) -> Response[RetryFromSuspendResponse]:
+    """重试指定的后台挂起任务"""
+    result = await agent_service.retry_from_suspend(
+        session_id=session_id,
+        user_id=current_user.id,
+        is_admin=current_user.is_admin(),
+        user_role=current_user.role.value,
+    )
+    return Response.success(
+        msg="重试后台任务成功",
+        data=RetryFromSuspendResponse.model_validate(result),
     )
 
 

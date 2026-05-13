@@ -3,6 +3,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
+from app.application.errors.exceptions import ConflictError
 from app.application.services.agent_service import AgentService
 from app.domain.models.session import Session, SessionStatus
 
@@ -161,6 +162,154 @@ async def test_chat_without_message_reconciles_running_status_when_task_missing(
         event_type="bg_failed_resume",
         payload={"session_id": "session-1"},
     )
+
+
+async def test_chat_without_message_keeps_suspended_background_when_task_missing(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="suspended",
+        retry_budget_remaining=1,
+        was_background=True,
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    emitter = AsyncMock()
+    service._memory_notification_emitter = emitter
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_check_attachments_access(*args, **kwargs) -> None:
+        return None
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    async def fake_safe_update_unread_count(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_check_attachments_access", fake_check_attachments_access)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+    monkeypatch.setattr(service, "_safe_update_unread_count", fake_safe_update_unread_count)
+
+    chat_gen = service.chat(
+        session_id="session-1",
+        user_id="user-1",
+        message=None,
+        attachments=None,
+        latest_event_id=None,
+        timestamp=None,
+    )
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)
+
+    assert uow.session.update_to_terminal_calls == []
+    emitter.emit.assert_not_awaited()
+    assert session.execution_phase == "suspended"
+    assert session.retry_budget_remaining == 1
+
+
+async def test_chat_with_message_on_suspended_background_raises_conflict(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="suspended",
+        retry_budget_remaining=1,
+        was_background=True,
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_check_attachments_access(*args, **kwargs) -> None:
+        return None
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    async def fake_safe_update_unread_count(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_check_attachments_access", fake_check_attachments_access)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+    monkeypatch.setattr(service, "_safe_update_unread_count", fake_safe_update_unread_count)
+
+    chat_gen = service.chat(
+        session_id="session-1",
+        user_id="user-1",
+        message="continue",
+        attachments=None,
+        latest_event_id=None,
+        timestamp=None,
+    )
+
+    with pytest.raises(ConflictError):
+        await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)
+
+    assert uow.session.add_event_calls == []
+    assert uow.session.update_to_terminal_calls == []
+
+
+async def test_chat_with_attachment_on_suspended_background_raises_conflict(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-1",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="suspended",
+        retry_budget_remaining=1,
+        was_background=True,
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_check_attachments_access(*args, **kwargs) -> None:
+        return None
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    async def fake_safe_update_unread_count(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_check_attachments_access", fake_check_attachments_access)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+    monkeypatch.setattr(service, "_safe_update_unread_count", fake_safe_update_unread_count)
+
+    chat_gen = service.chat(
+        session_id="session-1",
+        user_id="user-1",
+        message=None,
+        attachments=["file-1"],
+        latest_event_id=None,
+        timestamp=None,
+    )
+
+    with pytest.raises(ConflictError):
+        await asyncio.wait_for(chat_gen.__anext__(), timeout=0.2)
+
+    assert uow.session.add_event_calls == []
+    assert uow.session.update_to_terminal_calls == []
 
 
 async def test_chat_with_message_does_not_trigger_running_status_reconcile(
