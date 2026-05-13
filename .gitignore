@@ -91,6 +91,7 @@ TODO3.md
 TODO4.md
 
 .superpowers/
+.context/
 
 # B5 C12: live bench results contain raw LLM API responses — keep out of git
 api/tests/evals/reminder_bench_results.json
