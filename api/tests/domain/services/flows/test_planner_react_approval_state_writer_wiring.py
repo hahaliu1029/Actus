@@ -4,9 +4,11 @@ configurable 下发给 react_graph 的 tool_node（SmartApprove 写路径消费�
 锁死三个契约（对称 reader wiring）：
 1. 默认参数 ``approval_state_writer=None``（向后兼容现有 test fixture）
 2. ``__init__`` 保存到 ``self._approval_state_writer``
-3. ``_build_config()["configurable"]["approval_state_writer"]`` 是同一个对象
-   （react_graph 的 SmartApprove 分支通过 ``configurable.get("approval_state_writer")``
-   调 writer.write(...) 持久化 grant）
+3. ``_build_config()["configurable"]["_legacy_sa_writer"]`` 是同一个对象
+   （PE-0 Phase 8 后 key 从 "approval_state_writer" 改名为 "_legacy_sa_writer"
+   以保持 INV-1b 完整性；react_graph 的 legacy SmartApprove 分支通过
+   ``configurable.get("_legacy_sa_writer")`` 调 writer.write(...) 持久化 grant；
+   PE 路径下 PE 自己持 writer，此 slot 虽存在但不可达）
 """
 
 from __future__ import annotations
@@ -51,9 +53,11 @@ def test_constructor_stores_approval_state_writer() -> None:
 
 
 def test_build_config_exposes_approval_state_writer_in_configurable() -> None:
-    """``_build_config()["configurable"]["approval_state_writer"]`` 就是注入对象。
+    """``_build_config()["configurable"]["_legacy_sa_writer"]`` 就是注入对象。
 
-    SmartApprove 写路径通过 ``configurable.get("approval_state_writer")``
+    PE-0 Phase 8 后 key 从 "approval_state_writer" 改名为 "_legacy_sa_writer"
+    以保持 INV-1b 完整性（PE 路径不走此 slot）。
+    Legacy SmartApprove 写路径通过 ``configurable.get("_legacy_sa_writer")``
     拿到 Writer 并调 ``writer.write(ApprovalDecision(..., source_type='smart_approve'))``
     持久化 grant 行 —— AST guard Rule 7（R5b-4 翻开）依赖 configurable 下游是
     Writer 而不是 ApprovalCache。
@@ -61,11 +65,11 @@ def test_build_config_exposes_approval_state_writer_in_configurable() -> None:
     sentinel = object()
     flow = _make_flow(approval_state_writer=sentinel)
     cfg = flow._build_config()
-    assert cfg["configurable"]["approval_state_writer"] is sentinel
+    assert cfg["configurable"]["_legacy_sa_writer"] is sentinel
 
 
 def test_build_config_passes_none_when_writer_not_injected() -> None:
     """未注入时 configurable 里是 None；SmartApprove 守卫 fail-open 跳过持久化。"""
     flow = _make_flow()
     cfg = flow._build_config()
-    assert cfg["configurable"]["approval_state_writer"] is None
+    assert cfg["configurable"]["_legacy_sa_writer"] is None

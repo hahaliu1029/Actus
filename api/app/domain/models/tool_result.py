@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Generic, Literal, Optional, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_serializer
 
 from app.domain.services.tools.tool_source_resolver import ToolSource
 
@@ -208,6 +208,11 @@ class Asked(BaseModel):
     content: str
     reason: DecisionReason                    # CS2.2: type ∈ {approval_policy, smart_approve, risk_enforce}
     # NOT ast_validator (AST is fail-closed deny), NOT exception/timeout (those are AllowError)
+    confirmation_id: str | None = None  # PE-0: stable identifier used by
+                                        # ConfirmationQueue + frontend
+                                        # tool-confirmation-card. None for
+                                        # legacy callers — back-compat with
+                                        # R2 CS2 golden matrix payloads.
 
     model_config = ConfigDict(extra="forbid")
 
@@ -222,6 +227,20 @@ class Asked(BaseModel):
                 "exception/timeout must produce AllowError."
             )
         return v
+
+    @model_serializer(mode="wrap")
+    def _omit_none_confirmation_id(self, handler: Any) -> dict:
+        """Omit confirmation_id from wire output when None.
+
+        Back-compat with R2/R4 golden fixtures which predate PE-0 and do not
+        contain the confirmation_id field.  When confirmation_id is set to a
+        real value it is included normally so the frontend tool-confirmation-card
+        and ConfirmationQueue can read it.
+        """
+        data: dict = handler(self)
+        if data.get("confirmation_id") is None:
+            data.pop("confirmation_id", None)
+        return data
 
 
 class Passthrough(BaseModel):

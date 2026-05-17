@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -98,6 +99,11 @@ class SessionModel(Base):
         nullable=False,
         server_default=text("''::character varying"),
     )  # 会话状态
+    mode_revision: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )  # PE-0: strict-monotonic CAS counter for SessionStateMachine transitions
     user_id: Mapped[Optional[str]] = mapped_column(
         String(36),
         ForeignKey("users.id", ondelete="SET NULL"),

@@ -18,9 +18,11 @@ from typing import (
 
 if TYPE_CHECKING:
     from app.domain.models.app_config import ToolRuntimeConfig
+    from app.domain.services.permission.engine import PermissionEngine
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.prompts.memory_snapshot import MemorySnapshot
     from app.domain.services.provider_profiles._base import ProviderProfile
+    from app.domain.services.session.session_state_machine import SessionStateMachine
 
 
 from langchain_core.language_models import BaseChatModel
@@ -117,7 +119,7 @@ class PlannerReActFlow(BaseFlow):
         memory_session_redis=None,  # PR-3: per-session save counter
         memory_session_save_cap: int = 20,  # PR-3
         approval_state_reader: Any = None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
-        approval_state_writer: Any = None,  # R5b-3: ApprovalStateWriter | None（写路径 single writer）
+        approval_state_writer: Any = None,  # P2#8: ApprovalStateWriter | None（legacy SmartApprove grant写）
         confirmation_manager: Any = None,  # ConfirmationManager | None
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
         _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
@@ -138,9 +140,13 @@ class PlannerReActFlow(BaseFlow):
         # every LangGraph invoke so LLM calls generate CostRecord rows.
         cost_callback_handler: Any = None,
         execution_supervisor: Any = None,
+        permission_engine: "PermissionEngine | None" = None,
+        session_state_machine: "SessionStateMachine | None" = None,
     ) -> None:
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
+        self._permission_engine = permission_engine
+        self._session_state_machine = session_state_machine
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_processor_lookup = file_processor_lookup
@@ -270,9 +276,14 @@ class PlannerReActFlow(BaseFlow):
         self._memory_gate_batch_cap = memory_gate_batch_cap
         self._memory_notification_emitter = memory_notification_emitter
 
-        # R5b-2 Reader + R5b-3 Writer 接入；ApprovalCache 已于 R5b-4 移除
+        # R5b-2 Reader 接入；ApprovalCache 已于 R5b-4 移除。
+        # P2#8: Writer is restored for the LEGACY SmartApprove path only.
+        # When PE is active (permission_engine is not None), PE Stage P.2
+        # owns grant writes and this field is unused. The legacy branch in
+        # react_graph reads this via "_legacy_sa_writer" configurable key
+        # (NOT "approval_state_writer" — keeping INV-1b intact).
         self._approval_state_reader = approval_state_reader
-        self._approval_state_writer = approval_state_writer
+        self._approval_state_writer = approval_state_writer  # P2#8: legacy grant write
         self._confirmation_manager = confirmation_manager
 
         # D5: Execution health monitoring — persist across invoke/resume
@@ -1201,7 +1212,11 @@ class PlannerReActFlow(BaseFlow):
                 "has_file_view": self._file_processor_lookup is not None,
                 "has_memory_tools": self._has_memory_tools,
                 "approval_state_reader": self._approval_state_reader,
-                "approval_state_writer": self._approval_state_writer,
+                # P2#8: legacy SmartApprove approve branch writes a session grant via this slot.
+                # Key is "_legacy_sa_writer" (not "approval_state_writer") to keep INV-1b intact.
+                # When PE is active (permission_engine injected), this slot is present but
+                # the legacy SmartApprove branch is unreachable (PE takes the tool_node path).
+                "_legacy_sa_writer": self._approval_state_writer,
                 "skill_tool": self._skill_tool,  # R3: for pre-Stage-P risk refresh
                 "confirmation_manager": self._confirmation_manager,
                 "user_id": self._user_id,
@@ -1239,6 +1254,37 @@ class PlannerReActFlow(BaseFlow):
         from app.application.composition import build_decision_recorder
 
         cfg["configurable"]["decision_recorder"] = build_decision_recorder()
+        # PE-0 Phase 7: inject PermissionEngine + SessionStateMachine into
+        # LangGraph configurable. The flag ``permission_engine_native_enabled``
+        # mirrors AppConfig.agent_config.tool_confirmation (feature-gated);
+        # ``tc`` is already resolved above from self._agent_config.
+        # Both PE and SSM must be non-None AND the flag must be True for
+        # injection to happen — missing either means fall back to legacy path.
+        flag_native = (
+            bool(getattr(tc, "permission_engine_native_enabled", True))
+            if tc is not None
+            else True
+        )
+        # P2#6: respect the tool_confirmation.enabled master switch.
+        # When tc.enabled is False the operator intends dangerous tools to execute
+        # without any confirmation gate (legacy semantics).  Injecting PE here while
+        # tc.enabled=False would route tool calls through PE's Stage S/P chain,
+        # which may enqueue confirmation requests even though the operator disabled
+        # the feature.  Guard: only inject PE when tc is None (no config, default on)
+        # OR tc.enabled is True.
+        tc_master_enabled = (
+            bool(getattr(tc, "enabled", True))
+            if tc is not None
+            else True
+        )
+        if (
+            self._permission_engine is not None
+            and self._session_state_machine is not None
+            and flag_native
+            and tc_master_enabled
+        ):
+            cfg["configurable"]["permission_engine"] = self._permission_engine
+            cfg["configurable"]["session_state_machine"] = self._session_state_machine
         # B4 M0: attach the session-scoped CostCallbackHandler so every LLM
         # call inside the graph (planner, executor, updater, summarizer)
         # fires on_chat_model_start → on_llm_end and writes a CostRecord.

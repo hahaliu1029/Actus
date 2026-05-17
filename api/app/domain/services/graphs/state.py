@@ -111,6 +111,15 @@ class ReactGraphState(TypedDict):
     # 必须靠 state flag 直接 bypass.
     approved_tool_call_ids: NotRequired[list[str]]
 
+    # PE-0 Phase 10: typed resume bridge for the PE path (INV-5 path B).
+    # Written by interrupt_helper after pe.commit_resume; read by tool_node on
+    # the post-resume replay.  Keyed by tool_call_id; value is
+    # ToolOutcome.model_dump(mode='json').  Coexists with the legacy
+    # `approved_tool_call_ids` field — the latter remains for fail-open
+    # (PE unwired or feature flag off).  PE-3 cleanup removes the legacy
+    # field after all 4 tool sources have migrated.
+    pe_resume_outcomes: NotRequired[dict[str, dict[str, object]]]
+
     # R2 CS2: Asked 路径的 pending 状态, 给 interrupt_helper 节点消费.
     # pending_ask_outcome: Asked.model_dump(mode="json") — Layer 3 写入.
     # pending_ask_tool_call_id: 待审批的 tool_call_id.

@@ -845,6 +845,25 @@ def get_cost_aggregation_service(
     return CostAggregationService(DbCostRecordRepository(db_session))
 
 
+# ----------------------------------------------------------------------
+# PE-0 Phase 7: ConfirmationQueue DI factory
+# ----------------------------------------------------------------------
+
+
+def get_confirmation_queue(
+    redis_client: RedisClient = Depends(get_redis),
+) -> "ConfirmationQueue":
+    """Return a ConfirmationQueue backed by the raw redis.asyncio.Redis client.
+
+    C-R2-P0-3 correction: ConfirmationQueue.__init__ takes the raw redis
+    client (redis.asyncio.Redis), NOT the RedisClient wrapper. Unwrap via
+    ``.client`` before passing in.
+    """
+    from app.domain.services.permission.confirmation_queue import ConfirmationQueue
+
+    return ConfirmationQueue(redis_client.client)
+
+
 def build_cost_callback_handler(session_id: str, user_id: str):
     """B4 M0: thin wrapper around the application-layer factory.
 

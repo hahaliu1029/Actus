@@ -231,7 +231,7 @@ class TestContractTuplesFrozen:
     """
 
     def test_canonical_v1_size(self):
-        assert len(CANONICAL_ATTRIBUTES) == 15
+        assert len(CANONICAL_ATTRIBUTES) == 19
 
     def test_required_v1_size(self):
         assert len(REQUIRED_ATTRIBUTES) == 3
@@ -256,4 +256,9 @@ class TestContractTuplesFrozen:
             "attempt_ix",
             "event_id",
             "decision_reason",
+            # PE-0 (2026-05-14): PermissionEngine decision-pipeline attrs
+            "decision_stage",
+            "tool_source",
+            "confirmation_id_hash",
+            "session_mode",
         }

@@ -33,6 +33,7 @@ RULE_1_WHITELIST = {
     "api/app/domain/services/graphs/",
     "api/app/domain/services/safety/",
     "api/app/domain/services/tools/",
+    "api/app/domain/services/permission/",  # PE-0: PermissionEngine is a typed-outcome decision engine (R5 CS4 + R2 CS2); needs isinstance checks and ToolOutcome construction
     "api/app/application/services/tool_event_envelope_v1.py",
     "api/app/infrastructure/external/llm/_error_prefix.py",
 }

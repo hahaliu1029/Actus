@@ -20,7 +20,11 @@ which read the OTel global providers — same path as
 """
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from app.domain.services.permission.engine import PermissionEngine
+    from app.domain.services.session.session_state_machine import SessionStateMachine
 
 from app.domain.external.observability import MeterPort, TracerPort
 from app.infrastructure.observability.otel_llm_metrics import (
@@ -71,6 +75,126 @@ def build_observability_callbacks(
         OtelToolSpanCallback(tracer),
         OtelLLMMetricsCallback(meter),
     ]
+
+
+def build_session_state_machine(
+    *,
+    uow_factory: Any,
+    redis: Any = None,
+    event_publisher: Any = None,
+) -> "SessionStateMachine":
+    """Build a DefaultSessionStateMachine.
+
+    Parameters
+    ----------
+    uow_factory:
+        Callable that returns an IUnitOfWork context manager.  Passed through
+        to DefaultSessionStateMachine for per-call DB access.
+    redis:
+        Optional raw redis.asyncio.Redis client reserved for future hot-path
+        caching (A4-0 wires the real value; PE-0 passes None).
+    event_publisher:
+        Optional SseEventPublisher for SessionModeChangedEvent.  None →
+        DefaultSessionStateMachine falls back to its internal _NoopPublisher.
+    """
+    from app.domain.services.session.default_state_machine import (
+        DefaultSessionStateMachine,
+    )
+
+    return DefaultSessionStateMachine(
+        uow_factory=uow_factory,
+        redis=redis,
+        event_publisher=event_publisher,
+    )
+
+
+def build_permission_engine(
+    *,
+    uow_factory: Any,
+    writer: Any,
+    queue: Any,
+    session_machine: Any,
+    reader: Any,
+    summary_llm: Any,
+    smart_approve_timeout_seconds: float = 30.0,
+    smart_approve_enabled: bool = True,
+    smart_approve_medium_only: bool = False,
+    confirmation_timeout_seconds: int = 300,  # P2#3: deadline for ConfirmationQueue entries
+    decision_recorder: Any = None,  # P3#1: OTel decision recorder callable
+) -> "PermissionEngine":
+    """Build a DefaultPermissionEngine wired with SmartApproveProvider.
+
+    Parameters
+    ----------
+    uow_factory:
+        Per-call UoW factory for policy lookup (C-R5-P1).
+    writer:
+        ApprovalStateWriter instance (R5 CS4 single writer).
+    queue:
+        ConfirmationQueue instance (already backed by raw Redis client).
+    session_machine:
+        SessionStateMachine instance; used only for read-only
+        get_mode_with_revision (INV-2 enforces no mutator calls from PE).
+    reader:
+        ApprovalStateReader instance for grant lookup (Stage P.1).
+    summary_llm:
+        BaseChatModel used by SmartApprove for LLM-assisted risk evaluation.
+        When None the escalation_registry is built with an empty dict so
+        Stage P.2 is skipped and the flow falls directly to Asked enqueue.
+    smart_approve_timeout_seconds:
+        asyncio.wait_for timeout for the SmartApprove LLM call.
+    smart_approve_enabled:
+        P1#5: When False, SmartApproveProvider is NOT registered regardless of
+        whether summary_llm is available.  Mirrors tool_confirmation.smart_approve_enabled.
+        Defaults to True for backward-compat when the config field is absent.
+    smart_approve_medium_only:
+        When True, SmartApproveProvider will skip LLM evaluation for HIGH-risk
+        tool calls and fall directly through to Asked (user confirmation required).
+        This mirrors the legacy tool_confirmation behaviour where HIGH always
+        requires explicit human confirmation when medium_only is enabled.
+    confirmation_timeout_seconds:
+        P2#3: deadline for ConfirmationQueue entries (seconds from now).
+        Must match the ToolConfirmationEvent timeout sent to the frontend so
+        the backend sweep and frontend countdown stay consistent.
+        Mirrors ``tool_confirmation.timeout_seconds`` from AppConfig.
+    decision_recorder:
+        P3#1: Optional OTel-backed callable for recording PE decision events.
+        When provided, forwarded to DefaultPermissionEngine so that
+        ``_record_decision`` emits canonical OTel attributes (decision_stage,
+        etc.) on every stage transition.  Callers should pass
+        ``build_decision_recorder()`` here.  Defaults to None (no-op inside PE).
+    """
+    from app.domain.services.permission.default_engine import DefaultPermissionEngine
+    from app.domain.services.permission.smart_approve_provider import SmartApproveProvider
+
+    escalation_registry: dict[str, Any] = {}
+    # P1#5: gate SmartApproveProvider on the config flag (not just summary_llm presence).
+    # When smart_approve_enabled is False, escalation_registry stays empty → Stage P.2 is
+    # skipped and all high/medium-risk tool calls go directly to Asked (user confirmation).
+    # This prevents the LLM from auto-approving/denying when the operator disables SmartApprove.
+    if smart_approve_enabled and summary_llm is not None:
+        from app.domain.services.smart_approve import SmartApprove  # local import
+
+        smart_approve = SmartApprove(llm=summary_llm)
+        # P1#4: pass medium_only so HIGH-risk tools bypass LLM evaluation when
+        # the operator has configured smart_approve_medium_only=True.
+        provider = SmartApproveProvider(
+            smart_approve,
+            timeout_seconds=smart_approve_timeout_seconds,
+            medium_only=smart_approve_medium_only,
+        )
+        escalation_registry[provider.name] = provider
+
+    return DefaultPermissionEngine(
+        uow_factory=uow_factory,
+        writer=writer,
+        queue=queue,
+        session_machine=session_machine,
+        reader=reader,
+        escalation_registry=escalation_registry,
+        confirmation_timeout_seconds=confirmation_timeout_seconds,
+        decision_recorder=decision_recorder,  # P3#1: forward to PE for OTel emit
+    )
 
 
 def build_decision_recorder() -> Callable[..., None]:

@@ -1067,3 +1067,65 @@ class TestTranslateOutcomePassthroughCap:
             "type": "text",
             "text": "[... 3 more images omitted]",
         }
+
+
+# ---------------------------------------------------------------------------
+# P2#6: _build_resume_error_command must include pending_id in prefix
+# ---------------------------------------------------------------------------
+
+
+class TestBuildResumeErrorCommand:
+    """P2#6: _build_resume_error_command adds pending_id to completed_tool_call_prefix."""
+
+    def _make_state(
+        self,
+        pending_id: str = "tc_abc",
+        existing_prefix: list | None = None,
+    ) -> dict:
+        return {
+            "pending_ask_tool_call_id": pending_id,
+            "pending_ask_artifact": {"tool_name": "file_write"},
+            "pending_ask_outcome": None,
+            "pending_ask_tool_args": None,
+            "completed_tool_call_prefix": existing_prefix or [],
+        }
+
+    def test_adds_pending_id_to_empty_prefix(self):
+        from app.domain.services.graphs.react_graph import _build_resume_error_command
+
+        state = self._make_state(pending_id="tc1", existing_prefix=[])
+        cmd = _build_resume_error_command(state, Exception("policy conflict"))
+        prefix = cmd.update.get("completed_tool_call_prefix", [])
+        assert "tc1" in prefix, (
+            "_build_resume_error_command must add pending_id to completed_tool_call_prefix"
+        )
+
+    def test_appends_to_existing_prefix(self):
+        from app.domain.services.graphs.react_graph import _build_resume_error_command
+
+        state = self._make_state(pending_id="tc2", existing_prefix=["tc0", "tc1"])
+        cmd = _build_resume_error_command(state, Exception("conflict"))
+        prefix = cmd.update.get("completed_tool_call_prefix", [])
+        assert prefix == ["tc0", "tc1", "tc2"], (
+            "_build_resume_error_command must preserve existing prefix entries"
+        )
+
+    def test_error_message_is_included(self):
+        from app.domain.services.graphs.react_graph import _build_resume_error_command
+
+        state = self._make_state(pending_id="tc3")
+        cmd = _build_resume_error_command(state, Exception("nonce_mismatch"))
+        messages = cmd.update.get("messages", [])
+        assert len(messages) == 1
+        assert "POLICY_CONFLICT" in messages[0].content
+        assert "nonce_mismatch" in messages[0].content
+
+    def test_pending_fields_cleared(self):
+        from app.domain.services.graphs.react_graph import _build_resume_error_command
+
+        state = self._make_state(pending_id="tc4")
+        cmd = _build_resume_error_command(state, Exception("err"))
+        assert cmd.update.get("pending_ask_tool_call_id") is None
+        assert cmd.update.get("pending_ask_outcome") is None
+        assert cmd.update.get("pending_ask_artifact") is None
+        assert cmd.update.get("pending_ask_tool_args") is None

@@ -7,6 +7,7 @@ from .file_repository import FileRepository
 from .sandbox_lifecycle_log_repository import SandboxLifecycleLogRepository
 from .session_repository import SessionRepository
 from .tool_approval_log_repository import ToolApprovalLogRepository
+from .user_tool_approval_policy_repository import UserToolApprovalPolicyRepository
 
 T = TypeVar("T", bound="IUnitOfWork")
 
@@ -20,6 +21,7 @@ class IUnitOfWork(ABC):
     sandbox_lifecycle_log: SandboxLifecycleLogRepository
     approval_grants: ApprovalGrantRepository
     compaction: ConversationCompactionRepository  # NEW [B6]
+    user_tool_approval_policy: UserToolApprovalPolicyRepository  # NEW [PE-0]
 
     @abstractmethod
     async def commit(self):

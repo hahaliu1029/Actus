@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
@@ -16,6 +16,11 @@ from pydantic import ValidationError
 from sqlalchemy import cast, delete, func, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# PE-0 round 31 P2: SSM-owned columns must be set via the dedicated
+# transition_status arguments, not via extra_values. Guarding here so an
+# extra_values mistake fails loudly instead of silently double-writing.
+_TRANSITION_RESERVED_KEYS = frozenset({"status", "mode_revision", "updated_at"})
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +239,11 @@ class DBSessionRepository(SessionRepository):
             raise ValueError("terminal statuses must use update_to_terminal")
 
         # 1.构建更新值
-        values = {"status": status.value, "updated_at": datetime.now()}
+        values: dict = {
+            "status": status.value,
+            "mode_revision": SessionModel.mode_revision + 1,  # PE-0 race fence
+            "updated_at": datetime.now(),
+        }
         if status == SessionStatus.TAKEOVER_PENDING:
             # reopen 场景：从 completed 恢复时清空 completed_at，
             # 避免统计逻辑误判"非空即完成过"
@@ -439,6 +448,7 @@ class DBSessionRepository(SessionRepository):
             .where(~SessionModel.execution_phase.in_(("terminating", "terminated")))
             .values(
                 status=status.value,
+                mode_revision=SessionModel.mode_revision + 1,  # PE-0 race fence
                 completed_at=now,
                 terminal_reason=terminal_reason,
                 execution_phase="terminated",
@@ -735,3 +745,76 @@ class DBSessionRepository(SessionRepository):
 
         if result.rowcount == 0:
             raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    # ── PE-0: atomic CAS helpers for SessionStateMachine ──
+
+    async def transition_status(
+        self,
+        *,
+        session_id: str,
+        from_state: SessionStatus,
+        to_state: SessionStatus,
+        extra_values: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Atomic CAS: UPDATE sessions SET status=:to, mode_revision=mode_revision+1
+        WHERE id=:sid AND status=:from. Returns True iff row updated.
+
+        INV-4 contract: in PE-0 this method is the ONLY new write path
+        added in PR; existing update_status / update_to_terminal remain
+        callable (audit-only INV-4-soft). A4-1 migrates them into SSM.
+
+        ``extra_values`` (optional) merges additional column writes into the
+        SAME UPDATE so terminal-side metadata (``completed_at``,
+        ``terminal_reason``, ``execution_phase``) can be written atomically
+        with the status CAS. Keys reserved by the repo
+        (``status`` / ``mode_revision`` / ``updated_at``) raise ValueError.
+        """
+        # DBSessionRepository holds a single AsyncSession instance
+        # (`self.db_session: AsyncSession`, line 41). Do NOT open a new
+        # session inside repo methods; UoW commits at end of scope.
+        values: dict[str, Any] = {
+            "status": to_state.value,
+            "mode_revision": SessionModel.mode_revision + 1,
+            "updated_at": datetime.now(),
+        }
+        if extra_values:
+            reserved = _TRANSITION_RESERVED_KEYS & extra_values.keys()
+            if reserved:
+                raise ValueError(
+                    "extra_values must not override repo-owned keys: "
+                    f"{sorted(reserved)}"
+                )
+            values.update(extra_values)
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == from_state.value)
+            .values(**values)
+        )
+        res = await self.db_session.execute(stmt)
+        await self.db_session.flush()
+        return res.rowcount > 0
+
+    async def read_mode_revision(self, session_id: str) -> int:
+        """Return the current mode_revision counter."""
+        res = await self.db_session.execute(
+            select(SessionModel.mode_revision).where(SessionModel.id == session_id)
+        )
+        v = res.scalar_one_or_none()
+        if v is None:
+            raise KeyError(f"session not found: {session_id}")
+        return int(v)
+
+    async def read_status_with_revision(
+        self, session_id: str,
+    ) -> tuple[SessionStatus, int]:
+        """Return (status, mode_revision) as a single read."""
+        res = await self.db_session.execute(
+            select(SessionModel.status, SessionModel.mode_revision).where(
+                SessionModel.id == session_id
+            )
+        )
+        row = res.one_or_none()
+        if row is None:
+            raise KeyError(f"session not found: {session_id}")
+        return SessionStatus(row[0]), int(row[1])

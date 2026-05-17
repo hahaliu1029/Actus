@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Protocol
+from typing import TYPE_CHECKING, Any, List, Mapping, NamedTuple, Optional, Protocol
 
 from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
@@ -226,4 +226,36 @@ class SessionRepository(Protocol):
 
     async def clear_skill_graph_state(self, session_id: str) -> None:
         """清理 Skill 创建子图的持久化状态"""
+        ...
+
+    async def transition_status(
+        self,
+        *,
+        session_id: str,
+        from_state: SessionStatus,
+        to_state: SessionStatus,
+        extra_values: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Atomic CAS: UPDATE sessions SET status=:to,
+        mode_revision=mode_revision+1 WHERE id=:sid AND status=:from.
+        Returns True iff row updated. Caller (SSM) owns commit via UoW.
+
+        ``extra_values`` (optional) merges additional column writes into the
+        same UPDATE statement so terminal metadata (``completed_at``,
+        ``terminal_reason``, ``execution_phase``) can be written atomically
+        with the status CAS. Keys MUST be SessionModel column names; values
+        are passed through to SQLAlchemy unchanged. Reserved keys
+        (``status``, ``mode_revision``, ``updated_at``) are owned by the
+        repo and MUST NOT appear in ``extra_values``.
+        """
+        ...
+
+    async def read_mode_revision(self, session_id: str) -> int:
+        """Return the current mode_revision counter."""
+        ...
+
+    async def read_status_with_revision(
+        self, session_id: str,
+    ) -> tuple[SessionStatus, int]:
+        """Return (status, mode_revision) as a single read."""
         ...

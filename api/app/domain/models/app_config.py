@@ -237,6 +237,8 @@ class MemoryConfig(BaseModel):
 class ToolConfirmationConfig(BaseModel):
     """危险工具确认策略配置"""
 
+    model_config = ConfigDict(extra="forbid")
+
     enabled: bool = Field(default=True, description="是否启用危险工具确认（关闭后所有工具直接执行）")
     timeout_seconds: int = Field(default=300, ge=30, le=3600, description="确认超时秒数")
     smart_approve_enabled: bool = Field(default=False, description="启用 Smart Approve（LLM 辅助审批）")
@@ -249,6 +251,29 @@ class ToolConfirmationConfig(BaseModel):
             "`uv run python -m app.cli.backfill_approval_grants` 完成迁移后切 False。"
             "Phase 2 PermissionEngine 落地后删除本字段。"
         ),
+    )
+    # PE-0 (2026-05-14): per-source kill switches for the new PermissionEngine
+    # path. Default True for all five; flip a single flag in config.yaml to
+    # fall back to legacy _run_policy_chain for that source.
+    permission_engine_native_enabled: bool = Field(
+        default=True,
+        description="PE-0 native (file/shell/browser) path; False -> legacy _run_policy_chain",
+    )
+    permission_engine_skill_enabled: bool = Field(
+        default=True,
+        description="PE-1 Skill path; False -> R3 Stage P legacy",
+    )
+    permission_engine_mcp_enabled: bool = Field(
+        default=True,
+        description="PE-2 MCP path",
+    )
+    permission_engine_a2a_enabled: bool = Field(
+        default=True,
+        description="PE-3 A2A path",
+    )
+    permission_engine_a4_events_enabled: bool = Field(
+        default=True,
+        description="A4-0 SessionModeChangedEvent SSE; False -> suppress emission",
     )
 
 

@@ -1,6 +1,12 @@
 import logging
+import uuid
 
 from app.application.errors.exceptions import AppException, TooManyRequestsError
+from app.domain.services.permission.errors import (
+    PolicyConflict,
+    SessionModeViolation,
+    WriterIntegrityError,
+)
 from app.infrastructure.observability.context import (
     reset_trace_context,
     set_trace_context,
@@ -115,6 +121,43 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content=Response(code=exc.status_code, msg=exc.detail, data={}).model_dump(),
             headers=headers or None,
+        )
+
+    @app.exception_handler(PolicyConflict)
+    async def policy_conflict_handler(
+        request: Request, exc: PolicyConflict
+    ) -> JSONResponse:
+        """PE race / dedup / arg_digest mismatch → 409 Conflict."""
+        return JSONResponse(
+            status_code=409,
+            content={"error": str(exc)},
+            headers=_request_id_headers(request) or None,
+        )
+
+    @app.exception_handler(SessionModeViolation)
+    async def session_mode_violation_handler(
+        request: Request, exc: SessionModeViolation
+    ) -> JSONResponse:
+        """PE session lifecycle terminal state → 410 Gone."""
+        return JSONResponse(
+            status_code=410,
+            content={"error": "session_state_invalid", "detail": str(exc)},
+            headers=_request_id_headers(request) or None,
+        )
+
+    @app.exception_handler(WriterIntegrityError)
+    async def writer_integrity_handler(
+        request: Request, exc: WriterIntegrityError
+    ) -> JSONResponse:
+        """PE writer downstream IntegrityError → 500 with correlation_id for ops tracing."""
+        correlation_id = str(uuid.uuid4())[:16]
+        logger.error(
+            "WriterIntegrityError correlation_id=%s: %s", correlation_id, exc
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal", "correlation_id": correlation_id},
+            headers=_request_id_headers(request) or None,
         )
 
     @app.exception_handler(Exception)

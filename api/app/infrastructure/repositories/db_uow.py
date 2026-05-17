@@ -11,6 +11,7 @@ from .db_file_repository import DBFileRepository
 from .db_sandbox_lifecycle_log_repository import DBSandboxLifecycleLogRepository
 from .db_session_repository import DBSessionRepository
 from .db_tool_approval_log_repository import DBToolApprovalLogRepository
+from .db_user_tool_approval_policy_repository import DBUserToolApprovalPolicyRepository
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ class DBUnitOfWork(IUnitOfWork):
         self.sandbox_lifecycle_log = DBSandboxLifecycleLogRepository(db_session=self.db_session)
         self.approval_grants = DBApprovalGrantRepository(db_session=self.db_session)
         self.compaction = DBConversationCompactionRepository(db_session=self.db_session)  # NEW [B6]
+        self.user_tool_approval_policy = DBUserToolApprovalPolicyRepository(  # NEW [PE-0]
+            db_session=self.db_session,
+        )
 
         return self
 

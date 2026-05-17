@@ -60,6 +60,19 @@ jobs:
           uv run python api/tools/lint/no_logging_basicconfig.py
           uv run python api/tools/lint/no_print_in_backend.py
 
+      - name: Run invariant gates (PE-0 Phase 11)
+        # AST + behavior gates for PE/SSM separation contracts,
+        # single-writer contract, and PE-dominance invariants.
+        # Runs before the full test suite so a contract violation short-circuits early.
+        env:
+          SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          REDIS_DB: 0
+          JWT_SECRET_KEY: ci-test-secret-key
+          ENV: test
+        run: uv run pytest api/tests/invariants/ -v
+
       - name: Run tests
         env:
           SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test

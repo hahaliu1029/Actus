@@ -121,6 +121,11 @@ CANONICAL_ATTRIBUTES: tuple[str, ...] = (
     "attempt_ix",
     "event_id",
     "decision_reason",
+    # PE-0 (2026-05-14): PermissionEngine decision-pipeline attrs
+    "decision_stage",        # policy_get | stage_p1_reader | stage_p2_smart | decision_final | session_mode_check
+    "tool_source",           # native | skill | mcp | a2a
+    "confirmation_id_hash",  # sha256(confirmation_id)[:16]
+    "session_mode",          # SessionStatus.value
 )
 
 
@@ -221,6 +226,11 @@ def build_canonical_attributes(
     llm_provider: str | None = None,
     model: str | None = None,
     decision_reason: str | None = None,
+    # PE-0 (2026-05-14): PermissionEngine decision-pipeline attrs
+    decision_stage: str | None = None,
+    tool_source: str | None = None,
+    confirmation_id_hash: str | None = None,
+    session_mode: str | None = None,
 ) -> dict[str, Any]:
     """Build a contract-conformant attribute dict for an emit site.
 
@@ -272,5 +282,10 @@ def build_canonical_attributes(
             "attempt_ix": attempt_ix,
             "event_id": str(uuid.uuid4()),
             "decision_reason": decision_reason,
+            # PE-0 (2026-05-14): PermissionEngine decision-pipeline attrs
+            "decision_stage": decision_stage,
+            "tool_source": tool_source,
+            "confirmation_id_hash": confirmation_id_hash,
+            "session_mode": session_mode,
         }
     )

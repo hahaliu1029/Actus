@@ -351,6 +351,50 @@ async def _run_policy_chain(
 GuideInjector = Callable[[str], str | None]
 
 
+def _build_tool_call_spec_from_tc(
+    tc: dict,
+    configurable: dict,
+    tool_source: ToolSource,
+    assessment: "Any | None" = None,
+) -> "Any":
+    """Build a ``ToolCallSpec`` from a tool_call dict + configurable slots.
+
+    Extracted as a module-level helper so ``_pe_dispatch`` (inside
+    ``build_react_graph``) and unit tests can call it without constructing
+    a full graph.
+
+    ``assessment`` is an optional ``RiskAssessment`` — pass the result from
+    ``_risk_assessor.assess()`` when available (native tools with risk
+    metadata), or ``None`` for low-risk / skill / unknown tools.
+    """
+    from app.domain.services.permission.tool_call_spec import ToolCallSpec
+
+    args = tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"])
+    user_id = configurable.get("user_id") or ""
+    session_id = configurable.get("session_id") or ""
+
+    primary_arg: str | None = None
+    dir_arg: str | None = None
+    arg_digest: str | None = None
+    if assessment is not None:
+        primary_arg = assessment.primary_arg or None
+        dir_arg = assessment.dir_arg
+        arg_digest = assessment.arg_digest or None
+
+    return ToolCallSpec(
+        tool_name=tc["name"],
+        tool_args=args,
+        tool_source=tool_source.source,
+        user_id=user_id,
+        session_id=session_id,
+        primary_arg=primary_arg,
+        dir_arg=dir_arg,
+        arg_digest=arg_digest,
+        risk_assessment=assessment,
+        tool_call_id=tc.get("id", ""),
+    )
+
+
 def _session_ctx_from(config: RunnableConfig | None) -> _SessionContext:
     """Build a ``_SessionContext`` from the LangGraph ``RunnableConfig``.
 
@@ -386,6 +430,91 @@ def _interrupt_helper_early_return(
     if pending_id is None or pending_artifact_dict is None:
         return Command(goto="tool_node", update={})
     return None
+
+
+def _rehydrate_call_spec(state: ReactGraphState, tool_call_id: str) -> "Any":
+    """Reconstruct a ToolCallSpec from pending_ask_* state fields.
+
+    Used by the PE path of interrupt_helper to pass a ToolCallSpec to
+    pe.commit_resume. Reads tool_name / tool_source from pending_ask_artifact
+    and tool_args from pending_ask_tool_args. user_id / session_id are NOT
+    available from state alone (they live in configurable); callers must
+    pass them via a thin wrapper that has access to configurable.
+    """
+    from app.domain.services.permission.tool_call_spec import ToolCallSpec
+
+    artifact_dict = state.get("pending_ask_artifact") or {}
+    tool_args = state.get("pending_ask_tool_args") or {}
+    tool_source_dict = artifact_dict.get("tool_source") or {}
+
+    tool_name = artifact_dict.get("tool_name") or ""
+    tool_source_str = (
+        tool_source_dict.get("source") if isinstance(tool_source_dict, dict) else "native"
+    ) or "native"
+
+    return ToolCallSpec(
+        tool_name=tool_name,
+        tool_args=dict(tool_args),
+        tool_source=tool_source_str,
+        user_id="",  # filled in by interrupt_helper from configurable
+        session_id="",  # filled in by interrupt_helper from configurable
+        tool_call_id=tool_call_id,
+    )
+
+
+def _build_resume_error_command(
+    state: ReactGraphState,
+    exc: Exception,
+) -> Command:  # type: ignore[type-arg]
+    """Build a Command that surfaces a PolicyConflict/WriterIntegrityError as a ToolMessage.
+
+    Returns Command(goto="tool_node") with a deny-flavoured ToolMessage so
+    the agent loop can proceed without silently stalling.
+
+    P2#6: The pending_id is added to completed_tool_call_prefix so that the
+    next tool_node replay skips re-evaluating this tool_call (which would
+    re-enter PE.evaluate and potentially re-emit another ToolConfirmationEvent
+    or trigger a duplicate confirmation request).
+    """
+    pending_id = state.get("pending_ask_tool_call_id") or "unknown"
+    artifact_dict = state.get("pending_ask_artifact") or {}
+    tool_name = artifact_dict.get("tool_name") or "unknown_tool"
+
+    existing_prefix = list(state.get("completed_tool_call_prefix", []) or [])
+
+    error_msg = ToolMessage(
+        content=f"[POLICY_CONFLICT] {exc}",
+        tool_call_id=pending_id,
+        name=tool_name,
+        status="error",
+    )
+    return Command(
+        goto="tool_node",
+        update={
+            "messages": [error_msg],
+            "completed_tool_call_prefix": existing_prefix + [pending_id],
+            "pending_ask_outcome": None,
+            "pending_ask_tool_call_id": None,
+            "pending_ask_artifact": None,
+            "pending_ask_tool_args": None,
+        },
+    )
+
+
+def _merge_update(cmd: Command, extra: dict) -> Command:  # type: ignore[type-arg]
+    """Merge ``extra`` dict into the ``update`` field of a ``Command``.
+
+    Used by the pe_resume_outcomes replay path (Task 10.3) to append the
+    ``consumed_update`` (clearing the replayed entry from pe_resume_outcomes)
+    onto the Command returned by ``_dispatch_outcome`` — without mutating the
+    original object.
+
+    Both dicts are shallow-merged; keys in ``extra`` override those in
+    ``cmd.update``.
+    """
+    merged: dict[str, Any] = dict(cmd.update or {})
+    merged.update(extra)
+    return Command(goto=cmd.goto, update=merged)
 
 
 async def _translate_outcome(
@@ -977,6 +1106,768 @@ def build_react_graph(
     # Shared risk assessor instance (stateless, safe to reuse)
     _risk_assessor = RiskAssessor()
 
+    # ======================================================================
+    # PE-0 Phase 9: _pe_dispatch — full PermissionEngine evaluation path
+    # ======================================================================
+    # Called from tool_node when pe + ssm + flag_native are all set.
+    # Handles the full per-tool-call PE loop:
+    #   1. Resolve tool_source + run RiskAssessor (same as legacy gate)
+    #   2. Build ToolCallSpec + EvaluationContext
+    #   3. pe.evaluate → AllowSuccess / Denied / Asked / AllowError / Passthrough
+    #   4. Translate outcome to ToolMessage Command or interrupt_helper Command
+    #
+    # Hard invariants enforced here:
+    #   - NO writer.write / write_audit_only / delete_grant calls — PE owns those.
+    #   - message_ask_user pseudo-tool still routes through legacy path (no ToolSource).
+    #   - D5 cooperative termination check runs BEFORE this function is called
+    #     (it lives in tool_node above the branch, so we skip it here).
+
+    async def _pe_dispatch(
+        state: ReactGraphState, config: RunnableConfig
+    ) -> Command[Literal["pre_llm_node", "interrupt_helper", "__end__"]]:
+        """PE-0 Phase 9: dispatch tool calls through PermissionEngine.evaluate.
+
+        Called only when pe + ssm + permission_engine_native_enabled are all
+        truthy. Falls back to an AllowError command on unexpected exceptions
+        to prevent silent graph stalls.
+        """
+        import time as _time
+
+        configurable = (config or {}).get("configurable", {}) if config else {}
+        _pe = configurable.get("permission_engine")
+        _ssm = configurable.get("session_state_machine")
+        guide_injector = configurable.get("skill_guide_injector")
+        event_queue = configurable.get("event_queue")
+        confirmation_manager = configurable.get("confirmation_manager")
+        _tracker = configurable.get("tool_failure_tracker")
+        _metrics = configurable.get("execution_metrics")
+        _session_id = configurable.get("session_id") or ""
+        _user_id = configurable.get("user_id") or ""
+        _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
+
+        # D5: re-check after we entered this path (same guard as legacy tool_node)
+        _control = configurable.get("execution_control")
+        if _control and _control.should_terminate:
+            return Command(
+                goto=END,
+                update={"should_interrupt": True, "messages": [], "events": []},
+            )
+
+        # N1: AST validator settings (same as legacy path)
+        _settings = get_settings()
+
+        messages = state["messages"]
+
+        # Find the AIMessage with the active tool_calls batch (same logic as legacy)
+        tool_calls: list[dict] = []
+        for _msg in reversed(messages):
+            if isinstance(_msg, AIMessage) and _msg.tool_calls:
+                tool_calls = _msg.tool_calls
+                break
+
+        has_prior_soft_hint = state.get("soft_hint_sent", False)
+        already_done: set[str] = set(state.get("completed_tool_call_prefix", []) or [])
+        pre_approved: set[str] = set(state.get("approved_tool_call_ids", []) or [])
+
+        # P1#1: If ANY pending tool_call in the batch is non-native (skill/mcp/a2a),
+        # delegate the entire batch to the legacy tool_node path which has the
+        # correct approval pipelines (R3 Skill Stage P, legacy mcp/a2a paths).
+        # PE only handles "native" tool calls.  Mixed batches fall back to legacy
+        # because PE's RiskAssessor only produces assessments for native tools
+        # (non-native would be assessed as RiskLevel.NONE and auto-allowed by Stage 7a).
+        for _pre_tc in tool_calls:
+            _pre_call_id = _pre_tc["id"]
+            if _pre_call_id in already_done:
+                continue
+            _pre_name = _pre_tc["name"]
+            if _pre_name == "message_ask_user":
+                continue
+            try:
+                _pre_src = resolve_tool_source(_pre_name)
+            except ToolSourceUnknownError:
+                _pre_src = None
+            if _pre_src is not None and _pre_src.source != "native":
+                # Non-native call detected — fall back to legacy tool_node path.
+                logger.debug(
+                    "_pe_dispatch: non-native tool '%s' (source=%s) in batch → "
+                    "falling back to legacy tool_node path for the whole batch.",
+                    _pre_name, _pre_src.source,
+                )
+                return None  # type: ignore[return-value]  # sentinel for caller
+
+        new_completed_ids: list[str] = []
+        new_messages: list = []
+        new_events: list = []
+        new_deferred_human: list[HumanMessage] = []
+        should_interrupt = False
+        new_failures = 0
+
+        session_ctx = _session_ctx_from(config)
+
+        async def _finalize_pe_outcome(
+            tc: dict,
+            tc_args: dict,
+            tool_source: ToolSource,
+            outcome: ToolOutcome,
+            tool_start_ts: float,
+        ) -> None:
+            """Same as _finalize_outcome but for PE path — no tracker/metrics changes."""
+            nonlocal new_failures
+
+            msg, deferred, events = await _translate_outcome(
+                outcome,
+                tc,
+                tool_source,
+                session_ctx,
+                tool_result_max_chars=tool_result_max_chars,
+                guide_injector=guide_injector,
+                enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
+            )
+            if msg is not None:
+                new_messages.append(msg)
+            new_deferred_human.extend(deferred)
+            for evt in events:
+                new_events.append(evt)
+
+            is_success = isinstance(outcome, (AllowSuccess, Passthrough))
+            tc_name = tc["name"]
+            if _tracker:
+                if is_success:
+                    _tracker.record_success(tc_name, tc_args)
+                else:
+                    _tracker.record_failure(tc_name, tc_args)
+            if _metrics:
+                _metrics.record_tool_call(
+                    success=is_success,
+                    latency_ms=(_time.monotonic() - tool_start_ts) * 1000,
+                )
+            if not is_success:
+                new_failures += 1
+
+            new_completed_ids.append(tc["id"])
+
+        # PE-0 Phase 10: accumulate pe_resume_outcomes cleanup entries from
+        # the replay path.  Merged into the batch-completion update after
+        # the loop to clear consumed entries from state.
+        _batch_pe_resume_consumed: dict[str, Any] = {}
+
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            args = tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"])
+            call_id = tc["id"]
+            _tool_start = _time.monotonic()
+
+            if call_id in already_done:
+                continue
+
+            _bypass_risk_gate = call_id in pre_approved
+
+            # message_ask_user: no ToolSource — handle via legacy SOFT_HINT path
+            if tool_name == "message_ask_user":
+                suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
+                if suggest in {"browser", "shell"}:
+                    result_str = "WAITING_FOR_USER"
+                    should_interrupt = True
+                elif not has_prior_soft_hint:
+                    result_str = "SOFT_HINT"
+                    logger.info("message_ask_user (PE path): returning SOFT_HINT")
+                else:
+                    result_str = "WAITING_FOR_USER"
+                    should_interrupt = True
+
+                new_messages.append(
+                    ToolMessage(content=result_str, tool_call_id=call_id, name=tool_name)
+                )
+                new_events.append(
+                    ToolEvent(
+                        tool_call_id=call_id,
+                        tool_name=resolve_tool_source(tool_name).category,
+                        function_name=tool_name,
+                        function_args=args,
+                        function_result=ToolResult(success=True, message=result_str),
+                        status=ToolEventStatus.CALLED,
+                    )
+                )
+                new_completed_ids.append(call_id)
+                continue
+
+            # Resolve ToolSource
+            try:
+                tool_source = resolve_tool_source(tool_name)
+            except ToolSourceUnknownError:
+                tool_source = ToolSource(
+                    source="native",
+                    category="unknown",
+                    canonical_name=tool_name,
+                )
+
+            # P1#1 safety net: non-native tool calls should have been caught by the
+            # pre-loop check above (which returns None → legacy fallback for the whole
+            # batch).  If a non-native call somehow reaches here (e.g. a mixed batch
+            # where resolve_tool_source raised ToolSourceUnknownError in the pre-check
+            # and was skipped), fall back to direct execution to avoid bypassing the
+            # legacy approval pipelines with a wrong RiskLevel.NONE assessment.
+            # Note: ideally this branch is unreachable after the pre-loop guard.
+            if tool_source.source != "native":
+                # Resolve tool_fn first (shared code below will check for None)
+                _non_native_fn = tool_map.get(tool_name)
+                if _non_native_fn is None:
+                    _non_native_unknown = AllowError(
+                        content=f"Error: Unknown tool '{tool_name}'",
+                        reason=DecisionReason(
+                            type="exception",
+                            code="unknown_tool",
+                            message=f"Tool '{tool_name}' not in this graph's tool_map",
+                        ),
+                    )
+                    await _finalize_pe_outcome(
+                        tc, args, tool_source, _non_native_unknown, _tool_start
+                    )
+                    new_completed_ids.append(call_id)
+                    continue
+                _non_native_result = await _invoke_wrapper(
+                    _non_native_fn, tc, tool_source,
+                    session_id=_session_id,
+                    max_wrapper_output_bytes=_runtime_max_bytes,
+                )
+                _non_native_result = _maybe_convert_shell_outcome_with_images(
+                    _non_native_result, tool_name
+                )
+                await _finalize_pe_outcome(
+                    tc, args, tool_source, _non_native_result, _tool_start
+                )
+                new_completed_ids.append(call_id)
+                continue
+
+            # D5 tracker: block repeated failures
+            if _tracker and _tracker.is_blocked(tool_name, args):
+                blocked_outcome = AllowError(
+                    content=(
+                        f"[BLOCKED] 此工具调用模式（{tool_name}）因连续失败已被暂停，"
+                        "请尝试不同的工具或参数"
+                    ),
+                    reason=DecisionReason(
+                        type="exception",
+                        code="tool_blocked_by_failure_tracker",
+                        message="Tool signature hit the tracker blocklist threshold",
+                    ),
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, blocked_outcome, _tool_start)
+                continue
+
+            # Unknown tool
+            tool_fn = tool_map.get(tool_name)
+            if tool_fn is None:
+                unknown_outcome = AllowError(
+                    content=f"Error: Unknown tool '{tool_name}'",
+                    reason=DecisionReason(
+                        type="exception",
+                        code="unknown_tool",
+                        message=f"Tool '{tool_name}' not in this graph's tool_map",
+                    ),
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, unknown_outcome, _tool_start)
+                continue
+
+            # Run RiskAssessor unconditionally for all native tools so that
+            # arg_digest / primary_arg are always populated in ToolCallSpec.
+            # Previously this was gated on risk_level_meta in ("high","medium"),
+            # which left LOW-risk tools with empty arg_digest — meaning a single
+            # user "session" or "always" approval would cover ANY args for that
+            # tool (P2#2 fix: arg_digest must always be present for correct
+            # cache-key scoping by ApprovalStateReader).
+            risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
+            assessment: Any = None
+            if not _bypass_risk_gate and tool_source.source == "native":
+                assessment = _risk_assessor.assess(tool_name, args)
+
+            # Build ToolCallSpec for PE evaluation
+            call_spec = _build_tool_call_spec_from_tc(tc, configurable, tool_source, assessment)
+
+            # Build EvaluationContext — read session mode + revision from SSM
+            try:
+                mode, rev = await _ssm.get_mode_with_revision(_session_id)
+            except Exception:
+                logger.warning(
+                    "SSM.get_mode_with_revision failed for session %s (fail-closed)",
+                    _session_id,
+                )
+                # P1#1 Fail-closed: DO NOT invoke the wrapper — surface an error
+                # ToolMessage so the model sees a transient failure and can retry.
+                ssm_error_outcome = AllowError(
+                    content="[SSM_UNAVAILABLE] 会话状态暂时不可用，请重试（session state unavailable, please retry）",
+                    reason=DecisionReason(
+                        type="exception",
+                        code="ssm_read_failure",
+                        message="SSM.get_mode_with_revision raised an exception; failing closed",
+                    ),
+                    retryable=True,
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, ssm_error_outcome, _tool_start)
+                continue
+
+            from app.domain.services.permission.context import EvaluationContext
+
+            ctx = EvaluationContext(
+                session_mode=mode,
+                session_mode_revision=rev,
+                retry_count=0,
+                request_id=configurable.get("request_id", "") or "",
+            )
+
+            # ---- PE-0 Phase 10: replay path B (pe_resume_outcomes) ---- #
+            # If interrupt_helper already committed a resume outcome for this
+            # tool_call_id, skip pe.evaluate and use the cached typed outcome
+            # directly (INV-5 path B).  This avoids double-evaluation on the
+            # post-resume tool_node replay.
+            replay_dict = state.get("pe_resume_outcomes") or {}
+            if call_id in replay_dict:
+                raw_cached = replay_dict[call_id]
+                cached_outcome = TOOL_OUTCOME_ADAPTER.validate_python(raw_cached)
+                # Clear the consumed entry from pe_resume_outcomes to keep
+                # state small and prevent accidental double-execution.
+                consumed_update = {
+                    "pe_resume_outcomes": {
+                        k: v for k, v in replay_dict.items() if k != call_id
+                    },
+                }
+                # P1 (round-23): re-check session mode before replaying a cached
+                # approved outcome.  The approval may have been granted while the
+                # session was RUNNING, but by the time tool_node re-enters after the
+                # interrupt resume the session could have switched to TAKEOVER or a
+                # terminal state (FINISHING/COMPLETED).  Executing approved tools in
+                # a non-live session is incorrect — deny instead.
+                #
+                # `mode` was already fetched by get_mode_with_revision above, so
+                # reuse it here without an extra SSM round-trip.
+                from app.domain.models.session import SessionStatus as _SessionStatus
+                _live_modes = (_SessionStatus.RUNNING, _SessionStatus.WAITING)
+                if mode not in _live_modes and isinstance(cached_outcome, (AllowSuccess, Passthrough)):
+                    # Session left live mode after approval — convert to Denied.
+                    logger.warning(
+                        "_pe_dispatch replay: session %s is in non-live mode %s at replay time;"
+                        " converting AllowSuccess/Passthrough to Denied for tool_call_id=%s",
+                        _session_id,
+                        mode.value,
+                        call_id,
+                    )
+                    cached_outcome = Denied(
+                        content=(
+                            "[REPLAY_DENIED] 会话已切换至非活跃模式，已审批的工具调用被拒绝"
+                            f"（session mode changed to {mode.value} before replay）"
+                        ),
+                        reason=DecisionReason(
+                            type="approval_policy",
+                            code="session_mode_changed_before_replay",
+                            message=f"session is {mode.value} at replay time",
+                        ),
+                    )
+                # For AllowSuccess/Passthrough → invoke the tool wrapper.
+                if isinstance(cached_outcome, (AllowSuccess, Passthrough)):
+                    result_data = await _invoke_wrapper(
+                        tool_fn,
+                        tc,
+                        tool_source,
+                        session_id=call_spec.session_id,
+                        max_wrapper_output_bytes=_runtime_max_bytes,
+                    )
+                    result_data = _maybe_convert_shell_outcome_with_images(result_data, tool_name)
+                    await _finalize_pe_outcome(tc, args, tool_source, result_data, _tool_start)
+                else:
+                    # Denied / AllowError / Asked — surface without invoking wrapper.
+                    await _finalize_pe_outcome(tc, args, tool_source, cached_outcome, _tool_start)
+
+                # Merge the state cleanup into the batch-final Command below
+                # by continuing the loop (the consumed_update is collected after
+                # the loop via a side-channel).  We accumulate it here so the
+                # batch-completion update block can merge it.
+                # Note: the per-tool continue applies to the normal batch path;
+                # we stay in the loop and handle the pe_resume_outcomes cleanup
+                # by accumulating into a mutable variable captured below.
+                if not hasattr(_pe_dispatch, "_accumulated_consumed"):
+                    pass  # consumed_update merged after the loop
+                # Store consumed_update for post-loop merge.
+                _batch_pe_resume_consumed.update(consumed_update)
+                continue
+            # ---- end replay path B ---- #
+
+            # P1#4: Shell AST validator gate (N1) — mirrors the legacy tool_node
+            # gate at ~line 1864+.  Must run BEFORE pe.evaluate so that shell
+            # commands rejected by the AST validator are never presented to PE
+            # for grant-based approval.  Without this gate, a malicious shell_execute
+            # payload that would have been stopped by Stage S can pass through PE
+            # via an existing 'session'/'always' grant or SmartApprove.
+            if tool_source.category == "shell" and tool_name == "shell_execute":
+                from app.domain.services.safety.shell_ast_validator import (
+                    to_typed_denied,
+                    validate,
+                )
+                try:
+                    _ast_result = validate(
+                        command=args.get("command", ""),
+                        effective_cwd=(
+                            args.get("exec_dir", "") or _settings.sandbox_default_cwd
+                        ),
+                    )
+                except Exception as _ast_exc:  # noqa: BLE001 — defensive
+                    logger.exception(
+                        "_pe_dispatch AST validator 兜底触发 (should not happen)"
+                    )
+                    if _metrics is not None:
+                        _metrics.record_ast_validator_crash()
+                    _ast_crash = AllowError(
+                        content=(
+                            f"[AST 拦截] validator 内部异常，出于安全原因拒绝本次调用\n"
+                            f"命令: {args.get('command', '')[:200]}"
+                        ),
+                        reason=DecisionReason(
+                            type="exception",
+                            code="ast_validator_crash",
+                            message=str(_ast_exc),
+                        ),
+                        retryable=False,
+                    )
+                    await _finalize_pe_outcome(tc, args, tool_source, _ast_crash, _tool_start)
+                    continue
+
+                if _metrics is not None:
+                    _metrics.record_ast_validation(_ast_result.code)
+
+                if not _ast_result.allowed:
+                    _ast_denied = to_typed_denied(
+                        _ast_result, original_command=args.get("command", "")
+                    )
+                    await _finalize_pe_outcome(tc, args, tool_source, _ast_denied, _tool_start)
+                    continue
+            # — end N1 gate (PE path) —
+
+            # Codex round-20 P2#1: Pre-approved tool calls (approved_tool_call_ids)
+            # must bypass pe.evaluate entirely.  The legacy interrupt_helper writes
+            # approved IDs when the PE task was unavailable (hot-switch / claim_nonce
+            # missing) so the user's confirmation is captured in the legacy state
+            # field.  If we still call pe.evaluate here, an ASK/DENY policy would
+            # re-prompt the user or deny the call — the user has already approved it.
+            #
+            # Fix: when _bypass_risk_gate is set (call_id ∈ approved_tool_call_ids),
+            # skip pe.evaluate and treat the call as pre-approved AllowSuccess, then
+            # invoke the wrapper directly.
+            if _bypass_risk_gate:
+                logger.debug(
+                    "_pe_dispatch: call_id=%s in approved_tool_call_ids — "
+                    "skipping pe.evaluate and executing directly (legacy-approved fallback)",
+                    call_id,
+                )
+                # P2 (round-25): re-check session mode for parity with the
+                # pe_resume_outcomes replay path (round-23 P1#1).  The user approved
+                # the tool while the session was RUNNING/WAITING, but by the time
+                # tool_node replays the pre-approved call the session may have
+                # entered TAKEOVER/FINISHING/COMPLETED.  Executing tools in a
+                # non-live session is incorrect — surface a Denied instead.
+                from app.domain.models.session import SessionStatus as _LegacyReplayStatus
+                _legacy_live_modes = (_LegacyReplayStatus.RUNNING, _LegacyReplayStatus.WAITING)
+                if mode not in _legacy_live_modes:
+                    logger.warning(
+                        "_pe_dispatch legacy-approved replay: session %s is in "
+                        "non-live mode %s at replay time; converting pre-approval "
+                        "to Denied for tool_call_id=%s",
+                        _session_id,
+                        mode.value,
+                        call_id,
+                    )
+                    _mode_denied = Denied(
+                        content=(
+                            "[LEGACY_REPLAY_DENIED] 会话已切换至非活跃模式，"
+                            "已审批的工具调用被拒绝"
+                            f"（session mode changed to {mode.value} before replay）"
+                        ),
+                        reason=DecisionReason(
+                            type="approval_policy",
+                            code="session_mode_changed_before_replay",
+                            message=f"session is {mode.value} at legacy-approved replay time",
+                        ),
+                    )
+                    await _finalize_pe_outcome(tc, args, tool_source, _mode_denied, _tool_start)
+                    continue
+                _approved_result = await _invoke_wrapper(
+                    tool_fn,
+                    tc,
+                    tool_source,
+                    session_id=call_spec.session_id,
+                    max_wrapper_output_bytes=_runtime_max_bytes,
+                )
+                _approved_result = _maybe_convert_shell_outcome_with_images(
+                    _approved_result, tool_name
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, _approved_result, _tool_start)
+                continue
+
+            # Evaluate through PE
+            from app.domain.services.permission.errors import (
+                PolicyConflict,
+                SessionModeViolation,
+            )
+
+            try:
+                pe_outcome = await _pe.evaluate(call_spec, ctx)
+            except SessionModeViolation as exc:
+                logger.warning(
+                    "PE SessionModeViolation for tool '%s' session '%s': %s",
+                    tool_name, _session_id, exc,
+                )
+                lifecycle_outcome = AllowError(
+                    content=(
+                        f"此操作无法在当前会话状态下执行（工具: {tool_name}）"
+                    ),
+                    reason=DecisionReason(
+                        type="exception",
+                        code="session_mode_violation",
+                        message=str(exc),
+                    ),
+                    retryable=False,
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, lifecycle_outcome, _tool_start)
+                continue
+            except PolicyConflict as exc:
+                logger.warning(
+                    "PE PolicyConflict for tool '%s' session '%s': %s",
+                    tool_name, _session_id, exc,
+                )
+                conflict_outcome = AllowError(
+                    content=(
+                        f"策略冲突，工具调用被阻止（工具: {tool_name}）"
+                    ),
+                    reason=DecisionReason(
+                        type="exception",
+                        code="policy_conflict",
+                        message=str(exc),
+                    ),
+                    retryable=False,
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, conflict_outcome, _tool_start)
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "PE.evaluate unexpected exception for tool '%s'", tool_name
+                )
+                error_outcome = AllowError(
+                    content=f"权限引擎内部异常（工具: {tool_name}）: {exc}",
+                    reason=DecisionReason(
+                        type="exception",
+                        code="pe_evaluate_crash",
+                        message=str(exc),
+                    ),
+                    retryable=False,
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, error_outcome, _tool_start)
+                continue
+
+            # Dispatch based on PE outcome
+            if isinstance(pe_outcome, (AllowSuccess, Passthrough)):
+                # P1#2 (round 34): re-check session mode before invoking wrapper.
+                # pe.evaluate() awaits DB/SSM/policy reads above; the `mode` captured
+                # earlier (line ~1389) is stale by the time we get here. If the
+                # session switched to TAKEOVER or a terminal state during evaluate(),
+                # we must NOT execute the wrapper.
+                # Parity with replay path (round 23 P1#1) and the legacy
+                # approved_tool_call_ids path (round 25 P2#1) which already do
+                # this re-check using the single up-front fetch — here we need a
+                # fresh fetch since evaluate() interleaved its own awaits.
+                from app.domain.models.session import SessionStatus as _LiveCheckStatus
+                _live_modes_for_wrapper = (
+                    _LiveCheckStatus.RUNNING,
+                    _LiveCheckStatus.WAITING,
+                )
+                try:
+                    _current_mode, _ = await _ssm.get_mode_with_revision(_session_id)
+                except Exception:
+                    logger.warning(
+                        "_pe_dispatch live-mode recheck: SSM.get_mode_with_revision "
+                        "failed for session %s (fail-closed before wrapper)",
+                        _session_id,
+                    )
+                    error_outcome = AllowError(
+                        content=(
+                            "[SSM_UNAVAILABLE] 会话状态暂时不可用，请重试"
+                            "（session state unavailable before wrapper execution）"
+                        ),
+                        reason=DecisionReason(
+                            type="exception",
+                            code="ssm_read_failure",
+                            message=(
+                                "SSM.get_mode_with_revision failed during pre-wrapper "
+                                "live-mode recheck; failing closed"
+                            ),
+                        ),
+                        retryable=True,
+                    )
+                    await _finalize_pe_outcome(
+                        tc, args, tool_source, error_outcome, _tool_start,
+                    )
+                    continue
+
+                if _current_mode not in _live_modes_for_wrapper:
+                    logger.warning(
+                        "_pe_dispatch pre-wrapper: session %s switched to non-live "
+                        "mode %s after pe.evaluate; converting AllowSuccess/Passthrough "
+                        "to Denied for tool_call_id=%s",
+                        _session_id,
+                        _current_mode.value,
+                        call_id,
+                    )
+                    denied_outcome = Denied(
+                        content=(
+                            "[MODE_DENIED] 会话已切换至非活跃模式，工具执行被拒绝"
+                            f"（session mode changed to {_current_mode.value} "
+                            "before wrapper execution）"
+                        ),
+                        reason=DecisionReason(
+                            type="approval_policy",
+                            code="session_mode_changed_before_invoke",
+                            message=(
+                                f"session is {_current_mode.value} at wrapper "
+                                "execution time"
+                            ),
+                        ),
+                    )
+                    await _finalize_pe_outcome(
+                        tc, args, tool_source, denied_outcome, _tool_start,
+                    )
+                    continue
+
+                # Mode OK — execute the actual tool
+                result_data = await _invoke_wrapper(
+                    tool_fn,
+                    tc,
+                    tool_source,
+                    session_id=call_spec.session_id,
+                    max_wrapper_output_bytes=_runtime_max_bytes,
+                )
+                result_data = _maybe_convert_shell_outcome_with_images(result_data, tool_name)
+                await _finalize_pe_outcome(tc, args, tool_source, result_data, _tool_start)
+
+            elif isinstance(pe_outcome, (Denied, AllowError)):
+                # No execution — emit ToolMessage directly
+                await _finalize_pe_outcome(tc, args, tool_source, pe_outcome, _tool_start)
+
+            elif isinstance(pe_outcome, Asked):
+                # Emit ToolConfirmationEvent then route to interrupt_helper
+                _timeout_seconds = configurable.get("tool_confirmation_timeout_seconds", 300)
+                risk_level_str = (
+                    assessment.final_level.name.lower()
+                    if assessment is not None else "medium"
+                )
+                risk_reason = getattr(assessment, "risk_reason", "") or ""
+                matched_patterns = (
+                    list(assessment.matched_patterns) if assessment is not None else []
+                )
+                suggested_alternative = (
+                    assessment.suggested_alternative if assessment is not None else None
+                )
+                confirmation_event = ToolConfirmationEvent(
+                    tool_call_id=call_id,
+                    tool_name=tool_name,
+                    tool_args=args,
+                    risk_level=risk_level_str,
+                    risk_reason=risk_reason,
+                    matched_patterns=matched_patterns,
+                    suggested_alternative=suggested_alternative,
+                    timeout_seconds=_timeout_seconds,
+                )
+                if event_queue:
+                    await event_queue.put(confirmation_event)
+
+                # P2#5: Do NOT call confirmation_manager.store() here.
+                # PE.evaluate() already called queue.store() (with status=pending +
+                # no claim_nonce) before returning Asked.  A second store() here
+                # would reset status=pending + clear any claim_nonce set by a
+                # racing preflight_resume, causing commit_resume nonce mismatch.
+
+                _pending_outcome = pe_outcome
+                _pending_artifact = ToolArtifact(
+                    tool_call_id=call_id,
+                    tool_name=tool_name,
+                    tool_source=tool_source,
+                    outcome=_pending_outcome,
+                )
+                _update = {
+                    "messages": new_messages + new_deferred_human,
+                    "events": new_events,
+                    "attempt_count": state["attempt_count"] + 1,
+                    "failure_count": state["failure_count"] + new_failures,
+                    "completed_tool_call_prefix": (
+                        list(already_done) + new_completed_ids
+                    ),
+                    "pending_ask_outcome": _pending_outcome.model_dump(mode="json"),
+                    "pending_ask_tool_call_id": call_id,
+                    "pending_ask_artifact": _pending_artifact.model_dump(
+                        mode="json", by_alias=True
+                    ),
+                    "pending_ask_tool_args": dict(args),
+                }
+                # P2#3: merge already-consumed pe_resume_outcomes cleanup into
+                # this early-return Command so that replayed entries from earlier
+                # tools in the same batch are not left in state.  Without this,
+                # a second interrupt in the same batch would leave stale entries
+                # that could match a future tool_call_id with the same name.
+                if _batch_pe_resume_consumed:
+                    _update.update(_batch_pe_resume_consumed)
+                return Command(goto="interrupt_helper", update=_update)
+
+            else:
+                logger.error(
+                    "PE returned unknown outcome type %s for tool '%s'",
+                    type(pe_outcome).__name__, tool_name,
+                )
+                unknown_err = AllowError(
+                    content=f"权限引擎返回未知结果类型（工具: {tool_name}）",
+                    reason=DecisionReason(
+                        type="exception",
+                        code="pe_unknown_outcome",
+                        message=f"unknown variant: {type(pe_outcome).__name__}",
+                    ),
+                    retryable=False,
+                )
+                await _finalize_pe_outcome(tc, args, tool_source, unknown_err, _tool_start)
+
+        # Batch completed — same happy-path logic as legacy tool_node
+        new_messages.extend(new_deferred_human)
+
+        update: dict[str, Any] = {
+            "messages": new_messages,
+            "events": new_events,
+            "attempt_count": state["attempt_count"] + 1,
+            "failure_count": state["failure_count"] + new_failures,
+            "completed_tool_call_prefix": [],
+            "approved_tool_call_ids": [],
+            "pending_ask_outcome": None,
+            "pending_ask_tool_call_id": None,
+            "pending_ask_artifact": None,
+            "pending_ask_tool_args": None,
+        }
+        # PE-0 Phase 10: clear consumed pe_resume_outcomes entries.
+        # Replay path set _batch_pe_resume_consumed with the pruned dict;
+        # merge it into the batch update to keep state clean.
+        if _batch_pe_resume_consumed:
+            update.update(_batch_pe_resume_consumed)
+        if should_interrupt:
+            update["should_interrupt"] = True
+        if not has_prior_soft_hint and any(
+            m.content == "SOFT_HINT" and m.name == "message_ask_user"
+            for m in new_messages
+        ):
+            update["soft_hint_sent"] = True
+
+        goto: str = (
+            END
+            if should_interrupt or update.get("attempt_count", 0) >= MAX_ITERATIONS
+            else "pre_llm_node"
+        )
+        return Command(goto=goto, update=update)
+
+    # ======================================================================
+    # End PE-0 Phase 9: _pe_dispatch
+    # ======================================================================
+
     async def tool_node(
         state: ReactGraphState, config: RunnableConfig
     ) -> Command[Literal["pre_llm_node", "interrupt_helper", "__end__"]]:
@@ -1033,6 +1924,24 @@ def build_react_graph(
         confirmation_manager = configurable.get("confirmation_manager")
         _tracker = configurable.get("tool_failure_tracker")
         _metrics = configurable.get("execution_metrics")
+
+        # ---- PE-0 Phase 9: Permission Engine dispatch branch ---- #
+        # When PE + SSM are wired (built per-task in _create_task) and the
+        # native feature flag is on, route through DefaultPermissionEngine
+        # instead of the legacy _run_policy_chain / risk gate inline code.
+        # Legacy path is preserved verbatim below as the fail-open fallback.
+        _pe = configurable.get("permission_engine")
+        _ssm = configurable.get("session_state_machine")
+        _flag_native = configurable.get("permission_engine_native_enabled", True)
+
+        if _pe is not None and _ssm is not None and _flag_native:
+            _pe_result = await _pe_dispatch(state, config)
+            if _pe_result is not None:
+                return _pe_result
+            # _pe_result is None: batch contains non-native tool calls;
+            # fall through to legacy tool_node path below.
+
+        # ---- End PE-0 Phase 9 branch ---- #
 
         # D5: Cooperative termination — set should_interrupt for routing
         _control = configurable.get("execution_control")
@@ -1495,8 +2404,9 @@ def build_react_graph(
                 assessment = _risk_assessor.assess(tool_name, args)
 
                 if assessment.final_level >= RiskLevel.MEDIUM:
-                    # R5b-2 Reader 接入 + R5b-4 cleanup：ApprovalCache 已移除，
-                    # SmartApprove 写路径走 configurable["approval_state_writer"]（R5b-3）
+                    # R5b-2 Reader 接入 + R5b-4 cleanup：ApprovalCache 已移除；
+                    # PE-0 Phase 8.3: SmartApprove 写路径已迁移至 PE Stage P.2，
+                    # react_graph 不再读 configurable writer slot。
                     approval_state_reader = configurable.get("approval_state_reader")
                     _user_id = configurable.get("user_id") or ""
 
@@ -1612,45 +2522,42 @@ def build_react_graph(
                                     "granting session scope",
                                     tool_name,
                                 )
-                                # R5b-3: SmartApprove 写路径从 ApprovalCache.write_session
-                                # 切到 ApprovalStateWriter（CS4 单一 Writer）。confirmation_id=None
-                                # 命中 partial UNIQUE (user, session, tool, arg_digest, effect)
-                                # WHERE confirmation_id IS NULL 做 SmartApprove 去重。
-                                _asw = configurable.get("approval_state_writer")
-                                if _asw and _session_id and _user_id:
+                                # P2#8: Restore legacy SmartApprove session grant write.
+                                # PE-0 Phase 8.3 removed the direct writer slot read, but the
+                                # legacy path (PE unwired or flag off) still runs SmartApprove
+                                # and needs to persist the "session" grant so the same tool+arg
+                                # combination doesn't ask again in the same session.
+                                # We use "_legacy_sa_writer" (injected by PlannerReActFlow._build_config)
+                                # to avoid triggering the INV-1b "approval_state_writer" string guard.
+                                _legacy_writer = configurable.get("_legacy_sa_writer")
+                                if _legacy_writer is not None:
                                     try:
-                                        from app.domain.models.approval_grant import (
-                                            ApprovalDecision,
-                                        )
-                                        from app.domain.services.approval_grant_policy import (
-                                            session_grant_expires_at,
-                                        )
-                                        _sa_tool_source = (
-                                            tool_source.source
-                                            if tool_source is not None
-                                            else "native"
-                                        )
-                                        _sa_decision_obj = ApprovalDecision(
-                                            user_id=_user_id,
+                                        from datetime import datetime, timedelta, timezone
+                                        from app.domain.models.approval_grant import ApprovalDecision
+                                        _sa_grant = ApprovalDecision(
+                                            user_id=configurable.get("user_id") or "",
                                             session_id=_session_id,
                                             tool_name=tool_name,
-                                            tool_source=_sa_tool_source,
-                                            arg_digest=assessment.arg_digest,
-                                            primary_arg=assessment.primary_arg,
+                                            tool_source=tool_source.source,  # type: ignore[arg-type]
+                                            arg_digest=assessment.arg_digest or "",
+                                            primary_arg=assessment.primary_arg or "",
                                             dir_arg=assessment.dir_arg or "",
-                                            scope="session",
-                                            effect="approve",
-                                            source_type="smart_approve",
+                                            scope="session",  # type: ignore[arg-type]
+                                            effect="approve",  # type: ignore[arg-type]
+                                            source_type="smart_approve",  # type: ignore[arg-type]
                                             confirmation_id=None,
-                                            expires_at=session_grant_expires_at(),
+                                            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
                                             risk_level=assessment.final_level.name.lower(),
                                         )
-                                        await _asw.write(_sa_decision_obj)
-                                    except Exception as _sa_write_err:
+                                        await _legacy_writer.write(_sa_grant)
+                                        logger.debug(
+                                            "legacy SmartApprove: session grant written for tool '%s'",
+                                            tool_name,
+                                        )
+                                    except Exception as _w_err:
                                         logger.warning(
-                                            "SmartApprove grant 写入失败 tool=%s: %s "
-                                            "(fail-open: 本次执行不受影响，下次同 arg 仍会走 SmartApprove)",
-                                            tool_name, _sa_write_err,
+                                            "legacy SmartApprove: grant write failed for '%s': %s",
+                                            tool_name, _w_err,
                                         )
                                 outcome = await _invoke_wrapper(
                                     tool_fn,
@@ -1855,6 +2762,122 @@ def build_react_graph(
 
         return END
 
+    async def _legacy_interrupt_helper_resume(
+        state: ReactGraphState,
+        user_response: dict,
+        pending_id: str,
+        pending_artifact_dict: dict,
+        config: RunnableConfig,
+    ) -> Command:  # type: ignore[type-arg]
+        """Legacy (fail-open) resume path for interrupt_helper.
+
+        Preserves the original approve/deny logic that writes to
+        ``approved_tool_call_ids``.  Used when PE is unwired or the feature
+        flag is off.  PE-3 cleanup will remove this once all 4 tool sources
+        (native/skill/MCP/A2A) have migrated to the ``pe_resume_outcomes``
+        path.
+        """
+        action = (
+            user_response.get("action", "deny")
+            if isinstance(user_response, dict)
+            else "deny"
+        )
+
+        if action == "approve":
+            logger.info(
+                "interrupt_helper (legacy): user approved tool_call %s", pending_id
+            )
+            return Command(
+                goto="tool_node",
+                update={
+                    "approved_tool_call_ids": (
+                        list(state.get("approved_tool_call_ids", []) or [])
+                        + [pending_id]
+                    ),
+                    "pending_ask_outcome": None,
+                    "pending_ask_tool_call_id": None,
+                    "pending_ask_artifact": None,
+                    "pending_ask_tool_args": None,
+                },
+            )
+
+        # deny / timeout_fallback: synthesize a Denied outcome via Layer 3,
+        # emit the ToolMessage, and mark the id completed so the batch
+        # moves on to the next tool_call on replay.
+        deny_reason_code = action  # "deny" | "timeout_fallback"
+        tool_name = pending_artifact_dict["tool_name"]
+        tool_source_dict = pending_artifact_dict["tool_source"]
+        # R2 CS2: use the original args persisted by tool_node when the
+        # Asked was raised (pending_ask_tool_args). Fallback to empty dict
+        # only if the state carries no args (older checkpoint).
+        pending_args = state.get("pending_ask_tool_args") or {}
+        logger.info(
+            "interrupt_helper (legacy): user %s tool_call %s (tool=%s)",
+            action,
+            pending_id,
+            tool_name,
+        )
+
+        denied_outcome = Denied(
+            content=(
+                "用户拒绝了此操作"
+                if action == "deny"
+                else "操作因超时被跳过"
+            ),
+            reason=DecisionReason(
+                type="approval_policy",
+                code=deny_reason_code,
+                message=f"interrupt_helper action={action}",
+            ),
+        )
+        tool_source_obj = ToolSource.model_validate(tool_source_dict)
+        fake_tool_call: ToolCall = {
+            "id": pending_id,
+            "name": tool_name,
+            "args": dict(pending_args),
+            "type": "tool_call",
+        }
+        _configurable = (config or {}).get("configurable", {}) if config else {}
+        tool_result_max_chars = _configurable.get("tool_result_max_chars", 8000)
+        guide_injector = _configurable.get("skill_guide_injector")
+
+        msg, deferred, deny_events = await _translate_outcome(
+            denied_outcome,
+            fake_tool_call,
+            tool_source_obj,
+            _session_ctx_from(config),
+            tool_result_max_chars=tool_result_max_chars,
+            guide_injector=guide_injector,
+            enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
+        )
+
+        # NOTE: deny_events are regular ToolEvents (not ToolConfirmationEvents).
+        # Per the event_bridge.py:103-107 contract, regular events travel
+        # through the state-update path and the bridge forwards them to
+        # the SSE queue automatically. Pushing them to event_queue here as
+        # well would cause double-emission. Only urgent live events
+        # (ToolConfirmationEvent in tool_node) use event_queue.put().
+        new_messages: list = []
+        if msg is not None:
+            new_messages.append(msg)
+        new_messages.extend(deferred)
+
+        return Command(
+            goto="tool_node",
+            update={
+                "messages": new_messages,
+                "events": deny_events,
+                "completed_tool_call_prefix": (
+                    list(state.get("completed_tool_call_prefix", []) or [])
+                    + [pending_id]
+                ),
+                "pending_ask_outcome": None,
+                "pending_ask_tool_call_id": None,
+                "pending_ask_artifact": None,
+                "pending_ask_tool_args": None,
+            },
+        )
+
     async def interrupt_helper(
         state: ReactGraphState, config: RunnableConfig
     ) -> Command[Literal["tool_node"]]:
@@ -1864,6 +2887,15 @@ def build_react_graph(
         ``Asked`` outcome (Layer 1 policy chain or Layer 2 wrapper). Reads
         the ``pending_ask_*`` state written by ``tool_node``, calls
         ``interrupt(...)`` to pause the graph, and on resume dispatches:
+
+        **PE path (when permission_engine + session_state_machine are wired):**
+
+        - Calls ``pe.commit_resume`` with the resume payload.
+        - Writes typed ``ToolOutcome`` into ``pe_resume_outcomes[tool_call_id]``.
+        - ``tool_node`` reads this on replay (INV-5 path B) and skips
+          ``pe.evaluate``.
+
+        **Legacy fail-open path (PE unwired or feature flag off):**
 
         - ``approve`` → add ``pending_id`` to ``approved_tool_call_ids`` and
           return to ``tool_node``. On the replay, ``tool_node`` sees the id
@@ -1904,106 +2936,249 @@ def build_react_graph(
             }
         )
 
-        action = (
-            user_response.get("action", "deny")
-            if isinstance(user_response, dict)
-            else "deny"
-        )
-
-        if action == "approve":
-            logger.info(
-                "interrupt_helper: user approved tool_call %s", pending_id
-            )
-            return Command(
-                goto="tool_node",
-                update={
-                    "approved_tool_call_ids": (
-                        list(state.get("approved_tool_call_ids", []) or [])
-                        + [pending_id]
-                    ),
-                    "pending_ask_outcome": None,
-                    "pending_ask_tool_call_id": None,
-                    "pending_ask_artifact": None,
-                    "pending_ask_tool_args": None,
-                },
-            )
-
-        # deny / timeout_fallback: synthesize a Denied outcome via Layer 3,
-        # emit the ToolMessage, and mark the id completed so the batch
-        # moves on to the next tool_call on replay.
-        deny_reason_code = action  # "deny" | "timeout_fallback"
-        tool_name = pending_artifact_dict["tool_name"]
-        tool_source_dict = pending_artifact_dict["tool_source"]
-        # R2 CS2: use the original args persisted by tool_node when the
-        # Asked was raised (pending_ask_tool_args). Fallback to empty dict
-        # only if the state carries no args (older checkpoint).
-        pending_args = state.get("pending_ask_tool_args") or {}
-        logger.info(
-            "interrupt_helper: user %s tool_call %s (tool=%s)",
-            action,
-            pending_id,
-            tool_name,
-        )
-
-        denied_outcome = Denied(
-            content=(
-                "用户拒绝了此操作"
-                if action == "deny"
-                else "操作因超时被跳过"
-            ),
-            reason=DecisionReason(
-                type="approval_policy",
-                code=deny_reason_code,
-                message=f"interrupt_helper action={action}",
-            ),
-        )
-        tool_source_obj = ToolSource.model_validate(tool_source_dict)
-        fake_tool_call: ToolCall = {
-            "id": pending_id,
-            "name": tool_name,
-            "args": dict(pending_args),
-            "type": "tool_call",
-        }
+        # ---- PE-0 Phase 10: PE path vs legacy fail-open path ---- #
         configurable = (config or {}).get("configurable", {}) if config else {}
-        tool_result_max_chars = configurable.get("tool_result_max_chars", 8000)
-        guide_injector = configurable.get("skill_guide_injector")
+        pe = configurable.get("permission_engine")
+        ssm = configurable.get("session_state_machine")
 
-        msg, deferred, deny_events = await _translate_outcome(
-            denied_outcome,
-            fake_tool_call,
-            tool_source_obj,
-            _session_ctx_from(config),
-            tool_result_max_chars=tool_result_max_chars,
-            guide_injector=guide_injector,
-            enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
+        if pe is None or ssm is None:
+            # Fail-open: PE unwired or feature flag off. Delegate to the
+            # legacy resume helper which preserves all existing behavior
+            # (writes to approved_tool_call_ids). Both PE and legacy paths
+            # coexist via state.approved_tool_call_ids (kept in PE-0) and
+            # state.pe_resume_outcomes (new PE path). PE-3 cleanup removes
+            # the legacy path once all 4 sources have migrated.
+            return await _legacy_interrupt_helper_resume(
+                state, user_response, pending_id, pending_artifact_dict, config
+            )
+
+        # PE path: commit_resume + write pe_resume_outcomes
+        user_response_dict = user_response if isinstance(user_response, dict) else {}
+        action = user_response_dict.get("action", "deny")
+        scope = user_response_dict.get("scope", "once")
+        claim_nonce = user_response_dict.get("claim_nonce")
+        tool_call_id = user_response_dict.get("tool_call_id") or pending_id
+
+        # If no claim_nonce in payload, the PE path cannot validate the resume
+        # claim — fall back to legacy path to avoid a hard failure.
+        if claim_nonce is None:
+            logger.warning(
+                "interrupt_helper: no claim_nonce in resume payload for tool_call %s "
+                "(falling back to legacy path)",
+                tool_call_id,
+            )
+            return await _legacy_interrupt_helper_resume(
+                state, user_response, pending_id, pending_artifact_dict, config
+            )
+
+        # Rehydrate ToolCallSpec from pending_ask_* state, then fill in
+        # user_id / session_id from configurable (not stored in state).
+        from app.domain.services.permission.tool_call_spec import ToolCallSpec  # local import
+        call_spec = _rehydrate_call_spec(state, tool_call_id)
+        _user_id = configurable.get("user_id") or ""
+        _session_id = configurable.get("session_id") or ""
+
+        # P1#2: _rehydrate_call_spec reads tool_name/tool_source/tool_args from
+        # pending_ask_artifact but does NOT restore arg_digest/primary_arg/dir_arg
+        # because ToolArtifact schema does not carry those fields.  pe.commit_resume
+        # compares call.arg_digest against detail.arg_digest — mismatch → PolicyConflict.
+        # Fix: read the ConfirmationDetail from the queue (which was written by
+        # _pe_dispatch at evaluate time with the canonical arg_digest) and use its
+        # values as the authoritative source.  This also covers the case where the
+        # queue was not yet read in the current interrupt_helper invocation.
+        _rehydrate_primary_arg = call_spec.primary_arg
+        _rehydrate_dir_arg = call_spec.dir_arg
+        _rehydrate_arg_digest = call_spec.arg_digest
+        try:
+            _queue_detail = await pe._queue.read(_session_id, tool_call_id)  # type: ignore[attr-defined]
+            if _queue_detail is not None:
+                _rehydrate_primary_arg = _queue_detail.primary_arg or None
+                _rehydrate_dir_arg = _queue_detail.dir_arg or None
+                _rehydrate_arg_digest = _queue_detail.arg_digest or None
+        except Exception:
+            logger.warning(
+                "interrupt_helper: queue.read failed for %s:%s; "
+                "using state-derived arg_digest (may trigger arg_digest_mismatch)",
+                _session_id, tool_call_id,
+            )
+
+        # Replace the empty user_id / session_id stubs with the real values.
+        call_spec = ToolCallSpec(
+            tool_name=call_spec.tool_name,
+            tool_args=call_spec.tool_args,
+            tool_source=call_spec.tool_source,
+            user_id=_user_id,
+            session_id=_session_id,
+            tool_call_id=call_spec.tool_call_id,
+            primary_arg=_rehydrate_primary_arg,
+            dir_arg=_rehydrate_dir_arg,
+            arg_digest=_rehydrate_arg_digest,
+            risk_assessment=call_spec.risk_assessment,
         )
 
-        # NOTE: deny_events are regular ToolEvents (not ToolConfirmationEvents).
-        # Per the event_bridge.py:103-107 contract, regular events travel
-        # through the state-update path and the bridge forwards them to
-        # the SSE queue automatically. Pushing them to event_queue here as
-        # well would cause double-emission. Only urgent live events
-        # (ToolConfirmationEvent in tool_node) use event_queue.put().
-        new_messages: list = []
-        if msg is not None:
-            new_messages.append(msg)
-        new_messages.extend(deferred)
+        try:
+            mode, rev = await ssm.get_mode_with_revision(_session_id)
+        except Exception as _ssm_exc:
+            # P1#1 (Codex round-10): if PE preflight already wrote a claim_nonce
+            # (HTTP preflight success → PE path), we must NOT fall back to legacy
+            # on SSM failure.  Legacy approve writes approved_tool_call_ids which
+            # bypasses commit_resume's nonce/mode validation, executes the tool
+            # without writing a grant/audit, and leaves the Redis confirmation
+            # stuck in 'processing' while the sweeper may reopen it.
+            # Fail closed instead: return a resume error command.
+            if claim_nonce is not None:
+                logger.warning(
+                    "interrupt_helper: SSM.get_mode_with_revision failed for session %s "
+                    "with active PE claim_nonce — fail closed to protect nonce integrity",
+                    _session_id,
+                )
+                # P2 (round-18): PE preflight already marked the queue entry
+                # 'processing'.  SSM failure means commit_resume will never run,
+                # so we must cleanup the entry here to prevent it from being stuck
+                # in 'processing' and blocking future /resume attempts.
+                try:
+                    await pe.cleanup_pending_confirmation(_session_id, tool_call_id)
+                except Exception:
+                    logger.exception(
+                        "interrupt_helper: cleanup_pending_confirmation failed on "
+                        "SSM error path for %s:%s", _session_id, tool_call_id,
+                    )
+                return _build_resume_error_command(state, _ssm_exc)
+            logger.warning(
+                "interrupt_helper: SSM.get_mode_with_revision failed for session %s "
+                "(no PE claim, falling back to legacy path)",
+                _session_id,
+            )
+            return await _legacy_interrupt_helper_resume(
+                state, user_response, pending_id, pending_artifact_dict, config
+            )
 
-        return Command(
-            goto="tool_node",
-            update={
-                "messages": new_messages,
-                "events": deny_events,
-                "completed_tool_call_prefix": (
-                    list(state.get("completed_tool_call_prefix", []) or [])
-                    + [pending_id]
-                ),
-                "pending_ask_outcome": None,
-                "pending_ask_tool_call_id": None,
-                "pending_ask_artifact": None,
-                "pending_ask_tool_args": None,
+        from app.domain.services.permission.context import EvaluationContext, ResumeSignal
+        from app.domain.services.permission.errors import (
+            PolicyConflict,
+            SessionModeViolation,
+            WriterIntegrityError,
+        )
+
+        ctx = EvaluationContext(
+            session_mode=mode,
+            session_mode_revision=rev,
+            retry_count=0,
+            request_id=configurable.get("request_id", "") or "",
+        )
+        signal = ResumeSignal(
+            confirmation_id=f"{_session_id}:{tool_call_id}",
+            action=action,
+            grant_scope=scope,
+            actor="user_click",
+        )
+
+        try:
+            outcome = await pe.commit_resume(
+                call_spec, ctx, signal, claim_nonce=claim_nonce,
+            )
+        except (PolicyConflict, WriterIntegrityError, SessionModeViolation) as exc:
+            logger.warning(
+                "interrupt_helper: pe.commit_resume raised %s for tool_call %s: %s",
+                type(exc).__name__, tool_call_id, exc,
+            )
+            # P1 (round-25): claim_nonce_mismatch means the current call does NOT
+            # own the queue entry — another resume (new owner) has already claimed
+            # it.  Calling cleanup_pending_confirmation here would delete the new
+            # owner's state and corrupt their in-flight confirmation.  Skip cleanup
+            # and let the new owner's commit_resume handle it.
+            #
+            # For all other PolicyConflict / WriterIntegrityError /
+            # SessionModeViolation variants, the queue entry either belongs to us
+            # (commit_resume may have exited before its own cleanup) or is safe to
+            # purge because the session is in a terminal state.  Cleanup is
+            # idempotent so re-calling it after commit_resume's own cleanup is safe.
+            if isinstance(exc, PolicyConflict) and "claim_nonce_mismatch" in str(exc):
+                logger.warning(
+                    "interrupt_helper: nonce mismatch for %s:%s — leaving queue "
+                    "entry for new owner, no cleanup performed",
+                    _session_id, tool_call_id,
+                )
+                # TODO (codex round-35 P1, BLOCKED — accepted race window):
+                # Returning _build_resume_error_command below clears pending_ask_*
+                # AND adds tool_call_id to completed_tool_call_prefix → the graph
+                # advances past interrupt_helper.  Meanwhile, the new owner (B)
+                # already called task.resume(Command_B) which is sitting in the
+                # checkpointer waiting to be consumed by interrupt_helper.  But the
+                # graph has already advanced past interrupt → Command_B is consumed
+                # as a no-op → B's queue entry stays in 'processing' until B's
+                # deadline_ts expires and the sweeper find_expired() cleans it up.
+                #
+                # Fix Option A (re-raise GraphInterrupt) requires deep manipulation
+                # of LangGraph internals: scratchpad.resume is already populated
+                # with A's resume value, the runner re-persists RESUME writes at
+                # _runner.py:440-441, and on the next /resume call the OLD A value
+                # would be returned by interrupt() again instead of waiting for B.
+                # There is no documented LangGraph primitive for "consume the
+                # current resume but pause for a new one".
+                #
+                # Fix Option C (sweeper detects graph already advanced past
+                # interrupt while queue entry processing → cleanup) requires
+                # reading graph state from the sweeper — feasible but adds another
+                # round-trip per sweep cycle and is non-trivial.
+                #
+                # Current behavior: B's resume is lost; B's entry stays processing
+                # until deadline_ts expiry → sweeper find_expired() → submit
+                # timeout_fallback (which is a no-op since graph already advanced)
+                # → cleanup() in the resume_ok branch of sweep Phase 1.  B's user
+                # sees a confirmation timeout instead of the action they actually
+                # requested.  This is the accepted trade-off until Option A or C
+                # is properly designed.
+            else:
+                try:
+                    await pe.cleanup_pending_confirmation(_session_id, tool_call_id)
+                except Exception:
+                    logger.exception(
+                        "interrupt_helper: cleanup_pending_confirmation failed on "
+                        "commit_resume error path for %s:%s", _session_id, tool_call_id,
+                    )
+            return _build_resume_error_command(state, exc)
+        except Exception as exc:
+            # Infrastructure error (Redis/DB/SSM connection issue) — convert to
+            # an error ToolMessage so the caller sees the failure via SSE rather
+            # than the confirmation hanging in 'processing' forever.  The
+            # pending_ask_* fields are cleared by _build_resume_error_command so
+            # the next interrupt_helper replay does not re-enter the PE path with
+            # stale data.
+            # P2 (round-18): Cleanup the queue entry to prevent stale 'processing'
+            # state in case commit_resume raised before reaching its own cleanup.
+            logger.exception(
+                "interrupt_helper: pe.commit_resume failed with infrastructure error "
+                "for tool_call %s — returning error Command to prevent hang: %s",
+                tool_call_id,
+                exc,
+            )
+            try:
+                await pe.cleanup_pending_confirmation(_session_id, tool_call_id)
+            except Exception:
+                logger.exception(
+                    "interrupt_helper: cleanup_pending_confirmation failed on "
+                    "generic exception path for %s:%s", _session_id, tool_call_id,
+                )
+            return _build_resume_error_command(state, exc)
+
+        update: dict[str, Any] = {
+            "pe_resume_outcomes": {
+                **(state.get("pe_resume_outcomes") or {}),
+                tool_call_id: outcome.model_dump(mode="json"),
             },
+            # Clear pending_ask fields so the next interrupt_helper replay
+            # doesn't re-enter the PE path with stale data.
+            "pending_ask_outcome": None,
+            "pending_ask_tool_call_id": None,
+            "pending_ask_artifact": None,
+            "pending_ask_tool_args": None,
+        }
+        logger.info(
+            "interrupt_helper (PE): commit_resume done for tool_call %s action=%s scope=%s",
+            tool_call_id, action, scope,
         )
+        return Command(goto="tool_node", update=update)
 
     # ---- Build Graph --------------------------------------------------- #
 

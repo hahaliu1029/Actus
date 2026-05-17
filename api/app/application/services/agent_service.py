@@ -51,7 +51,7 @@ from app.domain.models.session import SandboxBindingState, Session, SessionStatu
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
-from app.domain.services.confirmation_manager import ConfirmationManager
+from app.domain.services.permission.confirmation_queue import ConfirmationQueue as ConfirmationManager
 from app.infrastructure.external.message_queue import STREAM_TTL_SECONDS
 from app.interfaces.schemas.session import SupervisorSnapshot
 from core.config import get_settings
@@ -111,6 +111,11 @@ class _ResumeToolConfirmationState:
     tool_call_id: str
     owner_user_id: str
     session_id: str
+    # PE-0 Phase 8.1 (C-P0-8): claim_nonce produced by pe.preflight_resume;
+    # forwarded in drive_resume_tool_confirmation → Command(resume=...)
+    # so graph-layer commit_resume can validate nonce before writing the grant.
+    # None when using the legacy path (feature flag off or PE unavailable).
+    claim_nonce: Optional[str] = None
 
 
 class AgentService:
@@ -337,6 +342,107 @@ class AgentService:
         # Reuse the service-level ConfirmationManager (initialized in __init__)
         confirmation_manager_inst = self._confirmation_manager
 
+        # PE-0 Phase 7 (C-R2-P0-1): build PermissionEngine + SessionStateMachine
+        # per-task. Both are None when the pre-conditions aren't met (no writer,
+        # no reader, no confirmation queue) so the legacy path in react_graph
+        # and PlannerReActFlow stays active until Phase 9 fully cuts over.
+        #
+        # P1#1 (round-11 fix): move the feature-flag gate INTO _create_task so that
+        # task._flow._permission_engine is the single authoritative signal for
+        # "PE is active for this task".  Previously the gate lived only in
+        # PlannerReActFlow._build_config, so a PE object could exist on the flow
+        # (built here) while _build_config skipped PE injection into the graph
+        # configurable — a split-brain that the HTTP preflight guard then failed to
+        # detect because it re-read the *current* config snapshot rather than the
+        # snapshot that was in effect at task-creation time.
+        #
+        # With this gate here, when permission_engine_native_enabled=False (or the
+        # tc.enabled master switch is off), we never build PE/SSM and both remain
+        # None.  The HTTP preflight split-brain check reduces to the simple and
+        # reliable: ``task._flow._permission_engine is not None``.
+        _tc_at_create = getattr(snap.agent_config, "tool_confirmation", None)
+        _flag_tc_enabled = bool(
+            getattr(_tc_at_create, "enabled", True)
+            if _tc_at_create is not None else True
+        )
+        _flag_pe_native = bool(
+            getattr(_tc_at_create, "permission_engine_native_enabled", True)
+            if _tc_at_create is not None else True
+        )
+        _flag_pe_active_at_create = _flag_tc_enabled and _flag_pe_native
+
+        ssm = None
+        permission_engine = None
+        if (
+            _flag_pe_active_at_create
+            and approval_state_writer is not None
+            and approval_state_reader is not None
+            and confirmation_manager_inst is not None
+        ):
+            try:
+                from app.application.composition.graph_assembly import (
+                    build_decision_recorder,
+                    build_permission_engine,
+                    build_session_state_machine,
+                )
+
+                ssm = build_session_state_machine(
+                    uow_factory=self._uow_factory,
+                    redis=(
+                        self._redis_client.client
+                        if self._redis_client and hasattr(self._redis_client, "client")
+                        else None
+                    ),
+                    event_publisher=None,
+                )
+                # P1#5: read SmartApprove gate flags from tool_confirmation config.
+                # Default to enabled=True so existing sessions with no explicit
+                # config keep the same behavior (backward-compat).
+                _tc_cfg = getattr(snap.agent_config, "tool_confirmation", None)
+                _sa_enabled = bool(
+                    getattr(_tc_cfg, "smart_approve_enabled", True)
+                    if _tc_cfg is not None else True
+                )
+                _sa_medium_only = bool(
+                    getattr(_tc_cfg, "smart_approve_medium_only", False)
+                    if _tc_cfg is not None else False
+                )
+                # P2#5: forward smart_approve_timeout_seconds from ToolRuntimeConfig
+                # so operator-configured timeouts (1-300s range) take effect for PE
+                # as well as the legacy path.  Default to 30.0 (build_permission_engine
+                # default) when the field is absent for backward-compat.
+                _sa_timeout = float(
+                    getattr(snap.tool_runtime, "smart_approve_timeout_seconds", 30.0)
+                )
+                # P2#3: forward confirmation_timeout_seconds from ToolConfirmationConfig
+                # so the ConfirmationQueue deadline matches the ToolConfirmationEvent
+                # timeout shown to the frontend.
+                _confirm_timeout = int(
+                    getattr(_tc_cfg, "timeout_seconds", 300)
+                    if _tc_cfg is not None else 300
+                )
+                permission_engine = build_permission_engine(
+                    uow_factory=self._uow_factory,
+                    writer=approval_state_writer,
+                    reader=approval_state_reader,
+                    queue=confirmation_manager_inst,
+                    session_machine=ssm,
+                    summary_llm=snap.summary_llm,
+                    smart_approve_enabled=_sa_enabled,
+                    smart_approve_medium_only=_sa_medium_only,
+                    smart_approve_timeout_seconds=_sa_timeout,
+                    confirmation_timeout_seconds=_confirm_timeout,
+                    decision_recorder=build_decision_recorder(),  # P3#1: wire OTel recorder
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to build PermissionEngine/SessionStateMachine; "
+                    "legacy confirmation path will be used for this session.",
+                    exc_info=True,
+                )
+                ssm = None
+                permission_engine = None
+
         # B5 #29: compute bootstrap language from the already-loaded session.
         # ``_get_accessible_session`` upstream already hydrated events via
         # ``get_by_id().to_domain()``, so ``session.get_latest_plan()`` is a
@@ -402,8 +508,10 @@ class AgentService:
             memory_gate_batch_cap=snap.memory_gate_batch_cap,
             memory_notification_emitter=self._memory_notification_emitter,
             approval_state_reader=approval_state_reader,
-            approval_state_writer=approval_state_writer,
+            approval_state_writer=approval_state_writer,  # P2#8: legacy SmartApprove grant
             confirmation_manager=confirmation_manager_inst,
+            permission_engine=permission_engine,
+            session_state_machine=ssm,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
             on_session_complete=self._compose_completion_callbacks(
@@ -553,13 +661,663 @@ class AgentService:
         except Exception as e:
             logger.warning(f"会话[{session_id}]后台更新未读消息计数失败: {e}")
 
+    async def _batch_has_non_native_pending(
+        self,
+        task_flow: object,
+        session_id: str,
+        pending_tool_name: str,
+    ) -> bool:
+        """Return True if the checkpointed tool_calls batch contains any non-native tool.
+
+        Mirrors ``_pe_dispatch``'s batch-level routing logic in react_graph:
+        when ANY tool in the active batch is non-native (skill/mcp/a2a),
+        ``_pe_dispatch`` falls back to the legacy tool_node path for the *whole*
+        batch — meaning it will never consume ``pe_resume_outcomes`` / claim_nonce.
+        Preflight must detect this case in advance and redirect to the legacy path
+        to avoid a split-brain where PE has claimed the queue entry but nobody
+        consumes the claim.
+
+        This is best-effort (returns False on any exception) because the graph
+        state may be unavailable (graph not built yet, checkpoint missing, etc.).
+
+        Called from two sites:
+          1. existing-task path (round-16 mixed-batch guard)
+          2. post-create path (round-17 guard — worker restart, new task created)
+        """
+        from app.domain.services.tools.tool_source_resolver import (
+            ToolSourceUnknownError as _TSUErr,
+            resolve_tool_source as _resolve,
+        )
+        from langchain_core.messages import AIMessage as _AIMsg
+        from langchain_core.messages import ToolMessage as _TMMsg
+
+        try:
+            _main_graph = getattr(task_flow, "_main_graph", None)
+            # P2#1 (round-22): When a new task is freshly created (post-restart worker
+            # recovery), _create_task builds a PlannerReActFlow but does NOT call
+            # _ensure_graphs() — so _main_graph is None at this point.  Without this
+            # guard, _main_graph is None → return False → mixed-batch guard is silently
+            # skipped → split-brain / stuck 'processing' entry.
+            #
+            # Fix (Option A): if _main_graph is None, attempt to build the graph here so
+            # the guard has a live graph to query.  If build also fails, fall through to
+            # the existing except-clause and return False (best-effort contract preserved).
+            if _main_graph is None:
+                _ensure = getattr(task_flow, "_ensure_graphs", None)
+                if _ensure is not None:
+                    await _ensure()
+                _main_graph = getattr(task_flow, "_main_graph", None)
+                if _main_graph is None:
+                    # Build failed or task_flow has no _ensure_graphs — skip guard.
+                    return False
+            _graph_config = task_flow._build_config()  # type: ignore[union-attr]
+            # Codex round-28 P1#1: use subgraphs=True so that PregelTask.state
+            # is populated with the nested ReactGraphState snapshot when the
+            # interrupt occurs inside the react_graph subgraph.
+            # Without subgraphs=True, only the outer MainGraphState is returned —
+            # its messages are planner outputs that typically have no tool_calls,
+            # causing _batch_tool_calls to be empty → guard returns False → mixed
+            # batch goes undetected → PE claim nonce is written but never consumed.
+            _graph_snap = await _main_graph.aget_state(_graph_config, subgraphs=True)
+
+            # Try to extract messages from the nested ReactGraphState first.
+            # PregelTask.state is None | RunnableConfig | StateSnapshot.
+            # When subgraphs=True and the interrupt fired inside a subgraph,
+            # the task for that subgraph will have state=StateSnapshot with
+            # its own values dict containing the react_graph messages.
+            _gs_messages: list = []
+            _snap_tasks = getattr(_graph_snap, "tasks", None) or []
+            for _task in _snap_tasks:
+                _sub_state = getattr(_task, "state", None)
+                if _sub_state is None:
+                    continue
+                _sub_values = getattr(_sub_state, "values", None) or {}
+                _sub_messages = _sub_values.get("messages", []) if isinstance(_sub_values, dict) else []
+                if _sub_messages:
+                    # Use the first subgraph task that has messages.
+                    _gs_messages = _sub_messages
+                    break
+
+            # Fallback: if no subgraph state had messages, use parent state.
+            if not _gs_messages and _graph_snap:
+                _gs_messages = ((_graph_snap.values or {}).get("messages", [])
+                                if _graph_snap else [])
+
+            # Find the most recent AIMessage that has tool_calls — this is the
+            # batch that _pe_dispatch will process on resume.
+            _batch_tool_calls: list[dict] = []
+            _batch_ai_idx: int = -1
+            for _idx, _msg in enumerate(reversed(_gs_messages)):
+                if isinstance(_msg, _AIMsg) and _msg.tool_calls:
+                    _batch_tool_calls = list(_msg.tool_calls)
+                    _batch_ai_idx = len(_gs_messages) - 1 - _idx
+                    break
+            if not _batch_tool_calls:
+                return False
+            # Determine which tool_calls are already completed by collecting
+            # tool_call_ids from ToolMessages that appear AFTER the AIMessage.
+            _already_done: set[str] = set()
+            for _tm in _gs_messages[_batch_ai_idx + 1:]:
+                if isinstance(_tm, _TMMsg) and _tm.tool_call_id:
+                    _already_done.add(_tm.tool_call_id)
+            # Check remaining pending tool_calls for non-native sources.
+            for _tc in _batch_tool_calls:
+                _tc_id = _tc.get("id", "")
+                if _tc_id in _already_done:
+                    continue
+                _tc_name = _tc.get("name", "")
+                if _tc_name == "message_ask_user":
+                    continue
+                try:
+                    _tc_src = _resolve(_tc_name).source
+                except _TSUErr:
+                    _tc_src = "native"
+                if _tc_src != "native":
+                    logger.info(
+                        "PE preflight mixed-batch guard: session=%s "
+                        "batch contains non-native tool '%s' (source=%s) "
+                        "alongside pending native tool '%s'. "
+                        "_pe_dispatch will fall back to legacy for the whole "
+                        "batch — routing preflight to legacy path to avoid "
+                        "split-brain.",
+                        session_id, _tc_name, _tc_src, pending_tool_name,
+                    )
+                    return True
+            return False
+        except Exception as _err:
+            logger.debug(
+                "PE preflight _batch_has_non_native_pending: graph state read failed for "
+                "session=%s (best-effort, returning False): %s",
+                session_id, _err,
+            )
+            return False
+
+    def _build_pe_ssm_for_resume(self, snap: "_ConfigSnapshot") -> "tuple[object | None, object | None]":
+        """Per-call helper that mirrors ``_create_task`` PE/SSM construction.
+
+        Used by HTTP-resume entry points (``preflight_resume_tool_confirmation``).
+        Returns ``(pe, ssm)`` or ``(None, None)`` when the feature flag is off
+        or required dependencies are unavailable — ensuring HTTP preflight and
+        graph resume consistently use the legacy path (no split-brain).
+        """
+        from app.application.composition.graph_assembly import (
+            build_decision_recorder,
+            build_permission_engine,
+            build_session_state_machine,
+        )
+
+        # Feature flag gate (mirrors PlannerReActFlow._build_config gate):
+        # P2#4: also check the master `enabled` switch — if tool_confirmation is
+        # globally disabled, preflight must return (None, None) so the graph also
+        # takes the legacy path (no split-brain when enabled=False + PE pending).
+        tc = getattr(snap.agent_config, "tool_confirmation", None)
+        if tc is not None:
+            if not getattr(tc, "enabled", True):
+                return None, None  # confirmation master switch off
+            if not getattr(tc, "permission_engine_native_enabled", True):
+                return None, None  # PE-0 native gate off
+
+        confirmation_queue = self._confirmation_manager
+        if confirmation_queue is None:
+            return None, None
+
+        # Build reader (fail-open)
+        approval_state_reader = None
+        try:
+            from app.application.services.approval_state_adapters import (
+                SessionLegacyRuleQuery,
+                UowApprovalGrantQuery,
+            )
+            from app.domain.services.approval_state_reader import ApprovalStateReader
+            from app.infrastructure.storage.postgres import get_postgres
+
+            grant_query = UowApprovalGrantQuery(uow_factory=self._uow_factory)
+            legacy_query = None
+            if tc is not None and getattr(tc, "legacy_rule_fallback", False):
+                legacy_query = SessionLegacyRuleQuery(
+                    session_factory=get_postgres().session_factory,
+                )
+            approval_state_reader = ApprovalStateReader(
+                query=grant_query, legacy_rule_query=legacy_query,
+            )
+        except Exception:
+            pass
+
+        # Build writer (fail-open)
+        approval_state_writer = None
+        try:
+            from app.application.services.approval_state_writer import ApprovalStateWriter
+
+            approval_state_writer = ApprovalStateWriter(uow_factory=self._uow_factory)
+        except Exception:
+            pass
+
+        if approval_state_writer is None or approval_state_reader is None:
+            return None, None
+
+        try:
+            ssm = build_session_state_machine(
+                uow_factory=self._uow_factory,
+                redis=(
+                    self._redis_client.client
+                    if self._redis_client and hasattr(self._redis_client, "client")
+                    else None
+                ),
+                event_publisher=None,
+            )
+            # P1#5 (resume path): mirror the _create_task gate so SmartApprove
+            # is consistently absent when disabled in config.
+            _tc_cfg_r = getattr(snap.agent_config, "tool_confirmation", None)
+            _sa_enabled_r = bool(
+                getattr(_tc_cfg_r, "smart_approve_enabled", True)
+                if _tc_cfg_r is not None else True
+            )
+            _sa_medium_only_r = bool(
+                getattr(_tc_cfg_r, "smart_approve_medium_only", False)
+                if _tc_cfg_r is not None else False
+            )
+            # P2#5 (resume path): mirror _create_task — forward operator-configured
+            # smart_approve_timeout_seconds from ToolRuntimeConfig so the PE used
+            # for HTTP preflight respects the same timeout as the graph-time PE.
+            _sa_timeout_r = float(
+                getattr(snap.tool_runtime, "smart_approve_timeout_seconds", 30.0)
+            )
+            # P2#3 (resume path): mirror _create_task — ConfirmationQueue deadline
+            # must match the ToolConfirmationEvent timeout sent to the frontend.
+            _confirm_timeout_r = int(
+                getattr(_tc_cfg_r, "timeout_seconds", 300)
+                if _tc_cfg_r is not None else 300
+            )
+            pe = build_permission_engine(
+                uow_factory=self._uow_factory,
+                writer=approval_state_writer,
+                reader=approval_state_reader,
+                queue=confirmation_queue,
+                session_machine=ssm,
+                summary_llm=snap.summary_llm,
+                smart_approve_enabled=_sa_enabled_r,
+                smart_approve_medium_only=_sa_medium_only_r,
+                smart_approve_timeout_seconds=_sa_timeout_r,
+                confirmation_timeout_seconds=_confirm_timeout_r,
+                decision_recorder=build_decision_recorder(),  # P3#1: wire OTel recorder
+            )
+            return pe, ssm
+        except Exception:
+            logger.warning(
+                "_build_pe_ssm_for_resume: failed to build PE/SSM, "
+                "falling back to legacy preflight path.",
+                exc_info=True,
+            )
+            return None, None
+
     async def preflight_resume_tool_confirmation(
         self,
         session_id: str,
         user_id: str,
         is_admin: bool,
         tool_confirmation: object,
-    ) -> _ResumeToolConfirmationState:
+    ) -> "_ResumeToolConfirmationState":
+        """PE-0 Phase 8.1: Delegating preflight entry point.
+
+        When PE is available (feature flag on + deps resolved), routes through
+        ``pe.preflight_resume`` so the claim_nonce is produced by PE and carried
+        into ``drive_resume_tool_confirmation`` → graph ``commit_resume``.
+
+        When PE is unavailable (flag off or build failure), falls back to the
+        original legacy implementation (``_preflight_resume_tool_confirmation_legacy``),
+        which preserves R5b-3 behavior exactly.
+        """
+        from app.domain.services.permission.context import (
+            EvaluationContext,
+            ResumeSignal,
+        )
+        from app.domain.services.permission.errors import SessionModeViolation
+        from app.domain.services.permission.tool_call_spec import ToolCallSpec
+
+        snap = self._config_snapshot
+        pe, ssm = self._build_pe_ssm_for_resume(snap)
+
+        if pe is None or ssm is None:
+            return await self._preflight_resume_tool_confirmation_legacy(
+                session_id=session_id,
+                user_id=user_id,
+                is_admin=is_admin,
+                tool_confirmation=tool_confirmation,
+            )
+
+        # PE path
+        action: str = getattr(tool_confirmation, "action", "deny")
+        scope: str = getattr(tool_confirmation, "scope", "once")
+        tool_call_id: str = getattr(tool_confirmation, "tool_call_id", "")
+
+        # Validate session access
+        session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+        # Read pending confirmation detail
+        if not self._confirmation_manager:
+            raise BadRequestError("ConfirmationManager 不可用，无法处理工具确认")
+
+        pending_detail = await self._confirmation_manager.read(session_id, tool_call_id)
+        if pending_detail is None:
+            # P2#7: Mirror the legacy path's late-duplicate handling.
+            # detail=None means the confirmation was already processed and cleaned up
+            # by a previous /resume (winner path), or it truly never existed / expired.
+            # Raising SessionModeViolation (410) would break the reconnect/retry contract.
+            # Instead: check for a persistent grant (same as legacy); if found → 409
+            # so the frontend can replay via /events?since=...; if truly missing → 404.
+            #
+            # P2#4: PE commit_resume writes the grant with
+            # confirmation_id=f"{session_id}:{tool_call_id}" (via _cid(call)),
+            # so we must query with the same composite key, not the bare
+            # tool_call_id.  Using only tool_call_id causes find_by_confirmation_id
+            # to miss the row → 404 instead of 409 on late-duplicate retry.
+            _pe_confirmation_id = f"{session_id}:{tool_call_id}"
+            try:
+                async with self._uow_factory() as _lookup_uow:
+                    existing_grant = await _lookup_uow.approval_grants.find_by_confirmation_id(
+                        _pe_confirmation_id
+                    )
+                    # P2#2 (Codex round-10): split-brain compatibility.
+                    # PE writes grants with composite confirmation_id
+                    # (f"{session_id}:{tool_call_id}") but the legacy path writes
+                    # with the bare tool_call_id.  On a session that started with a
+                    # legacy preflight and was then retried after PE became available,
+                    # pending_detail is already cleaned up, so we land here.  The PE
+                    # composite lookup misses the legacy-written row → 404 instead of
+                    # 409.  Fall back to the bare id before declaring "not found".
+                    if existing_grant is None:
+                        existing_grant = await _lookup_uow.approval_grants.find_by_confirmation_id(
+                            tool_call_id
+                        )
+            except Exception as _lookup_err:
+                logger.warning(
+                    "PE path late-duplicate grant lookup failed tool_call=%s: %s",
+                    tool_call_id, _lookup_err,
+                )
+                raise ServiceUnavailableError(
+                    f"工具确认[{tool_call_id}]状态查询暂时失败，请稍后重试"
+                ) from _lookup_err
+            if existing_grant is not None:
+                raise ConflictError(
+                    f"工具确认[{tool_call_id}]已被处理完成（grant 已持久）；"
+                    "请通过 /events?since=<last_event_id> 重连 SSE 复播结果"
+                )
+            raise NotFoundError(
+                f"工具确认请求[{tool_call_id}]不存在或已过期"
+            )
+
+        # P1#1: Check tool source — PE-0 only handles "native" tools.
+        # Skill/MCP/A2A tools still go through the legacy confirmation path
+        # because tool_node falls back to legacy for non-native batches and
+        # does not consume pe_resume_outcomes.  If we ran PE preflight on a
+        # non-native tool the user would be asked again via legacy → duplicate
+        # confirmation or stuck processing state.
+        from app.domain.services.tools.tool_source_resolver import (
+            ToolSourceUnknownError,
+            resolve_tool_source,
+        )
+        try:
+            _pending_tool_source = resolve_tool_source(pending_detail.tool_name).source
+        except ToolSourceUnknownError:
+            _pending_tool_source = "native"
+
+        if _pending_tool_source != "native":
+            logger.info(
+                "PE preflight: tool_name=%s has source=%s (not native), "
+                "routing to legacy confirmation path.",
+                pending_detail.tool_name, _pending_tool_source,
+            )
+            return await self._preflight_resume_tool_confirmation_legacy(
+                session_id=session_id,
+                user_id=user_id,
+                is_admin=is_admin,
+                tool_confirmation=tool_confirmation,
+            )
+
+        # P1#1 (split-brain guard): Check whether the existing task for this session
+        # was created with PE enabled.  A task built before PE was enabled (feature
+        # flag off, build failure, or first session before Phase 7 rollout) has
+        # _flow._permission_engine = None, meaning graph commit_resume uses the
+        # legacy path which does NOT consume pe_resume_outcomes / claim_nonce.
+        #
+        # Round-11 simplification: the flag gate is now enforced inside _create_task
+        # itself (P1#1 fix), so task._flow._permission_engine is None iff:
+        #   (a) PE build failed, OR
+        #   (b) tc.enabled=False / permission_engine_native_enabled=False at creation time
+        # Both cases mean the graph will walk the legacy commit path — PE preflight
+        # must NOT proceed.  Checking _task_pe is not None is now sufficient and
+        # immune to config hot-reload because the flag check already ran when the task
+        # was first built.
+        #
+        # Guard: peek at the existing task (without creating a new one).  If the
+        # task exists but is a legacy task (no PE), route to legacy path.
+        # If the task doesn't exist yet (will be created by drive_resume), we
+        # tentatively proceed with PE preflight and re-check after _create_task (P1#2).
+        _existing_task = await self._get_task(session)
+        if _existing_task is not None:
+            _task_runner = getattr(_existing_task, "_task_runner", None)
+            _task_flow = getattr(_task_runner, "_flow", None)
+            _task_pe = getattr(_task_flow, "_permission_engine", None)
+            # Simplified check: _task_pe is None means the task is legacy.
+            # Both flag=off and build-failure produce _task_pe=None (see _create_task).
+            if _task_pe is None:
+                logger.info(
+                    "PE preflight split-brain guard: session=%s task is not PE-active "
+                    "(pe_instance=None — flag was off or PE build failed at task creation). "
+                    "Routing to legacy confirmation path.",
+                    session_id,
+                )
+                return await self._preflight_resume_tool_confirmation_legacy(
+                    session_id=session_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    tool_confirmation=tool_confirmation,
+                )
+
+            # P2 (round-16): Mixed-batch routing consistency guard.
+            # _pe_dispatch in react_graph routes the ENTIRE batch to legacy when
+            # ANY tool_call in the batch is non-native (skill/mcp/a2a).  If we
+            # ran PE preflight on a native tool that happens to share a batch with
+            # a non-native tool, the graph would walk the legacy commit path and
+            # never consume pe_resume_outcomes / claim_nonce → split-brain.
+            #
+            # Fix: mirror the _pe_dispatch batch-level check here.  Read the active
+            # tool_calls batch from the graph checkpoint and if ANY non-native tool
+            # is present → fall back to legacy preflight for the whole batch.
+            #
+            # Extracted to _batch_has_non_native_pending (round-17) so the same
+            # check can be re-applied in the post-create guard (P2#1).
+            if await self._batch_has_non_native_pending(
+                _task_flow, session_id, pending_detail.tool_name
+            ):
+                return await self._preflight_resume_tool_confirmation_legacy(
+                    session_id=session_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    tool_confirmation=tool_confirmation,
+                )
+
+        # Read session mode
+        mode, mode_rev = await ssm.get_mode_with_revision(session_id)
+        if mode not in (SessionStatus.RUNNING, SessionStatus.WAITING):
+            raise SessionModeViolation(
+                f"resume not allowed in mode={mode.value if hasattr(mode, 'value') else mode}"
+            )
+
+        # Build PE input DTOs
+        call_spec = ToolCallSpec(
+            tool_name=pending_detail.tool_name,
+            tool_args=dict(pending_detail.tool_args),
+            tool_source="native",  # PE-0 scope: only native tools reach here
+            user_id=pending_detail.user_id,
+            session_id=session_id,
+            arg_digest=pending_detail.arg_digest,
+            primary_arg=getattr(pending_detail, "primary_arg", None),
+            dir_arg=getattr(pending_detail, "dir_arg", None),
+            tool_call_id=tool_call_id,
+        )
+        ctx = EvaluationContext(
+            session_mode=mode,
+            session_mode_revision=mode_rev,
+        )
+        signal = ResumeSignal(
+            confirmation_id=f"{session_id}:{tool_call_id}",
+            action=action,  # type: ignore[arg-type]
+            grant_scope=scope,  # type: ignore[arg-type]
+            actor="user_click",
+        )
+
+        # Codex round-28 P2#1: pe.preflight_resume can raise mid-CAS.  We
+        # distinguish the exception types because the safe response differs
+        # depending on whether we own the Redis claim:
+        #
+        # - PolicyConflict: we lost the CAS race or pre-CAS validation failed
+        #   (approval_already_claimed / no_pending_confirmation /
+        #   arg_digest_mismatch).  We do NOT own the claim — never rollback.
+        #
+        # - CancelledError (Codex round-30 P2#1 update): cancellation can arrive
+        #   either pre-CAS (no claim written) OR post-CAS (claim_nonce written
+        #   but preflight never returned).  Because we cannot prove which side
+        #   of the CAS we are on, and the claim_nonce is unknown in either case,
+        #   a background rollback with claim_nonce=None would skip the nonce
+        #   guard and unconditionally mark_pending — which can DELETE another
+        #   concurrent caller's legitimate claim (single-flight race).  Safer:
+        #   do NOT rollback on cancel.  Any genuinely orphaned 'processing'
+        #   entry will be reclaimed by the orphan sweeper (bounded by the
+        #   sweep threshold — see _confirmation_sweep_loop).
+        #
+        # - Any other exception: PE raises from pre-CAS validation paths and
+        #   does not write a claim_nonce.  No rollback needed — propagate.
+        from app.domain.services.permission.errors import PolicyConflict as _PolicyConflict
+
+        preflight = None
+        try:
+            preflight = await pe.preflight_resume(call_spec, ctx, signal)
+        except asyncio.CancelledError:
+            # Codex round-30 P2#1: we cannot prove ownership of the claim when
+            # cancellation arrives during preflight_resume.  Rolling back with
+            # claim_nonce=None would race against a concurrent winner and delete
+            # their nonce.  Let the orphan sweeper reclaim any stuck 'processing'
+            # entry instead (max delay = orphan threshold).
+            raise
+        except _PolicyConflict:
+            # We lost the CAS race (approval_already_claimed) or the validation
+            # failed before CAS (no_pending_confirmation / arg_digest_mismatch).
+            # In all PolicyConflict sub-cases we do NOT own the claim — do NOT
+            # rollback, as that would delete another concurrent caller's state.
+            raise
+        # Any other exception: PE raises from pre-CAS validation paths and does not
+        # write a claim_nonce.  No rollback needed — just propagate.
+
+        # P2#7: If _get_task / _create_task fails after preflight succeeded, the
+        # Redis entry is stuck in 'processing' with no graph to commit_resume.
+        # Roll back to 'pending' so a subsequent /resume can retry.
+        try:
+            # Get/create the task (same as legacy path)
+            task = await self._get_task(session)
+            _task_was_created_now = False
+            if task is None:
+                task = await self._create_task(session)
+                _task_was_created_now = True
+                if not task:
+                    raise ServiceUnavailableError(
+                        f"会话[{session_id}]创建任务失败，请稍后重试"
+                    )
+        except BaseException:
+            # P2#7 / P1#2: Use BaseException (not Exception) so asyncio.CancelledError
+            # (which is NOT an Exception subclass in Python 3.8+) is also caught
+            # and the claim is rolled back before propagating.  Without this,
+            # client disconnect leaves the entry stuck in 'processing' + claim_nonce
+            # forever (sweeper skips 'processing' state), causing resume conflicts.
+            #
+            # Codex round-20 P2#2: use _spawn_background_rollback_if_present (same
+            # pattern as drive_resume_tool_confirmation / legacy path) so that if
+            # the caller is cancelled (CancelledError), the mark_pending call itself
+            # is not also cancelled — the independent asyncio.Task survives the parent
+            # cancel scope and completes the rollback.  The "_if_present" variant
+            # additionally guards against resurrecting a partial Redis hash when
+            # commit_resume has already cleaned up the confirmation entry.
+            self._spawn_background_rollback_if_present(
+                persistent_scope=False,
+                decision_id=None,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                claim_nonce=preflight.claim_nonce,
+            )
+            raise
+
+        # P1#2 (round-11 fix): When a new task was just created, verify that PE was
+        # actually wired into it.  Between pe.preflight_resume (which writes claim_nonce
+        # into Redis) and _create_task there is a window where:
+        #   - The operator toggled permission_engine_native_enabled=false, OR
+        #   - build_permission_engine raised an exception (build failure)
+        # In either case _create_task returns a task with _flow._permission_engine=None,
+        # meaning the graph will walk the legacy commit path and never call
+        # pe.commit_resume.  Without this check the Redis entry stays stuck in
+        # 'processing' (claim_nonce set, nobody consumes it → processing orphan).
+        #
+        # Fix: detect the mismatch, roll back the PE claim to 'pending', and
+        # re-run preflight on the legacy path so the user gets a working confirmation.
+        if _task_was_created_now:
+            _new_runner = getattr(task, "_task_runner", None)
+            _new_flow = getattr(_new_runner, "_flow", None)
+            _new_pe = getattr(_new_flow, "_permission_engine", None)
+            if _new_pe is None:
+                logger.warning(
+                    "PE preflight split-brain guard (P1#2): session=%s "
+                    "newly created task has no PE wired "
+                    "(flag toggled or build failed between preflight and _create_task). "
+                    "Rolling back PE claim and falling back to legacy confirmation path.",
+                    session_id,
+                )
+                if self._confirmation_manager is not None:
+                    try:
+                        await self._confirmation_manager.mark_pending(session_id, tool_call_id)
+                    except BaseException as _rb_err:
+                        logger.warning(
+                            "PE preflight P1#2 rollback (mark_pending) failed for %s:%s: %s",
+                            session_id, tool_call_id, _rb_err,
+                        )
+                return await self._preflight_resume_tool_confirmation_legacy(
+                    session_id=session_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    tool_confirmation=tool_confirmation,
+                )
+
+            # P2#1 (round-17): Mixed-batch guard for the post-create path.
+            # When a worker restarts, in-memory task is lost and _create_task
+            # builds a new task.  The existing-task mixed-batch guard above was
+            # skipped (_existing_task was None).  PE preflight has already claimed
+            # the Redis entry (claim_nonce written).  But if the checkpointed batch
+            # contains non-native tools, _pe_dispatch will fall back to legacy for
+            # the whole batch on resume and never consume pe_resume_outcomes /
+            # claim_nonce → split-brain / stuck 'processing' entry.
+            #
+            # Fix: apply the same mixed-batch check here.  On mismatch, roll back
+            # the claim to 'pending' and redirect to legacy preflight (same
+            # rollback pattern as P1#2 above).
+            if _new_flow is not None and await self._batch_has_non_native_pending(
+                _new_flow, session_id, pending_detail.tool_name
+            ):
+                logger.warning(
+                    "PE preflight mixed-batch guard (P2#1 post-create): session=%s "
+                    "newly created task has a mixed batch in the checkpoint. "
+                    "Rolling back PE claim and falling back to legacy confirmation path.",
+                    session_id,
+                )
+                if self._confirmation_manager is not None:
+                    try:
+                        await self._confirmation_manager.mark_pending(session_id, tool_call_id)
+                    except BaseException as _rb_err:
+                        logger.warning(
+                            "PE preflight P2#1 rollback (mark_pending) failed for %s:%s: %s",
+                            session_id, tool_call_id, _rb_err,
+                        )
+                return await self._preflight_resume_tool_confirmation_legacy(
+                    session_id=session_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    tool_confirmation=tool_confirmation,
+                )
+
+        owner_user_id = pending_detail.user_id
+        persistent_scope = scope in ("session", "always")
+
+        # NOTE: mark_processing is intentionally NOT called here.
+        # pe.preflight_resume already performed an atomic CAS via
+        # mark_processing_if_pending (which writes the claim_nonce).  A second
+        # mark_processing call here would be a no-op at best; at worst, if it
+        # raises transiently, HTTP preflight returns an error while the entry
+        # remains stuck in 'processing' with no graph to commit_resume — causing
+        # a resume conflict on the next attempt. (P2#2 fix)
+
+        logger.info(
+            "会话[%s] PE preflight OK: tool_call_id=%s action=%s scope=%s claim_nonce=%s",
+            session_id, tool_call_id, action, scope,
+            preflight.claim_nonce[:8] + "..." if preflight.claim_nonce else "none",
+        )
+        return _ResumeToolConfirmationState(
+            session=session,
+            detail=pending_detail,
+            task=task,
+            decision_id=None,  # PE commit_resume owns the write; no pre-claim decision_id
+            persistent_scope=persistent_scope,
+            action=action,
+            scope=scope,
+            tool_call_id=tool_call_id,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            claim_nonce=preflight.claim_nonce,
+        )
+
+    async def _preflight_resume_tool_confirmation_legacy(
+        self,
+        session_id: str,
+        user_id: str,
+        is_admin: bool,
+        tool_confirmation: object,
+    ) -> "_ResumeToolConfirmationState":
         """R5b-3 (Codex round-2 HIGH fix) preflight 阶段——同步完成所有可能抛
         HTTP 异常的工作，返 drive 阶段所需的上下文。
 
@@ -578,6 +1336,11 @@ class AgentService:
            失败 → 409
         5. 取/建 task；失败回滚 claim 并抛 ``ServiceUnavailableError`` (503)
         6. once 路径立即写 audit 证据（赢 claim 后）
+
+        PE-0 Phase 8.1: This is the legacy path retained as a fallback when
+        ``permission_engine_native_enabled`` is False or PE build fails.
+        Direct writer calls (write/write_audit_only/delete_grant) here are
+        intentional and whitelisted under INV-1b for the legacy code path.
         """
         action: str = getattr(tool_confirmation, "action", "deny")
         scope: str = getattr(tool_confirmation, "scope", "once")
@@ -597,11 +1360,26 @@ class AgentService:
             # 持久保留；再次 /resume 同 confirmation_id 应返 409（前端凭此走
             # /events?since=... 重连复播已完成的 tool event），**不是**当
             # "已过期" 报 404。只有 detail 和 grant 都不存在才真正 404。
+            #
+            # Round-19 P2 (hot-switch): PE writes grants with composite
+            # confirmation_id (f"{session_id}:{tool_call_id}"); legacy path
+            # writes with bare tool_call_id.  When PE was active for a prior
+            # /resume (composite grant written) and then PE becomes unavailable
+            # (config degradation / build failure) so the retry lands here,
+            # the bare-only lookup misses the PE-written row → 404 instead of
+            # 409.  Mirror the PE path's dual-lookup: try bare first (legacy
+            # writes), then composite (PE writes), before declaring "not found".
             try:
                 async with self._uow_factory() as _lookup_uow:
                     existing_grant = await _lookup_uow.approval_grants.find_by_confirmation_id(
                         tool_call_id
                     )
+                    if existing_grant is None:
+                        # Fall back to PE composite key to cover hot-switch case.
+                        _pe_composite_id = f"{session_id}:{tool_call_id}"
+                        existing_grant = await _lookup_uow.approval_grants.find_by_confirmation_id(
+                            _pe_composite_id
+                        )
             except Exception as _lookup_err:
                 # Codex round-7 MEDIUM: 不再伪装成 404。真实 late-duplicate 但
                 # grant lookup 遭 DB/UoW 瞬时故障时，客户端必须知道这是基础设施
@@ -694,6 +1472,11 @@ class AgentService:
         else:
             # Codex round-4 CRITICAL: once 路径的 CAS 同样走 envelope
             async def _do_cas() -> tuple[Optional[str], bool]:
+                # PE-0: claim_nonce / processing_started_at are intentionally omitted here;
+                # this path will be rewritten in Phase 8 to go through pe.preflight_resume
+                # (which produces the nonce). The sweeper added in Phase 11 only fires for
+                # entries that have processing_started_at set, so this preflight path is
+                # inert under the sweeper until Phase 8 lands. See plan §Phase 8.1.
                 claimed_local = await confirmation_mgr.mark_processing_if_pending(
                     session_id, tool_call_id
                 )
@@ -857,6 +1640,93 @@ class AgentService:
             )
             return None
 
+    async def _rollback_resume_claim_if_present(
+        self,
+        *,
+        persistent_scope: bool,
+        decision_id: Optional[str],
+        session_id: str,
+        tool_call_id: str,
+        claim_nonce: Optional[str],
+    ) -> None:
+        """P2#3 (Codex round-10): Conditional rollback — only mark_pending when
+        the confirmation still exists in the queue AND our nonce matches.
+
+        commit_resume cleans up the Redis hash on the success path.  If cleanup
+        already ran, calling mark_pending would resurrect a partial hash that
+        lacks required fields (session_id, tool_name, …) → subsequent read()
+        raises KeyError / returns incomplete data.
+
+        Guard order:
+        1. confirmation no longer in queue → commit_resume succeeded → skip
+        2. nonce mismatch → another claim owner → skip
+        3. otherwise → delegate to the unconditional _rollback_resume_claim
+        """
+        if self._confirmation_manager is not None and claim_nonce is not None:
+            try:
+                detail = await self._confirmation_manager.read(session_id, tool_call_id)
+            except Exception as _read_err:
+                logger.warning(
+                    "P2#3 条件回滚: read() 失败 %s:%s — 跳过 mark_pending 避免脏写: %s",
+                    session_id, tool_call_id, _read_err,
+                )
+                return
+            if detail is None:
+                # commit_resume already cleaned up — nothing to rollback
+                logger.debug(
+                    "P2#3 条件回滚: confirmation 已清理 %s:%s — 跳过",
+                    session_id, tool_call_id,
+                )
+                return
+            if detail.claim_nonce != claim_nonce:
+                # Another owner claimed this slot — leave it alone
+                logger.debug(
+                    "P2#3 条件回滚: nonce 不匹配 %s:%s (expected=%s, found=%s) — 跳过",
+                    session_id, tool_call_id, claim_nonce, detail.claim_nonce,
+                )
+                return
+        # Safe to rollback: confirmation still exists and we own the claim
+        await self._rollback_resume_claim(
+            persistent_scope=persistent_scope,
+            decision_id=decision_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
+
+    def _spawn_background_rollback_if_present(
+        self,
+        *,
+        persistent_scope: bool,
+        decision_id: Optional[str],
+        session_id: str,
+        tool_call_id: str,
+        claim_nonce: Optional[str],
+    ) -> Optional[asyncio.Task]:
+        """Background-task wrapper for _rollback_resume_claim_if_present.
+
+        Used by the PE path in drive_resume_tool_confirmation to avoid
+        resurrecting a partial Redis hash when commit_resume has already
+        cleaned up the confirmation entry.
+
+        Returns asyncio.Task for testability; production code ignores return value.
+        """
+        try:
+            return asyncio.create_task(
+                self._rollback_resume_claim_if_present(
+                    persistent_scope=persistent_scope,
+                    decision_id=decision_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    claim_nonce=claim_nonce,
+                )
+            )
+        except RuntimeError:
+            logger.warning(
+                "P2#3: 无法创建条件回滚后台 task session=%s tool_call=%s",
+                session_id, tool_call_id,
+            )
+            return None
+
     async def _claim_with_post_cancel_rollback(
         self,
         claim_factory,  # () -> Awaitable[tuple[Optional[str], bool]]
@@ -923,7 +1793,15 @@ class AgentService:
         confirmation_mgr = self._confirmation_manager
         try:
             try:
-                resume_value = {"action": state.action, "scope": state.scope}
+                # PE-0 Phase 8.2: add claim_nonce so graph-layer commit_resume
+                # can validate the nonce before writing the grant.
+                # claim_nonce is None on the legacy path (feature flag off or
+                # PE unavailable) — graph interrupt_helper handles None gracefully.
+                resume_value = {
+                    "action": state.action,
+                    "scope": state.scope,
+                    "claim_nonce": state.claim_nonce,
+                }
                 await state.task.resume(Command(resume=resume_value))
             except BaseException:
                 # Codex round-3 CRITICAL + round-4 reinforcement：
@@ -931,15 +1809,37 @@ class AgentService:
                 # 独立 asyncio.Task 里跑，否则和父 task 一起被取消，delete_grant /
                 # mark_pending 根本跑不完 → orphan claim 永远 processing。
                 # 独立 task 不继承父 cancel scope（_safe_update_unread_count pattern）。
-                self._spawn_background_rollback(
-                    persistent_scope=state.persistent_scope,
-                    decision_id=state.decision_id,
-                    session_id=state.session_id,
-                    tool_call_id=state.tool_call_id,
-                )
+                #
+                # P2#3 (Codex round-10): when claim_nonce is set (PE path), use the
+                # conditional rollback that checks the confirmation still exists in
+                # the queue before calling mark_pending.  commit_resume cleans up the
+                # hash on success; an unconditional mark_pending would resurrect a
+                # partial hash that read() then fails to parse.
+                if state.claim_nonce is not None:
+                    self._spawn_background_rollback_if_present(
+                        persistent_scope=state.persistent_scope,
+                        decision_id=state.decision_id,
+                        session_id=state.session_id,
+                        tool_call_id=state.tool_call_id,
+                        claim_nonce=state.claim_nonce,
+                    )
+                else:
+                    self._spawn_background_rollback(
+                        persistent_scope=state.persistent_scope,
+                        decision_id=state.decision_id,
+                        session_id=state.session_id,
+                        tool_call_id=state.tool_call_id,
+                    )
                 raise
 
-            if confirmation_mgr is not None:
+            # P1#1: PE path — commit_resume already called queue.cleanup() internally
+            # (AllowSuccess/Denied paths in DefaultPermissionEngine.commit_resume each
+            # call self._queue.cleanup before returning).  Calling cleanup again here
+            # would delete the hash that was already removed, which is a no-op, but on
+            # a concurrent replay or slow network the race would delete the entry before
+            # commit_resume reads it → PolicyConflict("no_pending_confirmation").
+            # Only run cleanup on the legacy path (claim_nonce is None on legacy).
+            if confirmation_mgr is not None and state.claim_nonce is None:
                 await confirmation_mgr.cleanup(state.session_id, state.tool_call_id)
 
             latest_event_id = None
@@ -3125,7 +4025,7 @@ end
         )
 
     async def _confirmation_sweep_loop(self) -> None:
-        """Background task: sweep expired confirmations every 30s."""
+        """Background task: sweep expired and orphaned-processing confirmations every 30s."""
         import uuid
         worker_id = str(uuid.uuid4())[:8]
         while True:
@@ -3135,6 +4035,8 @@ end
                     continue
                 if not await self._confirmation_manager.acquire_sweep_lock(worker_id):
                     continue
+
+                # Phase 1: Sweep expired confirmations (timeout_fallback resume).
                 expired = await self._confirmation_manager.find_expired()
                 for detail in expired:
                     try:
@@ -3173,6 +4075,337 @@ end
                             detail.session_id,
                             detail.tool_call_id,
                         )
+
+                # Phase 2: P1#3 — Rescue orphaned 'processing' entries.
+                # These are claims where preflight_resume succeeded (status=processing +
+                # claim_nonce written) but commit_resume never ran (e.g. worker crash
+                # between HTTP response and graph resume).
+                #
+                # P2#1 fix: check deadline_ts before reopening.
+                # If the orphan's user-facing deadline has already passed, the
+                # confirmation can no longer be meaningfully retried — reopen
+                # would let a user approve an already-timed-out tool call.
+                # Expired orphans are cleaned up (not reopened); still-live
+                # orphans are mark_pending so /resume retry can re-claim.
+                try:
+                    import time as _time  # local to avoid hoisting at module top
+
+                    orphans = await self._confirmation_manager.find_orphaned_processing(
+                        processing_age_threshold_seconds=300,
+                    )
+                    _now_ts = _time.time()
+                    for orphan in orphans:
+                        try:
+                            _deadline = getattr(orphan, "deadline_ts", None)
+                            if _deadline is not None and _deadline <= _now_ts:
+                                # Already past user-facing timeout → advance graph
+                                # past interrupt first, then cleanup queue entry.
+                                # Without resuming the graph, the LangGraph checkpoint
+                                # stays in the interrupt state indefinitely while the
+                                # frontend can no longer retry (queue entry gone).
+                                logger.warning(
+                                    "Orphaned processing confirmation expired (deadline=%.0f now=%.0f)"
+                                    " — resuming graph with timeout_fallback then cleaning up:"
+                                    " session=%s tool_call=%s",
+                                    _deadline,
+                                    _now_ts,
+                                    orphan.session_id,
+                                    orphan.tool_call_id,
+                                )
+                                # P2#2 (round-17): Only cleanup the queue entry
+                                # *after* the graph resume succeeds.  If resume fails
+                                # (exception or no in-memory task), leave the entry so
+                                # the next sweep cycle can retry — otherwise the
+                                # LangGraph checkpoint stays stuck in the interrupt
+                                # state while the queue entry is gone, making the
+                                # frontend unable to retry.
+                                #
+                                # P2#1 (round-23): Task.resume() is async-submit — it
+                                # enqueues the resume command but does NOT wait for the
+                                # LangGraph checkpoint to actually advance.  If the
+                                # background graph execution fails (checkpoint error,
+                                # network issue) after resume returns, and we already
+                                # cleaned up the Redis confirmation entry, the interrupt
+                                # can never be retried.  Conservative fix: submit the
+                                # resume but never cleanup immediately — the commit_resume
+                                # path (called from within the graph when the interrupt
+                                # is actually consumed) is responsible for the final
+                                # cleanup.  Subsequent sweep iterations are idempotent:
+                                # re-submitting timeout_fallback to an already-advanced
+                                # graph is a no-op from the graph's perspective.
+                                try:
+                                    async with self._uow_factory() as _orphan_uow:
+                                        _orphan_session = await _orphan_uow.session.get_by_id(
+                                            orphan.session_id
+                                        )
+                                    if _orphan_session is not None:
+                                        _orphan_task = await self._get_task(_orphan_session)
+                                        if _orphan_task is None:
+                                            _orphan_task = await self._create_task(_orphan_session)
+                                        if _orphan_task is not None:
+                                            # P2#2 (round-25): check whether the task is
+                                            # PE-active before submitting a PE-style resume.
+                                            # If the task config was hot-switched or
+                                            # build_permission_engine failed after the
+                                            # orphan was written, _flow._permission_engine
+                                            # may be None.  In that case, forwarding
+                                            # claim_nonce causes interrupt_helper to call
+                                            # commit_resume on a None PE → AttributeError,
+                                            # and commit_resume cleanup never runs, leaving
+                                            # the Redis 'processing' entry permanently.
+                                            # Fix: detect legacy task + PE orphan and
+                                            # cleanup the queue entry directly here.
+                                            # P2#1 (round-26): RedisStreamTask stores
+                                            # the runner as self._task_runner; _flow
+                                            # lives on AgentTaskRunner, NOT on the task
+                                            # itself.  getattr(task, "_flow", None)
+                                            # always returns None for production tasks
+                                            # → _is_legacy_task never fires → PE orphan
+                                            # silently falls through to task.resume()
+                                            # → commit_resume hits None PE → AttributeError
+                                            # → entry leaks in 'processing' forever.
+                                            #
+                                            # Fix: resolve _flow via _task_runner first
+                                            # (production path), then fall back to direct
+                                            # _flow (test-stub compatibility).
+                                            _orphan_task_runner = getattr(
+                                                _orphan_task, "_task_runner", None
+                                            )
+                                            _orphan_flow = getattr(
+                                                _orphan_task_runner, "_flow", None
+                                            ) or getattr(_orphan_task, "_flow", None)
+                                            # Only check _permission_engine when _flow
+                                            # is explicitly present.  If _flow is absent
+                                            # on both paths, we cannot tell whether the
+                                            # task is legacy — fall through to the normal
+                                            # resume path (existing simple task stubs
+                                            # without _flow are not affected).
+                                            _orphan_task_pe = (
+                                                getattr(
+                                                    _orphan_flow, "_permission_engine", None
+                                                )
+                                                if _orphan_flow is not None
+                                                else None  # _flow absent → treat as unknown
+                                            )
+                                            _is_pe_orphan = orphan.claim_nonce is not None
+                                            # PE-orphan on legacy task: _flow is present
+                                            # but holds no _permission_engine.  If _flow
+                                            # is absent we cannot tell — fall through to
+                                            # the normal resume path.
+                                            _is_legacy_task = (
+                                                _orphan_flow is not None
+                                                and _orphan_task_pe is None
+                                            )
+
+                                            if _is_pe_orphan and _is_legacy_task:
+                                                # PE orphan on a legacy task: commit_resume
+                                                # won't run (no PE injected in task), so the
+                                                # queue entry must be freed manually.
+                                                # Codex round-29 P2#1: The LangGraph checkpoint
+                                                # is still at interrupt_helper — cleanup alone
+                                                # leaves the graph permanently stuck there
+                                                # (queue gone → frontend can't retry, and
+                                                # next sweep no longer sees an orphan).
+                                                # Fix: submit a legacy-style resume (no
+                                                # claim_nonce) so interrupt_helper walks the
+                                                # legacy deny path and advances the graph.
+                                                #
+                                                # Codex round-36 P2#1 (current fix):
+                                                # Legacy interrupt_helper NEVER calls
+                                                # commit_resume (no PE in flow), so the
+                                                # queue-cleanup path that the PE branch
+                                                # relies on does not exist for legacy tasks.
+                                                # Deferring cleanup to the next sweep means
+                                                # we repeatedly resubmit the same legacy
+                                                # deny every 30s forever — the entry stays
+                                                # in 'processing' permanently.  Round 35 was
+                                                # already wrong on this point.
+                                                #
+                                                # Correct behavior: after submitting the
+                                                # legacy resume successfully, cleanup the
+                                                # queue entry synchronously.  This DOES
+                                                # race with a background resume failure,
+                                                # but the alternative is a guaranteed
+                                                # permanent leak.  The trade-off here is
+                                                # explicit: legacy tasks have no
+                                                # commit_resume to defer to, so the sweeper
+                                                # is the only cleanup site.  If the
+                                                # background graph step fails after this
+                                                # point, the checkpoint stays in interrupt
+                                                # state but the user-facing confirmation is
+                                                # already timed out (deadline passed) and
+                                                # would have produced a deny outcome
+                                                # anyway.
+                                                logger.warning(
+                                                    "Expired orphan: PE orphan on legacy task"
+                                                    " (no _permission_engine) — submitting"
+                                                    " legacy deny resume and cleaning up queue"
+                                                    " entry on success (legacy path has no"
+                                                    " commit_resume to defer cleanup to);"
+                                                    " session=%s tool_call=%s claim_nonce=%s",
+                                                    orphan.session_id,
+                                                    orphan.tool_call_id,
+                                                    orphan.claim_nonce,
+                                                )
+                                                from langgraph.types import Command as _Command
+                                                _legacy_resume_ok = False
+                                                try:
+                                                    await _orphan_task.resume(
+                                                        _Command(
+                                                            resume={
+                                                                "tool_call_id": orphan.tool_call_id,
+                                                                "action": "deny",
+                                                                "scope": "once",
+                                                                "reason": "confirmation_timeout",
+                                                                # NO claim_nonce — forces legacy
+                                                                # interrupt_helper path which
+                                                                # will NOT call commit_resume.
+                                                            }
+                                                        )
+                                                    )
+                                                    _legacy_resume_ok = True
+                                                    logger.info(
+                                                        "Legacy resume submitted for PE-orphan-on-legacy-task;"
+                                                        " cleaning up queue entry synchronously"
+                                                        " (legacy path has no commit_resume) —"
+                                                        " session=%s tool_call=%s",
+                                                        orphan.session_id,
+                                                        orphan.tool_call_id,
+                                                    )
+                                                except Exception:
+                                                    logger.exception(
+                                                        "Expired orphan: legacy deny resume"
+                                                        " failed for PE orphan on legacy task"
+                                                        " — leaving entry for next sweep;"
+                                                        " session=%s tool_call=%s",
+                                                        orphan.session_id,
+                                                        orphan.tool_call_id,
+                                                    )
+                                                # Round 36 P2#1: cleanup ONLY on resume
+                                                # success.  Failure path leaves the entry
+                                                # so the next sweep can retry the resume
+                                                # submission itself.
+                                                if _legacy_resume_ok:
+                                                    try:
+                                                        await self._confirmation_manager.cleanup(
+                                                            orphan.session_id,
+                                                            orphan.tool_call_id,
+                                                        )
+                                                    except Exception:
+                                                        logger.exception(
+                                                            "Expired orphan: post-legacy-resume"
+                                                            " cleanup failed for"
+                                                            " session=%s tool_call=%s"
+                                                            " (entry may leak until manual"
+                                                            " intervention)",
+                                                            orphan.session_id,
+                                                            orphan.tool_call_id,
+                                                        )
+                                            else:
+                                                from langgraph.types import Command as _Command
+                                                await _orphan_task.resume(
+                                                    _Command(
+                                                        resume={
+                                                            "tool_call_id": orphan.tool_call_id,
+                                                            # P2#1 (round-24): use "deny" so
+                                                            # ResumeSignal.action Literal check
+                                                            # passes ("timeout_fallback" is not
+                                                            # a valid action literal and would
+                                                            # cause a ValueError in PE path).
+                                                            # timeout is treated as implicit deny.
+                                                            "action": "deny",
+                                                            "scope": "once",
+                                                            "reason": "confirmation_timeout",
+                                                            # Forward the PE claim nonce so
+                                                            # interrupt_helper routes to the PE
+                                                            # commit_resume path (which cleans
+                                                            # up the queue entry).  Without
+                                                            # this, claim_nonce is None → legacy
+                                                            # fallback → commit_resume cleanup
+                                                            # never runs → Redis entry leaks.
+                                                            "claim_nonce": orphan.claim_nonce,
+                                                        }
+                                                    )
+                                                )
+                                                logger.info(
+                                                    "Expired orphan: deny resume submitted"
+                                                    " (cleanup deferred to commit_resume) —"
+                                                    " session=%s tool_call=%s claim_nonce=%s",
+                                                    orphan.session_id,
+                                                    orphan.tool_call_id,
+                                                    orphan.claim_nonce,
+                                                )
+                                                # NOTE: Do NOT cleanup here. Task.resume is
+                                                # async-fire-and-forget; actual graph
+                                                # advancement happens in the background.
+                                                # Cleanup is handled by commit_resume when
+                                                # the graph interrupt is consumed, or by
+                                                # the next sweep if the background task
+                                                # fails.
+                                        else:
+                                            logger.warning(
+                                                "Expired orphan: no in-memory task found for"
+                                                " session=%s tool_call=%s — skipping cleanup,"
+                                                " next sweep will retry",
+                                                orphan.session_id,
+                                                orphan.tool_call_id,
+                                            )
+                                    else:
+                                        # P2#2 (round-24): session row deleted →
+                                        # orphan is unrecoverable (_get_task /
+                                        # _create_task will never succeed). Clean up
+                                        # the Redis processing entry immediately to
+                                        # prevent permanent resource leak and
+                                        # repeated-sweep noise every 30 s.
+                                        logger.warning(
+                                            "Expired orphan: session deleted for"
+                                            " session=%s tool_call=%s —"
+                                            " cleaning up unrecoverable confirmation",
+                                            orphan.session_id,
+                                            orphan.tool_call_id,
+                                        )
+                                        try:
+                                            await self._confirmation_manager.cleanup(
+                                                orphan.session_id,
+                                                orphan.tool_call_id,
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "Expired orphan: cleanup after session"
+                                                " deletion failed for session=%s"
+                                                " tool_call=%s",
+                                                orphan.session_id,
+                                                orphan.tool_call_id,
+                                            )
+                                except Exception:
+                                    logger.exception(
+                                        "Expired orphan: timeout resume submission failed for"
+                                        " session=%s tool_call=%s — leaving entry for next"
+                                        " sweep to retry",
+                                        orphan.session_id,
+                                        orphan.tool_call_id,
+                                    )
+                                # Never cleanup immediately — defer to commit_resume or next sweep
+                            else:
+                                # Still within deadline → reopen so user can retry
+                                logger.warning(
+                                    "Orphaned processing confirmation rescued: session=%s tool_call=%s",
+                                    orphan.session_id,
+                                    orphan.tool_call_id,
+                                )
+                                await self._confirmation_manager.mark_pending(
+                                    orphan.session_id,
+                                    orphan.tool_call_id,
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Orphan rescue failed for %s:%s",
+                                orphan.session_id,
+                                orphan.tool_call_id,
+                            )
+                except Exception:
+                    logger.exception("Orphaned processing sweep error")
+
             except asyncio.CancelledError:
                 break
             except Exception:
