@@ -65,6 +65,33 @@ class SessionService:
             self._spawn_fs_reconciler_walk(user_id)
         return session
 
+    async def create_session_with_parent(
+        self, user_id: str, sample_session_id: str
+    ) -> Session:
+        """创建一个 child session，挂在 parent 下（Phase 1 minimal subagent）。
+
+        Child sessions carry a non-null ``sample_session_id``; the frontend
+        session selector filters them out of the main list. Parent FK is
+        ondelete=RESTRICT — deleting the parent while children exist raises
+        IntegrityError, which the API layer (PR-5) translates to 409.
+
+        Does NOT trigger ``fs_reconciler`` walk: the parent ``create_session``
+        already walked the user's memory directory, so the child can skip the
+        redundant scan.
+        """
+        logger.info(
+            f"创建子会话: sample_session_id={sample_session_id} user_id={user_id}"
+        )
+        session = Session(
+            title="新对话",
+            user_id=user_id,
+            sample_session_id=sample_session_id,
+        )
+        async with self._uow:
+            await self._uow.session.save(session)
+        logger.info(f"成功创建子会话: {session.id} (parent={sample_session_id})")
+        return session
+
     def _spawn_fs_reconciler_walk(self, user_id: str) -> None:
         reconciler = self._fs_reconciler
         if reconciler is None:
