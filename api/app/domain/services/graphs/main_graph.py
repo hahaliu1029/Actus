@@ -467,7 +467,23 @@ def build_main_graph(
                 fresh_configurable["bound_tool_names"] = step_meta.bound_tool_names
                 fresh_skill_context = step_meta.skill_context
                 fresh_skill_ids: list[str] = list(step_meta.skill_ids)
-            except Exception:
+            except Exception as _exc:
+                # P1 #6 fix — when the runner has a ``tool_filter`` in
+                # effect (subagent), ``_react_graph_provider_for_executor``
+                # raises ``ToolFilterProviderFailure``. Propagate that
+                # marker so we do NOT fall back to the default unfiltered
+                # ``react_graph`` (which is built from the unfiltered
+                # ``_collect_all_tools()`` at flow construction time and
+                # would silently re-arm the subagent with the parent
+                # agent's complete tool set). The chat surfaces an error
+                # event instead of silently downgrading.
+                #
+                # Import is local to avoid a domain ↔ runner module cycle.
+                from app.domain.services.agent_task_runner import (
+                    ToolFilterProviderFailure,
+                )
+                if isinstance(_exc, ToolFilterProviderFailure):
+                    raise
                 logger.warning("react_graph_provider 失败，使用默认（无动态Skill工具）")
                 step_react = react_graph
                 fresh_skill_context = state.get("skill_context", "") or ""

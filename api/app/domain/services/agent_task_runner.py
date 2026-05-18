@@ -10,7 +10,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict, FrozenSet, List, Optional
 
 if TYPE_CHECKING:
     from app.domain.services.prompts.assembler import PromptAssembler
@@ -101,6 +101,19 @@ from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
 _EVENT_SEQ_TTL_SECONDS = 86400
+
+
+class ToolFilterProviderFailure(Exception):
+    """P1 #6 marker — raised by ``_react_graph_provider_for_executor``
+    when ``_tool_filter`` is in effect and the underlying provider
+    (``_build_step_react_graph``) fails.
+
+    ``main_graph.executor_node`` recognises this exception and
+    propagates it instead of falling back to the default unfiltered
+    ``react_graph``. Outside the subagent / filtered path this
+    exception is never raised — the wrapper delegates verbatim and
+    the executor's legacy graceful-degrade behaviour is preserved.
+    """
 
 # B4 Issue 1D: GC anchor + observability for shielded terminal tasks.
 # Without a hard reference, asyncio could collect the task before its done
@@ -264,8 +277,16 @@ class AgentTaskRunner(TaskRunner):
         was_background: bool = False,
         permission_engine: Any = None,  # PE-0 Phase 7: PermissionEngine | None
         session_state_machine: Any = None,  # PE-0 Phase 7: SessionStateMachine | None
+        tool_filter: Optional[FrozenSet[str]] = None,  # Phase 1 minimal subagent: tool-name allowlist (None = no filter)
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        # Phase 1 minimal subagent: optional tool-name allowlist.
+        # Distinguished by ``is not None`` not truthiness — an explicit
+        # empty frozenset means "deny all tools" (subagent scoped to
+        # zero capabilities), distinct from ``None`` ("no filter,
+        # legacy behavior"). See _build_lc_tools_full /
+        # _build_available_tool_summary for application.
+        self._tool_filter: Optional[FrozenSet[str]] = tool_filter
         # A7 Task 2.7: provider capability profile. None = legacy behavior
         # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
         self.profile = profile
@@ -1604,9 +1625,23 @@ class AgentTaskRunner(TaskRunner):
                         + ", ".join(always_bind_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
                     )
                 if mcp_discovery_names:
+                    # Phase 1 minimal subagent — tool_filter token leak fix:
+                    # the previous prefix "- mcp available (use get_mcp_tool
+                    # to activate): " baked the tool name ``get_mcp_tool``
+                    # into the prefix, which the filter loop below tokenized
+                    # only on the BODY portion. A subagent whose allowlist
+                    # excludes ``get_mcp_tool`` would still leak that name
+                    # via this prefix. Solution: keep the bullet prefix
+                    # tool-name-free, then emit the activation hint as a
+                    # SEPARATE bullet that the filter naturally drops when
+                    # ``get_mcp_tool`` is blocked (body-only filter
+                    # already handles it).
                     lines.append(
-                        "- mcp available (use get_mcp_tool to activate): "
+                        "- mcp available: "
                         + ", ".join(mcp_discovery_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                    )
+                    lines.append(
+                        "- mcp activation hint: get_mcp_tool"
                     )
 
         # A2A 工具（仅在 manager 存在时才有 LangChain 工具绑定到 LLM）
@@ -1641,6 +1676,53 @@ class AgentTaskRunner(TaskRunner):
             ):
                 memory_names.append("memory_save")
             lines.append("- memory: " + ", ".join(memory_names))
+
+        # Phase 1 minimal subagent: token-level allowlist filter.
+        # ``is not None`` (NOT truthy) — explicit ``frozenset()`` means
+        # "deny all"; ``None`` means "no filter, legacy behavior".
+        # Approach: regex over the category line ("- group: a, b, c"),
+        # keep only tokens (``[a-z_][a-z0-9_]+``) that are in the
+        # allowlist. Drop the whole line if no tokens survive. This
+        # guarantees blocked tool names cannot appear anywhere in the
+        # returned summary string — a hard behavioral invariant the
+        # ``test_tool_filter_available_summary_does_not_leak_blocked_tools``
+        # test enforces token-by-token.
+        _summary_tool_filter = getattr(self, "_tool_filter", None)
+        if _summary_tool_filter is not None:
+            _allow = _summary_tool_filter
+            # Allow ``-`` so canonical MCP tool names like
+            # ``mcp_amap-maps_maps_weather`` (server name segment can
+            # contain hyphens — see ``infrastructure/external/mcp.py``
+            # canonical name construction) tokenize as a single token
+            # and survive the allowlist intersection. Without this, an
+            # ALLOWED hyphenated MCP tool would be silently dropped
+            # from the summary even though it remains in the actual
+            # tool registry — a usability / false-negative leak.
+            _tok_re = re.compile(r"[a-z_][a-z0-9_\-]+")
+            _filtered_lines: list[str] = []
+            for _line in lines:
+                # Header line ("## Available Tool Summary") has no ":" prefix
+                # we care about — pass through unchanged.
+                if not _line.startswith("- "):
+                    _filtered_lines.append(_line)
+                    continue
+                # Split "- group: a, b, c" into "- group: " prefix + body.
+                _split_idx = _line.find(":")
+                if _split_idx < 0:
+                    # Defensive: malformed bullet — keep only if no tokens
+                    # collide with denylist (no body to filter, so skip).
+                    continue
+                _prefix = _line[: _split_idx + 1]
+                _body = _line[_split_idx + 1 :]
+                _kept_tokens = [
+                    _t for _t in _tok_re.findall(_body) if _t in _allow
+                ]
+                if not _kept_tokens:
+                    # All tool tokens on this line were blocked — drop the
+                    # whole bullet to avoid trailing "- group: " noise.
+                    continue
+                _filtered_lines.append(f"{_prefix} " + ", ".join(_kept_tokens))
+            lines = _filtered_lines
 
         summary = "\n".join(lines).strip()
         if len(summary) > char_budget:
@@ -1902,10 +1984,15 @@ class AgentTaskRunner(TaskRunner):
             from app.domain.services.tools.langchain_mcp_discovery import (
                 create_mcp_discovery_tools,
             )
+            # Phase 1 minimal subagent — thread tool_filter into discovery
+            # so that ``list_mcp_tools`` / ``get_mcp_tool`` cannot leak
+            # metadata or activate blocked MCP tools. The factory itself
+            # treats ``None`` as "no filter" (legacy behavior).
             lc_tools.extend(
                 create_mcp_discovery_tools(
                     mcp_tool_ref=lambda: self._mcp_tool,
                     activated_tools_ref=lambda: self._activated_mcp_tools,
+                    tool_filter=getattr(self, "_tool_filter", None),
                 )
             )
 
@@ -1948,6 +2035,16 @@ class AgentTaskRunner(TaskRunner):
                 )
             )
 
+        # Phase 1 minimal subagent: tool_filter allowlist enforcement.
+        # Use ``is not None`` not truthy — empty frozenset means "deny all"
+        # (explicit empty allowlist), distinct from None ("no filter").
+        # ``getattr`` default protects pre-existing tests that build
+        # half-constructed runners via ``object.__new__(AgentTaskRunner)``
+        # without setting ``_tool_filter``.
+        _tool_filter = getattr(self, "_tool_filter", None)
+        if _tool_filter is not None:
+            lc_tools = [t for t in lc_tools if t.name in _tool_filter]
+
         return wrap_tool_list_for_supervisor(lc_tools, self._execution_supervisor)
 
     def _build_lc_tools_for_step(self) -> list[Any]:
@@ -1978,6 +2075,57 @@ class AgentTaskRunner(TaskRunner):
         tools = self._build_lc_tools_full()
         self._lc_tools_cache[cache_key] = tools
         return tools
+
+    async def _react_graph_provider_for_executor(
+        self, step_description: str = ""
+    ) -> "tuple[Any, StepMetadata]":
+        """P1 #6 fix — fail-closed provider wrapper for the subagent path.
+
+        The default ``react_graph`` built once in
+        ``PlannerReActFlow._ensure_graphs`` aggregates ALL native + MCP +
+        A2A + skill + memory tools without applying ``self._tool_filter``
+        (the filter is enforced only inside per-step
+        ``_build_lc_tools_full``). When ``main_graph.executor_node``
+        catches a provider exception it falls back to that default
+        unfiltered ``react_graph`` (see ``main_graph.py`` around line
+        ``react_graph_provider 失败，使用默认（无动态Skill工具）``).
+        For a parent agent (``_tool_filter is None``) this is the
+        intended graceful-degradation path. For a subagent
+        (``_tool_filter is not None``) it would silently re-arm the
+        agent with the parent's full toolset and break the security
+        boundary.
+
+        Behaviour:
+          * ``_tool_filter is None`` → delegate verbatim to
+            ``_build_step_react_graph`` (legacy graceful-degrade path
+            stays intact at the executor level).
+          * ``_tool_filter is not None`` → catch any exception from
+            ``_build_step_react_graph`` and re-raise it wrapped in
+            ``ToolFilterProviderFailure``. ``main_graph.executor_node``
+            recognises this marker exception and lets it propagate
+            instead of falling back to the default unfiltered
+            ``react_graph``. Other exception types still hit the
+            executor's legacy fallback (unchanged behaviour).
+
+        Wrap site: ``self._flow._react_graph_provider = ...`` in the
+        invoke main loop.
+        """
+        if self._tool_filter is None:
+            return await self._build_step_react_graph(step_description)
+        try:
+            return await self._build_step_react_graph(step_description)
+        except Exception as exc:
+            logger.error(
+                "[ToolFilter] react_graph_provider failed under tool_filter "
+                "(allowlist size=%d); raising ToolFilterProviderFailure to "
+                "prevent fallback to default unfiltered react_graph.",
+                len(self._tool_filter),
+            )
+            raise ToolFilterProviderFailure(
+                "react_graph_provider failed while tool_filter is in effect; "
+                "fail-closed to prevent silently re-arming the subagent with "
+                "the parent agent's unfiltered tool set."
+            ) from exc
 
     async def _build_step_react_graph(
         self, step_description: str = ""
@@ -3300,7 +3448,20 @@ class AgentTaskRunner(TaskRunner):
                         # Phase 2+3: 设置 LangGraph configurable 回调
                         if hasattr(self._flow, '_skill_context_refresher'):
                             self._flow._skill_context_refresher = self._refresh_skill_context_for_step
-                            self._flow._react_graph_provider = self._build_step_react_graph
+                            # P1 #6 fix — subagent fail-closed: when a
+                            # ``tool_filter`` is in effect, route the
+                            # provider through ``_react_graph_provider_for_executor``
+                            # which re-raises provider exceptions instead
+                            # of letting ``main_graph.executor_node`` fall
+                            # back to the default UNFILTERED ``react_graph``
+                            # built in ``_ensure_graphs``. Without this
+                            # wrap, any provider exception silently re-arms
+                            # the subagent with the parent agent's full
+                            # tool set, undermining the security boundary
+                            # ``tool_filter`` exists to enforce.
+                            self._flow._react_graph_provider = (
+                                self._react_graph_provider_for_executor
+                            )
                             self._flow._skill_guide_injector = SkillGuideInjector(
                                 selected_skills, self._tier2_preloaded_skill_ids
                             )

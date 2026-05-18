@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Type
+from typing import Any, AsyncGenerator, Callable, Dict, FrozenSet, List, Optional, Type
 
 from app.application.errors.exceptions import (
     BadRequestError,
@@ -228,8 +228,24 @@ class AgentService:
         # 2.调用人物类的get方法获取对应的任务实例
         return self._task_cls.get(task_id)
 
-    async def _create_task(self, session: Session) -> Task:
-        """根据传递的会话创建一个新任务"""
+    async def _create_task(
+        self,
+        session: Session,
+        *,
+        tool_filter: Optional[FrozenSet[str]] = None,
+    ) -> Task:
+        """根据传递的会话创建一个新任务
+
+        Args:
+            session: 会话实例
+            tool_filter: Phase 1 minimal subagent — 可选的工具名白名单
+                （``None`` = 不过滤，沿用历史行为；空集合 = 显式拒绝所有工具）。
+                值会原封不动透传给 ``AgentTaskRunner``，仅在 fresh chat
+                创建任务的路径上由 ``chat()`` 注入；resume/handoff/sweeper
+                等路径上调用方默认传 ``None``（保持向后兼容）。
+                F8 已知 gap：当前 ``tool_filter`` 不会持久化，pod 重启后
+                重建任务时白名单会丢失，由 caller 自行兜底。
+        """
         snap = self._config_snapshot  # local capture — immune to concurrent refresh
 
         # 1. 通过 lifecycle service 获取或创建沙箱 handle（I5: 禁止隐式复活）
@@ -586,6 +602,7 @@ class AgentService:
             execution_supervisor=self._supervisor,
             idle_watchdog=getattr(self, "_idle_watchdog", None),
             was_background=session.was_background,
+            tool_filter=tool_filter,
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);
@@ -2681,8 +2698,21 @@ class AgentService:
         tool_confirmation: object | None = None,
         latest_event_id: Optional[str] = None,
         timestamp: Optional[datetime] = None,
+        tool_filter: Optional[FrozenSet[str]] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
-        """根据传递的信息调用Agent服务发起对话请求"""
+        """根据传递的信息调用Agent服务发起对话请求
+
+        Args:
+            tool_filter: Phase 1 minimal subagent — optional allowlist of
+                tool names. ``None`` (default) preserves existing behavior
+                (no filtering). Empty ``frozenset()`` means "deny all".
+                Propagated only into the fresh-chat ``_create_task`` path;
+                resume / FINISHING / tool_confirmation paths keep ``None``
+                because the caller has no fresh ``tool_filter`` context.
+                F8 known gap: ``tool_filter`` is process-local; if the pod
+                restarts mid-session, the rebuilt task will lose the
+                allowlist. Callers must replay if persistence is required.
+        """
         latest_event_id = (
             latest_event_id
             if self._is_valid_redis_stream_id(latest_event_id)
@@ -2775,7 +2805,10 @@ class AgentService:
                             await self._sandbox_lifecycle_service.resume(session.id)
                         except Exception:
                             pass  # acquire inside _create_task will handle the actual state
-                    task = await self._create_task(session)
+                    # Phase 1 minimal subagent: only the fresh-chat creation path
+                    # propagates tool_filter — resume / FINISHING / sweeper paths
+                    # have no fresh allowlist context and stay on the default None.
+                    task = await self._create_task(session, tool_filter=tool_filter)
                     if not task:
                         logger.error(f"会话[{session_id}]创建任务失败")
                         raise RuntimeError(f"会话[{session_id}]创建任务失败")

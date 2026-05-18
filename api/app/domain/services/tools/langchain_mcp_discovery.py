@@ -9,7 +9,7 @@ Follows the same pattern as Skill progressive loading:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, FrozenSet, Optional
 
 from langchain_core.tools import StructuredTool
 
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 def create_mcp_discovery_tools(
     mcp_tool_ref: Callable[[], Any],
     activated_tools_ref: Callable[[], set[str]],
+    tool_filter: Optional[FrozenSet[str]] = None,
 ) -> list[StructuredTool]:
     """Create MCP discovery tools for progressive loading.
 
@@ -31,6 +32,17 @@ def create_mcp_discovery_tools(
     ----------
     mcp_tool_ref : callable returning the MCPTool instance
     activated_tools_ref : callable returning the mutable activated tools set
+    tool_filter : optional frozenset of allowed tool names. When provided
+        (``is not None``; ``frozenset()`` means deny-all):
+          - ``list_mcp_tools`` only surfaces MCP tool names whose canonical
+            name is in the allowlist — names absent from the allowlist are
+            silently omitted from the discovery output.
+          - ``get_mcp_tool`` refuses to activate (and refuses to return a
+            schema for) any name absent from the allowlist; instead returns
+            a denial message that exposes only the requested name (which the
+            caller already chose to mention) and no schema/metadata.
+        ``None`` (default) preserves legacy "no filter" behaviour and is
+        the correct value at the top-level / parent-agent layer.
     """
 
     async def _list_mcp_tools(server_name: str = "") -> tuple[str, ToolOutcome]:
@@ -53,6 +65,11 @@ def create_mcp_discovery_tools(
                 prefix = server_name if server_name.startswith("mcp_") else f"mcp_{server_name}"
                 if not name.startswith(f"{prefix}_"):
                     continue
+            # Phase 1 minimal subagent — tool_filter enforcement:
+            # skip any tool whose canonical name is not in the allowlist
+            # so the metadata never reaches the LLM.
+            if tool_filter is not None and name not in tool_filter:
+                continue
             lines.append(f"- **{name}**: {desc}")
 
         if len(lines) == 1:
@@ -60,16 +77,48 @@ def create_mcp_discovery_tools(
             outcome = AllowSuccess(content=content)
             return outcome.content, outcome
 
-        lines.append(
-            "\nUse `get_mcp_tool(tool_name)` to get full parameter details "
-            "and activate a tool."
-        )
+        # P1 #5 fix — Make the activation-hint allowlist-aware so the
+        # blocked meta-tool name (``get_mcp_tool``) never leaks via the
+        # ``list_mcp_tools`` body when the subagent's allowlist excludes
+        # it. ``tool_filter is None`` preserves legacy parent-agent
+        # behaviour (hint always emitted).
+        if tool_filter is None or "get_mcp_tool" in tool_filter:
+            lines.append(
+                "\nUse `get_mcp_tool(tool_name)` to get full parameter details "
+                "and activate a tool."
+            )
         content = "\n".join(lines)
         outcome = AllowSuccess(content=content)
         return outcome.content, outcome
 
     async def _get_mcp_tool(tool_name: str) -> tuple[str, ToolOutcome]:
         """获取 MCP 工具完整参数定义并激活。激活后该工具将在下一个 plan step 可直接调用。"""
+        # Phase 1 minimal subagent — tool_filter enforcement:
+        # refuse activation BEFORE iterating the MCP catalog so we never
+        # leak schema details (parameters / description) for a blocked
+        # tool. The error message echoes only the requested name, which
+        # the LLM already supplied as the ``tool_name`` argument — so we
+        # don't leak any new information.
+        if tool_filter is not None and tool_name not in tool_filter:
+            # P1 #5 fix — Make the discovery hint allowlist-aware. If
+            # ``list_mcp_tools`` is itself blocked, omit the hint entirely
+            # so we don't leak the blocked meta-tool name in the denial
+            # message. When neither hint is allowed, the message is just
+            # the bare unavailability notice.
+            base = (
+                f"MCP tool '{tool_name}' is not available in this agent's "
+                "tool allowlist."
+            )
+            if "list_mcp_tools" in tool_filter:
+                content = (
+                    f"{base} Use `list_mcp_tools()` to see the tools that "
+                    "are accessible."
+                )
+            else:
+                content = base
+            outcome = AllowSuccess(content=content)
+            return outcome.content, outcome
+
         mcp = mcp_tool_ref()
         activated = activated_tools_ref()
 
@@ -108,10 +157,16 @@ def create_mcp_discovery_tools(
                 outcome = AllowSuccess(content=content, data=schema if isinstance(schema, dict) else None)
                 return outcome.content, outcome
 
-        content = (
-            f"MCP tool '{tool_name}' not found. "
-            "Use `list_mcp_tools()` to see available tools."
-        )
+        # P1 #5 fix — same allowlist-aware treatment for the "not found"
+        # branch: don't expose ``list_mcp_tools`` as a hint if the
+        # subagent allowlist excludes it.
+        not_found_base = f"MCP tool '{tool_name}' not found."
+        if tool_filter is None or "list_mcp_tools" in tool_filter:
+            content = (
+                f"{not_found_base} Use `list_mcp_tools()` to see available tools."
+            )
+        else:
+            content = not_found_base
         outcome = AllowSuccess(content=content)
         return outcome.content, outcome
 
