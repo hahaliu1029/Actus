@@ -1,0 +1,13 @@
+{
+  "id": "009_native_safe_file_read",
+  "tool_source": "native",
+  "tool_name": "file_read",
+  "tool_args": {"path": "/home/ubuntu/workspace/README.md"},
+  "risk_level": "low",
+  "runtime_type": "native",
+  "trust_origin": "builtin",
+  "expected_decision": "approve",
+  "decision_rationale": "Read-only inside workspace.",
+  "annotator": "@hahaliu1029",
+  "annotated_at": "2026-05-18"
+}

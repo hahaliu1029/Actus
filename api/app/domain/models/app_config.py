@@ -261,7 +261,12 @@ class ToolConfirmationConfig(BaseModel):
     )
     permission_engine_skill_enabled: bool = Field(
         default=True,
-        description="PE-1 Skill path; False -> R3 Stage P legacy",
+        description=(
+            "Drives the PE Skill source after PE-1 ship. When False, "
+            "skill tool calls fall back to the legacy R3 path inside "
+            "react_graph (line 2243-2395) until PE-1b deletes that branch. "
+            "PE-2 widens the source registry; per-source flags retire in PE-3."
+        ),
     )
     permission_engine_mcp_enabled: bool = Field(
         default=True,

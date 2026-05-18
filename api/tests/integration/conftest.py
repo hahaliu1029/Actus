@@ -762,3 +762,99 @@ def other_user_token() -> str:
     from core.security import create_access_token
 
     return create_access_token({"sub": str(_uuid.uuid4())})
+
+
+# ── PE-1 T20 SkillSource E2E fixture ───────────────────────────────────────
+#
+# Stub mirroring SkillTool's ``_tool_bindings`` shape (see
+# ``api/app/domain/services/tools/skill.py:133-141``) plus the two public
+# ports SkillRiskRefresher reaches into:
+#   - ``resolve_skill_dir(tool_name) -> Path | None``
+#   - ``refresh_risk_if_stale(tool_name) -> str | None``
+#
+# The fixture builds a real on-disk skill directory under tmp_path so
+# ``SkillsGuard.compute_content_hash(skill_dir)`` succeeds. The fake's
+# content_hash does NOT match the test's ``SkillCallMetadata.content_hash``
+# ("sha256:hash1"), so SkillRiskRefresher routes through the "hash differs"
+# branch → calls ``refresh_risk_if_stale`` → returns "high" → SkillSource
+# returns RiskLevel.HIGH (defense in depth).
+
+
+@pytest.fixture
+def fake_skill_tool_with_high_risk_binding(tmp_path):
+    """Stub SkillTool with a single binding registering ``myskill_run`` at
+    HIGH final_risk.
+
+    Layout::
+
+        tmp_path/skills_root/sk_test/manifest.json   # one stable file → deterministic hash
+
+    The skill_dir is real (so ``SkillsGuard.compute_content_hash`` works);
+    refresh_risk_if_stale always returns "high" (mirrors SkillSource's
+    "refreshed → risk_level=HIGH" branch).
+    """
+    from pathlib import Path
+
+    from app.domain.models.skill import (
+        Skill, SkillRuntimeType, SkillSourceType,
+    )
+
+    skills_root = tmp_path / "skills_root"
+    skill_dir = skills_root / "sk_test"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "manifest.json").write_text(
+        '{"name": "myskill", "tools": []}', encoding="utf-8",
+    )
+
+    skill = Skill(
+        id="sk_test",
+        slug="myskill",
+        name="myskill",
+        description="",
+        version="0.1.0",
+        source_type=SkillSourceType.LOCAL,
+        source_ref="/tmp/myskill",
+        runtime_type=SkillRuntimeType.NATIVE,
+        manifest={"name": "myskill", "tools": []},
+        enabled=True,
+        installed_by=None,
+        trust_origin="user_installed",
+        # content_hash deliberately differs from the test's
+        # SkillCallMetadata.content_hash so SkillRiskRefresher routes through
+        # the "hash diff → refresh_risk_if_stale" path.
+        scan_report={"content_hash": "sha256:hash1", "verdict": "safe"},
+    )
+
+    class _FakeSkillTool:
+        """SkillTool-shaped stub for SkillRiskRefresher / SkillSource."""
+
+        _tool_bindings: dict[str, dict[str, object]] = {
+            "myskill_run": {
+                "skill": skill,
+                "runtime_type": SkillRuntimeType.NATIVE,
+                "manifest_tool": {},
+                "final_risk": "high",
+                "trust_origin": "user_installed",
+                "scan_verdict": "safe",
+            },
+        }
+
+        def __init__(self, *, root: Path) -> None:
+            self._skills_root = root
+
+        def has_tool(self, name: str) -> bool:
+            return name in self._tool_bindings
+
+        def resolve_skill_dir(self, tool_name: str) -> Path | None:
+            binding = self._tool_bindings.get(tool_name)
+            if not binding:
+                return None
+            return self._skills_root / binding["skill"].id
+
+        def refresh_risk_if_stale(self, tool_name: str) -> str | None:
+            binding = self._tool_bindings.get(tool_name)
+            if not binding:
+                return None
+            return binding["final_risk"]
+
+    return _FakeSkillTool(root=skills_root)

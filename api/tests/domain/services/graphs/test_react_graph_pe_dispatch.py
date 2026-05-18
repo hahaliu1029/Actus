@@ -115,12 +115,37 @@ def _make_state(tool_name: str, tool_args: dict, call_id: str = "tc1") -> dict:
     }
 
 
-def _make_config(fake_pe, fake_ssm, *, user_id="u", session_id="s", extra: dict | None = None):
-    """Build a minimal RunnableConfig configurable dict."""
+def _make_config(
+    fake_pe,
+    fake_ssm,
+    *,
+    user_id="u",
+    session_id="s",
+    extra: dict | None = None,
+    pe_native_enabled: bool = True,
+    pe_skill_enabled: bool = True,
+):
+    """Build a minimal RunnableConfig configurable dict.
+
+    PE-1 §2.5: ``tool_confirmation_config`` is now required so that
+    ``is_pe_enabled_for_source`` can resolve the per-source flag inside
+    ``_pe_dispatch``. We expose a SimpleNamespace duck-typed to the real
+    ``ToolConfirmationConfig`` (only the flags consulted by the gate are
+    set).
+    """
+    from types import SimpleNamespace
+
+    tc_cfg = SimpleNamespace(
+        enabled=True,
+        permission_engine_native_enabled=pe_native_enabled,
+        permission_engine_skill_enabled=pe_skill_enabled,
+    )
+
     configurable: dict = {
         "permission_engine": fake_pe,
         "session_state_machine": fake_ssm,
-        "permission_engine_native_enabled": True,
+        "permission_engine_native_enabled": pe_native_enabled,
+        "tool_confirmation_config": tc_cfg,
         "user_id": user_id,
         "session_id": session_id,
         "thread_id": session_id,
@@ -227,13 +252,21 @@ class TestToolNodeCallsPeEvaluate:
         assert len(fake_pe.calls) == 0, "PE should not be called when absent"
 
     async def test_tool_node_pe_not_called_when_flag_false(self):
-        """When permission_engine_native_enabled=False, PE branch is skipped."""
+        """When permission_engine_native_enabled=False, PE branch is skipped.
+
+        PE-1 §2.5: the per-source flag now lives on ``tool_confirmation_config``
+        and is consulted per-call inside ``_pe_dispatch`` (no longer a master
+        gate). ``_make_config(pe_native_enabled=False)`` flips both the
+        configurable-level flag (used by the legacy code path) AND the
+        ``tool_confirmation_config.permission_engine_native_enabled`` attribute
+        (used by ``is_pe_enabled_for_source``).
+        """
         tool_node_fn = _build_tool_node_fn()
         fake_pe = FakeRecordingPE()
         fake_ssm = _make_fake_ssm()
 
         state = _make_state("file_write", {"path": "/a"})
-        config = _make_config(fake_pe, fake_ssm, extra={"permission_engine_native_enabled": False})
+        config = _make_config(fake_pe, fake_ssm, pe_native_enabled=False)
 
         await tool_node_fn(state, config)
 
@@ -670,6 +703,21 @@ class TestPeSkillSourceRouting:
 # P1#5: build_permission_engine respects smart_approve_enabled flag
 # ---------------------------------------------------------------------------
 
+def _make_pe_sources():
+    """PE-1 §2.6: build_permission_engine requires a full source registry.
+
+    Tests that exercise SmartApprove gating don't care about source dispatch —
+    provide minimal stubs that satisfy validate_pe_source_registry.
+    """
+    from unittest.mock import MagicMock
+    from app.domain.services.permission.sources import NativeSource, SkillSource
+
+    return {
+        "native": NativeSource(),
+        "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
+    }
+
+
 class TestBuildPermissionEngineSmartApproveGate:
     """P1#5: SmartApproveProvider only registered when smart_approve_enabled=True."""
 
@@ -693,6 +741,7 @@ class TestBuildPermissionEngineSmartApproveGate:
             reader=fake_reader,
             summary_llm=fake_llm,
             smart_approve_enabled=False,  # <-- gate
+            sources=_make_pe_sources(),
         )
 
         # DefaultPermissionEngine stores the registry
@@ -716,6 +765,7 @@ class TestBuildPermissionEngineSmartApproveGate:
             reader=MagicMock(),
             summary_llm=fake_llm,
             smart_approve_enabled=True,
+            sources=_make_pe_sources(),
         )
 
         from app.domain.services.permission.default_engine import DefaultPermissionEngine
@@ -737,6 +787,7 @@ class TestBuildPermissionEngineSmartApproveGate:
             reader=MagicMock(),
             summary_llm=None,  # no LLM
             smart_approve_enabled=True,
+            sources=_make_pe_sources(),
         )
 
         from app.domain.services.permission.default_engine import DefaultPermissionEngine

@@ -98,12 +98,24 @@ def _make_state(
 
 
 def _make_config(fake_pe, fake_ssm, *, user_id="u", session_id="s"):
-    from app.domain.models.session import SessionStatus
+    """PE-1 §2.5: include ``tool_confirmation_config`` so the per-call gate
+    inside ``_pe_dispatch`` resolves ``is_pe_enabled_for_source`` to True.
+    """
+    from types import SimpleNamespace
+
+    from app.domain.models.session import SessionStatus  # noqa: F401
+
+    tc_cfg = SimpleNamespace(
+        enabled=True,
+        permission_engine_native_enabled=True,
+        permission_engine_skill_enabled=True,
+    )
     return {
         "configurable": {
             "permission_engine": fake_pe,
             "session_state_machine": fake_ssm,
             "permission_engine_native_enabled": True,
+            "tool_confirmation_config": tc_cfg,
             "user_id": user_id,
             "session_id": session_id,
             "thread_id": session_id,
@@ -319,12 +331,19 @@ class TestBatchReplayPlusAskedClearsConsumed:
             "pending_ask_artifact": None,
             "pending_ask_tool_args": None,
         }
-        from app.domain.models.session import SessionStatus
+        from types import SimpleNamespace
+        from app.domain.models.session import SessionStatus  # noqa: F401
+        tc_cfg = SimpleNamespace(
+            enabled=True,
+            permission_engine_native_enabled=True,
+            permission_engine_skill_enabled=True,
+        )
         config = {
             "configurable": {
                 "permission_engine": fake_pe,
                 "session_state_machine": fake_ssm,
                 "permission_engine_native_enabled": True,
+                "tool_confirmation_config": tc_cfg,
                 "user_id": "u",
                 "session_id": "s",
                 "thread_id": "s",

@@ -20,7 +20,7 @@ which read the OTel global providers — same path as
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 if TYPE_CHECKING:
     from app.domain.services.permission.engine import PermissionEngine
@@ -121,6 +121,7 @@ def build_permission_engine(
     smart_approve_medium_only: bool = False,
     confirmation_timeout_seconds: int = 300,  # P2#3: deadline for ConfirmationQueue entries
     decision_recorder: Any = None,  # P3#1: OTel decision recorder callable
+    sources: "Mapping[str, Any] | None" = None,
 ) -> "PermissionEngine":
     """Build a DefaultPermissionEngine wired with SmartApproveProvider.
 
@@ -163,9 +164,19 @@ def build_permission_engine(
         ``_record_decision`` emits canonical OTel attributes (decision_stage,
         etc.) on every stage transition.  Callers should pass
         ``build_decision_recorder()`` here.  Defaults to None (no-op inside PE).
+    sources:
+        PE-1 §2.6: Mapping of tool_source → PermissionSource. Must contain
+        at least every entry in PE_SUPPORTED_SOURCES_AFTER_PE_1. Caller
+        constructs (typically NativeSource() + SkillSource(refresher, redis)
+        wired with the per-task Redis client).
     """
     from app.domain.services.permission.default_engine import DefaultPermissionEngine
     from app.domain.services.permission.smart_approve_provider import SmartApproveProvider
+
+    # PE-1 §2.6: validation is caller-driven (see _create_task + preflight_resume
+    # late-registration). Build accepts partial source maps so callers can
+    # register skill_source after AgentTaskRunner is constructed (skill_tool
+    # lives on the runner, not on AgentService at PE build time).
 
     escalation_registry: dict[str, Any] = {}
     # P1#5: gate SmartApproveProvider on the config flag (not just summary_llm presence).
@@ -194,6 +205,7 @@ def build_permission_engine(
         escalation_registry=escalation_registry,
         confirmation_timeout_seconds=confirmation_timeout_seconds,
         decision_recorder=decision_recorder,  # P3#1: forward to PE for OTel emit
+        sources=sources,
     )
 
 
@@ -222,3 +234,29 @@ def build_decision_recorder() -> Callable[..., None]:
     from app.infrastructure.observability.decision_trace import record_decision  # noqa: PLC0415
 
     return record_decision
+
+
+def validate_pe_source_registry(sources: "Mapping[str, Any]") -> None:
+    """Raise PermissionConfigurationError when the registered ``sources``
+    Mapping does not cover the entries that ``is_pe_enabled_for_source``
+    will gate-pass at runtime.
+
+    PE-1 §2.6: defense-in-depth at DI/factory time. The CI invariant test
+    is the primary gate; this runtime check catches operator missteps
+    (e.g., forgetting to wire SkillSource in a custom factory) before any
+    tool call reaches PE and triggers UnsupportedSource silently.
+    """
+    from app.domain.services.permission.errors import (
+        PermissionConfigurationError,
+    )
+    from app.domain.services.permission.sources import (
+        PE_SUPPORTED_SOURCES_AFTER_PE_1,
+    )
+
+    missing = PE_SUPPORTED_SOURCES_AFTER_PE_1 - set(sources or {})
+    if missing:
+        raise PermissionConfigurationError(
+            "PE_SUPPORTED_SOURCES_AFTER_PE_1 claims "
+            f"{sorted(PE_SUPPORTED_SOURCES_AFTER_PE_1)} but DI registered "
+            f"only {sorted((sources or {}).keys())}. Missing: {sorted(missing)}."
+        )

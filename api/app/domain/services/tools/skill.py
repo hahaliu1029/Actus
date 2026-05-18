@@ -8,6 +8,7 @@ import logging
 import re
 import shlex
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.domain.external.sandbox import SandboxHandle
@@ -161,6 +162,28 @@ class SkillTool(BaseTool):
 
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_bindings
+
+    def resolve_skill_dir(self, tool_name: str) -> Path | None:
+        """Public port for SkillRiskRefresher (PE-1).
+
+        Encapsulates: binding lookup → bundle_sync_manager._skills_root_dir
+        → ``skills_root / skill.id``. Returns ``None`` on any state preventing
+        resolution (binding miss / no manager / no root). Path existence is
+        the caller's concern.
+
+        PE-1 promotes the operation to a public method so SkillRiskRefresher
+        does not reach across two classes' private attrs (spec Round 3 P1#5).
+        """
+        binding = self._tool_bindings.get(tool_name)
+        if not binding:
+            return None
+        if not self._bundle_sync_manager:
+            return None
+        skills_root = getattr(self._bundle_sync_manager, "_skills_root_dir", None)
+        if not skills_root:
+            return None
+        skill = binding["skill"]
+        return Path(skills_root) / skill.id
 
     def refresh_risk_if_stale(self, tool_name: str) -> str | None:
         """Check if the skill's content has changed since init and rescan if needed.

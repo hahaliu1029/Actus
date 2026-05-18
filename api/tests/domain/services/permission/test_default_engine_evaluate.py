@@ -18,6 +18,7 @@ from app.domain.services.permission.errors import (
     PolicyConflict,
     SessionModeViolation,
 )
+from app.domain.services.permission.sources import NativeSource
 from app.domain.services.permission.tool_call_spec import ToolCallSpec
 from app.domain.services.risk_assessor import RiskAssessment, RiskLevel
 
@@ -26,6 +27,30 @@ import pytest
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _none_ra() -> RiskAssessment:
+    """RiskAssessment for a 'no risk' native call.
+
+    PE-1 step 5.5 routes every call through a PermissionSource; NativeSource
+    is a passthrough that raises if ``risk_assessment is None`` (it expects
+    tool_node to have already run RiskAssessor). Pre-fill with a NONE-level
+    assessment so existing PE-0 unit tests that don't care about risk still
+    exercise the policy / grant / queue branches.
+    """
+    return RiskAssessment(
+        tool_name="file_write",
+        tool_args={"path": "/x"},
+        static_level=RiskLevel.NONE,
+        dynamic_level=RiskLevel.NONE,
+        final_level=RiskLevel.NONE,
+        risk_reason="safe",
+        matched_patterns=[],
+        suggested_alternative=None,
+        primary_arg="",
+        dir_arg=None,
+        arg_digest="adg",
+    )
 
 
 def _call(tcid: str = "tc1") -> ToolCallSpec:
@@ -37,6 +62,7 @@ def _call(tcid: str = "tc1") -> ToolCallSpec:
         session_id="s1",
         arg_digest="adg",
         tool_call_id=tcid,
+        risk_assessment=_none_ra(),
     )
 
 
@@ -97,6 +123,7 @@ def _make_engine(*, policy="auto", grant=None, smart=None, queue_existing=None):
         session_machine=ssm,
         reader=reader,
         escalation_registry={"smart_approve": smart_provider},
+        sources={"native": NativeSource()},
     )
     return engine, writer, queue, ssm, reader, smart_provider
 
@@ -181,6 +208,7 @@ def test_evaluate_ask_policy_stores_queue_and_returns_asked_with_confirmation_id
         session_machine=AsyncMock(),
         reader=reader,
         escalation_registry={},  # no smart_approve provider
+        sources={"native": NativeSource()},
     )
 
     async def _run_test():
@@ -494,6 +522,7 @@ def test_evaluate_uses_configured_timeout_for_deadline_ts():
         session_machine=AsyncMock(),
         reader=reader,
         escalation_registry={},  # no smart_approve — straight to Asked
+        sources={"native": NativeSource()},
         confirmation_timeout_seconds=60,  # non-default
     )
 
@@ -715,6 +744,7 @@ def test_evaluate_smart_approve_deny_does_not_persist_session_grant():
         session_machine=ssm,
         reader=reader,
         escalation_registry={"smart_approve": smart_provider},
+        sources={"native": NativeSource()},
         decision_recorder=_capture_decision,
     )
 

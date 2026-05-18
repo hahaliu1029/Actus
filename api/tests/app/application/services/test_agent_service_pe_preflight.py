@@ -648,16 +648,20 @@ async def test_rollback_skips_when_nonce_mismatch() -> None:
 
 
 async def test_preflight_non_native_tool_routes_to_legacy(monkeypatch) -> None:
-    """P1#1: When pending_detail.tool_name resolves to a non-native source (skill/mcp/a2a),
-    preflight_resume_tool_confirmation must fall back to the legacy path.
+    """P1#1: When pending_detail.tool_name resolves to a non-native source (skill/mcp/a2a)
+    AND its per-source PE flag is disabled, preflight_resume_tool_confirmation must
+    fall back to the legacy path.
 
-    The PE path only handles native tools (PE-0 scope).  Non-native tools go
-    through the legacy confirmation path because tool_node does not consume
-    pe_resume_outcomes for skill/mcp/a2a batches.
+    PE-1 §3.2: skill is now PE-eligible by default (permission_engine_skill_enabled=True).
+    To preserve the legacy-routing intent of this test we explicitly set the
+    per-source flag to False below — emulating an operator who has not yet
+    enabled SkillSource for their deployment.
     """
     # Use a skill_ prefixed tool name — resolve_tool_source will return source="skill"
     skill_detail = _StubDetail(tool_name="skill_my_custom_tool")
     service, fakes = _make_service(detail=skill_detail, pe_enabled=True)
+    # PE-1 §3.2: explicitly disable per-source PE for skill so the legacy gate fires.
+    service._config_snapshot.agent_config.tool_confirmation.permission_engine_skill_enabled = False
     fake_session = Session(id="s_test", user_id="u_test", status=SessionStatus.RUNNING)
 
     async def _fake_get_accessible_session(*args, **kwargs):
@@ -794,6 +798,9 @@ async def test_preflight_mixed_batch_native_pending_skill_in_batch_routes_to_leg
         user_id="u_mixed",
     )
     service, fakes = _make_service(detail=native_detail, pe_enabled=True)
+    # PE-1 §3.2: skill is PE-eligible by default; disable per-source flag so
+    # the mixed-batch guard treats skill as non-PE-eligible (original test intent).
+    service._config_snapshot.agent_config.tool_confirmation.permission_engine_skill_enabled = False
     fake_session = Session(id="s_mixed", user_id="u_mixed", status=SessionStatus.RUNNING)
 
     async def _fake_get_accessible_session(*args, **kwargs):
@@ -1020,6 +1027,9 @@ async def test_preflight_after_create_task_with_mixed_batch_falls_back_to_legacy
         user_id="u_restart",
     )
     service, fakes = _make_service(detail=native_detail, pe_enabled=True)
+    # PE-1 §3.2: skill is PE-eligible by default; disable per-source flag so
+    # the mixed-batch guard treats skill as non-PE-eligible (original test intent).
+    service._config_snapshot.agent_config.tool_confirmation.permission_engine_skill_enabled = False
     fake_session = Session(id="s_restart_mixed", user_id="u_restart", status=SessionStatus.RUNNING)
 
     async def _fake_get_accessible_session(*args, **kwargs):

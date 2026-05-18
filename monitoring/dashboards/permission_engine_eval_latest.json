@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "total": 10,
+  "by_source": {
+    "skill": 5,
+    "native": 5
+  },
+  "by_expected_decision": {
+    "approve": 4,
+    "escalate": 3,
+    "deny": 3
+  }
+}

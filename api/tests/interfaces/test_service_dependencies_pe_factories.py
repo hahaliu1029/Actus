@@ -12,6 +12,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _make_pe_sources():
+    """PE-1 §2.6: build_permission_engine requires a full source registry.
+
+    These factory smoke tests don't exercise source dispatch — provide minimal
+    stubs that satisfy validate_pe_source_registry without dragging real
+    SkillTool / Redis wiring into a unit test.
+    """
+    from app.domain.services.permission.sources import NativeSource, SkillSource
+
+    return {
+        "native": NativeSource(),
+        "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Test 1: get_confirmation_queue unwraps .client
 # ---------------------------------------------------------------------------
@@ -63,6 +78,7 @@ def test_build_permission_engine_returns_default_engine():
             session_machine=session_machine,
             reader=reader,
             summary_llm=summary_llm,
+            sources=_make_pe_sources(),
         )
 
     assert isinstance(engine, DefaultPermissionEngine)
@@ -81,6 +97,7 @@ def test_build_permission_engine_no_summary_llm_skips_smart_approve():
         session_machine=MagicMock(),
         reader=MagicMock(),
         summary_llm=None,
+        sources=_make_pe_sources(),
     )
 
     assert isinstance(engine, DefaultPermissionEngine)
@@ -135,6 +152,7 @@ def test_build_permission_engine_passes_decision_recorder():
             reader=MagicMock(),
             summary_llm=MagicMock(),
             decision_recorder=recorder,
+            sources=_make_pe_sources(),
         )
 
     assert isinstance(engine, DefaultPermissionEngine)
@@ -159,6 +177,7 @@ def test_build_permission_engine_default_recorder_is_noop():
         session_machine=MagicMock(),
         reader=MagicMock(),
         summary_llm=None,
+        sources=_make_pe_sources(),
     )
 
     assert isinstance(engine, DefaultPermissionEngine)

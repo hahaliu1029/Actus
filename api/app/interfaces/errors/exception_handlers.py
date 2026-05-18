@@ -3,9 +3,14 @@ import uuid
 
 from app.application.errors.exceptions import AppException, TooManyRequestsError
 from app.domain.services.permission.errors import (
+    PEInfrastructureUnavailable,
     PolicyConflict,
     SessionModeViolation,
+    UnsupportedSource,
     WriterIntegrityError,
+)
+from app.domain.services.permission.sources import (
+    PE_SUPPORTED_SOURCES_AFTER_PE_1,
 )
 from app.infrastructure.observability.context import (
     reset_trace_context,
@@ -157,6 +162,45 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=500,
             content={"error": "internal", "correlation_id": correlation_id},
+            headers=_request_id_headers(request) or None,
+        )
+
+    @app.exception_handler(UnsupportedSource)
+    async def unsupported_source_handler(
+        request: Request, exc: UnsupportedSource
+    ) -> JSONResponse:
+        """PE-1 §5.2: PE-internal contract violation surfaced via HTTP
+        preflight (chat resume with unknown tool_source). 422 because the
+        client supplied a value the server cannot satisfy."""
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "unsupported_tool_source",
+                "source": exc.source,
+                "supported_sources": sorted(PE_SUPPORTED_SOURCES_AFTER_PE_1),
+            },
+            headers=_request_id_headers(request) or None,
+        )
+
+    @app.exception_handler(PEInfrastructureUnavailable)
+    async def pe_infra_unavailable_handler(
+        request: Request, exc: PEInfrastructureUnavailable
+    ) -> JSONResponse:
+        """PE-1 §5.2: Redis / queue / writer unavailable mid-evaluate or
+        mid-resume. 503 so the client (or proxy) can retry after a short
+        backoff. Carries correlation_id so ops can join the request to
+        backend logs."""
+        correlation_id = str(uuid.uuid4())[:16]
+        logger.error(
+            "PEInfrastructureUnavailable correlation_id=%s reason=%s",
+            correlation_id, exc.reason,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "pe_infrastructure_unavailable",
+                "correlation_id": correlation_id,
+            },
             headers=_request_id_headers(request) or None,
         )
 

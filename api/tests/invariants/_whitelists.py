@@ -89,13 +89,17 @@ INV5_CALLSITE_SAFETY_NET_WHITELIST: tuple[
 ] = (
     (
         "_pe_dispatch",
-        1328,
+        1375,
         "PE-3",
-        "P1#1 unreachable safety net: pre-loop guard at lines ~1178-1196 "
-        "returns None to delegate non-native batches to legacy tool_node; "
-        "this branch only fires if resolve_tool_source raised "
-        "ToolSourceUnknownError in the pre-check and was skipped, in which "
-        "case we fall back to direct execution rather than running a wrong "
-        "RiskLevel.NONE PE assessment. Documented at react_graph.py:1304-1310.",
+        "PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2 per-call escape: "
+        "the pre-loop guard now routes any non-PE-eligible call (mcp/a2a, "
+        "skill creator/guide, or skill/native with operator flag off) and "
+        "any unknown source to the legacy tool_node path for the WHOLE "
+        "batch via ``is_pe_eligible_tool_source``, so this per-call branch "
+        "is documented unreachable. The body is retained as a defensive "
+        "fail-open (logged at ERROR) to avoid stalling the graph if a "
+        "caller-side invariant ever regresses. PE-2/3 will lift mcp/a2a "
+        "sources into PE and remove this branch. Documented at "
+        "react_graph.py:1341-1358.",
     ),
 )

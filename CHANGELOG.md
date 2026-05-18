@@ -4,7 +4,20 @@
 
 ## [Unreleased]
 
-_最新批次：2026-04-14_
+_最新批次：2026-05-18 (PE-1)_
+
+### Permission Engine (PE-1)
+
+- **Skill source 内化进 `pe.evaluate()`**：新增 `permission/sources/` 子包（`PermissionSource` ABC + `NativeSource` 透传 + `SkillSource` 重算），把历史上 `react_graph.py:2243-2395` 的 Skill Stage P 旁路接入 PE step 5.5。Spec: `docs/superpowers/specs/2026-05-18-pe-1-skill-source-internalize-design.md`
+- **Per-source 特性开关**：`permission_engine_skill_enabled` 现在真正驱动 PE Skill 路径；`permission_engine_native_enabled` 保持原语义；`is_pe_enabled_for_source(source, tc)` + `PE_SUPPORTED_SOURCES_AFTER_PE_1 = {"native","skill"}` 替换 10 处 native-only callsite
+- **三个新异常**：`UnsupportedSource` (HTTP 422), `PEInfrastructureUnavailable` (HTTP 503), `PermissionConfigurationError` (DI fail-fast)。`agent_service` / `react_graph` 在 broad-except 之前显式重抛
+- **Redis 单飞 (single-flight) 风险刷新**：`SkillSource` 用 Redis NX + Lua compare-and-delete + loser poll + 45s 失败缓存，防 5 路并发同一 (skill_id, content_hash) 的 confirm storm
+- **`ConfirmationDetail` 兼容**：复用 `resolve_tool_source(pending_detail.tool_name).source` 推导，不扩 wire schema
+- **INV-6 grep gate（warning-only）**：扫描 `risk_level_meta` / `SkillRiskAssessor` / `risk_enforce` 在白名单外的引用；PE-1b 翻成 hard-fail 并删除 R3 legacy
+- **Grafana dashboard**：`monitoring/dashboards/permission_engine.json`（5 panels：skill_evaluate_count by outcome / skill_refresh status / singleflight_lost / unsupported_source / skill vs native deny）
+- **SmartApprove eval 套件**：`api/tests/eval/permission_smart_approve/`（opt-in via `ACTUS_RUN_SLOW_EVALS=1`），10 条人工标注 corpus（5 skill + 5 native）
+
+> Legacy R3 skill bypass `react_graph.py:2243-2395` 留 14 天 grace；PE-1b 删除。
 
 ### 新增
 

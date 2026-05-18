@@ -47,3 +47,49 @@ class EscalationTimeout(EscalationProviderError):
 
 class EscalationUnavailable(EscalationProviderError):
     pass
+
+
+class UnsupportedSource(PermissionError):
+    """tool_source not registered in PE _sources Mapping.
+
+    Graph path: caller should have gated via is_pe_enabled_for_source() — reaching
+    PE here means caller bug; _pe_dispatch catches and emits AllowError + alert.
+    HTTP preflight path: mapped to 422 by exception_handlers.py.
+    """
+
+    def __init__(self, source: str):
+        self.source = source
+        super().__init__(f"unsupported tool_source={source!r}")
+
+
+class PEInfrastructureUnavailable(PermissionError):
+    """Redis / queue / writer infrastructure unavailable mid-evaluate.
+
+    Graph path: _pe_dispatch has an explicit catch BEFORE the broad except
+    that emits AllowError(content="pe infra unavailable: ...", retryable=True);
+    agent retry chain handles transient outages (NOT PolicyConflict — that path
+    creates AllowError(retryable=False) at react_graph.py:1630 and would bypass
+    retry).
+    HTTP preflight path: mapped to 503 by exception_handlers.py.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"pe_infrastructure_unavailable: {reason}")
+
+
+class PermissionConfigurationError(PermissionError):
+    """PE source registry doesn't match PE_SUPPORTED_SOURCES_AFTER_PE_1 claim.
+
+    Raised at DI / factory time by validate_pe_source_registry() when the
+    sources Mapping is missing entries that is_pe_enabled_for_source would
+    gate-pass at runtime.
+
+    HARD RULE (spec §3.2 Round 4 P1#2): DI sites MUST re-raise this BEFORE
+    any broad ``except Exception`` in build_permission_engine / _create_task,
+    otherwise misconfig silently falls back to legacy and defeats the
+    registry contract.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)

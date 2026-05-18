@@ -1222,6 +1222,18 @@ class PlannerReActFlow(BaseFlow):
                 "user_id": self._user_id,
                 "session_id": self._session_id,
                 "tool_confirmation_enabled": tc_enabled,
+                # PE-1 §2.5: expose every source-specific PE flag so the
+                # gate helper inside react_graph can decide per call instead
+                # of relying on a single native-only switch.
+                "permission_engine_native_enabled": bool(
+                    getattr(tc, "permission_engine_native_enabled", True)
+                ) if tc is not None else True,
+                "permission_engine_skill_enabled": bool(
+                    getattr(tc, "permission_engine_skill_enabled", True)
+                ) if tc is not None else True,
+                # tool_confirmation config object itself — handy for the gate
+                # helper without rebuilding the per-flag dict on each tool call.
+                "tool_confirmation_config": tc,
                 "smart_approve_enabled": tc_smart_approve,
                 "smart_approve_medium_only": tc_smart_approve_medium_only,
                 "summary_llm": self._summary_llm if hasattr(self, "_summary_llm") else None,
@@ -1277,10 +1289,14 @@ class PlannerReActFlow(BaseFlow):
             if tc is not None
             else True
         )
+        # PE-1 §2.5: _create_task already gated the PE/SSM build by
+        # is_pe_enabled_for_source for every supported source. Here we only
+        # need to inject IF both objects exist AND the master switch is on.
+        # Per-source gating is performed inside react_graph._pe_dispatch
+        # via is_pe_enabled_for_source on the per-call tool_source.
         if (
             self._permission_engine is not None
             and self._session_state_machine is not None
-            and flag_native
             and tc_master_enabled
         ):
             cfg["configurable"]["permission_engine"] = self._permission_engine

@@ -1,0 +1,69 @@
+{
+  "title": "Permission Engine (PE-1)",
+  "uid": "permission_engine_pe1",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["permission_engine", "pe-1"],
+  "timezone": "",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "permission_engine.skill_evaluate_count by outcome",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(permission_engine_skill_evaluate_count[5m]))"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "permission_engine.skill_refresh status",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum by (status) (rate(permission_engine_skill_refresh[5m]))"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "permission_engine.skill_singleflight_lost (5m rate)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum(rate(permission_engine_skill_singleflight_lost[5m]))"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 5},
+              {"color": "red", "value": 20}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "permission_engine.unsupported_source count",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum(rate(permission_engine_unsupported_source[5m]))"}
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Skill vs native Denied rate",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"expr": "sum by (tool_source) (rate(permission_engine_skill_evaluate_count{outcome=\"deny\"}[5m]))"}
+      ]
+    }
+  ],
+  "templating": {"list": []},
+  "annotations": {"list": []}
+}

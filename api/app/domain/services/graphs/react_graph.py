@@ -53,6 +53,15 @@ from app.domain.models.tool_result import (
     ToolResult,
 )
 from app.domain.services.json_envelope import unwrap_message_envelope
+from app.domain.services.permission.errors import (
+    PEInfrastructureUnavailable,
+    PolicyConflict,
+    SessionModeViolation,
+    UnsupportedSource,
+)
+from app.domain.services.permission.sources import (
+    is_pe_eligible_tool_source,
+)
 from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
 from app.domain.services.tools.tool_source_resolver import (
     ToolSource,
@@ -356,6 +365,7 @@ def _build_tool_call_spec_from_tc(
     configurable: dict,
     tool_source: ToolSource,
     assessment: "Any | None" = None,
+    source_metadata: "Any | None" = None,
 ) -> "Any":
     """Build a ``ToolCallSpec`` from a tool_call dict + configurable slots.
 
@@ -366,6 +376,10 @@ def _build_tool_call_spec_from_tc(
     ``assessment`` is an optional ``RiskAssessment`` — pass the result from
     ``_risk_assessor.assess()`` when available (native tools with risk
     metadata), or ``None`` for low-risk / skill / unknown tools.
+
+    ``source_metadata`` (PE-1 §3.2) is an optional ``SourceMetadata`` (e.g.,
+    ``SkillCallMetadata``) populated by the caller for non-native sources.
+    SkillSource requires this; NativeSource ignores it.
     """
     from app.domain.services.permission.tool_call_spec import ToolCallSpec
 
@@ -392,6 +406,7 @@ def _build_tool_call_spec_from_tc(
         arg_digest=arg_digest,
         risk_assessment=assessment,
         tool_call_id=tc.get("id", ""),
+        source_metadata=source_metadata,
     )
 
 
@@ -1169,12 +1184,27 @@ def build_react_graph(
         already_done: set[str] = set(state.get("completed_tool_call_prefix", []) or [])
         pre_approved: set[str] = set(state.get("approved_tool_call_ids", []) or [])
 
-        # P1#1: If ANY pending tool_call in the batch is non-native (skill/mcp/a2a),
-        # delegate the entire batch to the legacy tool_node path which has the
-        # correct approval pipelines (R3 Skill Stage P, legacy mcp/a2a paths).
-        # PE only handles "native" tool calls.  Mixed batches fall back to legacy
-        # because PE's RiskAssessor only produces assessments for native tools
-        # (non-native would be assessed as RiskLevel.NONE and auto-allowed by Stage 7a).
+        # PE-1 §2.5 (T15 P1#2 fix) + Round 2 P1#2: per-call gate. If ANY
+        # pending tool_call in the batch is non-PE-eligible (mcp/a2a, skill
+        # creator/guide, or skill/native with operator flag off), delegate
+        # the WHOLE batch to the legacy tool_node path which preserves R3
+        # Skill Stage P / legacy mcp/a2a / skill creator + guide confirmation
+        # pipelines. PE only handles batches where every pending call
+        # qualifies for PE — otherwise we'd bypass legacy per-source
+        # confirmation for mixed cases.
+        #
+        # ``is_pe_eligible_tool_source`` consumes the full ToolSource
+        # (source + category) so that skill creator (``brainstorm_skill``,
+        # ``generate_skill``, ``install_skill``) and skill guide
+        # (``get_skill_guide``) tools — which share ``source="skill"`` but
+        # are NOT in ``SkillTool._tool_bindings`` — also fall back to
+        # legacy. ``build_skill_call_metadata`` would otherwise emit
+        # ``AllowError(code="skill_metadata_unresolvable")`` for them.
+        #
+        # message_ask_user is a synthetic pseudo-tool with no ToolSource
+        # and is handled inline within the PE loop (SOFT_HINT branch); it
+        # does NOT count toward PE eligibility either way.
+        _tc_for_gate = configurable.get("tool_confirmation_config")
         for _pre_tc in tool_calls:
             _pre_call_id = _pre_tc["id"]
             if _pre_call_id in already_done:
@@ -1186,14 +1216,21 @@ def build_react_graph(
                 _pre_src = resolve_tool_source(_pre_name)
             except ToolSourceUnknownError:
                 _pre_src = None
-            if _pre_src is not None and _pre_src.source != "native":
-                # Non-native call detected — fall back to legacy tool_node path.
+            if _tc_for_gate is None or not is_pe_eligible_tool_source(
+                _pre_src, _tc_for_gate
+            ):
+                # Non-PE-eligible call detected (unknown source, unsupported
+                # source, flag off, or skill creator/guide) — fall back to
+                # legacy tool_node for the whole batch.
                 logger.debug(
-                    "_pe_dispatch: non-native tool '%s' (source=%s) in batch → "
-                    "falling back to legacy tool_node path for the whole batch.",
-                    _pre_name, _pre_src.source,
+                    "_pe_dispatch: non-PE-eligible tool '%s' (source=%s, "
+                    "category=%s) in batch → falling back to legacy "
+                    "tool_node path for the whole batch.",
+                    _pre_name,
+                    getattr(_pre_src, "source", None),
+                    getattr(_pre_src, "category", None),
                 )
-                return None  # type: ignore[return-value]  # sentinel for caller
+                return None  # type: ignore[return-value]
 
         new_completed_ids: list[str] = []
         new_messages: list = []
@@ -1301,18 +1338,28 @@ def build_react_graph(
                     canonical_name=tool_name,
                 )
 
-            # P1#1 safety net: non-native tool calls should have been caught by the
-            # pre-loop check above (which returns None → legacy fallback for the whole
-            # batch).  If a non-native call somehow reaches here (e.g. a mixed batch
-            # where resolve_tool_source raised ToolSourceUnknownError in the pre-check
-            # and was skipped), fall back to direct execution to avoid bypassing the
-            # legacy approval pipelines with a wrong RiskLevel.NONE assessment.
-            # Note: ideally this branch is unreachable after the pre-loop guard.
-            if tool_source.source != "native":
+            # PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2: pre-loop should
+            # have routed any non-PE-eligible call to legacy. If we reach
+            # here with a non-PE-eligible source (or skill creator/guide),
+            # it's a caller-side invariant bug — we still execute via
+            # _invoke_wrapper to avoid stalling the graph, but log it loudly
+            # so the regression is visible.
+            _is_pe_eligible_per_call = is_pe_eligible_tool_source(
+                tool_source, _tc_for_gate
+            )
+            if not _is_pe_eligible_per_call:
+                logger.error(
+                    "_pe_dispatch: per-call non-PE-eligible reached PE loop "
+                    "for tool '%s' (source=%s, category=%s) — pre-loop guard "
+                    "should have prevented this; investigate",
+                    tool_name,
+                    tool_source.source,
+                    tool_source.category,
+                )
                 # Resolve tool_fn first (shared code below will check for None)
-                _non_native_fn = tool_map.get(tool_name)
-                if _non_native_fn is None:
-                    _non_native_unknown = AllowError(
+                _non_pe_fn = tool_map.get(tool_name)
+                if _non_pe_fn is None:
+                    _non_pe_unknown = AllowError(
                         content=f"Error: Unknown tool '{tool_name}'",
                         reason=DecisionReason(
                             type="exception",
@@ -1321,20 +1368,20 @@ def build_react_graph(
                         ),
                     )
                     await _finalize_pe_outcome(
-                        tc, args, tool_source, _non_native_unknown, _tool_start
+                        tc, args, tool_source, _non_pe_unknown, _tool_start
                     )
                     new_completed_ids.append(call_id)
                     continue
-                _non_native_result = await _invoke_wrapper(
-                    _non_native_fn, tc, tool_source,
+                _non_pe_result = await _invoke_wrapper(
+                    _non_pe_fn, tc, tool_source,
                     session_id=_session_id,
                     max_wrapper_output_bytes=_runtime_max_bytes,
                 )
-                _non_native_result = _maybe_convert_shell_outcome_with_images(
-                    _non_native_result, tool_name
+                _non_pe_result = _maybe_convert_shell_outcome_with_images(
+                    _non_pe_result, tool_name
                 )
                 await _finalize_pe_outcome(
-                    tc, args, tool_source, _non_native_result, _tool_start
+                    tc, args, tool_source, _non_pe_result, _tool_start
                 )
                 new_completed_ids.append(call_id)
                 continue
@@ -1381,8 +1428,45 @@ def build_react_graph(
             if not _bypass_risk_gate and tool_source.source == "native":
                 assessment = _risk_assessor.assess(tool_name, args)
 
+            # PE-1 §3.2: for skill calls, build SkillCallMetadata from the
+            # live ``skill_tool`` registration so PE's SkillSource sees the
+            # canonical risk_level / runtime_type / trust_origin / skill_id /
+            # content_hash. The metadata SUPERSEDES any caller-prefilled
+            # ``risk_assessment`` (Risk #1 hard rule, spec §5.5).
+            source_metadata = None
+            if tool_source.source == "skill":
+                from app.domain.services.permission.sources import (
+                    build_skill_call_metadata,
+                )
+                _skill_tool = configurable.get("skill_tool")
+                if _skill_tool is None or not _skill_tool.has_tool(tool_name):
+                    _missing_outcome = AllowError(
+                        content=(
+                            f"PE-1 skill metadata unresolvable for '{tool_name}' "
+                            f"(skill_tool missing or unregistered)"
+                        ),
+                        reason=DecisionReason(
+                            type="exception",
+                            code="skill_metadata_unresolvable",
+                            message="skill_tool not wired or tool not registered",
+                        ),
+                        retryable=False,
+                    )
+                    await _finalize_pe_outcome(
+                        tc, args, tool_source, _missing_outcome, _tool_start,
+                    )
+                    continue
+                source_metadata = build_skill_call_metadata(
+                    tool_name=tool_name,
+                    tool_fn=tool_fn,
+                    skill_tool=_skill_tool,
+                )
+
             # Build ToolCallSpec for PE evaluation
-            call_spec = _build_tool_call_spec_from_tc(tc, configurable, tool_source, assessment)
+            call_spec = _build_tool_call_spec_from_tc(
+                tc, configurable, tool_source, assessment,
+                source_metadata=source_metadata,
+            )
 
             # Build EvaluationContext — read session mode + revision from SSM
             try:
@@ -1602,11 +1686,11 @@ def build_react_graph(
                 continue
 
             # Evaluate through PE
-            from app.domain.services.permission.errors import (
-                PolicyConflict,
-                SessionModeViolation,
-            )
-
+            # PE-1 §2.7 / §5.1: explicit catches for UnsupportedSource and
+            # PEInfrastructureUnavailable MUST come BEFORE the broad
+            # ``except Exception`` block — otherwise these typed exceptions
+            # would be swallowed by the catch-all and lose their structured
+            # decision codes (Round 2 P1#10).
             try:
                 pe_outcome = await _pe.evaluate(call_spec, ctx)
             except SessionModeViolation as exc:
@@ -1644,6 +1728,61 @@ def build_react_graph(
                     retryable=False,
                 )
                 await _finalize_pe_outcome(tc, args, tool_source, conflict_outcome, _tool_start)
+                continue
+            except UnsupportedSource as exc:
+                # PE-1 §2.7 + Round 2 P1#2: caller should have gated via
+                # ``is_pe_eligible_tool_source`` (which delegates to
+                # ``is_pe_enabled_for_source`` and adds the skill creator/
+                # guide category check). Reaching PE with an unregistered
+                # source means a caller bug — surface AllowError so the
+                # model sees a structured failure and can decide whether to
+                # retry/abort. retryable=False because the registry is
+                # process-static and won't change mid-request.
+                logger.error(
+                    "PE UnsupportedSource for tool '%s' source=%r session '%s' "
+                    "(caller bug — gate helper should have caught this)",
+                    tool_name, exc.source, _session_id,
+                )
+                unsupported_outcome = AllowError(
+                    content=(
+                        f"权限引擎不支持此工具来源（工具: {tool_name}, "
+                        f"来源: {exc.source}）"
+                    ),
+                    reason=DecisionReason(
+                        type="exception",
+                        code="unsupported_tool_source",
+                        message=str(exc),
+                    ),
+                    retryable=False,
+                )
+                await _finalize_pe_outcome(
+                    tc, args, tool_source, unsupported_outcome, _tool_start,
+                )
+                continue
+            except PEInfrastructureUnavailable as exc:
+                # PE-1 §5.1 / Round 2 P1#10: Redis / queue / writer crashed
+                # mid-evaluate. retryable=True so the agent retry chain can
+                # treat this as a transient failure (PolicyConflict above is
+                # retryable=False because it indicates a deterministic state
+                # mismatch).
+                logger.warning(
+                    "PE PEInfrastructureUnavailable for tool '%s' session '%s': %s",
+                    tool_name, _session_id, exc,
+                )
+                infra_outcome = AllowError(
+                    content=(
+                        f"权限引擎基础设施暂时不可用（工具: {tool_name}），请重试"
+                    ),
+                    reason=DecisionReason(
+                        type="exception",
+                        code="pe_infrastructure_unavailable",
+                        message=str(exc),
+                    ),
+                    retryable=True,
+                )
+                await _finalize_pe_outcome(
+                    tc, args, tool_source, infra_outcome, _tool_start,
+                )
                 continue
             except Exception as exc:
                 logger.exception(
@@ -1750,18 +1889,52 @@ def build_react_graph(
                 await _finalize_pe_outcome(tc, args, tool_source, pe_outcome, _tool_start)
 
             elif isinstance(pe_outcome, Asked):
-                # Emit ToolConfirmationEvent then route to interrupt_helper
-                _timeout_seconds = configurable.get("tool_confirmation_timeout_seconds", 300)
-                risk_level_str = (
-                    assessment.final_level.name.lower()
-                    if assessment is not None else "medium"
+                # PE-1 §5.1: rebuild ToolConfirmationEvent from the
+                # ConfirmationDetail PE just stored — PE owns the canonical
+                # risk_level + matched_patterns (for skill calls these come
+                # from PE's recomputed SkillCallMetadata, NOT the legacy
+                # native-only RiskAssessment). Native calls fall back to the
+                # local assessment when the detail is unavailable so we
+                # never crash on a Redis miss / sweeper race.
+                _timeout_seconds = configurable.get(
+                    "tool_confirmation_timeout_seconds", 300
                 )
-                risk_reason = getattr(assessment, "risk_reason", "") or ""
-                matched_patterns = (
-                    list(assessment.matched_patterns) if assessment is not None else []
+                detail = None
+                if confirmation_manager is not None:
+                    try:
+                        detail = await confirmation_manager.read(_session_id, call_id)
+                    except Exception:
+                        logger.warning(
+                            "confirmation_manager.read failed for session=%s "
+                            "tool_call_id=%s — falling back to assessment",
+                            _session_id, call_id,
+                            exc_info=True,
+                        )
+                        detail = None
+                if detail is not None:
+                    risk_level_str = detail.risk_level
+                    matched_patterns = list(detail.matched_patterns)
+                else:
+                    risk_level_str = (
+                        assessment.final_level.name.lower()
+                        if assessment is not None else "medium"
+                    )
+                    matched_patterns = (
+                        list(assessment.matched_patterns)
+                        if assessment is not None else []
+                    )
+                # risk_reason: prefer PE's structured DecisionReason.message
+                # (carries the canonical skill_risk_high / smart_approve_*
+                # explanation); fall back to the local assessment.
+                _pe_reason = getattr(pe_outcome, "reason", None)
+                risk_reason = (
+                    getattr(_pe_reason, "message", None)
+                    or getattr(assessment, "risk_reason", "")
+                    or ""
                 )
                 suggested_alternative = (
-                    assessment.suggested_alternative if assessment is not None else None
+                    assessment.suggested_alternative
+                    if assessment is not None else None
                 )
                 confirmation_event = ToolConfirmationEvent(
                     tool_call_id=call_id,
@@ -1925,23 +2098,34 @@ def build_react_graph(
         _tracker = configurable.get("tool_failure_tracker")
         _metrics = configurable.get("execution_metrics")
 
-        # ---- PE-0 Phase 9: Permission Engine dispatch branch ---- #
-        # When PE + SSM are wired (built per-task in _create_task) and the
-        # native feature flag is on, route through DefaultPermissionEngine
-        # instead of the legacy _run_policy_chain / risk gate inline code.
+        # ---- PE-0 Phase 9 + PE-1 §2.5: Permission Engine dispatch branch ---- #
+        # When PE + SSM are wired (built per-task in _create_task), route
+        # through DefaultPermissionEngine instead of the legacy
+        # _run_policy_chain / risk gate inline code.
+        #
+        # PE-1 §2.5 + Round 2 P1#2 change: the master-entry no longer reads
+        # a single ``permission_engine_native_enabled`` flag. Per-source
+        # flags (``permission_engine_native_enabled`` /
+        # ``permission_engine_skill_enabled``) are now consulted PER CALL
+        # inside ``_pe_dispatch`` via
+        # ``is_pe_eligible_tool_source(tool_source, tool_confirmation_config)``
+        # — which checks source membership + per-source flag AND filters
+        # skill creator / skill guide tools (``source="skill"`` but
+        # ``category != "skill"``). Calls whose source is not PE-eligible
+        # short-circuit back to the legacy tool_node path (None sentinel).
         # Legacy path is preserved verbatim below as the fail-open fallback.
         _pe = configurable.get("permission_engine")
         _ssm = configurable.get("session_state_machine")
-        _flag_native = configurable.get("permission_engine_native_enabled", True)
 
-        if _pe is not None and _ssm is not None and _flag_native:
+        if _pe is not None and _ssm is not None:
             _pe_result = await _pe_dispatch(state, config)
             if _pe_result is not None:
                 return _pe_result
-            # _pe_result is None: batch contains non-native tool calls;
+            # _pe_result is None: batch contains zero PE-eligible tool
+            # calls (either non-PE source OR per-source flag off);
             # fall through to legacy tool_node path below.
 
-        # ---- End PE-0 Phase 9 branch ---- #
+        # ---- End PE-0 Phase 9 / PE-1 §2.5 branch ---- #
 
         # D5: Cooperative termination — set should_interrupt for routing
         _control = configurable.get("execution_control")

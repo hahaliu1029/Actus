@@ -52,6 +52,7 @@ from app.domain.models.session import SandboxBindingState, Session, SessionStatu
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.permission.confirmation_queue import ConfirmationQueue as ConfirmationManager
+from app.domain.services.permission.errors import PermissionConfigurationError
 from app.infrastructure.external.message_queue import STREAM_TTL_SECONDS
 from app.interfaces.schemas.session import SupervisorSnapshot
 from core.config import get_settings
@@ -361,15 +362,26 @@ class AgentService:
         # None.  The HTTP preflight split-brain check reduces to the simple and
         # reliable: ``task._flow._permission_engine is not None``.
         _tc_at_create = getattr(snap.agent_config, "tool_confirmation", None)
-        _flag_tc_enabled = bool(
-            getattr(_tc_at_create, "enabled", True)
-            if _tc_at_create is not None else True
+        # PE-1 §2.5: gate is now source-aware. Build PE/SSM if ANY supported
+        # source is enabled — previously only native triggered the build, so
+        # skill-only operators silently fell back to legacy R3 with no PE.
+        from app.domain.services.permission.sources import (
+            PE_SUPPORTED_SOURCES_AFTER_PE_1,
+            is_pe_enabled_for_source,
         )
-        _flag_pe_native = bool(
-            getattr(_tc_at_create, "permission_engine_native_enabled", True)
-            if _tc_at_create is not None else True
+
+        _flag_pe_active_at_create = (
+            _tc_at_create is not None
+            and any(
+                is_pe_enabled_for_source(src, _tc_at_create)
+                for src in PE_SUPPORTED_SOURCES_AFTER_PE_1
+            )
+        ) or (
+            # When no tool_confirmation config is present at all, mirror
+            # the previous default-on behavior (native + skill) — operator
+            # can disable per source via explicit config.
+            _tc_at_create is None
         )
-        _flag_pe_active_at_create = _flag_tc_enabled and _flag_pe_native
 
         ssm = None
         permission_engine = None
@@ -421,6 +433,40 @@ class AgentService:
                     getattr(_tc_cfg, "timeout_seconds", 300)
                     if _tc_cfg is not None else 300
                 )
+                # PE-1 §2.6: construct the initial source registry. NativeSource is
+                # always registered here; SkillSource is registered post-task_runner
+                # construction (skill_tool lives on AgentTaskRunner, not on
+                # AgentService at this point). validate_pe_source_registry is
+                # called after the late-registration block below — the broad
+                # except contract re-raises PermissionConfigurationError as a
+                # deploy-time bug (PE-1 §3.2 Round 4 P1#2).
+                from app.domain.services.permission.skill_refresher import (
+                    SkillRiskRefresher,
+                )
+                from app.domain.services.permission.sources import (
+                    NativeSource,
+                    SkillSource,
+                )
+
+                _redis_for_skill_source = (
+                    self._redis_client.client
+                    if self._redis_client and hasattr(self._redis_client, "client")
+                    else None
+                )
+                _skill_tool_for_source = getattr(self, "_skill_tool", None)
+                _skill_source = (
+                    SkillSource(
+                        refresher=SkillRiskRefresher(_skill_tool_for_source),
+                        redis=_redis_for_skill_source,
+                    )
+                    if _redis_for_skill_source is not None
+                    and _skill_tool_for_source is not None
+                    else None
+                )
+                _pe_sources: dict[str, Any] = {"native": NativeSource()}
+                if _skill_source is not None:
+                    _pe_sources["skill"] = _skill_source
+
                 permission_engine = build_permission_engine(
                     uow_factory=self._uow_factory,
                     writer=approval_state_writer,
@@ -433,7 +479,14 @@ class AgentService:
                     smart_approve_timeout_seconds=_sa_timeout,
                     confirmation_timeout_seconds=_confirm_timeout,
                     decision_recorder=build_decision_recorder(),  # P3#1: wire OTel recorder
+                    sources=_pe_sources,
                 )
+            except PermissionConfigurationError:
+                # PE-1 §3.2 Round 4 P1#2: PE registry mismatch is a deploy-time
+                # bug — never silently fall back to legacy and pretend nothing
+                # is wrong. Surface to the caller; HTTP layer will 500 with
+                # correlation_id from the catch-all handler.
+                raise
             except Exception:
                 logger.warning(
                     "Failed to build PermissionEngine/SessionStateMachine; "
@@ -534,6 +587,43 @@ class AgentService:
             idle_watchdog=getattr(self, "_idle_watchdog", None),
             was_background=session.was_background,
         )
+
+        # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);
+        # register SkillSource into the PE built earlier and validate the final
+        # registry. If validate fails, surface as PermissionConfigurationError
+        # (broad-except contract re-raises).
+        if permission_engine is not None:
+            from app.application.composition.graph_assembly import (
+                validate_pe_source_registry,
+            )
+            from app.domain.services.permission.skill_refresher import (
+                SkillRiskRefresher,
+            )
+            from app.domain.services.permission.sources import SkillSource
+
+            _redis_for_skill_source_late = (
+                self._redis_client.client
+                if self._redis_client and hasattr(self._redis_client, "client")
+                else None
+            )
+            _task_skill_tool = getattr(task_runner, "_skill_tool", None)
+            if (
+                _redis_for_skill_source_late is not None
+                and _task_skill_tool is not None
+                and "skill" not in (getattr(permission_engine, "_sources", None) or {})
+            ):
+                permission_engine.register_source(
+                    "skill",
+                    SkillSource(
+                        refresher=SkillRiskRefresher(_task_skill_tool),
+                        redis=_redis_for_skill_source_late,
+                    ),
+                )
+            # ALWAYS validate when PE exists — deploys missing the skill plumbing
+            # fail fast at this point (post-task_runner construction).
+            validate_pe_source_registry(
+                getattr(permission_engine, "_sources", None) or {}
+            )
 
         # 6.创建任务Task并更新会话中的信息
         task = self._task_cls.create(task_runner=task_runner)
@@ -792,6 +882,122 @@ class AgentService:
             )
             return False
 
+    async def _batch_has_non_pe_eligible_pending(
+        self,
+        task_flow: object,
+        session_id: str,
+        pending_tool_name: str,
+        tc: object,
+    ) -> bool:
+        """PE-1 §3.2 Correction E — source-aware variant of
+        ``_batch_has_non_native_pending``.
+
+        Returns True if the checkpointed tool_calls batch contains any tool
+        that is NOT PE-eligible under the current
+        ``ToolConfirmationConfig``. A tool is PE-eligible iff
+        ``is_pe_eligible_tool_source(tool_source, tc)`` returns True — which
+        requires the source to be in ``PE_SUPPORTED_SOURCES_AFTER_PE_1``,
+        the per-source flag enabled, AND (for ``source="skill"``) the
+        category to be ``"skill"`` so creator/guide tools fall back to
+        legacy (Round 2 P1#2).
+
+        Mirrors the routing logic ``_pe_dispatch`` uses post-PE-1: when
+        any tool in the batch is not PE-eligible, ``_pe_dispatch`` falls
+        back to the legacy tool_node path for the whole batch, so
+        preflight must also route to legacy or we end up with a stuck
+        claim_nonce / split-brain.
+        """
+        from app.domain.services.permission.sources import (
+            is_pe_eligible_tool_source,
+        )
+        from app.domain.services.tools.tool_source_resolver import (
+            ToolSourceUnknownError as _TSUErr,
+            resolve_tool_source as _resolve,
+        )
+        from langchain_core.messages import AIMessage as _AIMsg
+        from langchain_core.messages import ToolMessage as _TMMsg
+
+        try:
+            _main_graph = getattr(task_flow, "_main_graph", None)
+            if _main_graph is None:
+                _ensure = getattr(task_flow, "_ensure_graphs", None)
+                if _ensure is not None:
+                    await _ensure()
+                _main_graph = getattr(task_flow, "_main_graph", None)
+                if _main_graph is None:
+                    return False
+            _graph_config = task_flow._build_config()  # type: ignore[union-attr]
+            _graph_snap = await _main_graph.aget_state(_graph_config, subgraphs=True)
+
+            _gs_messages: list = []
+            _snap_tasks = getattr(_graph_snap, "tasks", None) or []
+            for _task in _snap_tasks:
+                _sub_state = getattr(_task, "state", None)
+                if _sub_state is None:
+                    continue
+                _sub_values = getattr(_sub_state, "values", None) or {}
+                _sub_messages = _sub_values.get("messages", []) if isinstance(_sub_values, dict) else []
+                if _sub_messages:
+                    _gs_messages = _sub_messages
+                    break
+
+            if not _gs_messages and _graph_snap:
+                _gs_messages = ((_graph_snap.values or {}).get("messages", [])
+                                if _graph_snap else [])
+
+            _batch_tool_calls: list[dict] = []
+            _batch_ai_idx: int = -1
+            for _idx, _msg in enumerate(reversed(_gs_messages)):
+                if isinstance(_msg, _AIMsg) and _msg.tool_calls:
+                    _batch_tool_calls = list(_msg.tool_calls)
+                    _batch_ai_idx = len(_gs_messages) - 1 - _idx
+                    break
+            if not _batch_tool_calls:
+                return False
+            _already_done: set[str] = set()
+            for _tm in _gs_messages[_batch_ai_idx + 1:]:
+                if isinstance(_tm, _TMMsg) and _tm.tool_call_id:
+                    _already_done.add(_tm.tool_call_id)
+            for _tc in _batch_tool_calls:
+                _tc_id = _tc.get("id", "")
+                if _tc_id in _already_done:
+                    continue
+                _tc_name = _tc.get("name", "")
+                if _tc_name == "message_ask_user":
+                    continue
+                try:
+                    _tc_source = _resolve(_tc_name)
+                except _TSUErr:
+                    # Round 2 P1#1: unknown source aligns with
+                    # ``react_graph._pe_dispatch`` — treat as non-PE-eligible
+                    # (the whole batch falls back to legacy). Passing None
+                    # to ``is_pe_eligible_tool_source`` returns False, which
+                    # surfaces as "non-PE-eligible found" → True here.
+                    _tc_source = None
+                if not is_pe_eligible_tool_source(_tc_source, tc):
+                    logger.info(
+                        "PE preflight mixed-batch guard (PE-1 §3.2 + Round 2 "
+                        "P1#1/P1#2): session=%s batch contains non-PE-eligible "
+                        "tool '%s' (source=%s, category=%s) alongside pending "
+                        "tool '%s'. _pe_dispatch will fall back to legacy for "
+                        "the whole batch — routing preflight to legacy path "
+                        "to avoid split-brain.",
+                        session_id,
+                        _tc_name,
+                        getattr(_tc_source, "source", None),
+                        getattr(_tc_source, "category", None),
+                        pending_tool_name,
+                    )
+                    return True
+            return False
+        except Exception as _err:
+            logger.debug(
+                "PE preflight _batch_has_non_pe_eligible_pending: graph state read failed for "
+                "session=%s (best-effort, returning False): %s",
+                session_id, _err,
+            )
+            return False
+
     def _build_pe_ssm_for_resume(self, snap: "_ConfigSnapshot") -> "tuple[object | None, object | None]":
         """Per-call helper that mirrors ``_create_task`` PE/SSM construction.
 
@@ -810,12 +1016,24 @@ class AgentService:
         # P2#4: also check the master `enabled` switch — if tool_confirmation is
         # globally disabled, preflight must return (None, None) so the graph also
         # takes the legacy path (no split-brain when enabled=False + PE pending).
+        # PE-1 §2.5: source-aware master gate. We build PE/SSM if ANY supported
+        # source is enabled; per-call source gating happens later in
+        # preflight_resume_tool_confirmation when we know the pending tool's
+        # actual source.
+        from app.domain.services.permission.sources import (
+            PE_SUPPORTED_SOURCES_AFTER_PE_1,
+            is_pe_enabled_for_source,
+        )
+
         tc = getattr(snap.agent_config, "tool_confirmation", None)
         if tc is not None:
             if not getattr(tc, "enabled", True):
                 return None, None  # confirmation master switch off
-            if not getattr(tc, "permission_engine_native_enabled", True):
-                return None, None  # PE-0 native gate off
+            if not any(
+                is_pe_enabled_for_source(src, tc)
+                for src in PE_SUPPORTED_SOURCES_AFTER_PE_1
+            ):
+                return None, None  # all per-source PE flags off
 
         confirmation_queue = self._confirmation_manager
         if confirmation_queue is None:
@@ -888,6 +1106,39 @@ class AgentService:
                 getattr(_tc_cfg_r, "timeout_seconds", 300)
                 if _tc_cfg_r is not None else 300
             )
+            # PE-1 §2.6: construct the source registry for the resume path.
+            # SkillSource registration here is best-effort — preflight_resume_
+            # tool_confirmation re-attaches the SkillSource from the live
+            # task_runner once the pending tool's source is known to be 'skill'
+            # and calls validate_pe_source_registry there. build_permission_engine
+            # no longer validates internally (PE-1 §2.6 fix: caller-driven).
+            from app.domain.services.permission.skill_refresher import (
+                SkillRiskRefresher,
+            )
+            from app.domain.services.permission.sources import (
+                NativeSource,
+                SkillSource,
+            )
+
+            _redis_for_skill_source_r = (
+                self._redis_client.client
+                if self._redis_client and hasattr(self._redis_client, "client")
+                else None
+            )
+            _skill_tool_for_source_r = getattr(self, "_skill_tool", None)
+            _skill_source_r = (
+                SkillSource(
+                    refresher=SkillRiskRefresher(_skill_tool_for_source_r),
+                    redis=_redis_for_skill_source_r,
+                )
+                if _redis_for_skill_source_r is not None
+                and _skill_tool_for_source_r is not None
+                else None
+            )
+            _pe_sources_r: dict[str, Any] = {"native": NativeSource()}
+            if _skill_source_r is not None:
+                _pe_sources_r["skill"] = _skill_source_r
+
             pe = build_permission_engine(
                 uow_factory=self._uow_factory,
                 writer=approval_state_writer,
@@ -900,8 +1151,15 @@ class AgentService:
                 smart_approve_timeout_seconds=_sa_timeout_r,
                 confirmation_timeout_seconds=_confirm_timeout_r,
                 decision_recorder=build_decision_recorder(),  # P3#1: wire OTel recorder
+                sources=_pe_sources_r,
             )
             return pe, ssm
+        except PermissionConfigurationError:
+            # PE-1 §3.2 Round 4 P1#2: PE registry mismatch is a deploy-time
+            # bug — never silently fall back to legacy and pretend nothing
+            # is wrong. Surface to the caller; HTTP layer will 500 with
+            # correlation_id from the catch-all handler.
+            raise
         except Exception:
             logger.warning(
                 "_build_pe_ssm_for_resume: failed to build PE/SSM, "
@@ -1006,26 +1264,44 @@ class AgentService:
                 f"工具确认请求[{tool_call_id}]不存在或已过期"
             )
 
-        # P1#1: Check tool source — PE-0 only handles "native" tools.
-        # Skill/MCP/A2A tools still go through the legacy confirmation path
-        # because tool_node falls back to legacy for non-native batches and
-        # does not consume pe_resume_outcomes.  If we ran PE preflight on a
-        # non-native tool the user would be asked again via legacy → duplicate
-        # confirmation or stuck processing state.
+        # PE-1 §3.2 + Round 2 P1#1/P1#2: source+category-aware per-call gate.
+        # PE-0 was native-only; PE-1 supports native + skill
+        # (PE_SUPPORTED_SOURCES_AFTER_PE_1). For any source that is NOT
+        # enabled at the per-source flag level — OR for skill creator /
+        # skill guide tools (``source="skill"`` but ``category != "skill"``,
+        # which ``SkillSource.build_skill_call_metadata`` cannot resolve) —
+        # OR for hallucinated / unknown tool names — we route to the legacy
+        # confirmation path so the graph layer's ``_pe_dispatch`` and the
+        # HTTP preflight stay in lock-step.
+        from app.domain.services.permission.sources import (
+            is_pe_eligible_tool_source,
+        )
         from app.domain.services.tools.tool_source_resolver import (
             ToolSourceUnknownError,
             resolve_tool_source,
         )
         try:
-            _pending_tool_source = resolve_tool_source(pending_detail.tool_name).source
+            _pending_tool_source_obj = resolve_tool_source(pending_detail.tool_name)
         except ToolSourceUnknownError:
-            _pending_tool_source = "native"
+            # Round 2 P1#1: align with ``react_graph._pe_dispatch`` which
+            # treats unknown source as non-PE-eligible (whole batch legacy).
+            # The previous fallback to ``"native"`` wrote PE claim /
+            # pe_resume_outcomes that the graph then ignored, causing
+            # split-brain. ``None`` makes ``is_pe_eligible_tool_source``
+            # return False so we route to legacy.
+            _pending_tool_source_obj = None
 
-        if _pending_tool_source != "native":
+        _tc_for_per_call_gate = getattr(snap.agent_config, "tool_confirmation", None)
+        if pending_detail is not None and not is_pe_eligible_tool_source(
+            _pending_tool_source_obj, _tc_for_per_call_gate,
+        ):
             logger.info(
-                "PE preflight: tool_name=%s has source=%s (not native), "
-                "routing to legacy confirmation path.",
-                pending_detail.tool_name, _pending_tool_source,
+                "PE preflight: tool_name=%s has source=%s category=%s — "
+                "per-source gate disabled, source unsupported, OR skill "
+                "creator/guide. Routing to legacy confirmation path.",
+                pending_detail.tool_name,
+                getattr(_pending_tool_source_obj, "source", None),
+                getattr(_pending_tool_source_obj, "category", None),
             )
             return await self._preflight_resume_tool_confirmation_legacy(
                 session_id=session_id,
@@ -1033,6 +1309,78 @@ class AgentService:
                 is_admin=is_admin,
                 tool_confirmation=tool_confirmation,
             )
+
+        # PE-1 §3.2 step 5.d + Round 2 P1#2: when the pending tool is a
+        # dynamic Skill (source="skill" AND category="skill" — only the
+        # SkillTool wrappers, NOT skill creator/guide), register a live
+        # SkillSource into the existing PE. _build_pe_ssm_for_resume cannot
+        # do this on its own because the SkillTool only exists on the live
+        # task_runner; here we have a chance to walk
+        # ``_existing_task._task_runner._flow._skill_tool`` and wire the
+        # adapter before pe.preflight_resume is invoked. Guarded so we only
+        # register once and only when a usable SkillTool + redis is
+        # available.
+        #
+        # Note: at this point ``is_pe_eligible_tool_source`` already returned
+        # True, so for ``source="skill"`` we know ``category == "skill"`` —
+        # the explicit check below is defensive only.
+        if (
+            _pending_tool_source_obj is not None
+            and _pending_tool_source_obj.source == "skill"
+            and _pending_tool_source_obj.category == "skill"
+        ):
+            try:
+                _existing_task_for_skill = await self._get_task(session)
+            except Exception:
+                _existing_task_for_skill = None
+            if _existing_task_for_skill is not None:
+                _runner_for_skill = getattr(
+                    _existing_task_for_skill, "_task_runner", None,
+                )
+                _flow_for_skill = getattr(_runner_for_skill, "_flow", None)
+                _skill_tool_live = getattr(_flow_for_skill, "_skill_tool", None)
+                _pe_sources_attr = getattr(pe, "_sources", None) or {}
+                _redis_for_late_skill = (
+                    self._redis_client.client
+                    if self._redis_client and hasattr(self._redis_client, "client")
+                    else None
+                )
+                if (
+                    _skill_tool_live is not None
+                    and _redis_for_late_skill is not None
+                    and "skill" not in _pe_sources_attr
+                ):
+                    from app.domain.services.permission.skill_refresher import (
+                        SkillRiskRefresher,
+                    )
+                    from app.domain.services.permission.sources import SkillSource
+
+                    try:
+                        pe.register_source(
+                            "skill",
+                            SkillSource(
+                                refresher=SkillRiskRefresher(_skill_tool_live),
+                                redis=_redis_for_late_skill,
+                            ),
+                        )
+                    except ValueError:
+                        # register_source raises on duplicate — concurrent
+                        # preflight may already have registered the source;
+                        # safe to ignore.
+                        logger.debug(
+                            "PE preflight: skill source already registered for "
+                            "session=%s; skipping duplicate.",
+                            session_id,
+                        )
+                    # PE-1 §2.6: validate now that the full registry is wired.
+                    # build_permission_engine no longer validates internally; the
+                    # caller (here) is responsible for the post late-register check.
+                    from app.application.composition.graph_assembly import (
+                        validate_pe_source_registry,
+                    )
+                    validate_pe_source_registry(
+                        getattr(pe, "_sources", None) or {}
+                    )
 
         # P1#1 (split-brain guard): Check whether the existing task for this session
         # was created with PE enabled.  A task built before PE was enabled (feature
@@ -1074,21 +1422,22 @@ class AgentService:
                     tool_confirmation=tool_confirmation,
                 )
 
-            # P2 (round-16): Mixed-batch routing consistency guard.
-            # _pe_dispatch in react_graph routes the ENTIRE batch to legacy when
-            # ANY tool_call in the batch is non-native (skill/mcp/a2a).  If we
-            # ran PE preflight on a native tool that happens to share a batch with
-            # a non-native tool, the graph would walk the legacy commit path and
+            # P2 (round-16) / PE-1 §3.2 Correction E: Mixed-batch routing
+            # consistency guard. _pe_dispatch in react_graph routes the ENTIRE
+            # batch to legacy when ANY tool_call in the batch is NOT
+            # PE-eligible (per is_pe_enabled_for_source). If we ran PE preflight
+            # on an eligible tool that happens to share a batch with an
+            # ineligible tool, the graph would walk the legacy commit path and
             # never consume pe_resume_outcomes / claim_nonce → split-brain.
             #
-            # Fix: mirror the _pe_dispatch batch-level check here.  Read the active
-            # tool_calls batch from the graph checkpoint and if ANY non-native tool
-            # is present → fall back to legacy preflight for the whole batch.
-            #
-            # Extracted to _batch_has_non_native_pending (round-17) so the same
-            # check can be re-applied in the post-create guard (P2#1).
-            if await self._batch_has_non_native_pending(
-                _task_flow, session_id, pending_detail.tool_name
+            # Fix: mirror the _pe_dispatch batch-level check here. Read the
+            # active tool_calls batch from the graph checkpoint and if ANY
+            # ineligible tool is present → fall back to legacy preflight for
+            # the whole batch. The _batch_has_non_native_pending helper is kept
+            # alongside for one PR-1b cycle so callers can migrate piecemeal.
+            if await self._batch_has_non_pe_eligible_pending(
+                _task_flow, session_id, pending_detail.tool_name,
+                _tc_for_per_call_gate,
             ):
                 return await self._preflight_resume_tool_confirmation_legacy(
                     session_id=session_id,
@@ -1104,11 +1453,14 @@ class AgentService:
                 f"resume not allowed in mode={mode.value if hasattr(mode, 'value') else mode}"
             )
 
-        # Build PE input DTOs
+        # Build PE input DTOs. At this point the gate above has already
+        # ensured ``_pending_tool_source_obj is not None`` (else we would
+        # have routed to legacy), so ``_pending_tool_source_obj.source``
+        # is safe to read.
         call_spec = ToolCallSpec(
             tool_name=pending_detail.tool_name,
             tool_args=dict(pending_detail.tool_args),
-            tool_source="native",  # PE-0 scope: only native tools reach here
+            tool_source=_pending_tool_source_obj.source,  # PE-1 §3.2 — accept skill/mcp/a2a
             user_id=pending_detail.user_id,
             session_id=session_id,
             arg_digest=pending_detail.arg_digest,
@@ -1245,20 +1597,24 @@ class AgentService:
                     tool_confirmation=tool_confirmation,
                 )
 
-            # P2#1 (round-17): Mixed-batch guard for the post-create path.
-            # When a worker restarts, in-memory task is lost and _create_task
-            # builds a new task.  The existing-task mixed-batch guard above was
-            # skipped (_existing_task was None).  PE preflight has already claimed
-            # the Redis entry (claim_nonce written).  But if the checkpointed batch
-            # contains non-native tools, _pe_dispatch will fall back to legacy for
-            # the whole batch on resume and never consume pe_resume_outcomes /
-            # claim_nonce → split-brain / stuck 'processing' entry.
+            # P2#1 (round-17) / PE-1 §3.2 Correction E: Mixed-batch guard for
+            # the post-create path. When a worker restarts, in-memory task is
+            # lost and _create_task builds a new task. The existing-task
+            # mixed-batch guard above was skipped (_existing_task was None).
+            # PE preflight has already claimed the Redis entry (claim_nonce
+            # written). But if the checkpointed batch contains tools whose
+            # source is NOT PE-eligible under the current
+            # ToolConfirmationConfig, _pe_dispatch will fall back to legacy
+            # for the whole batch on resume and never consume
+            # pe_resume_outcomes / claim_nonce → split-brain / stuck
+            # 'processing' entry.
             #
-            # Fix: apply the same mixed-batch check here.  On mismatch, roll back
-            # the claim to 'pending' and redirect to legacy preflight (same
-            # rollback pattern as P1#2 above).
-            if _new_flow is not None and await self._batch_has_non_native_pending(
-                _new_flow, session_id, pending_detail.tool_name
+            # Fix: apply the same mixed-batch check here. On mismatch, roll
+            # back the claim to 'pending' and redirect to legacy preflight
+            # (same rollback pattern as P1#2 above).
+            if _new_flow is not None and await self._batch_has_non_pe_eligible_pending(
+                _new_flow, session_id, pending_detail.tool_name,
+                _tc_for_per_call_gate,
             ):
                 logger.warning(
                     "PE preflight mixed-batch guard (P2#1 post-create): session=%s "

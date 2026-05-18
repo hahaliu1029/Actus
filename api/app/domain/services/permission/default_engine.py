@@ -12,10 +12,11 @@ No FastAPI / SQLAlchemy imports — domain layer constraint.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 from app.domain.models.approval_grant import ApprovalDecision
 from app.domain.models.session import SessionStatus
@@ -39,11 +40,15 @@ from app.domain.services.permission.engine import PermissionEngine
 from app.domain.services.permission.errors import (
     PolicyConflict,
     SessionModeViolation,
+    UnsupportedSource,
     WriterIntegrityError,
 )
 from app.domain.services.permission.escalation_provider import EscalationProvider
 from app.domain.services.permission.tool_call_spec import ToolCallSpec
 from app.domain.services.risk_assessor import RiskLevel
+
+if TYPE_CHECKING:
+    from app.domain.services.permission.sources.base import PermissionSource
 
 # Module-level constants for session mode sets
 _ALLOWED_LIVE_MODES = {SessionStatus.RUNNING, SessionStatus.WAITING}
@@ -81,6 +86,11 @@ class DefaultPermissionEngine(PermissionEngine):
         session_machine: Any,
         reader: Any,
         escalation_registry: Mapping[str, EscalationProvider],
+        # PE-1 §2.4: per-source RiskAssessment derivation. Required at PE-1;
+        # default {} only to keep PE-0 unit tests that pre-date the field
+        # working without surgery. Production wiring MUST pass a populated
+        # mapping (validate_pe_source_registry enforces this at DI time).
+        sources: Mapping[str, "PermissionSource"] | None = None,
         decision_recorder: Optional[Callable[..., None]] = None,
         confirmation_timeout_seconds: int = 300,  # P2#3: configurable deadline
     ) -> None:
@@ -90,8 +100,38 @@ class DefaultPermissionEngine(PermissionEngine):
         self._ssm = session_machine
         self._reader = reader
         self._escalation_registry: Mapping[str, EscalationProvider] = escalation_registry
+        # PE-1 §2.4: per-source adapters; resolved per evaluate() call.
+        self._sources: Mapping[str, "PermissionSource"] = sources or {}
         self._decision_recorder = decision_recorder or (lambda *a, **kw: None)
         self._confirmation_timeout_seconds: int = confirmation_timeout_seconds
+
+    def register_source(self, name: str, source: "PermissionSource") -> None:
+        """Post-construction source injection (PE-1 §2.6).
+
+        Required because some sources (notably SkillSource) depend on
+        runtime objects (skill_tool) that are only available after the
+        engine has been built. Wiring sequence:
+            1. build_permission_engine(..., sources={"native": NativeSource()})
+            2. construct task_runner / acquire skill_tool
+            3. pe.register_source("skill", SkillSource(refresher, redis))
+            4. validate_pe_source_registry(pe._sources)
+
+        Single-write per name — repeated calls raise ValueError so we
+        never silently swap evaluators mid-flight.
+        """
+        if not isinstance(self._sources, dict):
+            # Convert frozen Mapping → dict so we can mutate. After-first-
+            # evaluate mutation is the caller's concern (this method is for
+            # DI wiring, not hot-path swapping); INV-1b CI static scan
+            # ensures no source impl writes to writer/queue/SSM so a swap
+            # between registrations cannot corrupt those.
+            self._sources = dict(self._sources)
+        if name in self._sources:
+            raise ValueError(
+                f"source '{name}' already registered "
+                "(register_source is single-write per name)"
+            )
+        self._sources[name] = source
 
     # ------------------------------------------------------------------ helpers
 
@@ -334,6 +374,25 @@ class DefaultPermissionEngine(PermissionEngine):
                 ),
             )
 
+        # 5.5. PE-1 §2.4 — source-uniform RiskAssessment derivation.
+        # NativeSource is passthrough; SkillSource recomputes (Risk #1).
+        # We resolve source here so that the assessment used by steps 6-9
+        # is always the canonical one for this tool_source.
+        source = self._sources.get(call.tool_source)
+        if source is None:
+            self._record_decision(
+                "permission_engine.unsupported_source",
+                "deny",
+                reason=f"unregistered_source:{call.tool_source}",
+                attrs=self._build_attrs(call, ctx, "source_dispatch"),
+            )
+            raise UnsupportedSource(call.tool_source)
+        source_assessment = await source.assess_risk(call)
+        # Override caller pre-fill (Risk #1 hard rule). Frozen dataclass →
+        # dataclasses.replace creates a new instance; subsequent code reads
+        # `call.risk_assessment` as the post-source value.
+        call = dataclasses.replace(call, risk_assessment=source_assessment)
+
         # 6. Stage P.1 — ApprovalStateReader grant lookup (C-P0-2)
         verdict = await self._reader.check(
             user_id=call.user_id,
@@ -504,12 +563,32 @@ class DefaultPermissionEngine(PermissionEngine):
             reason="ask_policy_user_confirmation_required",
             attrs=self._build_attrs(call, ctx, "decision_final", confirmation_id=cid),
         )
+        # PE-1 §2.4 step 9: per-source reason.type dispatch.
+        # Skill source historically uses risk_enforce (matches the legacy
+        # react_graph.py:2243-2395 R3 path) with the LLM/risk_assessor's
+        # risk_reason as the user-facing message. Native uses approval_policy
+        # with the canned "user confirmation required" message (preserves
+        # the legacy native confirmation UX).
+        if call.tool_source == "skill":
+            reason_type = "risk_enforce"
+            reason_message = (
+                (call.risk_assessment.risk_reason if call.risk_assessment is not None else None)
+                or "user confirmation required"
+            )
+        else:
+            reason_type = "approval_policy"
+            reason_message = "user confirmation required"
+        reason_code = (
+            f"ask:{call.risk_assessment.final_level.name.lower()}"
+            if call.risk_assessment is not None
+            else "ask:once"
+        )
         return Asked(
             content=f"Confirm {call.tool_name}",
             reason=DecisionReason(
-                type="approval_policy",
-                code="ask:once",
-                message="user confirmation required",
+                type=reason_type,
+                code=reason_code,
+                message=reason_message,
             ),
             confirmation_id=cid,
         )
