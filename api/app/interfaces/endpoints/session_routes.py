@@ -156,6 +156,7 @@ async def _build_list_session_item(
     return ListSessionItem(
         session_id=session.id,
         title=session.title,
+        sample_session_id=session.sample_session_id,
         latest_message=session.latest_message,
         latest_message_at=session.latest_message_at,
         status=session.status,

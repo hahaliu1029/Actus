@@ -80,6 +80,7 @@ class Session(BaseModel):
     """会话领域模型"""
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 会话id
+    sample_session_id: Optional[str] = None  # 父会话id（Phase 1 minimal subagent：子会话回链）
     sandbox_id: Optional[str] = None  # 沙箱id（仅 infrastructure ORM 兼容层使用）
     sandbox_binding: SandboxBinding = Field(
         default_factory=SandboxBinding

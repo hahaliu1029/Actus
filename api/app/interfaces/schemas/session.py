@@ -40,6 +40,7 @@ class ListSessionItem(BaseModel):
 
     session_id: str = ""
     title: str = ""
+    sample_session_id: Optional[str] = None
     latest_message: str = ""
     latest_message_at: Optional[datetime] = Field(default_factory=datetime.now)
     status: SessionStatus = SessionStatus.PENDING

@@ -38,6 +38,11 @@ class SessionModel(Base):
         primary_key=True,
         default=lambda: str(uuid.uuid4()),
     )  # 会话id
+    sample_session_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )  # 父会话id（partial index lives in migration; Phase 1 minimal subagent：子会话回链）
     sandbox_id: Mapped[str] = mapped_column(String(255), nullable=True)  # 沙箱id
     # ── Sandbox binding columns (lifecycle state machine, I8) ──
     sandbox_state: Mapped[str] = mapped_column(
