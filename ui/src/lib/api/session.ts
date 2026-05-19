@@ -380,14 +380,32 @@ export function openSubagentResearchStream(
         buf = blocks.pop() ?? "";
         for (const block of blocks) {
           let dataLine = "";
+          let eventLine = "";
+          let idLine = "";
           for (const line of block.split(SSE_LINE_SEP)) {
             if (line.startsWith("data:")) {
               dataLine = line.slice(5).trim();
+            } else if (line.startsWith("event:")) {
+              eventLine = line.slice(6).trim();
+            } else if (line.startsWith("id:")) {
+              idLine = line.slice(3).trim();
             }
           }
-          if (dataLine) {
+          if (dataLine && eventLine) {
             try {
-              const ev = JSON.parse(dataLine) as SubagentEvent;
+              // Cross-PR P1 (final review): backend EventMapper →
+              // CommonEventData.from_event excludes `id`/`type` from the
+              // `data:` JSON (api/app/interfaces/schemas/event.py:60); the
+              // discriminator lives on the SSE `event:` line and the frame id
+              // on the `id:` line. Reassemble them back onto the event object
+              // so `SubagentEvent` discriminated-union narrowing actually
+              // matches at runtime.
+              const payload = JSON.parse(dataLine) as Record<string, unknown>;
+              const ev = {
+                ...payload,
+                type: eventLine,
+                id: idLine,
+              } as unknown as SubagentEvent;
               onEvent(ev);
             } catch (parseErr) {
               console.warn("subagent SSE parse error:", parseErr);

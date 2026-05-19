@@ -30,10 +30,19 @@ function makeReadableStreamFromBytes(chunks: Uint8Array[]): ReadableStream<Uint8
 function encode(payload: object): Uint8Array {
   // sse-starlette frame format, CRLF separators:
   // id: <id>\r\nevent: <type>\r\ndata: <json>\r\n\r\n
-  const json = JSON.stringify(payload);
-  const id = (payload as { id?: string }).id ?? "x";
-  const type = (payload as { type?: string }).type ?? "x";
-  const frame = `id: ${id}\r\nevent: ${type}\r\ndata: ${json}\r\n\r\n`;
+  //
+  // Mirrors the real backend wire (cross-PR P1 fix): backend EventMapper →
+  // CommonEventData.from_event EXCLUDES `id` and `type` from the data: JSON
+  // (api/app/interfaces/schemas/event.py:60). The discriminator type lives on
+  // the SSE `event:` frame line and the frame id on the `id:` frame line.
+  // Encoding them only in the SSE frame here (not duplicated inside the JSON
+  // body) locks the regression — without the parser fix the panel would never
+  // see `type` on the event object.
+  const { id, type, ...body } = payload as { id?: string; type?: string };
+  const frameId = id ?? "x";
+  const frameType = type ?? "x";
+  const json = JSON.stringify(body);
+  const frame = `id: ${frameId}\r\nevent: ${frameType}\r\ndata: ${json}\r\n\r\n`;
   return new TextEncoder().encode(frame);
 }
 
