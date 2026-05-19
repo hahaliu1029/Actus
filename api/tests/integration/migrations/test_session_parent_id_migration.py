@@ -144,10 +144,13 @@ def test_downgrade_upgrade_roundtrip(alembic_cfg):
     engine = create_engine(sync_url)
 
     try:
-        # Establish baseline at p1m (conftest already upgraded to head; pin
-        # explicitly so any future revision on top of p1m can't shift what
-        # we're about to assert).
-        command.upgrade(alembic_cfg, P1M_REVISION)
+        # Establish baseline at p1m. Conftest already upgraded to head; with
+        # T12 (`t12_tool_filter_preset`) now living above p1m, walking to
+        # p1m is a *downgrade* direction. Calling ``command.upgrade(...,
+        # P1M_REVISION)`` would be a no-op / error on a head-stamped DB;
+        # use ``downgrade`` so the baseline is reachable from any future
+        # revision stacked on top of t12 as well.
+        command.downgrade(alembic_cfg, P1M_REVISION)
 
         # ---- Downgrade to pe0_mode_rev: column / FK / partial index gone. ----
         command.downgrade(alembic_cfg, PRE_P1M_REVISION)
@@ -316,6 +319,11 @@ async def test_fk_restrict_blocks_parent_delete_with_live_children(db_session):
             status="pending",
             title="child",
             sample_session_id=parent_sid,
+            # T12 cross-column CHECK (ck_sessions_child_must_have_preset)
+            # now requires a non-null preset on every child row, so this
+            # pre-T12 fixture must satisfy it to keep covering the
+            # *parent-delete RESTRICT* invariant it was written for.
+            tool_filter_preset="subagent_research",
         )
     )
     await db_session.flush()

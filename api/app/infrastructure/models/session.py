@@ -43,6 +43,10 @@ class SessionModel(Base):
         ForeignKey("sessions.id", ondelete="RESTRICT"),
         nullable=True,
     )  # 父会话id（partial index lives in migration; Phase 1 minimal subagent：子会话回链）
+    tool_filter_preset: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )  # T12: 持久化 tool_filter 预设名，让 _create_task 重建路径还原 allowlist；CHECK 约束见 migration
     sandbox_id: Mapped[str] = mapped_column(String(255), nullable=True)  # 沙箱id
     # ── Sandbox binding columns (lifecycle state machine, I8) ──
     sandbox_state: Mapped[str] = mapped_column(

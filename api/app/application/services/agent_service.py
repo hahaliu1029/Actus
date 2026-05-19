@@ -228,6 +228,51 @@ class AgentService:
         # 2.调用人物类的get方法获取对应的任务实例
         return self._task_cls.get(task_id)
 
+    @staticmethod
+    def _resolve_effective_tool_filter(
+        session: Session,
+        tool_filter: Optional[FrozenSet[str]],
+    ) -> Optional[FrozenSet[str]]:
+        """T12 / Phase 1 PR-X — F8 pod-restart resilience.
+
+        Precedence:
+
+        1. Explicit caller ``tool_filter`` (including ``frozenset()`` "deny-all")
+           **always wins** — fresh-chat paths already know the right policy.
+        2. If caller passed ``None`` *and* ``session.tool_filter_preset`` is
+           non-``None``, resolve the preset to its allowlist via
+           ``resolve_preset(...)``. ``resolve_preset`` raises ``ValueError``
+           on unknown presets (including ``""``) so a code/data drift
+           surfaces loudly instead of silently dropping the restriction.
+        3. Otherwise return ``None`` (no restriction).
+
+        Centralised here so every ``_create_task`` reconstruction path
+        (chat, resume, FINISHING, orphan sweep, preflight rebuild) gets the
+        same restore semantics without each caller needing to remember it.
+
+        Contract note (codex R1 P2): the predicate is ``is None``, NOT
+        ``not preset_name``. The empty string ``""`` MUST flow through to
+        ``resolve_preset`` (which fails closed with ``ValueError``) rather
+        than being coerced to "no restriction" by truthiness — that
+        coercion would silently widen permissions on a malformed row.
+        """
+        if tool_filter is not None:
+            return tool_filter
+        preset_name = getattr(session, "tool_filter_preset", None)
+        if preset_name is None:
+            return None
+        from app.domain.services.tool_filter_presets import resolve_preset
+
+        restored = resolve_preset(preset_name)
+        if restored is not None:
+            logger.info(
+                "[T12] 会话[%s] tool_filter 从 preset 还原: preset=%s allow=%d",
+                session.id,
+                preset_name,
+                len(restored),
+            )
+        return restored
+
     async def _create_task(
         self,
         session: Session,
@@ -241,11 +286,20 @@ class AgentService:
             tool_filter: Phase 1 minimal subagent — 可选的工具名白名单
                 （``None`` = 不过滤，沿用历史行为；空集合 = 显式拒绝所有工具）。
                 值会原封不动透传给 ``AgentTaskRunner``，仅在 fresh chat
-                创建任务的路径上由 ``chat()`` 注入；resume/handoff/sweeper
-                等路径上调用方默认传 ``None``（保持向后兼容）。
-                F8 已知 gap：当前 ``tool_filter`` 不会持久化，pod 重启后
-                重建任务时白名单会丢失，由 caller 自行兜底。
+                创建任务的路径上由 ``chat()`` 注入。
+
+                T12 / Phase 1 PR-X：resume / FINISHING / orphan / preflight
+                等重建路径调用方仍然传 ``None``——本函数会在入口处检查
+                ``session.tool_filter_preset``，若有值则通过
+                ``resolve_preset(...)`` 还原同一份白名单，从而填上 F8
+                pod-restart 安全缺口。显式传入的 ``tool_filter`` 优先级
+                高于 preset：caller 已经知道自己要的是什么。
         """
+        # T12: pod-restart resilience — restore tool_filter from preset when
+        # caller didn't pass one (resume / FINISHING / orphan paths). See
+        # ``_resolve_effective_tool_filter`` for the precedence contract.
+        tool_filter = self._resolve_effective_tool_filter(session, tool_filter)
+
         snap = self._config_snapshot  # local capture — immune to concurrent refresh
 
         # 1. 通过 lifecycle service 获取或创建沙箱 handle（I5: 禁止隐式复活）

@@ -191,11 +191,15 @@ async def test_run_research_happy_path(service, mock_deps):
     mock_deps["quota_service"].release = AsyncMock()
 
     children_created = []
+    # T12: capture tool_filter_preset so we can assert below that
+    # SubagentResearchService always tags children with "subagent_research".
+    preset_seen: list = []
 
-    async def fake_create(user_id, sample_session_id):
+    async def fake_create(user_id, sample_session_id, tool_filter_preset=None):
         child = MagicMock()
         child.id = f"child-{len(children_created)+1}"
         children_created.append(child)
+        preset_seen.append(tool_filter_preset)
         return child
 
     mock_deps["session_service"].create_session_with_parent = AsyncMock(
@@ -236,6 +240,10 @@ async def test_run_research_happy_path(service, mock_deps):
     assert len(summary) == 1
     assert mock_deps["sandbox_lifecycle_service"].suspend.call_count == 3
     mock_deps["quota_service"].release.assert_called_once()
+    # T12 / Phase 1 PR-X: every child session must be persisted with the
+    # "subagent_research" preset so AgentService._create_task can re-derive
+    # the read-only allowlist after a pod restart (F8 gap fix).
+    assert preset_seen == ["subagent_research", "subagent_research", "subagent_research"]
 
 
 async def test_run_research_quota_exceeded_raises(service, mock_deps):
@@ -271,7 +279,7 @@ async def test_run_research_finally_runs_release_on_consumer_aclose(
     mock_deps["quota_service"].acquire = AsyncMock(return_value=True)
     mock_deps["quota_service"].release = AsyncMock()
 
-    async def fake_create(user_id, sample_session_id):
+    async def fake_create(user_id, sample_session_id, tool_filter_preset=None):
         child = MagicMock()
         child.id = "child-disconnect"
         return child
@@ -360,7 +368,7 @@ async def test_run_research_aclose_mid_fanout_cancels_pending_children(
 
     created = []
 
-    async def fake_create(user_id, sample_session_id):
+    async def fake_create(user_id, sample_session_id, tool_filter_preset=None):
         child = MagicMock()
         child.id = f"child-{len(created) + 1}"
         created.append(child)

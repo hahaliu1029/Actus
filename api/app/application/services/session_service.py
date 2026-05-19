@@ -66,7 +66,10 @@ class SessionService:
         return session
 
     async def create_session_with_parent(
-        self, user_id: str, sample_session_id: str
+        self,
+        user_id: str,
+        sample_session_id: str,
+        tool_filter_preset: Optional[str] = None,
     ) -> Session:
         """创建一个 child session，挂在 parent 下（Phase 1 minimal subagent）。
 
@@ -75,17 +78,53 @@ class SessionService:
         ondelete=RESTRICT — deleting the parent while children exist raises
         IntegrityError, which the API layer (PR-5) translates to 409.
 
+        T12 / Phase 1 PR-X: ``tool_filter_preset`` is **required** for every
+        child created via this method — closes the codex R1 P1 bypass where
+        a child row could be persisted with ``tool_filter_preset = NULL``
+        and then reconstructed on resume with no restriction. The value
+        must match a key in
+        ``app.domain.services.tool_filter_presets.TOOL_FILTER_PRESETS``; an
+        unknown name surfaces at runtime via ``resolve_preset(...)``'s
+        ``ValueError`` and the DB CHECK constraint
+        ``ck_sessions_tool_filter_preset`` is the last-line defense.
+
+        The DB also enforces
+        ``ck_sessions_child_must_have_preset`` (``sample_session_id IS NULL
+        OR tool_filter_preset IS NOT NULL``); this app-level ValueError
+        produces a cleaner error than the IntegrityError path.
+
+        Defaults to ``None`` only because the kwarg is positional-safe for
+        existing test stubs; passing ``None`` (or any unknown preset) raises.
+
         Does NOT trigger ``fs_reconciler`` walk: the parent ``create_session``
         already walked the user's memory directory, so the child can skip the
         redundant scan.
         """
+        if tool_filter_preset is None:
+            raise ValueError(
+                "create_session_with_parent: tool_filter_preset is required "
+                "for child sessions (T12 / Phase 1 PR-X). Pass a known "
+                "preset key from TOOL_FILTER_PRESETS, e.g. 'subagent_research'."
+            )
+        from app.domain.services.tool_filter_presets import TOOL_FILTER_PRESETS
+
+        if tool_filter_preset not in TOOL_FILTER_PRESETS:
+            raise ValueError(
+                f"create_session_with_parent: unknown tool_filter_preset "
+                f"{tool_filter_preset!r}. Known: {sorted(TOOL_FILTER_PRESETS)}."
+            )
+
         logger.info(
-            f"创建子会话: sample_session_id={sample_session_id} user_id={user_id}"
+            "创建子会话: sample_session_id=%s user_id=%s tool_filter_preset=%s",
+            sample_session_id,
+            user_id,
+            tool_filter_preset,
         )
         session = Session(
             title="新对话",
             user_id=user_id,
             sample_session_id=sample_session_id,
+            tool_filter_preset=tool_filter_preset,
         )
         async with self._uow:
             await self._uow.session.save(session)

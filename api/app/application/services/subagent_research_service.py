@@ -37,6 +37,9 @@ from app.domain.services.prompts.subagent_summary_join import (
 from app.domain.services.subagent_research_classifier import (
     SubagentResearchClassifier,
 )
+from app.domain.services.tool_filter_presets import (
+    SUBAGENT_RESEARCH_ALLOWED_TOOLS,
+)
 from app.infrastructure.cache.probe_quota import ProbeQuotaService
 from app.interfaces.schemas.subagent import (
     ChildDoneEvent,
@@ -49,18 +52,11 @@ from app.interfaces.schemas.subagent import (
 logger = logging.getLogger(__name__)
 
 
-SUBAGENT_RESEARCH_ALLOWED_TOOLS = frozenset({
-    "search_web",
-    "file_read",
-    "file_list",
-    "file_view",
-    "list_mcp_tools",
-    "get_mcp_tool",
-    "get_skill_guide",
-    "memory_search",
-    "memory_get",
-    "shell_read_output",
-})
+# T12: ``Session.tool_filter_preset`` value persisted on every child created
+# by ``run_research``. ``AgentService._create_task`` reads it on resume /
+# FINISHING / orphan paths and re-derives the allowlist via ``resolve_preset``
+# so a pod restart doesn't silently drop the tool restriction (F8).
+_SUBAGENT_RESEARCH_PRESET = "subagent_research"
 
 
 METRIC_LOG_PATH = Path.home() / ".gstack" / "metrics" / "actus-multiagent-probe.jsonl"
@@ -352,7 +348,9 @@ class SubagentResearchService:
         try:
             for prompt in prompts[:max_children]:
                 child = await self._session_service.create_session_with_parent(
-                    user_id=user_id, sample_session_id=sample_session_id
+                    user_id=user_id,
+                    sample_session_id=sample_session_id,
+                    tool_filter_preset=_SUBAGENT_RESEARCH_PRESET,
                 )
                 # NOTE: spec calls `session_service.update_title(...)` here for
                 # UX (prefixing child titles with "[probe]"), but that method

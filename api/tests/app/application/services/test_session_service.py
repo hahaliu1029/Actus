@@ -45,7 +45,12 @@ class TestCreateSessionWithParent:
         service = SessionService(uow_factory=factory)
 
         child = await service.create_session_with_parent(
-            user_id="u-1", sample_session_id="parent-1"
+            user_id="u-1",
+            sample_session_id="parent-1",
+            # T12: preset is required for every child created via this method
+            # (codex R1 P1 fix). Existing PR-1 contract preserved by passing
+            # the canonical subagent_research preset.
+            tool_filter_preset="subagent_research",
         )
 
         assert child.user_id == "u-1"
@@ -75,7 +80,9 @@ class TestCreateSessionWithParent:
         service._spawn_fs_reconciler_walk = spawn_spy  # type: ignore[method-assign]
 
         await service.create_session_with_parent(
-            user_id="u-1", sample_session_id="parent-1"
+            user_id="u-1",
+            sample_session_id="parent-1",
+            tool_filter_preset="subagent_research",  # T12: required for children
         )
 
         spawn_spy.assert_not_called()
@@ -96,7 +103,9 @@ class TestCreateSessionWithParent:
         children = []
         for _ in range(3):
             child = await service.create_session_with_parent(
-                user_id="u-1", sample_session_id="parent-1"
+                user_id="u-1",
+                sample_session_id="parent-1",
+                tool_filter_preset="subagent_research",  # T12: required
             )
             children.append(child)
 
