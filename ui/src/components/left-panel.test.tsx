@@ -28,31 +28,34 @@ vi.mock("next/navigation", () => ({
   }),
 }));
 
+const mockSessionsFixture = [
+  {
+    session_id: "sid-1",
+    title: "测试会话",
+    sample_session_id: null,
+    latest_message: "最新消息",
+    latest_message_at: "2026-02-21T10:00:00.000Z",
+    status: "running",
+    unread_message_count: 1,
+    supervisor_snapshot: {
+      execution_mode: "background",
+      execution_phase: "suspended",
+      background_reason: "explicit",
+      expires_at: null,
+      retry_budget_remaining: 2,
+      suspended_reason: "bg_idle_timeout",
+      terminal_reason: null,
+      last_progress_at: null,
+      is_alive: false,
+      cancellation_state: "none",
+    },
+  },
+];
+
 vi.mock("@/lib/store/session-store", () => ({
   useSessionStore: (selector: (state: Record<string, unknown>) => unknown) =>
     selector({
-      sessions: [
-        {
-          session_id: "sid-1",
-          title: "测试会话",
-          latest_message: "最新消息",
-          latest_message_at: "2026-02-21T10:00:00.000Z",
-          status: "running",
-          unread_message_count: 1,
-          supervisor_snapshot: {
-            execution_mode: "background",
-            execution_phase: "suspended",
-            background_reason: "explicit",
-            expires_at: null,
-            retry_budget_remaining: 2,
-            suspended_reason: "bg_idle_timeout",
-            terminal_reason: null,
-            last_progress_at: null,
-            is_alive: false,
-            cancellation_state: "none",
-          },
-        },
-      ],
+      sessions: mockSessionsFixture,
       isLoadingSessions: false,
       fetchSessions: storeMocks.fetchSessions,
       streamSessions: vi.fn(),
@@ -61,6 +64,10 @@ vi.mock("@/lib/store/session-store", () => ({
       deleteSession: vi.fn(async () => {}),
       retryFromSuspend: storeMocks.retryFromSuspend,
     }),
+  // PR-6 Task 26: hook used by LeftPanel to exclude probe child sessions.
+  // In tests, return the same fixture (all entries have sample_session_id=null
+  // so filter is a no-op and existing behavioural assertions still hold).
+  useFilteredSessionsForList: () => mockSessionsFixture,
 }));
 
 vi.mock("@/lib/api/session", () => ({

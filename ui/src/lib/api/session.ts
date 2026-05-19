@@ -1,5 +1,11 @@
 import { createSSEStream, get, parseSSEStream, post } from "./fetch";
 import { fileTransferClient } from "./axios-client";
+import {
+  API_BASE_URL,
+  getAccessToken,
+  handleLogout,
+  maybeRefreshToken,
+} from "@/lib/api/auth-utils";
 import type {
   BackgroundQuotaResponse,
   ChatParams,
@@ -18,6 +24,7 @@ import type {
   RenewTakeoverParams,
   RenewTakeoverResponse,
   ReopenTakeoverResponse,
+  ResearchSubagentRequest,
   RetryFromSuspendResponse,
   Session,
   ShellReadResponse,
@@ -25,6 +32,7 @@ import type {
   SSEEventHandler,
   StartTakeoverParams,
   StartTakeoverResponse,
+  SubagentEvent,
   ViewFileParams,
   ViewShellParams,
 } from "./types";
@@ -281,3 +289,120 @@ export const sessionApi = {
     return get<CostAggregateResponse>(`/sessions/${sessionId}/cost`);
   },
 };
+
+// ==================== Subagent Research (Phase 1 minimal) ====================
+
+/**
+ * Open a POST-SSE stream against the subagent research endpoint.
+ *
+ * Unlike `sessionApi.chat`, this uses raw `fetch()` instead of the shared
+ * `createSSEStream` helper because the backend SSE wire here uses
+ * single-line `data:` JSON payloads (no `event:` field) and the helper
+ * pre-parses them differently. Returning `{ close }` matches the panel
+ * component's cleanup contract on unmount / user dismiss.
+ */
+export function openSubagentResearchStream(
+  parentSessionId: string,
+  request: ResearchSubagentRequest,
+  onEvent: (event: SubagentEvent) => void,
+  onError: (error: Event) => void,
+  onClose: () => void,
+): { close: () => void } {
+  const url = `${API_BASE_URL}/sessions/${parentSessionId}/subagents/research`;
+  const controller = new AbortController();
+
+  // Initial auth token check — refresh-and-retry on 401 happens below.
+  const initialToken = getAccessToken();
+  if (!initialToken) {
+    onError(new Event("no-auth-token"));
+    return { close: () => {} };
+  }
+
+  // Codex R3 P2: mirror requestResponse() 401-refresh-and-retry behaviour
+  // (ui/src/lib/api/fetch.ts:126) so an expired access token gets transparently
+  // refreshed instead of failing the panel.
+  const doFetch = (authToken: string): Promise<Response> =>
+    fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+
+  void (async () => {
+    try {
+      let response = await doFetch(initialToken);
+
+      if (response.status === 401) {
+        const refreshed = await maybeRefreshToken();
+        if (!refreshed) {
+          handleLogout();
+          onError(new Event("http-401"));
+          return;
+        }
+        const fresh = getAccessToken();
+        if (!fresh) {
+          onError(new Event("no-auth-token"));
+          return;
+        }
+        response = await doFetch(fresh);
+      }
+
+      if (!response.ok) {
+        // Codex R2 P2: propagate status so the panel can map 400/409/404 to
+        // user-readable copy (classifier reject / quota / parent not found).
+        onError(new Event(`http-${response.status}`));
+        return;
+      }
+      if (!response.body) {
+        onError(new Event("no-body"));
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      // Codex R1 P1#1: sse-starlette emits CRLF (`\r\n...\r\n\r\n`), so we must
+      // split blocks on `\r?\n\r?\n` rather than `\n\n` — otherwise the buffer
+      // grows forever and no event fires. Verified via
+      // `ServerSentEvent(...).encode()` empirically.
+      const SSE_BLOCK_SEP = /\r?\n\r?\n/;
+      const SSE_LINE_SEP = /\r?\n/;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const blocks = buf.split(SSE_BLOCK_SEP);
+        buf = blocks.pop() ?? "";
+        for (const block of blocks) {
+          let dataLine = "";
+          for (const line of block.split(SSE_LINE_SEP)) {
+            if (line.startsWith("data:")) {
+              dataLine = line.slice(5).trim();
+            }
+          }
+          if (dataLine) {
+            try {
+              const ev = JSON.parse(dataLine) as SubagentEvent;
+              onEvent(ev);
+            } catch (parseErr) {
+              console.warn("subagent SSE parse error:", parseErr);
+            }
+          }
+        }
+      }
+      onClose();
+    } catch (err: unknown) {
+      if (controller.signal.aborted) return;
+      onError(err instanceof Event ? err : new Event("fetch-error"));
+    }
+  })();
+
+  return {
+    close: () => controller.abort(),
+  };
+}

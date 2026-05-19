@@ -9,6 +9,7 @@ import { sessionApi } from "@/lib/api/session";
 import { fetchCompactionList } from "@/lib/api/session-compaction";
 import type {
   ChatParams,
+  ChildOutcome,
   FileInfo,
   GetSessionFilesResponse,
   ListSessionItem,
@@ -20,6 +21,32 @@ import type { CompactionListItem } from "@/types/session-compaction";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
 import { normalizeSessionStatus } from "@/lib/utils/session-status";
+
+// ---------------------------------------------------------------------------
+// Phase 1 minimal subagent research — probe state slice
+// ---------------------------------------------------------------------------
+
+// "pending" is a UI-only marker for "child_started arrived but child_done has
+// not"; the backend never sends it. The wire outcomes come from ChildOutcome.
+export type ProbeChildOutcome = ChildOutcome | "pending";
+
+export interface ProbeChildState {
+  child_session_id: string;
+  prompt: string;
+  outcome: ProbeChildOutcome | null;
+  final_answer: string | null;
+}
+
+export interface ProbeState {
+  running: boolean;
+  probe_run_id: string | null;
+  children: ProbeChildState[];
+  summary: string | null;
+  validation_warnings: string[];
+  // Codex R1 P1#2: surface preflight/stream errors so the panel can leave the
+  // "进行中…" state when classifier / quota / conflict / network failures land.
+  error: string | null;
+}
 
 type SessionState = {
   sessions: ListSessionItem[];
@@ -33,6 +60,7 @@ type SessionState = {
   chatAbort: (() => void) | null;
   sessionsAbort: (() => void) | null;
   _isRecovering: boolean;
+  probeState: ProbeState;
 };
 
 type SessionActions = {
@@ -75,6 +103,14 @@ type SessionActions = {
   recoverSession: (sessionId: string) => Promise<void>;
   retryFromSuspend: (sessionId: string) => Promise<void>;
   mergeCompactionList: (items: CompactionListItem[]) => void;
+  // Phase 1 minimal subagent research
+  getFilteredSessionsForList: () => ListSessionItem[];
+  resetProbe: () => void;
+  startProbe: (probeRunId: string, prompts: string[]) => void;
+  updateChild: (childSessionId: string, update: Partial<ProbeChildState>) => void;
+  updateChildByPrompt: (prompt: string, update: Partial<ProbeChildState>) => void;
+  setProbeSummary: (summary: string, warnings: string[]) => void;
+  setProbeError: (message: string) => void;
 };
 
 type SessionStore = SessionState & SessionActions;
@@ -82,6 +118,15 @@ type SessionStore = SessionState & SessionActions;
 export type SessionEventRecord = {
   event: string;
   data: Record<string, unknown>;
+};
+
+const initialProbeState: ProbeState = {
+  running: false,
+  probe_run_id: null,
+  children: [],
+  summary: null,
+  validation_warnings: [],
+  error: null,
 };
 
 const initialState: SessionState = {
@@ -96,6 +141,7 @@ const initialState: SessionState = {
   chatAbort: null,
   sessionsAbort: null,
   _isRecovering: false,
+  probeState: initialProbeState,
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -1621,8 +1667,87 @@ export const useSessionStore = create<SessionStore>()(
     downloadSandboxFile: async (sessionId: string, filepath: string, options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }) => {
       return sessionApi.downloadSandboxFile(sessionId, filepath, options);
     },
+
+    // -----------------------------------------------------------------------
+    // Phase 1 minimal subagent research
+    // -----------------------------------------------------------------------
+
+    getFilteredSessionsForList: () =>
+      get().sessions.filter(
+        (s) => s.sample_session_id === null || s.sample_session_id === undefined,
+      ),
+
+    resetProbe: () => set({ probeState: initialProbeState }),
+
+    startProbe: (probeRunId, prompts) =>
+      set({
+        probeState: {
+          running: true,
+          probe_run_id: probeRunId,
+          children: prompts.map((p) => ({
+            child_session_id: "",
+            prompt: p,
+            outcome: null,
+            final_answer: null,
+          })),
+          summary: null,
+          validation_warnings: [],
+          error: null,
+        },
+      }),
+
+    updateChild: (childSessionId, update) =>
+      set((st) => ({
+        probeState: {
+          ...st.probeState,
+          children: st.probeState.children.map((c) =>
+            c.child_session_id === childSessionId ? { ...c, ...update } : c,
+          ),
+        },
+      })),
+
+    // Match by prompt for the initial ChildStartedEvent payload — child_session_id
+    // is empty until then. Update the FIRST row with matching prompt that has no
+    // session_id; later ChildDoneEvent updates by child_session_id.
+    updateChildByPrompt: (prompt, update) =>
+      set((st) => {
+        let updated = false;
+        const children = st.probeState.children.map((c) => {
+          if (!updated && c.prompt === prompt && !c.child_session_id) {
+            updated = true;
+            return { ...c, ...update };
+          }
+          return c;
+        });
+        return { probeState: { ...st.probeState, children } };
+      }),
+
+    setProbeSummary: (summary, warnings) =>
+      set((st) => ({
+        probeState: {
+          ...st.probeState,
+          running: false,
+          summary,
+          validation_warnings: warnings,
+        },
+      })),
+
+    setProbeError: (message) =>
+      set((st) => ({
+        probeState: {
+          ...st.probeState,
+          running: false,
+          error: message,
+        },
+      })),
   }))
 );
+
+// Hook export — selector returns filtered session list (excludes probe child
+// sessions whose sample_session_id is non-null).
+export function useFilteredSessionsForList(): ListSessionItem[] {
+  return useSessionStore((s) => s.getFilteredSessionsForList());
+}
 
 registerStoreResetter("session", () => {
   useSessionStore.getState().reset();

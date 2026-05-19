@@ -21,6 +21,7 @@ import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
 import { ToolConfirmationCard } from "@/components/tool-confirmation-card";
 import { StatusIndicator } from "@/components/status-indicator";
+import { SubagentResearchButton } from "@/components/subagent-research-button";
 import { SessionTaskDock } from "@/components/session-task-dock";
 import { WorkbenchPanel } from "@/components/workbench-panel";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -1374,6 +1375,7 @@ export default function SessionPage() {
               ) : null}
             </div>
             <div className="flex items-center gap-2">
+              <SubagentResearchButton parentSessionId={sessionId} />
               {isMobile ? (
                 <Button
                   variant="outline"

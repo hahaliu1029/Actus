@@ -19,7 +19,7 @@ import { sessionApi } from "@/lib/api/session";
 import { formatRelativeTime } from "@/lib/session-ui";
 import { getSessionStatusMeta } from "@/lib/status-copy";
 import type { BackgroundQuotaResponse, SupervisorSnapshot } from "@/lib/api/types";
-import { useSessionStore } from "@/lib/store/session-store";
+import { useFilteredSessionsForList, useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
 function getBackgroundPhaseLabel(
@@ -45,7 +45,9 @@ export function LeftPanel() {
   const router = useRouter();
   const pathname = usePathname();
 
-  const sessions = useSessionStore((state) => state.sessions);
+  // Phase 1 minimal subagent research: filter probe child sessions
+  // (sample_session_id non-null) out of the LeftPanel list view.
+  const sessions = useFilteredSessionsForList();
   const isLoadingSessions = useSessionStore((state) => state.isLoadingSessions);
   const fetchSessions = useSessionStore((state) => state.fetchSessions);
   const streamSessions = useSessionStore((state) => state.streamSessions);

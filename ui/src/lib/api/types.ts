@@ -289,6 +289,9 @@ export type FileUploadParams = {
 export type ListSessionItem = {
   session_id: string;
   title: string;
+  // Phase 1 minimal subagent research: non-null when this session is a probe
+  // child of another (parent) session. Filtered out of the session list UI.
+  sample_session_id: string | null;
   latest_message: string;
   latest_message_at: string | null;
   status: SessionStatus;
@@ -668,6 +671,62 @@ export type CompactionEventData = {
   messages_removed: number;
   usage_ratio_after?: number;
 };
+
+// ==================== Subagent Research (Phase 1 minimal) ====================
+
+export type ChildOutcome =
+  | "completed"
+  | "failed"
+  | "timed_out"
+  | "waiting"
+  | "cancelled";
+
+export interface ResearchSubagentRequest {
+  prompts: string[];
+  max_children: number;
+}
+
+export interface ChildStartedEvent {
+  id: string;
+  type: "child_started";
+  probe_run_id: string;
+  child_session_id: string;
+  prompt: string;
+}
+
+export interface ChildDoneEvent {
+  id: string;
+  type: "child_done";
+  probe_run_id: string;
+  child_session_id: string;
+  outcome: ChildOutcome;
+  final_answer: string | null;
+  transcript_tokens: number;
+  error_summary: string | null;
+}
+
+export interface DroppedChild {
+  child_id: string;
+  outcome: string;
+  error_summary: string | null;
+}
+
+export interface JoinedSummaryEvent {
+  id: string;
+  type: "joined_summary";
+  probe_run_id: string;
+  summary: string;
+  summary_tokens: number;
+  completed_children: string[];
+  dropped_children: DroppedChild[];
+  metrics: Record<string, number>;
+  validation_warnings: string[];
+}
+
+export type SubagentEvent =
+  | ChildStartedEvent
+  | ChildDoneEvent
+  | JoinedSummaryEvent;
 
 export type SSEEventType =
   | "message"
