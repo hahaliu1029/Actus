@@ -877,3 +877,96 @@ def build_cost_callback_handler(session_id: str, user_id: str):
     )
 
     return _build(session_id=session_id, user_id=user_id, uow_factory=get_uow)
+
+
+# ----------------------------------------------------------------------
+# Phase 1 minimal subagent research probe DI wiring
+# ----------------------------------------------------------------------
+#
+# Five factories wire ``SubagentResearchService`` through FastAPI's
+# ``Depends()`` graph. ``summary_llm`` is read from the same
+# ``_ConfigSnapshot`` the main chat pipeline uses (canonical path; spec
+# v3 fix per Codex round 2 P0#2 — there is no ``settings.summary_llm``
+# attribute on Settings). ``TokenEstimator`` is constructed with a fixed
+# ``"hybrid"`` strategy here because a configurable estimator field is
+# not currently exposed on ``Settings``; if a future PR needs another
+# strategy, add the field and read it here.
+
+
+def get_token_estimator() -> "TokenEstimator":
+    """Phase 1 minimal: TokenEstimator instance using hybrid strategy.
+
+    No mutable state after __init__ — safe to construct per-request.
+    """
+    from app.domain.services.graphs.token_estimator import TokenEstimator
+
+    return TokenEstimator(strategy="hybrid")
+
+
+def get_summary_llm() -> "BaseChatModel":
+    """Phase 1 minimal: summary join LLM from the live config snapshot.
+
+    Resolves through ``_load_app_config`` + ``_build_config_snapshot``
+    so a hot config reload (which updates ``_config_generation``) is
+    honored by the next request. Returns ``None`` only if the config
+    has no ``agent_config.memory.summary_model`` — caller should treat
+    that as a misconfiguration (the probe service requires summary_llm
+    for the join step and will surface a clear error downstream).
+    """
+    snapshot = _build_config_snapshot(_load_app_config())
+    return snapshot.summary_llm
+
+
+def get_subagent_research_classifier(
+    summary_llm: "BaseChatModel" = Depends(get_summary_llm),
+) -> "SubagentResearchClassifier":
+    """Classifier reuses the summary LLM (single LLM, no separate config)."""
+    from app.domain.services.subagent_research_classifier import (
+        SubagentResearchClassifier,
+    )
+
+    return SubagentResearchClassifier(llm=summary_llm)
+
+
+def get_probe_quota_service(
+    redis_client: RedisClient = Depends(get_redis),
+) -> "ProbeQuotaService":
+    """Phase 1 minimal: per-user active probe quota (atomic Lua acquire/release)."""
+    from app.infrastructure.cache.probe_quota import ProbeQuotaService
+
+    return ProbeQuotaService(redis_client=redis_client)
+
+
+def get_subagent_research_service(
+    session_service: SessionService = Depends(get_session_service),
+    agent_service: AgentService = Depends(get_agent_service),
+    supervisor=Depends(get_supervisor),
+    token_estimator: "TokenEstimator" = Depends(get_token_estimator),
+    summary_llm: "BaseChatModel" = Depends(get_summary_llm),
+    classifier: "SubagentResearchClassifier" = Depends(
+        get_subagent_research_classifier
+    ),
+    sandbox_lifecycle_service=Depends(get_sandbox_lifecycle_service),
+    quota_service: "ProbeQuotaService" = Depends(get_probe_quota_service),
+) -> "SubagentResearchService":
+    """Phase 1 minimal: research probe orchestrator.
+
+    Per-request construction is cheap (the service is stateless across
+    requests — each ``run_research`` call owns its own probe_run_id +
+    children list + tasks). Sharing across requests would require
+    splitting hot dependencies (e.g. supervisor) from per-request scope.
+    """
+    from app.application.services.subagent_research_service import (
+        SubagentResearchService,
+    )
+
+    return SubagentResearchService(
+        session_service=session_service,
+        agent_service=agent_service,
+        execution_supervisor=supervisor,
+        token_estimator=token_estimator,
+        summary_llm=summary_llm,
+        classifier=classifier,
+        sandbox_lifecycle_service=sandbox_lifecycle_service,
+        quota_service=quota_service,
+    )

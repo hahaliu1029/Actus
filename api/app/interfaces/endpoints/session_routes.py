@@ -69,8 +69,13 @@ from app.interfaces.schemas.session import (
 from app.interfaces.service_dependencies import (
     get_agent_service,
     get_session_service,
+    get_subagent_research_service,
     get_supervisor,
 )
+from app.application.services.subagent_research_service import (
+    SubagentResearchService,
+)
+from app.interfaces.schemas.subagent import ResearchSubagentRequest
 from app.infrastructure.storage.redis import RedisClient, get_redis
 from core.config import get_settings
 from fastapi import APIRouter, Body, Depends, Request, Response as FastAPIResponse
@@ -1464,3 +1469,201 @@ async def vnc_websocket(
     finally:
         if lease:
             await lease.release()
+
+
+async def _drain_subagent_cleanup(agen, lease) -> None:
+    """Run agen.aclose() + lease.release() to completion under cancel storm.
+
+    Codex R4 P2#1: a plain ``await asyncio.shield(coro)`` becomes a
+    "fire-and-forget task" the moment outer cancellation fires; the await
+    returns CancelledError and execution continues, but the inner coro is
+    now a detached task that the event loop is free to cancel during
+    shutdown (e.g. worker termination). For the SSE-slot/quota cleanup
+    we actually need both cleanups to RUN TO COMPLETION on the current
+    loop tick. Pattern: spawn each cleanup as a task, then loop
+    ``await asyncio.shield(task)`` until ``task.done()``. Any
+    CancelledError on the outer is captured and re-raised after BOTH
+    cleanups finish, so cooperative cancellation is honored without
+    leaking the lease slot via the ``_released=True`` / Redis-zrem race
+    at ``rate_limit.py:113``.
+    """
+    pending_cancel: BaseException | None = None
+    agen_task = asyncio.create_task(agen.aclose())
+    release_task = asyncio.create_task(lease.release())
+    for cleanup_task, label in (
+        (agen_task, "agen.aclose"),
+        (release_task, "lease.release"),
+    ):
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as exc:
+                pending_cancel = exc
+            except Exception as exc:
+                logger.warning(
+                    "subagent_research cleanup %s raised: %s", label, exc,
+                )
+                break
+    if pending_cancel is not None:
+        raise pending_cancel
+
+
+@router.post(
+    path="/{sample_session_id}/subagents/research",
+    summary="Phase 1 minimal: spawn read-only research subagents",
+    description="Spawn 1-3 read-only research subagents under the parent session, fan-out execution with deterministic summary join, multi-metric jsonl probe record.",
+    dependencies=[Depends(rate_limit_chat)],
+)
+async def subagent_research(
+    sample_session_id: str,
+    request: ResearchSubagentRequest,
+    current_user: CurrentUser,
+    redis_client: RedisClient = Depends(get_redis),
+    session_service: SessionService = Depends(get_session_service),
+    service: SubagentResearchService = Depends(get_subagent_research_service),
+) -> EventSourceResponse:
+    """Spawn N (1-3) read-only research subagents under the parent session.
+
+    Order of side effects MUST match the chat endpoint preflight contract:
+    1. Parent ownership check (404 on miss/cross-tenant → no existence leak)
+    2. Acquire SSE connection lease (rate_limit_chat already enforced via
+       dependency declaration; lease is a separate per-connection guard)
+    3. Prime the inner ``run_research`` generator so preflight errors
+       (ConflictError/BadRequestError) surface as proper HTTP 409/400 via
+       FastAPI exception handlers, NOT as 200-then-broken-SSE-stream
+    4. Stream remaining events through EventMapper → ServerSentEvent
+
+    CS3 invariant: ``ServerSentEvent.id == event.id`` (== payload event_id).
+    All probe event domain models extend BaseEvent which carries ``id``;
+    EventMapper falls through to CommonSSEEvent for unknown event types so
+    ``probe_run_id`` / ``child_session_id`` / ``metrics`` etc. survive the
+    wire envelope via ``CommonEventData(extra="allow")``.
+
+    Cancellation contract: when the SSE client disconnects, the outer
+    generator's ``aclose()`` triggers ``GeneratorExit`` at its yield
+    point. The outer ``finally`` MUST explicitly ``aclose()`` the inner
+    ``run_research`` generator (an ``async for`` does NOT propagate
+    close to the producer), otherwise ``run_research``'s PR-4 R3
+    GeneratorExit safety (child cancel + sandbox suspend + quota
+    release) is delayed until garbage collection — i.e. effectively
+    leaks until the event loop is shut down.
+    """
+    parent = await session_service.get_session(
+        session_id=sample_session_id,
+        user_id=current_user.id,
+        is_admin=current_user.is_admin(),
+    )
+    if parent is None:
+        raise NotFoundError(
+            f"Session {sample_session_id} not found or not accessible"
+        )
+
+    lease = await acquire_connection_limit(
+        channel=RateLimitChannel.SSE,
+        user_id=current_user.id,
+        redis_client=redis_client,
+    )
+    lease.start_heartbeat()
+
+    # Prime the inner generator BEFORE returning EventSourceResponse so
+    # preflight errors (ConflictError / BadRequestError / NotFoundError
+    # raised in `run_research` before its first yield) become real HTTP
+    # 409 / 400 / 404 responses. Once we return EventSourceResponse the
+    # status line is already 200 and exceptions can only manifest as a
+    # truncated body. On any exception OR an empty stream we own the
+    # lease release here; on success the streaming generator owns it.
+    agen = service.run_research(
+        sample_session_id=sample_session_id,
+        user_id=current_user.id,
+        prompts=request.prompts,
+        max_children=request.max_children,
+    )
+    first_event = None
+    try:
+        first_event = await agen.__anext__()
+    except StopAsyncIteration:
+        # Legitimate empty stream — fall through to the streaming response
+        # with first_event=None; the generator below will just not yield.
+        pass
+    except BaseException as preflight_exc:
+        # Includes ConflictError, BadRequestError, NotFoundError, asyncio
+        # CancelledError, and any other startup failure. Drain cleanup to
+        # completion (Codex R4 P2 helper handles cancel storm), then
+        # re-raise the ORIGINAL preflight exception so FastAPI's exception
+        # chain produces the right HTTP status (409 / 400 / 404 / 500).
+        try:
+            await _drain_subagent_cleanup(agen, lease)
+        except asyncio.CancelledError:
+            # If the route task is being cancelled, prefer the
+            # cancellation over the preflight error (cooperative
+            # cancel semantics — outer is going away regardless).
+            raise
+        except Exception as cleanup_exc:
+            logger.warning(
+                "subagent_research priming cleanup raised: %s", cleanup_exc,
+            )
+        raise preflight_exc
+
+    async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
+        try:
+            if first_event is not None:
+                sse_event = EventMapper.event_to_sse_event(first_event)
+                yield ServerSentEvent(
+                    id=first_event.id,
+                    event=sse_event.event,
+                    data=sse_event.to_sse_data_json(),
+                )
+            async for event in agen:
+                sse_event = EventMapper.event_to_sse_event(event)
+                yield ServerSentEvent(
+                    id=event.id,
+                    event=sse_event.event,
+                    data=sse_event.to_sse_data_json(),
+                )
+        finally:
+            # Codex R3 P1 + R4 P2: drain via _drain_subagent_cleanup so
+            # `ConnectionLease.release()` reaches its Redis zrem
+            # (rate_limit.py:113-126) even under cancel storm (task_group
+            # cancel triggered by sibling _ping / handler finishing while
+            # we are inside this finally) AND even on the second iteration
+            # of the drain loop if the first cleanup task itself absorbs
+            # a cancel. The helper re-raises CancelledError after both
+            # cleanups complete, preserving cooperative cancellation.
+            try:
+                await _drain_subagent_cleanup(agen, lease)
+            except asyncio.CancelledError:
+                # Generator is being torn down — re-raising would just
+                # propagate into sse-starlette which is already cancelling
+                # its task group; let GeneratorExit/StopAsyncIteration
+                # take its natural course.
+                pass
+
+    # Codex R2 P1: sse-starlette's _stream_response only aclose()s the
+    # body_iterator on send_timeout (sse_starlette/sse.py:186-187), NOT on
+    # client http.disconnect — that path just calls the close handler then
+    # cancels the task group, leaving the body iterator in a suspended
+    # state until GC. Without an explicit aclose() in the close handler,
+    # the outer `event_generator` finally above (and therefore the inner
+    # `agen.aclose()` + `lease.release()` chain) runs non-deterministically
+    # on GC pressure rather than synchronously on disconnect. The chat
+    # endpoint at session_routes.py:489-493 uses the same
+    # `client_close_handler_callable` pattern.
+    stream = event_generator()
+
+    async def handle_client_close(_message: dict[str, object]) -> None:
+        try:
+            await stream.aclose()
+        except RuntimeError as exc:
+            # Race when the outer generator is mid-await on agen.__anext__()
+            # at the moment disconnect fires. The subsequent task_group
+            # cancel propagates CancelledError into that await, which still
+            # triggers the generator's finally — so cleanup is preserved
+            # even when we can't aclose synchronously here.
+            if "already running" not in str(exc):
+                raise
+
+    return EventSourceResponse(
+        stream,
+        headers=SSE_HEADERS,
+        client_close_handler_callable=handle_client_close,
+    )
