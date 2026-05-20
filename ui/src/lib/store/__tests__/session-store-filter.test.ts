@@ -7,6 +7,8 @@ function makeItem(overrides: Partial<ListSessionItem> = {}): ListSessionItem {
     session_id: "s",
     title: "t",
     sample_session_id: null,
+    parent_session_id: null,
+    worker_type: "root",
     latest_message: "",
     latest_message_at: null,
     status: "pending",
@@ -39,6 +41,8 @@ describe("useFilteredSessionsForList selector", () => {
       session_id: "child-1",
       title: "[probe] x",
       sample_session_id: "main-1",
+      parent_session_id: "main-1",
+      worker_type: "subagent",
     });
     useSessionStore.setState({ sessions: [main, child] });
 

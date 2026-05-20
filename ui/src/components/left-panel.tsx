@@ -46,7 +46,8 @@ export function LeftPanel() {
   const pathname = usePathname();
 
   // Phase 1 minimal subagent research: filter probe child sessions
-  // (sample_session_id non-null) out of the LeftPanel list view.
+  // (parent_session_id, or legacy sample_session_id during PR-1..PR-3, non-null)
+  // out of the LeftPanel list view.
   const sessions = useFilteredSessionsForList();
   const isLoadingSessions = useSessionStore((state) => state.isLoadingSessions);
   const fetchSessions = useSessionStore((state) => state.fetchSessions);

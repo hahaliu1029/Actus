@@ -33,6 +33,8 @@ const mockSessionsFixture = [
     session_id: "sid-1",
     title: "测试会话",
     sample_session_id: null,
+    parent_session_id: null,
+    worker_type: "root" as const,
     latest_message: "最新消息",
     latest_message_at: "2026-02-21T10:00:00.000Z",
     status: "running",
@@ -66,7 +68,8 @@ vi.mock("@/lib/store/session-store", () => ({
     }),
   // PR-6 Task 26: hook used by LeftPanel to exclude probe child sessions.
   // In tests, return the same fixture (all entries have sample_session_id=null
-  // so filter is a no-op and existing behavioural assertions still hold).
+  // and parent_session_id=null, so filter is a no-op and existing behavioural
+  // assertions still hold).
   useFilteredSessionsForList: () => mockSessionsFixture,
 }));
 

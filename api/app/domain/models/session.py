@@ -81,6 +81,8 @@ class Session(BaseModel):
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 会话id
     sample_session_id: Optional[str] = None  # 父会话id（Phase 1 minimal subagent：子会话回链）
+    parent_session_id: Optional[str] = None  # C1a canonical lineage field; dual-written with sample_session_id during PR-1..PR-3; PR-4 leaves this as the sole survivor.
+    worker_type: Literal["root", "subagent"] = "root"  # C1a identity axis; CHECK ck_sessions_worker_type_parent_invariant keeps this in sync with parent_session_id.
     tool_filter_preset: Optional[Literal["subagent_research"]] = (
         None  # T12 pod-restart resilience：持久化 tool_filter 预设名；NULL = 不限制
     )

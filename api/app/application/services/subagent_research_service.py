@@ -295,29 +295,41 @@ class SubagentResearchService:
 
     async def run_research(
         self,
-        sample_session_id: str,
         user_id: str,
         prompts: list[str],
+        *,
+        parent_session_id: Optional[str] = None,
+        sample_session_id: Optional[str] = None,  # deprecated; PR-4 removes
         max_children: int = 3,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Run a research probe. See module docstring for invariants.
 
         Yields ChildStartedEvent × N → ChildDoneEvent × N (interleaved by
         as_completed order) → JoinedSummaryEvent (final).
+
+        C1a PR-1: accepts ``parent_session_id`` (canonical) or
+        ``sample_session_id`` (legacy alias). At least one is required.
+        PR-4 drops the legacy alias.
         """
         from app.application.errors.exceptions import (
             BadRequestError, ConflictError, NotFoundError,
         )
 
+        parent_id = parent_session_id or sample_session_id
+        if parent_id is None:
+            raise ValueError(
+                "parent_session_id is required (legacy alias sample_session_id also accepted)"
+            )
+
         probe_run_id = uuid.uuid4().hex
         start_ts = time.time()
 
         parent = await self._session_service.get_session(
-            sample_session_id, user_id, is_admin=False
+            parent_id, user_id, is_admin=False
         )
         if parent is None:
             raise NotFoundError(
-                f"Session {sample_session_id} not found or not accessible"
+                f"Session {parent_id} not found or not accessible"
             )
 
         classifier_results = await self._classifier.classify_batch(prompts)
@@ -349,7 +361,7 @@ class SubagentResearchService:
             for prompt in prompts[:max_children]:
                 child = await self._session_service.create_session_with_parent(
                     user_id=user_id,
-                    sample_session_id=sample_session_id,
+                    sample_session_id=parent_id,
                     tool_filter_preset=_SUBAGENT_RESEARCH_PRESET,
                 )
                 # NOTE: spec calls `session_service.update_title(...)` here for
@@ -488,7 +500,7 @@ class SubagentResearchService:
                     await asyncio.shield(
                         self._write_metric_line(
                             probe_run_id=probe_run_id,
-                            sample_session_id=sample_session_id,
+                            parent_session_id=parent_id,
                             completed_results=completed_results,
                             summary_tokens=summary_tokens or 0,
                             metrics=metrics,
@@ -542,19 +554,32 @@ class SubagentResearchService:
     async def _write_metric_line(
         self,
         probe_run_id: str,
-        sample_session_id: str,
         completed_results: list[ChildResult],
         summary_tokens: int,
         metrics: dict,
+        *,
+        parent_session_id: Optional[str] = None,
+        sample_session_id: Optional[str] = None,  # deprecated; PR-4 removes
     ) -> None:
         """Append a jsonl metric line to ~/.gstack/metrics/.
 
         File I/O runs in a thread so the async path stays non-blocking.
+
+        C1a PR-1: accepts ``parent_session_id`` (canonical) or
+        ``sample_session_id`` (legacy alias) and dual-emits BOTH keys in the
+        metric record so existing downstream aggregations keep working
+        through the PR-1..PR-3 window. PR-4 drops the legacy mirror.
         """
+        parent_id = parent_session_id or sample_session_id
+        if parent_id is None:
+            raise ValueError(
+                "parent_session_id is required (legacy alias sample_session_id also accepted)"
+            )
         line = {
             "ts": time.time(),
             "probe_run_id": probe_run_id,
-            "sample_session_id": sample_session_id,
+            "parent_session_id": parent_id,
+            "sample_session_id": parent_id,  # deprecated mirror; PR-4 removes
             "child_session_ids": [r.child_id for r in completed_results],
             "child_outcomes": [r.outcome.value for r in completed_results],
             "child_transcript_tokens": [

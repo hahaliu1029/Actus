@@ -88,6 +88,8 @@ describe("subagent types", () => {
       session_id: "s-1",
       title: "test",
       sample_session_id: null,
+      parent_session_id: null,
+      worker_type: "root",
       latest_message: "",
       latest_message_at: new Date().toISOString(),
       status: "pending",

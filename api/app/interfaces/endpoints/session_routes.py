@@ -162,6 +162,8 @@ async def _build_list_session_item(
         session_id=session.id,
         title=session.title,
         sample_session_id=session.sample_session_id,
+        parent_session_id=session.parent_session_id or session.sample_session_id,
+        worker_type=session.worker_type,
         latest_message=session.latest_message,
         latest_message_at=session.latest_message_at,
         status=session.status,
@@ -1509,12 +1511,38 @@ async def _drain_subagent_cleanup(agen, lease) -> None:
 
 
 @router.post(
-    path="/{sample_session_id}/subagents/research",
+    path="/{parent_session_id}/subagents/research",
     summary="Phase 1 minimal: spawn read-only research subagents",
     description="Spawn 1-3 read-only research subagents under the parent session, fan-out execution with deterministic summary join, multi-metric jsonl probe record.",
     dependencies=[Depends(rate_limit_chat)],
 )
 async def subagent_research(
+    parent_session_id: str,
+    request: ResearchSubagentRequest,
+    current_user: CurrentUser,
+    redis_client: RedisClient = Depends(get_redis),
+    session_service: SessionService = Depends(get_session_service),
+    service: SubagentResearchService = Depends(get_subagent_research_service),
+) -> EventSourceResponse:
+    """Canonical C1a route — delegates to ``_run_subagent_research``."""
+    return await _run_subagent_research(
+        resolved_parent_id=parent_session_id,
+        request=request,
+        current_user=current_user,
+        redis_client=redis_client,
+        session_service=session_service,
+        service=service,
+    )
+
+
+@router.post(
+    path="/{sample_session_id}/subagents/research",
+    summary="Phase 1 minimal: spawn read-only research subagents (legacy path)",
+    description="Deprecated legacy path; PR-4 removes. Prefer /{parent_session_id}/subagents/research.",
+    dependencies=[Depends(rate_limit_chat)],
+    include_in_schema=False,
+)
+async def subagent_research_legacy(
     sample_session_id: str,
     request: ResearchSubagentRequest,
     current_user: CurrentUser,
@@ -1522,7 +1550,37 @@ async def subagent_research(
     session_service: SessionService = Depends(get_session_service),
     service: SubagentResearchService = Depends(get_subagent_research_service),
 ) -> EventSourceResponse:
-    """Spawn N (1-3) read-only research subagents under the parent session.
+    """Legacy alias — preserves the pre-C1a URL while PR-1..PR-3 migrate
+    callers. ``include_in_schema=False`` keeps it out of OpenAPI so docs
+    only advertise the canonical path. PR-4 removes both this handler and
+    the ``_run_subagent_research`` indirection."""
+    return await _run_subagent_research(
+        resolved_parent_id=sample_session_id,
+        request=request,
+        current_user=current_user,
+        redis_client=redis_client,
+        session_service=session_service,
+        service=service,
+    )
+
+
+async def _run_subagent_research(
+    resolved_parent_id: str,
+    request: ResearchSubagentRequest,
+    current_user: CurrentUser,
+    redis_client: RedisClient,
+    session_service: SessionService,
+    service: SubagentResearchService,
+) -> EventSourceResponse:
+    """Shared implementation for canonical + legacy subagent-research routes.
+
+    C1a PR-1: both ``/{parent_session_id}/subagents/research`` (canonical,
+    OpenAPI-visible) and ``/{sample_session_id}/subagents/research``
+    (legacy, hidden via ``include_in_schema=False``) delegate here. Each
+    route declares its own path-param kwarg so the OpenAPI schema for
+    the canonical route advertises ``parent_session_id`` as a path
+    parameter and NOT ``sample_session_id`` as a query parameter. PR-4
+    drops the legacy route + this helper indirection.
 
     Order of side effects MUST match the chat endpoint preflight contract:
     1. Parent ownership check (404 on miss/cross-tenant → no existence leak)
@@ -1549,13 +1607,13 @@ async def subagent_research(
     leaks until the event loop is shut down.
     """
     parent = await session_service.get_session(
-        session_id=sample_session_id,
+        session_id=resolved_parent_id,
         user_id=current_user.id,
         is_admin=current_user.is_admin(),
     )
     if parent is None:
         raise NotFoundError(
-            f"Session {sample_session_id} not found or not accessible"
+            f"Session {resolved_parent_id} not found or not accessible"
         )
 
     lease = await acquire_connection_limit(
@@ -1572,8 +1630,11 @@ async def subagent_research(
     # status line is already 200 and exceptions can only manifest as a
     # truncated body. On any exception OR an empty stream we own the
     # lease release here; on success the streaming generator owns it.
+    # PR-1: service still uses legacy ``sample_session_id`` kwarg. PR-2
+    # flips the signature; until then we pass the resolved id under the
+    # legacy keyword to avoid coupling two PRs together.
     agen = service.run_research(
-        sample_session_id=sample_session_id,
+        sample_session_id=resolved_parent_id,
         user_id=current_user.id,
         prompts=request.prompts,
         max_children=request.max_children,

@@ -291,7 +291,10 @@ export type ListSessionItem = {
   title: string;
   // Phase 1 minimal subagent research: non-null when this session is a probe
   // child of another (parent) session. Filtered out of the session list UI.
+  /** @deprecated PR-4 removes this; reads should prefer parent_session_id. */
   sample_session_id: string | null;
+  parent_session_id: string | null;
+  worker_type: 'root' | 'subagent';
   latest_message: string;
   latest_message_at: string | null;
   status: SessionStatus;
