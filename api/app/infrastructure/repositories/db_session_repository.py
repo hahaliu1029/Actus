@@ -13,6 +13,7 @@ from app.domain.repositories._sentinel import _UNSET, UnsetType
 from app.domain.repositories.session_repository import BgSessionRow, SessionRepository
 from app.infrastructure.models import SessionModel
 from pydantic import ValidationError
+import sqlalchemy as sa
 from sqlalchemy import cast, delete, func, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -818,3 +819,111 @@ class DBSessionRepository(SessionRepository):
         if row is None:
             raise KeyError(f"session not found: {session_id}")
         return SessionStatus(row[0]), int(row[1])
+
+    # ---- C1a: lineage queries ----
+    _DESCENDANTS_CTE = sa.text(
+        """
+        WITH RECURSIVE descendants AS (
+          SELECT id, parent_session_id, 1 AS depth, user_id
+            FROM sessions
+           WHERE parent_session_id = :ancestor_id
+             AND user_id = :user_id
+          UNION ALL
+          SELECT s.id, s.parent_session_id, d.depth + 1, s.user_id
+            FROM sessions s
+            JOIN descendants d ON s.parent_session_id = d.id
+           WHERE d.depth < :max_depth
+             AND s.user_id = :user_id
+        )
+        SELECT id, depth FROM descendants
+        ORDER BY depth ASC, id ASC
+        LIMIT :limit
+        """
+    )
+
+    async def find_descendants(
+        self,
+        ancestor_id: str,
+        *,
+        user_id: str,
+        max_depth: int,
+        limit: int,
+    ) -> List[Session]:
+        rows = (await self.db_session.execute(
+            self._DESCENDANTS_CTE,
+            {
+                "ancestor_id": ancestor_id,
+                "user_id": user_id,
+                "max_depth": max_depth,
+                "limit": limit,
+            },
+        )).all()
+        ids_in_order = [r.id for r in rows]
+        if not ids_in_order:
+            return []
+        stmt = (
+            select(SessionModel)
+            .where(SessionModel.id.in_(ids_in_order))
+            .where(SessionModel.user_id == user_id)
+        )
+        fetched = (await self.db_session.execute(stmt)).scalars().all()
+        by_id: Dict[str, SessionModel] = {r.id: r for r in fetched}
+        return [by_id[i].to_domain() for i in ids_in_order if i in by_id]
+
+    _COUNT_DESCENDANTS_CTE = sa.text(
+        """
+        SELECT COUNT(*) FROM (
+          WITH RECURSIVE descendants AS (
+            SELECT id, parent_session_id, 1 AS depth
+              FROM sessions
+             WHERE parent_session_id = :ancestor_id
+               AND user_id = :user_id
+            UNION ALL
+            SELECT s.id, s.parent_session_id, d.depth + 1
+              FROM sessions s
+              JOIN descendants d ON s.parent_session_id = d.id
+             WHERE s.user_id = :user_id
+          )
+          SELECT 1 FROM descendants LIMIT :limit
+        ) sub
+        """
+    )
+
+    async def count_descendants(
+        self,
+        ancestor_id: str,
+        *,
+        user_id: str,
+        cap: int,
+    ) -> int:
+        result = await self.db_session.execute(
+            self._COUNT_DESCENDANTS_CTE,
+            {
+                "ancestor_id": ancestor_id,
+                "user_id": user_id,
+                "limit": cap + 1,
+            },
+        )
+        return int(result.scalar() or 0)
+
+    async def lock_session_for_spawn(self, parent_id: str) -> Optional[Session]:
+        stmt = (
+            select(SessionModel)
+            .where(SessionModel.id == parent_id)
+            .with_for_update()
+        )
+        result = await self.db_session.execute(stmt)
+        record = result.scalar_one_or_none()
+        return record.to_domain() if record is not None else None
+
+    async def find_by_id_for_user(
+        self, session_id: str, *, user_id: str
+    ) -> Optional[Session]:
+        stmt = (
+            select(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.user_id == user_id)
+        )
+        result = await self.db_session.execute(stmt)
+        record = result.scalar_one_or_none()
+        return record.to_domain() if record is not None else None

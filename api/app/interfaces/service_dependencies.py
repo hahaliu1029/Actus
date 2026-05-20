@@ -95,6 +95,12 @@ def get_app_config_service() -> AppConfigService:
     return AppConfigService(app_config_repository=file_app_config_repository)
 
 
+def get_subagent_limits() -> "SubagentLimitsConfig":
+    """C1a: spawn cap config loaded once from env. Used by SessionService.create_session_with_parent."""
+    from core.config import SubagentLimitsConfig  # local import avoids circular
+    return settings.subagent_limits
+
+
 # @lru_cache()
 def get_status_service(
     db_session: AsyncSession = Depends(get_db_session),
@@ -142,6 +148,7 @@ def get_session_service(request: HTTPConnection) -> SessionService:
         sandbox_lifecycle_service=lifecycle_service,
         fs_reconciler=fs_reconciler,
         execution_supervisor=supervisor,
+        subagent_limits=get_subagent_limits(),
     )
 
 

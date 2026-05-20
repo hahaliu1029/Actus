@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.application.services.session_service import SessionService
+from app.domain.models.session import Session
 
 pytestmark = pytest.mark.anyio
 
@@ -23,12 +24,26 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-def _make_uow_and_factory():
+def _make_uow_and_factory(
+    *,
+    parent_user_id: str = "u-1",
+    parent_session_id: str = "parent-1",
+):
+    """C1a (PR-2): UoW mock now also satisfies lock_session_for_spawn and
+    count_descendants. Defaults give a valid root parent owned by ``u-1`` with
+    zero descendants so the T12 preset-required / preset-unknown branches still
+    surface the same ValueError before the FOR UPDATE path runs."""
     uow = MagicMock()
     uow.__aenter__ = AsyncMock(return_value=uow)
     uow.__aexit__ = AsyncMock(return_value=None)
     uow.session = MagicMock()
     uow.session.save = AsyncMock()
+    uow.session.lock_session_for_spawn = AsyncMock(
+        return_value=Session(
+            id=parent_session_id, user_id=parent_user_id, worker_type="root"
+        )
+    )
+    uow.session.count_descendants = AsyncMock(return_value=0)
     return uow, lambda: uow
 
 

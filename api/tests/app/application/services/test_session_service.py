@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.application.services.session_service import SessionService
+from app.domain.models.session import Session
 
 pytestmark = pytest.mark.anyio
 
@@ -28,13 +29,31 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-def _make_uow_and_factory():
-    """Returns (uow_mock, factory) so tests can both inject and introspect."""
+def _make_uow_and_factory(
+    *,
+    parent_user_id: str = "u-1",
+    parent_session_id: str = "parent-1",
+    descendants_count: int = 0,
+):
+    """Returns (uow_mock, factory) so tests can both inject and introspect.
+
+    C1a (PR-2): create_session_with_parent now performs
+    ``lock_session_for_spawn`` + owner check + ``count_descendants`` inside
+    the UoW. The mock must satisfy those async calls; defaults give a valid
+    root parent with no descendants so the existing PR-1 assertions still
+    hold.
+    """
     uow = MagicMock()
     uow.__aenter__ = AsyncMock(return_value=uow)
     uow.__aexit__ = AsyncMock(return_value=None)
     uow.session = MagicMock()
     uow.session.save = AsyncMock()
+    uow.session.lock_session_for_spawn = AsyncMock(
+        return_value=Session(
+            id=parent_session_id, user_id=parent_user_id, worker_type="root"
+        )
+    )
+    uow.session.count_descendants = AsyncMock(return_value=descendants_count)
     return uow, lambda: uow
 
 

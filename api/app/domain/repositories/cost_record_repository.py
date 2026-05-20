@@ -26,3 +26,10 @@ class CostRecordRepository(Protocol):
     async def find_by_session(self, session_id: str) -> list["CostRecord"]:
         """Return all cost rows for a session, ordered by (created_at, step_ix)."""
         ...
+
+    async def find_by_sessions_for_user(
+        self, session_ids: list[str], *, user_id: str
+    ) -> list["CostRecord"]:
+        """C1a: batch fetch + user_id filter. Used by SessionCostTreeService
+        to roll up cost rows for a session and its descendants."""
+        ...

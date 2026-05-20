@@ -66,6 +66,20 @@ class DbCostRecordRepository:
         result = await self._session.execute(stmt)
         return [_orm_to_domain(row) for row in result.scalars().all()]
 
+    async def find_by_sessions_for_user(
+        self, session_ids: list[str], *, user_id: str
+    ) -> list[CostRecord]:
+        if not session_ids:
+            return []
+        stmt = (
+            select(CostRecordModel)
+            .where(CostRecordModel.session_id.in_(session_ids))
+            .where(CostRecordModel.user_id == user_id)
+            .order_by(CostRecordModel.created_at)
+        )
+        result = await self._session.execute(stmt)
+        return [_orm_to_domain(row) for row in result.scalars().all()]
+
 
 def _orm_to_domain(row: CostRecordModel) -> CostRecord:
     return CostRecord(

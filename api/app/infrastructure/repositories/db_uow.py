@@ -51,21 +51,28 @@ class DBUnitOfWork(IUnitOfWork):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """退出上下文时执行的逻辑，如果出现异常则回滚，否则提交
+        """退出上下文时执行的逻辑，如果出现异常则回滚，否则提交。
 
-        当SSE客户端断开连接时，sse_starlette的cancel scope会取消所有await操作，
-        包括此处的commit/rollback/close。如果不妥善处理CancelledError，
-        会导致连接池中的连接处于异常状态，影响后续使用该池的其他任务。
+        C1a (PR-2): DEFERRABLE CONSTRAINT TRIGGER `trg_sessions_parent_user_match`
+        fires at commit time; SQLAlchemy IntegrityError raised inside `commit()` must
+        propagate to the caller so application services see real failure. Previously
+        these were caught + logged, which produced false-success returns.
+
+        CancelledError (SSE client disconnect) is still swallowed because there is
+        no caller to surface it to at that point.
         """
+        from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+        commit_error: Exception | None = None
         try:
             if exc_type:
                 await self.rollback()
             else:
                 await self.commit()
         except asyncio.CancelledError:
-            # SSE断连等场景下cancel scope取消了commit/rollback操作，
-            # 记录警告但不让异常传播，避免后续close操作也被跳过
             logger.warning("UoW提交/回滚操作被取消(可能是客户端断开连接)")
+        except (SQLAlchemyError, DBAPIError) as e:
+            logger.warning(f"UoW提交触发数据库错误: {e}")
+            commit_error = e
         except Exception as e:
             logger.warning(f"UoW提交/回滚操作失败: {e}")
         finally:
@@ -75,3 +82,8 @@ class DBUnitOfWork(IUnitOfWork):
                 logger.warning("UoW关闭数据库会话被取消(可能是客户端断开连接)")
             except Exception as e:
                 logger.warning(f"UoW关闭数据库会话失败: {e}")
+        if commit_error is not None and exc_type is None:
+            # Only re-raise when there was no inbound exception. If exc_type was
+            # already set, Python's `with` rules require returning falsy to
+            # propagate the inbound exception; raising here would mask it.
+            raise commit_error

@@ -9,6 +9,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _logger = logging.getLogger(__name__)
 
 
+class SubagentLimitsConfig(BaseSettings):
+    """C1a spawn caps. Loaded once from env via ACTUS_ prefix."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ACTUS_",
+        extra="ignore",
+    )
+
+    max_subagent_depth: int = Field(default=1, ge=1, le=8)
+    max_descendants_per_root: int = Field(default=10, ge=1, le=200)
+
+
 class Settings(BaseSettings):
     """应用程序的配置设置，继承自Pydantic的BaseSettings。从.env或者环境变量中加载配置。"""
 
@@ -213,6 +225,10 @@ class Settings(BaseSettings):
     # Prometheus exposition format（``text/plain; version=0.0.4``）。
     # 仅供内部 Prometheus / VictoriaMetrics 拉取，不暴露给终端用户。
     metrics_endpoint_token: str = ""
+
+    # C1a: subagent spawn caps. Nested config so the same env_prefix=ACTUS_
+    # surface stays consistent regardless of how it's accessed.
+    subagent_limits: SubagentLimitsConfig = Field(default_factory=SubagentLimitsConfig)
 
     # 使用pydantic v2的写法来完成环境变量信息的告知
     model_config = SettingsConfigDict(

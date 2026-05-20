@@ -259,3 +259,42 @@ class SessionRepository(Protocol):
     ) -> tuple[SessionStatus, int]:
         """Return (status, mode_revision) as a single read."""
         ...
+
+    async def find_descendants(
+        self,
+        ancestor_id: str,
+        *,
+        user_id: str,
+        max_depth: int,
+        limit: int,
+    ) -> List[Session]:
+        """C1a: return descendants of ancestor_id, depth-limited, user-scoped.
+
+        `max_depth` is the inclusive depth limit (1 == direct children only).
+        `limit` is the row cap; callers pass `cap + 1` to detect truncation.
+        Order: depth ASC, id ASC. Excludes the ancestor itself.
+        """
+        ...
+
+    async def count_descendants(
+        self,
+        ancestor_id: str,
+        *,
+        user_id: str,
+        cap: int,
+    ) -> int:
+        """C1a: return count of descendants up to `cap + 1` (sentinel for >= cap).
+        Implementation MUST use a LIMIT cap+1 subquery, not a full count."""
+        ...
+
+    async def lock_session_for_spawn(self, parent_id: str) -> Optional[Session]:
+        """C1a: SELECT ... FOR UPDATE on parent row inside an active transaction.
+        Caller MUST be inside `async with uow:` - lock releases on UoW exit."""
+        ...
+
+    async def find_by_id_for_user(
+        self, session_id: str, *, user_id: str
+    ) -> Optional[Session]:
+        """C1a: owner-scoped fetch. Returns None for missing OR foreign-user
+        (collapse 403/404 to a single 404 to defeat ID enumeration)."""
+        ...

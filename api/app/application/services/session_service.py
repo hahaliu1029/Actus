@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
     from app.domain.services.execution_supervisor import ExecutionSupervisor
     from app.infrastructure.external.memory.fs_reconciler import FsReconciler
+    from core.config import SubagentLimitsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,25 @@ class SessionService:
         sandbox_lifecycle_service: Optional["SandboxLifecycleService"] = None,
         fs_reconciler: Optional["FsReconciler"] = None,
         execution_supervisor: Optional["ExecutionSupervisor"] = None,
+        *,
+        subagent_limits: Optional["SubagentLimitsConfig"] = None,
     ) -> None:
-        """构造函数，完成会话服务初始化"""
+        """构造函数，完成会话服务初始化
+
+        ``subagent_limits`` is the C1a spawn-cap config; when ``None`` we
+        lazy-construct ``SubagentLimitsConfig()`` inside
+        ``create_session_with_parent`` so env overrides
+        (``ACTUS_MAX_SUBAGENT_DEPTH`` / ``ACTUS_MAX_DESCENDANTS_PER_ROOT``)
+        still take effect for callers that don't go through the DI factory
+        (test code, ad-hoc constructors).
+        """
         self._uow_factory = uow_factory
         self._uow = uow_factory()
         self._task_cls = task_cls
         self._lifecycle = sandbox_lifecycle_service
         self._fs_reconciler = fs_reconciler
         self._supervisor = execution_supervisor
+        self._subagent_limits = subagent_limits
 
     async def create_session(self, user_id: str) -> Session:
         """创建一个空白的新任务会话"""
@@ -68,15 +80,26 @@ class SessionService:
     async def create_session_with_parent(
         self,
         user_id: str,
-        sample_session_id: str,
+        sample_session_id: str | None = None,
+        *,
+        parent_session_id: str | None = None,
         tool_filter_preset: Optional[str] = None,
+        title: str | None = None,
     ) -> Session:
-        """创建一个 child session，挂在 parent 下（Phase 1 minimal subagent）。
+        """C1a (PR-2): owner-checked + FOR UPDATE locked + spawn cap enforced.
 
-        Child sessions carry a non-null ``sample_session_id``; the frontend
-        session selector filters them out of the main list. Parent FK is
+        Phase 1 max_depth=1: the parent must itself be a root (``worker_type='root'``,
+        ``parent_session_id IS NULL``). If callers want deeper trees later, expand
+        ``MAX_SUBAGENT_DEPTH`` and replace the ``parent.parent_session_id is not None``
+        guard with a walk-up-the-chain.
+
+        Legacy alias ``sample_session_id`` is accepted during PR-1..PR-3 (dual-write
+        window). PR-4 removes the alias.
+
+        Child sessions carry a non-null ``parent_session_id`` / ``sample_session_id``;
+        the frontend session selector filters them out of the main list. Parent FK is
         ondelete=RESTRICT — deleting the parent while children exist raises
-        IntegrityError, which the API layer (PR-5) translates to 409.
+        IntegrityError, which the API layer translates to 409.
 
         T12 / Phase 1 PR-X: ``tool_filter_preset`` is **required** for every
         child created via this method — closes the codex R1 P1 bypass where
@@ -93,18 +116,20 @@ class SessionService:
         OR tool_filter_preset IS NOT NULL``); this app-level ValueError
         produces a cleaner error than the IntegrityError path.
 
-        Defaults to ``None`` only because the kwarg is positional-safe for
-        existing test stubs; passing ``None`` (or any unknown preset) raises.
-
         Does NOT trigger ``fs_reconciler`` walk: the parent ``create_session``
         already walked the user's memory directory, so the child can skip the
         redundant scan.
         """
+        parent_id = parent_session_id or sample_session_id
+        if parent_id is None:
+            raise ValueError(
+                "create_session_with_parent: parent_session_id is required "
+                "(legacy alias sample_session_id also accepted)"
+            )
         if tool_filter_preset is None:
             raise ValueError(
                 "create_session_with_parent: tool_filter_preset is required "
-                "for child sessions (T12 / Phase 1 PR-X). Pass a known "
-                "preset key from TOOL_FILTER_PRESETS, e.g. 'subagent_research'."
+                "for child sessions (T12 / Phase 1 PR-X)."
             )
         from app.domain.services.tool_filter_presets import TOOL_FILTER_PRESETS
 
@@ -114,22 +139,64 @@ class SessionService:
                 f"{tool_filter_preset!r}. Known: {sorted(TOOL_FILTER_PRESETS)}."
             )
 
-        logger.info(
-            "创建子会话: sample_session_id=%s user_id=%s tool_filter_preset=%s",
-            sample_session_id,
-            user_id,
-            tool_filter_preset,
-        )
-        session = Session(
-            title="新对话",
-            user_id=user_id,
-            sample_session_id=sample_session_id,
-            tool_filter_preset=tool_filter_preset,
-        )
-        async with self._uow:
-            await self._uow.session.save(session)
-        logger.info(f"成功创建子会话: {session.id} (parent={sample_session_id})")
-        return session
+        from app.domain.services.subagent_limits import SpawnCapExceeded
+
+        # Resolve runtime config: prefer DI-injected instance, fall back to
+        # env-loaded default. ``SubagentLimitsConfig()`` reads
+        # ``ACTUS_MAX_SUBAGENT_DEPTH`` / ``ACTUS_MAX_DESCENDANTS_PER_ROOT`` at
+        # construction so non-DI callers (tests, scripts) still honor env
+        # overrides without going through the FastAPI Depends graph.
+        limits = self._subagent_limits
+        if limits is None:
+            from core.config import SubagentLimitsConfig
+
+            limits = SubagentLimitsConfig()
+
+        # Phase 1 invariant: only ``max_subagent_depth=1`` is implemented.
+        # The env-knob is reserved for forward-compat (the field's
+        # ``ge=1, le=8`` validator allows higher values), so we fail loudly
+        # rather than silently accept >1 and behave as 1 — the latter would
+        # surprise operators tuning the config thinking they enabled deeper
+        # trees. When Phase 2 lands the walk-up-the-chain implementation,
+        # this guard is removed.
+        if limits.max_subagent_depth != 1:
+            raise NotImplementedError(
+                "max_subagent_depth > 1 not yet implemented "
+                "(Phase 1 enforces 'parent must be a root'); "
+                f"got max_subagent_depth={limits.max_subagent_depth}"
+            )
+
+        async with self._uow_factory() as uow:
+            parent = await uow.session.lock_session_for_spawn(parent_id)
+            if parent is None or parent.user_id != user_id:
+                raise NotFoundError(f"parent session {parent_id} not found")
+
+            # Phase 1 max_depth=1: parent must be a root.
+            if parent.parent_session_id is not None or parent.worker_type != "root":
+                raise SpawnCapExceeded("depth", 2, limits.max_subagent_depth)
+
+            root_id = parent.parent_session_id or parent.id
+            descendant_count = await uow.session.count_descendants(
+                root_id, user_id=user_id, cap=limits.max_descendants_per_root,
+            )
+            if descendant_count >= limits.max_descendants_per_root:
+                raise SpawnCapExceeded(
+                    "descendants",
+                    descendant_count,
+                    limits.max_descendants_per_root,
+                )
+
+            child = Session(
+                user_id=user_id,
+                parent_session_id=parent_id,
+                sample_session_id=parent_id,  # PR-1 dual-write; PR-4 removes
+                worker_type="subagent",
+                tool_filter_preset=tool_filter_preset,
+                title=title or "新对话",
+            )
+            await uow.session.save(child)
+            logger.info("成功创建子会话: %s (parent=%s)", child.id, parent_id)
+            return child
 
     def _spawn_fs_reconciler_walk(self, user_id: str) -> None:
         reconciler = self._fs_reconciler
