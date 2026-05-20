@@ -853,6 +853,42 @@ def get_cost_aggregation_service(
 
 
 # ----------------------------------------------------------------------
+# C1a: SessionRepository + SessionCostTreeService DI wiring
+# ----------------------------------------------------------------------
+
+
+def get_session_repository(
+    db_session: AsyncSession = Depends(get_db_session),
+):
+    """C1a: per-request SessionRepository for endpoints that don't need a full UoW."""
+    from app.infrastructure.repositories.db_session_repository import (
+        DBSessionRepository,
+    )
+
+    return DBSessionRepository(db_session=db_session)
+
+
+def get_session_cost_tree_service(
+    session_repo=Depends(get_session_repository),
+    cost_repo=Depends(get_cost_record_repository),
+    cost_aggregator=Depends(get_cost_aggregation_service),
+):
+    """C1a: SessionCostTreeService composed of 3 deps. FastAPI Depends cache
+    guarantees ``db_session`` is shared between session_repo and cost_repo within
+    the same request.
+    """
+    from app.application.services.session_cost_tree_service import (
+        SessionCostTreeService,
+    )
+
+    return SessionCostTreeService(
+        session_repo=session_repo,
+        cost_repo=cost_repo,
+        cost_aggregator=cost_aggregator,
+    )
+
+
+# ----------------------------------------------------------------------
 # PE-0 Phase 7: ConfirmationQueue DI factory
 # ----------------------------------------------------------------------
 

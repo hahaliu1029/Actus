@@ -972,3 +972,35 @@ export interface CostAggregateResponse {
   last_record_at: string | null;
   has_partial_records: boolean;
 }
+
+/** C1a: single descendant in /children response (no events/messages). */
+export interface ChildSessionItem {
+  id: string;
+  parent_session_id: string;
+  worker_type: "root" | "subagent";
+  tool_filter_preset: string | null;
+  status: SessionStatus;
+  title: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** C1a: GET /api/sessions/{id}/children body. */
+export interface ChildrenListResponse {
+  parent_session_id: string;
+  descendants: ChildSessionItem[];
+  truncated: boolean;
+  depth_applied: number;
+}
+
+/** C1a: GET /api/sessions/{id}/cost/tree body. */
+export interface CostTreeResponse {
+  session_id: string;
+  self_cost: CostAggregateResponse;
+  descendants_cost: CostAggregateResponse;
+  total_cost: CostAggregateResponse;
+  descendant_ids: string[];
+  depth_reached: number;
+  max_depth_applied: number;
+  truncated: boolean;
+}

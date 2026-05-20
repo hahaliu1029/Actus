@@ -44,6 +44,8 @@ from app.interfaces.schemas.session import (
     BackgroundQuotaResponse,
     CancelSessionRequest,
     ChatRequest,
+    ChildSessionItem,
+    ChildrenListResponse,
     CreateSessionResponse,
     EndTakeoverRequest,
     EndTakeoverResponse,
@@ -66,8 +68,14 @@ from app.interfaces.schemas.session import (
     StartTakeoverRequest,
     StartTakeoverResponse,
 )
+from app.domain.repositories.session_repository import SessionRepository
+from app.domain.services.subagent_limits import (
+    MAX_DESCENDANTS_PER_ROOT,
+    MAX_SUBAGENT_DEPTH,
+)
 from app.interfaces.service_dependencies import (
     get_agent_service,
+    get_session_repository,
     get_session_service,
     get_subagent_research_service,
     get_supervisor,
@@ -78,7 +86,7 @@ from app.application.services.subagent_research_service import (
 from app.interfaces.schemas.subagent import ResearchSubagentRequest
 from app.infrastructure.storage.redis import RedisClient, get_redis
 from core.config import get_settings
-from fastapi import APIRouter, Body, Depends, Request, Response as FastAPIResponse
+from fastapi import APIRouter, Body, Depends, Query, Request, Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -169,6 +177,20 @@ async def _build_list_session_item(
         status=session.status,
         unread_message_count=session.unread_message_count,
         supervisor_snapshot=supervisor_snapshot,
+    )
+
+
+def _build_child_session_item(s: Session) -> ChildSessionItem:
+    """C1a: schema mapper — Session has no `from_domain` classmethod."""
+    return ChildSessionItem(
+        id=s.id,
+        parent_session_id=s.parent_session_id or s.sample_session_id or "",
+        worker_type=s.worker_type,
+        tool_filter_preset=s.tool_filter_preset,
+        status=s.status,
+        title=s.title or None,
+        created_at=getattr(s, "created_at", None),
+        updated_at=getattr(s, "updated_at", None),
     )
 
 
@@ -279,6 +301,46 @@ async def get_background_quota(
     return Response.success(
         msg="获取后台任务额度成功",
         data=BackgroundQuotaResponse.model_validate(quota),
+    )
+
+
+@router.get(
+    path="/{session_id}/children",
+    response_model=Response[ChildrenListResponse],
+    summary="返回 session 的后代会话（flat list, depth-capped）",
+    description="C1a: flat list of descendant sessions for the session tree.",
+    dependencies=[Depends(rate_limit_read)],
+)
+async def list_session_children(
+    session_id: str,
+    current_user: CurrentUser,
+    repo: SessionRepository = Depends(get_session_repository),
+    depth: int = Query(default=MAX_SUBAGENT_DEPTH, ge=1, le=10),
+) -> Response[ChildrenListResponse]:
+    """C1a: GET /api/sessions/{session_id}/children — flat descendants list."""
+    session = await repo.find_by_id_for_user(session_id, user_id=current_user.id)
+    if session is None:
+        raise NotFoundError(f"session {session_id} not found")
+
+    effective_depth = min(depth, MAX_SUBAGENT_DEPTH)
+    depth_clamped = effective_depth < depth
+    cap = MAX_DESCENDANTS_PER_ROOT
+    raw = await repo.find_descendants(
+        session_id,
+        user_id=current_user.id,
+        max_depth=effective_depth,
+        limit=cap + 1,
+    )
+    truncated = len(raw) > cap or depth_clamped
+    items = [_build_child_session_item(s) for s in raw[:cap]]
+    return Response.success(
+        msg="获取后代会话列表成功",
+        data=ChildrenListResponse(
+            parent_session_id=session_id,
+            descendants=items,
+            truncated=truncated,
+            depth_applied=effective_depth,
+        ),
     )
 
 

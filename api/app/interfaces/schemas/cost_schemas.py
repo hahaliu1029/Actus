@@ -43,3 +43,18 @@ class CostAggregateResponse(BaseModel):
     @field_serializer("by_node", "by_model", "by_provider")
     def _ser_breakdown(self, v: dict[str, Decimal]) -> dict[str, str]:
         return {k: _dec_to_str(amount) for k, amount in v.items()}
+
+
+class CostTreeResponse(BaseModel):
+    """C1a: GET /api/sessions/{id}/cost/tree body."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    session_id: str
+    self_cost: CostAggregateResponse
+    descendants_cost: CostAggregateResponse
+    total_cost: CostAggregateResponse
+    descendant_ids: list[str]
+    depth_reached: int
+    max_depth_applied: int
+    truncated: bool

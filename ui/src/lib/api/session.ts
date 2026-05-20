@@ -9,7 +9,9 @@ import {
 import type {
   BackgroundQuotaResponse,
   ChatParams,
+  ChildrenListResponse,
   CostAggregateResponse,
+  CostTreeResponse,
   CreateSessionResponse,
   EndTakeoverParams,
   EndTakeoverResponse,
@@ -287,6 +289,37 @@ export const sessionApi = {
    */
   getSessionCost: (sessionId: string): Promise<CostAggregateResponse> => {
     return get<CostAggregateResponse>(`/sessions/${sessionId}/cost`);
+  },
+
+  /**
+   * C1a: flat list of descendant sessions for the session tree.
+   *
+   * Depth is capped server-side at MAX_SUBAGENT_DEPTH (Phase 1 = 1).
+   * `truncated=true` marks either depth clamping or descendants exceeding cap.
+   */
+  getSessionChildren: (
+    sessionId: string,
+    depth = 1,
+  ): Promise<ChildrenListResponse> => {
+    return get<ChildrenListResponse>(
+      `/sessions/${sessionId}/children?depth=${depth}`,
+    );
+  },
+
+  /**
+   * C1a: tree-aware cost rollup (self + descendants).
+   *
+   * Live aggregate under READ COMMITTED — totals refresh as descendants accrue
+   * cost rows. `total_cost.cost_status` propagates `partial` from any
+   * descendant; render verbatim like `getSessionCost`.
+   */
+  getSessionCostTree: (
+    sessionId: string,
+    depth = 1,
+  ): Promise<CostTreeResponse> => {
+    return get<CostTreeResponse>(
+      `/sessions/${sessionId}/cost/tree?depth=${depth}`,
+    );
   },
 };
 

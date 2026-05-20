@@ -242,3 +242,28 @@ class RenewTakeoverResponse(BaseModel):
     request_status: str
     takeover_id: str
     expires_at: Optional[int] = None
+
+
+class ChildSessionItem(BaseModel):
+    """C1a: single descendant in /children response.
+
+    Note: does NOT include events/messages — UI fetches detail via GET /sessions/{id}.
+    """
+
+    id: str
+    parent_session_id: str
+    worker_type: Literal["root", "subagent"]
+    tool_filter_preset: Optional[str] = None
+    status: SessionStatus
+    title: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ChildrenListResponse(BaseModel):
+    """C1a: GET /api/sessions/{id}/children body."""
+
+    parent_session_id: str
+    descendants: List[ChildSessionItem]
+    truncated: bool
+    depth_applied: int

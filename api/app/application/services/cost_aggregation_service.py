@@ -58,9 +58,14 @@ class CostAggregationService:
     def __init__(self, repository: "CostRecordRepository") -> None:
         self._repo = repository
 
-    async def get_aggregate(self, session_id: str) -> CostAggregate:
-        rows: list["CostRecord"] = await self._repo.find_by_session(session_id)
+    @staticmethod
+    def aggregate_rows(rows: list["CostRecord"]) -> CostAggregate:
+        """C1a: pure rollup over already-fetched rows.
 
+        Extracted from `get_aggregate` so `SessionCostTreeService` can re-use
+        the partial/degraded/mixed status rubric without going through the
+        repository again.
+        """
         if not rows:
             return CostAggregate(
                 total_usd=Decimal(0),
@@ -126,3 +131,7 @@ class CostAggregationService:
             last_record_at=rows_sorted[-1].created_at,
             has_partial_records=has_partial,
         )
+
+    async def get_aggregate(self, session_id: str) -> CostAggregate:
+        rows: list["CostRecord"] = await self._repo.find_by_session(session_id)
+        return self.aggregate_rows(rows)
