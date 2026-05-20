@@ -38,16 +38,11 @@ class SessionModel(Base):
         primary_key=True,
         default=lambda: str(uuid.uuid4()),
     )  # 会话id
-    sample_session_id: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=True,
-    )  # 父会话id（partial index lives in migration; Phase 1 minimal subagent：子会话回链）
     parent_session_id: Mapped[Optional[str]] = mapped_column(
         String(255),
         ForeignKey("sessions.id", ondelete="RESTRICT"),
         nullable=True,
-    )  # C1a canonical column; dual-written alongside sample_session_id until PR-4.
+    )  # C1a canonical column — sole lineage field after PR-4 contract drop.
     worker_type: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
@@ -236,15 +231,11 @@ class SessionModel(Base):
                 include={"memories", "files", "events"},
             ),
         )
-        # C1a dual-write: belt-and-suspenders alongside the DB mirror trigger.
-        # Callers may set only sample_session_id (legacy) or only parent_session_id (C1a);
-        # mirror both so old/new code paths see a consistent view until PR-4.
-        model.sample_session_id = session.sample_session_id or session.parent_session_id
-        model.parent_session_id = session.parent_session_id or session.sample_session_id
-        # worker_type is fully determined by lineage presence per
-        # ck_sessions_worker_type_parent_invariant. Derive locally so the Python
-        # side never produces a CHECK-violating intermediate even if a caller
-        # passes the default worker_type='root' on a non-root domain Session.
+        # PR-4 contract: parent_session_id is the sole lineage source. Derive
+        # worker_type locally to keep ck_sessions_worker_type_parent_invariant
+        # satisfied even if a caller passes the default 'root' on a non-root
+        # domain Session.
+        model.parent_session_id = session.parent_session_id
         model.worker_type = "subagent" if model.parent_session_id is not None else "root"
         model._apply_sandbox_binding(session.sandbox_binding)
         return model
@@ -252,12 +243,9 @@ class SessionModel(Base):
     def to_domain(self) -> Session:
         """将会话ORM模型转换成领域模型"""
         session = Session.model_validate(self, from_attributes=True)
-        # C1a dual-read: prefer canonical parent_session_id, fall back to legacy
-        # sample_session_id so rows written by pre-PR-1 code still surface lineage.
         return session.model_copy(
             update={
-                "sample_session_id": self.sample_session_id,
-                "parent_session_id": self.parent_session_id or self.sample_session_id,
+                "parent_session_id": self.parent_session_id,
                 "worker_type": self.worker_type or "root",
             }
         )
@@ -292,13 +280,9 @@ class SessionModel(Base):
         for field, value in {**base_data, **json_data}.items():
             setattr(self, field, value)
 
-        # 4. C1a dual-write: belt-and-suspenders alongside the DB mirror trigger.
-        # See from_domain() for the rationale.
-        self.sample_session_id = session.sample_session_id or session.parent_session_id
-        self.parent_session_id = session.parent_session_id or session.sample_session_id
-        # worker_type derived from final parent state, matching from_domain — keeps
-        # the Python side ck_sessions_worker_type_parent_invariant-consistent
-        # without depending on the mirror trigger backstop.
+        # 4. PR-4 contract: parent_session_id is the sole lineage source;
+        # derive worker_type to stay ck_sessions_worker_type_parent_invariant-consistent.
+        self.parent_session_id = session.parent_session_id
         self.worker_type = "subagent" if self.parent_session_id is not None else "root"
 
         # 5. Sandbox binding: flatten into ORM columns

@@ -3,7 +3,7 @@
 in-memory allowlist after a pod restart.
 
 Companion to ``test_session_service.py`` (PR-1 contract) — that file pinned
-``sample_session_id`` plumbing; this file pins the T12 ``tool_filter_preset``
+``parent_session_id`` plumbing; this file pins the T12 ``tool_filter_preset``
 extension. Kept separate so the T12 boundary stays grep-traceable.
 """
 
@@ -63,7 +63,7 @@ class TestCreateSessionWithParentToolFilterPreset:
 
         with pytest.raises(ValueError, match="tool_filter_preset"):
             await service.create_session_with_parent(
-                user_id="u-1", sample_session_id="parent-1",
+                user_id="u-1", parent_session_id="parent-1",
             )
 
         # Critical: nothing should have hit the UoW save path on a rejected
@@ -83,7 +83,7 @@ class TestCreateSessionWithParentToolFilterPreset:
         with pytest.raises(ValueError, match="unknown tool_filter_preset"):
             await service.create_session_with_parent(
                 user_id="u-1",
-                sample_session_id="parent-1",
+                parent_session_id="parent-1",
                 tool_filter_preset="not_a_real_preset",
             )
         uow.session.save.assert_not_called()
@@ -95,11 +95,11 @@ class TestCreateSessionWithParentToolFilterPreset:
 
         child = await service.create_session_with_parent(
             user_id="u-1",
-            sample_session_id="parent-1",
+            parent_session_id="parent-1",
             tool_filter_preset="subagent_research",
         )
         assert child.tool_filter_preset == "subagent_research"
-        assert child.sample_session_id == "parent-1"
+        assert child.parent_session_id == "parent-1"
 
         saved = uow.session.save.call_args.args[0]
         assert saved.tool_filter_preset == "subagent_research"
@@ -116,8 +116,8 @@ class TestCreateSessionWithParentToolFilterPreset:
 
         child = await service.create_session_with_parent(
             user_id="u-1",
-            sample_session_id="parent-x",
+            parent_session_id="parent-x",
             tool_filter_preset="subagent_research",
         )
-        assert child.sample_session_id == "parent-x"
+        assert child.parent_session_id == "parent-x"
         assert child.tool_filter_preset == "subagent_research"

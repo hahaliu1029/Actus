@@ -65,7 +65,6 @@ function buildListSession(overrides?: Partial<ListSessionItem>): ListSessionItem
   return {
     session_id: "s-list",
     title: "列表会话",
-    sample_session_id: null,
     parent_session_id: null,
     worker_type: "root",
     latest_message: "处理中",
@@ -759,7 +758,6 @@ describe("session-store", () => {
         {
           session_id: "s-done",
           title: "会话",
-          sample_session_id: null,
           parent_session_id: null,
           worker_type: "root",
           latest_message: "",
@@ -791,7 +789,6 @@ describe("session-store", () => {
         {
           session_id: "s-stop",
           title: "会话",
-          sample_session_id: null,
           parent_session_id: null,
           worker_type: "root",
           latest_message: "",

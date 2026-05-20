@@ -169,8 +169,7 @@ async def _build_list_session_item(
     return ListSessionItem(
         session_id=session.id,
         title=session.title,
-        sample_session_id=session.sample_session_id,
-        parent_session_id=session.parent_session_id or session.sample_session_id,
+        parent_session_id=session.parent_session_id,
         worker_type=session.worker_type,
         latest_message=session.latest_message,
         latest_message_at=session.latest_message_at,
@@ -184,7 +183,7 @@ def _build_child_session_item(s: Session) -> ChildSessionItem:
     """C1a: schema mapper — Session has no `from_domain` classmethod."""
     return ChildSessionItem(
         id=s.id,
-        parent_session_id=s.parent_session_id or s.sample_session_id or "",
+        parent_session_id=s.parent_session_id or "",
         worker_type=s.worker_type,
         tool_filter_preset=s.tool_filter_preset,
         status=s.status,
@@ -1597,35 +1596,6 @@ async def subagent_research(
     )
 
 
-@router.post(
-    path="/{sample_session_id}/subagents/research",
-    summary="Phase 1 minimal: spawn read-only research subagents (legacy path)",
-    description="Deprecated legacy path; PR-4 removes. Prefer /{parent_session_id}/subagents/research.",
-    dependencies=[Depends(rate_limit_chat)],
-    include_in_schema=False,
-)
-async def subagent_research_legacy(
-    sample_session_id: str,
-    request: ResearchSubagentRequest,
-    current_user: CurrentUser,
-    redis_client: RedisClient = Depends(get_redis),
-    session_service: SessionService = Depends(get_session_service),
-    service: SubagentResearchService = Depends(get_subagent_research_service),
-) -> EventSourceResponse:
-    """Legacy alias — preserves the pre-C1a URL while PR-1..PR-3 migrate
-    callers. ``include_in_schema=False`` keeps it out of OpenAPI so docs
-    only advertise the canonical path. PR-4 removes both this handler and
-    the ``_run_subagent_research`` indirection."""
-    return await _run_subagent_research(
-        resolved_parent_id=sample_session_id,
-        request=request,
-        current_user=current_user,
-        redis_client=redis_client,
-        session_service=session_service,
-        service=service,
-    )
-
-
 async def _run_subagent_research(
     resolved_parent_id: str,
     request: ResearchSubagentRequest,
@@ -1634,15 +1604,12 @@ async def _run_subagent_research(
     session_service: SessionService,
     service: SubagentResearchService,
 ) -> EventSourceResponse:
-    """Shared implementation for canonical + legacy subagent-research routes.
+    """Shared implementation for the subagent-research route.
 
-    C1a PR-1: both ``/{parent_session_id}/subagents/research`` (canonical,
-    OpenAPI-visible) and ``/{sample_session_id}/subagents/research``
-    (legacy, hidden via ``include_in_schema=False``) delegate here. Each
-    route declares its own path-param kwarg so the OpenAPI schema for
-    the canonical route advertises ``parent_session_id`` as a path
-    parameter and NOT ``sample_session_id`` as a query parameter. PR-4
-    drops the legacy route + this helper indirection.
+    C1a PR-4: only ``/{parent_session_id}/subagents/research`` remains.
+    The PR-1 legacy alias path was dropped together with the column. The
+    helper indirection is retained so we keep one place to encode the
+    preflight/cancellation contract below.
 
     Order of side effects MUST match the chat endpoint preflight contract:
     1. Parent ownership check (404 on miss/cross-tenant → no existence leak)
@@ -1692,11 +1659,8 @@ async def _run_subagent_research(
     # status line is already 200 and exceptions can only manifest as a
     # truncated body. On any exception OR an empty stream we own the
     # lease release here; on success the streaming generator owns it.
-    # PR-1: service still uses legacy ``sample_session_id`` kwarg. PR-2
-    # flips the signature; until then we pass the resolved id under the
-    # legacy keyword to avoid coupling two PRs together.
     agen = service.run_research(
-        sample_session_id=resolved_parent_id,
+        parent_session_id=resolved_parent_id,
         user_id=current_user.id,
         prompts=request.prompts,
         max_children=request.max_children,

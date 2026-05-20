@@ -2,7 +2,7 @@
 for the Phase 1 minimal subagent feature.
 
 Contract:
-- Stores sample_session_id on the new Session entity
+- Stores parent_session_id on the new Session entity
 - Persists via uow.session.save exactly once
 - Default title is "新对话" (parity with create_session)
 - Does NOT trigger fs_reconciler walk (parent already walked the user dir);
@@ -58,14 +58,14 @@ def _make_uow_and_factory(
 
 
 class TestCreateSessionWithParent:
-    async def test_sets_sample_session_id(self) -> None:
-        """create_session_with_parent stores sample_session_id on the child Session."""
+    async def test_sets_parent_session_id(self) -> None:
+        """create_session_with_parent stores parent_session_id on the child Session."""
         uow, factory = _make_uow_and_factory()
         service = SessionService(uow_factory=factory)
 
         child = await service.create_session_with_parent(
             user_id="u-1",
-            sample_session_id="parent-1",
+            parent_session_id="parent-1",
             # T12: preset is required for every child created via this method
             # (codex R1 P1 fix). Existing PR-1 contract preserved by passing
             # the canonical subagent_research preset.
@@ -73,12 +73,12 @@ class TestCreateSessionWithParent:
         )
 
         assert child.user_id == "u-1"
-        assert child.sample_session_id == "parent-1"
+        assert child.parent_session_id == "parent-1"
         assert child.title == "新对话"
 
         uow.session.save.assert_awaited_once()
         saved = uow.session.save.call_args.args[0]
-        assert saved.sample_session_id == "parent-1"
+        assert saved.parent_session_id == "parent-1"
         assert saved.user_id == "u-1"
 
     async def test_does_not_trigger_fs_reconciler_walk(self) -> None:
@@ -100,7 +100,7 @@ class TestCreateSessionWithParent:
 
         await service.create_session_with_parent(
             user_id="u-1",
-            sample_session_id="parent-1",
+            parent_session_id="parent-1",
             tool_filter_preset="subagent_research",  # T12: required for children
         )
 
@@ -123,11 +123,11 @@ class TestCreateSessionWithParent:
         for _ in range(3):
             child = await service.create_session_with_parent(
                 user_id="u-1",
-                sample_session_id="parent-1",
+                parent_session_id="parent-1",
                 tool_filter_preset="subagent_research",  # T12: required
             )
             children.append(child)
 
         assert len(children) == 3
-        assert all(c.sample_session_id == "parent-1" for c in children)
+        assert all(c.parent_session_id == "parent-1" for c in children)
         assert uow.session.save.await_count == 3

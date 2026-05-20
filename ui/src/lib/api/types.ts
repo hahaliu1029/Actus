@@ -289,10 +289,8 @@ export type FileUploadParams = {
 export type ListSessionItem = {
   session_id: string;
   title: string;
-  // Phase 1 minimal subagent research: non-null when this session is a probe
-  // child of another (parent) session. Filtered out of the session list UI.
-  /** @deprecated PR-4 removes this; reads should prefer parent_session_id. */
-  sample_session_id: string | null;
+  // C1a: non-null when this session is a probe child of another (parent)
+  // session. Filtered out of the session list UI.
   parent_session_id: string | null;
   worker_type: 'root' | 'subagent';
   latest_message: string;

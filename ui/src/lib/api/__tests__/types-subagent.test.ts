@@ -83,11 +83,10 @@ describe("subagent types", () => {
     expect(req.max_children).toBe(2);
   });
 
-  it("ListSessionItem has sample_session_id field (nullable)", () => {
+  it("ListSessionItem has parent_session_id field (nullable)", () => {
     const item: ListSessionItem = {
       session_id: "s-1",
       title: "test",
-      sample_session_id: null,
       parent_session_id: null,
       worker_type: "root",
       latest_message: "",
@@ -96,6 +95,6 @@ describe("subagent types", () => {
       unread_message_count: 0,
       supervisor_snapshot: null,
     };
-    expect(item.sample_session_id).toBeNull();
+    expect(item.parent_session_id).toBeNull();
   });
 });

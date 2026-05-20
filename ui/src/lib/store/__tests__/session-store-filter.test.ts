@@ -6,7 +6,6 @@ function makeItem(overrides: Partial<ListSessionItem> = {}): ListSessionItem {
   return {
     session_id: "s",
     title: "t",
-    sample_session_id: null,
     parent_session_id: null,
     worker_type: "root",
     latest_message: "",
@@ -23,7 +22,7 @@ describe("useFilteredSessionsForList selector", () => {
     useSessionStore.setState({ sessions: [] });
   });
 
-  it("includes sessions where sample_session_id is null", () => {
+  it("includes sessions where parent_session_id is null", () => {
     const main = makeItem({
       session_id: "main-1",
       title: "Main session",
@@ -35,12 +34,11 @@ describe("useFilteredSessionsForList selector", () => {
     expect(filtered[0]?.session_id).toBe("main-1");
   });
 
-  it("excludes probe child sessions (sample_session_id non-null)", () => {
+  it("excludes probe child sessions (parent_session_id non-null)", () => {
     const main = makeItem({ session_id: "main-1", title: "main" });
     const child = makeItem({
       session_id: "child-1",
       title: "[probe] x",
-      sample_session_id: "main-1",
       parent_session_id: "main-1",
       worker_type: "subagent",
     });

@@ -175,21 +175,21 @@ class TestOrmRoundTripThroughResolver:
             id="sess-orm-t12",
             user_id="user-1",
             title="reloaded child",
-            sample_session_id="parent-1",
+            parent_session_id="parent-1",
             tool_filter_preset="subagent_research",
         )
         orm = self._hydrate_orm(seed)
 
         # Forward mapping pinned the column.
         assert orm.tool_filter_preset == "subagent_research"
-        assert orm.sample_session_id == "parent-1"
+        assert orm.parent_session_id == "parent-1"
 
         # ``to_domain`` uses ``Session.model_validate(self,
         # from_attributes=True)`` so any attribute-name drift between ORM
         # and domain blows up here.
         reloaded = orm.to_domain()
         assert reloaded.tool_filter_preset == "subagent_research"
-        assert reloaded.sample_session_id == "parent-1"
+        assert reloaded.parent_session_id == "parent-1"
 
         # And the resolver re-derives the canonical allowlist — the actual
         # F8 fix observable end-to-end on a "post-restart" reload.
@@ -208,7 +208,7 @@ class TestOrmRoundTripThroughResolver:
             id="sess-orm-parent",
             user_id="user-1",
             title="reloaded parent",
-            sample_session_id=None,
+            parent_session_id=None,
             tool_filter_preset=None,
         )
         orm = self._hydrate_orm(seed)

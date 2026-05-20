@@ -81,7 +81,7 @@ def _install_stub_research_service(app, events=None, raise_exc=None):
 async def test_endpoint_requires_parent_ownership(
     asgi_client, sample_user_token
 ):
-    """POST with non-existent sample_session_id → 404 (not 500)."""
+    """POST with non-existent parent_session_id → 404 (not 500)."""
     response = await asgi_client.post(
         "/api/sessions/00000000-0000-0000-0000-000000000000/subagents/research",
         json={"prompts": ["test"], "max_children": 1},

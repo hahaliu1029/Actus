@@ -40,7 +40,6 @@ class ListSessionItem(BaseModel):
 
     session_id: str = ""
     title: str = ""
-    sample_session_id: Optional[str] = None  # deprecated - PR-4 removes; reads should prefer parent_session_id
     parent_session_id: Optional[str] = None  # C1a canonical lineage field
     worker_type: Literal["root", "subagent"] = "root"  # C1a identity axis
     latest_message: str = ""

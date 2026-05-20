@@ -183,8 +183,8 @@ async def test_run_research_happy_path(service, mock_deps, monkeypatch, tmp_path
     from app.application.services import subagent_research_service as _srs
     from app.domain.models.event import DoneEvent, MessageEvent
 
-    # C1a PR-1: redirect metric jsonl to a temp file so we can assert the
-    # dual-emit invariant (parent_session_id + sample_session_id mirror).
+    # C1a: redirect metric jsonl to a temp file so we can assert the
+    # parent_session_id key is present (PR-4 dropped the deprecated mirror).
     metric_log = tmp_path / "actus-multiagent-probe.jsonl"
     monkeypatch.setattr(_srs, "METRIC_LOG_PATH", metric_log)
 
@@ -203,10 +203,8 @@ async def test_run_research_happy_path(service, mock_deps, monkeypatch, tmp_path
     # SubagentResearchService always tags children with "subagent_research".
     preset_seen: list = []
 
-    async def fake_create(user_id, sample_session_id=None, parent_session_id=None, tool_filter_preset=None):
-        # C1a PR-1: SubagentResearchService still passes sample_session_id;
-        # accept either kwarg so PR-2's flip doesn't require a test churn.
-        _parent = parent_session_id or sample_session_id
+    async def fake_create(user_id, *, parent_session_id, tool_filter_preset=None):
+        _parent = parent_session_id
         child = MagicMock()
         child.id = f"child-{len(children_created)+1}"
         children_created.append(child)
@@ -235,7 +233,7 @@ async def test_run_research_happy_path(service, mock_deps, monkeypatch, tmp_path
 
     events = []
     async for ev in service.run_research(
-        sample_session_id="parent-1",
+        parent_session_id="parent-1",
         user_id="u-1",
         prompts=["q1", "q2", "q3"],
         max_children=3,
@@ -256,14 +254,11 @@ async def test_run_research_happy_path(service, mock_deps, monkeypatch, tmp_path
     # the read-only allowlist after a pod restart (F8 gap fix).
     assert preset_seen == ["subagent_research", "subagent_research", "subagent_research"]
 
-    # C1a PR-1: metric jsonl must dual-emit parent_session_id (canonical) AND
-    # sample_session_id (deprecated mirror) so downstream aggregations can
-    # migrate without a coordinated cutover. PR-4 drops the legacy mirror.
+    # C1a PR-4: metric jsonl emits parent_session_id only.
     raw = metric_log.read_text().strip()
     assert raw, "expected at least one metric line"
     record = _json.loads(raw.splitlines()[-1])
     assert record["parent_session_id"] == "parent-1"
-    assert record["sample_session_id"] == "parent-1"
 
 
 async def test_run_research_quota_exceeded_raises(service, mock_deps):
@@ -278,7 +273,7 @@ async def test_run_research_quota_exceeded_raises(service, mock_deps):
 
     with pytest.raises(ConflictError):
         async for _ in service.run_research(
-            sample_session_id="parent-1", user_id="u-1",
+            parent_session_id="parent-1", user_id="u-1",
             prompts=["q1"], max_children=1,
         ):
             pass
@@ -299,10 +294,8 @@ async def test_run_research_finally_runs_release_on_consumer_aclose(
     mock_deps["quota_service"].acquire = AsyncMock(return_value=True)
     mock_deps["quota_service"].release = AsyncMock()
 
-    async def fake_create(user_id, sample_session_id=None, parent_session_id=None, tool_filter_preset=None):
-        # C1a PR-1: SubagentResearchService still passes sample_session_id;
-        # accept either kwarg so PR-2's flip doesn't require a test churn.
-        _parent = parent_session_id or sample_session_id
+    async def fake_create(user_id, *, parent_session_id, tool_filter_preset=None):
+        _parent = parent_session_id
         child = MagicMock()
         child.id = "child-disconnect"
         return child
@@ -321,7 +314,7 @@ async def test_run_research_finally_runs_release_on_consumer_aclose(
     mock_deps["sandbox_lifecycle_service"].suspend = AsyncMock()
 
     gen = service.run_research(
-        sample_session_id="parent-1", user_id="u-1",
+        parent_session_id="parent-1", user_id="u-1",
         prompts=["q1"], max_children=1,
     )
     # Consume one event then close the generator (simulates SSE client
@@ -365,7 +358,7 @@ async def test_classifier_word_boundary_no_false_positive_on_prefix(
     # (static block short-circuits). The fact we configure classifier here
     # means service should accept the prompt. We just confirm no raise.
     async for _ in service.run_research(
-        sample_session_id="parent-1", user_id="u-1",
+        parent_session_id="parent-1", user_id="u-1",
         prompts=["research prefix sum patterns"], max_children=1,
     ):
         pass
@@ -391,10 +384,8 @@ async def test_run_research_aclose_mid_fanout_cancels_pending_children(
 
     created = []
 
-    async def fake_create(user_id, sample_session_id=None, parent_session_id=None, tool_filter_preset=None):
-        # C1a PR-1: SubagentResearchService still passes sample_session_id;
-        # accept either kwarg so PR-2's flip doesn't require a test churn.
-        _parent = parent_session_id or sample_session_id
+    async def fake_create(user_id, *, parent_session_id, tool_filter_preset=None):
+        _parent = parent_session_id
         child = MagicMock()
         child.id = f"child-{len(created) + 1}"
         created.append(child)
@@ -430,7 +421,7 @@ async def test_run_research_aclose_mid_fanout_cancels_pending_children(
     mock_deps["agent_service"].stop_session = AsyncMock()
 
     gen = service.run_research(
-        sample_session_id="parent-1", user_id="u-1",
+        parent_session_id="parent-1", user_id="u-1",
         prompts=["q1", "q2"], max_children=2,
     )
 

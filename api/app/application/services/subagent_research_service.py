@@ -298,28 +298,21 @@ class SubagentResearchService:
         user_id: str,
         prompts: list[str],
         *,
-        parent_session_id: Optional[str] = None,
-        sample_session_id: Optional[str] = None,  # deprecated; PR-4 removes
+        parent_session_id: str,
         max_children: int = 3,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Run a research probe. See module docstring for invariants.
 
         Yields ChildStartedEvent × N → ChildDoneEvent × N (interleaved by
         as_completed order) → JoinedSummaryEvent (final).
-
-        C1a PR-1: accepts ``parent_session_id`` (canonical) or
-        ``sample_session_id`` (legacy alias). At least one is required.
-        PR-4 drops the legacy alias.
         """
         from app.application.errors.exceptions import (
             BadRequestError, ConflictError, NotFoundError,
         )
 
-        parent_id = parent_session_id or sample_session_id
+        parent_id = parent_session_id
         if parent_id is None:
-            raise ValueError(
-                "parent_session_id is required (legacy alias sample_session_id also accepted)"
-            )
+            raise ValueError("parent_session_id is required")
 
         probe_run_id = uuid.uuid4().hex
         start_ts = time.time()
@@ -361,7 +354,7 @@ class SubagentResearchService:
             for prompt in prompts[:max_children]:
                 child = await self._session_service.create_session_with_parent(
                     user_id=user_id,
-                    sample_session_id=parent_id,
+                    parent_session_id=parent_id,
                     tool_filter_preset=_SUBAGENT_RESEARCH_PRESET,
                 )
                 # NOTE: spec calls `session_service.update_title(...)` here for
@@ -558,28 +551,19 @@ class SubagentResearchService:
         summary_tokens: int,
         metrics: dict,
         *,
-        parent_session_id: Optional[str] = None,
-        sample_session_id: Optional[str] = None,  # deprecated; PR-4 removes
+        parent_session_id: str,
     ) -> None:
         """Append a jsonl metric line to ~/.gstack/metrics/.
 
         File I/O runs in a thread so the async path stays non-blocking.
-
-        C1a PR-1: accepts ``parent_session_id`` (canonical) or
-        ``sample_session_id`` (legacy alias) and dual-emits BOTH keys in the
-        metric record so existing downstream aggregations keep working
-        through the PR-1..PR-3 window. PR-4 drops the legacy mirror.
         """
-        parent_id = parent_session_id or sample_session_id
+        parent_id = parent_session_id
         if parent_id is None:
-            raise ValueError(
-                "parent_session_id is required (legacy alias sample_session_id also accepted)"
-            )
+            raise ValueError("parent_session_id is required")
         line = {
             "ts": time.time(),
             "probe_run_id": probe_run_id,
             "parent_session_id": parent_id,
-            "sample_session_id": parent_id,  # deprecated mirror; PR-4 removes
             "child_session_ids": [r.child_id for r in completed_results],
             "child_outcomes": [r.outcome.value for r in completed_results],
             "child_transcript_tokens": [

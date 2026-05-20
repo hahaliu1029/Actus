@@ -1673,9 +1673,7 @@ export const useSessionStore = create<SessionStore>()(
     // -----------------------------------------------------------------------
 
     getFilteredSessionsForList: () =>
-      get().sessions.filter(
-        (s) => (s.parent_session_id ?? s.sample_session_id ?? null) === null,
-      ),
+      get().sessions.filter((s) => s.parent_session_id === null),
 
     resetProbe: () => set({ probeState: initialProbeState }),
 
@@ -1744,7 +1742,7 @@ export const useSessionStore = create<SessionStore>()(
 );
 
 // Hook export — selector returns filtered session list (excludes probe child
-// sessions whose parent_session_id (or legacy sample_session_id during PR-1..PR-3) is non-null).
+// sessions whose parent_session_id is non-null).
 export function useFilteredSessionsForList(): ListSessionItem[] {
   return useSessionStore((s) => s.getFilteredSessionsForList());
 }

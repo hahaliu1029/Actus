@@ -80,9 +80,8 @@ class SessionService:
     async def create_session_with_parent(
         self,
         user_id: str,
-        sample_session_id: str | None = None,
         *,
-        parent_session_id: str | None = None,
+        parent_session_id: str,
         tool_filter_preset: Optional[str] = None,
         title: str | None = None,
     ) -> Session:
@@ -93,13 +92,10 @@ class SessionService:
         ``MAX_SUBAGENT_DEPTH`` and replace the ``parent.parent_session_id is not None``
         guard with a walk-up-the-chain.
 
-        Legacy alias ``sample_session_id`` is accepted during PR-1..PR-3 (dual-write
-        window). PR-4 removes the alias.
-
-        Child sessions carry a non-null ``parent_session_id`` / ``sample_session_id``;
-        the frontend session selector filters them out of the main list. Parent FK is
-        ondelete=RESTRICT — deleting the parent while children exist raises
-        IntegrityError, which the API layer translates to 409.
+        Child sessions carry a non-null ``parent_session_id``; the frontend session
+        selector filters them out of the main list. Parent FK is ondelete=RESTRICT —
+        deleting the parent while children exist raises IntegrityError, which the API
+        layer translates to 409.
 
         T12 / Phase 1 PR-X: ``tool_filter_preset`` is **required** for every
         child created via this method — closes the codex R1 P1 bypass where
@@ -111,20 +107,19 @@ class SessionService:
         ``ValueError`` and the DB CHECK constraint
         ``ck_sessions_tool_filter_preset`` is the last-line defense.
 
-        The DB also enforces
-        ``ck_sessions_child_must_have_preset`` (``sample_session_id IS NULL
-        OR tool_filter_preset IS NOT NULL``); this app-level ValueError
-        produces a cleaner error than the IntegrityError path.
+        The DB also enforces ``ck_sessions_child_must_have_preset``
+        (``parent_session_id IS NULL OR tool_filter_preset IS NOT NULL``);
+        this app-level ValueError produces a cleaner error than the
+        IntegrityError path.
 
         Does NOT trigger ``fs_reconciler`` walk: the parent ``create_session``
         already walked the user's memory directory, so the child can skip the
         redundant scan.
         """
-        parent_id = parent_session_id or sample_session_id
+        parent_id = parent_session_id
         if parent_id is None:
             raise ValueError(
-                "create_session_with_parent: parent_session_id is required "
-                "(legacy alias sample_session_id also accepted)"
+                "create_session_with_parent: parent_session_id is required"
             )
         if tool_filter_preset is None:
             raise ValueError(
@@ -189,7 +184,6 @@ class SessionService:
             child = Session(
                 user_id=user_id,
                 parent_session_id=parent_id,
-                sample_session_id=parent_id,  # PR-1 dual-write; PR-4 removes
                 worker_type="subagent",
                 tool_filter_preset=tool_filter_preset,
                 title=title or "新对话",
