@@ -906,10 +906,13 @@ class DBSessionRepository(SessionRepository):
         )
         return int(result.scalar() or 0)
 
-    async def lock_session_for_spawn(self, parent_id: str) -> Optional[Session]:
+    async def lock_session_for_spawn(
+        self, parent_id: str, *, user_id: str
+    ) -> Optional[Session]:
         stmt = (
             select(SessionModel)
             .where(SessionModel.id == parent_id)
+            .where(SessionModel.user_id == user_id)
             .with_for_update()
         )
         result = await self.db_session.execute(stmt)

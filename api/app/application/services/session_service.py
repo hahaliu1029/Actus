@@ -162,8 +162,13 @@ class SessionService:
             )
 
         async with self._uow_factory() as uow:
-            parent = await uow.session.lock_session_for_spawn(parent_id)
-            if parent is None or parent.user_id != user_id:
+            # SQL pushes (id, user_id) into WHERE so a cross-tenant parent_id
+            # never acquires a row lock. Foreign-user collapses to None,
+            # identical to a missing id — defeats ID enumeration via lock-timing.
+            parent = await uow.session.lock_session_for_spawn(
+                parent_id, user_id=user_id
+            )
+            if parent is None:
                 raise NotFoundError(f"parent session {parent_id} not found")
 
             # Phase 1 max_depth=1: parent must be a root.

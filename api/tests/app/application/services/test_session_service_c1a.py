@@ -23,8 +23,14 @@ class _FakeRepo:
         self._count = descendants_count
         self.saved: Session | None = None
 
-    async def lock_session_for_spawn(self, parent_id: str):
+    async def lock_session_for_spawn(self, parent_id: str, *, user_id: str):
         del parent_id
+        if self._parent is None:
+            return None
+        # Mirror the SQL `WHERE user_id == :user_id` filter so cross-tenant
+        # calls collapse to None — identical to the real repository.
+        if self._parent.user_id != user_id:
+            return None
         return self._parent
 
     async def count_descendants(self, ancestor_id: str, *, user_id: str, cap: int) -> int:

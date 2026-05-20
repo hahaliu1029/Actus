@@ -287,9 +287,18 @@ class SessionRepository(Protocol):
         Implementation MUST use a LIMIT cap+1 subquery, not a full count."""
         ...
 
-    async def lock_session_for_spawn(self, parent_id: str) -> Optional[Session]:
+    async def lock_session_for_spawn(
+        self, parent_id: str, *, user_id: str
+    ) -> Optional[Session]:
         """C1a: SELECT ... FOR UPDATE on parent row inside an active transaction.
-        Caller MUST be inside `async with uow:` - lock releases on UoW exit."""
+        Caller MUST be inside `async with uow:` - lock releases on UoW exit.
+
+        Defense-in-depth: ``user_id`` is pushed into the SQL ``WHERE`` clause
+        alongside ``id`` so a cross-tenant ``parent_id`` never acquires a row
+        lock (returns ``None`` exactly like a missing id). This collapses
+        cross-tenant + not-found into a single ``None`` result, mirroring
+        ``find_by_id_for_user`` and defeating ID-enumeration via lock-timing.
+        """
         ...
 
     async def find_by_id_for_user(
