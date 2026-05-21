@@ -27,6 +27,53 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture
+async def fake_redis(anyio_backend):
+    """Shared fakeredis async client for any test in any ``tests/`` subdir.
+
+    Placed in the root ``tests/conftest.py`` per pytest discovery rules — only
+    conftest files at or above the test's path are loaded, so sibling-dir
+    tests (e.g. ``tests/infrastructure/external/mailbox/`` and
+    ``tests/domain/services/``) need this fixture at a common ancestor.
+
+    The fixture depends on ``anyio_backend`` so it runs under pytest-anyio
+    (the project's async test runner — there is no pytest-asyncio plugin
+    installed). Tests that use this fixture must decorate with
+    ``@pytest.mark.anyio``, NOT ``@pytest.mark.asyncio``.
+
+    ``decode_responses=False`` mirrors the C3 wire contract (publisher writes
+    bytes via ``json.dumps(...).encode("utf-8")``); production
+    ``RedisClient.client`` has ``decode_responses=True`` but the wire-level
+    bytes survive either decode mode on the round trip, and tests assert
+    bytes-keyed dicts via ``entries[0][1][b"envelope"]``.
+    """
+    from fakeredis.aioredis import FakeRedis
+
+    r = FakeRedis(decode_responses=False)
+    try:
+        yield r
+    finally:
+        await r.aclose()
+
+
+@pytest.fixture
+async def fake_redis_decoded(anyio_backend):
+    """Production-shape fakeredis with decode_responses=True.
+
+    Production ``RedisClient.client`` uses ``decode_responses=True``
+    (see ``api/app/infrastructure/storage/redis.py:30``). Use this
+    fixture to verify wrappers handle ``str`` ids / ``str`` field keys
+    coming back from XREADGROUP, XAUTOCLAIM, etc.
+    """
+    from fakeredis.aioredis import FakeRedis
+
+    r = FakeRedis(decode_responses=True)
+    try:
+        yield r
+    finally:
+        await r.aclose()
+
+
 @pytest.fixture(autouse=True)
 def _clear_tool_source_registry():
     """Clear and re-bootstrap _REGISTRY before and after every test.

@@ -2,6 +2,7 @@ import logging
 import uuid
 
 from app.application.errors.exceptions import AppException, TooManyRequestsError
+from app.domain.external.mailbox_publisher import MailboxPublishOversize
 from app.domain.services.permission.errors import (
     PEInfrastructureUnavailable,
     PolicyConflict,
@@ -147,6 +148,27 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=410,
             content={"error": "session_state_invalid", "detail": str(exc)},
+            headers=_request_id_headers(request) or None,
+        )
+
+    @app.exception_handler(MailboxPublishOversize)
+    async def mailbox_oversize_handler(
+        request: Request, exc: MailboxPublishOversize
+    ) -> JSONResponse:
+        """C3 PR-2 — mailbox envelope serialized size exceeded
+        ``APPROVAL_PAYLOAD_MAX_BYTES``. 413 Payload Too Large.
+
+        Defensive surface: ``RedisMailboxPublisher`` only raises when an
+        internal caller (handlers / services) violates the cap. There is
+        no external request path that constructs an oversized envelope
+        in PR-2 — this handler exists so that future endpoints which
+        synthesize envelopes from request bodies (PR-4+) surface a
+        canonical 413 with a stable JSON shape instead of falling
+        through to the catch-all 500.
+        """
+        return JSONResponse(
+            status_code=413,
+            content={"error": "mailbox_envelope_oversize", "detail": str(exc)},
             headers=_request_id_headers(request) or None,
         )
 

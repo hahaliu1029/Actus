@@ -29,6 +29,7 @@ from app.infrastructure.external.health_checker.postgres_health_checker import (
 from app.infrastructure.external.health_checker.redis_health_checker import (
     RedisHealthChecker,
 )
+from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.models.app_config import LLMConfig, SkillRiskPolicy
 from app.application.services.agent_service import _ConfigSnapshot
 from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
@@ -905,6 +906,34 @@ def get_confirmation_queue(
     from app.domain.services.permission.confirmation_queue import ConfirmationQueue
 
     return ConfirmationQueue(redis_client.client)
+
+
+# ----------------------------------------------------------------------
+# C3 PR-2: MailboxPublisher DI factory
+# ----------------------------------------------------------------------
+
+
+def get_mailbox_publisher(
+    redis_client: RedisClient = Depends(get_redis),
+) -> MailboxPublisher:
+    """Return a :class:`RedisMailboxPublisher` bound to the raw
+    ``redis.asyncio.Redis`` client.
+
+    Same unwrap pattern as :func:`get_confirmation_queue` —
+    ``RedisMailboxPublisher.__init__`` accepts ``redis.asyncio.Redis``, not
+    the ``RedisClient`` wrapper. The publisher only needs SET / XADD; no
+    pubsub or pipeline state is shared with other Redis users, so the same
+    singleton ``RedisClient.client`` is safe to reuse.
+
+    Consumer-side (:class:`RedisMailboxConsumer`) is **not** wired here —
+    it's constructed per-supervisor in PR-3a (one consumer per root
+    session) and never injected through FastAPI Depends.
+    """
+    from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+        RedisMailboxPublisher,
+    )
+
+    return RedisMailboxPublisher(redis_client.client)
 
 
 def build_cost_callback_handler(session_id: str, user_id: str):

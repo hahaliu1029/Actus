@@ -70,3 +70,8 @@ testpaths = ["api/tests"]
 members = [
     "sandbox",
 ]
+
+[dependency-groups]
+dev = [
+    "fakeredis>=2.35.1",
+]
