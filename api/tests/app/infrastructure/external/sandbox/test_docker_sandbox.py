@@ -2,6 +2,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from docker.errors import APIError, NotFound
 
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 
@@ -191,3 +192,134 @@ def test_build_memory_mount_honors_custom_target(tmp_path) -> None:
 
     assert mount is not None
     assert mount["Target"] == "/mnt/memory"
+
+
+# ── destroy() NotFound contract (C3 PR-1 codex round 10 P2) ───────────────
+# Externally removed containers (NotFound) must be treated as terminal
+# success, not retryable failure. Without this, the registry would
+# translate False → SandboxLifecycleError and loop forever in DESTROYING.
+
+
+class _NotFoundContainers:
+    """Fake docker_client.containers that raises NotFound on get()."""
+
+    def get(self, name):  # noqa: ANN001
+        raise NotFound(f"container {name} not found")
+
+
+class _NotFoundDockerClient:
+    def __init__(self) -> None:
+        self.containers = _NotFoundContainers()
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _APIErrorContainers:
+    """Fake docker_client.containers that raises APIError on get()."""
+
+    def get(self, name):  # noqa: ANN001
+        raise APIError("docker daemon down")
+
+
+class _APIErrorDockerClient:
+    def __init__(self) -> None:
+        self.containers = _APIErrorContainers()
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _RemoveNotFoundContainer:
+    """Container whose remove(force=True) raises NotFound (race condition)."""
+
+    def remove(self, force: bool = False) -> None:  # noqa: ARG002
+        raise NotFound("container vanished mid-remove")
+
+
+class _RemoveNotFoundContainers:
+    def __init__(self) -> None:
+        self._container = _RemoveNotFoundContainer()
+
+    def get(self, name):  # noqa: ANN001, ARG002
+        return self._container
+
+
+class _RemoveNotFoundDockerClient:
+    def __init__(self) -> None:
+        self.containers = _RemoveNotFoundContainers()
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_destroy_returns_true_when_container_already_gone(monkeypatch) -> None:
+    """C3 PR-1 (codex round 10 P2) — NotFound is terminal success.
+
+    When ``containers.get(name)`` raises ``NotFound`` (externally removed
+    container), ``destroy()`` returns ``True`` so the registry treats it
+    as idempotent terminal success instead of a retryable failure that
+    would loop forever in DESTROYING.
+    """
+    fake_docker_client = _NotFoundDockerClient()
+    monkeypatch.setattr(
+        DockerSandbox,
+        "_create_docker_client",
+        classmethod(lambda cls: fake_docker_client),
+    )
+    sandbox = DockerSandbox(ip="127.0.0.1", container_name="actus-sb-gone")
+
+    result = await sandbox.destroy()
+
+    assert result is True
+    assert fake_docker_client.closed is True
+
+
+@pytest.mark.anyio
+async def test_destroy_returns_true_when_remove_races_with_external_delete(
+    monkeypatch,
+) -> None:
+    """C3 PR-1 (codex round 10 P2) — NotFound on ``container.remove()``
+    (race between ``get()`` and ``remove()``) is also terminal success.
+    """
+    fake_docker_client = _RemoveNotFoundDockerClient()
+    monkeypatch.setattr(
+        DockerSandbox,
+        "_create_docker_client",
+        classmethod(lambda cls: fake_docker_client),
+    )
+    sandbox = DockerSandbox(ip="127.0.0.1", container_name="actus-sb-race")
+
+    result = await sandbox.destroy()
+
+    assert result is True
+    assert fake_docker_client.closed is True
+
+
+@pytest.mark.anyio
+async def test_destroy_returns_false_on_genuine_docker_error(monkeypatch) -> None:
+    """C3 PR-1 (codex round 10 P2) — only ``NotFound`` is success; genuine
+    errors (e.g. APIError when daemon down) must still return ``False`` so
+    the registry surfaces ``SandboxLifecycleError`` for retry.
+    """
+    fake_docker_client = _APIErrorDockerClient()
+    monkeypatch.setattr(
+        DockerSandbox,
+        "_create_docker_client",
+        classmethod(lambda cls: fake_docker_client),
+    )
+    sandbox = DockerSandbox(ip="127.0.0.1", container_name="actus-sb-broken")
+
+    result = await sandbox.destroy()
+
+    assert result is False
+    assert fake_docker_client.closed is True
+
+
+@pytest.fixture()
+def anyio_backend() -> str:
+    return "asyncio"

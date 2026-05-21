@@ -113,3 +113,30 @@ class SandboxPoisonedError(SandboxLifecycleError):
             f"handle generation={expected_generation}, "
             f"current generation={actual_generation}"
         )
+
+
+class SandboxAlreadyDestroyed(SandboxLifecycleError):
+    """Raised by SandboxLifecycleService.destroy() when target is already DESTROYED.
+
+    Mailbox handlers (spec §3.2 M2 + §7.3) treat this as terminal-success:
+    idempotent no-op equivalent to a fresh destroy. Distinguishing
+    already-destroyed from just-destroyed is required for forensics/audit
+    classification.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"sandbox for session {session_id} already destroyed")
+        self.session_id = session_id
+
+
+class SandboxBindingMissing(SandboxLifecycleError):
+    """Raised when destroy() cannot find a sandbox binding (UNBOUND / missing row).
+
+    Equivalent terminal-success: nothing to destroy, treat as if destroy already
+    happened. Distinct from SandboxAlreadyDestroyed because the binding never
+    reached ACTIVE — the row may have been GCed by an earlier reconcile pass.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"sandbox binding missing for session {session_id}")
+        self.session_id = session_id

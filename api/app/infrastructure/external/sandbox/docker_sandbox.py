@@ -332,7 +332,21 @@ class DockerSandbox(Sandbox):
         )
 
     async def destroy(self) -> bool:
-        """销毁当前的DockerSandbox实例"""
+        """销毁当前的DockerSandbox实例.
+
+        Returns ``True`` on success **including the case where the container
+        is already gone** (``docker.errors.NotFound``) — gone-is-gone, this
+        is the idempotent terminal-success contract C3 PR-1 requires.
+        Returns ``False`` only on genuine Docker remove/close failures the
+        caller should retry.
+
+        C3 PR-1 (codex round 10 P2): NotFound is terminal success, not
+        failure. Without this distinction, an externally removed container
+        (e.g. ``docker rm`` from ops, or a parallel cleanup) would be
+        classified as a retryable failure by the registry, leaving the
+        binding stuck in DESTROYING and causing an infinite reconcile loop
+        for a container that no longer exists.
+        """
         try:
             # 1.关闭httpx客户端
             if self.client:
@@ -342,7 +356,28 @@ class DockerSandbox(Sandbox):
             if self._container_name:
                 docker_client = self._create_docker_client()
                 try:
-                    docker_client.containers.get(self._container_name).remove(force=True)
+                    try:
+                        container = docker_client.containers.get(
+                            self._container_name
+                        )
+                    except NotFound:
+                        # 容器已被外部删除 → 终态成功，符合 C3 PR-1
+                        # destroy() 的 idempotent 语义。
+                        logger.info(
+                            "销毁时容器 %s 已不存在，按终态成功处理",
+                            self._container_name,
+                        )
+                        return True
+                    try:
+                        container.remove(force=True)
+                    except NotFound:
+                        # 与上面的 get() NotFound 同义——race condition 下
+                        # 容器在 get 之后、remove 之前被移除也算成功。
+                        logger.info(
+                            "移除容器 %s 时已不存在，按终态成功处理",
+                            self._container_name,
+                        )
+                        return True
                 finally:
                     docker_client.close()
             return True

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.domain.errors.sandbox_lifecycle import SandboxLifecycleError
 from app.infrastructure.external.sandbox.sandbox_registry import SandboxRegistry
 
 pytestmark = pytest.mark.anyio
@@ -197,3 +198,43 @@ async def test_destroy_infra_calls_sandbox_destroy() -> None:
 async def test_destroy_infra_no_sandbox_noop() -> None:
     reg = SandboxRegistry()
     await reg.destroy_infra("nonexistent")  # no error
+
+
+async def test_destroy_infra_raises_when_destroy_returns_false() -> None:
+    """C3 PR-1 (codex round 9 P1) — DockerSandbox.destroy() returns False on
+    docker rm / httpx aclose failure. The registry MUST translate that into
+    SandboxLifecycleError so SandboxLifecycleService's failure path triggers
+    (binding stays DESTROYING for retry; registry entry preserved).
+    """
+    reg = SandboxRegistry()
+    sbx = FakeSandbox()
+    sbx.destroy = AsyncMock(return_value=False)
+    reg.register("sess-1", sbx, generation=1)
+
+    with pytest.raises(SandboxLifecycleError) as exc:
+        await reg.destroy_infra("sess-1")
+    assert "sess-1" in str(exc.value)
+    sbx.destroy.assert_awaited_once()
+
+
+async def test_destroy_infra_completes_when_destroy_returns_true() -> None:
+    """Happy path — Sandbox.destroy() returns True → destroy_infra returns None."""
+    reg = SandboxRegistry()
+    sbx = FakeSandbox()
+    sbx.destroy = AsyncMock(return_value=True)
+    reg.register("sess-1", sbx, generation=1)
+
+    result = await reg.destroy_infra("sess-1")
+    assert result is None
+
+
+async def test_destroy_infra_no_op_when_no_registered_sandbox() -> None:
+    """destroy_infra on an unknown session is a silent no-op (no exception).
+
+    Matches the existing contract that allows the lifecycle service to call
+    destroy_infra after the binding has already been cleaned up by another
+    path (defensive idempotency).
+    """
+    reg = SandboxRegistry()
+    result = await reg.destroy_infra("never-registered")
+    assert result is None

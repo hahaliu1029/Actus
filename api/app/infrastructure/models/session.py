@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
@@ -16,6 +17,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.schema import conv
 
 from ...domain.models.session import (
     DestroyReason,
@@ -30,7 +32,25 @@ class SessionModel(Base):
     """会话ORM模型"""
 
     __tablename__ = "sessions"
-    __table_args__ = (PrimaryKeyConstraint("id", name="pk_sessions_id"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_sessions_id"),
+        # C3 PR-1 (codex round 11 P2): mirror the migration-level CHECK so
+        # ``Base.metadata.create_all`` (used by tests/integration conftest)
+        # also gets the constraint. NULL ≡ 'legacy' per R1 P2.3 contract.
+        #
+        # C3 PR-1 (codex round 12 P2): wrap the name with ``conv()`` to mark it
+        # as already-conventionalized. Base.metadata.naming_convention applies
+        # ``ck_%(table_name)s_%(constraint_name)s``, so a bare
+        # ``name="ck_sessions_subagent_control_plane_valid"`` would double-
+        # prefix to ``ck_sessions_ck_sessions_subagent_control_plane_valid`` —
+        # mismatching the migration's raw SQL name and creating spurious
+        # alembic autogen diffs (drop/recreate). ``conv()`` opts out.
+        CheckConstraint(
+            "subagent_control_plane IS NULL "
+            "OR subagent_control_plane IN ('legacy', 'mailbox')",
+            name=conv("ck_sessions_subagent_control_plane_valid"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(255),
@@ -48,6 +68,15 @@ class SessionModel(Base):
         nullable=False,
         server_default=text("'root'::character varying"),
     )  # C1a identity axis root/subagent; CHECK constraints live in c1a migration.
+    # C3 PR-1 — control plane discriminator (spec §11.2). NULLABLE with NO
+    # server_default; NULL ≡ 'legacy' (pre-C3 rows). Consumers must apply
+    # ``coalesce(value, 'legacy')`` semantics; see migration
+    # c3_add_mailbox_envelope_audit.py for the canonical contract.
+    subagent_control_plane: Mapped[Optional[str]] = mapped_column(
+        String(16),
+        nullable=True,
+        default=None,
+    )
     tool_filter_preset: Mapped[Optional[str]] = mapped_column(
         String(64),
         nullable=True,

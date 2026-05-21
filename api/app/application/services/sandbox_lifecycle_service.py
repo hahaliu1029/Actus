@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from typing import Callable, Optional, Type, cast
 
 from app.domain.errors.sandbox_lifecycle import (
+    SandboxAlreadyDestroyed,
+    SandboxBindingMissing,
     SandboxLifecycleError,
     SessionCreatingError,
     SessionDestroyingError,
@@ -89,6 +91,16 @@ class SandboxLifecycleService:
         if session_id not in self._per_session_locks:
             self._per_session_locks[session_id] = asyncio.Lock()
         return self._per_session_locks[session_id]
+
+    def _pop_lock_for(self, session_id: str) -> None:
+        """Drop the per-session lock entry.
+
+        Used by terminal-success ``destroy`` paths (missing row, UNBOUND,
+        DESTROYED) and by the normal DESTROYED completion so that lock
+        entries never leak for one-shot session ids (C3 PR-1 codex round 6
+        P2).
+        """
+        self._per_session_locks.pop(session_id, None)
 
     # ── State transition helper ──
 
@@ -369,26 +381,156 @@ class SandboxLifecycleService:
         """ACTIVE|SUSPENDED → DESTROYING → DESTROYED.
 
         Two-phase destroy + quiesce barrier (I6). See spec §8.5.
+
+        C3 PR-1 (spec §3.2 M2 + §7.3 + plan Step 3.4) — raises typed signals
+        instead of silent return on idempotent paths, and propagates infra
+        failures instead of swallowing them:
+
+        - binding.state == DESTROYED → :class:`SandboxAlreadyDestroyed`
+        - binding.state == UNBOUND → :class:`SandboxBindingMissing`
+        - missing session row → :class:`SandboxBindingMissing`
+        - infra teardown failure → :class:`SandboxLifecycleError`
+          (still records DESTROYING state so reconcile can pick up; the
+          DESTROYED transition does NOT happen on infra failure)
+        - happy path (ACTIVE/SUSPENDED/CREATING/DESTROYING resume) → None
+
+        Callers must catch the two terminal-success subclasses if they need
+        idempotent semantics (mailbox handlers, session delete path,
+        reconcile pass).
         """
         async with self._get_lock(session_id):
             async with self._uow_factory() as uow:
                 session = await uow.session.get_by_id(session_id)
             if session is None:
-                raise ValueError(f"Session {session_id} not found")
+                # C3 PR-1 (spec §3.2 M2): missing binding row → typed signal.
+                # C3 PR-1 (codex round 6 P2): pop lock to avoid leak — caller
+                # treats SandboxBindingMissing as terminal-success and will
+                # not retry.
+                self._pop_lock_for(session_id)
+                raise SandboxBindingMissing(session_id)
 
             binding = session.sandbox_binding
 
             if binding.state == DESTROYED:
-                return  # Already destroyed, idempotent
+                # C3 PR-1 (spec §3.2 M2 + §7.3): typed signal instead of silent return.
+                # C3 PR-1 (codex round 6 P2): pop lock to avoid leak.
+                self._pop_lock_for(session_id)
+                raise SandboxAlreadyDestroyed(session_id)
+            if binding.state == UNBOUND:
+                # C3 PR-1 (plan Step 3.4): UNBOUND has no sandbox to destroy →
+                # terminal-success signal identical to a missing row.
+                # C3 PR-1 (codex round 6 P2): pop lock to avoid leak.
+                self._pop_lock_for(session_id)
+                raise SandboxBindingMissing(session_id)
+            # C3 PR-1 (codex round 15 P2): defensive check for data
+            # inconsistency. If the binding state is non-terminal (ACTIVE /
+            # SUSPENDED / DESTROYING / CREATING) but ``binding.id`` is missing,
+            # there is no sandbox to destroy — treat as terminal-success
+            # identical to UNBOUND. Without this, the destroy flow would fall
+            # through to ``cancel_and_drain`` + ``destroy_infra`` (both silent
+            # no-ops when the registry has no entry) and then advance the
+            # binding to DESTROYED — polluting forensic audit with a
+            # phantom-destroy row for a row that never had a container.
+            if binding.id is None:
+                self._pop_lock_for(session_id)
+                logger.warning(
+                    "destroy: session %s has binding.state=%s but binding.id "
+                    "is None — data inconsistency; treating as "
+                    "SandboxBindingMissing",
+                    session_id,
+                    binding.state.value,
+                )
+                raise SandboxBindingMissing(session_id)
             if binding.state == DESTROYING:
+                # C3 PR-1 (codex round 13 P2 + round 14 P2): if the registry
+                # entry was lost (e.g. process restart between a first destroy()
+                # that left binding=DESTROYING + container alive and this retry),
+                # the downstream ``cancel_and_drain`` / ``destroy_infra`` would
+                # silently no-op (registry sees no entry) and the binding would
+                # advance to DESTROYED while the container leaks. Rehydrate
+                # from ``binding.id`` before continuing so destroy_infra
+                # actually targets the live container.
+                #
+                # Round 14 P2: ``Sandbox.get()`` returning ``None`` is AMBIGUOUS
+                # in production — ``DockerSandbox.get()`` collapses both
+                # ``NotFound`` (container externally removed; terminal success)
+                # AND ``APIError`` (Docker daemon unreachable; transient
+                # failure) into ``None``. We cannot safely distinguish these
+                # cases here, so the conservative posture is to preserve
+                # DESTROYING by raising ``SandboxLifecycleError``: an operator
+                # retry (once Docker recovers) or the next ``reconcile_orphans``
+                # pass will resolve it correctly. Premature DESTROYED would
+                # silently mark a live container as gone during a Docker
+                # outage. If/when ``DockerSandbox.get()`` is refactored to
+                # distinguish NotFound from APIError (planned for PR-3a
+                # supervisor lifecycle integration), the NotFound branch can
+                # cleanly short-circuit to terminal-success here.
+                if self._registry.get_sandbox(session_id) is None and binding.id:
+                    try:
+                        rehydrated = await self._sandbox_cls.get(binding.id)
+                    except Exception as e:
+                        logger.exception(
+                            "destroy: DESTROYING retry for session %s — sandbox "
+                            "lookup failed for binding.id=%s",
+                            session_id,
+                            binding.id,
+                        )
+                        raise SandboxLifecycleError(
+                            f"destroy: DESTROYING retry for session {session_id} "
+                            f"could not rehydrate registry — Sandbox.get raised "
+                            f"({e!r}). Preserving DESTROYING for next reconcile "
+                            f"pass."
+                        ) from e
+
+                    if rehydrated is None:
+                        # Ambiguous: NotFound (terminal success) and APIError
+                        # (transient failure) both collapse to None in
+                        # DockerSandbox.get(). Treat as retryable failure so
+                        # live containers aren't silently marked DESTROYED
+                        # during Docker outages. Reconcile / operator retry
+                        # resolves once Docker is reachable again.
+                        raise SandboxLifecycleError(
+                            f"destroy: DESTROYING retry for session {session_id} "
+                            f"could not rehydrate registry (Sandbox.get returned "
+                            f"None — could be NotFound OR Docker daemon "
+                            f"unreachable). Preserving DESTROYING for next "
+                            f"reconcile pass."
+                        )
+
+                    self._registry.register(
+                        session_id,
+                        rehydrated,
+                        generation=binding.generation,
+                    )
+                    logger.info(
+                        "destroy: DESTROYING retry for session %s — registry "
+                        "rehydrated from binding.id",
+                        session_id,
+                    )
                 # Another destroy in progress — continue the flow
-                pass
             elif binding.state in (ACTIVE, SUSPENDED):
                 # Step 1: persist DESTROYING + generation++ (I7 rule b)
+                # C3 PR-1 (codex round 4 P2): persist destroy_reason now so a
+                # subsequent reconcile-driven DESTROYED transition preserves the
+                # original reason (instead of being audited as RECONCILE_ORPHAN
+                # when destroy_infra raises and reconcile picks up later).
                 await self._transition(
-                    session_id, target=DESTROYING, generation_delta=1
+                    session_id,
+                    target=DESTROYING,
+                    generation_delta=1,
+                    destroy_reason=reason,
                 )
-            elif binding.state in (UNBOUND, CREATING):
+                # C3 PR-1 (codex round 10 P2): sync registry generation so any
+                # in-flight ``SandboxHandle`` referencing the OLD generation
+                # fails ``_check_generation()`` after this point. Without this,
+                # handles can still dispatch commands at a DESTROYING sandbox
+                # if ``destroy_infra`` raises and leaves the registry entry
+                # alive for retry. ``_transition`` is the canonical generation
+                # source (it bumped the DB row), so derive the new value as
+                # ``binding.generation + 1`` to avoid an extra DB roundtrip.
+                new_generation = binding.generation + 1
+                self._registry.update_generation(session_id, new_generation)
+            elif binding.state == CREATING:
                 # Nothing to destroy
                 await self._transition(
                     session_id,
@@ -397,7 +539,7 @@ class SandboxLifecycleService:
                     destroyed_at=datetime.now(UTC),
                     destroy_reason=reason,
                 )
-                self._per_session_locks.pop(session_id, None)
+                self._pop_lock_for(session_id)
                 return
 
             # Step 2-4: quiesce + infra destroy
@@ -411,26 +553,47 @@ class SandboxLifecycleService:
                     session_id,
                 )
 
+            # C3 PR-1 (spec §7.3): propagate infra failure as retryable
+            # SandboxLifecycleError. Binding stays DESTROYING; reconcile or
+            # an explicit retry can pick up on the next pass.
             try:
                 await self._registry.destroy_infra(session_id)
-            except Exception:
-                logger.exception(
-                    "Docker rm failed during destroy session=%s", session_id
+            except SandboxLifecycleError:
+                logger.warning(
+                    "destroy_infra raised typed SandboxLifecycleError for "
+                    "session %s — propagating",
+                    session_id,
                 )
+                raise
+            except Exception as e:
+                logger.warning(
+                    "destroy_infra failed for session %s; binding stays "
+                    "DESTROYING until next reconcile/retry: %s",
+                    session_id, e,
+                )
+                raise SandboxLifecycleError(
+                    f"destroy_infra failed for {session_id}: {e}"
+                ) from e
 
             self._registry.remove(session_id)
 
             # Step 5: persist DESTROYED + destroyed_at
+            # C3 PR-1 (codex round 6 P2): preserve the originally persisted
+            # destroy_reason on the DESTROYING-resume path. If
+            # ``binding.destroy_reason`` is already set from a prior cycle that
+            # failed at destroy_infra, that value is canonical for forensic
+            # classification; only fall back to the current ``reason`` if no
+            # value was previously persisted.
             await self._transition(
                 session_id,
                 target=DESTROYED,
                 generation_delta=0,  # I7: DESTROYING→DESTROYED doesn't increment
                 destroyed_at=datetime.now(UTC),
-                destroy_reason=reason,
+                destroy_reason=binding.destroy_reason or reason,
             )
 
             # Cleanup lock (eng review decision #3)
-            self._per_session_locks.pop(session_id, None)
+            self._pop_lock_for(session_id)
 
     async def reconcile_orphans(self) -> None:
         """App startup reconciliation (I11).
@@ -499,14 +662,28 @@ class SandboxLifecycleService:
                             "reconcile_orphans: drain timed out for session %s",
                             session_id,
                         )
+                    infra_failed = False
                     try:
                         await self._registry.destroy_infra(session_id)
-                    except Exception:
+                    except Exception as e:
                         logger.exception(
-                            "reconcile_orphans: docker rm failed for session %s",
-                            session_id,
+                            "reconcile_orphans: docker rm failed for session %s; "
+                            "leaving DESTROYING for next reconcile pass: %s",
+                            session_id, e,
                         )
+                        infra_failed = True
+
+                    if infra_failed:
+                        # C3 PR-1 (codex round 3 P2 + round 4 P2): preserve
+                        # DESTROYING AND keep the registry entry so the next
+                        # reconcile cycle (or an explicit destroy()) can actually
+                        # retry destroy_infra against the live container.
+                        # Clearing the registry here would make subsequent
+                        # destroy_infra a silent no-op and leak the container.
+                        continue
+
                     self._registry.remove(session_id)
+
                     await self._transition(
                         session_id,
                         target=DESTROYED,

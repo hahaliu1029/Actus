@@ -48,6 +48,11 @@ class DestroyReason(str, Enum):
     SESSION_DELETE = "session_delete"  # 用户主动删除会话
     WATCHDOG_TIMEOUT = "watchdog_timeout"  # 超时销毁
     RECONCILE_ORPHAN = "reconcile_orphan"  # 容器被外部 kill，reconcile 标记
+    # C3 PR-1 — mailbox-driven terminal transitions (spec §7.2)
+    SUBAGENT_TERMINAL_RESULT = "subagent_terminal_result"  # RESULT_READY observed
+    CANCEL_ACK_OBSERVED = "cancel_ack_observed"  # child confirmed cooperative cancel
+    ORPHAN_TIMEOUT = "orphan_timeout"  # supervisor stale detection
+    FORCE_TERMINATE = "force_terminate"  # cascade cancel policy=TERMINATE
 
 
 class SandboxBinding(BaseModel):
@@ -82,6 +87,13 @@ class Session(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 会话id
     parent_session_id: Optional[str] = None  # C1a canonical lineage field — sole survivor after PR-4 contract drop.
     worker_type: Literal["root", "subagent"] = "root"  # C1a identity axis; CHECK ck_sessions_worker_type_parent_invariant keeps this in sync with parent_session_id.
+    # C3 PR-1 — control plane discriminator (spec §11.2). 'legacy' = SSE-only
+    # path; 'mailbox' = MailboxSupervisor manages lifecycle; None = pre-C3 rows
+    # (treat as 'legacy' via consumer-side coalesce). Narrowed to a Literal
+    # in codex round-11 P2 review so typo'd values are caught at the domain
+    # boundary and never reach the DB CHECK constraint
+    # (ck_sessions_subagent_control_plane_valid).
+    subagent_control_plane: Optional[Literal["legacy", "mailbox"]] = None
     tool_filter_preset: Optional[Literal["subagent_research"]] = (
         None  # T12 pod-restart resilience：持久化 tool_filter 预设名；NULL = 不限制
     )

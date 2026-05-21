@@ -8,6 +8,8 @@ from app.application.errors.exceptions import (
     ServerRequestsError,
 )
 from app.domain.errors.sandbox_lifecycle import (
+    SandboxAlreadyDestroyed,
+    SandboxBindingMissing,
     SandboxLifecycleError,
     SessionFinalizedError,
     SessionSuspendedError,
@@ -257,19 +259,46 @@ class SessionService:
         await self._cleanup_task(session.task_id)
 
         # 3. Lifecycle-managed sandbox destroy (I6: quiesce barrier)
+        destroy_error: SandboxLifecycleError | None = None
         if self._lifecycle:
             try:
                 await self._lifecycle.destroy(session_id, DestroyReason.SESSION_DELETE)
-            except Exception:
+            except (SandboxAlreadyDestroyed, SandboxBindingMissing) as e:
+                # C3 PR-1 (spec §3.2 M2 + §7.3): terminal-success signals
+                # — sandbox already gone, treat as no-op for delete path.
+                logger.debug(
+                    "Sandbox already terminal for session %s during delete: %s",
+                    session_id,
+                    e,
+                )
+            except SandboxLifecycleError as e:
+                # C3 PR-1 (codex P1 round 1 + round 13 P2): non-terminal sandbox
+                # teardown failure (docker daemon down, network blip, generation
+                # mismatch, etc.) must NOT proceed to DB delete —
+                # reconcile_orphans needs the session row to find the still-bound
+                # sandbox on retry. Capture the error and re-raise AFTER the
+                # background slot cleanup runs: the slot cleanup is idempotent
+                # and a sandbox teardown failure should not strand the Redis
+                # quota slot until TTL, blocking future background-task quota.
                 logger.warning(
-                    "Sandbox lifecycle destroy failed for session %s, proceeding with delete",
+                    "Sandbox lifecycle destroy failed for session %s — aborting delete",
                     session_id,
                     exc_info=True,
                 )
+                destroy_error = e
+
+        # Background slot cleanup is idempotent — always run so a sandbox
+        # destroy failure doesn't strand the Redis quota slot.
         await self._cleanup_background_slot_if_needed(
             session,
             reason="session_delete",
         )
+
+        if destroy_error is not None:
+            # Re-raise the original SandboxLifecycleError so the HTTP DELETE
+            # handler returns 5xx and the session row stays for the next
+            # reconcile pass.
+            raise destroy_error
 
         # 4.根据传递的会话id删除会话
         async with self._uow:

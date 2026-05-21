@@ -2,6 +2,7 @@ from .base import Base
 from .conversation_compaction import ConversationCompactionModel
 from .cost_record_orm import CostRecordModel
 from .file import FileModel
+from .mailbox_envelope_audit import MailboxEnvelopeAuditModel
 from .memory_audit_log import MemoryAuditLogModel
 from .memory_chunk_orm import MEMORY_EMBEDDING_DIM, MemoryChunkModel
 from .memory_system_notification import MemorySystemNotificationModel
@@ -18,6 +19,7 @@ __all__ = [
     "CostRecordModel",
     "SessionModel",
     "FileModel",
+    "MailboxEnvelopeAuditModel",
     "MemoryAuditLogModel",
     "MemoryChunkModel",
     "MemorySystemNotificationModel",

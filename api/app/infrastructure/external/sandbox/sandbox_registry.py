@@ -19,6 +19,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Protocol
 
+from app.domain.errors.sandbox_lifecycle import SandboxLifecycleError
 from app.domain.external.sandbox import Sandbox
 
 if TYPE_CHECKING:
@@ -219,8 +220,25 @@ class SandboxRegistry:
     async def destroy_infra(self, session_id: str) -> None:
         """Call Sandbox.destroy() on the live instance (docker rm + httpx aclose).
 
-        Must run AFTER cancel_and_drain. Exceptions propagate to caller.
+        Must run AFTER cancel_and_drain. Either raises ``SandboxLifecycleError``
+        or completes successfully — never silently no-ops on failure (apart
+        from the no-registered-sandbox branch, which is a true no-op).
+
+        C3 PR-1 (codex round 9 P1): ``DockerSandbox.destroy()`` returns ``bool``
+        (``False`` on Docker remove/httpx close error). Translate ``False`` →
+        ``SandboxLifecycleError`` so the ``SandboxLifecycleService`` failure
+        handling path actually triggers — otherwise the binding silently
+        advances to ``DESTROYED``, the registry entry is removed, and the
+        live container leaks with no retry signal.
         """
         sandbox = self._sandboxes.get(session_id)
-        if sandbox is not None:
-            await sandbox.destroy()
+        if sandbox is None:
+            # No active binding to destroy — caller treats this as no-op.
+            # The surrounding service has already transitioned to DESTROYING
+            # and is making a final cleanup pass.
+            return
+        ok = await sandbox.destroy()
+        if not ok:
+            raise SandboxLifecycleError(
+                f"sandbox.destroy() returned False for session {session_id}"
+            )
