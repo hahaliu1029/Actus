@@ -1,10 +1,20 @@
 import logging
+import socket
 from datetime import datetime
 from functools import lru_cache
 from typing import Optional
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Source the Settings defaults from the canonical spec constants so changing
+# spec §4.3 in one place propagates to both the in-process consumer loop AND
+# the env-var-exposed defaults. Codex r8 [P2] fix — prior version hard-coded
+# 1000 / 32 here, creating silent drift if the spec constants moved.
+from app.domain.models.mailbox_envelope import (
+    MAILBOX_XREADGROUP_BLOCK_MS as _MAILBOX_XREADGROUP_BLOCK_MS,
+    MAILBOX_XREADGROUP_COUNT as _MAILBOX_XREADGROUP_COUNT,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -230,6 +240,22 @@ class Settings(BaseSettings):
     # surface stays consistent regardless of how it's accessed.
     subagent_limits: SubagentLimitsConfig = Field(default_factory=SubagentLimitsConfig)
 
+    # ─── C3 Mailbox Supervisor (PR-3a) ────────────────────────────────────
+    # `mailbox_supervisor_enabled` is the deployment-time feature flag.
+    # PR-3a ships with default=False (影子模式 — supervisor task not started);
+    # PR-5 翻 true 后 MailboxSupervisor 正式接管 child→parent 终态分发。
+    # `mailbox_pod_id` is the consumer-group consumer-name prefix. Empty value
+    # degrades to socket.gethostname() via resolve_mailbox_pod_id() — for
+    # production prefer injecting the k8s downward-API pod name.
+    # `mailbox_xreadgroup_block_ms` / `mailbox_xreadgroup_count` mirror the
+    # spec §4.3 constants (1000ms, batch=32); kept here only so ops can tune
+    # without code changes. Unit tests pass block_ms=0 explicitly because
+    # fakeredis async XREADGROUP doesn't wake on a concurrent XADD.
+    mailbox_supervisor_enabled: bool = False
+    mailbox_pod_id: str = ""
+    mailbox_xreadgroup_block_ms: int = Field(_MAILBOX_XREADGROUP_BLOCK_MS, gt=0)
+    mailbox_xreadgroup_count: int = Field(_MAILBOX_XREADGROUP_COUNT, gt=0)
+
     # 使用pydantic v2的写法来完成环境变量信息的告知
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
@@ -267,6 +293,19 @@ class Settings(BaseSettings):
                 "请在 .env 或环境变量中设置一个安全的随机密钥"
             )
         return self
+
+
+def resolve_mailbox_pod_id(configured: str) -> str:
+    """Resolve the effective MailboxSupervisor pod_id.
+
+    Empty / whitespace-only ``configured`` degrades to ``socket.gethostname()``.
+    PR-3b's XAUTOCLAIM uses pod_id to detect cross-pod PEL ownership; an empty
+    string would collapse all pods into one consumer-name space and break
+    crash-recovery detection, so the hostname fallback is the safe default.
+    """
+    if configured and configured.strip():
+        return configured
+    return socket.gethostname()
 
 
 @lru_cache()
