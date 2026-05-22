@@ -498,6 +498,186 @@ _last_refresh_generation: int = 0
 _refresh_lock = threading.Lock()
 
 
+# codex r4 [HIGH CONTRACT] — PR-4 readiness gate (see ``build_supervisor_registry``).
+#
+# Flip to ``True`` ONLY in the PR-4 change that ships real
+# ResultReadyHandler / CancelAckHandler with ``SandboxLifecycleService.destroy``
+# side-effects per spec §7.3. Until then, ``build_supervisor_registry``
+# refuses to construct a registry so an operator who flips
+# ``MAILBOX_SUPERVISOR_ENABLED=True`` at PR-3c gets a hard lifespan failure
+# instead of silent sandbox leaks (stub handlers ACK terminal envelopes
+# without destroy — see ``app/application/services/mailbox_supervisor.py:167``).
+#
+# Tests that need to construct the registry (e.g. integration harness fixtures
+# in PR-4 / PR-4.5) patch this to ``True`` via ``monkeypatch.setattr``.
+_PR4_TERMINAL_HANDLERS_READY: bool = False
+
+
+def build_supervisor_registry(
+    *,
+    redis_client: RedisClient,
+    publisher: MailboxPublisher,
+    sandbox_lifecycle_service: object,
+) -> "SupervisorRegistry":
+    """C3 PR-3c — construct the per-pod :class:`SupervisorRegistry` singleton.
+
+    Called exclusively from ``main.py`` lifespan startup; the DI provider
+    :func:`get_supervisor_registry` is a thin read of
+    ``app.state.supervisor_registry`` and does NOT re-invoke this factory.
+    The lifespan path owns construction so the singleton is built once
+    before ``reconcile_orphans`` runs and is reused by every request.
+    The registry's ``supervisor_factory`` closure builds a
+    :class:`MailboxSupervisor` per root using:
+
+    * the raw ``redis.asyncio.Redis`` client (unwrap from ``RedisClient``);
+    * a fresh :class:`DbMailboxEnvelopeAuditRepository` per supervisor —
+      the audit repo owns its own short-lived sessions per call (see the
+      class docstring; it is NOT registered in DBUnitOfWork);
+    * the shared mailbox ``publisher`` (XADD-only, no pubsub state shared
+      with other callers);
+    * the sandbox lifecycle service (typed as ``object`` here because
+      ``SandboxLifecycleService`` lives in ``application/`` and we don't
+      want a circular import — supervisor only calls ``destroy(session_id,
+      reason)`` per the ``_SandboxLifecycleProtocol`` shape in
+      mailbox_supervisor.py).
+
+    ``agent_service_callback`` is ``_pr3c_noop_callback`` for PR-3c — the
+    in-process dispatch callback that wakes the root agent on subagent
+    events is wired in PR-4 alongside the real terminal handlers. The
+    PR-3a stub handlers tolerate the noop callback only because PR-3c
+    does not actually publish envelopes through the supervisor in
+    production (the flag defaults to False); when PR-4 ships the real
+    callback, the factory below at line ~602 is the single edit site.
+
+    codex r4 [HIGH CONTRACT] fail-closed gate: ``MailboxSupervisor`` is
+    still using the PR-3a stub dispatch table (terminal handlers ACK
+    ``RESULT_READY`` / ``CANCEL_ACK`` WITHOUT calling
+    ``SandboxLifecycleService.destroy``). If an operator flips
+    ``mailbox_supervisor_enabled=True`` before PR-4 lands the real
+    terminal handlers + before PR-4.5 lands publishers + AgentService
+    helper, the supervisor would silently drain terminal envelopes →
+    sandboxes leak with no destroy. The constant below is the single
+    place PR-4 flips to ``True`` once real handlers are wired; until
+    then this function raises ``RuntimeError`` so lifespan fails closed
+    on misconfiguration. Tests can bypass via patch of
+    ``_PR4_TERMINAL_HANDLERS_READY``.
+    """
+    if not _PR4_TERMINAL_HANDLERS_READY:
+        raise RuntimeError(
+            "build_supervisor_registry: mailbox_supervisor_enabled=True is "
+            "not safe yet — the supervisor's PR-3a stub dispatch table ACKs "
+            "RESULT_READY / CANCEL_ACK envelopes WITHOUT destroying the "
+            "subagent sandbox, so enabling now would leak sandboxes on "
+            "every terminal envelope. PR-4 ships the real terminal handlers "
+            "and flips _PR4_TERMINAL_HANDLERS_READY in this module. Either "
+            "wait for PR-4 to land, or set MAILBOX_SUPERVISOR_ENABLED=False "
+            "(the default) in your .env."
+        )
+    from app.application.services.mailbox_supervisor import (
+        MailboxSupervisor,
+        SupervisorContext,
+    )
+    from app.application.services.supervisor_registry import SupervisorRegistry
+    from app.infrastructure.repositories.db_mailbox_envelope_audit_repository import (
+        DbMailboxEnvelopeAuditRepository,
+    )
+    from core.config import resolve_mailbox_pod_id
+    import uuid as _uuid
+
+    settings_local = get_settings()
+    pod_id = resolve_mailbox_pod_id(settings_local.mailbox_pod_id)
+    audit_repo = DbMailboxEnvelopeAuditRepository(
+        session_factory=get_postgres().session_factory,
+    )
+
+    class _TelemetryAdapter:
+        """Best-effort logger-backed adapter exposing the
+        ``emit(name, data) -> None`` shape the supervisor's
+        ``_TelemetryProtocol`` expects.
+
+        codex r1 [MEDIUM CONTRACT] — the previous incarnation tried to
+        share ``JsonlPromptTelemetry`` for mailbox events, but that
+        class has no generic ``write()`` method (only
+        ``record_assembly`` / ``record_llm_invocation`` /
+        ``emit_recovery_event`` — schema-typed callsites unrelated to
+        mailbox supervisor telemetry). The fallback chain
+        (``getattr(sink, "write", None) → logger.info``) was therefore
+        ALWAYS taking the logger branch — the JsonlPromptTelemetry
+        construction was dead code that promised a JSONL stream it
+        never wrote to. Drop the dead path and log directly with a
+        stable ``mailbox.telemetry`` prefix so ops can grep without
+        reading two layers of indirection. PR-4 can wire a real
+        ``mailbox_telemetry.jsonl`` writer if/when the volume warrants
+        it — for the PR-3a/3b stub-handler workload, log is enough.
+        """
+
+        async def emit(self, name: str, data: dict) -> None:
+            try:
+                logger.info("mailbox.telemetry %s %s", name, data)
+            except Exception:
+                logger.debug(
+                    "mailbox telemetry emit failed event=%s",
+                    name,
+                    exc_info=True,
+                )
+
+    telemetry_adapter = _TelemetryAdapter()
+
+    raw_redis = redis_client.client
+
+    def _factory(root_session_id: str) -> MailboxSupervisor:
+        ctx = SupervisorContext(
+            root_session_id=root_session_id,
+            pod_id=pod_id,
+            instance_id=_uuid.uuid4().hex[:8],
+            redis=raw_redis,
+            audit_repo=audit_repo,
+            publisher=publisher,
+            sandbox_lifecycle=sandbox_lifecycle_service,  # type: ignore[arg-type]
+            # PR-3c: in-process dispatch callback is PR-4's responsibility.
+            # The PR-3a stub handlers call ``ctx.agent_service_callback``
+            # only on non-terminal types; PR-3c does not flip the flag, so
+            # this code path is not exercised in production until PR-4.
+            agent_service_callback=_pr3c_noop_callback,
+            telemetry=telemetry_adapter,
+        )
+        return MailboxSupervisor(
+            ctx,
+            block_ms=settings_local.mailbox_xreadgroup_block_ms,
+            count=settings_local.mailbox_xreadgroup_count,
+        )
+
+    return SupervisorRegistry(supervisor_factory=_factory)
+
+
+async def _pr3c_noop_callback(envelope) -> None:  # noqa: ANN001
+    """C3 PR-3c placeholder for ``ctx.agent_service_callback``.
+
+    The real callback (waking the root agent on subagent envelope
+    arrival) is wired in PR-4 together with the terminal handlers. Until
+    then this is a no-op — PR-3c keeps the flag default False so the
+    supervisor isn't actually consuming envelopes in production, and the
+    PR-3a stub handlers tolerate the no-op for tests that explicitly
+    enable the flag.
+    """
+    return None
+
+
+_supervisor_registry_singleton: "SupervisorRegistry | None" = None
+_supervisor_registry_lock = threading.Lock()
+
+
+def get_supervisor_registry(request: HTTPConnection) -> "SupervisorRegistry | None":
+    """Return the lifespan-scoped :class:`SupervisorRegistry`.
+
+    Returns ``None`` when the mailbox plane is disabled
+    (``mailbox_supervisor_enabled=False`` — the PR-3a default). The DI
+    callers (``get_agent_service`` indirectly) accept ``None`` and skip
+    runner-side wiring.
+    """
+    return getattr(request.app.state, "supervisor_registry", None)
+
+
 def _build_agent_service(
     minio_store: MinioStore,
     redis_client: RedisClient,
@@ -506,6 +686,7 @@ def _build_agent_service(
     memory_embedding_provider: object | None,
     file_memory_store: object | None = None,
     sandbox_lifecycle_service: object | None = None,
+    supervisor_registry: "SupervisorRegistry | None" = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
@@ -588,6 +769,11 @@ def _build_agent_service(
         redis_client=redis_client,
         uow_factory=get_uow,
         meter=OtelMeter(),
+        # C3 PR-3c (codex r6 [HIGH CONTRACT]) — wire the per-pod MailboxSupervisor
+        # registry through so ExecutionSupervisor's non-runner terminal-write
+        # paths (idle_watchdog cancel, FINISHING reconcile at boot) can call
+        # ``registry.stop`` to prevent supervisor task leaks.
+        supervisor_registry=supervisor_registry,
     )
     # Notification emitter is always constructible (DB-only, no Redis
     # dep); gate-off deployments just never call it.
@@ -616,6 +802,7 @@ def _build_agent_service(
         memory_gate_rebuild_fn=_build_memory_gate_deps,
         event_recovery=RedisEventRecovery(),
         sandbox_lifecycle_service=sandbox_lifecycle_service,
+        supervisor_registry=supervisor_registry,
     )
     agent_svc._supervisor = supervisor
     _last_refresh_generation = _config_generation

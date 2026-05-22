@@ -21,6 +21,7 @@ from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
+from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.external.task import Task
 from app.domain.errors.supervisor import SupervisorContractError
 from app.domain.models.app_config import (
@@ -60,6 +61,62 @@ from langgraph.types import Command
 from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
+
+
+async def _commit_uow_if_real(uow) -> None:
+    """C3 PR-3c (codex r11 [HIGH CONTRACT] fix).
+
+    Explicitly commit the underlying DB session when ``uow`` is a real
+    :class:`~app.infrastructure.repositories.db_uow.DBUnitOfWork` (which
+    exposes ``db_session.commit()``) so a terminal-write site can detect
+    commit failure synchronously and skip downstream side-effects
+    (mailbox supervisor stop, Redis revoke, notification emit).
+
+    Why explicit: ``DBUnitOfWork.__aexit__`` swallows
+    ``asyncio.CancelledError`` on commit for SSE-disconnect ergonomics,
+    so "left the with-block normally" does NOT imply "commit durably
+    succeeded". This helper lets callers raise commit failure as an
+    exception that breaks out before the supervisor stop runs.
+
+    Test stubs (e.g. unit tests' ``_Uow`` lacking ``db_session``) get a
+    no-op so this fix doesn't break their mocked paths. Mirrors the
+    runner's ``await uow.db_session.commit()`` at
+    ``agent_task_runner.py:3092``.
+    """
+    db_session = getattr(uow, "db_session", None)
+    if db_session is None:
+        return
+    commit = getattr(db_session, "commit", None)
+    if commit is None:
+        return
+    await commit()
+
+
+# C3 PR-3c (codex r9 [HIGH CONTRACT] fix) — GC anchor + observability for
+# shielded mailbox-stop tasks. Without a hard reference, asyncio can GC the
+# task spawned by ``_maybe_stop_supervisor_for_session`` before its done
+# callback fires, swallowing exceptions. Same pattern as
+# ``_PENDING_TERMINAL_TASKS`` in ``agent_task_runner.py:119``.
+_PENDING_MAILBOX_STOP_TASKS: set[asyncio.Task] = set()
+
+
+def _on_mailbox_stop_task_done(task: asyncio.Task) -> None:
+    _PENDING_MAILBOX_STOP_TASKS.discard(task)
+    if task.cancelled():
+        # Shouldn't happen: ``asyncio.shield`` protects the inner task
+        # from the outer cancel and we don't cancel it directly.
+        logger.warning(
+            "mailbox stop task %s was cancelled unexpectedly", task.get_name()
+        )
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "mailbox stop task %s raised: %s",
+            task.get_name(),
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 OUTPUT_STREAM_POLL_BLOCK_MS = 1000
 TAKEOVER_CANCEL_TIMEOUT_SECONDS = 15
 TAKEOVER_LEASE_TTL_SECONDS = 15 * 60
@@ -150,6 +207,12 @@ class AgentService:
         # snapshot's ``memory_gate_llm`` identity changes so breaker +
         # daily_cap track the new LLM. None = static wiring (tests /
         # legacy callers that don't reshape gate config at runtime).
+        supervisor_registry: SupervisorRegistryPort | None = None,
+        # C3 PR-3c: per-pod MailboxSupervisor registry. Forwarded into every
+        # ``AgentTaskRunner`` constructed in ``_create_task`` so the runner
+        # can spawn/stop a supervisor when its root session enters
+        # RUNNING / terminal. None when the mailbox plane is disabled
+        # (deployment-time ``settings.mailbox_supervisor_enabled=False``).
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -171,6 +234,22 @@ class AgentService:
         self._memory_gate_daily_cap = memory_gate_daily_cap
         self._memory_notification_emitter = memory_notification_emitter
         self._memory_gate_rebuild_fn = memory_gate_rebuild_fn
+        self._supervisor_registry = supervisor_registry
+
+        # codex r5 [HIGH CONTRACT] — partial-bind protection.
+        # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
+        # ``_maybe_stop_mailbox_supervisor`` (shielded), so runner-driven
+        # terminal paths reliably stop the supervisor. But ``AgentService``
+        # has SEVEN other direct ``update_to_terminal`` call sites (admin
+        # cancel, takeover-pending timeout, takeover-lease timeout, force
+        # terminate via approval, retry budget exhaustion, etc.) that do
+        # NOT flow through the runner. Codex r5 caught those leaking a
+        # spawned root supervisor task after these non-runner terminals.
+        # ``_maybe_stop_supervisor_for_session`` is the shared helper —
+        # idempotent, swallowing failures, safe to call on subagent IDs
+        # (the registry's ``stop`` is a no-op on unknown roots), so every
+        # terminal-write site below just appends one ``await`` and stays
+        # symmetric with the runner path.
         self._event_recovery = event_recovery
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_timeout_tasks: dict[str, asyncio.Task] = {}
@@ -657,6 +736,15 @@ class AgentService:
             idle_watchdog=getattr(self, "_idle_watchdog", None),
             was_background=session.was_background,
             tool_filter=tool_filter,
+            # C3 PR-3c: ``getattr`` mirrors the ``_idle_watchdog`` line above —
+            # several tests build ``AgentService`` via ``__new__`` to bypass the
+            # heavy ctor wiring, then drive ``_create_task``; defensiveness keeps
+            # those paths green while production wiring (main.py:305) always
+            # passes a real value (or ``None`` when the mailbox flag is off).
+            supervisor_registry=getattr(self, "_supervisor_registry", None),
+            mailbox_supervisor_enabled=getattr(
+                getattr(self, "_settings", None), "mailbox_supervisor_enabled", False
+            ),
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);
@@ -2912,12 +3000,20 @@ class AgentService:
                         SessionStatus.COMPLETED,
                         "resume_state_lost",
                     )
+                    # codex r11 [HIGH CONTRACT] — explicit commit so a
+                    # swallowed CancelledError on UoW close cannot leave
+                    # the supervisor stop firing without a durable
+                    # terminal write. Mirrors runner pattern at
+                    # agent_task_runner.py:3092.
+                    await _commit_uow_if_real(uow)
                 if transitioned is not False:
                     await self._emit_bg_terminal_notification_if_background(
                         session_id,
                         SessionStatus.COMPLETED,
                         "resume_state_lost",
                     )
+                # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
+                await self._maybe_stop_supervisor_for_session(session_id)
                 # Sync sandbox binding: ACTIVE → SUSPENDED (same as normal completion)
                 if self._sandbox_lifecycle_service:
                     try:
@@ -3022,12 +3118,16 @@ class AgentService:
                 SessionStatus.COMPLETED,
                 "user_cancel",
             )
+            # codex r11 — explicit commit (see resume_state_lost path).
+            await _commit_uow_if_real(uow)
         if transitioned is not False:
             await self._emit_bg_terminal_notification_if_background(
                 session_id,
                 SessionStatus.COMPLETED,
                 "user_cancel",
             )
+        # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
+        await self._maybe_stop_supervisor_for_session(session_id)
         await self._cleanup_background_slot_if_needed(session, reason="user_cancel")
 
         # 4. Suspend sandbox binding (I2: ACTIVE → SUSPENDED, container stays alive)
@@ -3320,12 +3420,17 @@ end
                     SessionStatus.COMPLETED,
                     "watchdog_timeout",
                 )
+                # codex r11 — explicit commit (see resume_state_lost path).
+                await _commit_uow_if_real(uow)
             if transitioned is not False:
                 await self._emit_bg_terminal_notification_if_background(
                     session_id,
                     SessionStatus.COMPLETED,
                     "watchdog_timeout",
                 )
+            # C3 PR-3c (codex r5 explicit cite) — non-runner terminal
+            # (takeover_pending TTL expired): stop supervisor.
+            await self._maybe_stop_supervisor_for_session(session_id)
             await self._force_release_takeover_lease(session_id)
         except asyncio.CancelledError:
             raise
@@ -3559,6 +3664,62 @@ end
             return
         await self._emit_bg_notification_if_background(session_id, event_type)
 
+    async def _maybe_stop_supervisor_for_session(self, session_id: str) -> None:
+        """C3 PR-3c (codex r5 [HIGH CONTRACT] fix) — stop the per-pod
+        MailboxSupervisor when ``AgentService`` writes a terminal status
+        outside the runner's ``_set_terminal_status`` path.
+
+        Safe + idempotent:
+          * No-op when ``_supervisor_registry`` is ``None`` (mailbox flag
+            disabled or PR-4 not yet shipped — registry isn't built).
+          * No-op when ``session_id`` is a subagent or otherwise has no
+            slot — ``SupervisorRegistry.stop`` simply ``pop``s a missing
+            entry, returns immediately. We don't pre-filter for root
+            because (a) the round-trip would cost a UoW lookup per
+            terminal, and (b) the registry is the single source of
+            truth for "is this id a tracked root?" — keep that authority
+            in one place.
+          * Exceptions logged + swallowed so a transient registry hiccup
+            cannot fail a terminal write that already committed.
+
+        Called from every non-runner ``update_to_terminal`` site in
+        AgentService (admin cancel, takeover-pending timeout,
+        takeover-lease timeout, FORCE_TERMINATE via approval, retry
+        budget exhaustion, ...). The runner's own terminal path goes
+        through ``AgentTaskRunner._set_terminal_status._terminal_op``
+        which calls ``self._maybe_stop_mailbox_supervisor()`` — same
+        intent, different code path, both fire under the same registry
+        idempotency contract so duplicate calls are harmless.
+        """
+        registry = self._supervisor_registry
+        if registry is None:
+            return
+        # C3 PR-3c (codex r7→r12) — fire-and-forget the stop so this hook
+        # introduces ZERO cancellation seam at the caller. Earlier rounds
+        # used ``asyncio.shield(await ...)`` then re-raised CancelledError;
+        # r12 caught that the re-raise still skips downstream cleanup in
+        # every caller (background slot cleanup, control events, lua
+        # revoke, ...). Fire-and-forget removes the await entirely:
+        #
+        # * The spawned task is anchored in ``_PENDING_MAILBOX_STOP_TASKS``
+        #   so asyncio cannot GC it before completion.
+        # * ``_on_mailbox_stop_task_done`` observes raises via the done
+        #   callback (logs at ERROR with traceback).
+        # * If lifespan shutdown happens before the stop completes,
+        #   ``SupervisorRegistry.stop_all()`` (main.py shutdown step)
+        #   sweeps any in-flight slots; the in-flight stop task's
+        #   completion is a race we accept because stop is idempotent.
+        #
+        # This is the same trade-off the C3 spec §6.5 makes: the stop
+        # hook is best-effort plumbing, NOT a synchronization barrier
+        # the caller depends on.
+        stop_task = asyncio.create_task(
+            registry.stop(session_id),
+            name=f"mailbox-stop-{session_id}",
+        )
+        _PENDING_MAILBOX_STOP_TASKS.add(stop_task)
+        stop_task.add_done_callback(_on_mailbox_stop_task_done)
+
     async def _inject_handoff_message(self, task: Task, text: str) -> str:
         """向任务输入流注入一条handoff消息，用于恢复执行上下文。"""
         handoff_event = MessageEvent(
@@ -3750,6 +3911,8 @@ end
                     SessionStatus.TIMED_OUT,
                     "resume_state_lost",
                 )
+                # codex r11 — explicit commit (see resume_state_lost path).
+                await _commit_uow_if_real(uow)
         except Exception:
             logger.warning(
                 "retry_from_suspend fallback terminal update failed for session %s",
@@ -3757,6 +3920,8 @@ end
                 exc_info=True,
             )
             return
+        # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
+        await self._maybe_stop_supervisor_for_session(session.id)
 
         try:
             async with self._uow_factory() as uow:
@@ -3876,12 +4041,16 @@ end
                 SessionStatus.COMPLETED,
                 "resume_state_lost",
             )
+            # codex r11 — explicit commit (see other resume_state_lost path).
+            await _commit_uow_if_real(uow)
         if transitioned is not False:
             await self._emit_bg_terminal_notification_if_background(
                 session_id,
                 SessionStatus.COMPLETED,
                 "resume_state_lost",
             )
+        # C3 PR-3c (codex r5) — non-runner terminal: stop supervisor.
+        await self._maybe_stop_supervisor_for_session(session_id)
         await self._append_control_event(
             session_id,
             action=ControlAction.ENDED,
@@ -4272,12 +4441,16 @@ end
                     SessionStatus.COMPLETED,
                     "user_cancel",
                 )
+                # codex r11 — explicit commit (see resume_state_lost path).
+                await _commit_uow_if_real(uow)
             if transitioned is not False:
                 await self._emit_bg_terminal_notification_if_background(
                     session_id,
                     SessionStatus.COMPLETED,
                     "user_cancel",
                 )
+            # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
+            await self._maybe_stop_supervisor_for_session(session_id)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.REJECTED,
@@ -4366,12 +4539,16 @@ end
                     SessionStatus.COMPLETED,
                     "natural",
                 )
+                # codex r11 — explicit commit (see resume_state_lost path).
+                await _commit_uow_if_real(uow)
             if transitioned is not False:
                 await self._emit_bg_terminal_notification_if_background(
                     session_id,
                     SessionStatus.COMPLETED,
                     "natural",
                 )
+            # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
+            await self._maybe_stop_supervisor_for_session(session_id)
             await self._append_control_event(
                 session_id,
                 action=ControlAction.ENDED,

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Awaitable, Callable, Literal
 
 from app.domain.errors.supervisor import SupervisorContractError
+from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.models.session import Session, SessionStatus
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
@@ -24,6 +25,49 @@ from app.domain.services._lua_scripts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _commit_uow_if_real(uow) -> None:
+    """C3 PR-3c (codex r11 [HIGH CONTRACT] fix) — same contract as
+    ``app.application.services.agent_service._commit_uow_if_real``.
+
+    Explicit commit so DBUnitOfWork's CancelledError-swallowing
+    ``__aexit__`` (db_uow.py:71) cannot let a terminal write appear
+    durable when it isn't, before this module's mailbox-supervisor stop
+    side-effect runs. Test stubs without ``db_session`` get a no-op.
+    """
+    db_session = getattr(uow, "db_session", None)
+    if db_session is None:
+        return
+    commit = getattr(db_session, "commit", None)
+    if commit is None:
+        return
+    await commit()
+
+
+# C3 PR-3c (codex r9 [HIGH CONTRACT] fix) — GC anchor + observability for
+# shielded mailbox-stop tasks. Same pattern as runner's
+# ``_PENDING_TERMINAL_TASKS`` in ``agent_task_runner.py:119`` and
+# AgentService's ``_PENDING_MAILBOX_STOP_TASKS``: a strong reference
+# prevents GC, and the done callback surfaces any exception.
+_PENDING_MAILBOX_STOP_TASKS: set[asyncio.Task] = set()
+
+
+def _on_mailbox_stop_task_done(task: asyncio.Task) -> None:
+    _PENDING_MAILBOX_STOP_TASKS.discard(task)
+    if task.cancelled():
+        logger.warning(
+            "mailbox stop task %s was cancelled unexpectedly", task.get_name()
+        )
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "mailbox stop task %s raised: %s",
+            task.get_name(),
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 _BACKGROUND_RETRY_BUDGET = 3
 _BG_SLOT_TTL_SECONDS = 86400
@@ -74,6 +118,7 @@ class ExecutionSupervisor:
         meter=None,
         max_system_bg: int = 100,
         max_user_bg: int = 5,
+        supervisor_registry: SupervisorRegistryPort | None = None,
     ) -> None:
         if session_repository is None and uow_factory is None:
             raise ValueError("session_repository or uow_factory is required")
@@ -89,7 +134,44 @@ class ExecutionSupervisor:
         self._sha_revoke: str | None = None
         self._sha_sweep: str | None = None
         self._runners: dict[str, object] = {}
+        # C3 PR-3c (codex r6 [HIGH CONTRACT] fix) — ExecutionSupervisor owns
+        # two non-runner terminal-write paths (`terminate` for
+        # idle_watchdog + admin cancel, and `reconcile_running_background_at_boot`
+        # for FINISHING cleanup at pod start). Both used to bypass the
+        # MailboxSupervisor stop hook → if mailbox plane was enabled, the
+        # supervisor task would outlive its root session. Injecting the
+        # SupervisorRegistry port here (domain Protocol → application impl
+        # via duck typing) keeps Clean Architecture clean and gives both
+        # paths a one-line stop call below. Default None preserves
+        # backwards compat for tests / pre-mailbox deployments.
+        self._supervisor_registry = supervisor_registry
         self._init_metrics()
+
+    async def _maybe_stop_supervisor_for_session(self, session_id: str) -> None:
+        """C3 PR-3c (codex r6) — stop the per-pod MailboxSupervisor on
+        non-runner terminal writes owned by ExecutionSupervisor.
+
+        Mirrors ``AgentService._maybe_stop_supervisor_for_session``: safe
+        on missing registry, safe on unknown session id (the registry's
+        ``stop`` is a no-op on roots it doesn't track), swallows
+        exceptions so a transient registry hiccup cannot fail a terminal
+        write that already committed.
+        """
+        registry = self._supervisor_registry
+        if registry is None:
+            return
+        # C3 PR-3c (codex r7→r12) — fire-and-forget the stop. See
+        # AgentService._maybe_stop_supervisor_for_session for the full
+        # rationale: awaiting the stop introduces a cancellation seam
+        # that can skip downstream caller cleanup (lua_revoke, control
+        # events). Spawn + anchor + done callback gives us GC safety +
+        # exception observability without blocking the caller.
+        stop_task = asyncio.create_task(
+            registry.stop(session_id),
+            name=f"mailbox-stop-{session_id}",
+        )
+        _PENDING_MAILBOX_STOP_TASKS.add(stop_task)
+        stop_task.add_done_callback(_on_mailbox_stop_task_done)
 
     async def script_load_all(self) -> None:
         self._sha_admit = await self._redis.script_load(LUA_ADMIT)
@@ -386,8 +468,41 @@ class ExecutionSupervisor:
         notification_emitter=None,
     ) -> None:
         emit_bg_failed_watchdog = False
-        async with self._repo_context() as repo:
-            session = await repo.get_by_id(session_id)
+        session = None
+        # codex r11 [HIGH CONTRACT] — explicit commit so swallowed
+        # CancelledError on UoW commit cannot leave the registry stop
+        # firing on a non-durable terminal write. Mirrors the runner's
+        # explicit ``await _commit_uow_if_real(uow)`` pattern at
+        # agent_task_runner.py:3092. Falls back to the previous
+        # auto-commit path when the supervisor was constructed with a
+        # direct ``session_repository`` (test wiring) — that path lacks
+        # an explicit commit hook by design.
+        if self._uow_factory is not None:
+            async with self._uow_factory() as uow:
+                session = await uow.session.get_by_id(session_id)
+                if (
+                    session is not None
+                    and session.status
+                    not in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT)
+                    and session.execution_mode == "background"
+                    and session.execution_phase in ("running", "suspended")
+                ):
+                    transitioned = await uow.session.update_to_terminal(
+                        session_id,
+                        status,
+                        terminal_reason,
+                    )
+                    # Raise on commit failure so post-commit side-effects
+                    # below (lua_revoke / stop) only run on durable terminal.
+                    await _commit_uow_if_real(uow)
+                    emit_bg_failed_watchdog = (
+                        transitioned is not False
+                        and terminal_reason == "watchdog_timeout"
+                        and bool(getattr(session, "was_background", False))
+                        and getattr(session, "user_id", None) is not None
+                    )
+        elif self._repo is not None:
+            session = await self._repo.get_by_id(session_id)
             if (
                 session is not None
                 and session.status
@@ -395,7 +510,7 @@ class ExecutionSupervisor:
                 and session.execution_mode == "background"
                 and session.execution_phase in ("running", "suspended")
             ):
-                transitioned = await repo.update_to_terminal(
+                transitioned = await self._repo.update_to_terminal(
                     session_id,
                     status,
                     terminal_reason,
@@ -419,11 +534,28 @@ class ExecutionSupervisor:
                     session_id,
                     exc,
                 )
+        # C3 PR-3c (codex r6 [HIGH CONTRACT] + r10 [HIGH CONTRACT]) —
+        # non-runner terminal write (idle_watchdog timeout, admin cancel,
+        # retry-budget exhaustion). Order matters:
+        #   1. DB terminal write committed above.
+        #   2. ``_lua_revoke`` clears the Redis supervisor slot. MUST run
+        #      before the new stop seam below — codex r10 caught that
+        #      stop-then-revoke was a regression: an outer CancelledError
+        #      at the stop await would re-raise (helper deliberately
+        #      propagates cancel) and skip _lua_revoke, leaving a stale
+        #      Redis slot after the DB row was already terminal.
+        #   3. ``_maybe_stop_supervisor_for_session`` stops the per-pod
+        #      MailboxSupervisor task. Shielded internally; safe to put
+        #      last because if cancel hits here, the only thing skipped
+        #      is the supervisor task — the registry's `stop_all()` at
+        #      pod shutdown sweeps any leak, and the supervisor doesn't
+        #      do anything visible after the session is terminal anyway.
         await self._lua_revoke(
             session_id=session_id,
             user_id=user_id,
             reason=terminal_reason,
         )
+        await self._maybe_stop_supervisor_for_session(session_id)
 
     async def reconcile_running_background_at_boot(
         self,
@@ -432,49 +564,121 @@ class ExecutionSupervisor:
     ) -> dict[str, int]:
         finishing = 0
         suspended = 0
+        # codex r9 [HIGH CONTRACT] + r10 [HIGH CONTRACT] — per-row explicit
+        # commit so "added to finished_session_ids" durably implies
+        # "DB terminal write succeeded". The shared ``_repo_context`` /
+        # DBUnitOfWork swallows ``CancelledError`` during commit
+        # (db_uow.py:71) for SSE-disconnect ergonomics, which means
+        # "left the with-block" does NOT imply "commit durably succeeded".
+        # The runner faces the same constraint and solves it with explicit
+        # ``await _commit_uow_if_real(uow)`` inside its shielded terminal
+        # task (agent_task_runner.py:3092). We mirror that here: open a
+        # fresh UoW per FINISHING row, call ``commit()`` directly so
+        # commit failure surfaces as a raised exception, then add to the
+        # stop-list ONLY on observed success. Suspended rows still use the
+        # auto-commit ``_repo_context`` because they don't trigger a
+        # downstream registry side-effect — a swallowed commit just means
+        # the next pod restart retries the suspend.
+        rows: list = []
+        finished_session_ids: list[str] = []
         async with self._repo_context() as repo:
             rows = await repo.find_running_background()
-            for row in rows:
-                try:
-                    if row.status == SessionStatus.FINISHING:
-                        transitioned = await repo.update_to_terminal(
+
+        for row in rows:
+            try:
+                if row.status == SessionStatus.FINISHING:
+                    transitioned: bool | None = None
+                    if self._uow_factory is not None:
+                        # Production path: fresh UoW + explicit commit so
+                        # commit failure raises and skips the registry
+                        # stop side-effect for this row.
+                        async with self._uow_factory() as uow:
+                            transitioned = await uow.session.update_to_terminal(
+                                row.session_id,
+                                SessionStatus.TIMED_OUT,
+                                "server_restart",
+                            )
+                            await _commit_uow_if_real(uow)
+                    elif self._repo is not None:
+                        # Test path: direct repo without UoW. No explicit
+                        # commit available — fall back to the prior
+                        # behavior (acceptable because tests don't exercise
+                        # commit-cancel ergonomics).
+                        transitioned = await self._repo.update_to_terminal(
                             row.session_id,
                             SessionStatus.TIMED_OUT,
                             "server_restart",
                         )
+                    # codex r11 [HIGH CONTRACT] — commit succeeded above
+                    # (explicit raise on the prod path). Append to the
+                    # stop-list IMMEDIATELY so a subsequent best-effort
+                    # side-effect failure (lua_revoke / notification)
+                    # CANNOT cancel the supervisor stop and leak the slot.
+                    # The terminal DB write is durable; the registry MUST
+                    # see the stop.
+                    if transitioned is not False:
+                        finished_session_ids.append(row.session_id)
+                    # Best-effort Redis revoke — failure is isolated so
+                    # the supervisor stop still runs at the post-commit
+                    # phase below.
+                    try:
                         await self._lua_revoke(
                             session_id=row.session_id,
                             user_id=row.user_id,
                             reason="server_restart",
                         )
-                        if (
-                            transitioned is not False
-                            and notification_emitter is not None
-                        ):
+                    except Exception:
+                        logger.exception(
+                            "supervisor boot reconcile: _lua_revoke failed for %s "
+                            "— DB terminal already committed; supervisor stop "
+                            "will still fire from finished_session_ids",
+                            row.session_id,
+                        )
+                    if (
+                        transitioned is not False
+                        and notification_emitter is not None
+                    ):
+                        try:
                             await notification_emitter.emit(
                                 user_id=row.user_id,
                                 event_type="bg_terminal_server_restart",
                                 payload={"session_id": row.session_id},
                             )
-                        finishing += 1
-                    else:
+                        except Exception:
+                            logger.exception(
+                                "supervisor boot reconcile: notification emit "
+                                "failed for %s — supervisor stop will still fire",
+                                row.session_id,
+                            )
+                    finishing += 1
+                else:
+                    async with self._repo_context() as repo:
                         await repo.update_supervisor_fields(
                             row.session_id,
                             execution_phase="suspended",
                             suspended_reason="server_restart",
                         )
-                        if notification_emitter is not None:
-                            await notification_emitter.emit(
-                                user_id=row.user_id,
-                                event_type="bg_suspended_server_restart",
-                                payload={"session_id": row.session_id},
-                            )
-                        suspended += 1
-                except Exception:
-                    logger.exception(
-                        "supervisor boot reconcile failed for %s",
-                        row.session_id,
-                    )
+                    if notification_emitter is not None:
+                        await notification_emitter.emit(
+                            user_id=row.user_id,
+                            event_type="bg_suspended_server_restart",
+                            payload={"session_id": row.session_id},
+                        )
+                    suspended += 1
+            except Exception:
+                logger.exception(
+                    "supervisor boot reconcile failed for %s",
+                    row.session_id,
+                )
+        # C3 PR-3c (codex r6 + r9 + r10 [HIGH CONTRACT]) — post-commit
+        # phase. Only sessions whose explicit ``commit()`` above returned
+        # normally reach this loop; commit failure (including swallowed
+        # CancelledError on the legacy auto-commit path, now eliminated
+        # for FINISHING rows) skips ``finished_session_ids.append``, so
+        # stopping a supervisor here implies the session truly is
+        # terminal in DB.
+        for sid in finished_session_ids:
+            await self._maybe_stop_supervisor_for_session(sid)
         return {
             "finishing": finishing,
             "suspended": suspended,

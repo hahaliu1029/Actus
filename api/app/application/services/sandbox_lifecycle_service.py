@@ -29,6 +29,7 @@ from app.domain.errors.sandbox_lifecycle import (
     SessionUnboundError,
 )
 from app.domain.external.sandbox import Sandbox, SandboxHandle
+from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.models.event import SandboxStateChangedEvent
 from app.domain.models.session import (
     DestroyReason,
@@ -70,12 +71,21 @@ class SandboxLifecycleService:
         sandbox_cls: Type[Sandbox],
         uow_factory: Callable[[], IUnitOfWork],
         quiesce_timeout_seconds: float = 10.0,
+        supervisor_registry: Optional[SupervisorRegistryPort] = None,
     ) -> None:
         self._sandbox_cls = sandbox_cls
         self._uow_factory = uow_factory
         self._registry = SandboxRegistry()
         self._quiesce_timeout = quiesce_timeout_seconds
         self._per_session_locks: dict[str, asyncio.Lock] = {}
+        # C3 PR-3c: when injected, reconcile_orphans re-ensures a mailbox
+        # supervisor task exists per root that still has in-flight subagents
+        # on the mailbox plane. None keeps the legacy (pre-mailbox) behavior
+        # so existing tests / smaller integration harnesses don't need to
+        # pass a registry through.
+        self._supervisor_registry: Optional[SupervisorRegistryPort] = (
+            supervisor_registry
+        )
 
         # Single-worker runtime check (§8.6 layer 2)
         web_concurrency = os.environ.get("WEB_CONCURRENCY", "1")
@@ -726,6 +736,104 @@ class SandboxLifecycleService:
             len(destroying_sessions),
             len(creating_sessions),
         )
+
+        # C3 PR-3c (plan §11.3) — mailbox supervisor recovery after pod restart.
+        # When a pod dies, every per-pod ``MailboxSupervisor`` task dies with it.
+        # The mailbox stream's PEL still holds undelivered envelopes; we need a
+        # fresh supervisor on each affected root so the startup XAUTOCLAIM
+        # (PR-3b spec §5.6) can drain the orphans.
+        #
+        # Gated on ``supervisor_registry`` injection so legacy / pre-mailbox
+        # deployments and existing tests that didn't pass a registry stay
+        # untouched.
+        #
+        # Failure isolation rules:
+        # * DB query failure → log + bail out. There is NO in-process retry:
+        #   ``reconcile_orphans`` is called once at FastAPI lifespan startup
+        #   (``app/main.py`` step 9) and not again until the next pod boot.
+        #   The log message at the bail-out site spells this out so ops know
+        #   to restart instead of waiting for a non-existent retry cycle.
+        # * Per-root ``spawn`` failure → log + continue with the rest of the
+        #   list. ``health_check()`` ran ONCE before the loop so a transient
+        #   spawn failure is genuinely scoped to that one root.
+        # * ``health.get(root_id) in ("alive", "restarting", "crashed")``
+        #   short-circuits so (a) successful per-pod restart-loop ticks
+        #   that already brought the slot back don't get re-spawned and
+        #   (b) crashed slots are left to the restart loop's recovery
+        #   path (it owns crash recovery; ``spawn`` would no-op on the
+        #   already-registered slot anyway — see codex r1 [HIGH ARCH]).
+        if self._supervisor_registry is not None:
+            try:
+                async with self._uow_factory() as uow:
+                    running_root_ids = (
+                        await uow.session.find_running_mailbox_plane_root_ids()
+                    )
+            except Exception:
+                # codex r2 [HIGH CONTRACT] — be honest about the retry
+                # cadence. ``reconcile_orphans`` is wired into FastAPI
+                # lifespan startup (``app/main.py`` step 9) and is NOT
+                # called again until the next pod boot — there is no
+                # in-process retry cycle. If the mailbox-plane query
+                # fails here, this pod runs without supervisor recovery
+                # for the affected roots until either: (a) the operator
+                # manually triggers another reconcile via admin tooling
+                # (none ships in PR-3c — TODO PR-4+), or (b) the pod
+                # restarts. Surfacing this in the log so ops know to
+                # restart instead of waiting for an auto-recovery that
+                # never comes.
+                logger.exception(
+                    "reconcile_orphans: failed to query mailbox plane roots; "
+                    "this pod's mailbox supervisor recovery is now disabled "
+                    "until the next pod restart re-runs reconcile_orphans"
+                )
+                return
+
+            try:
+                health = await self._supervisor_registry.health_check()
+            except Exception:
+                logger.exception(
+                    "reconcile_orphans: supervisor_registry.health_check failed; "
+                    "treating all slots as missing and re-spawning"
+                )
+                health = {}
+
+            # codex r1 [HIGH ARCH] — skip "crashed" too: the per-pod
+            # ``_restart_loop`` (SupervisorRegistry §spec 6.2) owns crashed-slot
+            # recovery and will resurrect it within ``restart_interval_s``.
+            # ``spawn()`` is idempotent on existing slots (returns no-op when
+            # ``root in self._slots``), so calling it on a crashed slot was a
+            # no-op already — making the skip explicit avoids misleading
+            # "ensured mailbox supervisor" log lines for roots whose recovery
+            # is actually the restart loop's job.
+            #
+            # codex r1 [MEDIUM PERF] — parallelize per-root spawn. Serial await
+            # at 5s per-slot ``ready_timeout_s`` could blow startup latency at
+            # O(N) for N RUNNING mailbox-plane roots; ``asyncio.gather`` with
+            # ``return_exceptions=True`` keeps per-root failure isolation while
+            # collapsing wall-clock to ~5s regardless of N.
+            spawn_tasks = []
+            spawn_root_ids: list[str] = []
+            for root_id in running_root_ids:
+                state = health.get(root_id)
+                if state in ("alive", "restarting", "crashed"):
+                    continue
+                spawn_tasks.append(self._supervisor_registry.spawn(root_id))
+                spawn_root_ids.append(root_id)
+            if spawn_tasks:
+                results = await asyncio.gather(*spawn_tasks, return_exceptions=True)
+                for root_id, result in zip(spawn_root_ids, results):
+                    if isinstance(result, Exception):
+                        logger.exception(
+                            "reconcile_orphans: failed to spawn supervisor "
+                            "for root %s — continuing with remaining roots",
+                            root_id,
+                            exc_info=result,
+                        )
+                    else:
+                        logger.info(
+                            "reconcile_orphans: ensured mailbox supervisor for root %s",
+                            root_id,
+                        )
 
     # ── Internal helpers ──
 

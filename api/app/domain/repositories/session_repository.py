@@ -81,6 +81,35 @@ class SessionRepository(Protocol):
         """Return background sessions in running/recovering supervisor phases."""
         ...
 
+    async def find_running_mailbox_plane_root_ids(self) -> list[str]:
+        """C3 PR-3c: return DISTINCT root session ids whose mailbox-plane
+        subagents are still in flight.
+
+        Used by ``SandboxLifecycleService.reconcile_orphans`` (after a pod
+        restart) to re-spawn ``MailboxSupervisor`` tasks for roots that lost
+        their per-pod supervisor when the process died.
+
+        Selection criteria:
+          * ``worker_type = 'subagent'`` (only mailbox sub-sessions need
+            a supervisor; root-only sessions are out of scope).
+          * ``subagent_control_plane = 'mailbox'`` (legacy plane has no
+            mailbox supervisor).
+          * ``status NOT IN ('completed', 'timed_out')`` — every other
+            ``SessionStatus`` value (PENDING / RUNNING / TAKEOVER_PENDING /
+            TAKEOVER / WAITING / FINISHING) is non-terminal and still
+            needs a supervisor. codex r1 [HIGH CONTRACT] caught the
+            original RUNNING/PENDING/FINISHING-only IN-list dropping
+            WAITING+TAKEOVER* subagents (live but paused awaiting human).
+            The NOT-IN-terminal phrasing also forward-protects against
+            future non-terminal SessionStatus additions.
+
+        Returns DISTINCT ``parent_session_id`` values. C1a memory pins
+        ``parent_session_id`` as the sole lineage source; the C3 plan §6.5
+        audit foci confirm mailbox subagents spawn only at depth=1, so
+        ``parent_session_id`` IS the root id for these rows.
+        """
+        ...
+
     async def update_supervisor_fields(
         self,
         session_id: str,

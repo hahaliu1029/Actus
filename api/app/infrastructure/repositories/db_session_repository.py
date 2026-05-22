@@ -290,6 +290,51 @@ class DBSessionRepository(SessionRepository):
             for row in result.all()
         ]
 
+    async def find_running_mailbox_plane_root_ids(self) -> list[str]:
+        """C3 PR-3c: see :meth:`SessionRepository.find_running_mailbox_plane_root_ids`.
+
+        SELECT DISTINCT parent_session_id FROM sessions
+         WHERE worker_type = 'subagent'
+           AND subagent_control_plane = 'mailbox'
+           AND status NOT IN ('completed', 'timed_out')
+           AND parent_session_id IS NOT NULL.
+
+        **Why NOT-IN-terminal instead of IN-(RUNNING,PENDING,FINISHING)?**
+        codex r1 [HIGH CONTRACT] caught the original IN-list dropping
+        ``WAITING`` / ``TAKEOVER_PENDING`` / ``TAKEOVER`` — these are
+        non-terminal live states (subagent paused awaiting user action),
+        not failures. After a pod restart the supervisor for those roots
+        MUST be re-spawned so the mailbox plane resumes when the human
+        responds. ``NOT IN (terminal)`` is also forward-compatible: any
+        future non-terminal SessionStatus auto-flows through without a
+        repository edit. Terminal set is the closed pair
+        ``COMPLETED`` / ``TIMED_OUT`` (see ``domain/models/session.py``
+        SessionStatus enum — only these two are absorbing terminal states).
+
+        ``parent_session_id IS NOT NULL`` is defensive — the
+        ``ck_sessions_worker_type_parent_invariant`` CHECK constraint already
+        guarantees subagents have a non-null parent, but the explicit guard
+        makes the SQL self-documenting and survives accidental constraint
+        removal.
+        """
+        stmt = (
+            select(SessionModel.parent_session_id)
+            .where(SessionModel.worker_type == "subagent")
+            .where(SessionModel.subagent_control_plane == "mailbox")
+            .where(
+                SessionModel.status.notin_(
+                    (
+                        SessionStatus.COMPLETED.value,
+                        SessionStatus.TIMED_OUT.value,
+                    )
+                )
+            )
+            .where(SessionModel.parent_session_id.is_not(None))
+            .distinct()
+        )
+        result = await self.db_session.execute(stmt)
+        return [str(row.parent_session_id) for row in result.all()]
+
     async def update_supervisor_fields(
         self,
         session_id: str,

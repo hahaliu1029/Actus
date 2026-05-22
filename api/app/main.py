@@ -34,6 +34,34 @@ setup_logging()
 setup_observability()
 logger = logging.getLogger()
 
+
+# C3 PR-3c (codex r13 [HIGH CANCELLATION] fix) — GC anchor + observability
+# for the lifespan stale-FINISHING cleanup fire-and-forget supervisor stops.
+# Without this hard-reference set, asyncio could collect the task before
+# its done callback fires, swallowing any exception inside the stop body.
+# Mirrors ``_PENDING_MAILBOX_STOP_TASKS`` in agent_service.py /
+# execution_supervisor.py — same purpose, distinct namespace so the
+# lifespan-only batch is observable separately from per-request stops.
+_STALE_FINISHING_STOP_TASKS: set[asyncio.Task] = set()
+
+
+def _on_stale_finishing_stop_done(task: asyncio.Task) -> None:
+    _STALE_FINISHING_STOP_TASKS.discard(task)
+    if task.cancelled():
+        logger.warning(
+            "stale-FINISHING stop task %s was cancelled unexpectedly",
+            task.get_name(),
+        )
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "stale-FINISHING cleanup: supervisor stop task %s raised: %s",
+            task.get_name(),
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
 logger.info("应用程序启动中...")
 
 # 定义FastApi路由tags标签
@@ -233,11 +261,67 @@ async def lifespan(app: FastAPI):
         from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
         from app.infrastructure.storage.postgres import get_uow
         SandboxLifecycleService.check_single_worker_argv()
+
+        # C3 PR-3c — forward reference holder for the deferred lifecycle
+        # service. The supervisor factory closure needs the lifecycle
+        # service, but SandboxLifecycleService itself needs the supervisor
+        # registry to be injectable (see ``reconcile_orphans``). We break
+        # the cycle by giving the factory a tiny adapter that resolves
+        # lifecycle lazily through this dict, then filling the dict
+        # immediately after construct. The supervisor isn't consuming
+        # envelopes until PR-4 flips the flag-gated handlers, so the
+        # brief construct-then-fill sequence is safe.
+        _pending_lifecycle_ref: dict[str, object] = {}
+
+        class _DeferredLifecycle:
+            async def destroy(self, session_id: str, reason) -> None:
+                svc = _pending_lifecycle_ref.get("svc")
+                if svc is None:
+                    logger.warning(
+                        "mailbox supervisor destroy called before "
+                        "lifecycle service ready session=%s",
+                        session_id,
+                    )
+                    return
+                await svc.destroy(session_id, reason)
+
+        supervisor_registry = None
+        if settings.mailbox_supervisor_enabled:
+            # codex r1 [HIGH CONTRACT] — fail-closed when the operator
+            # explicitly enabled the mailbox plane and init breaks. Silently
+            # falling back to ``supervisor_registry=None`` was a fail-open
+            # contract violation: the deployment intended mailbox semantics,
+            # subagent_control_plane='mailbox' rows already exist in DB,
+            # publishers will XADD to streams that have no consumer → lost
+            # envelopes. Raising here surfaces the misconfiguration at the
+            # one place operators look (pod-start logs) instead of letting
+            # it hide as ``mailbox_supervisor_enabled=true`` + zero throughput.
+            from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+                RedisMailboxPublisher,
+            )
+            from app.interfaces.service_dependencies import (
+                build_supervisor_registry,
+            )
+
+            mailbox_publisher = RedisMailboxPublisher(redis_client.client)
+            supervisor_registry = build_supervisor_registry(
+                redis_client=redis_client,
+                publisher=mailbox_publisher,
+                sandbox_lifecycle_service=_DeferredLifecycle(),
+            )
+            logger.info(
+                "SupervisorRegistry 单例初始化完成 (mailbox_supervisor_enabled=true)"
+            )
+        app.state.supervisor_registry = supervisor_registry
+
         sandbox_lifecycle_service = SandboxLifecycleService(
             sandbox_cls=DockerSandbox,
             uow_factory=get_uow,
+            supervisor_registry=supervisor_registry,
         )
         app.state.sandbox_lifecycle_service = sandbox_lifecycle_service
+        # Fill the forward reference now that lifecycle service is live.
+        _pending_lifecycle_ref["svc"] = sandbox_lifecycle_service
         logger.info(
             "SandboxLifecycleService 单例初始化完成 "
             "(Actus sandbox lifecycle running in SINGLE-WORKER mode)"
@@ -257,6 +341,7 @@ async def lifespan(app: FastAPI):
             memory_embedding_provider=app.state.memory_embedding_provider,
             file_memory_store=getattr(app.state, "file_memory_store", None),
             sandbox_lifecycle_service=sandbox_lifecycle_service,
+            supervisor_registry=supervisor_registry,
         )
         logger.info("AgentService 单例初始化完成")
 
@@ -324,6 +409,34 @@ async def lifespan(app: FastAPI):
                         "postprocess_skipped_on_restart: cleaned %d stale FINISHING sessions",
                         len(session_ids),
                     )
+                # codex r7 [HIGH CONTRACT] — stale-FINISHING cleanup is a
+                # third non-runner terminal-write path (besides AgentService
+                # and ExecutionSupervisor). ``reconcile_orphans`` ran above
+                # at lifespan step 9 (line ~303) and may have spawned a
+                # MailboxSupervisor for any of these stale roots via the
+                # PR-3c §11.3 dual path; stop those slots NOW so the
+                # registry stays consistent with the freshly written
+                # terminal status. Best-effort — failure logged + swallowed
+                # because the cleanup outer try/except already catches.
+                # C3 PR-3c (codex r13 [HIGH CANCELLATION]) — fire-and-forget.
+                # Earlier rounds awaited each stop in this loop, but that
+                # creates the same cancellation/hang seam codex removed from
+                # AgentService and ExecutionSupervisor in r12: an outer
+                # CancelledError or a hung registry.stop() would skip the
+                # remaining stale-root stops. Spawn tasks that asyncio
+                # anchors via the supervisor's done callback chain — they
+                # complete in the background; ``SupervisorRegistry.stop_all``
+                # at lifespan shutdown sweeps any in-flight ones.
+                if session_ids and supervisor_registry is not None:
+                    for session_id in session_ids:
+                        stop_task = asyncio.create_task(
+                            supervisor_registry.stop(session_id),
+                            name=f"mailbox-stop-stale-finishing-{session_id}",
+                        )
+                        _STALE_FINISHING_STOP_TASKS.add(stop_task)
+                        stop_task.add_done_callback(
+                            _on_stale_finishing_stop_done
+                        )
         except Exception as e:
             logger.warning("Failed to clean stale FINISHING sessions: %s", e)
 
@@ -379,6 +492,23 @@ async def lifespan(app: FastAPI):
             logger.warning("Agent服务关闭超时, 强制关闭, 部分任务将被释放")
         except Exception as e:
             logger.error(f"Agent服务关闭期间出现错误: {str(e)}")
+
+        # C3 PR-3c — stop the per-pod MailboxSupervisor registry BEFORE the
+        # lifecycle service closes. Order: AgentService.shutdown drains
+        # in-flight runners (above) → registry.stop_all cancels supervisor
+        # tasks waiting on XREADGROUP / running destroy() side-effects →
+        # SandboxLifecycleService.shutdown (below) tears down sandbox infra.
+        # ``stop_all`` is best-effort: it logs + swallows per-slot cancel
+        # failures so one stuck supervisor doesn't block teardown.
+        sup_registry = getattr(app.state, "supervisor_registry", None)
+        if sup_registry is not None:
+            try:
+                await asyncio.wait_for(sup_registry.stop_all(), timeout=10.0)
+                logger.info("SupervisorRegistry 关闭成功")
+            except asyncio.TimeoutError:
+                logger.warning("SupervisorRegistry 关闭超时")
+            except Exception as e:
+                logger.warning(f"SupervisorRegistry 关闭时出错: {e}")
 
         # 关闭 SandboxLifecycleService（在 AgentService 之后——agent 可能持有 handle）
         lifecycle_svc = getattr(app.state, "sandbox_lifecycle_service", None)

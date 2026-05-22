@@ -26,6 +26,7 @@ from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox, SandboxHandle
 from app.domain.external.search import SearchEngine
+from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.external.task import Task, TaskRunner
 from app.domain.models.app_config import (
     A2AConfig,
@@ -278,6 +279,8 @@ class AgentTaskRunner(TaskRunner):
         permission_engine: Any = None,  # PE-0 Phase 7: PermissionEngine | None
         session_state_machine: Any = None,  # PE-0 Phase 7: SessionStateMachine | None
         tool_filter: Optional[FrozenSet[str]] = None,  # Phase 1 minimal subagent: tool-name allowlist (None = no filter)
+        supervisor_registry: Optional[SupervisorRegistryPort] = None,  # C3 PR-3c: per-pod MailboxSupervisor registry (None when mailbox plane disabled)
+        mailbox_supervisor_enabled: bool = False,  # C3 PR-3c: deployment-time flag mirror (false unless wired by application layer)
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -287,6 +290,19 @@ class AgentTaskRunner(TaskRunner):
         # legacy behavior"). See _build_lc_tools_full /
         # _build_available_tool_summary for application.
         self._tool_filter: Optional[FrozenSet[str]] = tool_filter
+        # C3 PR-3c — lifecycle hooks to spawn/stop the per-pod MailboxSupervisor
+        # for THIS session iff this runner is for a root session AND the
+        # deployment flag is enabled. Both default to None / False so existing
+        # tests (and pre-mailbox-plane deployments) skip the supervisor calls
+        # entirely. ``_is_root_session()`` is computed lazily because we don't
+        # have the Session model loaded at construction — only ``_session_id``.
+        # The lazy check reads ``self._session.worker_type`` once and caches.
+        self._supervisor_registry: Optional[SupervisorRegistryPort] = (
+            supervisor_registry
+        )
+        self._mailbox_supervisor_enabled: bool = mailbox_supervisor_enabled
+        self._cached_is_root_session: Optional[bool] = None
+        self._supervisor_spawned: bool = False  # set after first successful spawn (informational only — spawn is idempotent)
         # A7 Task 2.7: provider capability profile. None = legacy behavior
         # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
         self.profile = profile
@@ -3084,6 +3100,22 @@ class AgentTaskRunner(TaskRunner):
                         "on_session_complete callback failed for session %s",
                         self._session_id,
                     )
+
+            # codex r3 [HIGH ARCH] — supervisor stop INSIDE the shielded
+            # terminal task body so:
+            #   1. Outer ``CancelledError`` between ``_set_terminal_status``
+            #      and a separate post-step (the prior R2 placement) cannot
+            #      leak the supervisor task.
+            #   2. ``AgentService.stop_session()`` pre-writing terminal
+            #      doesn't matter — the runner's terminal path still
+            #      flows through this _terminal_op, and the stop call
+            #      runs unconditionally regardless of ``transitioned``
+            #      (it's idempotent on already-stopped slots).
+            # Best-effort: the helper's broad-except wrapper ensures a
+            # supervisor stop failure can't fail the terminal write that
+            # already committed above.
+            await self._maybe_stop_mailbox_supervisor()
+
             return transitioned is not False
 
         # Create a NAMED task and register it so a) the asyncio debugger
@@ -3112,6 +3144,14 @@ class AgentTaskRunner(TaskRunner):
         status: SessionStatus,
         terminal_reason: str | None = None,
     ) -> None:
+        # C3 PR-3c (codex r3 fix) — supervisor stop now lives INSIDE
+        # ``_set_terminal_status._terminal_op``, sharing the same
+        # ``asyncio.shield`` envelope as the DB terminal write + drain
+        # + on_complete callback. That guarantees the stop fires even
+        # when an outer ``CancelledError`` arrives at the shield-await
+        # boundary (e.g. SSE disconnect mid-terminal). The wrapper here
+        # is just responsible for the bg notification after a
+        # successful (transitioned=True) terminal entry.
         transitioned = await self._set_terminal_status(status, terminal_reason)
         if transitioned is False:
             return
@@ -3280,6 +3320,101 @@ class AgentTaskRunner(TaskRunner):
         self._last_skill_risk_fp = ()
         self._last_initialized_skills = []
 
+    async def _is_root_session(self) -> bool:
+        """C3 PR-3c: lazy-cached check whether this runner drives a root session.
+
+        Only root sessions get a per-pod ``MailboxSupervisor``; subagent
+        runners are driven by the parent's supervisor. We don't carry a
+        ``Session`` snapshot at construction so we read once via a fresh UoW
+        and cache the result.
+
+        On lookup failure we return ``False`` (skip supervisor wiring) — the
+        supervisor is best-effort plumbing, not a precondition for the agent
+        loop. ``reconcile_orphans`` will pick up any missed root on the next
+        pod-start.
+
+        ``getattr`` is used for ``_cached_is_root_session`` because some
+        unit tests construct runners via ``AgentTaskRunner.__new__`` (to
+        avoid the 20-arg ctor) and inject only the attrs each test path
+        needs; matches the same defensive pattern used elsewhere in this
+        file (e.g. ``_idle_watchdog``, ``_event_seq_client``).
+        """
+        cached = getattr(self, "_cached_is_root_session", None)
+        if cached is not None:
+            return cached
+        try:
+            async with self._uow_factory() as uow:
+                session = await uow.session.get_by_id(self._session_id)
+        except Exception:
+            logger.warning(
+                "_is_root_session lookup failed session=%s — assuming non-root "
+                "(skip mailbox supervisor wiring)",
+                self._session_id,
+                exc_info=True,
+            )
+            self._cached_is_root_session = False
+            return False
+        if session is None:
+            self._cached_is_root_session = False
+            return False
+        is_root = getattr(session, "worker_type", "root") == "root"
+        self._cached_is_root_session = is_root
+        return is_root
+
+    async def _maybe_spawn_mailbox_supervisor(self) -> None:
+        """C3 PR-3c spawn hook (idempotent).
+
+        Best-effort: ``spawn`` failure MUST NOT block the agent loop —
+        ``SupervisorRegistry.spawn`` is per-pod plumbing for subagent
+        envelope dispatch; the root agent itself runs without it. Pod
+        restart's ``reconcile_orphans`` will retry.
+
+        ``getattr`` defends against ``__new__``-bypass test runners that
+        don't set the PR-3c attrs — the hook becomes a no-op in that
+        case, matching ``_idle_watchdog`` / ``_event_seq_client``
+        defensiveness on the same class.
+        """
+        registry = getattr(self, "_supervisor_registry", None)
+        flag = getattr(self, "_mailbox_supervisor_enabled", False)
+        if registry is None or not flag:
+            return
+        if not await self._is_root_session():
+            return
+        try:
+            await registry.spawn(self._session_id)
+            self._supervisor_spawned = True
+        except Exception:
+            logger.exception(
+                "mailbox supervisor spawn failed for root session %s — "
+                "agent will run without subagent envelope dispatch; "
+                "reconcile_orphans will retry on next pod start",
+                self._session_id,
+            )
+
+    async def _maybe_stop_mailbox_supervisor(self) -> None:
+        """C3 PR-3c stop hook (idempotent).
+
+        Called from terminal-status paths. Failure is logged + swallowed —
+        the per-pod restart loop / next pod-start reconcile will reap a
+        stuck supervisor task.
+
+        ``getattr`` defends against ``__new__``-bypass test runners
+        (see ``_maybe_spawn_mailbox_supervisor`` for the rationale).
+        """
+        registry = getattr(self, "_supervisor_registry", None)
+        if registry is None:
+            return
+        if not await self._is_root_session():
+            return
+        try:
+            await registry.stop(self._session_id)
+        except Exception:
+            logger.exception(
+                "mailbox supervisor stop failed for root session %s — "
+                "task will be reaped by restart loop / next reconcile",
+                self._session_id,
+            )
+
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
         try:
@@ -3288,6 +3423,12 @@ class AgentTaskRunner(TaskRunner):
                 await self._uow.session.update_status(
                     self._session_id, SessionStatus.RUNNING
                 )
+
+            # C3 PR-3c — spawn the per-pod MailboxSupervisor right after the
+            # status transition so subagent envelopes that arrive in the
+            # earliest part of the loop have a consumer. Best-effort: failure
+            # is logged inside the helper, never raised.
+            await self._maybe_spawn_mailbox_supervisor()
 
             # 2.确保沙箱、mcp、a2a均初始化完成
             logger.info(f"AgentTaskRunner任务处理开始")
