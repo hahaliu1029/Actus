@@ -15,6 +15,7 @@ from ``domain/`` — only the orchestration is application-layer.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import time
@@ -24,8 +25,16 @@ from typing import Awaitable, Callable, Optional, Protocol
 
 from redis.asyncio import Redis
 
+from app.domain.errors.sandbox_lifecycle import (
+    SandboxAlreadyDestroyed,
+    SandboxBindingMissing,
+    SandboxLifecycleError,
+)
 from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.models.mailbox_envelope import (
+    APPROVAL_REQUEST_TIMEOUT_DEFAULT_SECONDS,
+    CANCEL_AUTO_ESCALATE_TO_TERMINATE,
+    CHILD_CANCEL_ACK_TIMEOUT_MS,
     CHILD_TO_PARENT_TYPES,
     MAILBOX_PEL_IDLE_MS_FOR_CLAIM,
     MAILBOX_POISON_MAX_RECLAIM,
@@ -33,11 +42,17 @@ from app.domain.models.mailbox_envelope import (
     MAILBOX_XAUTOCLAIM_PERIODIC_INTERVAL_SECONDS,
     MAILBOX_XREADGROUP_BLOCK_MS,
     MAILBOX_XREADGROUP_COUNT,
+    SUBAGENT_PROGRESS_STALE_AFTER_SECONDS,
+    ApprovalDecidedBy,
+    ApprovalResponsePayload,
+    CancelAckPayload,
     CancelPolicy,
+    CancelRequestPayload,
     MailboxEnvelope,
     MailboxEnvelopeType,
     ProducerRole,
 )
+from app.domain.models.session import DestroyReason
 from app.domain.repositories.mailbox_envelope_audit_repository import (
     MailboxEnvelopeAuditRepository,
 )
@@ -45,8 +60,58 @@ from app.infrastructure.external.mailbox.redis_mailbox_consumer import (
     RedisMailboxConsumer,
 )
 
+# Re-export for tests that monkeypatch via the supervisor module path
+# (e.g. ``monkeypatch.setattr(ms, "CANCEL_AUTO_ESCALATE_TO_TERMINATE", False)``).
+__all__ = [
+    "APPROVAL_REQUEST_TIMEOUT_DEFAULT_SECONDS",
+    "ApprovalRequestHandler",
+    "CANCEL_AUTO_ESCALATE_TO_TERMINATE",
+    "CancelAckHandler",
+    "CancelRequestHandler",
+    "HandlerOutcome",
+    "HandoffRequestHandler",
+    "MailboxSupervisor",
+    "ResultReadyHandler",
+    "SupervisorContext",
+    "build_default_dispatch_table",
+]
+
 
 logger = logging.getLogger(__name__)
+
+
+# C3 PR-4 — audit table caps ``envelope_id`` at ``String(64)``
+# (``infrastructure/models/mailbox_envelope_audit.py:47``). Every supervisor-
+# synthesised envelope_id (synthetic CANCEL_ACK echo, APPROVAL_RESPONSE deny,
+# cascade re-publishes) MUST stay inside this bound. Helper hashes the
+# composition key so the result is stable for repeated inputs (e.g.
+# redelivery of the same incoming envelope produces the same synthetic id —
+# the audit-repo's UNIQUE constraint catches dedup naturally).
+#
+# Format: ``{tag}:{sha256(key)[:32]}`` — 32-hex digest + tag + colon.
+# - ``tag="ack"`` → 36 chars; ``tag="deny"`` → 37 chars; both ≤ 64.
+# - sha256 truncated to 128 bits is collision-resistant for the supervisor's
+#   single-instance synthetic-envelope workload (millions of envelopes is
+#   safely below the birthday bound).
+#
+# codex r3 [R3-7, HIGH CONTRACT] — the previous format
+# ``{envelope.envelope_id}:ack`` could overflow 64 when the incoming
+# envelope_id was at or near the limit (e.g. a future producer using the
+# full ULID + suffix).
+_SYNTHETIC_DIGEST_BYTES: int = 32
+
+
+def _synthetic_envelope_id(tag: str, key: str) -> str:
+    """Compose a stable, length-bounded envelope_id for synthetic envelopes.
+
+    ``tag`` is a short human-readable prefix (``"ack"``, ``"deny"``).
+    ``key`` is the composition input (typically the originating envelope_id
+    plus any disambiguator); the function hashes it so the result fits
+    inside the audit table's ``envelope_id`` ``String(64)`` column even when
+    the upstream envelope_id is at the 64-char limit.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:_SYNTHETIC_DIGEST_BYTES]
+    return f"{tag}:{digest}"
 
 
 class _SandboxLifecycleProtocol(Protocol):
@@ -57,14 +122,36 @@ class _TelemetryProtocol(Protocol):
     async def emit(self, name: str, data: dict) -> None: ...
 
 
+class _CascadeFailedError(Exception):
+    """codex r7 [R7-7, HIGH CONTRACT] — raised by
+    ``_emit_cascade_terminate`` when the XADD publish failed *and* the
+    direct-kill fallback also failed with a retryable
+    ``SandboxLifecycleError``. Callers (orphan tick / cancel
+    auto-escalate / poison drop) catch this to skip per-child tracking
+    cleanup so a subsequent supervisor tick retries the cascade.
+
+    Non-retryable terminal cases (``SandboxAlreadyDestroyed``,
+    ``SandboxBindingMissing``) do NOT raise this — the child is already
+    gone from the lifecycle service's POV, so retrying would burn
+    cycles with no chance of success. They are "success-equivalent"
+    from a cascade POV and let the caller proceed to clear tracking.
+    """
+
+
 @dataclass
 class SupervisorContext:
     """Handler injection bag — supervisor passes this to every handler.
 
-    Handlers MUST treat ``ctx`` as read-only — there is no per-call ``ctx``
-    cloning. State that must be observed across handler invocations belongs
-    on ``audit_repo`` (durable) or on the per-supervisor instance via a
-    dedicated dependency, NOT mutated on ``ctx``.
+    Handlers MUST treat ``ctx`` as read-only **at handler invocation time** —
+    there is no per-call ``ctx`` cloning. State that must be observed across
+    handler invocations belongs on ``audit_repo`` (durable) or on the
+    per-supervisor instance via a dedicated dependency.
+
+    One narrow exception (PR-4): ``register_cancel_state`` is a hook bound
+    once by :meth:`MailboxSupervisor.__init__` so the ``CancelRequestHandler``
+    can stash REQUEST_CANCEL cascade state for the auto-escalate tick to
+    promote later (spec §8). The supervisor mutates ``ctx`` *exactly once*
+    at construction; handlers only *call* the hook.
     """
 
     root_session_id: str
@@ -77,6 +164,53 @@ class SupervisorContext:
     agent_service_callback: Callable[[MailboxEnvelope], Awaitable[None]]
     telemetry: _TelemetryProtocol
     clock: Callable[[], float] = time.monotonic
+    register_cancel_state: Optional[
+        Callable[[str, CancelPolicy, float], Awaitable[None]]
+    ] = None
+    # Codex F7+F9 (HIGH) — synchronous hook so terminal handlers can drop
+    # ``_cancel_states[child]`` + ``_last_seen_mono[child]`` after a child
+    # is destroyed. Without this cleanup the auto-escalate tick and orphan
+    # detector fire spurious CANCEL_REQUEST(TERMINATE) cascades for an
+    # already-dead child. Bound once in
+    # :meth:`MailboxSupervisor.__init__` (same pattern as
+    # ``register_cancel_state``).
+    clear_child_tracking: Optional[Callable[[str], None]] = None
+    # codex r6 [R6-2, HIGH CONTRACT] — supervisor-private side-table for
+    # threading an explicit ``DestroyReason`` from orphan/poison cascades
+    # to ``CancelRequestHandler._terminate_outcome``. Keyed by the
+    # synthetic envelope_id of the cascade-emitted CANCEL_REQUEST; the
+    # publisher populates the entry BEFORE ``publisher.publish`` so the
+    # handler can read on dispatch. Replaces the previous
+    # ``CancelRequestPayload.destroy_reason`` wire field (R2-6/R3-6),
+    # which broke the frozen schema and required a producer_role guard
+    # to defuse hostile overrides. The dict is shared by reference
+    # between the supervisor and its context so the handler reads from
+    # the same backing store the publisher writes to.
+    #
+    # codex r7 [R7-4, HIGH CONTRACT] — pop happens AFTER side_effect's
+    # destroy + publish_ack succeed (not before). On PEL retry the
+    # override is still present and the same ``DestroyReason`` is
+    # re-applied. See ``CancelRequestHandler._terminate_outcome``.
+    #
+    # codex r7 [R7-5, HIGH CONTRACT — DOCUMENTED DRIFT] — this is an
+    # in-process Python dict; it does NOT survive supervisor restart.
+    # If the supervisor crashes between publishing the synthetic
+    # CANCEL_REQUEST and the handler consuming it, the restarting
+    # supervisor reads the durable envelope from Redis but its empty
+    # side-table → the handler falls back to ``DestroyReason
+    # .FORCE_TERMINATE`` instead of the original ``ORPHAN_TIMEOUT``
+    # (or any other override). This is an **accepted degradation**:
+    # ``ORPHAN_TIMEOUT`` vs ``FORCE_TERMINATE`` is a *reason annotation*
+    # — both result in the same kill action against the sandbox. The
+    # destroy still fires (the cascade envelope is durable in the
+    # stream); only the audit reason field is approximate post-restart.
+    # The alternative (encoding the override into the envelope_id /
+    # adding a producer_role variant) re-introduces a wire-format
+    # channel that the spec freeze explicitly forbids and that earlier
+    # rounds (R6-2) intentionally removed. Test coverage for the
+    # fallback path lives at
+    # ``test_mailbox_supervisor.py::test_cascade_override_lost_after_supervisor_restart_falls_back_to_force_terminate``.
+    cascade_destroy_overrides: dict = field(default_factory=dict)
 
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -131,7 +265,7 @@ class _CancelState:
     requested_at_mono: float
 
 
-# ─── PR-3a stub handlers (PR-4 replaces with real destroy hooks) ──────────────
+# ─── PR-3a non-terminal stub (PR-4 keeps this for SPAWN/PROGRESS/etc.) ────────
 
 
 class _StubNonTerminalHandler:
@@ -146,25 +280,992 @@ class _StubNonTerminalHandler:
         return HandlerOutcome(ack=True, audit_payload={"stub": True})
 
 
-class _StubTerminalHandler:
-    """PR-3a placeholder for terminal envelopes (RESULT_READY, CANCEL_ACK).
+# ─── PR-4 terminal + cascade handlers (spec §7.3-§7.6 + §10.2 + §6.6) ─────────
 
-    Emits telemetry and ACKs. PR-4 will swap for
-    ResultReadyHandler/CancelAckHandler that actually call destroy().
+
+class ResultReadyHandler:
+    """Spec §7.3 — terminal envelope → destroy with full failure classification.
+
+    Side-effect-first ordering (spec §5.8 hard rule):
+
+    1. ``get_processed`` precheck → already processed? return ack=True
+       without side_effect (idempotency).
+    2. ``upsert_processing`` stages the audit row (belt-and-suspenders;
+       supervisor's outer ``_handle_envelope`` also upserts).
+    3. ``side_effect`` runs destroy() → on success: agent_service_callback
+       (ChildDoneEvent fanout) → mark_processed.
+
+    Destroy outcome classification:
+      - clean return                  → callback + mark_processed (ACK)
+      - ``SandboxAlreadyDestroyed``    → terminal-success (idempotent no-op)
+      - ``SandboxBindingMissing``      → terminal-success (nothing to destroy)
+      - ``SandboxLifecycleError`` else → raise (no ACK, XAUTOCLAIM retry)
+
+    codex r5 [R5-2, MEDIUM PERF] handler invariant — every terminal handler
+    MUST verify its own audit state (``get_processed`` + ``upsert_processing``)
+    even though the outer ``_handle_envelope`` already pre-staged both calls
+    (see ``MailboxSupervisor._handle_envelope`` lines ~1396 and ~1493). This
+    is deliberate belt-and-suspenders, NOT redundant work that should be
+    deleted:
+      * Handlers are invoked directly in unit tests (47 callsites in
+        ``test_mailbox_supervisor.py``) that do NOT pre-call
+        ``upsert_processing``; without the in-handler check the
+        ``mark_processed`` calls inside the handler would raise on the
+        DB-faithful ``_StrictAuditRepo`` stub.
+      * Future code paths (e.g. PR-5 ``reconcile_orphans`` synthetic
+        re-dispatch) may invoke the handler outside the standard
+        ``_handle_envelope`` funnel — the duplicate guard keeps each handler
+        self-contained.
+    Cost: 2 extra DB roundtrips per terminal envelope (one ``get_processed``
+    + one ``upsert_processing``); both are short, indexed reads on the
+    audit table. The supervisor's terminal-envelope rate is bounded by
+    child completion (not high frequency), so the cost is acceptable in
+    exchange for the contract simplicity.
     """
 
     async def handle(
         self, envelope: MailboxEnvelope, ctx: SupervisorContext
     ) -> HandlerOutcome:
-        await ctx.telemetry.emit(
-            "mailbox.terminal_envelope_dispatched_stub",
-            {
-                "envelope_id": envelope.envelope_id,
-                "type": envelope.type.value,
-                "child_session_id": envelope.child_session_id,
+        # R5-2 belt-and-suspenders — see class docstring. The outer
+        # ``_handle_envelope`` already ran ``get_processed`` at the entry
+        # gate (line ~1396) and ``upsert_processing`` before dispatch (line
+        # ~1493). Repeating both here keeps the handler usable outside the
+        # supervisor's main loop (unit tests, future synthetic dispatchers).
+        if await ctx.audit_repo.get_processed(
+            envelope.parent_session_id, envelope.envelope_id
+        ):
+            return HandlerOutcome(ack=True, audit_payload={"dedup": True})
+
+        await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
+
+        async def _side_effect() -> None:
+            # Codex F5 (HIGH) — every ``telemetry.emit`` inside this block
+            # is wrapped so an OTel / sink fault never escapes the
+            # side_effect. A raised emit would propagate up to
+            # ``_handle_envelope``, prevent the ACK, and XAUTOCLAIM would
+            # redeliver. Once destroyed, redelivery hits AlreadyDestroyed
+            # (terminal-success) → emit raises again → infinite loop until
+            # poison drop. **Fail-open via the observability path.**
+            try:
+                await ctx.sandbox_lifecycle.destroy(
+                    envelope.child_session_id,
+                    DestroyReason.SUBAGENT_TERMINAL_RESULT,
+                )
+            except SandboxAlreadyDestroyed:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.destroy_idempotent_noop",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "destroy_idempotent_noop telemetry raised envelope=%s "
+                        "— terminal-success path continues",
+                        envelope.envelope_id,
+                    )
+            except SandboxBindingMissing:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.destroy_binding_missing",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "destroy_binding_missing telemetry raised envelope=%s "
+                        "— terminal-success path continues",
+                        envelope.envelope_id,
+                    )
+            except SandboxLifecycleError as e:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.destroy_retryable_failed",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                            "error": str(e),
+                            "reclaim_count": envelope.reclaim_count,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "destroy_retryable_failed telemetry raised envelope=%s "
+                        "— re-raising SandboxLifecycleError to preserve PEL-"
+                        "retain semantics",
+                        envelope.envelope_id,
+                    )
+                # No mark_processed; supervisor sees the raise → no ACK →
+                # XAUTOCLAIM retries; reclaim_count > MAX → poison drop.
+                raise
+
+            # Codex r4 [R4-4, MEDIUM CONTRACT] — clear per-child tracking
+            # BEFORE the agent_service_callback. The previous ordering
+            # placed ``clear_child_tracking`` after the callback so a
+            # callback failure (agent_service down, SSE bridge raises,
+            # ...) caused the in-memory tracking state to leak: the
+            # destroyed child stayed in ``_last_seen_mono`` and
+            # ``_cancel_states`` and the auto-escalate / orphan ticks
+            # would fire spurious cascades against it.
+            #
+            # The child IS destroyed at this point; tracking should be
+            # cleared regardless of whether the downstream notification
+            # (callback fires SSE events to the frontend) succeeds. The
+            # callback's job is to surface the terminal event to
+            # observers — orthogonal to cleanup invariants.
+            if ctx.clear_child_tracking is not None:
+                ctx.clear_child_tracking(envelope.child_session_id)
+
+            # Wrap the callback so its failure doesn't abort the rest
+            # of the side_effect (mark_processed below). The callback
+            # is a notification hook; a downstream observer fault must
+            # not corrupt the supervisor's own state-machine progress.
+            try:
+                await ctx.agent_service_callback(envelope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — best-effort hook
+                logger.exception(
+                    "result_ready agent_service_callback raised envelope=%s "
+                    "— continuing to mark_processed; child tracking already "
+                    "cleared (R4-4)",
+                    envelope.envelope_id,
+                )
+
+            # Codex F6 (HIGH) — mark_processed here is belt-and-suspenders;
+            # the outer ``_handle_envelope`` runs an idempotent mark_processed
+            # post-side_effect. Wrap in try/except so a DB hiccup doesn't
+            # cause the side_effect to raise → no ACK → XAUTOCLAIM redelivers
+            # → destroy is now AlreadyDestroyed (terminal-success) → re-fire
+            # callback + spurious work on every retry. The outer
+            # mark_processed at line ~1109 is the load-bearing dedup write.
+            try:
+                await ctx.audit_repo.mark_processed(
+                    envelope.parent_session_id,
+                    envelope.envelope_id,
+                    processed_at=ctx.now(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "result_ready inner mark_processed failed envelope=%s "
+                    "— outer _handle_envelope will retry post-side_effect",
+                    envelope.envelope_id,
+                )
+
+        return HandlerOutcome(
+            ack=False,
+            side_effect=_side_effect,
+            audit_payload={"terminal": "RESULT_READY"},
+        )
+
+
+class CancelAckHandler:
+    """Spec §7.4 — mirror of ResultReady with destroy reason CANCEL_ACK_OBSERVED.
+
+    Triggered when the child cooperatively confirmed cancellation (its CANCEL_ACK
+    envelope arrived). Same 4-way destroy classification + side-effect-first
+    ordering as ResultReady; only the ``DestroyReason`` differs.
+
+    codex r9b [R9b-2, HIGH CONTRACT] — supervisor-echo trust contract:
+    the handler short-circuits on ``producer_role=SUPERVISOR_ECHO``
+    without verifying the envelope's origin, by design. The contract is
+    a deliberate extension of the cross-root publisher trust (codex r3
+    [R3-1] — see ``MailboxSupervisor._handle_envelope`` for the parallel
+    rationale and the deferred PR-5/PR-6 acceptance-gate TODO):
+
+      Publisher contract — ``ProducerRole.SUPERVISOR_ECHO`` is reserved
+      for the supervisor's own re-published CANCEL_ACK envelope after a
+      TERMINATE cascade. No other publisher (child agent, sibling
+      supervisor, ops tool, external publisher) is permitted to set
+      this producer_role. The supervisor trusts the wire field rather
+      than verifying the envelope's origin because cross-root +
+      ancestor-chain verification would require session-repo plumbing
+      into ``SupervisorContext`` (same plumbing budget called out in
+      R3-1) for a defence-in-depth check that the publisher contract is
+      supposed to make redundant.
+
+    A forged ``CHILD_AGENT``-published CANCEL_ACK with
+    ``producer_role=SUPERVISOR_ECHO`` would short-circuit destroy +
+    callback. The cross-root guard (parent_session_id check) catches
+    misrouted envelopes from other supervisor scopes; within one root,
+    we trust the publishers participating in that root's mailbox. The
+    SUPERVISOR_ECHO short-circuit is load-bearing for the FORCE_TERMINATE
+    flow: without it, every cascade's synthetic CANCEL_ACK re-fires
+    destroy → wasted lifecycle work + duplicate telemetry on every
+    cascade (the R2-4 regression this guard fixed).
+
+    Locked behaviour:
+    ``tests/domain/services/test_mailbox_supervisor.py::TestCancelAckHandlerEchoTrust::test_supervisor_echo_short_circuit_is_trust_based``
+    asserts the desired behaviour under the trust contract (an envelope
+    presenting as SUPERVISOR_ECHO is honoured regardless of the rest of
+    the wire shape).
+    """
+
+    async def handle(
+        self, envelope: MailboxEnvelope, ctx: SupervisorContext
+    ) -> HandlerOutcome:
+        # R5-2 belt-and-suspenders — see ResultReadyHandler.__doc__. The
+        # outer ``_handle_envelope`` already ran the duplicate audit calls,
+        # but each handler must verify its own state to remain usable in
+        # direct unit-test / synthetic-dispatch contexts.
+        if await ctx.audit_repo.get_processed(
+            envelope.parent_session_id, envelope.envelope_id
+        ):
+            return HandlerOutcome(ack=True, audit_payload={"dedup": True})
+
+        # Codex r2 [R2-4, HIGH CONTRACT] — supervisor-echo short-circuit.
+        # CancelRequestHandler._terminate_outcome publishes a synthetic
+        # ``producer_role=SUPERVISOR_ECHO`` CANCEL_ACK so external observers
+        # (frontend SSE bridge, parent audit trail) see the terminal
+        # transition (spec §9.2). The same supervisor reads that envelope
+        # back via XREADGROUP and re-dispatches here. Without this guard
+        # every FORCE_TERMINATE produces a second destroy attempt that
+        # raises ``SandboxAlreadyDestroyed`` (idempotent terminal-success)
+        # → wasted lifecycle work + duplicate telemetry on every cascade.
+        # The echo carries a synthetic envelope_id (``ack:{sha256...}``
+        # after R3-7) but ``producer_role`` is the load-bearing
+        # discriminator — NOT the envelope_id prefix. Mark
+        # processed + ACK so the audit trail records the supervisor's own
+        # echo without re-firing destroy / agent_service_callback.
+        if envelope.producer_role == ProducerRole.SUPERVISOR_ECHO:
+            await ctx.audit_repo.upsert_processing(
+                envelope, processing_at=ctx.now()
+            )
+            # ack=True + no side_effect — _handle_envelope writes
+            # mark_processed on the ack-only path (codex r1 F8 fix in the
+            # supervisor's outer loop). No destroy. No callback.
+            return HandlerOutcome(
+                ack=True,
+                audit_payload={"supervisor_echo": True},
+            )
+
+        await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
+
+        async def _side_effect() -> None:
+            # Codex F5 (HIGH) — telemetry.emit isolation; see
+            # ResultReadyHandler for the full rationale. Without these
+            # wrappers, a sink fault on the AlreadyDestroyed branch
+            # propagates → no ACK → XAUTOCLAIM redelivers → destroy
+            # AlreadyDestroyed → loops on the observability path.
+            try:
+                await ctx.sandbox_lifecycle.destroy(
+                    envelope.child_session_id,
+                    DestroyReason.CANCEL_ACK_OBSERVED,
+                )
+            except SandboxAlreadyDestroyed:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.cancel_ack_destroy_idempotent",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "cancel_ack_destroy_idempotent telemetry raised "
+                        "envelope=%s — terminal-success path continues",
+                        envelope.envelope_id,
+                    )
+            except SandboxBindingMissing:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.cancel_ack_binding_missing",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "cancel_ack_binding_missing telemetry raised "
+                        "envelope=%s — terminal-success path continues",
+                        envelope.envelope_id,
+                    )
+            except SandboxLifecycleError as e:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.cancel_ack_destroy_retryable_failed",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                            "error": str(e),
+                            "reclaim_count": envelope.reclaim_count,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "cancel_ack_destroy_retryable_failed telemetry raised "
+                        "envelope=%s — re-raising SandboxLifecycleError to "
+                        "preserve PEL-retain semantics",
+                        envelope.envelope_id,
+                    )
+                raise
+
+            # Codex r4 [R4-4, MEDIUM CONTRACT] — clear per-child tracking
+            # BEFORE the agent_service_callback so a callback failure
+            # doesn't leak the destroyed child's tracking state into
+            # ``_last_seen_mono`` / ``_cancel_states``. See
+            # ResultReadyHandler for the full rationale; mirrored here
+            # because the bug shape is identical:
+            #   prior order: destroy → callback → clear_child_tracking
+            #                callback raises → clear never runs → stale
+            #                state → auto-escalate cascades fire against
+            #                an already-destroyed child.
+            if ctx.clear_child_tracking is not None:
+                ctx.clear_child_tracking(envelope.child_session_id)
+
+            # Wrap the callback so its failure doesn't abort the rest
+            # of the side_effect (mark_processed below). Notification
+            # hook fault must not corrupt the supervisor's progress.
+            try:
+                await ctx.agent_service_callback(envelope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — best-effort hook
+                logger.exception(
+                    "cancel_ack agent_service_callback raised envelope=%s "
+                    "— continuing to mark_processed; child tracking already "
+                    "cleared (R4-4)",
+                    envelope.envelope_id,
+                )
+
+            # Codex F6 (HIGH) — best-effort mark_processed; outer
+            # ``_handle_envelope`` provides the load-bearing dedup write.
+            try:
+                await ctx.audit_repo.mark_processed(
+                    envelope.parent_session_id,
+                    envelope.envelope_id,
+                    processed_at=ctx.now(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cancel_ack inner mark_processed failed envelope=%s "
+                    "— outer _handle_envelope will retry post-side_effect",
+                    envelope.envelope_id,
+                )
+
+        return HandlerOutcome(
+            ack=False,
+            side_effect=_side_effect,
+            audit_payload={"terminal": "CANCEL_ACK"},
+        )
+
+
+class CancelRequestHandler:
+    """Spec §7.6 + §8 — TERMINATE drives hard kill; REQUEST_CANCEL records state
+    for the auto-escalate tick (§8.4).
+
+    TERMINATE branch ordering (spec §7.6 step 1-3):
+      1. ``agent_service_callback`` first (callback may stop the agent task
+         cooperatively before the sandbox dies).
+      2. ``destroy(reason)`` — reason defaults to FORCE_TERMINATE. Internal
+         cascades (orphan tick §7.5, poison drop §5.7, cancel auto-escalate
+         §8.4) thread an explicit ``DestroyReason`` (e.g., ``ORPHAN_TIMEOUT``)
+         via the supervisor-private ``cascade_destroy_overrides`` side-table
+         on :class:`SupervisorContext` — see R6-2 and R7-4 below. Parent-
+         originated cancels never appear in the side-table and always get
+         the default ``FORCE_TERMINATE``.
+      3. Synthetic CANCEL_ACK echo (``producer_role=SUPERVISOR_ECHO`` — must
+         NOT be CHILD_AGENT or the last_seen heartbeat invariant breaks).
+      4. ``mark_processed``.
+
+    REQUEST_CANCEL branch:
+      1. Forward to in-process callback so the child agent can cooperate.
+      2. Record ``_cancel_state`` for ``_maybe_tick_cancel_check`` to promote
+         to TERMINATE after ``CHILD_CANCEL_ACK_TIMEOUT_MS``.
+      3. ``mark_processed``.
+
+    Override-threading mechanism (codex r6 [R6-2] + r7 [R7-4]):
+      Earlier rounds threaded the cascade destroy reason through the wire
+      via ``CancelRequestPayload.destroy_reason`` and used a
+      ``producer_role=SUPERVISOR`` guard to defuse hostile overrides. R6-2
+      moved the field off the wire — the schema remains frozen at C3 ship
+      at ``{reason, policy}`` — and into the supervisor-private
+      ``ctx.cascade_destroy_overrides`` side-table keyed by the synthetic
+      envelope_id of the cascade. The publisher
+      (``_emit_cascade_terminate``) populates the entry BEFORE
+      ``publisher.publish`` so the handler can read it on dispatch via
+      ``ctx.cascade_destroy_overrides.get(env_id)``. External producers
+      cannot reach the dict, which moots the previous producer_role guard.
+
+      R7-4 defers the ``pop`` until AFTER the side_effect's
+      ``destroy + publish_ack`` have both succeeded; on PEL retry the
+      override is still present so the same ``DestroyReason`` is
+      re-applied. See ``_terminate_outcome`` and
+      :attr:`SupervisorContext.cascade_destroy_overrides` for details.
+    """
+
+    async def handle(
+        self, envelope: MailboxEnvelope, ctx: SupervisorContext
+    ) -> HandlerOutcome:
+        # R5-2 belt-and-suspenders — see ResultReadyHandler.__doc__. Handler
+        # repeats the supervisor's pre-stage so it stays self-contained
+        # under direct invocation.
+        if await ctx.audit_repo.get_processed(
+            envelope.parent_session_id, envelope.envelope_id
+        ):
+            return HandlerOutcome(ack=True, audit_payload={"dedup": True})
+
+        await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
+
+        policy_raw = envelope.payload.get("policy", CancelPolicy.REQUEST_CANCEL.value)
+        # `policy` can already be coerced to enum by the envelope model_validator
+        # round-trip (mode="python"); accept both raw string and enum value.
+        try:
+            policy = (
+                policy_raw
+                if isinstance(policy_raw, CancelPolicy)
+                else CancelPolicy(policy_raw)
+            )
+        except ValueError:
+            await ctx.telemetry.emit(
+                "mailbox.cancel_invalid_policy",
+                {
+                    "envelope_id": envelope.envelope_id,
+                    "policy": str(policy_raw),
+                },
+            )
+            return HandlerOutcome(
+                ack=True, audit_payload={"invalid_policy": True}
+            )
+
+        if policy == CancelPolicy.TERMINATE:
+            return self._terminate_outcome(envelope, ctx)
+        # REQUEST_CANCEL is the only remaining value — ABANDON is reserved/
+        # rejected per spec §4.2.1, so CancelPolicy() above would have raised
+        # ValueError and the invalid-policy ACK-drop would have triggered.
+        return self._request_cancel_outcome(envelope, ctx)
+
+    def _terminate_outcome(
+        self, envelope: MailboxEnvelope, ctx: SupervisorContext
+    ) -> HandlerOutcome:
+        # codex r6 [R6-2, HIGH CONTRACT] — read the supervisor-private
+        # ``cascade_destroy_overrides`` side-table for the explicit
+        # ``DestroyReason`` to thread into ``SandboxLifecycleService
+        # .destroy``. Orphan tick (§7.5) and poison-drop fallback (§5.7)
+        # stamp the entry (keyed by the synthetic envelope_id of the
+        # cascade) BEFORE publishing the synthetic CANCEL_REQUEST; this
+        # handler reads on dispatch. Parent-originated cancels
+        # never appear in the side-table → default
+        # ``DestroyReason.FORCE_TERMINATE``.
+        #
+        # Earlier rounds (R2-6 + R3-6) threaded the override via
+        # ``CancelRequestPayload.destroy_reason`` on the wire and
+        # restricted honoring to ``producer_role=SUPERVISOR`` to defuse a
+        # hostile-override attack. R6-2 moves the field off the wire so
+        # the schema stays frozen at C3 ship at ``{reason, policy}`` and
+        # the side-table is supervisor-private (external producers
+        # cannot reach it), which moots the R3-6 guard.
+        #
+        # codex r7 [R7-4, HIGH CONTRACT] — earlier R6-2 implementation
+        # ``pop``ped the override BEFORE running the side_effect. If any
+        # downstream step raised (e.g., destroy raised the retryable
+        # ``SandboxLifecycleError``), side_effect re-raises → no ACK →
+        # XAUTOCLAIM redelivers the envelope → the handler runs again
+        # → the override has already been popped → falls back to
+        # ``FORCE_TERMINATE`` instead of the original ``ORPHAN_TIMEOUT``.
+        # Switch to ``get`` here; the pop happens *only* on the
+        # all-steps-succeeded path inside the side_effect closure (right
+        # before the outer ACK flow runs). On retry the override is still
+        # present and the same destroy reason is re-applied.
+        cascade_overrides = (
+            ctx.cascade_destroy_overrides
+            if ctx.cascade_destroy_overrides is not None
+            else {}
+        )
+        override = cascade_overrides.get(envelope.envelope_id)
+        destroy_reason_to_apply: DestroyReason = (
+            override if override is not None else DestroyReason.FORCE_TERMINATE
+        )
+
+        async def _side_effect() -> None:
+            # Step 1: stop_session (best-effort, isolated). The agent task
+            # cooperating means the destroy below is less likely to land
+            # mid-tool-call, but a callback failure must NOT prevent the
+            # destroy from running. Codex F1 (HIGH) — the telemetry emit
+            # itself is wrapped so a sink fault doesn't abort the cascade
+            # (spec §7.6 invariant: stop failure must not prevent destroy).
+            try:
+                await ctx.agent_service_callback(envelope)
+            except Exception as e:  # noqa: BLE001 — best-effort hook
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.force_terminate_stop_failed",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                            "error": str(e),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "force_terminate_stop_failed telemetry raised "
+                        "envelope=%s — continuing to destroy",
+                        envelope.envelope_id,
+                    )
+
+            # Step 2: destroy with the resolved ``DestroyReason``. Default
+            # is FORCE_TERMINATE; orphan/poison cascades override via the
+            # supervisor-private ``cascade_destroy_overrides`` side-table
+            # (codex r6 [R6-2]; the R2-6 payload field is gone). Codex F5 (HIGH)
+            # — every ``telemetry.emit`` in this block is isolated so an
+            # OTel / sink hiccup doesn't escape the side_effect and
+            # trigger XAUTOCLAIM redelivery (which would re-hit
+            # AlreadyDestroyed → terminal-success → loop forever).
+            try:
+                await ctx.sandbox_lifecycle.destroy(
+                    envelope.child_session_id,
+                    destroy_reason_to_apply,
+                )
+            except SandboxAlreadyDestroyed:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.force_terminate_idempotent_noop",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "force_terminate_idempotent_noop telemetry raised "
+                        "envelope=%s — terminal-success path continues",
+                        envelope.envelope_id,
+                    )
+            except SandboxBindingMissing:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.force_terminate_binding_missing",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "force_terminate_binding_missing telemetry raised "
+                        "envelope=%s — terminal-success path continues",
+                        envelope.envelope_id,
+                    )
+            except SandboxLifecycleError as e:
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.force_terminate_destroy_retryable_failed",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                            "reclaim_count": envelope.reclaim_count,
+                            "error": str(e),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "force_terminate_destroy_retryable_failed telemetry "
+                        "raised envelope=%s — re-raising SandboxLifecycleError "
+                        "to preserve PEL-retain semantics",
+                        envelope.envelope_id,
+                    )
+                raise
+
+            # Codex r4 [R4-4, MEDIUM CONTRACT] — clear per-child tracking
+            # immediately after destroy success, BEFORE the synthetic
+            # CANCEL_ACK echo publish. The publish call is the only
+            # un-wrapped step in this side_effect; if the Redis client
+            # raises here, ``clear_child_tracking`` would never fire,
+            # leaving stale tracking state for an already-destroyed
+            # child → auto-escalate / orphan cascades against a dead
+            # child. Mirror of the ResultReady / CancelAck R4-4 fix:
+            # cleanup invariants run before any potentially-raising
+            # downstream step.
+            if ctx.clear_child_tracking is not None:
+                ctx.clear_child_tracking(envelope.child_session_id)
+
+            # Step 3: synthetic CANCEL_ACK echo so any parent / SSE bridge
+            # observers see the terminal transition. SUPERVISOR_ECHO is
+            # critical here — using CHILD_AGENT would falsely refresh
+            # ``_last_seen_mono`` and the orphan detector would think a
+            # destroyed child is still alive (spec §9.2 invariant).
+            # codex r3 [R3-7, HIGH CONTRACT] — hash the synthetic envelope_id
+            # so a long upstream envelope_id doesn't overflow the audit
+            # column's ``String(64)`` bound. See ``_synthetic_envelope_id``.
+            ack_env = MailboxEnvelope(
+                envelope_id=_synthetic_envelope_id("ack", envelope.envelope_id),
+                type=MailboxEnvelopeType.CANCEL_ACK,
+                parent_session_id=envelope.parent_session_id,
+                child_session_id=envelope.child_session_id,
+                correlation_id=envelope.correlation_id,
+                emitted_at=ctx.now(),
+                producer_role=ProducerRole.SUPERVISOR_ECHO,
+                payload=CancelAckPayload(
+                    final_state="force_terminated"
+                ).model_dump(mode="json"),
+            )
+            await ctx.publisher.publish(ack_env)
+
+            # codex r7 [R7-4, HIGH CONTRACT] — pop the cascade override
+            # ONLY after destroy + publish_ack have succeeded. If any
+            # earlier step raised, side_effect re-raises → outer
+            # _handle_envelope leaves the entry in PEL → XAUTOCLAIM
+            # redelivers → this handler runs again → override is still
+            # present and the same ``DestroyReason`` is re-applied. The
+            # publish above is the last raise-capable step that gates
+            # PEL retention; mark_processed below is wrapped to swallow
+            # so the pop here is safe. Mirrors the “consume the override
+            # only when the handler is about to ACK successfully”
+            # pattern called out in the R7-4 finding.
+            if ctx.cascade_destroy_overrides is not None:
+                ctx.cascade_destroy_overrides.pop(envelope.envelope_id, None)
+
+            # Codex F6 (HIGH) — mark_processed here is belt-and-suspenders;
+            # the outer ``_handle_envelope`` runs an idempotent mark_processed
+            # post-side_effect. Wrapping in try/except so a DB hiccup doesn't
+            # raise from side_effect → trigger redelivery → burn a destroy
+            # cycle on every retry.
+            try:
+                await ctx.audit_repo.mark_processed(
+                    envelope.parent_session_id,
+                    envelope.envelope_id,
+                    processed_at=ctx.now(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "force_terminate inner mark_processed failed envelope=%s "
+                    "— outer _handle_envelope will retry post-side_effect",
+                    envelope.envelope_id,
+                )
+
+        return HandlerOutcome(
+            ack=False,
+            side_effect=_side_effect,
+            audit_payload={"terminal": "CANCEL_TERMINATE"},
+        )
+
+    def _request_cancel_outcome(
+        self, envelope: MailboxEnvelope, ctx: SupervisorContext
+    ) -> HandlerOutcome:
+        async def _side_effect() -> None:
+            # codex r5 [R5-3, HIGH CONTRACT] — register cancel state FIRST so
+            # the auto-escalate tick (`_maybe_tick_cancel_check` §8.4) is
+            # armed BEFORE any callback that might hang or fail. The prior
+            # ordering was `callback → register_cancel_state`; if the
+            # in-process ``agent_service_callback`` hung (child task slow
+            # to respond to cancel) or raised (callback bug), the
+            # ``register_cancel_state`` step never ran → ``_cancel_states[child]``
+            # stayed empty → the auto-escalate tick saw no state for this
+            # child → REQUEST_CANCEL never escalated to TERMINATE → child
+            # stuck in REQUEST_CANCEL limbo until the 90s orphan tick. The
+            # invariant: cancel-state registration is the load-bearing
+            # safety net; the callback is best-effort cooperation. Wrap the
+            # callback in try/except so its failure doesn't abort
+            # mark_processed below.
+            if ctx.register_cancel_state is not None:
+                await ctx.register_cancel_state(
+                    envelope.child_session_id,
+                    CancelPolicy.REQUEST_CANCEL,
+                    ctx.clock(),
+                )
+            else:
+                # Should never happen — supervisor binds the hook in __init__.
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.cancel_state_hook_missing",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "cancel_state_hook_missing telemetry raised "
+                        "envelope=%s — continuing",
+                        envelope.envelope_id,
+                    )
+
+            # Forward to child via in-process callback (best-effort). With
+            # cancel state already registered, even a callback fault leaves
+            # the auto-escalate tick armed — child cannot get stuck in
+            # REQUEST_CANCEL limbo on a callback bug.
+            try:
+                await ctx.agent_service_callback(envelope)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — best-effort hook
+                try:
+                    await ctx.telemetry.emit(
+                        "mailbox.request_cancel_callback_failed",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                            "error": str(e),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "request_cancel_callback_failed telemetry raised "
+                        "envelope=%s — continuing to mark_processed",
+                        envelope.envelope_id,
+                    )
+            await ctx.audit_repo.mark_processed(
+                envelope.parent_session_id,
+                envelope.envelope_id,
+                processed_at=ctx.now(),
+            )
+
+        return HandlerOutcome(
+            ack=False,
+            side_effect=_side_effect,
+            audit_payload={"cancel_state": "REQUEST_CANCEL"},
+        )
+
+
+class ApprovalRequestHandler:
+    """Spec §10.2 — Permission-Engine HITL stub.
+
+    PR-4 ships an *immediate deny* stub (NOT a 300s timeout wait) because
+    PE-2 is not yet integrated. Publishes a paired APPROVAL_RESPONSE envelope
+    with ``decided_by=AUTO_POLICY`` so the child's pending request unblocks
+    immediately instead of timing out at ``APPROVAL_REQUEST_TIMEOUT_DEFAULT_SECONDS``.
+    """
+
+    async def handle(
+        self, envelope: MailboxEnvelope, ctx: SupervisorContext
+    ) -> HandlerOutcome:
+        # ApprovalRequest carries its own correlation_id inside the payload
+        # (spec §10.1) — use it to thread the response back to the same
+        # in-flight tool call on the child side. The ``correlation_id`` key
+        # is REQUIRED by ``ApprovalRequestPayload`` (see
+        # ``api/app/domain/models/mailbox_envelope.py``) and that schema is
+        # re-validated by ``MailboxEnvelope._validate_payload_matches_type``,
+        # so any envelope reaching this handler is guaranteed to carry a
+        # non-empty value (envelope-level locked guard:
+        # ``tests/domain/services/test_mailbox_supervisor.py::TestApprovalRequestCorrelationIdMismatch::test_envelope_rejects_approval_request_missing_payload_correlation_id``).
+        payload_correlation_id = envelope.payload["correlation_id"]
+
+        # codex r4 [R4-2, HIGH CONTRACT] (refined by codex r6 [R6-4]) —
+        # spec §13.1 T7 producer contract: ``payload.correlation_id`` MUST
+        # equal ``envelope.correlation_id``. The two ids serve different
+        # layers (envelope-level routing vs. tool-call-level correlation
+        # on the child side), but APPROVAL_REQUEST is the one envelope
+        # type where the spec mandates they match — producers are
+        # required to wire the same string into both fields.
+        #
+        # codex r6 [R6-4, HIGH CONTRACT] — earlier R4-2 fix ACK+dropped
+        # on mismatch WITHOUT publishing a paired APPROVAL_RESPONSE,
+        # which forced the child agent to wait the full 300s
+        # ``APPROVAL_REQUEST_TIMEOUT_DEFAULT_SECONDS`` before its
+        # deny-by-default branch fired. PR-4's design intent (codex r5
+        # veto: "立即 deny — 不假等 300s 制造假挂死") is the opposite:
+        # children should NEVER block 300s on approval. Publish an
+        # immediate deny keyed to ``envelope.correlation_id`` (the
+        # supervisor's trusted source — the envelope router is what we
+        # control; the payload field is producer-supplied). A child
+        # written against the documented contract (payload mirrors
+        # envelope) will unblock immediately on this deny. A buggy
+        # child that keys only on the payload's id will still time out
+        # at 300s — that's the producer's bug, not the supervisor's.
+        # ``payload_correlation_id`` is guaranteed non-empty by the
+        # envelope-level Pydantic validator (see comment at the top of
+        # ``handle``); the mismatch branch is the only divergence case
+        # because both ids are present.
+        if payload_correlation_id != envelope.correlation_id:
+            try:
+                await ctx.telemetry.emit(
+                    "mailbox.approval_correlation_id_mismatch",
+                    {
+                        "envelope_id": envelope.envelope_id,
+                        "envelope_correlation_id": envelope.correlation_id,
+                        "payload_correlation_id": payload_correlation_id,
+                        "producer_role": envelope.producer_role.value,
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "approval_correlation_id_mismatch telemetry raised "
+                    "envelope=%s — continuing to publish deny keyed to "
+                    "envelope.correlation_id (R6-4)",
+                    envelope.envelope_id,
+                )
+
+            # R6-4 — publish a deny keyed to the trusted envelope-level
+            # correlation_id so the child unblocks immediately. Use
+            # ``_synthetic_envelope_id`` to keep the response envelope
+            # id ≤ 64 chars even when the request id is at the limit.
+            mismatch_response = MailboxEnvelope(
+                envelope_id=_synthetic_envelope_id(
+                    "mismatch_deny", envelope.envelope_id
+                ),
+                type=MailboxEnvelopeType.APPROVAL_RESPONSE,
+                parent_session_id=envelope.parent_session_id,
+                child_session_id=envelope.child_session_id,
+                correlation_id=envelope.correlation_id,
+                emitted_at=ctx.now(),
+                producer_role=ProducerRole.SUPERVISOR,
+                payload=ApprovalResponsePayload(
+                    correlation_id=envelope.correlation_id,
+                    approved=False,
+                    decided_by=ApprovalDecidedBy.AUTO_POLICY,
+                    reason=(
+                        "correlation_id_mismatch — payload.correlation_id "
+                        "differs from envelope.correlation_id; supervisor "
+                        "denies and keys response off envelope.correlation_id "
+                        "(R6-4)"
+                    ),
+                ).model_dump(mode="json"),
+            )
+            # codex r7 [R7-6, HIGH CONTRACT] — earlier R6-4 implementation
+            # ACKed the envelope regardless of the deny publish outcome.
+            # If ``publisher.publish`` raised here, the paired deny never
+            # reached the stream so the child agent stayed blocked the
+            # full ``APPROVAL_REQUEST_TIMEOUT_DEFAULT_SECONDS`` (300s) —
+            # violating PR-4's "immediate deny" contract (codex r5 veto
+            # rationale). Worse: the ACK + ``mark_processed`` made
+            # redelivery impossible (no XAUTOCLAIM rescue). The
+            # publisher uses SET NX dedupe (see RedisMailboxPublisher),
+            # so retrying the same deny envelope_id is safe; defer ACK
+            # so PEL retention triggers redelivery + retry until the
+            # deny lands.
+            try:
+                await ctx.publisher.publish(mismatch_response)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "approval mismatch deny publish failed envelope=%s — "
+                    "leaving envelope in PEL (R7-6) so XAUTOCLAIM redelivers "
+                    "and the paired deny is retried; child unblocks on the "
+                    "first successful publish via SET NX dedup",
+                    envelope.envelope_id,
+                )
+                # Explicit defer — no ACK, no side_effect; PR-3b reliability
+                # layer reclaims via XAUTOCLAIM and re-dispatches.
+                return HandlerOutcome(
+                    ack=False,
+                    audit_payload={
+                        "correlation_id_mismatch": True,
+                        "mismatch_deny_publish_failed": True,
+                    },
+                )
+            return HandlerOutcome(
+                ack=True,
+                audit_payload={"correlation_id_mismatch": True},
+            )
+
+        # codex r9b [R9b-3, MEDIUM TEST] — the prior fallback
+        # ``payload_correlation_id or envelope.correlation_id`` was dead
+        # code: ``ApprovalRequestPayload.correlation_id`` is required and
+        # re-validated by ``MailboxEnvelope._validate_payload_matches_type``,
+        # so reaching this point with a missing ``payload_correlation_id``
+        # is impossible from real wire input. Use the payload value
+        # directly; the equality check above guarantees it matches
+        # ``envelope.correlation_id`` on this branch.
+        correlation_id = payload_correlation_id
+        # codex r3 [R3-7, HIGH CONTRACT] — hash the synthetic envelope_id
+        # so a long upstream envelope_id doesn't overflow the audit column's
+        # ``String(64)`` bound. See ``_synthetic_envelope_id``.
+        response_env = MailboxEnvelope(
+            envelope_id=_synthetic_envelope_id("deny", envelope.envelope_id),
+            type=MailboxEnvelopeType.APPROVAL_RESPONSE,
+            parent_session_id=envelope.parent_session_id,
+            child_session_id=envelope.child_session_id,
+            correlation_id=correlation_id,
+            emitted_at=ctx.now(),
+            producer_role=ProducerRole.SUPERVISOR,
+            payload=ApprovalResponsePayload(
+                correlation_id=correlation_id,
+                approved=False,
+                reason="approval handler unavailable (PE-2 not yet integrated)",
+                decided_by=ApprovalDecidedBy.AUTO_POLICY,
+            ).model_dump(mode="json"),
+        )
+        await ctx.publisher.publish(response_env)
+        return HandlerOutcome(
+            ack=True,
+            audit_payload={"pe_stub_denied": True},
+        )
+
+
+class HandoffRequestHandler:
+    """Spec §6.6 — handoff intentionally not implemented in C3 ship.
+
+    The wire envelope is frozen so future PRs can light up real handoff
+    behavior without breaking publishers / consumers; for now we just emit
+    telemetry and ACK. No destroy, no agent_service_callback.
+    """
+
+    async def handle(
+        self, envelope: MailboxEnvelope, ctx: SupervisorContext
+    ) -> HandlerOutcome:
+        # codex r2 [R2-7, MEDIUM CONTRACT] — telemetry.emit isolation;
+        # same pattern as ResultReadyHandler / CancelAckHandler. If the
+        # sink raises (OTel hiccup, JSONL disk full, ...), the
+        # exception propagates → no ACK → XAUTOCLAIM redelivers → handler
+        # raises again → infinite loop on the observability path. The
+        # handoff envelope is unsupported by design (spec §6.6 — wire
+        # reserved without lighting up handoff logic) so the only
+        # action is the telemetry note; failing to emit is loggable but
+        # MUST NOT block the ACK.
+        try:
+            await ctx.telemetry.emit(
+                "mailbox.handoff_request_unsupported",
+                {
+                    "envelope_id": envelope.envelope_id,
+                    "child_session_id": envelope.child_session_id,
+                    "handoff_target": envelope.payload.get("handoff_target"),
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "handoff_request_unsupported telemetry raised envelope=%s "
+                "— ACKing anyway; the handoff envelope is unsupported and "
+                "carries no side-effect work that retrying could unblock",
+                envelope.envelope_id,
+            )
+        return HandlerOutcome(
+            ack=True,
+            audit_payload={
+                "unsupported": True,
+                "reason": "c3_ship_does_not_implement_handoff",
             },
         )
-        return HandlerOutcome(ack=True, audit_payload={"stub_terminal": True})
 
 
 # ─── Dispatch table (spec §6.3) ───────────────────────────────────────────────
@@ -235,27 +1336,29 @@ def _validate_dispatch_table(
 
 
 def build_default_dispatch_table() -> dict[MailboxEnvelopeType, EnvelopeHandler]:
-    """PR-3a default: every type routed to a stub. PR-4 overrides terminal +
-    cascade entries with real handlers.
+    """PR-4 default — terminal + cascade routes wire to the real handlers
+    (``ResultReadyHandler`` / ``CancelAckHandler`` / ``CancelRequestHandler``
+    / ``ApprovalRequestHandler`` / ``HandoffRequestHandler``); non-terminal
+    pass-through types stay on ``_StubNonTerminalHandler`` (forward to
+    ``ctx.agent_service_callback`` and ACK).
 
     INV: every value of ``MailboxEnvelopeType`` MUST be a key in the returned
     table — otherwise the supervisor would fall into the unknown-type branch
     and ACK-drop legitimate envelopes. CI enforcement: see the unit test that
     counts entries.
     """
-    stub_terminal = _StubTerminalHandler()
     stub_nonterminal = _StubNonTerminalHandler()
     return {
-        MailboxEnvelopeType.RESULT_READY: stub_terminal,
-        MailboxEnvelopeType.CANCEL_ACK: stub_terminal,
+        MailboxEnvelopeType.RESULT_READY: ResultReadyHandler(),
+        MailboxEnvelopeType.CANCEL_ACK: CancelAckHandler(),
+        MailboxEnvelopeType.CANCEL_REQUEST: CancelRequestHandler(),
+        MailboxEnvelopeType.APPROVAL_REQUEST: ApprovalRequestHandler(),
         MailboxEnvelopeType.SPAWN_REQUEST: stub_nonterminal,
         MailboxEnvelopeType.SPAWN_ACK: stub_nonterminal,
         MailboxEnvelopeType.PROGRESS_UPDATE: stub_nonterminal,
-        MailboxEnvelopeType.APPROVAL_REQUEST: stub_nonterminal,
         MailboxEnvelopeType.APPROVAL_RESPONSE: stub_nonterminal,
-        MailboxEnvelopeType.CANCEL_REQUEST: stub_nonterminal,
         MailboxEnvelopeType.DEPENDENCY_BLOCKED: stub_nonterminal,
-        MailboxEnvelopeType.HANDOFF_REQUEST: stub_nonterminal,
+        MailboxEnvelopeType.HANDOFF_REQUEST: HandoffRequestHandler(),
     }
 
 
@@ -278,6 +1381,16 @@ class MailboxSupervisor:
     # autoclaim into the test window. Production keeps the spec constants.
     _XAUTOCLAIM_INTERVAL_S: float = MAILBOX_XAUTOCLAIM_PERIODIC_INTERVAL_SECONDS
     _XAUTOCLAIM_MIN_IDLE_MS: int = MAILBOX_PEL_IDLE_MS_FOR_CLAIM
+
+    # PR-4 cascade tunables. Production keeps both at 1s/5s respectively; tests
+    # monkeypatch via the instance attribute so the cancel/orphan ticks fire
+    # within the test window. ``_CANCEL_CHECK_INTERVAL_S`` MUST be smaller
+    # than ``CHILD_CANCEL_ACK_TIMEOUT_MS / 1000`` (30s) — otherwise the
+    # auto-escalate deadline is missed. ``_ORPHAN_CHECK_INTERVAL_S`` MUST be
+    # smaller than ``SUBAGENT_PROGRESS_STALE_AFTER_SECONDS`` (90s) for the
+    # same reason.
+    _CANCEL_CHECK_INTERVAL_S: float = 1.0
+    _ORPHAN_CHECK_INTERVAL_S: float = 5.0
 
     def __init__(
         self,
@@ -337,10 +1450,65 @@ class MailboxSupervisor:
         # iteration after _initial_xautoclaim() must wait one interval
         # before running the periodic sweep again.
         self._last_autoclaim_mono: float = 0.0
-        # _known_children is populated by SupervisorRegistry.spawn at PR-3c
-        # so _restore_last_seen_after_pod_restart() can scan XREVRANGE for
-        # the children we care about. Defaults to empty (no restore work).
+        # codex r9b [R9b-1, HIGH ARCH] — pod-restart clock recovery
+        # scaffolding deferred to PR-5.
+        #
+        # ``_known_children`` is the input set for
+        # ``_restore_last_seen_after_pod_restart`` (spec §9.3 — XREVRANGE
+        # scan + Redis-time anchor to rehydrate ``_last_seen_mono``). The
+        # original PR-3b/PR-3c plan wired this in ``SupervisorRegistry.spawn``
+        # by querying the session repo for running children at supervisor
+        # startup, but that plumbing budget (``session_factory`` /
+        # ``AsyncSession`` lifecycle / ancestor-chain walk into
+        # ``SupervisorContext``) widens PR-4's blast radius beyond the
+        # audit repo for an additive recovery optimisation. PR-4 ships
+        # the orphan tick + cascade pipeline; pod-restart clock recovery
+        # is now slated for PR-5 alongside the deferred R3-1 cross-root
+        # child_session_id verification (same plumbing budget).
+        #
+        # Runtime safety while unwired: ``_known_children`` defaults to
+        # ``[]`` so ``_restore_last_seen_after_pod_restart`` is a safe
+        # no-op (the for-loop over an empty list never enters). The next
+        # child-origin envelope after restart refreshes
+        # ``_last_seen_mono`` via ``_maybe_advance_last_seen`` on the
+        # normal dispatch path — the recovery routine is an
+        # optimisation, not a correctness invariant.
+        #
+        # Locked behaviour:
+        # ``tests/domain/services/test_mailbox_supervisor.py::TestSupervisorPodRestartClockRecovery::test_unwired_known_children_default_is_safe_noop``
+        # asserts the unwired default is a no-op (no exception, no
+        # mutation of ``_last_seen_mono``).
         self._known_children: list[str] = []
+        # PR-4 cascade-tick anchors (spec §7.5 + §8.4). Both default to 0.0
+        # so the first tick after ``run()`` startup waits a full interval
+        # before firing (avoids a spurious tick immediately after
+        # ``_initial_xautoclaim`` returns).
+        self._last_cancel_check_mono: float = 0.0
+        self._last_orphan_check_mono: float = 0.0
+        # codex r6 [R6-2, HIGH CONTRACT] — supervisor-private side-table
+        # mapping synthetic envelope_id → DestroyReason override.
+        # ``_emit_cascade_terminate`` populates BEFORE publish; the
+        # CancelRequestHandler TERMINATE branch reads+pops on dispatch.
+        # Replaces the R2-6 wire-payload field so the frozen
+        # CancelRequestPayload schema stays {reason, policy} (R6-2).
+        self._cascade_destroy_overrides: dict[str, DestroyReason] = {}
+        # Bind the cancel-state registration hook so ``CancelRequestHandler``
+        # can stash REQUEST_CANCEL state for the auto-escalate tick (spec §8).
+        # The hook is bound exactly once at construction; handlers only call
+        # it, preserving the "ctx is read-only at handler time" contract.
+        ctx.register_cancel_state = self._register_cancel_state
+        # Codex F7+F9 (HIGH) — same binding pattern for the per-child
+        # cleanup hook used by terminal handlers to drop tracking entries
+        # after destroy.
+        ctx.clear_child_tracking = self._clear_child_tracking
+        # codex r6 [R6-2, HIGH CONTRACT] — supervisor-private side-table
+        # threaded into ctx so ``CancelRequestHandler._terminate_outcome``
+        # can read+pop the explicit DestroyReason override that
+        # ``_emit_cascade_terminate`` stamped before publish. Shared by
+        # reference; the field default on SupervisorContext is a fresh
+        # dict per ctx instance (dataclass default_factory) so test
+        # contexts also get one without manual wiring.
+        ctx.cascade_destroy_overrides = self._cascade_destroy_overrides
 
     async def run(self) -> None:
         try:
@@ -393,6 +1561,13 @@ class MailboxSupervisor:
                     # is driven by the same loop's clock and we don't need a
                     # separate task.
                     await self._maybe_periodic_xautoclaim()
+                    # PR-4 spec §8.4 — auto-escalate REQUEST_CANCEL when the
+                    # child hasn't ACKed within CHILD_CANCEL_ACK_TIMEOUT_MS.
+                    await self._maybe_tick_cancel_check()
+                    # PR-4 spec §7.5 — cascade TERMINATE when a child's
+                    # last_seen_mono is older than
+                    # SUBAGENT_PROGRESS_STALE_AFTER_SECONDS.
+                    await self._maybe_tick_check_orphans()
                     if not entries and self._idle_poll_sleep_s > 0:
                         await asyncio.sleep(self._idle_poll_sleep_s)
                 except asyncio.CancelledError:
@@ -456,14 +1631,48 @@ class MailboxSupervisor:
         ``increment_reclaim`` (PR-3b Phase B) so reclaim_count is
         durable across pod restarts.
         """
-        # Codex r8 [P1] fix — cross-root defense-in-depth. The XREADGROUP
-        # stream key already scopes reads to one root, so a mismatch implies
-        # either a publisher bug or a misrouted/forged envelope. We refuse
-        # to dispatch and ACK to drain instead of looping; the warning
-        # surfaces the publisher bug in production logs. Without this guard
-        # a misrouted envelope could trigger PR-4 terminal destruction
-        # against the wrong root, violating the M1 per-root single-writer
-        # invariant.
+        # Codex r8 [P1] fix — cross-root defense-in-depth on
+        # ``parent_session_id``. The XREADGROUP stream key already scopes
+        # reads to one root, so a mismatch on parent_session_id implies a
+        # publisher bug or a misrouted/forged envelope. We refuse to
+        # dispatch and ACK to drain instead of looping; the warning
+        # surfaces the publisher bug in production logs.
+        #
+        # codex r3 [R3-1, CRITICAL ARCH] — we deliberately do NOT verify
+        # that ``envelope.child_session_id`` actually descends from
+        # ``ctx.root_session_id``. Doing so would require a session-repo
+        # ancestor-chain traversal per terminal envelope plus the
+        # accompanying ``session_factory`` / ``AsyncSession`` lifecycle
+        # plumbing into ``SupervisorContext`` (currently the only DB
+        # touch is the audit repo). Decision: keep the trust assumption
+        # explicit by **publisher contract** rather than defensive
+        # verification:
+        #
+        #   Publisher contract — every envelope published to
+        #   ``actus:child:{root_session_id}:mailbox`` MUST set
+        #   ``envelope.parent_session_id = root_session_id`` AND
+        #   ``envelope.child_session_id`` MUST be a session whose
+        #   ancestor chain includes ``root_session_id``. The supervisor
+        #   verifies the first invariant (this guard) and trusts the
+        #   publisher for the second.
+        #
+        # Negative integration test in
+        # ``test_mailbox_cross_root_guard.py`` makes the trust visible: a
+        # cross-root child_session_id with a matching parent_session_id
+        # proceeds through the supervisor unblocked.
+        #
+        # TODO(PR-5 / PR-6 acceptance gate): add defensive cross-root
+        # ``child_session_id`` verification via cached session-repo lookup
+        # on the terminal-handler path. Plumbing budget required:
+        # ``session_factory`` (or a pre-built session repo) into
+        # ``SupervisorContext``, ``AsyncSession`` lifecycle inside the
+        # supervisor (per-lookup or pool), per-supervisor LRU cache
+        # keyed by child_session_id → root_session_id, and a recursion-
+        # bounded parent-chain walk since sessions store ``parent_session
+        # _id`` rather than a denormalised root column. Tracked outside
+        # PR-4 because it widens the supervisor's blast radius beyond
+        # the audit repo for a defence-in-depth check that the publisher
+        # contract is supposed to make redundant.
         if envelope.parent_session_id != self._ctx.root_session_id:
             logger.warning(
                 "cross-root envelope refused — supervisor root=%s but "
@@ -561,6 +1770,50 @@ class MailboxSupervisor:
                 await self._on_poison_drop(envelope)
             except asyncio.CancelledError:
                 raise
+            except _CascadeFailedError as exc:
+                # codex r8 [R8-5, HIGH CONTRACT] — the poison-drop hook's
+                # cascade emitted a synthetic CANCEL_REQUEST, the XADD
+                # failed, AND the direct-kill fallback raised a retryable
+                # ``SandboxLifecycleError`` (see ``_cascade_publish_failed_
+                # direct_kill`` and ``_CascadeFailedError`` for the
+                # state-machine derivation). Spec §5.7 step 3 mandates that
+                # the poison drop hook MUST fire a cascade so the M2
+                # invariant (every running child reaches destroy() OR
+                # RESULT_READY) holds. If the cascade fails we still ACK
+                # the poison envelope to break the redelivery loop (the
+                # alternative is leaving it in PEL forever, which we
+                # already proved unrecoverable past MAX reclaim). The
+                # dedicated telemetry event below surfaces the cleanup
+                # failure to ops alerts — the broad-except branch beneath
+                # logs but doesn't emit a distinguishable signal, so ops
+                # would have to grep ``logger.exception`` to notice. Emit
+                # a structured event so this raises an alert instead.
+                try:
+                    await self._ctx.telemetry.emit(
+                        "mailbox.poison_cascade_failed_critical",
+                        {
+                            "envelope_id": envelope.envelope_id,
+                            "child_session_id": envelope.child_session_id,
+                            "type": envelope.type.value,
+                            "error": str(exc),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "poison_cascade_failed_critical telemetry raised "
+                        "envelope=%s — ACK still proceeds",
+                        envelope.envelope_id,
+                    )
+                logger.error(
+                    "poison drop hook cascade failed envelope=%s child=%s "
+                    "— the orphaned child may not have been destroyed; "
+                    "ACK proceeds to break the redelivery loop. See "
+                    "telemetry mailbox.poison_cascade_failed_critical.",
+                    envelope.envelope_id,
+                    envelope.child_session_id,
+                )
             except Exception:
                 logger.exception(
                     "poison drop hook raised envelope=%s — ACK anyway to "
@@ -643,29 +1896,105 @@ class MailboxSupervisor:
                     envelope.envelope_id,
                 )
                 return  # do NOT ack — PEL retain for XAUTOCLAIM retry
-            # PR-3b spec §5.8 layer 2 — write the dedup marker BEFORE XACK
-            # (codex r6 [HIGH] fix). A crash window between this call and
-            # the XACK below is recoverable: XAUTOCLAIM redelivers, the
-            # ``get_processed`` check at envelope entry finds the row, ACKs
-            # without re-firing side_effect.
+            # Codex r4 [R4-3, HIGH CONTRACT] — spec §5.8 layer 2 dedup
+            # marker MUST land BEFORE the XACK. The previous policy ACKed
+            # even when ``mark_processed`` raised (rationale: avoid
+            # double-destroy on redelivery). That reasoning was inverted:
+            # if we ACK without a durable marker, the next XAUTOCLAIM
+            # sweep would never replay this envelope at all, so the
+            # supposed "double-destroy" was a no-op in steady state, and
+            # the ACK loss was the false comfort. The real failure mode
+            # is different: side_effect already ran (destroy succeeded),
+            # mark_processed failed → if we ACK now, the audit row never
+            # gets ``processed_at``, but the envelope is gone from the
+            # PEL → fine in steady state. Where it breaks is when the
+            # supervisor restarts mid-PEL with stale entries: the new
+            # supervisor has no audit row, no PEL entry, and no way to
+            # reconcile that this envelope was already handled. The audit
+            # row IS the load-bearing dedup contract per spec §5.8 ("the
+            # marker is the truth"), so without it the contract is
+            # silently downgraded.
             #
-            # ``mark_processed`` failure: log + ACK anyway. Skipping the ACK
-            # would force redelivery — and since the side_effect already
-            # ran, the next pass (with ``get_processed=False`` because the
-            # marker write failed) would re-fire destroy(). ACKing on
-            # mark_processed failure accepts at-most-once dedup-loss in the
-            # rare audit-DB-down case, but avoids guaranteed double-destroy.
+            # The fix is to leave the entry in the PEL: XAUTOCLAIM
+            # redelivers, the terminal handler's destroy is idempotent
+            # (RESULT_READY / CANCEL_ACK / CANCEL_TERMINATE all classify
+            # ``SandboxAlreadyDestroyed`` and ``SandboxBindingMissing``
+            # as terminal-success), and ``mark_processed`` is retried.
+            # When the DB recovers, the marker lands and the entry ACKs
+            # cleanly. If the failure persists past
+            # ``MAILBOX_POISON_MAX_RECLAIM`` sweeps, the poison-drop
+            # gate at handle_envelope entry fires, telemetry records the
+            # incident, and the orphan-cascade hook can take over.
+            try:
+                await self._ctx.audit_repo.mark_processed(
+                    envelope.parent_session_id,
+                    envelope.envelope_id,
+                    processed_at=self._ctx.now(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # §5.8 hard rule — do NOT ACK without a durable dedup
+                # marker. Idempotent destroy on the terminal handlers
+                # makes redelivery safe; poison-drop is the eventual
+                # backstop if the DB outage persists.
+                logger.exception(
+                    "audit_repo.mark_processed failed envelope=%s — "
+                    "leaving entry in PEL for XAUTOCLAIM retry. The "
+                    "terminal handlers' destroy() is idempotent "
+                    "(AlreadyDestroyed / BindingMissing → terminal-"
+                    "success), so the next redelivery short-circuits to "
+                    "mark_processed without re-firing side effects. If "
+                    "the DB stays down past MAILBOX_POISON_MAX_RECLAIM "
+                    "reclaim sweeps, the poison-drop gate fires.",
+                    envelope.envelope_id,
+                )
+                return  # PEL retain — no ACK
+            await self._consumer.ack(redis_id)
+            return
+
+        # No side_effect — honor ``outcome.ack`` as the explicit ACK/defer
+        # signal. ``ack=False`` is the legitimate "defer" path PR-3b reliability
+        # layer relies on (e.g., dedup hit waiting for the in-flight handler).
+        #
+        # Codex F8 (HIGH) — mark_processed runs symmetrically with the
+        # side_effect path. Handlers that return ``ack=True`` with no
+        # side_effect (ApprovalRequestHandler stub, _StubNonTerminalHandler
+        # for PROGRESS_UPDATE / SPAWN_REQUEST / ..., dedup-hit returns) MUST
+        # leave a ``processed_at`` row so a redelivered envelope is detected
+        # by the ``get_processed`` short-circuit at envelope entry. Without
+        # this write, T7's ``test_duplicate_approval_request_dedups_via_audit``
+        # asserts ``processed_at is not None`` and would FAIL on a real DB
+        # run; more importantly, an ApprovalRequest that survives the SET NX
+        # publisher window (e.g., publishers across pods) would re-fire the
+        # deny response on every XAUTOCLAIM redelivery.
+        #
+        # For dedup-hit returns (where ``get_processed`` was already true at
+        # handler entry), this is a no-op — the DB UPDATE preserves the
+        # existing ``processed_at``. Safe + idempotent.
+        if outcome.ack:
+            # codex r5 [R5-4, HIGH CONTRACT] — mirror of the R4-3 fix on the
+            # side_effect path. spec §5.8 hard rule: do NOT ACK without a
+            # durable dedup marker. The previous policy ACKed even when
+            # ``mark_processed`` raised, which broke the same invariant
+            # R4-3 fixed for the side_effect path:
             #
-            # KNOWN PR-4 TRADEOFF (codex r7 [MEDIUM CONTRACT]): the dedup
-            # contract for destructive terminal handlers is silently
-            # downgraded in this code path — we ACK with no durable marker
-            # iff ``mark_processed`` raises. The cleanest fix is making
-            # ``side_effect`` + ``mark_processed`` atomic in the same DB
-            # transaction (e.g., the PR-4 terminal handler writes both the
-            # destroy outcome and the audit marker in a single SQLAlchemy
-            # tx). PR-4 scope MUST address this — tracked in TODO2.md (C3
-            # PR-4 acceptance gate). Until then, the at-most-once dedup-loss
-            # is the lesser evil vs guaranteed double-destroy on redelivery.
+            #   ApprovalRequestHandler returns ack=True after publishing
+            #   APPROVAL_RESPONSE. If mark_processed fails and we ACK
+            #   anyway, the envelope is gone from the PEL → no XAUTOCLAIM
+            #   replay → audit row never gets ``processed_at`` → on the
+            #   rare publisher-cross-pod redelivery window the deny
+            #   response would re-fire. More importantly the audit trail
+            #   silently downgrades the "the marker is the truth"
+            #   contract.
+            #
+            # Fix: leave entry in PEL. XAUTOCLAIM redelivers; the handler's
+            # idempotent path (publisher SET NX dedups APPROVAL_RESPONSE;
+            # _StubNonTerminalHandler re-fires its callback — cheap)
+            # re-runs and ``mark_processed`` is retried. When the DB
+            # recovers, the marker lands and the entry ACKs cleanly. If
+            # the failure persists past ``MAILBOX_POISON_MAX_RECLAIM``
+            # sweeps, the poison-drop gate fires.
             try:
                 await self._ctx.audit_repo.mark_processed(
                     envelope.parent_session_id,
@@ -676,18 +2005,14 @@ class MailboxSupervisor:
                 raise
             except Exception:
                 logger.exception(
-                    "audit_repo.mark_processed failed envelope=%s — ACK "
-                    "anyway to avoid double-fire on next redelivery; "
-                    "PR-4 should make side_effect+mark_processed transactional",
+                    "audit_repo.mark_processed failed on ack=True "
+                    "envelope=%s — leaving entry in PEL for XAUTOCLAIM "
+                    "retry per §5.8 (handler is idempotent: publisher "
+                    "SET NX dedups APPROVAL_RESPONSE; stub callback "
+                    "re-fire is cheap). Matches the R4-3 side_effect fix.",
                     envelope.envelope_id,
                 )
-            await self._consumer.ack(redis_id)
-            return
-
-        # No side_effect — honor ``outcome.ack`` as the explicit ACK/defer
-        # signal. ``ack=False`` is the legitimate "defer" path PR-3b reliability
-        # layer relies on (e.g., dedup hit waiting for the in-flight handler).
-        if outcome.ack:
+                return  # PEL retain — no ACK
             await self._consumer.ack(redis_id)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -946,14 +2271,97 @@ class MailboxSupervisor:
     # ──────────────────────────────────────────────────────────────────────
 
     async def _on_poison_drop(self, envelope: MailboxEnvelope) -> None:
-        """Hook for PR-4 to trigger orphan cascade when a *terminal-type*
-        poison envelope is dropped while its child is still RUNNING.
+        """Spec §5.7 step 3 — when a *terminal-type* poison envelope is dropped
+        and a child_session_id is present, fire a synthetic
+        CANCEL_REQUEST(TERMINATE) so the orphaned child still gets destroyed.
 
-        PR-3b ships the empty body — telemetry alone surfaces the drop in
-        the spec §5.7 step 1/2 path. PR-4 overrides to call the
-        cancel-cascade handler so the orphaned child is destroyed.
+        Without this hook the M2 invariant (every running child must reach
+        either RESULT_READY or destroy()) silently breaks: the poison drop
+        ACKs the envelope and we lose the only signal that the child needs
+        cleanup. Cascading via a fresh CANCEL_REQUEST routes through the
+        same TERMINATE side-effect chain that ``CancelRequestHandler``
+        already exercises, including stop_session and
+        ``destroy(ORPHAN_TIMEOUT)`` (R2-6 thread, R3-8 doc).
+
+        codex r8 [R8-4, MEDIUM PERF] — if the *dropped* envelope is itself
+        a synthetic cascade CANCEL_REQUEST that has poisoned (we have
+        already exhausted XAUTOCLAIM retries against it), clean up the
+        matching ``_cascade_destroy_overrides`` entry. ``_emit_cascade_terminate``
+        stamps the override BEFORE publishing the synthetic envelope, and
+        the only pop sites are the successful side_effect path inside
+        ``CancelRequestHandler._terminate_outcome`` (R7-4) and the
+        publish-failure fallback inside ``_emit_cascade_terminate``
+        (R6-3). If the synthetic envelope poisons via XAUTOCLAIM
+        redelivery (not via XADD failure), neither pop site runs and the
+        side-table accumulates one stale entry per poisoned cascade — a
+        slow leak in long-lived supervisors. Capture-then-pop so the
+        cascade CANCEL_REQUEST branch below can reuse the override.
+
+        codex r10 [R10-1, HIGH ARCH] — when the *dropped* envelope is a
+        synthetic cascade CANCEL_REQUEST with policy=TERMINATE, the
+        orphan/cancel-tick that produced it has already cleared
+        ``_last_seen_mono[child]`` / ``_cancel_states[child]`` (the
+        publish succeeded so the early-clear was correct from the
+        tick's POV). If the handler then exhausts retries via
+        XAUTOCLAIM, the original ACKed-and-dropped contract leaves the
+        child with no remaining retry signal: no tracking entry to
+        re-fire the tick, no envelope in the PEL. Cascade the
+        emergency direct-kill path here so the orphaned child still
+        gets destroyed, reusing the side-table's
+        ``destroy_reason`` override (so ORPHAN_TIMEOUT cascades keep
+        their forensic tag; non-tagged cascades fall back to
+        FORCE_TERMINATE — same default the handler would have used).
         """
-        return None
+        # R8-4 — capture-then-drop any stale cascade override keyed on this
+        # envelope_id. We must capture before popping so the cascade
+        # CANCEL_REQUEST direct-kill branch below can reuse the override.
+        # Non-cascade envelopes never appear in the side-table so the get
+        # is a no-op None for them.
+        cascade_override = self._cascade_destroy_overrides.pop(
+            envelope.envelope_id, None
+        )
+
+        # codex r10 [R10-1, HIGH ARCH] — cascade CANCEL_REQUEST poison drop
+        # branch. The synthetic envelope we published earlier has
+        # exhausted retries; tracking is already gone (orphan/cancel
+        # tick cleared it post-publish), so the child has no remaining
+        # retry signal and the ACKed-and-dropped envelope would
+        # otherwise leak the orphan. Fall back to the direct-kill
+        # emergency path (callback → destroy) so M2 still holds.
+        if (
+            envelope.type == MailboxEnvelopeType.CANCEL_REQUEST
+            and envelope.child_session_id
+        ):
+            try:
+                payload = CancelRequestPayload.model_validate(envelope.payload)
+            except Exception:
+                payload = None
+            if payload is not None and payload.policy == CancelPolicy.TERMINATE:
+                await self._cascade_publish_failed_direct_kill(
+                    envelope.child_session_id,
+                    reason="poison_drop_cascade_envelope",
+                    destroy_reason=cascade_override
+                    or DestroyReason.FORCE_TERMINATE,
+                    synthetic_envelope_id=envelope.envelope_id,
+                    synthetic_envelope=envelope,
+                )
+                return
+
+        terminal_types = {
+            MailboxEnvelopeType.RESULT_READY,
+            MailboxEnvelopeType.CANCEL_ACK,
+        }
+        if envelope.type in terminal_types and envelope.child_session_id:
+            # codex r2 [R2-6, HIGH CONTRACT] — poison-drop fallback is
+            # an orphan-cleanup variant (the child is unreachable per
+            # the failing destroy retries). Thread ORPHAN_TIMEOUT so the
+            # eventual destroy lands in the DB with the right reason
+            # tag for ops/forensics rather than FORCE_TERMINATE.
+            await self._emit_cascade_terminate(
+                envelope.child_session_id,
+                reason="poison_drop_terminal_envelope",
+                destroy_reason=DestroyReason.ORPHAN_TIMEOUT,
+            )
 
     # ──────────────────────────────────────────────────────────────────────
     # PR-3b Phase D — pod-restart clock recovery (spec §9.3)
@@ -970,11 +2378,21 @@ class MailboxSupervisor:
             age_ms = redis_now_ms - entry_ms        # how long ago the envelope was added
             last_seen_mono = clock_now - age_ms/1000  # convert into local monotonic frame
 
-        PR-3c will wire this in ``SupervisorRegistry.spawn`` (after
-        populating ``_known_children`` from the session repo at supervisor
-        startup). PR-3b ships the function unused — the unit tests cover
-        it in isolation; the registry integration is deferred so we don't
-        spread session-repo dependencies into PR-3b scope.
+        codex r9b [R9b-1, HIGH ARCH] — caller wiring deferred to PR-5.
+        PR-3b/PR-3c originally scoped ``SupervisorRegistry.spawn`` to
+        populate ``_known_children`` from the session repo at supervisor
+        startup and call this routine after ``ensure_group()``. That
+        plumbing widens PR-4's blast radius (``session_factory`` /
+        ``AsyncSession`` lifecycle + ancestor-chain walk into
+        ``SupervisorContext``) for an additive recovery optimisation, so
+        PR-4 ships the routine plus its in-isolation unit coverage and
+        the actual wiring follows in PR-5 alongside the deferred R3-1
+        cross-root child_session_id verification (same plumbing budget;
+        see the comment block on ``_known_children`` in ``__init__``).
+        Runtime safety while unwired: ``_known_children`` defaults to
+        ``[]`` so the for-loop is a no-op and the next child-origin
+        envelope refreshes ``_last_seen_mono`` via the normal dispatch
+        path (``_maybe_advance_last_seen``).
 
         Idempotent — if XREVRANGE / TIME both fail we just skip; the next
         child-origin envelope will refresh ``_last_seen_mono`` naturally.
@@ -1044,3 +2462,555 @@ class MailboxSupervisor:
                 except ValueError:
                     return None
         return None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # PR-4 cascade — register_cancel_state + tick orchestration (spec §7.5 + §8)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _register_cancel_state(
+        self, child_id: str, policy: CancelPolicy, mono: float
+    ) -> None:
+        """Bound to ``SupervisorContext.register_cancel_state`` in __init__.
+
+        Stashes the cascade state for ``_maybe_tick_cancel_check`` to read on
+        the next tick. The hook is async to keep symmetry with the rest of
+        ``SupervisorContext``'s callables; the actual work is pure dict
+        assignment.
+
+        codex r6 [R6-1, HIGH ARCH] — preserve the earliest
+        ``requested_at_mono`` when the same child receives another
+        REQUEST_CANCEL. Pre-fix this unconditionally overwrote the entry,
+        which meant XAUTOCLAIM redelivery (or any second CANCEL_REQUEST
+        for the same child) would reset the timestamp and the §8.4 auto-
+        escalate tick would see "fresh" state that hasn't yet exceeded
+        ``CHILD_CANCEL_ACK_TIMEOUT_MS`` — the escalate timer would never
+        fire. The TERMINATE transition is the only legitimate path that
+        re-keys the cancel state for a given child; that path calls
+        ``clear_child_tracking`` (via the terminal handler side_effect)
+        BEFORE the next register call lands, so the slot is empty when a
+        TERMINATE-triggered registration arrives and the policy-mismatch
+        guard below would fall through to the fresh assignment anyway.
+        """
+        existing = self._cancel_states.get(child_id)
+        if (
+            existing is not None
+            and existing.policy == CancelPolicy.REQUEST_CANCEL
+            and policy == CancelPolicy.REQUEST_CANCEL
+        ):
+            # Same child, same REQUEST_CANCEL policy → second envelope
+            # MUST NOT reset the auto-escalate timer. No-op.
+            return
+        self._cancel_states[child_id] = _CancelState(
+            child_session_id=child_id,
+            policy=policy,
+            requested_at_mono=mono,
+        )
+
+    def _clear_child_tracking(self, child_id: str) -> None:
+        """Bound to ``SupervisorContext.clear_child_tracking`` in __init__.
+
+        Codex F7+F9 (HIGH) — drop both ``_cancel_states[child]`` and
+        ``_last_seen_mono[child]`` after a terminal handler destroys the
+        child. Without this cleanup:
+
+        * F7: ``_cancel_states`` lingers with policy=REQUEST_CANCEL after
+          CANCEL_ACK arrives → auto-escalate tick (spec §8.4) sees stale
+          state aged past ``CHILD_CANCEL_ACK_TIMEOUT_MS`` → fires synthetic
+          CANCEL_REQUEST(TERMINATE) → CancelRequestHandler hits
+          ``SandboxAlreadyDestroyed`` (idempotent terminal-success) → spurious
+          envelope spam + wasted lifecycle work on every tick.
+
+        * F9: ``_last_seen_mono`` lingers after RESULT_READY / CANCEL_ACK /
+          TERMINATE → orphan detector (spec §7.5) sees stale heartbeat past
+          ``SUBAGENT_PROGRESS_STALE_AFTER_SECONDS`` → fires synthetic
+          CANCEL_REQUEST(TERMINATE) → AlreadyDestroyed → same spurious work.
+
+        Synchronous because cleanup is pure dict pop with no I/O — keeps the
+        terminal handler side_effect simple and avoids spawning an event-loop
+        round-trip per call.
+        """
+        self._cancel_states.pop(child_id, None)
+        self._last_seen_mono.pop(child_id, None)
+
+    async def _maybe_tick_cancel_check(self) -> None:
+        """Spec §8.4 — promote stuck REQUEST_CANCEL → TERMINATE.
+
+        Runs no more often than every ``_CANCEL_CHECK_INTERVAL_S`` from the
+        main loop. For each tracked ``_CancelState`` with policy
+        REQUEST_CANCEL whose ``requested_at_mono`` has aged past
+        ``CHILD_CANCEL_ACK_TIMEOUT_MS``, publishes a synthetic
+        CANCEL_REQUEST(TERMINATE) — re-dispatched on the next loop iteration
+        through ``CancelRequestHandler``'s TERMINATE branch — and clears the
+        in-memory state so we don't double-cascade.
+
+        ``CANCEL_AUTO_ESCALATE_TO_TERMINATE=False`` short-circuits the tick
+        entirely for operators who need the spec §8.4 promotion disabled.
+        """
+        # Read the flag through this module's namespace so tests can flip
+        # the behavior via monkeypatch on the supervisor module path
+        # (the import-time constant value is otherwise frozen by Python).
+        from app.application.services import (
+            mailbox_supervisor as _ms,
+        )  # local import keeps the cycle minimal
+
+        if not _ms.CANCEL_AUTO_ESCALATE_TO_TERMINATE:
+            return
+
+        now = self._ctx.clock()
+        if now - self._last_cancel_check_mono < self._CANCEL_CHECK_INTERVAL_S:
+            return
+        self._last_cancel_check_mono = now
+
+        for child_id, state in list(self._cancel_states.items()):
+            if state.policy != CancelPolicy.REQUEST_CANCEL:
+                continue
+            elapsed_ms = (now - state.requested_at_mono) * 1000.0
+            if elapsed_ms <= CHILD_CANCEL_ACK_TIMEOUT_MS:
+                continue
+            try:
+                await self._ctx.telemetry.emit(
+                    "mailbox.cascade_auto_escalate_terminate",
+                    {
+                        "child_session_id": child_id,
+                        "elapsed_ms": int(elapsed_ms),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade_auto_escalate_terminate telemetry raised root=%s "
+                    "child=%s — continuing without the emit",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+            try:
+                await self._emit_cascade_terminate(
+                    child_id, reason="cancel_ack_timeout"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade_terminate publish failed root=%s child=%s — "
+                    "leaving state in place for next tick to retry",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+                continue
+            # Only drop the state after the publish succeeds — otherwise a
+            # transient Redis blip would silently swallow the promotion.
+            #
+            # codex r10 [R10-1, HIGH ARCH] — same shape as the orphan tick
+            # at the bottom of ``_maybe_tick_check_orphans``: per-child
+            # tracking is dropped immediately post-publish. If the
+            # synthetic cascade envelope then exhausts XAUTOCLAIM retries
+            # and reaches ``_on_poison_drop`` (handler chain failing), the
+            # child would have NO remaining retry signal (tracking gone +
+            # envelope ACKed). The cascade-CANCEL_REQUEST branch in
+            # ``_on_poison_drop`` catches that case and fires the
+            # direct-kill fallback so the orphan still gets destroyed.
+            self._cancel_states.pop(child_id, None)
+
+    async def _maybe_tick_check_orphans(self) -> None:
+        """Spec §7.5 — orphan detection.
+
+        Runs every ``_ORPHAN_CHECK_INTERVAL_S`` from the main loop. For each
+        ``last_seen_mono`` entry older than
+        ``SUBAGENT_PROGRESS_STALE_AFTER_SECONDS``, publish a synthetic
+        ``CANCEL_REQUEST(TERMINATE, reason="orphan_timeout")`` AND populate
+        the supervisor-private ``_cascade_destroy_overrides[envelope_id]``
+        side-table with ``DestroyReason.ORPHAN_TIMEOUT``. ``CancelRequest
+        Handler._terminate_outcome`` reads that side-table during dispatch
+        so the eventual ``sandbox_lifecycle.destroy`` call is tagged
+        ``ORPHAN_TIMEOUT`` rather than the default ``FORCE_TERMINATE``.
+        After a successful publish the heartbeat slot is cleared so the
+        next tick doesn't re-cascade; on failure the slot is retained so
+        the next ``_ORPHAN_CHECK_INTERVAL_S`` tick retries.
+
+        codex r3 [R3-8, LOW DOC] — earlier wording said
+        ``destroy(FORCE_TERMINATE)``; that was stale after R2-6 made the
+        orphan tick thread ``DestroyReason.ORPHAN_TIMEOUT`` through the
+        cascade payload so binding history distinguishes orphan-triggered
+        destroys from parent-initiated FORCE_TERMINATE cascades.
+
+        codex r6 [R6-2, HIGH CONTRACT] — the cascade payload field was
+        removed; the override moved off the wire and into the supervisor-
+        private ``_cascade_destroy_overrides`` side-table. The wire
+        schema is restored to ``{reason, policy}``.
+
+        codex r7 [R7-8, MEDIUM DOC] — earlier docstring still referenced
+        the ``destroy_reason=ORPHAN_TIMEOUT`` payload field, which no
+        longer exists post-R6. See also R7-4: the override is now popped
+        only on side_effect success so PEL redelivery re-applies the
+        same ``ORPHAN_TIMEOUT`` on retry.
+        """
+        now = self._ctx.clock()
+        if now - self._last_orphan_check_mono < self._ORPHAN_CHECK_INTERVAL_S:
+            return
+        self._last_orphan_check_mono = now
+
+        for child_id, last_seen in list(self._last_seen_mono.items()):
+            stale_seconds = now - last_seen
+            if stale_seconds <= SUBAGENT_PROGRESS_STALE_AFTER_SECONDS:
+                continue
+            try:
+                await self._ctx.telemetry.emit(
+                    "mailbox.orphan_detected",
+                    {
+                        "child_session_id": child_id,
+                        "stale_seconds": int(stale_seconds),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "orphan_detected telemetry raised root=%s child=%s — "
+                    "continuing without the emit",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+            try:
+                # codex r2 [R2-6, HIGH CONTRACT] — thread ORPHAN_TIMEOUT
+                # through to the destroy call so ops can distinguish
+                # orphan-triggered destroys from parent-initiated
+                # FORCE_TERMINATE cascades in the binding history.
+                await self._emit_cascade_terminate(
+                    child_id,
+                    reason="orphan_timeout",
+                    destroy_reason=DestroyReason.ORPHAN_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "orphan cascade publish failed root=%s child=%s — "
+                    "leaving last_seen in place for next tick to retry",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+                continue
+            # Drop the heartbeat slot so the next tick doesn't re-cascade.
+            #
+            # codex r10 [R10-1, HIGH ARCH] — the slot is cleared after a
+            # successful publish so the next tick doesn't double-fire.
+            # If the published cascade envelope then exhausts XAUTOCLAIM
+            # retries (handler chain failing repeatedly), the child has
+            # NO remaining retry signal here — both tracking and the
+            # envelope are gone. The cascade-CANCEL_REQUEST branch in
+            # ``_on_poison_drop`` catches that case and fires the
+            # direct-kill fallback (reusing the
+            # ``_cascade_destroy_overrides`` entry for ORPHAN_TIMEOUT).
+            self._last_seen_mono.pop(child_id, None)
+
+    async def _emit_cascade_terminate(
+        self,
+        child_id: str,
+        *,
+        reason: str,
+        destroy_reason: Optional[DestroyReason] = None,
+    ) -> None:
+        """Publish a synthetic CANCEL_REQUEST(TERMINATE) so the main loop
+        re-dispatches through ``CancelRequestHandler`` on the next read.
+
+        ``producer_role=SUPERVISOR`` (not SUPERVISOR_ECHO) — this is a fresh
+        cascade message originating from the supervisor, NOT an echo of a
+        child→parent envelope. Empty ``child_id`` is rejected with a no-op
+        (defensive guard for cross-root forgery paths the supervisor already
+        filters elsewhere).
+
+        codex r2 [R2-5, HIGH CONTRACT] — envelope_id MUST fit the audit
+        table's ``String(64)`` column. The previous format
+        ``cascade:{reason}:{child_id}:{ts_ms}`` could reach 70+ characters
+        with UUID child_ids (36 char) + ``cancel_ack_timeout`` reason.
+        We now compose ``cascade:{sha256(reason:child_id:ts_ms)[:32]}``
+        — always 39 chars — stable per (reason, child, time) tuple. Same
+        (reason, child_id, time) → same envelope_id (idempotent across
+        retries inside one tick); different times → different ids.
+
+        codex r3 [R3-5, HIGH CONTRACT] — ``correlation_id`` is ALSO bounded
+        by ``String(64)`` (``infrastructure/models/mailbox_envelope_audit
+        .py:51``). The previous comment incorrectly claimed correlation_id
+        was unbounded; the audit-repo upsert would silently fail (or row
+        write would truncate / raise) when ``reason`` was a long string
+        like ``poison_drop_terminal_envelope`` (28 chars) combined with a
+        UUID child_id (36 chars) — total 73 chars including the
+        ``cascade:`` prefix. Apply the same hash-or-truncate strategy as
+        envelope_id: ``cascade:{sha256(reason:child_id)[:32]}`` = 40 chars,
+        stable per (reason, child) tuple. We deliberately omit ``ts_ms``
+        from the correlation hash so that all retries within one cascade
+        tick share a correlation_id (cross-envelope grep stays useful).
+
+        codex r2 [R2-6, HIGH CONTRACT] (superseded by R6-2) — ``destroy_reason``
+        was originally threaded into the public payload so the TERMINATE
+        handler could pass it to ``SandboxLifecycleService.destroy``
+        instead of the hardcoded ``DestroyReason.FORCE_TERMINATE``. codex
+        r6 [R6-2] moved this off the wire and into the supervisor-private
+        ``_cascade_destroy_overrides`` side-table so the
+        ``CancelRequestPayload`` schema remains frozen at C3 ship at
+        ``{reason, policy}``. We populate the side-table BEFORE
+        ``publisher.publish`` so the in-process handler can read+pop
+        the override on dispatch; external producers cannot reach the
+        dict, which moots the R3-6 producer_role guard.
+        """
+        if not child_id:
+            return
+        now_mono = self._ctx.clock()
+        ts_ms = int(now_mono * 1000)
+        # 32-hex-char digest fits within the 64-char audit column with
+        # the ``cascade:`` prefix (39 chars total). sha256 is collision-
+        # resistant; truncation to 128 bits is safe at supervisor scale.
+        env_key = f"{reason}:{child_id}:{ts_ms}"
+        env_digest = hashlib.sha256(env_key.encode("utf-8")).hexdigest()[:32]
+        # R3-5 — correlation_id also bounded to 64. Hash (reason, child_id)
+        # without ts_ms so retries inside one cascade tick share the id
+        # for cross-envelope grep. 40 chars total with ``cascade:`` prefix.
+        corr_key = f"{reason}:{child_id}"
+        corr_digest = hashlib.sha256(corr_key.encode("utf-8")).hexdigest()[:32]
+        synthetic_envelope_id = f"cascade:{env_digest}"
+        cascade_env = MailboxEnvelope(
+            envelope_id=synthetic_envelope_id,
+            type=MailboxEnvelopeType.CANCEL_REQUEST,
+            parent_session_id=self._ctx.root_session_id,
+            child_session_id=child_id,
+            correlation_id=f"cascade:{corr_digest}",
+            emitted_at=self._ctx.now(),
+            producer_role=ProducerRole.SUPERVISOR,
+            payload=CancelRequestPayload(
+                reason=reason,
+                policy=CancelPolicy.TERMINATE,
+            ).model_dump(mode="json"),
+        )
+        # codex r6 [R6-2] — stamp the override BEFORE publish. The handler
+        # reads+pops the entry on dispatch; if publish fails (R6-3 fallback)
+        # the entry is explicitly removed below since the handler will
+        # never see the envelope.
+        if destroy_reason is not None:
+            self._cascade_destroy_overrides[synthetic_envelope_id] = (
+                destroy_reason
+            )
+        try:
+            await self._ctx.publisher.publish(cascade_env)
+        except asyncio.CancelledError:
+            # Caller (orphan/poison/cancel-ack-timeout tick) handles
+            # cancellation; clean up the side-table so a future
+            # synthetic envelope sharing the id doesn't accidentally
+            # inherit an override from this aborted cascade.
+            self._cascade_destroy_overrides.pop(synthetic_envelope_id, None)
+            raise
+        except Exception:
+            # codex r6 [R6-3] — direct stop+destroy fallback so an XADD
+            # failure still kills the orphaned child (spec §7.5 / §7.6
+            # hard rule). Cleanup the side-table since the handler will
+            # never see this envelope.
+            self._cascade_destroy_overrides.pop(synthetic_envelope_id, None)
+            # codex r7 [R7-7, HIGH CONTRACT] — propagate
+            # ``_CascadeFailedError`` from the fallback so callers can
+            # preserve per-child tracking + retry on the next tick.
+            # Non-terminal cases (already destroyed / binding
+            # missing) in the fallback path do NOT raise — they are
+            # success-equivalent. Only retryable
+            # ``SandboxLifecycleError`` in the fallback bubbles up.
+            #
+            # codex r10 [R10-2, HIGH CONTRACT] — pass the synthetic
+            # envelope through so the fallback can fire
+            # ``agent_service_callback`` BEFORE ``destroy`` (spec §7.6
+            # stop-before-destroy order, even in the XADD-failure
+            # emergency path).
+            await self._cascade_publish_failed_direct_kill(
+                child_id,
+                reason=reason,
+                destroy_reason=destroy_reason or DestroyReason.FORCE_TERMINATE,
+                synthetic_envelope_id=synthetic_envelope_id,
+                synthetic_envelope=cascade_env,
+            )
+            # Swallow non-cascade-failed paths — the cascade is
+            # considered done (we tried XADD, we fell back to direct
+            # destroy and it succeeded or hit a terminal state).
+            # Re-raising would block the caller's continue-to-next-child
+            # loop. _CascadeFailedError from the fallback above is the
+            # exception: it MUST propagate so the caller skips tracking
+            # cleanup.
+
+    async def _cascade_publish_failed_direct_kill(
+        self,
+        child_id: str,
+        *,
+        reason: str,
+        destroy_reason: DestroyReason,
+        synthetic_envelope_id: str,
+        synthetic_envelope: Optional[MailboxEnvelope] = None,
+    ) -> None:
+        """codex r6 [R6-3, HIGH CONTRACT] — spec §7.5 + §7.6: "XADD record
+        is best-effort; XADD failure still kills." When
+        ``_emit_cascade_terminate``'s publish raises, the synthetic
+        CANCEL_REQUEST never lands in the stream so
+        ``CancelRequestHandler`` will never destroy this child. Fall
+        back to a direct ``sandbox_lifecycle.destroy`` so the orphaned
+        child still gets cleaned up.
+
+        codex r10 [R10-2, HIGH CONTRACT] — spec §7.6 mandates
+        ``stop → destroy`` order. Earlier rounds skipped the callback in
+        this emergency path on the rationale that we lacked a useful
+        envelope; the cascade synthetic envelope is now threaded
+        through so the callback (which signals the child to stop
+        cooperatively in production via ``AgentService.stop_session``)
+        fires before destroy. The callback is best-effort — any
+        exception is logged and swallowed so a callback fault never
+        blocks the load-bearing destroy step. ``CancelledError`` still
+        propagates so caller-driven cancellation aborts cleanly.
+        """
+        logger.exception(
+            "cascade publish failed root=%s child=%s reason=%s — "
+            "falling back to direct destroy(%s)",
+            self._ctx.root_session_id,
+            child_id,
+            reason,
+            destroy_reason.value,
+        )
+        # codex r10 [R10-2, HIGH CONTRACT] — fire callback BEFORE destroy
+        # so the stop-before-destroy ordering is preserved even in the
+        # XADD-failure emergency path. Best-effort: log + swallow so a
+        # callback fault doesn't block the load-bearing destroy.
+        if synthetic_envelope is not None:
+            try:
+                await self._ctx.agent_service_callback(synthetic_envelope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade direct-kill callback failed root=%s child=%s — "
+                    "continuing to destroy",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+        try:
+            await self._ctx.sandbox_lifecycle.destroy(child_id, destroy_reason)
+        except SandboxAlreadyDestroyed:
+            # codex r8 [R8-6, MEDIUM CONTRACT] — terminal-success branch.
+            # The child is already gone from the lifecycle service's POV,
+            # so per-child tracking (_last_seen_mono / _cancel_states) is
+            # now stale and must be cleared. Without this, the next
+            # orphan tick (_ORPHAN_CHECK_INTERVAL_S) re-fires a cascade
+            # against the same already-destroyed child — same bug shape
+            # as F7+F9 mirrored from the in-handler clear_child_tracking
+            # invariant. Mirrored across all three terminal-success
+            # branches (AlreadyDestroyed / BindingMissing / success).
+            self._clear_child_tracking(child_id)
+            try:
+                await self._ctx.telemetry.emit(
+                    "mailbox.cascade_xadd_failed_direct_kill_already_destroyed",
+                    {
+                        "child_session_id": child_id,
+                        "reason": reason,
+                        "destroy_reason": destroy_reason.value,
+                        "synthetic_envelope_id": synthetic_envelope_id,
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade_xadd_failed_direct_kill_already_destroyed "
+                    "telemetry raised root=%s child=%s",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+        except SandboxBindingMissing:
+            # R8-6 — terminal-success branch (binding gone). Same
+            # reasoning as the AlreadyDestroyed branch above: clear stale
+            # per-child tracking so the orphan tick doesn't re-cascade.
+            self._clear_child_tracking(child_id)
+            try:
+                await self._ctx.telemetry.emit(
+                    "mailbox.cascade_xadd_failed_direct_kill_binding_missing",
+                    {
+                        "child_session_id": child_id,
+                        "reason": reason,
+                        "destroy_reason": destroy_reason.value,
+                        "synthetic_envelope_id": synthetic_envelope_id,
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade_xadd_failed_direct_kill_binding_missing "
+                    "telemetry raised root=%s child=%s",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+        except SandboxLifecycleError as e:
+            # codex r7 [R7-7, HIGH CONTRACT] — earlier rounds logged +
+            # returned, after which the orphan tick / cancel auto-escalate
+            # cleared per-child tracking → cascade was lost (no future
+            # tick will retry; no PEL entry exists since XADD failed; no
+            # in-memory state remains). Signal the caller via
+            # ``_CascadeFailedError`` so it preserves tracking and the
+            # next ``_ORPHAN_CHECK_INTERVAL_S`` / cancel tick retries the
+            # cascade end-to-end (Option A + C combined from the R7-7
+            # finding).
+            logger.exception(
+                "cascade publish failed AND direct destroy raised "
+                "SandboxLifecycleError root=%s child=%s reason=%s err=%s — "
+                "raising _CascadeFailedError so caller preserves tracking "
+                "for next-tick retry",
+                self._ctx.root_session_id,
+                child_id,
+                reason,
+                e,
+            )
+            try:
+                await self._ctx.telemetry.emit(
+                    "mailbox.cascade_xadd_failed_direct_kill_retryable_failed",
+                    {
+                        "child_session_id": child_id,
+                        "reason": reason,
+                        "destroy_reason": destroy_reason.value,
+                        "synthetic_envelope_id": synthetic_envelope_id,
+                        "error": str(e),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade_xadd_failed_direct_kill_retryable_failed "
+                    "telemetry raised root=%s child=%s",
+                    self._ctx.root_session_id,
+                    child_id,
+                )
+            raise _CascadeFailedError(
+                f"cascade publish + direct destroy both failed "
+                f"child={child_id} reason={reason} err={e}"
+            ) from e
+        else:
+            # codex r8 [R8-6, MEDIUM CONTRACT] — destroy succeeded via the
+            # direct-kill fallback (XADD failed but the local destroy
+            # call landed). The child is gone; per-child tracking is now
+            # stale and the orphan tick would otherwise see the lingering
+            # ``_last_seen_mono[child]`` and re-cascade. Mirror the
+            # terminal-handler invariant (F7+F9 / R4-4) here so the
+            # direct-kill path leaves tracking in the same clean state
+            # the normal CancelRequestHandler.TERMINATE path produces.
+            self._clear_child_tracking(child_id)
+            try:
+                await self._ctx.telemetry.emit(
+                    "mailbox.cascade_xadd_failed_direct_kill",
+                    {
+                        "child_session_id": child_id,
+                        "reason": reason,
+                        "destroy_reason": destroy_reason.value,
+                        "synthetic_envelope_id": synthetic_envelope_id,
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "cascade_xadd_failed_direct_kill telemetry raised "
+                    "root=%s child=%s",
+                    self._ctx.root_session_id,
+                    child_id,
+                )

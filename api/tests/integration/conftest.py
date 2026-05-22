@@ -15,6 +15,7 @@ CI: ci.yml:13-22 单独启动 postgres 容器，映射 5432，库名 manus_test�
 默认值使用 CI 环境（manus_test），本地开发者需显式设置环境变量。
 """
 
+import asyncio
 import os
 import uuid as _uuid
 from pathlib import Path
@@ -858,3 +859,321 @@ def fake_skill_tool_with_high_risk_binding(tmp_path):
             return binding["final_risk"]
 
     return _FakeSkillTool(root=skills_root)
+
+
+# ── C3 PR-4 Phase H — Mailbox supervisor integration harness ────────────────
+#
+# Plan reference: docs/superpowers/plans/2026-05-21-c3-mailbox-control-protocol.md
+# §"Phase H — Integration tests T1, T4, T7, T11" lines 4804-5113.
+#
+# Fixtures added here (alongside the existing ``redis_client``):
+#   - ``sandbox_lifecycle_spy`` — records destroy/suspend calls; can be
+#     configured to raise on destroy via ``set_destroy_side_effect``.
+#   - ``child_session_in_db`` — FK-satisfied root + child session rows;
+#     yields the child ORM row exposing ``.id`` / ``.parent_session_id``.
+#   - ``mailbox_envelope_factory`` — synchronous builder for
+#     ``MailboxEnvelope`` with sane defaults; tests override only what they need.
+#   - ``full_supervisor_stack`` — yields ``(supervisor, ctx, audit_repo,
+#     publisher, task)`` where ``task`` is the ``asyncio.Task`` running the
+#     supervisor (codex F10 fix — the harness comment previously claimed
+#     ``registry`` as the 5th tuple element, but the fixture body yields
+#     the bare task; there is no SupervisorRegistry instantiation here).
+#     Backed by real Postgres (via ``async_session_factory``) + real Redis
+#     (via ``redis_client``) + DI-injected ``sandbox_lifecycle_spy``.
+#
+# Auto-deactivating skipif in ``test_mailbox_crash_recovery.py`` /
+# ``test_mailbox_supervisor_lifecycle.py`` checks for these names at module
+# import time and activates the previously-skipped tests as soon as the
+# fixtures land.
+
+
+@pytest.fixture
+def sandbox_lifecycle_spy():
+    """Recording spy for ``_SandboxLifecycleProtocol`` (mailbox_supervisor.py).
+
+    Records every ``destroy(session_id, reason)`` and ``suspend(session_id)``
+    call in ``.destroy_calls`` / ``.suspend_calls`` (each entry is a
+    ``{"session_id": str, "reason": Any}`` dict).
+
+    ``set_destroy_side_effect(exc_factory)`` makes every subsequent ``destroy``
+    call raise ``exc_factory()`` (a zero-arg callable returning an Exception).
+    Pass ``None`` to clear. The semantics deliberately do NOT limit to "next N
+    calls" — T11 needs destroy to keep raising past
+    ``MAILBOX_POISON_MAX_RECLAIM`` retries until poison drop kicks in.
+    """
+
+    class _SandboxLifecycleSpy:
+        def __init__(self) -> None:
+            self.destroy_calls: list[dict] = []
+            self.suspend_calls: list[dict] = []
+            self._destroy_exc_factory = None
+
+        def set_destroy_side_effect(self, exc_factory) -> None:
+            """``exc_factory`` is a zero-arg callable returning an Exception
+            instance (e.g. ``lambda: SandboxLifecycleError("boom")``). Pass
+            ``None`` to reset to the default no-raise behavior.
+            """
+            self._destroy_exc_factory = exc_factory
+
+        async def destroy(self, session_id: str, reason) -> None:
+            self.destroy_calls.append({"session_id": session_id, "reason": reason})
+            if self._destroy_exc_factory is not None:
+                raise self._destroy_exc_factory()
+
+        async def suspend(self, session_id: str) -> None:
+            self.suspend_calls.append({"session_id": session_id})
+
+    return _SandboxLifecycleSpy()
+
+
+@pytest.fixture
+async def child_session_in_db(db_session, sample_user, full_supervisor_stack):
+    """Flush a child ``SessionModel`` row whose ``parent_session_id`` matches
+    the supervisor stack's root, with ``worker_type='subagent'``,
+    ``subagent_control_plane='mailbox'``, ``status='running'``.
+
+    Codex r3 [R3-2, HIGH TEST] — the fixture used to build its OWN root row
+    distinct from ``full_supervisor_stack``'s root. Tests then routed
+    envelopes via ``ctx.root_session_id`` (the stack's root) but used the
+    child whose actual ancestor was the other orphan root. The cross-root
+    guard in ``_handle_envelope`` was the only thing masking the
+    inconsistency — and R3-1's publisher contract assertion (negative test
+    in ``test_mailbox_cross_root_guard.py``) makes that masking explicit.
+
+    Now ``child_session_in_db`` depends on ``full_supervisor_stack`` so the
+    child is linked to the SAME root row the supervisor owns. ``ctx``-routed
+    envelopes thus match the child's real ancestor chain.
+
+    Yields the child SessionModel ORM row — exposes ``.id`` and
+    ``.parent_session_id``. FK on ``sessions.parent_session_id`` is satisfied
+    because ``full_supervisor_stack`` already flushed the root row.
+    """
+    from app.infrastructure.models.session import SessionModel
+
+    # Inherit the root from full_supervisor_stack so the child + supervisor
+    # share a coherent root_session_id.
+    _supervisor, ctx, _audit_repo, _publisher, _task = full_supervisor_stack
+    root_id = ctx.root_session_id
+    child_id = f"child-c3h-{_uuid.uuid4().hex[:12]}"
+
+    child_row = SessionModel(
+        id=child_id,
+        user_id=sample_user.id,
+        parent_session_id=root_id,
+        status="running",
+        title="c3 ph mailbox child",
+        task_id=child_id,
+        execution_mode="foreground",
+        execution_phase="running",
+        retry_budget_remaining=3,
+        was_background=False,
+        worker_type="subagent",
+        subagent_control_plane="mailbox",
+    )
+    db_session.add(child_row)
+    await db_session.flush()
+    yield child_row
+
+
+@pytest.fixture
+def mailbox_envelope_factory():
+    """Synchronous builder for ``MailboxEnvelope`` with sane defaults.
+
+    Caller overrides any field via kwargs::
+
+        env = mailbox_envelope_factory(
+            envelope_id="01HSPYU0t1d00000000000000",
+            type=MailboxEnvelopeType.RESULT_READY,
+            parent_session_id=root_id,
+            child_session_id=child_id,
+            payload=ResultReadyPayload(...).model_dump(mode="json"),
+        )
+    """
+    from datetime import datetime, timezone
+
+    from app.domain.models.mailbox_envelope import (
+        MailboxEnvelope,
+        MailboxEnvelopeType,
+        ProducerRole,
+        ProgressKind,
+        ProgressUpdatePayload,
+        ProgressVisibility,
+    )
+
+    def _make(**overrides) -> MailboxEnvelope:
+        defaults: dict = dict(
+            envelope_id=f"env-{_uuid.uuid4().hex[:12]}",
+            type=MailboxEnvelopeType.PROGRESS_UPDATE,
+            parent_session_id=f"parent-{_uuid.uuid4().hex[:8]}",
+            child_session_id=f"child-{_uuid.uuid4().hex[:8]}",
+            correlation_id=f"corr-{_uuid.uuid4().hex[:12]}",
+            emitted_at=datetime.now(tz=timezone.utc),
+            producer_role=ProducerRole.CHILD_AGENT,
+            payload=ProgressUpdatePayload(
+                kind=ProgressKind.HEARTBEAT,
+                visibility=ProgressVisibility.HIDDEN,
+            ).model_dump(mode="json"),
+        )
+        defaults.update(overrides)
+        return MailboxEnvelope(**defaults)
+
+    return _make
+
+
+@pytest.fixture
+async def full_supervisor_stack(
+    db_session,
+    async_session_factory,
+    redis_client,
+    sandbox_lifecycle_spy,
+    sample_user,
+):
+    """Spawn one ``MailboxSupervisor`` task bound to a fresh root session.
+
+    Yields a tuple ``(supervisor, ctx, audit_repo, publisher, task)``:
+
+      - ``supervisor`` — the live ``MailboxSupervisor`` instance
+      - ``ctx`` — the ``SupervisorContext`` (also exposes ``root_session_id``,
+        ``telemetry`` collecting stub, ``now()`` for envelope timestamps)
+      - ``audit_repo`` — ``DbMailboxEnvelopeAuditRepository`` bound to the
+        test ``async_session_factory``
+      - ``publisher`` — ``RedisMailboxPublisher`` bound to ``redis_client``
+      - ``task`` — the running ``asyncio.Task``
+
+    Implementation notes:
+      - ``redis_client`` is a thin wrapper exposing the underlying
+        ``redis.asyncio.Redis``; we pass the wrapper through — the supervisor
+        only invokes ``.xreadgroup`` / ``.xack`` / ``.xautoclaim`` / ``.set``
+        etc., all of which the wrapper forwards via ``__getattr__``.
+      - The root session is flushed BUT not committed (rolled back at
+        teardown via ``db_session``). The audit repo, however, uses its own
+        independent session per call — meaning audit rows it writes DO commit
+        and persist across teardown. Tests assert against the audit repo's
+        ``fetch_raw`` reads (which see the committed rows). The transactional
+        gap is documented in ``planner_react_with_compactor``'s docstring.
+      - The supervisor's tight tick intervals (``_CANCEL_CHECK_INTERVAL_S`` /
+        ``_ORPHAN_CHECK_INTERVAL_S``) stay at module defaults; individual
+        tests monkeypatch attributes directly when they need faster cascades.
+    """
+    import uuid as _uid
+
+    from app.application.services.mailbox_supervisor import (
+        MailboxSupervisor,
+        SupervisorContext,
+    )
+    from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+        RedisMailboxPublisher,
+    )
+    from app.infrastructure.repositories.db_mailbox_envelope_audit_repository import (
+        DbMailboxEnvelopeAuditRepository,
+    )
+
+    # Each test gets a unique root id so module-scoped DB / Redis state
+    # doesn't bleed across tests.
+    root_session_id = f"root-c3h-stack-{_uid.uuid4().hex[:12]}"
+    pod_id = f"pod-test-{_uid.uuid4().hex[:6]}"
+    instance_id = f"i{_uid.uuid4().hex[:6]}"
+
+    # Persist the root session row so any FK lookups during audit /
+    # supervisor flow find a real parent.
+    #
+    # codex r3 [R3-2, HIGH TEST] fixture chain — ``child_session_in_db``
+    # was reworked to DEPEND on ``full_supervisor_stack``: it now derives
+    # its ``parent_session_id`` from ``ctx.root_session_id`` (this same
+    # ``root_session_id`` built one line above), not its own freshly-
+    # minted orphan root. See ``child_session_in_db`` lines 953-956 for
+    # the inverse hand-off (``ctx = full_supervisor_stack; root_id =
+    # ctx.root_session_id``).
+    #
+    # codex r4 [R4-6, LOW DOC] — the canonical pattern for tests that
+    # need a child wired up to this supervisor is ``async def test_x(
+    # full_supervisor_stack, child_session_in_db, ...)``: pytest resolves
+    # ``full_supervisor_stack`` first (this fixture), then
+    # ``child_session_in_db`` re-injects the same fixture instance and
+    # derives the child's ``parent_session_id`` from ``ctx.root_session_id``.
+    # Tests should route envelopes via ``ctx.root_session_id`` (the
+    # supervisor's root) and ``child_session_in_db.id`` — those two
+    # always belong to the same ancestor chain after R3-2.
+    from app.infrastructure.models.session import SessionModel
+
+    root_row = SessionModel(
+        id=root_session_id,
+        user_id=sample_user.id,
+        status="running",
+        title="c3 ph supervisor stack root",
+        task_id=root_session_id,
+        execution_mode="foreground",
+        execution_phase="running",
+        retry_budget_remaining=3,
+        was_background=False,
+        worker_type="root",
+    )
+    db_session.add(root_row)
+    await db_session.flush()
+
+    audit_repo = DbMailboxEnvelopeAuditRepository(
+        session_factory=async_session_factory,
+    )
+    publisher = RedisMailboxPublisher(redis_client)
+
+    # In-process callback stub — records every envelope dispatched to the
+    # in-process agent service. Tests can introspect ``.received``.
+    class _StubAgentCallback:
+        def __init__(self) -> None:
+            self.received: list = []
+
+        async def __call__(self, envelope) -> None:
+            self.received.append(envelope)
+
+    agent_service_callback = _StubAgentCallback()
+
+    # Telemetry collecting stub — supervisor emits e.g.
+    # ``mailbox.poison_message_dropped`` / ``mailbox.cascade_*``;
+    # tests assert via the recorded list of (name, data) tuples.
+    class _StubTelemetry:
+        def __init__(self) -> None:
+            self.emitted: list[tuple[str, dict]] = []
+
+        async def emit(self, name: str, data: dict) -> None:
+            self.emitted.append((name, data))
+
+    telemetry = _StubTelemetry()
+
+    ctx = SupervisorContext(
+        root_session_id=root_session_id,
+        pod_id=pod_id,
+        instance_id=instance_id,
+        redis=redis_client,
+        audit_repo=audit_repo,
+        publisher=publisher,
+        sandbox_lifecycle=sandbox_lifecycle_spy,
+        agent_service_callback=agent_service_callback,
+        telemetry=telemetry,
+    )
+
+    # Expose extra hooks tests need (mirror unit-test fixture shape).
+    ctx.agent_callback = agent_service_callback  # type: ignore[attr-defined]
+    ctx.telemetry = telemetry  # type: ignore[attr-defined]
+
+    sup = MailboxSupervisor(
+        ctx,
+        block_ms=0,  # non-blocking — see PR-3a comment
+        idle_poll_sleep_s=0.05,
+    )
+    task = asyncio.create_task(sup.run())
+    # Give the supervisor a tick to ensure_group + initial xautoclaim.
+    await asyncio.sleep(0.1)
+
+    try:
+        yield sup, ctx, audit_repo, publisher, task
+    finally:
+        try:
+            await sup.stop(drain_timeout_s=2.0)
+        except Exception:
+            pass
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass

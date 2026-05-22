@@ -129,6 +129,25 @@ class ResultReadyPayload(BaseModel):
 
 
 class CancelRequestPayload(BaseModel):
+    """Spec §7.6 — cancel request payload.
+
+    Wire schema is frozen at C3 ship: ``{reason, policy}``. NO other
+    fields belong here.
+
+    codex r6 [R6-2, HIGH CONTRACT] — earlier rounds (R2-6, R3-6) added an
+    optional ``destroy_reason`` to thread ``DestroyReason.ORPHAN_TIMEOUT``
+    from orphan/poison cascades into the TERMINATE handler. That broke
+    the frozen wire schema (external consumers, spec-conformance tests,
+    type-checkers all saw a new field) and forced an R3-6 producer_role
+    guard to defuse the hostile-override attack the field opened. R6-2
+    restores the spec by moving the override to an in-process side-table
+    on ``MailboxSupervisor`` (keyed by synthetic envelope_id, populated
+    by ``_emit_cascade_terminate`` BEFORE publish, consumed/popped by
+    ``CancelRequestHandler._terminate_outcome``). The side-table is
+    supervisor-private; external producers cannot reach it, so the
+    R3-6 guard is moot and the wire stays clean.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True)
     reason: str
     policy: CancelPolicy

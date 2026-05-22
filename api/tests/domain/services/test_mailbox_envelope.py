@@ -144,6 +144,37 @@ def test_envelope_rejects_cancel_request_with_deprecated_force_field():
         ))
 
 
+def test_cancel_request_payload_wire_schema_frozen_at_reason_policy():
+    """codex r6 [R6-2, HIGH CONTRACT] — CancelRequestPayload wire schema is
+    frozen at C3 ship at ``{reason, policy}``. The R2-6 ``destroy_reason``
+    field was moved off the wire to a supervisor-private side-table; the
+    payload model must reject any attempt to set it (``extra="forbid"``).
+    """
+    # Positive: schema accepts the canonical fields.
+    p = CancelRequestPayload(reason="user_cancel", policy=CancelPolicy.TERMINATE)
+    assert set(p.model_dump().keys()) == {"reason", "policy"}
+
+    # Negative: destroy_reason is no longer part of the payload schema.
+    with pytest.raises(ValidationError):
+        CancelRequestPayload(  # type: ignore[call-arg]
+            reason="orphan_timeout",
+            policy=CancelPolicy.TERMINATE,
+            destroy_reason="orphan_timeout",
+        )
+
+    # Envelope-level validator also rejects the extra field so a hostile
+    # producer cannot publish a CANCEL_REQUEST with destroy_reason on the wire.
+    with pytest.raises(ValidationError):
+        MailboxEnvelope(**_envelope_kwargs(
+            type=MailboxEnvelopeType.CANCEL_REQUEST,
+            payload={
+                "reason": "x",
+                "policy": "TERMINATE",
+                "destroy_reason": "orphan_timeout",
+            },
+        ))
+
+
 def test_envelope_rejects_approval_request_missing_tool_call_id():
     """tool_call_id is required on ApprovalRequestPayload; envelope must
     surface the violation even though it stores payload as dict[str, Any]."""

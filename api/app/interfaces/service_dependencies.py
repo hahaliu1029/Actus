@@ -498,18 +498,32 @@ _last_refresh_generation: int = 0
 _refresh_lock = threading.Lock()
 
 
-# codex r4 [HIGH CONTRACT] — PR-4 readiness gate (see ``build_supervisor_registry``).
+# codex r4 [HIGH CONTRACT] — PR-4.5 readiness gate (see ``build_supervisor_registry``).
 #
-# Flip to ``True`` ONLY in the PR-4 change that ships real
-# ResultReadyHandler / CancelAckHandler with ``SandboxLifecycleService.destroy``
-# side-effects per spec §7.3. Until then, ``build_supervisor_registry``
-# refuses to construct a registry so an operator who flips
-# ``MAILBOX_SUPERVISOR_ENABLED=True`` at PR-3c gets a hard lifespan failure
-# instead of silent sandbox leaks (stub handlers ACK terminal envelopes
-# without destroy — see ``app/application/services/mailbox_supervisor.py:167``).
+# The flag stays ``False`` through PR-4 and is flipped ONLY by PR-4.5, in
+# the SAME commit that replaces ``_pr3c_noop_callback`` (line ~680) with a
+# real ``AgentService.stop_session`` bridge. PR-4 ships the real terminal
+# handlers (ResultReadyHandler / CancelAckHandler / CancelRequestHandler
+# with ``SandboxLifecycleService.destroy`` side-effects per spec §7.3-§7.6;
+# ApprovalRequestHandler stub-denies per codex r5 veto; HandoffRequestHandler
+# emits telemetry only per spec §6.6) but the in-process
+# ``agent_service_callback`` is STILL ``_pr3c_noop_callback``. Until PR-4.5
+# swaps the callback, ``build_supervisor_registry`` refuses to construct a
+# registry so an operator who flips ``MAILBOX_SUPERVISOR_ENABLED=True`` gets
+# a hard lifespan failure instead of CancelRequestHandler TERMINATE step 1
+# silently no-op'ing while step 2 destroys a still-running asyncio.Task
+# (spec §7.6 "stop → destroy" violation).
 #
-# Tests that need to construct the registry (e.g. integration harness fixtures
-# in PR-4 / PR-4.5) patch this to ``True`` via ``monkeypatch.setattr``.
+# codex r2 [R2-1, HIGH ARCH] — flipping ONLY this flag (or ONLY swapping
+# the callback) without the matching change in the same commit violates
+# spec §7.6 and re-opens the leak this gate blocks. PR-4.5 is the single
+# atomic commit that lands both halves.
+#
+# Tests that need to construct the registry (e.g. integration harness
+# fixtures in PR-4 / PR-4.5) patch this to ``True`` via
+# ``monkeypatch.setattr``. The locked gate is asserted by
+# ``tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py``
+# (covers both the flag-False path and the callback-still-noop path).
 _PR4_TERMINAL_HANDLERS_READY: bool = False
 
 
@@ -549,15 +563,22 @@ def build_supervisor_registry(
     production (the flag defaults to False); when PR-4 ships the real
     callback, the factory below at line ~602 is the single edit site.
 
-    codex r4 [HIGH CONTRACT] fail-closed gate: ``MailboxSupervisor`` is
-    still using the PR-3a stub dispatch table (terminal handlers ACK
-    ``RESULT_READY`` / ``CANCEL_ACK`` WITHOUT calling
-    ``SandboxLifecycleService.destroy``). If an operator flips
-    ``mailbox_supervisor_enabled=True`` before PR-4 lands the real
-    terminal handlers + before PR-4.5 lands publishers + AgentService
-    helper, the supervisor would silently drain terminal envelopes →
-    sandboxes leak with no destroy. The constant below is the single
-    place PR-4 flips to ``True`` once real handlers are wired; until
+    codex r4 [HIGH CONTRACT] fail-closed gate (refined by codex r5 [R5-5]
+    after PR-4 shipped real terminal handlers): the supervisor's dispatch
+    table is no longer the PR-3a stub — PR-4 landed
+    :class:`ResultReadyHandler`, :class:`CancelAckHandler`,
+    :class:`CancelRequestHandler`, :class:`ApprovalRequestHandler`, and
+    :class:`HandoffRequestHandler` which DO call
+    ``SandboxLifecycleService.destroy``. The remaining stub is the
+    ``agent_service_callback`` parameter, still wired to
+    ``_pr3c_noop_callback``. CancelRequestHandler TERMINATE step 1 calls
+    that callback to stop the agent loop **before** step 2 destroys the
+    sandbox (spec §7.6 stop → destroy ordering). If the noop callback is
+    in place and the gate is flipped, step 1 silently no-ops and step 2
+    destroys a still-running asyncio.Task — half-baked production
+    deployment. PR-4.5 is the SINGLE commit that replaces
+    ``_pr3c_noop_callback`` with a real ``AgentService.stop_session``
+    bridge AND flips ``_PR4_TERMINAL_HANDLERS_READY`` to ``True``; until
     then this function raises ``RuntimeError`` so lifespan fails closed
     on misconfiguration. Tests can bypass via patch of
     ``_PR4_TERMINAL_HANDLERS_READY``.
@@ -565,13 +586,27 @@ def build_supervisor_registry(
     if not _PR4_TERMINAL_HANDLERS_READY:
         raise RuntimeError(
             "build_supervisor_registry: mailbox_supervisor_enabled=True is "
-            "not safe yet — the supervisor's PR-3a stub dispatch table ACKs "
-            "RESULT_READY / CANCEL_ACK envelopes WITHOUT destroying the "
-            "subagent sandbox, so enabling now would leak sandboxes on "
-            "every terminal envelope. PR-4 ships the real terminal handlers "
-            "and flips _PR4_TERMINAL_HANDLERS_READY in this module. Either "
-            "wait for PR-4 to land, or set MAILBOX_SUPERVISOR_ENABLED=False "
-            "(the default) in your .env."
+            "not safe yet. PR-4 shipped the real terminal handlers "
+            "(ResultReady / CancelAck / CancelRequest / ApprovalRequest / "
+            "Handoff) that call SandboxLifecycleService.destroy, so the "
+            "dispatch table is no longer the PR-3a stub. What is STILL "
+            "stub is the in-process ``agent_service_callback``, which is "
+            "wired to ``_pr3c_noop_callback``. CancelRequestHandler "
+            "TERMINATE branch executes step 1 (callback → stop the agent "
+            "task cooperatively) BEFORE step 2 (destroy the sandbox) per "
+            "spec §7.6 stop → destroy ordering. With the noop callback in "
+            "place, step 1 silently no-ops and step 2 destroys a still-"
+            "running task — that's the leak/half-baked-deploy this gate "
+            "blocks. PR-4.5 is the SINGLE commit that swaps "
+            "`_pr3c_noop_callback` for `AgentService.stop_session` AND "
+            "flips `_PR4_TERMINAL_HANDLERS_READY` to True; flipping only "
+            "one half violates spec §7.6. The locked gate test is "
+            "tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py"
+            "::test_callback_is_still_noop_pending_pr_4_5 (codex r6 [R6-5] — "
+            "reference by name not line range so the message stays accurate "
+            "across future edits). Either wait for PR-4.5 to land both halves, "
+            "or set MAILBOX_SUPERVISOR_ENABLED=False (the default) in your "
+            ".env."
         )
     from app.application.services.mailbox_supervisor import (
         MailboxSupervisor,
