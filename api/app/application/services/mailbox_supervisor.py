@@ -56,6 +56,7 @@ from app.domain.models.session import DestroyReason
 from app.domain.repositories.mailbox_envelope_audit_repository import (
     MailboxEnvelopeAuditRepository,
 )
+from app.domain.repositories.session_repository import SessionRepository
 from app.infrastructure.external.mailbox.redis_mailbox_consumer import (
     RedisMailboxConsumer,
 )
@@ -211,6 +212,28 @@ class SupervisorContext:
     # fallback path lives at
     # ``test_mailbox_supervisor.py::test_cascade_override_lost_after_supervisor_restart_falls_back_to_force_terminate``.
     cascade_destroy_overrides: dict = field(default_factory=dict)
+    # C3 PR-5 (spec §11.6 rollback runbook + R1 P2.2) — optional plumbing
+    # for ``MailboxSupervisor._check_should_stop_for_rollback``.
+    #
+    # ``session_repo`` is the read-only session repository the supervisor
+    # uses to detect "all my subagent children are now legacy-plane" — that
+    # condition fires after the operator runs the §11.6 rollback SQL
+    # (UPDATE sessions SET subagent_control_plane='legacy' WHERE
+    # root_session_id=... AND subagent_control_plane='mailbox'). Optional
+    # because PR-3a/3b/3c-era unit tests construct contexts without DI;
+    # the rollback-check method early-returns when None.
+    #
+    # ``stop_self_callback`` is the registry-injected hook for
+    # ``_check_should_stop_for_rollback`` to pop this supervisor's slot from
+    # ``SupervisorRegistry._slots`` AND cancel its run task in one shot.
+    # ``MailboxSupervisor.stop()`` alone only signals the run loop to exit —
+    # the slot stays in ``_slots`` (showing as "crashed" in ``health_check``)
+    # until ``registry.stop(root_session_id)`` is invoked. The registry
+    # binds this callback at ``spawn`` time (same pattern as
+    # ``register_cancel_state``); pre-PR-5 paths that never bind leave the
+    # supervisor to ``self.stop()`` only — backward-compatible.
+    session_repo: Optional[SessionRepository] = None
+    stop_self_callback: Optional[Callable[[], Awaitable[None]]] = None
 
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -1391,6 +1414,15 @@ class MailboxSupervisor:
     # same reason.
     _CANCEL_CHECK_INTERVAL_S: float = 1.0
     _ORPHAN_CHECK_INTERVAL_S: float = 5.0
+    # C3 PR-5 (spec §11.6 rollback runbook) — operator runs the rollback
+    # SQL out of band; the supervisor needs to detect that all live
+    # subagent children flipped to legacy and stop itself on the next
+    # tick. codex r3 [HIGH CONTRACT] — 5s cadence (matched to orphan
+    # check) keeps the M1 race window between SQL apply + supervisor
+    # exit short; the predicate also runs BEFORE entry dispatch in
+    # ``run()`` so the supervisor doesn't process new mailbox work
+    # within a tick of detecting rollback.
+    _ROLLBACK_CHECK_INTERVAL_S: float = 5.0
 
     def __init__(
         self,
@@ -1485,6 +1517,8 @@ class MailboxSupervisor:
         # ``_initial_xautoclaim`` returns).
         self._last_cancel_check_mono: float = 0.0
         self._last_orphan_check_mono: float = 0.0
+        # C3 PR-5 (spec §11.6) — see ``_maybe_tick_check_rollback``.
+        self._last_rollback_check_mono: float = 0.0
         # codex r6 [R6-2, HIGH CONTRACT] — supervisor-private side-table
         # mapping synthetic envelope_id → DestroyReason override.
         # ``_emit_cascade_terminate`` populates BEFORE publish; the
@@ -1525,6 +1559,18 @@ class MailboxSupervisor:
             await self._initial_xautoclaim()
             while not self._stopping.is_set():
                 try:
+                    # C3 PR-5 spec §11.6 rollback runbook (codex r3 [HIGH
+                    # CONTRACT]) — check rollback BEFORE consuming new
+                    # mailbox entries / dispatching handlers, so the
+                    # supervisor doesn't fire destroy() on a row whose
+                    # control_plane just flipped to legacy. Throttled to
+                    # _ROLLBACK_CHECK_INTERVAL_S so the DB query is
+                    # bounded; if the check decides to stop it sets
+                    # _stopping eagerly so this iteration's read does
+                    # not block long.
+                    await self._maybe_tick_check_rollback()
+                    if self._stopping.is_set():
+                        break
                     entries = await self._consumer.read(
                         count=self._count,
                         block_ms=self._block_ms,
@@ -1568,6 +1614,12 @@ class MailboxSupervisor:
                     # last_seen_mono is older than
                     # SUBAGENT_PROGRESS_STALE_AFTER_SECONDS.
                     await self._maybe_tick_check_orphans()
+                    # (C3 PR-5 rollback check now runs at the TOP of
+                    # this try-block — before consuming entries — so
+                    # the supervisor doesn't dispatch new mailbox work
+                    # after the operator has flipped child rows to
+                    # legacy. See ``_maybe_tick_check_rollback`` and
+                    # codex r3 [HIGH CONTRACT] rationale.)
                     if not entries and self._idle_poll_sleep_s > 0:
                         await asyncio.sleep(self._idle_poll_sleep_s)
                 except asyncio.CancelledError:
@@ -2703,6 +2755,250 @@ class MailboxSupervisor:
             # direct-kill fallback (reusing the
             # ``_cascade_destroy_overrides`` entry for ORPHAN_TIMEOUT).
             self._last_seen_mono.pop(child_id, None)
+
+    async def _check_should_stop_for_rollback(self) -> None:
+        """C3 PR-5 (spec §11.6 rollback runbook + R1 P2.2 NULL-coalesce).
+
+        After the operator runs the rollback SQL
+
+            UPDATE sessions
+               SET subagent_control_plane = 'legacy'
+             WHERE root_session_id = :root_id
+               AND subagent_control_plane = 'mailbox';
+
+        every live subagent child of this root becomes legacy-plane (their
+        AgentService finalize path will then own destroy via the four gated
+        suspend sites in ``app/application/services/agent_service.py``).
+        Once that happens this supervisor has no further work to do — every
+        SPAWN_REQUEST it would dispatch belongs to a session whose
+        ``subagent_control_plane`` has been rolled back — so it stops
+        itself.
+
+        **R1 P2.2 NULL-coalesce.** Pre-C3 backfill leaves
+        ``subagent_control_plane`` as NULL for legacy-managed children; the
+        rollback SQL above skips them because ``NULL <> 'mailbox'``. A
+        naive ``all(c.subagent_control_plane == 'legacy')`` check would
+        then BLOCK the rollback because NULL ≠ 'legacy'. The fix is to
+        coalesce: ``(c.subagent_control_plane or 'legacy') == 'legacy'``
+        so NULL and 'legacy' are both treated as canonical legacy.
+
+        Optional plumbing: tests and pre-PR-5 callers that build a
+        ``SupervisorContext`` without ``session_repo`` get a safe no-op;
+        the method also early-returns on any read failure rather than
+        raising into the run loop. When ``stop_self_callback`` is wired
+        (DI factory case) we schedule it via ``asyncio.create_task`` so
+        the registry's ``stop`` pops the slot and cancels the run task
+        AND ``health_check`` stops listing the root. When the callback
+        is absent (direct construction in tests) we only set
+        ``self._stopping`` so the run loop exits on the next iteration;
+        the slot, if any, remains until external cleanup
+        (``stop_all`` / ``stop`` / restart-loop reaping). The eager
+        ``_stopping.set()`` runs in both cases so cancel propagation
+        timing doesn't gate the exit.
+
+        **Live-row filter (codex r3/r4 [HIGH CONTRACT]).** Terminal
+        rows (``completed`` / ``timed_out``) keep their
+        ``subagent_control_plane='mailbox'`` value because their
+        ``destroy`` already ran. A naive "all subagents are legacy"
+        predicate would then never converge after rollback because of
+        the leftover terminal rows. The predicate therefore considers
+        only NON-terminal rows — ``status NOT IN ('completed',
+        'timed_out')``. This is BROADER than spec §11.6's rollback SQL
+        (which only flips ``status IN ('running','finishing',
+        'pending')``); it intentionally also covers WAITING /
+        TAKEOVER* statuses that the spec SQL omits but the repo's
+        live-set definition (``domain/repositories/session_repository.py:97``)
+        includes. The spec doc itself needs a follow-up doc PR to
+        align — until then the runtime predicate is the authoritative
+        contract.
+
+        Invocation: PR-5 wires this method into the main run loop via
+        ``_maybe_tick_check_rollback`` (throttled to
+        ``_ROLLBACK_CHECK_INTERVAL_S``). No HTTP admin route is exposed
+        in PR-5; the integration tests in
+        ``tests/integration/test_mailbox_migration.py`` exercise the
+        method via direct supervisor construction. A future PR can
+        wire an admin/cli entry point if operators want to force the
+        check between ticks.
+
+        **Self-cancel safety (codex r2 [HIGH CONTRACT]).** The registry-
+        injected ``stop_self_callback`` is
+        ``lambda: registry.stop(root_session_id)``, which does
+        ``self._slots.pop(...)`` → ``slot.task.cancel()`` →
+        ``await slot.task``. When invoked from within the supervisor's
+        own run loop (i.e. from this tick), ``slot.task`` IS the current
+        task — awaiting it would deadlock. The fix is to fire the
+        callback as a separate task (``asyncio.create_task``) so the
+        cancel propagates into the current task without awaiting it,
+        AND eagerly set ``self._stopping`` so the run loop also exits
+        on the next iteration if the cancel propagation is delayed.
+        ``SupervisorRegistry._restart_crashed`` treats cancelled tasks
+        as clean shutdown (not crashes) and does NOT resurrect the
+        slot, so the supervisor stays dead post-rollback.
+        """
+        repo = self._ctx.session_repo
+        if repo is None:
+            return  # no DI plumbing — caller intentionally not wired
+
+        try:
+            root = await repo.get_by_id(self._ctx.root_session_id)
+        except Exception:
+            logger.warning(
+                "rollback-stop check: get_by_id(root=%s) failed; skipping",
+                self._ctx.root_session_id,
+                exc_info=True,
+            )
+            return
+        if root is None:
+            return  # root deleted — supervisor will be reaped elsewhere
+
+        try:
+            children = await repo.find_descendants(
+                self._ctx.root_session_id,
+                user_id=root.user_id,
+                max_depth=1,
+                limit=1024,
+            )
+        except Exception:
+            logger.warning(
+                "rollback-stop check: find_descendants(root=%s) failed; skipping",
+                self._ctx.root_session_id,
+                exc_info=True,
+            )
+            return
+
+        # codex r4 [HIGH CONTRACT] — "non-terminal" must mirror the
+        # repository's authoritative definition, not the narrower spec
+        # §11.6 SQL WHERE clause. The repo's
+        # ``find_running_mailbox_subagent_sessions`` (see
+        # ``domain/repositories/session_repository.py:97``) treats
+        # ``status NOT IN ('completed', 'timed_out')`` as the live
+        # set — which intentionally includes ``WAITING`` /
+        # ``TAKEOVER_PENDING`` / ``TAKEOVER`` (paused but supervisor-
+        # owned). The spec SQL leaves those rows on ``'mailbox'``; if
+        # we filtered them OUT here, a running mailbox WAITING child
+        # would be ignored and the supervisor would stop while it
+        # still owns destroy for that child. NOT-IN-terminal also
+        # forward-protects against future non-terminal status
+        # additions. Reading status via ``_status_value`` so domain
+        # enum + raw-string both work (callers always pass domain
+        # Session objects, but defensive — repo unit tests sometimes
+        # return shaped dicts).
+        _ROLLBACK_TERMINAL_STATUSES = {"completed", "timed_out"}
+
+        def _status_value(c) -> str:
+            status = getattr(c, "status", None)
+            if status is None:
+                return ""
+            value = getattr(status, "value", None)
+            return value if isinstance(value, str) else str(status)
+
+        all_subagent_children = [
+            c for c in children if c.worker_type == "subagent"
+        ]
+        if not all_subagent_children:
+            return  # truly fresh root — no subagents yet, don't stop
+
+        live_subagent_children = [
+            c
+            for c in all_subagent_children
+            if _status_value(c) not in _ROLLBACK_TERMINAL_STATUSES
+        ]
+        if not live_subagent_children:
+            # codex r5 [HIGH CONTRACT] — DO NOT stop on "all subagents
+            # terminal". Runner's terminal sequence at
+            # ``agent_task_runner._terminal_op`` commits the DB
+            # status FIRST (line ~3118), then publishes the
+            # ``RESULT_READY``/``CANCEL_ACK`` envelope (line ~3149).
+            # The race window between these two ops would let this
+            # tick observe "all terminal" and stop the supervisor
+            # BEFORE the terminal envelope is read by
+            # ``ResultReadyHandler`` — losing the supervisor's
+            # ``destroy()`` call. Reconcile_orphans / pod restart
+            # eventually clean up, but the M1 single-writer contract
+            # is broken for that envelope window.
+            #
+            # The cost of NOT stopping here is bounded: a few ticks of
+            # supervisor + DB queries until external cleanup (pod
+            # restart, ``registry.stop``, ``stop_all``). Rollback-stop
+            # is the only safe self-stop signal — operator-driven SQL
+            # is the synchronization point, not the runner's terminal
+            # write. A future PR can add a stronger "drained PEL +
+            # all-terminal" stop signal once the PEL idle check is
+            # cheap enough.
+            return
+
+        # R1 P2.2 — NULL is canonical legacy; coalesce before comparison.
+        # Explicit ``is None`` check rather than ``or 'legacy'`` so the
+        # empty string ``''`` — should it ever appear despite the DB
+        # CHECK constraint — would still fail the predicate rather than
+        # masquerading as legacy. Matches the SQL ``COALESCE(value,
+        # 'legacy') == 'legacy'`` semantics exactly.
+        def _plane_or_legacy(c) -> str:
+            value = getattr(c, "subagent_control_plane", None)
+            return "legacy" if value is None else value
+
+        all_legacy = all(
+            _plane_or_legacy(c) == "legacy"
+            for c in live_subagent_children
+        )
+        if not all_legacy:
+            return
+
+        logger.info(
+            "rollback-stop: root=%s all %d LIVE (non-terminal) subagent "
+            "children are legacy-plane (NULL coalesced; non-terminal "
+            "matches repo definition status NOT IN ('completed','timed_out') "
+            "— covers WAITING/TAKEOVER too) — stopping supervisor (spec §11.6)",
+            self._ctx.root_session_id,
+            len(live_subagent_children),
+        )
+        # Eagerly signal the run loop to exit on the next iteration so we
+        # don't depend on cancel propagation timing.
+        self._stopping.set()
+        # Prefer registry-side stop so the slot is popped from
+        # ``SupervisorRegistry._slots`` (health_check stops listing it).
+        # Fire-and-forget — see method docstring "Self-cancel safety":
+        # awaiting ``registry.stop(rid)`` from this task would deadlock
+        # because ``registry.stop`` awaits ``slot.task`` which IS the
+        # current task. ``asyncio.create_task`` schedules it concurrently;
+        # the cancel propagates to the current run loop and ``run()``
+        # exits via CancelledError. The fire-and-forget task itself
+        # completes naturally once the run loop exits.
+        if self._ctx.stop_self_callback is not None:
+            try:
+                asyncio.create_task(
+                    self._ctx.stop_self_callback(),
+                    name=f"mailbox-sup-rollback-stop:{self._ctx.root_session_id}",
+                )
+            except Exception:
+                logger.exception(
+                    "rollback-stop: scheduling registry stop_self_callback "
+                    "failed root=%s — relying on _stopping.set() to exit run loop",
+                    self._ctx.root_session_id,
+                )
+        # If no callback is wired (e.g. direct construction in tests
+        # without the registry), ``self._stopping.set()`` above is the
+        # only signal — the run loop checks it on the next iteration.
+
+    async def _maybe_tick_check_rollback(self) -> None:
+        """C3 PR-5 (spec §11.6) — throttled wrapper around
+        ``_check_should_stop_for_rollback``. Runs at most every
+        ``_ROLLBACK_CHECK_INTERVAL_S`` from the main loop so the DB
+        query is bounded. Errors raised by the check itself are
+        swallowed inside the helper; this wrapper only enforces the
+        cadence so a transient DB blip doesn't poison the run loop.
+
+        codex r2 [HIGH CONTRACT] regression fix — PR-5 R1 shipped
+        ``_check_should_stop_for_rollback`` but forgot to wire it into
+        the tick set; spec §11.6 expects the supervisor to detect the
+        rollback SQL on the next tick. The R2 wiring closes that gap.
+        """
+        now = self._ctx.clock()
+        if now - self._last_rollback_check_mono < self._ROLLBACK_CHECK_INTERVAL_S:
+            return
+        self._last_rollback_check_mono = now
+        await self._check_should_stop_for_rollback()
 
     async def _emit_cascade_terminate(
         self,

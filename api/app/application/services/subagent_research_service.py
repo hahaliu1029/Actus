@@ -5,7 +5,16 @@ Canonical try/finally guarantees:
 2. children created serially (UoW race fix)
 3. child events streamed via asyncio.as_completed (incremental yield)
 4. summary join validated deterministically with 1× retry on fail
-5. finally: sandbox suspend per child + quota release + jsonl metric
+5. finally: quota release + jsonl metric write.
+   C3 PR-5 (spec §11.1) removed the legacy per-child
+   ``sandbox_lifecycle_service.suspend`` call — MailboxSupervisor owns
+   destroy under M1 single-writer (spec §7.3) for mailbox-plane
+   children; legacy-plane children's sandboxes are destroyed by their
+   own AgentService finalize path (the four gated suspend sites added
+   in PR-4.5 — see ``app/application/services/agent_service.py``).
+   Orphans (publish-failed children with no runner task) are reclaimed
+   by the supervisor orphan tick (spec §7.5) / reconcile_orphans
+   (PR-3c §11.7).
 
 CancelledError propagates → all running children cancelled via
 ExecutionSupervisor.request_cancel before re-raise (parent SSE
@@ -31,7 +40,6 @@ from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.models.event import BaseEvent
 from app.domain.models.session import Session
 from app.domain.services.execution_supervisor import ExecutionSupervisor
-from app.domain.services.mailbox_skip_helper import _should_skip_mailbox_lifecycle
 from app.domain.services.graphs.token_estimator import TokenEstimator
 from app.domain.services.prompts.subagent_summary_join import (
     build_summary_prompt,
@@ -104,15 +112,26 @@ class SubagentResearchService:
         # codex r3 [R3-3, HIGH ARCH] — set of child IDs whose
         # SPAWN_REQUEST publish actually succeeded during the most
         # recent ``_ensure_supervisor_and_publish_spawns`` invocation.
-        # ``run_research`` resets this per invocation; the finally-block
-        # consults it before skipping legacy suspend.
+        # ``run_research`` resets this per invocation.
+        #
+        # C3 PR-5 (codex r1 [F4, LOW DOC]) — the finally-block suspend
+        # was removed in PR-5; this set is no longer consulted by the
+        # finally. It is still populated + pruned for diagnostic /
+        # future-extension purposes (e.g. an admin endpoint that
+        # surfaces which spawns succeeded in the latest run). Removing
+        # it is a follow-up cleanup PR (M1 single-writer holds without
+        # this set today).
         self._handoff_published_child_ids: set[str] = set()
-        # codex r11 [R11-2, HIGH ARCH] — children whose rollback to
-        # ``legacy`` FAILED. Caller must skip ``_consume_child`` /
-        # task creation for these to avoid the parallel-writer race
-        # (DB still says mailbox so runner publishes terminal
-        # envelopes, but parent has no supervisor handoff and would
-        # otherwise legacy-suspend in parallel).
+        # codex r11 [R11-2, HIGH ARCH] / r7 [LOW DOC, PR-5 update]
+        # — children whose rollback to ``legacy`` FAILED. Caller
+        # must skip ``_consume_child`` / task creation for these:
+        # the DB row still says ``mailbox`` so the runner would
+        # publish terminal envelopes against a non-existent
+        # supervisor handoff, orphaning the sandbox until
+        # reconcile_orphans / pod restart reclaims it. (Pre-PR-5
+        # ALSO raced the parent's finally legacy suspend; PR-5
+        # removed that, so the residual hazard is just the orphan
+        # window, not the parallel-writer race.)
         self._failed_rollback_child_ids: set[str] = set()
         # C3 PR-4.5 — mailbox-plane wiring (None when flag is off or for
         # tests that bypass DI). ``run_research`` uses ``supervisor_registry``
@@ -273,9 +292,14 @@ class SubagentResearchService:
         Returns ``True`` if the DB UPDATE committed, ``False``
         otherwise. Callers MUST treat a ``False`` return as "do not
         start this child runner": the stale ``mailbox`` row would
-        otherwise let the runner publish SPAWN_ACK/RESULT_READY in
-        parallel with the parent's legacy suspend → re-opens the M1
-        race.
+        otherwise let the runner publish SPAWN_ACK/RESULT_READY into
+        a stream with no consumer (no supervisor for this root) →
+        orphan sandbox until the supervisor's orphan tick or
+        reconcile_orphans reclaims it. Pre-PR-5 the parent's finally
+        block also ran a legacy suspend in parallel which re-opened
+        the M1 race; PR-5 removed that finally suspend, so the
+        remaining hazard is just the orphan window (bounded by the
+        orphan-tick / reconcile cadence).
 
         codex r20 [R20-3, MEDIUM SEC] / r22 [R22-2, HIGH ARCH] —
         when ``expected_parent_id`` is provided, the UPDATE is
@@ -325,9 +349,12 @@ class SubagentResearchService:
         except Exception:
             logger.error(
                 "rollback child=%s to control_plane=legacy failed — "
-                "caller MUST skip starting this child runner to avoid "
-                "the parallel-writer race (operator: re-run the UPDATE "
-                "manually OR delete the orphan row + container)",
+                "caller MUST skip starting this child runner; otherwise "
+                "the runner sees stale mailbox plane and publishes "
+                "terminal envelopes against a non-existent supervisor "
+                "handoff, orphaning the sandbox until reconcile / pod "
+                "restart (operator: re-run the UPDATE manually OR "
+                "delete the orphan row + container)",
                 child_id,
                 exc_info=True,
             )
@@ -344,9 +371,16 @@ class SubagentResearchService:
 
         Best-effort: a registry/publisher failure is logged and SWALLOWED.
         Pre-PR-5 the flag is off so this whole path is a no-op (every
-        child has ``subagent_control_plane='legacy'``). Post-PR-5, if
-        publish fails the SubagentResearchService's existing legacy
-        fallback handles the child (the suspend at line ~466).
+        child has ``subagent_control_plane='legacy'``). Post-PR-5 the
+        flag is on by default; if publish fails the row is rolled back
+        to ``subagent_control_plane='legacy'`` and the child is added
+        to ``_failed_rollback_child_ids`` so the runner is never
+        started — otherwise the runner would publish terminal envelopes
+        against a non-existent supervisor handoff, orphaning the
+        sandbox until reconcile_orphans / pod restart reclaims it.
+        (Pre-PR-5 the parent's finally legacy suspend ALSO raced the
+        supervisor; PR-5 removed that finally so the residual hazard
+        is just the orphan window.)
         """
         registry = self._supervisor_registry
         publisher = self._mailbox_publisher
@@ -415,11 +449,16 @@ class SubagentResearchService:
         # idempotent — it's a no-op when the slot already holds an alive
         # supervisor.
         #
-        # codex r4 [R4-1, HIGH ARCH] — if spawn fails AND we cannot
-        # otherwise prove a supervisor exists, we MUST fall back to
-        # legacy suspend in the finally block (do NOT mark handoff
-        # successful). Track spawn outcome and require both spawn-ok +
-        # publish-ok before adding to ``_handoff_published_child_ids``.
+        # codex r4 [R4-1, HIGH ARCH] — track spawn outcome and require
+        # both spawn-ok + publish-ok before marking the child as
+        # supervisor-handed-off. Pre-PR-5 the finally block consulted
+        # this set to decide whether to suspend the child; PR-5 removed
+        # the finally suspend (mailbox supervisor + reconcile_orphans
+        # own destroy now), so the set is bookkeeping only. The
+        # spawn-confirm logic is still useful so we never claim handoff
+        # for a publish that landed in a non-existent supervisor (the
+        # orphan reconcile path catches this case, but recording the
+        # outcome here keeps audit / diagnostics honest).
         supervisor_confirmed = False
         if registry is not None:
             try:
@@ -428,19 +467,26 @@ class SubagentResearchService:
             except Exception:
                 logger.exception(
                     "supervisor_registry.spawn(%s) failed in subagent research "
-                    "— skipping publish and falling back to legacy suspend "
-                    "for the affected children",
+                    "— skipping publish and rolling these children back to "
+                    "control_plane=legacy (their AgentService finalize path "
+                    "owns suspend per spec §11.4 legacy fallback; orphans "
+                    "without a runner get reclaimed by supervisor orphan "
+                    "tick / reconcile_orphans)",
                     parent_id,
                 )
 
         if publisher is None or not supervisor_confirmed:
-            # codex r7 [R7-1, HIGH ARCH] / r11 [R11-2] — no consumer /
-            # no publisher means the supervisor will never see these
-            # children. The child rows are still
-            # ``subagent_control_plane='mailbox'`` though, so the
-            # child runner would read mailbox plane and publish
-            # SPAWN_ACK/RESULT_READY anyway — re-opening the M1 race
-            # the finally fallback is supposed to close. Roll each
+            # codex r7 [R7-1, HIGH ARCH] / r11 [R11-2] / codex r7
+            # [LOW DOC, PR-5 update] — no consumer / no publisher
+            # means the supervisor will never see these children. The
+            # child rows are still ``subagent_control_plane='mailbox'``
+            # though, so the child runner would read mailbox plane and
+            # publish SPAWN_ACK/RESULT_READY anyway → orphan sandbox
+            # until reconcile_orphans / pod restart reclaims it. (Pre-
+            # PR-5 there was a parent-side finally legacy suspend that
+            # ALSO raced the supervisor's destroy; PR-5 deleted the
+            # finally suspend so the residual hazard is just the
+            # orphan window, not the parallel-writer race.) Roll each
             # affected child to legacy; if rollback fails, mark the
             # child as do-not-start so the caller skips task creation.
             for c, _ in mailbox_children:
@@ -480,14 +526,17 @@ class SubagentResearchService:
                     ).model_dump(mode="json"),
                 ))
                 # codex r3 [R3-3, HIGH ARCH] — record successful publish
-                # so the caller can decide whether to fall back to legacy
-                # suspend for children whose SPAWN_REQUEST failed.
+                # so the post-spawn pruning step knows which children
+                # also have a running task. PR-5: no longer gates a
+                # finally suspend (the suspend was removed in PR-5);
+                # kept as diagnostic bookkeeping. See ``__init__`` for
+                # the post-PR-5 contract on this set.
                 self._handoff_published_child_ids.add(child.id)
             except Exception:
                 logger.exception(
                     "SPAWN_REQUEST publish failed for child %s — rolling "
-                    "back DB row to control_plane=legacy and falling back "
-                    "to legacy suspend",
+                    "back DB row to control_plane=legacy; runner uses the "
+                    "AgentService finalize destroy path on this row",
                     child.id,
                 )
                 # codex r6 [R6-1, CRITICAL ARCH] / r11 [R11-2] —
@@ -496,10 +545,11 @@ class SubagentResearchService:
                 # ``legacy`` before invoke()'s spawn check fires.
                 # Otherwise the runner sees stale ``mailbox`` plane,
                 # publishes SPAWN_ACK/RESULT_READY into a stream with
-                # no consumer, and the parent's finally fallback runs
-                # legacy suspend in parallel → re-opens the M1
-                # single-writer race. If rollback fails, mark the
-                # child as do-not-start.
+                # no consumer → orphan sandbox until the supervisor's
+                # orphan tick / reconcile_orphans reclaims it.
+                # (Pre-PR-5 also raced the parent's finally legacy
+                # suspend, but PR-5 removed that.) If rollback fails,
+                # mark the child as do-not-start.
                 rolled_back = await self._rollback_child_to_legacy(
                     child.id, expected_parent_id=parent_id
                 )
@@ -692,19 +742,27 @@ class SubagentResearchService:
                 children_with_prompts=children,
             )
 
-            # codex r11 [R11-2, HIGH ARCH] — filter out children whose
-            # mailbox→legacy rollback FAILED. Starting their runner
-            # would race the parent's finally-suspend (DB still says
-            # mailbox so runner would publish terminal envelopes
-            # against a non-existent supervisor handoff). Yield a
-            # ChildDoneEvent with the failure outcome so the caller
-            # sees the dropped child and the metric is accurate.
+            # codex r11 [R11-2, HIGH ARCH] / r6 [LOW DOC, PR-5 update]
+            # — filter out children whose mailbox→legacy rollback
+            # FAILED. Starting their runner would publish terminal
+            # envelopes (RESULT_READY / CANCEL_ACK) against a non-
+            # existent supervisor handoff (DB still says mailbox so
+            # ``_should_skip_mailbox_lifecycle`` returns True and the
+            # AgentService legacy fallback never runs), orphaning the
+            # sandbox until reconcile_orphans / pod restart reclaims
+            # it. (Pre-PR-5 also raced the parent's finally legacy
+            # suspend; PR-5 removed that, so the remaining hazard is
+            # the orphan window, not the race.) Yield a ChildDoneEvent
+            # with the failure outcome so the caller sees the dropped
+            # child and the metric is accurate.
             for child, prompt in children:
                 if child.id in self._failed_rollback_child_ids:
                     logger.error(
                         "subagent_research: skipping start of child=%s — "
                         "control_plane rollback failed; child runner not "
-                        "started to prevent the parallel-writer race",
+                        "started to avoid publishing terminal envelopes "
+                        "against a non-existent supervisor handoff "
+                        "(orphan window until reconcile / pod restart)",
                         child.id,
                     )
                     completed_results.append(
@@ -716,7 +774,10 @@ class SubagentResearchService:
                             transcript_tokens=0,
                             error_summary=(
                                 "internal: mailbox→legacy rollback failed; "
-                                "child runner skipped to avoid race"
+                                "child runner skipped to avoid publishing "
+                                "terminal envelopes against a non-existent "
+                                "supervisor handoff (orphan window until "
+                                "reconcile)"
                             ),
                         )
                     )
@@ -756,12 +817,16 @@ class SubagentResearchService:
             # to ``_handoff_published_child_ids`` immediately on
             # publish success, but the window between publish and
             # task creation can be interrupted (rollback failure,
-            # filter logic, generator cancel mid-loop). If a child
-            # is in the handoff set but has no created task, the
-            # finally would skip suspend while no runner exists to
-            # fire RESULT_READY → orphan sandbox. Restrict to
-            # ``startable_children`` ids so the finally only honors
-            # handoff for children with a real task.
+            # filter logic, generator cancel mid-loop).
+            #
+            # C3 PR-5 (codex r1 [F4, LOW DOC]) — the finally suspend
+            # was removed in PR-5, so the set no longer gates suspend
+            # at all. Pruning is retained for diagnostic accuracy
+            # (the set's purpose is "spawns that ALSO produced a
+            # runner task"); a future cleanup PR may drop the set
+            # entirely. Until then, orphan children with no runner
+            # are reclaimed by the supervisor orphan tick (§7.5) /
+            # reconcile_orphans (PR-3c §11.7).
             _started_child_ids = {child.id for child, _ in startable_children}
             self._handoff_published_child_ids &= _started_child_ids
 
@@ -849,71 +914,25 @@ class SubagentResearchService:
                     )
                 except Exception as e:
                     logger.warning("pending children cancel in finally failed: %s", e)
-            # Shield sandbox suspend per child + quota release from outer cancel.
-            # GeneratorExit also lands here; await on a shielded coroutine is
-            # allowed in finally.
-            #
-            # C3 PR-4.5 (codex r1 [R1-1, CRITICAL ARCH]) — mailbox-plane
-            # children must SKIP the legacy suspend here: MailboxSupervisor
-            # owns destroy on the RESULT_READY / CANCEL_ACK path (M1
-            # single-writer). Running suspend here in parallel races the
-            # supervisor's destroy() and corrupts the SandboxBinding state
-            # machine. Pre-PR-5 the feature flag defaults False so every
-            # child is ``subagent_control_plane='legacy'`` and the legacy
-            # branch runs unchanged. The literal
-            # ``_should_skip_mailbox_lifecycle`` reference also satisfies
-            # the AST CI gate (§13.3) for this function body.
-            for child, _ in children:
-                # codex r5 [R5-3, HIGH CONTRACT] — re-read the current
-                # session row BEFORE deciding to skip suspend. §11.6
-                # rollback SQL can flip the row from mailbox to legacy
-                # mid-run; if we trust the stale in-memory child we'd
-                # skip both supervisor destroy AND legacy suspend,
-                # leaking the sandbox. Best-effort: a DB lookup failure
-                # falls through to legacy suspend (safer than skip).
-                refreshed = None
-                try:
-                    refreshed = await self._session_service.get_session(
-                        child.id, user_id, is_admin=True
-                    )
-                except Exception:
-                    logger.debug(
-                        "finally re-read child=%s failed — falling back to legacy suspend",
-                        child.id,
-                        exc_info=True,
-                    )
-
-                # codex r3 [R3-3, HIGH ARCH] — only skip suspend when
-                # BOTH (a) the CURRENT row is still mailbox-plane AND
-                # (b) the SPAWN_REQUEST publish actually succeeded
-                # (handoff established). If publish failed OR the row
-                # was rolled back, fall through to legacy suspend so
-                # the sandbox isn't orphaned. ``_should_skip_mailbox_lifecycle``
-                # is the AST-gate-recognized predicate (spec §13.3).
-                if (
-                    refreshed is not None
-                    and _should_skip_mailbox_lifecycle(refreshed)
-                    and child.id in self._handoff_published_child_ids
-                ):
-                    logger.debug(
-                        "subagent_research: skip suspend child=%s — mailbox plane "
-                        "+ handoff established (current row still mailbox)",
-                        child.id,
-                    )
-                    continue
-                try:
-                    await asyncio.shield(
-                        self._sandbox_lifecycle_service.suspend(child.id)
-                    )
-                except asyncio.CancelledError:
-                    logger.warning(
-                        "child %s sandbox suspend shielded but re-cancelled",
-                        child.id,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "child %s sandbox suspend failed: %s", child.id, e
-                    )
+            # C3 PR-5 (spec §11.1) — mailbox supervisor owns child lifecycle
+            # (M1 single-writer). The supervisor's RESULT_READY / CANCEL_ACK
+            # handlers invoke SandboxLifecycleService.destroy() per spec §7.3.
+            # Legacy-plane children's sandboxes are destroyed by their own
+            # AgentService finalize path (the four gated suspend call sites
+            # added in PR-4.5 — see app/application/services/agent_service.py).
+            # Children whose SPAWN_REQUEST publish failed (no runner ever
+            # started) are reclaimed by the supervisor's periodic orphan
+            # sweep (`_maybe_tick_check_orphans`, spec §8.4) and the
+            # MailboxReconciler crash-recovery path (PR-3c, spec §11.7).
+            # The PR-4.5 in-finally re-read + handoff-set check race window
+            # is closed by deleting the legacy suspend altogether: with
+            # MAILBOX_SUPERVISOR_ENABLED=true (PR-5) the supervisor is the
+            # single writer for every mailbox-plane child sandbox.
+            # AST CI gate (spec §13.3) no longer matches this function body:
+            # the `.suspend()`/`.destroy()` calls are gone, so no anchor is
+            # needed. Re-introducing a sandbox lifecycle call here without
+            # ``_should_skip_mailbox_lifecycle`` will trip the gate.
+            # Quota release + jsonl metric write below remain unchanged.
             try:
                 await asyncio.shield(
                     self._quota_service.release(user_id, probe_run_id)

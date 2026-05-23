@@ -666,6 +666,60 @@ def build_supervisor_registry(
 
     raw_redis = redis_client.client
 
+    # C3 PR-5 (spec §11.6 rollback runbook + R1 P2.2) — per-call session
+    # adapter so ``MailboxSupervisor._check_should_stop_for_rollback`` can
+    # run its read-only ``get_by_id`` + ``find_descendants`` queries
+    # without holding a long-lived ``AsyncSession`` across the supervisor's
+    # run lifetime. Mirrors the ``DbMailboxEnvelopeAuditRepository``
+    # session-per-call pattern (see its class docstring at
+    # ``infrastructure/repositories/db_mailbox_envelope_audit_repository.py:30``).
+    #
+    # Only the two methods used by the rollback-stop check are
+    # implemented; the supervisor never calls anything else. Cast to the
+    # full ``SessionRepository`` Protocol at the ``ctx.session_repo``
+    # assignment site so the type checker matches the field declaration
+    # (the Protocol is duck-typed at runtime so partial impl is fine,
+    # but the cast keeps mypy happy).
+    pg_session_factory = get_postgres().session_factory
+
+    class _SupervisorSessionRepoAdapter:
+        __slots__ = ("_session_factory",)
+
+        def __init__(self, session_factory) -> None:  # type: ignore[no-untyped-def]
+            self._session_factory = session_factory
+
+        async def get_by_id(self, session_id: str):  # type: ignore[no-untyped-def]
+            from app.infrastructure.repositories.db_session_repository import (
+                DBSessionRepository,
+            )
+            async with self._session_factory() as db_session:
+                repo = DBSessionRepository(db_session=db_session)
+                return await repo.get_by_id(session_id)
+
+        async def find_descendants(  # type: ignore[no-untyped-def]
+            self,
+            ancestor_id: str,
+            *,
+            user_id: str,
+            max_depth: int,
+            limit: int,
+        ):
+            from app.infrastructure.repositories.db_session_repository import (
+                DBSessionRepository,
+            )
+            async with self._session_factory() as db_session:
+                repo = DBSessionRepository(db_session=db_session)
+                return await repo.find_descendants(
+                    ancestor_id,
+                    user_id=user_id,
+                    max_depth=max_depth,
+                    limit=limit,
+                )
+
+    supervisor_session_repo = _SupervisorSessionRepoAdapter(
+        session_factory=pg_session_factory,
+    )
+
     def _factory(root_session_id: str) -> MailboxSupervisor:
         ctx = SupervisorContext(
             root_session_id=root_session_id,
@@ -687,6 +741,10 @@ def build_supervisor_registry(
             # happens before the supervisor consumer loop starts).
             agent_service_callback=_pr4_5_agent_service_callback,
             telemetry=telemetry_adapter,
+            # C3 PR-5 (spec §11.6) — session reader for the rollback
+            # stop check. Adapter holds session_factory and opens a
+            # short-lived AsyncSession per query.
+            session_repo=supervisor_session_repo,  # type: ignore[arg-type]
         )
         return MailboxSupervisor(
             ctx,

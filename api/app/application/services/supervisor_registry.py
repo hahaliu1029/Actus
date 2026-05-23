@@ -106,6 +106,12 @@ class SupervisorRegistry:
         ready_event: asyncio.Event = asyncio.Event()
         # Inject the readiness event — MailboxSupervisor.run() checks for it.
         sup._ready_event = ready_event  # type: ignore[attr-defined]
+        # C3 PR-5 (spec §11.6 rollback runbook) — inject the registry-side
+        # ``stop`` so ``MailboxSupervisor._check_should_stop_for_rollback``
+        # can pop this slot from ``self._slots`` AND cancel the run task
+        # atomically. See ``_inject_stop_self_callback`` for the lifecycle
+        # contract + fake-supervisor compatibility.
+        self._inject_stop_self_callback(sup, root_session_id)
         task = asyncio.create_task(
             sup.run(),
             name=f"mailbox-sup:{root_session_id}:{instance_id}",
@@ -143,6 +149,45 @@ class SupervisorRegistry:
                 self._ready_timeout_s,
                 root_session_id,
             )
+
+    def _inject_stop_self_callback(self, sup, root_session_id: str) -> None:
+        """C3 PR-5 (spec §11.6) — wire the registry-side ``stop`` into the
+        supervisor's ``ctx.stop_self_callback`` so
+        ``_check_should_stop_for_rollback`` can pop the slot and cancel
+        the task atomically (otherwise ``self.stop()`` alone leaves the
+        slot in place + ``_restart_crashed`` resurrects it).
+
+        codex r1 [F1, HIGH TEST] — duck-typed registry fakes (see
+        ``_FakeSupervisor`` in
+        ``tests/app/application/services/test_supervisor_registry.py``)
+        do not implement ``_ctx``. The injection therefore guards on
+        ``hasattr(sup, "_ctx")`` and on the field existing on ctx
+        (``SupervisorContext.stop_self_callback`` — a real
+        ``MailboxSupervisor`` always has it; a partial fake may not).
+        The fallback path inside
+        ``MailboxSupervisor._check_should_stop_for_rollback`` handles
+        the "no callback" case by setting ``self._stopping`` so the
+        run loop exits on the next iteration (without popping the
+        slot; the slot stays in ``_slots`` as ``"crashed"`` in
+        ``health_check`` until ``stop_all`` / explicit removal). That
+        is the right behaviour for tests using the fake (which do not
+        exercise rollback).
+
+        Same mutate-ctx-once-at-startup pattern as
+        ``register_cancel_state`` / ``clear_child_tracking`` bound in
+        ``MailboxSupervisor.__init__``; the supervisor only ever *calls*
+        the hook. ``self.stop`` is idempotent (``pop(..., None)``) so a
+        duplicate fire (rollback-check + parallel external stop) is
+        safe.
+        """
+        ctx = getattr(sup, "_ctx", None)
+        if ctx is None:
+            return
+        if not hasattr(ctx, "stop_self_callback"):
+            return
+        ctx.stop_self_callback = (
+            lambda rid=root_session_id: self.stop(rid)
+        )
 
     async def stop(self, root_session_id: str) -> None:
         """Cancel + remove the supervisor for one root. Idempotent on
@@ -249,6 +294,14 @@ class SupervisorRegistry:
             # can come up; we just need the new task running ASAP).
             ready_event: asyncio.Event = asyncio.Event()
             sup._ready_event = ready_event  # type: ignore[attr-defined]
+            # C3 PR-5 codex r1 [F2, HIGH CONTRACT] — restart-created
+            # supervisors MUST get the same registry-side stop hook the
+            # original ``spawn`` wired, otherwise
+            # ``_check_should_stop_for_rollback`` would fall back to
+            # ``self.stop()`` after a restart and the registry would
+            # resurrect the slot on the next ``_restart_crashed`` tick
+            # (spec §11.6 rollback would no longer be terminal).
+            self._inject_stop_self_callback(sup, root)
             new_task = asyncio.create_task(
                 sup.run(),
                 name=f"mailbox-sup:{root}:{new_instance_id}",

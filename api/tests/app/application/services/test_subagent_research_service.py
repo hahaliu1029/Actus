@@ -247,7 +247,12 @@ async def test_run_research_happy_path(service, mock_deps, monkeypatch, tmp_path
     assert len(started) == 3
     assert len(done) == 3
     assert len(summary) == 1
-    assert mock_deps["sandbox_lifecycle_service"].suspend.call_count == 3
+    # C3 PR-5 (spec §11.1) — mailbox supervisor owns child destroy
+    # (M1 single-writer). SubagentResearchService no longer calls
+    # ``sandbox_lifecycle_service.suspend`` in its finally; legacy-plane
+    # children's sandboxes are destroyed by their own AgentService
+    # finalize path (the four gated suspend sites added in PR-4.5).
+    assert mock_deps["sandbox_lifecycle_service"].suspend.call_count == 0
     mock_deps["quota_service"].release.assert_called_once()
     # T12 / Phase 1 PR-X: every child session must be persisted with the
     # "subagent_research" preset so AgentService._create_task can re-derive
@@ -283,9 +288,13 @@ async def test_run_research_finally_runs_release_on_consumer_aclose(
     service, mock_deps
 ):
     """Locks in codex R1 P1: client disconnect / aclose() must still release
-    the quota slot and suspend sandboxes. Simulates parent SSE disconnect by
-    breaking out of `async for` mid-stream — the async generator's finally
-    block must run."""
+    the quota slot. Simulates parent SSE disconnect by breaking out of
+    ``async for`` mid-stream — the async generator's finally block must run.
+
+    C3 PR-5 (spec §11.1) — the legacy ``sandbox_lifecycle_service.suspend``
+    call inside the finally was removed in PR-5; mailbox supervisor owns
+    child destroy under M1 single-writer. The quota release path is what
+    this test still pins."""
     from app.domain.models.event import DoneEvent, MessageEvent
 
     mock_deps["classifier"].classify_batch = AsyncMock(
@@ -322,9 +331,10 @@ async def test_run_research_finally_runs_release_on_consumer_aclose(
     await gen.__anext__()
     await gen.aclose()
 
-    # finally must have run: quota release + (per-child) sandbox suspend.
+    # finally must have run: quota release (PR-5 removes the per-child
+    # sandbox suspend — mailbox supervisor owns destroy now).
     mock_deps["quota_service"].release.assert_called_once()
-    mock_deps["sandbox_lifecycle_service"].suspend.assert_called()
+    mock_deps["sandbox_lifecycle_service"].suspend.assert_not_called()
 
 
 async def test_classifier_word_boundary_no_false_positive_on_prefix(
@@ -449,8 +459,13 @@ async def test_run_research_aclose_mid_fanout_cancels_pending_children(
     )
     # Quota also released.
     mock_deps["quota_service"].release.assert_called_once()
-    # Sandbox suspended for both children.
-    assert mock_deps["sandbox_lifecycle_service"].suspend.call_count == 2
+    # C3 PR-5 (spec §11.1) — mailbox supervisor owns child destroy
+    # (M1 single-writer). Even on the cancel path, no legacy suspend
+    # is invoked from SubagentResearchService.run_research; the
+    # cancelled children's sandboxes are reclaimed by the supervisor's
+    # cascade CANCEL_REQUEST → destroy path (§7.5) or by reconcile
+    # orphan sweep (§7.5 / PR-3c §11.7).
+    assert mock_deps["sandbox_lifecycle_service"].suspend.call_count == 0
 
 
 def test_classifier_word_boundary_directly():
