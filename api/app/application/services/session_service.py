@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, Type
+from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Type
 
 from app.application.errors.exceptions import (
     ForbiddenError,
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
     from app.domain.services.execution_supervisor import ExecutionSupervisor
     from app.infrastructure.external.memory.fs_reconciler import FsReconciler
-    from core.config import SubagentLimitsConfig
+    from core.config import Settings, SubagentLimitsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,8 @@ class SessionService:
         execution_supervisor: Optional["ExecutionSupervisor"] = None,
         *,
         subagent_limits: Optional["SubagentLimitsConfig"] = None,
+        settings: Optional["Settings"] = None,
+        mailbox_flag_reader: Optional[Callable[[], bool]] = None,
     ) -> None:
         """构造函数，完成会话服务初始化
 
@@ -55,6 +57,23 @@ class SessionService:
         (``ACTUS_MAX_SUBAGENT_DEPTH`` / ``ACTUS_MAX_DESCENDANTS_PER_ROOT``)
         still take effect for callers that don't go through the DI factory
         (test code, ad-hoc constructors).
+
+        ``settings`` and ``mailbox_flag_reader`` are the C3 PR-4.5 hooks
+        for the ``mailbox_supervisor_enabled`` feature flag (spec §11.2).
+        Resolution order on each ``create_session_with_parent`` call:
+
+        1. ``settings`` stub (deterministic test override).
+        2. ``mailbox_flag_reader`` callable — the DI factory wires
+           the env-file-aware, cache-bypassing
+           ``_read_mailbox_supervisor_enabled_uncached`` so the
+           rollback runbook §11.6 toggles take effect without
+           ``get_settings.cache_clear()`` or a pod restart. The
+           production reader is downgrade-only: once the process
+           started with ``MAILBOX_SUPERVISOR_ENABLED=False`` it
+           stays False at runtime even if ``.env`` flips True
+           (the SupervisorRegistry would be missing otherwise).
+        3. Fallback ``get_settings()`` — cached; only hit by
+           non-DI callers (ad-hoc constructors, legacy paths).
         """
         self._uow_factory = uow_factory
         self._uow = uow_factory()
@@ -63,6 +82,15 @@ class SessionService:
         self._fs_reconciler = fs_reconciler
         self._supervisor = execution_supervisor
         self._subagent_limits = subagent_limits
+        self._settings = settings
+        # codex r9 [R9-1, HIGH CONTRACT] — live flag reader that
+        # bypasses ``get_settings``' @lru_cache so the rollback
+        # runbook §11.6 ("flip ``MAILBOX_SUPERVISOR_ENABLED=false``
+        # and new children immediately go legacy") works without a
+        # ``get_settings.cache_clear()`` or pod restart. Reads the
+        # raw env var on every call; ``settings`` injection wins
+        # when present (tests use the explicit Settings stub).
+        self._mailbox_flag_reader = mailbox_flag_reader
 
     async def create_session(self, user_id: str) -> Session:
         """创建一个空白的新任务会话"""
@@ -188,15 +216,42 @@ class SessionService:
                     limits.max_descendants_per_root,
                 )
 
+            # C3 PR-4.5 — pick control plane via runtime feature flag (spec
+            # §11.2). PR-5 will flip the .env.example default; until then
+            # every new subagent persists ``'legacy'`` and the legacy
+            # suspend path remains authoritative.
+            #
+            # codex r9 [R9-1, HIGH CONTRACT] — flag precedence:
+            #   1. test-injected ``settings`` stub (deterministic test fixtures)
+            #   2. ``mailbox_flag_reader`` callable (live env var read,
+            #      bypasses ``get_settings`` @lru_cache so rollback
+            #      runbook §11.6 toggles behavior without service restart)
+            #   3. ``get_settings()`` fallback for code paths that don't
+            #      go through the DI factory (cached, but at least the
+            #      DI factory wires a live reader so production paths
+            #      honor rollback)
+            if self._settings is not None:
+                mailbox_enabled = self._settings.mailbox_supervisor_enabled
+            elif self._mailbox_flag_reader is not None:
+                mailbox_enabled = bool(self._mailbox_flag_reader())
+            else:
+                mailbox_enabled = get_settings().mailbox_supervisor_enabled
+            control_plane: Literal["legacy", "mailbox"] = (
+                "mailbox" if mailbox_enabled else "legacy"
+            )
             child = Session(
                 user_id=user_id,
                 parent_session_id=parent_id,
                 worker_type="subagent",
+                subagent_control_plane=control_plane,
                 tool_filter_preset=tool_filter_preset,
                 title=title or "新对话",
             )
             await uow.session.save(child)
-            logger.info("成功创建子会话: %s (parent=%s)", child.id, parent_id)
+            logger.info(
+                "成功创建子会话: %s (parent=%s, control_plane=%s)",
+                child.id, parent_id, control_plane,
+            )
             return child
 
     def _spawn_fs_reconciler_walk(self, user_id: str) -> None:

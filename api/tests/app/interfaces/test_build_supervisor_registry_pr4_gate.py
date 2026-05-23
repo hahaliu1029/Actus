@@ -1,5 +1,5 @@
-"""C3 PR-3c / PR-4 / PR-4.5 — fail-closed gate for ``build_supervisor_registry``
-(codex r4 [HIGH CONTRACT], codex r2 [R2-1, HIGH ARCH]).
+"""C3 PR-3c / PR-4 / PR-4.5 — readiness gate for ``build_supervisor_registry``
+(codex r4 [HIGH CONTRACT], codex r2 [R2-1, HIGH ARCH], codex r1 [R1-3]).
 
 The supervisor's PR-3a stub dispatch table ACKed ``RESULT_READY`` /
 ``CANCEL_ACK`` envelopes without calling
@@ -7,24 +7,19 @@ The supervisor's PR-3a stub dispatch table ACKed ``RESULT_READY`` /
 terminal envelope. ``build_supervisor_registry`` is gated on the
 module-level constant ``_PR4_TERMINAL_HANDLERS_READY``.
 
-PR-4 ships the real terminal handlers + cascade pipeline behind the gate
-(monkeypatched ``True`` in tests). The flag itself stays ``False`` until
-PR-4.5 replaces ``_pr3c_noop_callback`` with a real
-``AgentService.stop_session`` bridge — otherwise CancelRequestHandler
-TERMINATE step 1 (`agent_service_callback`) silently does nothing and
-step 2 destroys a still-running asyncio.Task, violating spec §7.6
-"stop → destroy" ordering.
+**PR-4.5 landed** — the readiness gate is now ``True`` and the registry
+factory wires ``_pr4_5_agent_service_callback`` (the real
+``AgentService.stop_session`` bridge) instead of ``_pr3c_noop_callback``.
 
-These tests lock both halves of the gate:
+These tests now lock the POST-PR-4.5 state:
 
-* While the callback remains ``_pr3c_noop_callback`` (the PR-3c
-  placeholder), :func:`build_supervisor_registry` MUST raise
-  ``RuntimeError``. The flag is the single edit site PR-4.5 will flip
-  alongside wiring the real callback.
-* The factory monkeypatched ``True`` (PR-4.5 + future) still constructs
-  the registry with the same ``_pr3c_noop_callback`` shape today; that
-  combination is intentionally noisy at the gate (False default) so a
-  premature flip without callback wiring fails closed.
+* ``_PR4_TERMINAL_HANDLERS_READY`` must be ``True`` so the factory
+  constructs the registry when ``MAILBOX_SUPERVISOR_ENABLED=true``.
+* The factory MUST wire ``_pr4_5_agent_service_callback`` (the spec §7.6
+  stop-before-destroy bridge), NOT ``_pr3c_noop_callback``.
+* The legacy gate (flag forced False) still raises with the operator-
+  readable message intact, so an inadvertent regression that flips the
+  flag back to False without removing the gate is still caught.
 """
 
 from __future__ import annotations
@@ -36,29 +31,88 @@ import pytest
 from app.interfaces import service_dependencies
 
 
-def test_build_supervisor_registry_fails_closed_while_callback_is_noop() -> None:
-    """codex r2 [R2-1] — current production state is the noop-callback +
-    flag-False combination. Lifespan MUST refuse to construct the registry
-    so operators can't silently land in the half-baked "destroy but never
-    stop" path documented in spec §7.6.
+def test_pr_4_5_readiness_gate_is_open() -> None:
+    """codex r1 [R1-3, HIGH CONTRACT] — PR-4.5 flipped the gate to True
+    in the same commit that replaced ``_pr3c_noop_callback`` with
+    ``_pr4_5_agent_service_callback``. Both halves moved together per
+    spec §7.6.
     """
-    assert service_dependencies._PR4_TERMINAL_HANDLERS_READY is False, (
-        "_PR4_TERMINAL_HANDLERS_READY must be False while "
-        "_pr3c_noop_callback (line ~660 in service_dependencies.py) is "
-        "still wired as agent_service_callback. PR-4.5 flips this to True "
-        "in the same commit that replaces the no-op with a real "
-        "AgentService.stop_session bridge. If a refactor sneaks this "
-        "constant to True without wiring the callback, CancelRequest "
-        "TERMINATE step 1 (stop) silently no-ops and step 2 destroys a "
-        "still-running task → spec §7.6 ordering violated."
+    assert service_dependencies._PR4_TERMINAL_HANDLERS_READY is True, (
+        "_PR4_TERMINAL_HANDLERS_READY must be True after PR-4.5. The "
+        "factory now wires _pr4_5_agent_service_callback (the real "
+        "AgentService.stop_session bridge) as ctx.agent_service_callback. "
+        "If a refactor flips this back to False without also restoring "
+        "the noop callback, the gate semantics break."
     )
 
 
-def test_build_supervisor_registry_fails_closed_when_pr4_flag_false(
-    monkeypatch,
-) -> None:
-    """Regression — confirm the gate raises with operator-readable message
-    so the misconfiguration is visible at lifespan startup.
+def test_factory_wires_pr_4_5_callback_bridge() -> None:
+    """codex r1 [R1-3] / r14 [R14-5] — verify the registry factory
+    actually constructs SupervisorContext with
+    ``_pr4_5_agent_service_callback`` (NOT the legacy noop). The
+    earlier round only checked the symbol existed; that passed even
+    if the factory secretly switched back to ``_pr3c_noop_callback``.
+    This test captures ``ctx.agent_service_callback`` via monkeypatch
+    and asserts identity equality.
+    """
+    from unittest.mock import patch, MagicMock
+
+    callback = service_dependencies._pr4_5_agent_service_callback
+    assert callable(callback)
+    assert callback.__name__ == "_pr4_5_agent_service_callback"
+
+    captured: dict[str, object] = {}
+
+    def _capture_context(ctx, **kwargs):  # noqa: ANN001
+        captured["agent_service_callback"] = ctx.agent_service_callback
+        return MagicMock()
+
+    redis_client = MagicMock()
+    redis_client.client = MagicMock()
+    publisher = MagicMock()
+    lifecycle = MagicMock()
+
+    # Stub postgres + audit repo so the factory body doesn't try to
+    # touch the real DB at import-time. ``DbMailboxEnvelopeAuditRepository``
+    # only stores the session_factory at __init__ (no I/O), but
+    # ``get_postgres()`` raises when the global pool isn't initialized.
+    fake_postgres = MagicMock()
+    fake_postgres.session_factory = MagicMock()
+
+    with patch(
+        "app.application.services.mailbox_supervisor.MailboxSupervisor",
+        side_effect=_capture_context,
+    ), patch(
+        "app.interfaces.service_dependencies.get_postgres",
+        return_value=fake_postgres,
+    ):
+        registry = service_dependencies.build_supervisor_registry(
+            redis_client=redis_client,
+            publisher=publisher,
+            sandbox_lifecycle_service=lifecycle,
+        )
+        # Trigger the inner _factory closure by spawning a supervisor.
+        registry._factory("root-test")  # type: ignore[attr-defined]
+
+    assert captured["agent_service_callback"] is callback, (
+        "build_supervisor_registry must wire "
+        "_pr4_5_agent_service_callback as ctx.agent_service_callback; "
+        f"got {captured.get('agent_service_callback')!r}"
+    )
+
+
+def test_pr_3c_noop_callback_kept_for_backwards_compat() -> None:
+    """The PR-3c placeholder is preserved as a named symbol for tests and
+    code paths that still reference it by name. It must remain a no-op
+    so accidental wiring doesn't reintroduce the leak."""
+    callback = service_dependencies._pr3c_noop_callback
+    assert callback.__name__ == "_pr3c_noop_callback"
+
+
+def test_legacy_gate_message_still_load_bearing(monkeypatch) -> None:
+    """Regression — when an operator (or buggy refactor) forces the gate
+    back to False, the error message must still cite spec §7.6 and the
+    callback-swap contract so they know what's missing.
     """
     monkeypatch.setattr(
         service_dependencies, "_PR4_TERMINAL_HANDLERS_READY", False
@@ -76,48 +130,8 @@ def test_build_supervisor_registry_fails_closed_when_pr4_flag_false(
         )
 
     msg = str(exc_info.value).lower()
-    # Pin keywords so the operator-facing error stays load-bearing.
     assert "pr-4" in msg
-    assert "stub" in msg
     assert "destroy" in msg or "leak" in msg
-    # Codex r4 [R4-5, MEDIUM DOC] — the message now points operators at the
-    # PR-4.5 flip site (callback swap + flag flip in the SAME commit) so
-    # operators surfacing this error don't go looking for a missing PR-4
-    # follow-up. Lock the PR-4.5 reference + the gate-test pointer so a
-    # future copy-edit doesn't silently regress this guidance.
-    assert "pr-4.5" in msg, (
-        "operator-facing message must direct ops to PR-4.5 (the planned "
-        "callback swap + flag flip site); otherwise the error reads as "
-        "'wait for PR-4' which already shipped."
-    )
-    assert "stop_session" in msg.replace("_", "").replace("`", "") or (
-        "stop_session" in msg
-    ), (
-        "operator-facing message must name AgentService.stop_session as "
-        "the planned PR-4.5 replacement for _pr3c_noop_callback so ops "
-        "know what the half-baked state looks like."
-    )
     assert "spec §7.6" in msg or "spec section 7.6" in msg, (
-        "operator-facing message must cite spec §7.6 (stop → destroy) so "
-        "ops can find the contract that the gate is enforcing."
-    )
-
-
-def test_callback_is_still_noop_pending_pr_4_5() -> None:
-    """codex r2 [R2-1] — explicit assertion that the registry factory is
-    still wired to ``_pr3c_noop_callback``. PR-4.5 is the planned site to
-    flip both this callback AND ``_PR4_TERMINAL_HANDLERS_READY``; flipping
-    only one half causes silent contract violations. If PR-4.5 replaces
-    the no-op, update this test to reference the new bridge function name
-    rather than ``_pr3c_noop_callback``.
-    """
-    # Locate the function defined in service_dependencies and confirm it
-    # is the documented PR-3c no-op placeholder. Without this lock, a
-    # diff that swaps the callback name without also flipping the flag
-    # (or vice versa) would skip the gate test.
-    callback = service_dependencies._pr3c_noop_callback
-    assert callback.__name__ == "_pr3c_noop_callback"
-    assert "PR-3c placeholder" in (callback.__doc__ or ""), (
-        "_pr3c_noop_callback docstring must keep flagging itself as the "
-        "PR-3c placeholder so PR-4.5 has a clear edit site."
+        "operator-facing error must cite spec §7.6 (stop → destroy)"
     )

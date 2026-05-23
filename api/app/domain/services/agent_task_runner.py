@@ -26,6 +26,7 @@ from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox, SandboxHandle
 from app.domain.external.search import SearchEngine
+from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.external.task import Task, TaskRunner
 from app.domain.models.app_config import (
@@ -281,6 +282,7 @@ class AgentTaskRunner(TaskRunner):
         tool_filter: Optional[FrozenSet[str]] = None,  # Phase 1 minimal subagent: tool-name allowlist (None = no filter)
         supervisor_registry: Optional[SupervisorRegistryPort] = None,  # C3 PR-3c: per-pod MailboxSupervisor registry (None when mailbox plane disabled)
         mailbox_supervisor_enabled: bool = False,  # C3 PR-3c: deployment-time flag mirror (false unless wired by application layer)
+        mailbox_publisher: Optional[MailboxPublisher] = None,  # C3 PR-4.5: child-side envelope publisher (None when mailbox plane disabled or this runner is a root)
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -303,6 +305,30 @@ class AgentTaskRunner(TaskRunner):
         self._mailbox_supervisor_enabled: bool = mailbox_supervisor_enabled
         self._cached_is_root_session: Optional[bool] = None
         self._supervisor_spawned: bool = False  # set after first successful spawn (informational only — spawn is idempotent)
+        # C3 PR-4.5 — child-side envelope publisher state.
+        # ``_mailbox_publisher`` is the wire publisher (RedisMailboxPublisher in
+        # production, fake in tests). ``_cached_session_for_publisher`` is the
+        # one-shot Session fetch used by ``_is_mailbox_plane_child`` so the
+        # spawn / terminal paths don't re-hit the DB on every check. The
+        # heartbeat task + its asyncio handle are stopped in the terminal path.
+        from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
+        self._mailbox_publisher: Optional[MailboxPublisher] = mailbox_publisher
+        # codex r3 [R3-5, HIGH ARCH] — store only the LAST session row
+        # fetched inside ``_is_mailbox_plane_child``. The predicate is
+        # NOT cached: §11.6 rollback can change control_plane mid-run.
+        self._cached_session_for_publisher = None  # Optional[Session]
+        self._heartbeat_task: Optional[ChildHeartbeatTask] = None
+        self._heartbeat_handle: Optional[asyncio.Task] = None
+        # codex r21 [R21-1, HIGH CONTRACT] — runner-exception flag
+        # consumed by ``_maybe_stop_child_publisher`` to override
+        # outcome=SUCCESS to outcome=FAILED on the mailbox wire,
+        # without violating the domain-model Literal for
+        # ``terminal_reason``.
+        self._runner_exception_terminal: bool = False
+        # Stable per-spawn correlation id mirrored on parent side
+        # (SubagentResearchService publishes SPAWN_REQUEST with the same
+        # scheme so the audit table can join the full lifecycle.)
+        self._spawn_correlation_id: str = f"spawn:{session_id}"
         # A7 Task 2.7: provider capability profile. None = legacy behavior
         # (accepts_image_url defaults to True via pathway — see _build_image_blocks).
         self.profile = profile
@@ -3115,6 +3141,12 @@ class AgentTaskRunner(TaskRunner):
             # supervisor stop failure can't fail the terminal write that
             # already committed above.
             await self._maybe_stop_mailbox_supervisor()
+            # C3 PR-4.5 — when this runner IS a mailbox-plane child, publish
+            # the terminal envelope (RESULT_READY or CANCEL_ACK) and stop
+            # the heartbeat task. Stays inside the shielded body for the
+            # same r3 ordering guarantees as supervisor stop above. Helper
+            # is best-effort: publish failure logs but does not raise.
+            await self._maybe_stop_child_publisher(status, terminal_reason)
 
             return transitioned is not False
 
@@ -3415,6 +3447,350 @@ class AgentTaskRunner(TaskRunner):
                 self._session_id,
             )
 
+    async def _is_mailbox_plane_child(self) -> bool:
+        """C3 PR-4.5 — True when this runner is a mailbox-plane subagent.
+
+        Used by ``_maybe_spawn_child_publisher`` /
+        ``_maybe_stop_child_publisher``.
+
+        codex r3 [R3-5, HIGH ARCH] — DO NOT cache the predicate across
+        the runner's lifetime. The session row's
+        ``subagent_control_plane`` can change between spawn and terminal:
+        the §11.6 rollback runbook may flip a mailbox-plane row back to
+        legacy mid-run, and the terminal path must re-check so the
+        runner doesn't publish RESULT_READY/CANCEL_ACK into a stream
+        whose consumer (the supervisor) is already gone. The
+        ``_cached_session_for_publisher`` caches only the ID-derived
+        parent_session_id snapshot inside this method for the duration
+        of the current decision; it is re-fetched on each call.
+
+        Defaults to False on lookup failure (best-effort: a missing /
+        erroring DB read makes the runner behave as a legacy/root path,
+        which is the safe fallback).
+        """
+        try:
+            async with self._uow_factory() as uow:
+                session = await uow.session.get_by_id(self._session_id)
+        except Exception:
+            logger.debug(
+                "_is_mailbox_plane_child lookup failed session=%s — assuming "
+                "non-mailbox-plane (skip child publisher wiring)",
+                self._session_id,
+                exc_info=True,
+            )
+            self._cached_session_for_publisher = None
+            return False
+        if session is None:
+            self._cached_session_for_publisher = None
+            return False
+        self._cached_session_for_publisher = session
+        return (
+            getattr(session, "worker_type", None) == "subagent"
+            and getattr(session, "subagent_control_plane", None) == "mailbox"
+        )
+
+    async def _maybe_spawn_child_publisher(self) -> None:
+        """C3 PR-4.5 — emit SPAWN_ACK + start heartbeat for mailbox-plane child.
+
+        Best-effort: publisher failure does NOT abort the agent loop. The
+        SPAWN_ACK timeout on the supervisor side (spec §4.3, 10s) recovers
+        by treating the spawn as failed and cleaning up.
+
+        Idempotent: the heartbeat task is only started once. ``getattr``
+        defends against ``__new__``-bypass test runners.
+        """
+        publisher = getattr(self, "_mailbox_publisher", None)
+        if publisher is None:
+            return
+        if not await self._is_mailbox_plane_child():
+            return
+        session = self._cached_session_for_publisher
+        if session is None or not session.parent_session_id:
+            return
+        # Local import: keep mailbox_envelope models out of the module-top
+        # import graph to avoid pulling pydantic + datetime helpers on hot
+        # paths that don't touch the mailbox plane.
+        from datetime import datetime, timezone
+        from app.domain.models.mailbox_envelope import (
+            MailboxEnvelope,
+            MailboxEnvelopeType,
+            ProducerRole,
+            SpawnAckPayload,
+        )
+        from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
+
+        # codex r7 [R7-2] / r11 [R11-3] / r13 [R13-4] / r18 [R18-2,
+        # HIGH ARCH] — plan Step 13f: BEST-EFFORT ensure the
+        # per-root supervisor exists before publishing the first
+        # child envelope. The primary supervisor.spawn call is owned
+        # by SubagentResearchService on the parent side (R1 P0.2
+        # prewire); this child-side spawn is redundant belt-and-
+        # braces for paths where the parent prewire didn't run
+        # (resume after pod restart, ad-hoc spawn).
+        #
+        # Earlier rounds fail-closed on spawn failure (R11) AND on
+        # missing registry (R13). Round 18 surfaced that this was
+        # too aggressive: ``registry.spawn`` is idempotent, so if it
+        # raises while the supervisor is actually healthy (already
+        # spawned by the parent path), fail-closing here disables
+        # the publisher for a perfectly working supervisor. Now:
+        #   - missing registry → log warning, skip publish (we
+        #     genuinely have no way to confirm a consumer).
+        #   - spawn raises → log warning and CONTINUE to publish
+        #     (the supervisor may exist from parent prewire; if it
+        #     doesn't, the publish will fall on a stream with no
+        #     consumer and the supervisor's orphan_reconcile is the
+        #     fallback).
+        registry = getattr(self, "_supervisor_registry", None)
+        if registry is None:
+            logger.warning(
+                "child-side mailbox publisher: registry is None for "
+                "session=%s — skipping SPAWN_ACK/heartbeat; ensure "
+                "SupervisorRegistry is wired alongside MailboxPublisher "
+                "in lifespan",
+                self._session_id,
+            )
+            return
+        try:
+            await registry.spawn(session.parent_session_id)
+        except Exception as exc:
+            logger.warning(
+                "child-side redundant ensure-supervisor for parent=%s "
+                "raised %s — continuing to publish; parent prewire "
+                "should have already spawned the supervisor, and "
+                "orphan_reconcile is the fallback if not",
+                session.parent_session_id,
+                exc,
+            )
+
+        now = datetime.now(tz=timezone.utc)
+        try:
+            await publisher.publish(MailboxEnvelope(
+                envelope_id=f"spawn-ack:{self._session_id}",
+                type=MailboxEnvelopeType.SPAWN_ACK,
+                parent_session_id=session.parent_session_id,
+                child_session_id=self._session_id,
+                correlation_id=self._spawn_correlation_id,
+                emitted_at=now,
+                producer_role=ProducerRole.CHILD_AGENT,
+                payload=SpawnAckPayload(
+                    accepted=True,
+                    child_session_id=self._session_id,
+                    sandbox_ready=True,
+                    sandbox_ready_at=now,
+                ).model_dump(mode="json"),
+            ))
+        except Exception:
+            # codex r3 [R3-4, HIGH CONTRACT] — a transient SPAWN_ACK
+            # publish failure must NOT prevent ChildHeartbeatTask from
+            # starting. The supervisor's stale-detection clock relies on
+            # heartbeat arrival; if we abort here the child looks
+            # orphaned even though it's running. Log and continue —
+            # heartbeats themselves carry independent retry semantics
+            # via the resilient ``run()`` loop.
+            logger.exception(
+                "SPAWN_ACK publish failed for child session %s — continuing "
+                "to start heartbeat so supervisor still sees liveness",
+                self._session_id,
+            )
+
+        # Start the heartbeat task. Idempotent w.r.t. multiple invoke calls
+        # (e.g. ``__new__``-bypass tests that call invoke twice — we only
+        # create the asyncio task on first wire).
+        if self._heartbeat_handle is None:
+            try:
+                self._heartbeat_task = ChildHeartbeatTask(
+                    publisher,
+                    session.parent_session_id,
+                    self._session_id,
+                )
+                self._heartbeat_handle = asyncio.create_task(
+                    self._heartbeat_task.run(),
+                    name=f"heartbeat-{self._session_id}",
+                )
+            except Exception:
+                logger.exception(
+                    "Heartbeat task start failed for child session %s — "
+                    "stale-detection at supervisor may classify as orphan",
+                    self._session_id,
+                )
+
+    async def _cleanup_heartbeat_task(self) -> None:
+        """codex r4 [R4-2, HIGH PERF] — stop the heartbeat task
+        unconditionally on terminal entry.
+
+        Idempotent: a missing task is a no-op. Best-effort: a stop
+        timeout falls through to ``task.cancel()`` so the task doesn't
+        outlive the runner.
+        """
+        if self._heartbeat_task is None or self._heartbeat_handle is None:
+            return
+        try:
+            await self._heartbeat_task.stop()
+            await asyncio.wait_for(self._heartbeat_handle, timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "heartbeat task stop timed out for child %s — cancelling",
+                self._session_id,
+            )
+            self._heartbeat_handle.cancel()
+            try:
+                await self._heartbeat_handle
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception:
+            logger.debug(
+                "heartbeat task stop raised for child %s — best-effort",
+                self._session_id,
+                exc_info=True,
+            )
+        finally:
+            # Defensive: null out so a second terminal entry doesn't
+            # re-await a closed task.
+            self._heartbeat_task = None
+            self._heartbeat_handle = None
+
+    async def _maybe_stop_child_publisher(
+        self,
+        status: SessionStatus,
+        terminal_reason: str | None,
+    ) -> None:
+        """C3 PR-4.5 — emit RESULT_READY / CANCEL_ACK + stop heartbeat.
+
+        Called from within ``_terminal_op`` (shielded), so failure here
+        does NOT prevent the DB terminal write. The supervisor's
+        ORPHAN_TIMEOUT path is the fallback if RESULT_READY is lost.
+
+        codex r4 [R4-2, HIGH PERF] — heartbeat cleanup ALWAYS runs
+        unconditionally first: even if the runtime decision says
+        "no longer mailbox plane" (§11.6 rollback mid-run, DB lookup
+        failure, etc.), an already-started heartbeat task must be
+        stopped or it keeps publishing PROGRESS_UPDATE forever. Only
+        the terminal-envelope publish is gated on the current
+        ``_is_mailbox_plane_child()`` check.
+
+        Mapping (spec §7.2 + §7.6):
+
+        - ``terminal_reason == "user_cancel"`` → ``CANCEL_ACK(cancelled)``
+        - any other terminal_reason on ``COMPLETED`` with ``natural`` /
+          ``None`` reason → ``RESULT_READY(SUCCESS)``
+        - any other (TIMED_OUT, watchdog, server_restart, runner_error,
+          etc.) → ``RESULT_READY(FAILED)``
+        """
+        # codex r4 [R4-2, HIGH PERF] — unconditional heartbeat cleanup.
+        await self._cleanup_heartbeat_task()
+
+        publisher = getattr(self, "_mailbox_publisher", None)
+        if publisher is None:
+            return
+        # codex r23 [R23-2, MEDIUM ARCH] — mirror the spawn path gate:
+        # if there is no SupervisorRegistry, there is no confirmed
+        # consumer for the per-root stream, so terminal envelopes
+        # would land on a stream nobody is reading. Skip publish in
+        # that case — orphan_reconcile is the fallback.
+        if getattr(self, "_supervisor_registry", None) is None:
+            return
+        if not await self._is_mailbox_plane_child():
+            # Row rolled back to legacy or no longer exists; do NOT
+            # publish RESULT_READY/CANCEL_ACK to a (possibly already
+            # gone) supervisor. Heartbeat is already stopped above.
+            return
+        session = self._cached_session_for_publisher
+        if session is None or not session.parent_session_id:
+            return
+
+        from datetime import datetime, timezone
+        from app.domain.models.mailbox_envelope import (
+            CancelAckPayload,
+            CostAggregate,
+            MailboxEnvelope,
+            MailboxEnvelopeType,
+            ProducerRole,
+            ResultReadyOutcome,
+            ResultReadyPayload,
+        )
+
+        # codex r15 [R15-1] / r16 [R16-2, HIGH ARCH] — when the
+        # supervisor's CancelRequestHandler TERMINATE path drove this
+        # terminal (via the callback bridge calling stop_session),
+        # the supervisor will synthesize its own
+        # ``CANCEL_ACK(force_terminated)``. The child runner MUST NOT
+        # publish its own ``CANCEL_ACK(cancelled)`` here or the wire
+        # carries two terminal envelopes for the same correlation
+        # (and CancelAckHandler double-fires destroy). The marker
+        # primitive lives in the domain layer so this consumer does
+        # NOT reverse-import from interfaces.
+        try:
+            from app.domain.services.supervisor_terminate_marker import (
+                consume_supervisor_terminate_marker,
+            )
+            supervisor_drove_terminal = consume_supervisor_terminate_marker(
+                self._session_id
+            )
+        except Exception:
+            supervisor_drove_terminal = False
+
+        now = datetime.now(tz=timezone.utc)
+        try:
+            if supervisor_drove_terminal:
+                logger.debug(
+                    "child terminal publish: skipping CANCEL_ACK for "
+                    "session=%s — supervisor-initiated TERMINATE drives "
+                    "synthetic CANCEL_ACK(force_terminated) instead",
+                    self._session_id,
+                )
+                return
+            if terminal_reason == "user_cancel":
+                envelope = MailboxEnvelope(
+                    envelope_id=f"cancel-ack:{self._session_id}",
+                    type=MailboxEnvelopeType.CANCEL_ACK,
+                    parent_session_id=session.parent_session_id,
+                    child_session_id=self._session_id,
+                    correlation_id=self._spawn_correlation_id,
+                    emitted_at=now,
+                    producer_role=ProducerRole.CHILD_AGENT,
+                    payload=CancelAckPayload(
+                        final_state="cancelled",
+                        summary=None,
+                    ).model_dump(mode="json"),
+                )
+            else:
+                # codex r4 [R4-4] / r21 [R21-1, HIGH CONTRACT] —
+                # outcome resolution:
+                #   * runner-exception flag overrides everything → FAILED
+                #   * COMPLETED + natural/None reason → SUCCESS
+                #   * anything else → FAILED
+                if getattr(self, "_runner_exception_terminal", False):
+                    outcome = ResultReadyOutcome.FAILED
+                elif (
+                    status == SessionStatus.COMPLETED
+                    and terminal_reason in (None, "natural")
+                ):
+                    outcome = ResultReadyOutcome.SUCCESS
+                else:
+                    outcome = ResultReadyOutcome.FAILED
+                envelope = MailboxEnvelope(
+                    envelope_id=f"result-ready:{self._session_id}",
+                    type=MailboxEnvelopeType.RESULT_READY,
+                    parent_session_id=session.parent_session_id,
+                    child_session_id=self._session_id,
+                    correlation_id=self._spawn_correlation_id,
+                    emitted_at=now,
+                    producer_role=ProducerRole.CHILD_AGENT,
+                    payload=ResultReadyPayload(
+                        summary="",
+                        outcome=outcome,
+                        cost_summary=CostAggregate(),
+                    ).model_dump(mode="json"),
+                )
+            await publisher.publish(envelope)
+        except Exception:
+            logger.exception(
+                "terminal envelope publish failed for child %s (status=%s, "
+                "reason=%s) — supervisor ORPHAN_TIMEOUT will recover",
+                self._session_id, status.value, terminal_reason,
+            )
+
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
         try:
@@ -3433,6 +3809,15 @@ class AgentTaskRunner(TaskRunner):
             # 2.确保沙箱、mcp、a2a均初始化完成
             logger.info(f"AgentTaskRunner任务处理开始")
             await self._sandbox.ensure_sandbox()
+            # C3 PR-4.5 (codex r1 [R1-4, HIGH CONTRACT]) — emit SPAWN_ACK
+            # AFTER ensure_sandbox() succeeds. The envelope payload sets
+            # ``sandbox_ready=True`` which the supervisor interprets as
+            # "container can accept tool calls"; firing it before
+            # ensure_sandbox would publish a false ready signal that
+            # supervisor + audit would record as a lie. No-op for roots
+            # and legacy-plane children (lazy worker_type /
+            # control_plane check inside the helper).
+            await self._maybe_spawn_child_publisher()
             mcp_preference_map = await self._load_user_preferences_map(ToolType.MCP)
             a2a_preference_map = await self._load_user_preferences_map(ToolType.A2A)
             skill_preference_map = await self._load_user_preferences_map(ToolType.SKILL)
@@ -3738,10 +4123,38 @@ class AgentTaskRunner(TaskRunner):
                 await self._put_and_add_event(
                     task, ErrorEvent(error=f"AgentTaskRunner出错: {str(e)}")
                 )
+                # codex r4 [R4-4] / r21 [R21-1, HIGH CONTRACT] —
+                # runner exception is NOT a natural completion, but
+                # the Session domain model + DB CHECK only accept a
+                # fixed Literal of terminal_reason values; injecting
+                # "runner_error" would fail validation. Instead, set
+                # an instance flag that ``_maybe_stop_child_publisher``
+                # consumes when mapping the terminal envelope, so the
+                # mailbox wire emits ``RESULT_READY(outcome=FAILED)``
+                # while the persistence layer still uses an
+                # accepted terminal_reason (``natural`` is the
+                # caller-default; the flag overrides outcome only
+                # for the mailbox audit wire).
+                self._runner_exception_terminal = True
                 await self._set_terminal_status_with_notifications(
                     SessionStatus.COMPLETED
                 )
         finally:
+            # codex r5 [R5-2, HIGH PERF] — unconditional heartbeat
+            # cleanup on EVERY invoke() exit (including early-raise
+            # branches: supervisor_suspend, takeover_*, session_delete,
+            # GeneratorExit). Without this the heartbeat asyncio task
+            # outlives the runner and keeps publishing PROGRESS_UPDATE,
+            # refreshing the supervisor's liveness clock and bleeding
+            # Redis Stream entries. Idempotent — re-entry is a no-op
+            # because ``_cleanup_heartbeat_task`` nulls the handle.
+            try:
+                await self._cleanup_heartbeat_task()
+            except Exception:
+                logger.debug(
+                    "heartbeat cleanup in invoke().finally raised — best-effort",
+                    exc_info=True,
+                )
             # 17.在同一个asyncio Task上下文中清理MCP/A2A工具资源
             # 这是关键：streamablehttp_client内部使用anyio.create_task_group()，
             # 要求在同一个Task中进入和退出cancel scope，

@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -150,6 +152,16 @@ def get_session_service(request: HTTPConnection) -> SessionService:
         fs_reconciler=fs_reconciler,
         execution_supervisor=supervisor,
         subagent_limits=get_subagent_limits(),
+        # codex r9 [R9-1] + r10 [R10-1, HIGH CONTRACT] — wire a LIVE,
+        # env-file-aware reader that bypasses ``get_settings`` @lru_cache
+        # but stays consistent with the Settings ``env_file=".env"``
+        # source. A bare ``os.environ`` read would diverge: ops sets the
+        # flag in ``.env`` → ``main.py`` reads via ``settings`` → builds
+        # SupervisorRegistry; new child still goes legacy because env
+        # var wasn't exported into the process environment. Constructing
+        # a fresh ``Settings()`` per call honors both .env and env vars
+        # and gives rollback-without-restart semantics.
+        mailbox_flag_reader=_read_mailbox_supervisor_enabled_uncached,
     )
 
 
@@ -498,33 +510,36 @@ _last_refresh_generation: int = 0
 _refresh_lock = threading.Lock()
 
 
-# codex r4 [HIGH CONTRACT] — PR-4.5 readiness gate (see ``build_supervisor_registry``).
+# codex r4 [HIGH CONTRACT] / r1 [R1-3] — PR-4.5 readiness gate (see
+# ``build_supervisor_registry``).
 #
-# The flag stays ``False`` through PR-4 and is flipped ONLY by PR-4.5, in
-# the SAME commit that replaces ``_pr3c_noop_callback`` (line ~680) with a
-# real ``AgentService.stop_session`` bridge. PR-4 ships the real terminal
-# handlers (ResultReadyHandler / CancelAckHandler / CancelRequestHandler
-# with ``SandboxLifecycleService.destroy`` side-effects per spec §7.3-§7.6;
-# ApprovalRequestHandler stub-denies per codex r5 veto; HandoffRequestHandler
-# emits telemetry only per spec §6.6) but the in-process
-# ``agent_service_callback`` is STILL ``_pr3c_noop_callback``. Until PR-4.5
-# swaps the callback, ``build_supervisor_registry`` refuses to construct a
-# registry so an operator who flips ``MAILBOX_SUPERVISOR_ENABLED=True`` gets
-# a hard lifespan failure instead of CancelRequestHandler TERMINATE step 1
-# silently no-op'ing while step 2 destroys a still-running asyncio.Task
-# (spec §7.6 "stop → destroy" violation).
+# POST-PR-4.5: the flag is ``True`` (set below) and the registry
+# factory wires ``_pr4_5_agent_service_callback`` — the real
+# ``AgentService.stop_session`` bridge that satisfies spec §7.6
+# stop-before-destroy ordering. The legacy ``_pr3c_noop_callback`` is
+# preserved as a named symbol for backwards-compat tests but is no
+# longer wired into the factory.
 #
-# codex r2 [R2-1, HIGH ARCH] — flipping ONLY this flag (or ONLY swapping
-# the callback) without the matching change in the same commit violates
-# spec §7.6 and re-opens the leak this gate blocks. PR-4.5 is the single
-# atomic commit that lands both halves.
+# The constant remains gateable: if a future refactor accidentally
+# flips it back to ``False`` (or swaps the callback back to the noop)
+# the lifespan still fails closed via the ``RuntimeError`` raised in
+# ``build_supervisor_registry``, surfacing the misconfiguration at
+# pod startup.
 #
-# Tests that need to construct the registry (e.g. integration harness
-# fixtures in PR-4 / PR-4.5) patch this to ``True`` via
-# ``monkeypatch.setattr``. The locked gate is asserted by
+# Locked tests:
 # ``tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py``
-# (covers both the flag-False path and the callback-still-noop path).
-_PR4_TERMINAL_HANDLERS_READY: bool = False
+# pin both the True-default and the callback identity; the legacy
+# False-forced path still raises a load-bearing error with §7.6
+# context for any regression that re-disables the gate.
+_PR4_TERMINAL_HANDLERS_READY: bool = True
+# codex r1 [R1-3, HIGH CONTRACT] (PR-4.5) — flipped True alongside the
+# replacement of ``_pr3c_noop_callback`` with
+# ``_pr4_5_agent_service_callback`` in this same commit. Spec §7.6 +
+# the readiness-gate docstring above mandate that both halves move
+# together: the real ``AgentService.stop_session`` bridge is now wired
+# into ``build_supervisor_registry``'s factory below. The locked test
+# at ``tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py``
+# has been updated in lockstep.
 
 
 def build_supervisor_registry(
@@ -555,58 +570,49 @@ def build_supervisor_registry(
       reason)`` per the ``_SandboxLifecycleProtocol`` shape in
       mailbox_supervisor.py).
 
-    ``agent_service_callback`` is ``_pr3c_noop_callback`` for PR-3c — the
-    in-process dispatch callback that wakes the root agent on subagent
-    events is wired in PR-4 alongside the real terminal handlers. The
-    PR-3a stub handlers tolerate the noop callback only because PR-3c
-    does not actually publish envelopes through the supervisor in
-    production (the flag defaults to False); when PR-4 ships the real
-    callback, the factory below at line ~602 is the single edit site.
+    ``agent_service_callback`` is ``_pr4_5_agent_service_callback`` —
+    the post-PR-4.5 production bridge that dispatches
+    ``CANCEL_REQUEST(TERMINATE)`` to ``AgentService.stop_session``
+    (spec §7.6 stop-before-destroy) and is a no-op for every other
+    envelope type. The legacy ``_pr3c_noop_callback`` is preserved as
+    a named symbol for backwards-compat tests but is no longer wired
+    into the registry factory.
 
-    codex r4 [HIGH CONTRACT] fail-closed gate (refined by codex r5 [R5-5]
-    after PR-4 shipped real terminal handlers): the supervisor's dispatch
-    table is no longer the PR-3a stub — PR-4 landed
-    :class:`ResultReadyHandler`, :class:`CancelAckHandler`,
-    :class:`CancelRequestHandler`, :class:`ApprovalRequestHandler`, and
-    :class:`HandoffRequestHandler` which DO call
-    ``SandboxLifecycleService.destroy``. The remaining stub is the
-    ``agent_service_callback`` parameter, still wired to
-    ``_pr3c_noop_callback``. CancelRequestHandler TERMINATE step 1 calls
-    that callback to stop the agent loop **before** step 2 destroys the
-    sandbox (spec §7.6 stop → destroy ordering). If the noop callback is
-    in place and the gate is flipped, step 1 silently no-ops and step 2
-    destroys a still-running asyncio.Task — half-baked production
-    deployment. PR-4.5 is the SINGLE commit that replaces
-    ``_pr3c_noop_callback`` with a real ``AgentService.stop_session``
-    bridge AND flips ``_PR4_TERMINAL_HANDLERS_READY`` to ``True``; until
-    then this function raises ``RuntimeError`` so lifespan fails closed
-    on misconfiguration. Tests can bypass via patch of
-    ``_PR4_TERMINAL_HANDLERS_READY``.
+    POST-PR-4.5 (codex r1 [R1-3] / r10 [R10-3]): the gate is OPEN by
+    default. The factory wires :func:`_pr4_5_agent_service_callback`
+    as ``ctx.agent_service_callback`` — the real
+    ``AgentService.stop_session`` bridge that satisfies spec §7.6
+    stop-before-destroy ordering on the
+    ``CANCEL_REQUEST(policy=TERMINATE)`` path and is a no-op for
+    every other envelope type. The legacy
+    :func:`_pr3c_noop_callback` is preserved as a named symbol for
+    backwards-compat tests but is NOT wired into the factory.
+
+    If a refactor forces ``_PR4_TERMINAL_HANDLERS_READY`` back to
+    ``False`` (regression), this function still raises
+    ``RuntimeError`` so lifespan fails closed on misconfiguration.
+    Tests can bypass via ``monkeypatch.setattr`` on the flag. The
+    locked tests at
+    ``tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py``
+    pin both the True-default and the
+    :func:`_pr4_5_agent_service_callback` identity.
     """
     if not _PR4_TERMINAL_HANDLERS_READY:
         raise RuntimeError(
-            "build_supervisor_registry: mailbox_supervisor_enabled=True is "
-            "not safe yet. PR-4 shipped the real terminal handlers "
-            "(ResultReady / CancelAck / CancelRequest / ApprovalRequest / "
-            "Handoff) that call SandboxLifecycleService.destroy, so the "
-            "dispatch table is no longer the PR-3a stub. What is STILL "
-            "stub is the in-process ``agent_service_callback``, which is "
-            "wired to ``_pr3c_noop_callback``. CancelRequestHandler "
-            "TERMINATE branch executes step 1 (callback → stop the agent "
-            "task cooperatively) BEFORE step 2 (destroy the sandbox) per "
-            "spec §7.6 stop → destroy ordering. With the noop callback in "
-            "place, step 1 silently no-ops and step 2 destroys a still-"
-            "running task — that's the leak/half-baked-deploy this gate "
-            "blocks. PR-4.5 is the SINGLE commit that swaps "
-            "`_pr3c_noop_callback` for `AgentService.stop_session` AND "
-            "flips `_PR4_TERMINAL_HANDLERS_READY` to True; flipping only "
-            "one half violates spec §7.6. The locked gate test is "
-            "tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py"
-            "::test_callback_is_still_noop_pending_pr_4_5 (codex r6 [R6-5] — "
-            "reference by name not line range so the message stays accurate "
-            "across future edits). Either wait for PR-4.5 to land both halves, "
-            "or set MAILBOX_SUPERVISOR_ENABLED=False (the default) in your "
-            ".env."
+            "build_supervisor_registry: _PR4_TERMINAL_HANDLERS_READY is "
+            "False. This is a REGRESSION post-PR-4.5: the gate should "
+            "default to True so the factory wires the real "
+            "_pr4_5_agent_service_callback (AgentService.stop_session "
+            "bridge satisfying spec §7.6 stop-before-destroy). If "
+            "you see this error, something flipped the flag back to "
+            "False without also reverting the callback wiring — fix "
+            "that regression rather than bypassing the gate. The "
+            "locked tests are in "
+            "tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py "
+            "(test_pr_4_5_readiness_gate_is_open + "
+            "test_factory_wires_pr_4_5_callback_bridge). To temporarily "
+            "disable mailbox supervisor entirely, set "
+            "MAILBOX_SUPERVISOR_ENABLED=False in your .env."
         )
     from app.application.services.mailbox_supervisor import (
         MailboxSupervisor,
@@ -669,11 +675,17 @@ def build_supervisor_registry(
             audit_repo=audit_repo,
             publisher=publisher,
             sandbox_lifecycle=sandbox_lifecycle_service,  # type: ignore[arg-type]
-            # PR-3c: in-process dispatch callback is PR-4's responsibility.
-            # The PR-3a stub handlers call ``ctx.agent_service_callback``
-            # only on non-terminal types; PR-3c does not flip the flag, so
-            # this code path is not exercised in production until PR-4.
-            agent_service_callback=_pr3c_noop_callback,
+            # C3 PR-4.5 — real callback bridge replacing
+            # ``_pr3c_noop_callback``. Supervisor handlers invoke this
+            # BEFORE destroy on the TERMINATE path (spec §7.6 stop →
+            # destroy ordering) so the child's agent task is stopped
+            # cooperatively. ``_pr4_5_agent_service_callback`` is a
+            # closure over the lifespan-scoped ``AgentService`` set via
+            # ``_bind_agent_service_for_callback`` after
+            # ``_build_agent_service`` returns; until binding completes
+            # it is a safe no-op (lifespan ordering guarantees binding
+            # happens before the supervisor consumer loop starts).
+            agent_service_callback=_pr4_5_agent_service_callback,
             telemetry=telemetry_adapter,
         )
         return MailboxSupervisor(
@@ -686,16 +698,324 @@ def build_supervisor_registry(
 
 
 async def _pr3c_noop_callback(envelope) -> None:  # noqa: ANN001
-    """C3 PR-3c placeholder for ``ctx.agent_service_callback``.
+    """C3 PR-3c placeholder for ``ctx.agent_service_callback`` — kept
+    around for backwards compatibility with code paths and tests that
+    still reference it by name (the locked gate test asserts on its
+    existence and docstring).
 
-    The real callback (waking the root agent on subagent envelope
-    arrival) is wired in PR-4 together with the terminal handlers. Until
-    then this is a no-op — PR-3c keeps the flag default False so the
-    supervisor isn't actually consuming envelopes in production, and the
-    PR-3a stub handlers tolerate the no-op for tests that explicitly
-    enable the flag.
+    PR-3c placeholder behavior: no-op. PR-4.5 introduced
+    ``_pr4_5_agent_service_callback`` as the production wiring; new
+    callers should reference that name instead.
     """
     return None
+
+
+# C3 PR-4.5 — mutable holder for the lifespan-scoped AgentService that
+# ``_pr4_5_agent_service_callback`` dispatches into. Set ONCE by
+# ``_bind_agent_service_for_callback`` immediately after
+# ``_build_agent_service`` returns; before that, the callback waits on
+# ``_PR4_5_AGENT_SERVICE_BIND_EVENT`` (codex r3 [R3-1, HIGH ARCH] —
+# main.py lifespan runs ``reconcile_orphans`` BEFORE
+# ``_build_agent_service`` so any supervisor that consumes a TERMINATE
+# during the reconcile window must block until bind, not silently
+# no-op).
+#
+# codex r5 [R5-1, HIGH ARCH] / codex r5 [R5-1 fix] — the event is
+# created LAZILY on first ``_ensure_bind_event()`` call (which happens
+# from inside an async context with a live loop). Module-load
+# instantiation tied the event to whatever loop existed at import
+# time (often the wrong one in pytest-anyio harnesses where each test
+# spins its own loop), producing
+# ``RuntimeError: <Event ...> is bound to a different event loop``.
+# The lazy pattern defers loop binding to the first await.
+_PR4_5_AGENT_SERVICE_FOR_CALLBACK: "AgentService | None" = None
+_PR4_5_AGENT_SERVICE_BIND_EVENT: "asyncio.Event | None" = None
+# How long to wait inside the callback for the AgentService to bind
+# before giving up. Short enough that a permanently misconfigured
+# lifespan surfaces quickly; long enough to absorb normal startup
+# jitter on the reconcile → bind path.
+_PR4_5_BIND_WAIT_TIMEOUT_SECONDS: float = 10.0
+
+
+def _ensure_bind_event() -> "asyncio.Event":
+    """Lazy ``asyncio.Event`` factory tied to the current running loop.
+
+    Must be called from inside an async context. If the AgentService
+    was already bound via ``_bind_agent_service_for_callback`` before
+    this loop was entered (the common production case: bind happens in
+    lifespan startup with a single asyncio loop), the freshly-created
+    event is immediately set so the callback does not block on a
+    permanently-cleared event.
+    """
+    global _PR4_5_AGENT_SERVICE_BIND_EVENT
+    if _PR4_5_AGENT_SERVICE_BIND_EVENT is None:
+        _PR4_5_AGENT_SERVICE_BIND_EVENT = asyncio.Event()
+        if _PR4_5_AGENT_SERVICE_FOR_CALLBACK is not None:
+            _PR4_5_AGENT_SERVICE_BIND_EVENT.set()
+    return _PR4_5_AGENT_SERVICE_BIND_EVENT
+
+
+def _bind_agent_service_for_callback(agent_service: "AgentService") -> None:
+    """Wire the lifespan-scoped AgentService into the supervisor callback.
+
+    Called from ``_build_agent_service`` after ``AgentService`` is fully
+    constructed. Idempotent re-binds are safe (e.g. test harnesses that
+    rebuild AgentService) but only the most recent reference wins. If a
+    bind event has already been created (callback ran before bind), it
+    is set so any pending awaits wake up; otherwise the event stays
+    unset and ``_ensure_bind_event`` will set it lazily on first
+    callback invocation.
+    """
+    global _PR4_5_AGENT_SERVICE_FOR_CALLBACK
+    _PR4_5_AGENT_SERVICE_FOR_CALLBACK = agent_service
+    if _PR4_5_AGENT_SERVICE_BIND_EVENT is not None:
+        _PR4_5_AGENT_SERVICE_BIND_EVENT.set()
+
+
+# codex r16 [R16-2, HIGH ARCH] — supervisor-terminate marker moved
+# to ``app.domain.services.supervisor_terminate_marker`` so the
+# domain-layer agent_task_runner doesn't reverse-import from
+# interfaces (CLAUDE.md Clean Architecture rule). This module
+# re-exports the helper for backwards-compat with any caller that
+# imported the symbol from here.
+from app.domain.services.supervisor_terminate_marker import (  # noqa: E402
+    add_supervisor_terminate_marker as _add_supervisor_terminate_marker,
+    consume_supervisor_terminate_marker as consume_supervisor_terminate_marker,  # noqa: F401
+)
+
+
+# codex r14 [R14-4, MEDIUM ARCH] — startup snapshot of
+# ``mailbox_supervisor_enabled``. The supervisor registry is only
+# built at lifespan startup based on ``get_settings()``; if startup
+# was False (no registry), letting the live reader return True at
+# runtime would create mailbox children with no consumer (orphan
+# state until restart). The downgrade-only reader pattern enforces:
+#   - startup True  ⇒ runtime read can return True OR False
+#                     (operator may toggle to False to roll back)
+#   - startup False ⇒ runtime read ALWAYS returns False, even if
+#                     ``.env`` later flips to True (operator must
+#                     restart to enable; reflected in the docstring
+#                     and ops runbook §11.6).
+_PR4_5_STARTUP_MAILBOX_ENABLED: bool | None = None
+# codex r15 [R15-3, MEDIUM ARCH] — snapshot the startup value at
+# module import so a runtime ``.env`` toggle from False→True without
+# restart cannot upgrade the runtime reader; codex flagged that the
+# lazy "first call" snapshot lost the actual lifespan-startup value
+# if the first child creation happened AFTER an operator edit.
+try:
+    from core.config import Settings as _PR4_5_StartupSettings  # noqa: E402
+    _PR4_5_STARTUP_MAILBOX_ENABLED = bool(
+        _PR4_5_StartupSettings().mailbox_supervisor_enabled
+    )
+except Exception:  # noqa: BLE001 — fail closed if Settings can't construct
+    _PR4_5_STARTUP_MAILBOX_ENABLED = False
+
+
+def _read_mailbox_supervisor_enabled_uncached() -> bool:
+    """codex r10 [R10-1] / r14 [R14-4] — env-file-aware,
+    cache-bypassing read of ``mailbox_supervisor_enabled`` with
+    downgrade-only semantics.
+
+    * The ``.env`` file is honored (matches ``main.py``'s
+      ``settings`` source).
+    * The ``@lru_cache`` on ``get_settings()`` is bypassed so the
+      rollback runbook §11.6 ("flip
+      ``MAILBOX_SUPERVISOR_ENABLED=false`` and the next new child
+      immediately goes legacy") works without ``cache_clear()`` or a
+      pod restart.
+    * Runtime UPGRADE from False to True is intentionally NOT
+      honored — enabling the mailbox plane requires a pod restart
+      so the SupervisorRegistry is constructed alongside it. The
+      first call snapshots the startup value via
+      ``Settings().mailbox_supervisor_enabled``; subsequent calls
+      AND the snapshot together via boolean AND.
+
+    Construction cost is negligible — Pydantic BaseSettings reads a
+    handful of env vars + the .env file; SessionService creates new
+    children at human-typing rate, not per-message.
+    """
+    global _PR4_5_STARTUP_MAILBOX_ENABLED
+    from core.config import Settings
+    current = Settings().mailbox_supervisor_enabled
+    if _PR4_5_STARTUP_MAILBOX_ENABLED is None:
+        _PR4_5_STARTUP_MAILBOX_ENABLED = current
+    # Downgrade-only: must be True at startup AND currently.
+    return bool(_PR4_5_STARTUP_MAILBOX_ENABLED and current)
+
+
+def _reset_mailbox_startup_snapshot_for_tests() -> None:
+    """Test helper — clear the startup snapshot so a fresh
+    Settings() value can be picked up. Not used in production."""
+    global _PR4_5_STARTUP_MAILBOX_ENABLED
+    _PR4_5_STARTUP_MAILBOX_ENABLED = None
+
+
+def _reset_agent_service_callback_state_for_tests() -> None:
+    """Test helper — clear the holder + event so the unbound branch is
+    exercisable. Not used in production; do NOT call from app code.
+    """
+    global _PR4_5_AGENT_SERVICE_FOR_CALLBACK, _PR4_5_AGENT_SERVICE_BIND_EVENT
+    _PR4_5_AGENT_SERVICE_FOR_CALLBACK = None
+    _PR4_5_AGENT_SERVICE_BIND_EVENT = None
+
+
+async def _pr4_5_agent_service_callback(envelope) -> None:  # noqa: ANN001
+    """C3 PR-4.5 supervisor → AgentService bridge (spec §7.6).
+
+    Used by MailboxSupervisor handlers as ``ctx.agent_service_callback``.
+
+    codex r2 [R2-1, CRITICAL ARCH] — handlers invoke this callback on
+    MULTIPLE envelope types (SPAWN_REQUEST stub-dispatch, PROGRESS_UPDATE
+    dispatch, ResultReadyHandler post-destroy wake, CancelAckHandler
+    post-destroy wake, CancelRequestHandler TERMINATE step 1, direct-kill
+    fallback). Only the TERMINATE step 1 path requires actually stopping
+    the child's agent task; the others are pure wake/dispatch signals.
+    A blanket ``stop_session`` on any envelope with ``child_session_id``
+    would treat every heartbeat as a user-cancel.
+
+    Behavior:
+
+    * ``CANCEL_REQUEST`` with ``policy=TERMINATE`` ⇒ call
+      ``AgentService.stop_session(child_id, is_admin=True)`` so the
+      child's asyncio task is cancelled cooperatively BEFORE the
+      supervisor's destroy side-effect runs (spec §7.6 stop-before-destroy).
+      ``stop_session`` is fire-and-signal: ``task.cancel()`` propagates
+      but the runner's terminal cleanup is async. The destroy that
+      follows races a still-draining task — this is documented best-
+      effort behavior; a stricter wait-for-terminal would require a new
+      drain primitive on AgentService (deferred to PR-5).
+    * If AgentService is not bound yet (TERMINATE arrives during the
+      reconcile_orphans → bind window in lifespan startup), the call
+      WAITS on the module-level bind event with a
+      ``_PR4_5_BIND_WAIT_TIMEOUT_SECONDS`` cap. Timeout logs an error
+      so the violation is auditable; destroy still proceeds because
+      handlers swallow callback exceptions.
+    * ``CANCEL_REQUEST`` with ``policy=REQUEST_CANCEL`` ⇒ no
+      ``stop_session`` call (per spec §8.2 the child decides whether to
+      cooperate). A future PR-5 cooperative-cancel dispatcher may add
+      a non-destructive child-side signal here.
+    * Any other envelope type (SPAWN_REQUEST / SPAWN_ACK /
+      PROGRESS_UPDATE / RESULT_READY / CANCEL_ACK / APPROVAL_* /
+      HANDOFF_REQUEST) ⇒ no-op. Heartbeat / progress envelopes do NOT
+      carry a stop intent; ResultReady / CancelAck callbacks fire
+      AFTER destroy and the spec uses them only as wake signals which
+      the legacy notification path already handles.
+    * Exceptions are logged and swallowed: the caller (handler) still
+      executes the destroy side-effect; a failed callback must not
+      block destroy.
+    """
+    # codex r2 [R2-1, CRITICAL ARCH] — type/policy gate (before the
+    # bind-wait so non-TERMINATE envelopes are cheap no-ops even during
+    # startup).
+    from app.domain.models.mailbox_envelope import (
+        CancelPolicy,
+        MailboxEnvelopeType,
+    )
+    if getattr(envelope, "type", None) != MailboxEnvelopeType.CANCEL_REQUEST:
+        return
+    payload = getattr(envelope, "payload", None) or {}
+    policy = payload.get("policy") if isinstance(payload, dict) else None
+    if policy not in (CancelPolicy.TERMINATE.value, CancelPolicy.TERMINATE):
+        return
+
+    svc = _PR4_5_AGENT_SERVICE_FOR_CALLBACK
+    if svc is None:
+        # codex r3 [R3-1, HIGH ARCH] / codex r5 [R5-1] — block briefly
+        # on a per-loop bind event so a TERMINATE consumed during
+        # ``reconcile_orphans`` (which runs BEFORE
+        # ``_build_agent_service`` in main.py lifespan) is still
+        # processed correctly. ``_ensure_bind_event`` creates the
+        # event inside the current loop on first call so the multi-
+        # loop pytest harness doesn't see "Event bound to different
+        # loop" errors.
+        ev = _ensure_bind_event()
+        try:
+            await asyncio.wait_for(
+                ev.wait(),
+                timeout=_PR4_5_BIND_WAIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "agent_service_callback: timed out waiting for "
+                "AgentService bind on TERMINATE envelope=%s; destroy "
+                "will proceed without cooperative stop (spec §7.6 "
+                "violated — investigate lifespan misordering)",
+                getattr(envelope, "envelope_id", "?"),
+            )
+            return
+        svc = _PR4_5_AGENT_SERVICE_FOR_CALLBACK
+        if svc is None:
+            return
+
+    sid = getattr(envelope, "child_session_id", None)
+    if not sid:
+        return
+    try:
+        session = await svc.get_session(sid)
+        if session is None:
+            # Already deleted — destroy will be a no-op anyway.
+            return
+        # codex r8 [R8-2] / r14 [R14-1, HIGH SEC] — defense in depth:
+        # only stop sessions whose row is actually a mailbox-plane
+        # subagent AND whose parent matches the envelope's claimed
+        # parent. ``is_admin=True`` bypasses ownership checks (this
+        # is a system-driven cancel), so without these gates a
+        # malformed or cross-root envelope could end an unrelated
+        # session. The supervisor's child→root mapping is trusted
+        # publisher-side (per mailbox_supervisor.py docstring), so
+        # the callback enforces the parent-match here as the last
+        # line of defense.
+        if (
+            getattr(session, "worker_type", None) != "subagent"
+            or getattr(session, "subagent_control_plane", None) != "mailbox"
+        ):
+            logger.warning(
+                "agent_service_callback: refusing stop_session for sid=%s "
+                "envelope_id=%s — row is not a mailbox-plane subagent "
+                "(worker_type=%s, subagent_control_plane=%s); destroy will "
+                "still proceed but cooperative stop is skipped",
+                sid,
+                getattr(envelope, "envelope_id", "?"),
+                getattr(session, "worker_type", None),
+                getattr(session, "subagent_control_plane", None),
+            )
+            return
+        env_parent = getattr(envelope, "parent_session_id", None)
+        row_parent = getattr(session, "parent_session_id", None)
+        if env_parent and row_parent and env_parent != row_parent:
+            logger.warning(
+                "agent_service_callback: refusing stop_session for sid=%s "
+                "envelope_id=%s — envelope.parent_session_id=%s does not "
+                "match session.parent_session_id=%s (cross-root envelope "
+                "or routing bug); destroy will still proceed but "
+                "cooperative stop is skipped",
+                sid,
+                getattr(envelope, "envelope_id", "?"),
+                env_parent,
+                row_parent,
+            )
+            return
+        user_id = str(session.user_id) if session.user_id else "system"
+        # codex r15 [R15-1] / r16 [R16-2] — register the session in
+        # the supervisor-initiated marker set BEFORE calling
+        # stop_session so the runner's terminal path skips its own
+        # CANCEL_ACK emission. Otherwise the child publishes
+        # ``CANCEL_ACK(cancelled)`` AND the supervisor synthesizes
+        # ``CANCEL_ACK(force_terminated)`` for the same correlation,
+        # producing duplicate destroy invocations and confused audit.
+        # Marker primitive lives in the domain layer
+        # (see ``app.domain.services.supervisor_terminate_marker``)
+        # so the runner-side consumer doesn't reverse-import
+        # interfaces.
+        _add_supervisor_terminate_marker(sid)
+        await svc.stop_session(sid, user_id=user_id, is_admin=True)
+    except Exception:
+        logger.warning(
+            "agent_service_callback stop_session failed sid=%s envelope_id=%s",
+            sid,
+            getattr(envelope, "envelope_id", "?"),
+            exc_info=True,
+        )
 
 
 _supervisor_registry_singleton: "SupervisorRegistry | None" = None
@@ -812,6 +1132,18 @@ def _build_agent_service(
     )
     # Notification emitter is always constructible (DB-only, no Redis
     # dep); gate-off deployments just never call it.
+    # C3 PR-4.5 — single lifespan-scoped publisher so every AgentTaskRunner
+    # constructed by ``AgentService._create_task`` shares one Redis-bound
+    # publisher rather than re-wrapping the raw client per task.
+    from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+        RedisMailboxPublisher,
+    )
+    redis_inner = (
+        redis_client.client if redis_client and hasattr(redis_client, "client") else None
+    )
+    mailbox_publisher = (
+        RedisMailboxPublisher(redis_inner) if redis_inner is not None else None
+    )
     agent_svc = AgentService(
         uow_factory=get_uow,
         config_snapshot=snapshot,
@@ -838,8 +1170,15 @@ def _build_agent_service(
         event_recovery=RedisEventRecovery(),
         sandbox_lifecycle_service=sandbox_lifecycle_service,
         supervisor_registry=supervisor_registry,
+        mailbox_publisher=mailbox_publisher,
     )
     agent_svc._supervisor = supervisor
+    # C3 PR-4.5 — bind AgentService into the supervisor callback bridge
+    # so ``_pr4_5_agent_service_callback`` can dispatch ``stop_session``
+    # on the TERMINATE path. Lifespan ordering: this returns to main.py
+    # before the supervisor consumer loop is started, so the bind always
+    # precedes the first envelope dispatch.
+    _bind_agent_service_for_callback(agent_svc)
     _last_refresh_generation = _config_generation
     return agent_svc
 
@@ -1242,6 +1581,8 @@ def get_subagent_research_service(
     ),
     sandbox_lifecycle_service=Depends(get_sandbox_lifecycle_service),
     quota_service: "ProbeQuotaService" = Depends(get_probe_quota_service),
+    supervisor_registry: "SupervisorRegistry | None" = Depends(get_supervisor_registry),
+    mailbox_publisher: MailboxPublisher = Depends(get_mailbox_publisher),
 ) -> "SubagentResearchService":
     """Phase 1 minimal: research probe orchestrator.
 
@@ -1263,4 +1604,9 @@ def get_subagent_research_service(
         classifier=classifier,
         sandbox_lifecycle_service=sandbox_lifecycle_service,
         quota_service=quota_service,
+        # C3 PR-4.5 — mailbox-plane wiring (registry may be None when the
+        # supervisor flag is off; publisher always available since it's a
+        # thin Redis wrapper).
+        supervisor_registry=supervisor_registry,
+        mailbox_publisher=mailbox_publisher,
     )

@@ -21,6 +21,7 @@ from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
+from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.external.task import Task
 from app.domain.errors.supervisor import SupervisorContractError
@@ -52,6 +53,7 @@ from app.domain.models.session import SandboxBindingState, Session, SessionStatu
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.mailbox_skip_helper import _should_skip_mailbox_lifecycle
 from app.domain.services.permission.confirmation_queue import ConfirmationQueue as ConfirmationManager
 from app.domain.services.permission.errors import PermissionConfigurationError
 from app.infrastructure.external.message_queue import STREAM_TTL_SECONDS
@@ -213,6 +215,11 @@ class AgentService:
         # can spawn/stop a supervisor when its root session enters
         # RUNNING / terminal. None when the mailbox plane is disabled
         # (deployment-time ``settings.mailbox_supervisor_enabled=False``).
+        mailbox_publisher: "MailboxPublisher | None" = None,
+        # C3 PR-4.5: child-side envelope publisher. Forwarded into every
+        # ``AgentTaskRunner`` so mailbox-plane children can publish
+        # SPAWN_ACK / RESULT_READY / CANCEL_ACK / PROGRESS_UPDATE
+        # envelopes back to the supervisor.
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -235,6 +242,7 @@ class AgentService:
         self._memory_notification_emitter = memory_notification_emitter
         self._memory_gate_rebuild_fn = memory_gate_rebuild_fn
         self._supervisor_registry = supervisor_registry
+        self._mailbox_publisher = mailbox_publisher
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -745,6 +753,10 @@ class AgentService:
             mailbox_supervisor_enabled=getattr(
                 getattr(self, "_settings", None), "mailbox_supervisor_enabled", False
             ),
+            # C3 PR-4.5: child-side publisher. Same ``getattr`` defense for
+            # ``__new__``-bypass tests; production wiring threads the
+            # ``RedisMailboxPublisher`` through from ``_build_agent_service``.
+            mailbox_publisher=getattr(self, "_mailbox_publisher", None),
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);
@@ -825,13 +837,56 @@ class AgentService:
         _resume_tool_confirmation, confirmation_sweep, and _resume_task_with_handoff.
         """
         if self._sandbox_lifecycle_service:
+            # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
+            # owns destroy (M1 single-writer). _should_skip_mailbox_lifecycle is
+            # referenced literally so the AST CI gate (§13.3) marks this site as
+            # guarded. Session fetch can return None when the row was deleted
+            # concurrently — in that case we conservatively fall through to the
+            # legacy path (no row → not a mailbox plane child by definition).
+            #
+            # codex r12 [R12-3] / r13 [R13-3] / r25 [R25-2, HIGH
+            # ARCH] — ``get_session()`` lookup must be try-guarded.
+            # On lookup exception we ATTEMPT ONE RETRY (transient
+            # DB blip is the most common cause). If retry also
+            # fails, fall back to legacy suspend: most sessions
+            # are root/legacy and their sandbox would orphan
+            # without it. The M1 race for an unknown mailbox child
+            # is the lesser risk vs orphan sandboxes for all
+            # root/legacy sessions. The live event sink release
+            # still runs unconditionally.
+            session = None
             try:
-                await self._sandbox_lifecycle_service.suspend(session_id)
+                session = await self.get_session(session_id)
             except Exception:
                 logger.debug(
-                    "on_task_runner_complete: suspend for session %s skipped",
+                    "on_task_runner_complete: get_session(%s) raised on first "
+                    "try — retrying once before falling back",
+                    session_id,
+                    exc_info=True,
+                )
+                try:
+                    session = await self.get_session(session_id)
+                except Exception:
+                    logger.warning(
+                        "on_task_runner_complete: get_session(%s) raised on retry "
+                        "— falling back to legacy suspend (best-effort cleanup)",
+                        session_id,
+                        exc_info=True,
+                    )
+            if session is not None and _should_skip_mailbox_lifecycle(session):
+                logger.debug(
+                    "on_task_runner_complete: skip suspend session=%s "
+                    "— mailbox supervisor owns lifecycle (M1)",
                     session_id,
                 )
+            else:
+                try:
+                    await self._sandbox_lifecycle_service.suspend(session_id)
+                except Exception:
+                    logger.debug(
+                        "on_task_runner_complete: suspend for session %s skipped",
+                        session_id,
+                    )
             # Release the live event sink AFTER suspend so the SUSPENDED event
             # reaches the SSE stream. The subsequent DoneEvent from task_runner
             # goes through task.output_stream directly — it doesn't need the sink.
@@ -3015,11 +3070,20 @@ class AgentService:
                 # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
                 await self._maybe_stop_supervisor_for_session(session_id)
                 # Sync sandbox binding: ACTIVE → SUSPENDED (same as normal completion)
+                # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
+                # owns destroy. _should_skip_mailbox_lifecycle reference satisfies
+                # AST CI gate (§13.3). ``session`` here is the row fetched above.
                 if self._sandbox_lifecycle_service:
-                    try:
-                        await self._sandbox_lifecycle_service.suspend(session_id)
-                    except Exception:
-                        logger.debug("status-reconcile suspend for %s skipped", session_id)
+                    if _should_skip_mailbox_lifecycle(session):
+                        logger.debug(
+                            "status-reconcile: skip suspend %s — mailbox plane",
+                            session_id,
+                        )
+                    else:
+                        try:
+                            await self._sandbox_lifecycle_service.suspend(session_id)
+                        except Exception:
+                            logger.debug("status-reconcile suspend for %s skipped", session_id)
                 session = session.model_copy(update={"status": SessionStatus.COMPLETED})
 
             # 11.记录日志展示会话已启动
@@ -3131,15 +3195,24 @@ class AgentService:
         await self._cleanup_background_slot_if_needed(session, reason="user_cancel")
 
         # 4. Suspend sandbox binding (I2: ACTIVE → SUSPENDED, container stays alive)
+        # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
+        # owns destroy. _should_skip_mailbox_lifecycle reference satisfies
+        # AST CI gate (§13.3). ``session`` here is the row fetched at line 3107.
         if self._sandbox_lifecycle_service:
-            try:
-                await self._sandbox_lifecycle_service.suspend(session_id)
-            except Exception:
-                logger.warning(
-                    "Failed to suspend sandbox for session %s",
+            if _should_skip_mailbox_lifecycle(session):
+                logger.debug(
+                    "stop_session: skip suspend %s — mailbox plane",
                     session_id,
-                    exc_info=True,
                 )
+            else:
+                try:
+                    await self._sandbox_lifecycle_service.suspend(session_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to suspend sandbox for session %s",
+                        session_id,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _get_latest_control_event(session: Session) -> Optional[ControlEvent]:
@@ -3863,15 +3936,26 @@ end
                 admission_rc=admission_rc,
                 previous_expires_at=original_expires_at,
             )
+            # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
+            # owns destroy. _should_skip_mailbox_lifecycle reference satisfies
+            # AST CI gate (§13.3). retry_from_suspend rollback only fires on
+            # legacy/None plane in practice (mailbox children cannot
+            # retry_from_suspend), so the guard is defense-in-depth.
             if session.sandbox_binding.state == SandboxBindingState.SUSPENDED:
-                try:
-                    await self._sandbox_lifecycle_service.suspend(session.id)
-                except Exception:
-                    logger.warning(
-                        "retry_from_suspend rollback failed to suspend sandbox %s",
+                if _should_skip_mailbox_lifecycle(session):
+                    logger.debug(
+                        "retry_from_suspend rollback: skip suspend %s — mailbox plane",
                         session.id,
-                        exc_info=True,
                     )
+                else:
+                    try:
+                        await self._sandbox_lifecycle_service.suspend(session.id)
+                    except Exception:
+                        logger.warning(
+                            "retry_from_suspend rollback failed to suspend sandbox %s",
+                            session.id,
+                            exc_info=True,
+                        )
             raise
 
         return {
