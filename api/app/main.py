@@ -285,33 +285,28 @@ async def lifespan(app: FastAPI):
                     return
                 await svc.destroy(session_id, reason)
 
-        supervisor_registry = None
-        if settings.mailbox_supervisor_enabled:
-            # codex r1 [HIGH CONTRACT] — fail-closed when the operator
-            # explicitly enabled the mailbox plane and init breaks. Silently
-            # falling back to ``supervisor_registry=None`` was a fail-open
-            # contract violation: the deployment intended mailbox semantics,
-            # subagent_control_plane='mailbox' rows already exist in DB,
-            # publishers will XADD to streams that have no consumer → lost
-            # envelopes. Raising here surfaces the misconfiguration at the
-            # one place operators look (pod-start logs) instead of letting
-            # it hide as ``mailbox_supervisor_enabled=true`` + zero throughput.
-            from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
-                RedisMailboxPublisher,
-            )
-            from app.interfaces.service_dependencies import (
-                build_supervisor_registry,
-            )
+        # C3 PR-6 (spec §11.7) — mailbox plane is the only supported
+        # control plane. SupervisorRegistry is built unconditionally;
+        # the ``mailbox_supervisor_enabled`` env-var rollback gate is
+        # decommissioned. Init failure still raises (fail-closed) so
+        # mis-configuration surfaces at pod-start instead of as silent
+        # zero-throughput.
+        from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+            RedisMailboxPublisher,
+        )
+        from app.interfaces.service_dependencies import (
+            build_supervisor_registry,
+        )
 
-            mailbox_publisher = RedisMailboxPublisher(redis_client.client)
-            supervisor_registry = build_supervisor_registry(
-                redis_client=redis_client,
-                publisher=mailbox_publisher,
-                sandbox_lifecycle_service=_DeferredLifecycle(),
-            )
-            logger.info(
-                "SupervisorRegistry 单例初始化完成 (mailbox_supervisor_enabled=true)"
-            )
+        mailbox_publisher = RedisMailboxPublisher(redis_client.client)
+        supervisor_registry = build_supervisor_registry(
+            redis_client=redis_client,
+            publisher=mailbox_publisher,
+            sandbox_lifecycle_service=_DeferredLifecycle(),
+        )
+        logger.info(
+            "SupervisorRegistry 单例初始化完成 (C3 PR-6 — mailbox plane mandatory)"
+        )
         app.state.supervisor_registry = supervisor_registry
 
         sandbox_lifecycle_service = SandboxLifecycleService(

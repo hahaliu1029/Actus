@@ -837,23 +837,24 @@ class AgentService:
         _resume_tool_confirmation, confirmation_sweep, and _resume_task_with_handoff.
         """
         if self._sandbox_lifecycle_service:
-            # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
-            # owns destroy (M1 single-writer). _should_skip_mailbox_lifecycle is
-            # referenced literally so the AST CI gate (§13.3) marks this site as
-            # guarded. Session fetch can return None when the row was deleted
-            # concurrently — in that case we conservatively fall through to the
-            # legacy path (no row → not a mailbox plane child by definition).
+            # C3 PR-6 — legacy retired (spec §11.7). Subagent suspend owned
+            # exclusively by MailboxSupervisor via the destroy hook (M1
+            # single-writer). Root sessions retain AgentService suspend.
+            # ``_should_skip_mailbox_lifecycle`` is referenced literally so the
+            # AST CI gate (§13.3) still marks this site as guarded; the
+            # ``worker_type=="root"`` check replaces the legacy ``else``
+            # suspend fallback PR-4.5 left in place for rollback safety.
             #
             # codex r12 [R12-3] / r13 [R13-3] / r25 [R25-2, HIGH
             # ARCH] — ``get_session()`` lookup must be try-guarded.
             # On lookup exception we ATTEMPT ONE RETRY (transient
             # DB blip is the most common cause). If retry also
-            # fails, fall back to legacy suspend: most sessions
-            # are root/legacy and their sandbox would orphan
-            # without it. The M1 race for an unknown mailbox child
-            # is the lesser risk vs orphan sandboxes for all
-            # root/legacy sessions. The live event sink release
-            # still runs unconditionally.
+            # fails, we conservatively suspend (best-effort): a
+            # lost session row is almost always a root whose
+            # sandbox would orphan without cleanup, and the M1
+            # race for an unknown mailbox child is the lesser
+            # risk. The live event sink release still runs
+            # unconditionally.
             session = None
             try:
                 session = await self.get_session(session_id)
@@ -869,7 +870,7 @@ class AgentService:
                 except Exception:
                     logger.warning(
                         "on_task_runner_complete: get_session(%s) raised on retry "
-                        "— falling back to legacy suspend (best-effort cleanup)",
+                        "— falling back to defensive suspend (best-effort cleanup)",
                         session_id,
                         exc_info=True,
                     )
@@ -879,7 +880,7 @@ class AgentService:
                     "— mailbox supervisor owns lifecycle (M1)",
                     session_id,
                 )
-            else:
+            elif session is None or session.worker_type == "root":
                 try:
                     await self._sandbox_lifecycle_service.suspend(session_id)
                 except Exception:
@@ -887,6 +888,14 @@ class AgentService:
                         "on_task_runner_complete: suspend for session %s skipped",
                         session_id,
                     )
+            else:
+                logger.debug(
+                    "on_task_runner_complete: skip suspend session=%s — "
+                    "worker_type=%s is not root and not mailbox-plane "
+                    "(unreachable post-PR-6 legacy retirement)",
+                    session_id,
+                    session.worker_type,
+                )
             # Release the live event sink AFTER suspend so the SUSPENDED event
             # reaches the SSE stream. The subsequent DoneEvent from task_runner
             # goes through task.output_stream directly — it doesn't need the sink.
@@ -3070,20 +3079,30 @@ class AgentService:
                 # C3 PR-3c (codex r5 + r11) — non-runner terminal: stop supervisor.
                 await self._maybe_stop_supervisor_for_session(session_id)
                 # Sync sandbox binding: ACTIVE → SUSPENDED (same as normal completion)
-                # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
-                # owns destroy. _should_skip_mailbox_lifecycle reference satisfies
-                # AST CI gate (§13.3). ``session`` here is the row fetched above.
+                # C3 PR-6 — legacy retired (spec §11.7). Subagent suspend owned
+                # exclusively by MailboxSupervisor via destroy hook (M1).
+                # _should_skip_mailbox_lifecycle reference satisfies AST CI gate
+                # (§13.3); worker_type=="root" gate replaces the legacy else
+                # fallback. ``session`` here is the row fetched above.
                 if self._sandbox_lifecycle_service:
                     if _should_skip_mailbox_lifecycle(session):
                         logger.debug(
                             "status-reconcile: skip suspend %s — mailbox plane",
                             session_id,
                         )
-                    else:
+                    elif session.worker_type == "root":
                         try:
                             await self._sandbox_lifecycle_service.suspend(session_id)
                         except Exception:
                             logger.debug("status-reconcile suspend for %s skipped", session_id)
+                    else:
+                        logger.debug(
+                            "status-reconcile: skip suspend %s — worker_type=%s "
+                            "is not root and not mailbox-plane (unreachable "
+                            "post-PR-6 legacy retirement)",
+                            session_id,
+                            session.worker_type,
+                        )
                 session = session.model_copy(update={"status": SessionStatus.COMPLETED})
 
             # 11.记录日志展示会话已启动
@@ -3195,16 +3214,18 @@ class AgentService:
         await self._cleanup_background_slot_if_needed(session, reason="user_cancel")
 
         # 4. Suspend sandbox binding (I2: ACTIVE → SUSPENDED, container stays alive)
-        # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
-        # owns destroy. _should_skip_mailbox_lifecycle reference satisfies
-        # AST CI gate (§13.3). ``session`` here is the row fetched at line 3107.
+        # C3 PR-6 — legacy retired (spec §11.7). Subagent suspend owned
+        # exclusively by MailboxSupervisor via destroy hook (M1).
+        # _should_skip_mailbox_lifecycle reference satisfies AST CI gate
+        # (§13.3); worker_type=="root" gate replaces the legacy else fallback.
+        # ``session`` here is the row fetched at line 3107.
         if self._sandbox_lifecycle_service:
             if _should_skip_mailbox_lifecycle(session):
                 logger.debug(
                     "stop_session: skip suspend %s — mailbox plane",
                     session_id,
                 )
-            else:
+            elif session.worker_type == "root":
                 try:
                     await self._sandbox_lifecycle_service.suspend(session_id)
                 except Exception:
@@ -3213,6 +3234,14 @@ class AgentService:
                         session_id,
                         exc_info=True,
                     )
+            else:
+                logger.debug(
+                    "stop_session: skip suspend %s — worker_type=%s is not "
+                    "root and not mailbox-plane (unreachable post-PR-6 "
+                    "legacy retirement)",
+                    session_id,
+                    session.worker_type,
+                )
 
     @staticmethod
     def _get_latest_control_event(session: Session) -> Optional[ControlEvent]:
@@ -3936,18 +3965,20 @@ end
                 admission_rc=admission_rc,
                 previous_expires_at=original_expires_at,
             )
-            # C3 PR-4.5 — mailbox-plane children skip legacy suspend; supervisor
-            # owns destroy. _should_skip_mailbox_lifecycle reference satisfies
-            # AST CI gate (§13.3). retry_from_suspend rollback only fires on
-            # legacy/None plane in practice (mailbox children cannot
-            # retry_from_suspend), so the guard is defense-in-depth.
+            # C3 PR-6 — legacy retired (spec §11.7). Subagent suspend owned
+            # exclusively by MailboxSupervisor via destroy hook (M1).
+            # _should_skip_mailbox_lifecycle reference satisfies AST CI gate
+            # (§13.3); worker_type=="root" gate replaces the legacy else
+            # fallback. retry_from_suspend rollback only fires on root
+            # sessions in practice (mailbox children cannot retry_from_suspend),
+            # so the explicit guard is defense-in-depth.
             if session.sandbox_binding.state == SandboxBindingState.SUSPENDED:
                 if _should_skip_mailbox_lifecycle(session):
                     logger.debug(
                         "retry_from_suspend rollback: skip suspend %s — mailbox plane",
                         session.id,
                     )
-                else:
+                elif session.worker_type == "root":
                     try:
                         await self._sandbox_lifecycle_service.suspend(session.id)
                     except Exception:
@@ -3956,6 +3987,14 @@ end
                             session.id,
                             exc_info=True,
                         )
+                else:
+                    logger.debug(
+                        "retry_from_suspend rollback: skip suspend %s — "
+                        "worker_type=%s is not root and not mailbox-plane "
+                        "(unreachable post-PR-6 legacy retirement)",
+                        session.id,
+                        session.worker_type,
+                    )
             raise
 
         return {

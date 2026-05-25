@@ -1,12 +1,19 @@
-"""C3 PR-4.5 — SessionService picks subagent_control_plane from feature flag.
+"""C3 PR-6 (spec §11.7) — SessionService unconditionally writes
+``subagent_control_plane='mailbox'`` for new subagent children.
 
-Spec §11.2 — when ``mailbox_supervisor_enabled`` is true the new child's
-``subagent_control_plane`` is ``'mailbox'``; otherwise ``'legacy'``. The
-flag is read on every ``create_session_with_parent`` call so the rollback
-runbook (§11.6) can flip behavior without a service restart.
+The PR-4.5 era ``mailbox_supervisor_enabled`` runtime feature flag was
+retired in PR-6: the §11.6 rollback runbook is decommissioned and the
+``c3pr6_retire_legacy_control_plane`` alembic migration upgrades any
+historic ``legacy`` rows to ``mailbox``. The constructor still accepts
+the ``settings`` and ``mailbox_flag_reader`` kwargs (back-compat) but
+the values are not consulted; this test pins both the new contract
+(always-mailbox) and the back-compat surface (passing ``settings`` /
+``mailbox_flag_reader`` with falsey values does NOT downgrade to
+``legacy``).
 
 Reuses the ``_FakeRepo`` / ``_FakeUoW`` pattern from
-``test_session_service_c1a.py`` to keep the test pure (no DB / no FastAPI).
+``test_session_service_c1a.py`` to keep the test pure (no DB / no
+FastAPI).
 """
 
 from __future__ import annotations
@@ -63,18 +70,24 @@ def _uow_factory(repo: _FakeRepo):
     return lambda: _FakeUoW(repo)
 
 
-def _settings(flag: bool) -> Any:
-    # Lightweight stand-in for ``core.config.Settings``. SessionService only
-    # touches ``mailbox_supervisor_enabled`` on it, so a SimpleNamespace
-    # exposes exactly the contract being relied on.
+def _settings_stub(flag: bool) -> Any:
+    """Lightweight stand-in for ``core.config.Settings``.
+
+    Post-PR-6 the value is ignored by ``create_session_with_parent``;
+    we still build a stub so the back-compat tests can confirm the
+    ctor accepts the kwarg without error.
+    """
     return SimpleNamespace(mailbox_supervisor_enabled=flag)
 
 
 @pytest.mark.anyio
-async def test_subagent_child_uses_mailbox_when_flag_enabled() -> None:
+async def test_subagent_child_always_uses_mailbox_plane() -> None:
+    """C3 PR-6 contract — every new subagent gets
+    ``subagent_control_plane='mailbox'`` regardless of how the service
+    was constructed."""
     parent = Session(id="p", user_id="u1", worker_type="root")
     repo = _FakeRepo(parent=parent)
-    svc = SessionService(uow_factory=_uow_factory(repo), settings=_settings(True))
+    svc = SessionService(uow_factory=_uow_factory(repo))
 
     child = await svc.create_session_with_parent(
         user_id="u1",
@@ -87,10 +100,17 @@ async def test_subagent_child_uses_mailbox_when_flag_enabled() -> None:
 
 
 @pytest.mark.anyio
-async def test_subagent_child_uses_legacy_when_flag_disabled() -> None:
+async def test_subagent_child_uses_mailbox_even_when_settings_flag_false() -> None:
+    """Back-compat surface check — passing a ``settings`` stub whose
+    ``mailbox_supervisor_enabled=False`` does NOT downgrade the new
+    child to ``legacy``. The §11.6 rollback runbook is decommissioned;
+    the flag is inert."""
     parent = Session(id="p", user_id="u1", worker_type="root")
     repo = _FakeRepo(parent=parent)
-    svc = SessionService(uow_factory=_uow_factory(repo), settings=_settings(False))
+    svc = SessionService(
+        uow_factory=_uow_factory(repo),
+        settings=_settings_stub(False),
+    )
 
     child = await svc.create_session_with_parent(
         user_id="u1",
@@ -98,107 +118,45 @@ async def test_subagent_child_uses_legacy_when_flag_disabled() -> None:
         tool_filter_preset="subagent_research",
     )
 
-    assert child.subagent_control_plane == "legacy"
+    assert child.subagent_control_plane == "mailbox"
 
 
 @pytest.mark.anyio
-async def test_root_session_unaffected_by_flag() -> None:
-    """Root sessions (``create_session``) never carry control_plane.
+async def test_subagent_child_uses_mailbox_even_when_flag_reader_returns_false() -> None:
+    """Back-compat surface check — a ``mailbox_flag_reader`` callable
+    returning ``False`` is now ignored; the legacy downgrade path is
+    removed."""
+    parent = Session(id="p", user_id="u1", worker_type="root")
+    repo = _FakeRepo(parent=parent)
+    svc = SessionService(
+        uow_factory=_uow_factory(repo),
+        mailbox_flag_reader=lambda: False,
+    )
 
-    Spec §11.2 narrows ``subagent_control_plane`` to subagent rows only.
-    The DB CHECK constraint ``ck_sessions_subagent_control_plane_root_null``
-    enforces this; the helper relies on it returning ``None`` for roots.
+    child = await svc.create_session_with_parent(
+        user_id="u1",
+        parent_session_id="p",
+        tool_filter_preset="subagent_research",
+    )
+
+    assert child.subagent_control_plane == "mailbox"
+
+
+@pytest.mark.anyio
+async def test_root_session_carries_null_control_plane() -> None:
+    """Root sessions (``create_session``) never carry a control plane.
+
+    Spec §11.2 narrows ``subagent_control_plane`` to subagent rows in
+    practice — ``SessionService.create_session()`` never sets the
+    column, so root rows land with ``None``. The CHECK constraint
+    ``ck_sessions_subagent_control_plane_valid`` permits
+    ``NULL | 'legacy' | 'mailbox'`` for any row, so the NULL-for-roots
+    invariant is enforced by ``SessionService``, not by the DB. PR-6
+    does not change this behavior.
     """
     repo = _FakeRepo(parent=None)
-    svc = SessionService(uow_factory=_uow_factory(repo), settings=_settings(True))
+    svc = SessionService(uow_factory=_uow_factory(repo))
 
     root = await svc.create_session(user_id="u1")
     assert root.worker_type == "root"
     assert root.subagent_control_plane is None
-
-
-@pytest.mark.anyio
-async def test_mailbox_flag_reader_picks_up_live_env_changes() -> None:
-    """codex r9 [R9-1, HIGH CONTRACT] — production wires a live env
-    var reader instead of a cached Settings instance, so the rollback
-    runbook §11.6 toggle takes effect without ``cache_clear()`` or a
-    pod restart. This test pins that contract: a mutable
-    ``flag_reader`` callable, called per request, drives the choice.
-    """
-    parent = Session(id="p", user_id="u1", worker_type="root")
-    repo = _FakeRepo(parent=parent)
-
-    flag = {"on": False}
-    svc = SessionService(
-        uow_factory=_uow_factory(repo),
-        mailbox_flag_reader=lambda: flag["on"],
-    )
-
-    child_a = await svc.create_session_with_parent(
-        user_id="u1",
-        parent_session_id="p",
-        tool_filter_preset="subagent_research",
-    )
-    assert child_a.subagent_control_plane == "legacy"
-
-    # Flip the flag — no restart, no cache_clear, no service rebuild.
-    flag["on"] = True
-    child_b = await svc.create_session_with_parent(
-        user_id="u1",
-        parent_session_id="p",
-        tool_filter_preset="subagent_research",
-    )
-    assert child_b.subagent_control_plane == "mailbox"
-
-
-@pytest.mark.anyio
-async def test_settings_stub_wins_over_flag_reader() -> None:
-    """codex r9 [R9-1] — explicit Settings injection is the
-    deterministic test override; it must take precedence over the
-    flag_reader callable so test fixtures can pin behavior."""
-    parent = Session(id="p", user_id="u1", worker_type="root")
-    repo = _FakeRepo(parent=parent)
-
-    svc = SessionService(
-        uow_factory=_uow_factory(repo),
-        settings=_settings(False),
-        mailbox_flag_reader=lambda: True,  # would say mailbox but settings wins
-    )
-    child = await svc.create_session_with_parent(
-        user_id="u1",
-        parent_session_id="p",
-        tool_filter_preset="subagent_research",
-    )
-    assert child.subagent_control_plane == "legacy"
-
-
-@pytest.mark.anyio
-async def test_flag_flip_takes_effect_on_next_create() -> None:
-    """codex r1 [R1-6, MEDIUM CONTRACT] — when a NEW SessionService is
-    built with a different Settings stub, the new control_plane choice
-    takes effect immediately. Rollback per §11.6 requires either a
-    service restart (which gives a fresh ``get_settings()`` cache) OR
-    ``get_settings.cache_clear()`` from an admin path; tests pin
-    behavior via explicit Settings injection."""
-    parent = Session(id="p", user_id="u1", worker_type="root")
-    repo = _FakeRepo(parent=parent)
-
-    # First service: flag on
-    svc_on = SessionService(uow_factory=_uow_factory(repo), settings=_settings(True))
-    child_a = await svc_on.create_session_with_parent(
-        user_id="u1",
-        parent_session_id="p",
-        tool_filter_preset="subagent_research",
-    )
-    assert child_a.subagent_control_plane == "mailbox"
-
-    # Second service: flag off (simulates ops flipping
-    # ``MAILBOX_SUPERVISOR_ENABLED`` and a fresh request hitting the new
-    # Settings instance — the DI factory rebuilds SessionService per request)
-    svc_off = SessionService(uow_factory=_uow_factory(repo), settings=_settings(False))
-    child_b = await svc_off.create_session_with_parent(
-        user_id="u1",
-        parent_session_id="p",
-        tool_filter_preset="subagent_research",
-    )
-    assert child_b.subagent_control_plane == "legacy"

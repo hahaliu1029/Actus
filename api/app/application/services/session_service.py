@@ -58,22 +58,15 @@ class SessionService:
         still take effect for callers that don't go through the DI factory
         (test code, ad-hoc constructors).
 
-        ``settings`` and ``mailbox_flag_reader`` are the C3 PR-4.5 hooks
-        for the ``mailbox_supervisor_enabled`` feature flag (spec §11.2).
-        Resolution order on each ``create_session_with_parent`` call:
-
-        1. ``settings`` stub (deterministic test override).
-        2. ``mailbox_flag_reader`` callable — the DI factory wires
-           the env-file-aware, cache-bypassing
-           ``_read_mailbox_supervisor_enabled_uncached`` so the
-           rollback runbook §11.6 toggles take effect without
-           ``get_settings.cache_clear()`` or a pod restart. The
-           production reader is downgrade-only: once the process
-           started with ``MAILBOX_SUPERVISOR_ENABLED=False`` it
-           stays False at runtime even if ``.env`` flips True
-           (the SupervisorRegistry would be missing otherwise).
-        3. Fallback ``get_settings()`` — cached; only hit by
-           non-DI callers (ad-hoc constructors, legacy paths).
+        ``settings`` and ``mailbox_flag_reader`` are inert PR-6 retired
+        constructor parameters. They were the C3 PR-4.5 hooks for the
+        ``mailbox_supervisor_enabled`` feature flag (spec §11.2) that
+        controlled the runtime choice between the legacy and mailbox
+        subagent control planes. PR-6 (spec §11.7) retires the legacy
+        plane and the §11.6 rollback runbook; every new subagent now
+        gets ``subagent_control_plane='mailbox'`` unconditionally. The
+        parameters are still accepted so existing DI wiring and test
+        fixtures don't break, but their values are NOT consulted.
         """
         self._uow_factory = uow_factory
         self._uow = uow_factory()
@@ -82,14 +75,12 @@ class SessionService:
         self._fs_reconciler = fs_reconciler
         self._supervisor = execution_supervisor
         self._subagent_limits = subagent_limits
+        # PR-6: kept for back-compat with callers that still pass these
+        # kwargs; values are intentionally ignored by
+        # ``create_session_with_parent``. Marked private + unused so a
+        # future cleanup PR can drop them once all callers stop passing
+        # them. Do NOT add new readers — the rollback path is gone.
         self._settings = settings
-        # codex r9 [R9-1, HIGH CONTRACT] — live flag reader that
-        # bypasses ``get_settings``' @lru_cache so the rollback
-        # runbook §11.6 ("flip ``MAILBOX_SUPERVISOR_ENABLED=false``
-        # and new children immediately go legacy") works without a
-        # ``get_settings.cache_clear()`` or pod restart. Reads the
-        # raw env var on every call; ``settings`` injection wins
-        # when present (tests use the explicit Settings stub).
         self._mailbox_flag_reader = mailbox_flag_reader
 
     async def create_session(self, user_id: str) -> Session:
@@ -216,29 +207,13 @@ class SessionService:
                     limits.max_descendants_per_root,
                 )
 
-            # C3 PR-4.5 — pick control plane via runtime feature flag (spec
-            # §11.2). PR-5 will flip the .env.example default; until then
-            # every new subagent persists ``'legacy'`` and the legacy
-            # suspend path remains authoritative.
-            #
-            # codex r9 [R9-1, HIGH CONTRACT] — flag precedence:
-            #   1. test-injected ``settings`` stub (deterministic test fixtures)
-            #   2. ``mailbox_flag_reader`` callable (live env var read,
-            #      bypasses ``get_settings`` @lru_cache so rollback
-            #      runbook §11.6 toggles behavior without service restart)
-            #   3. ``get_settings()`` fallback for code paths that don't
-            #      go through the DI factory (cached, but at least the
-            #      DI factory wires a live reader so production paths
-            #      honor rollback)
-            if self._settings is not None:
-                mailbox_enabled = self._settings.mailbox_supervisor_enabled
-            elif self._mailbox_flag_reader is not None:
-                mailbox_enabled = bool(self._mailbox_flag_reader())
-            else:
-                mailbox_enabled = get_settings().mailbox_supervisor_enabled
-            control_plane: Literal["legacy", "mailbox"] = (
-                "mailbox" if mailbox_enabled else "legacy"
-            )
+            # C3 PR-6 (spec §11.7) — legacy retired. Every new subagent
+            # gets ``subagent_control_plane='mailbox'`` unconditionally.
+            # The ``mailbox_supervisor_enabled`` feature flag and the
+            # §11.6 rollback runbook are decommissioned; the PR-6
+            # alembic migration ``c3pr6_retire_legacy_control_plane``
+            # rewrites any pre-existing ``legacy`` rows to ``mailbox``.
+            control_plane: Literal["legacy", "mailbox"] = "mailbox"
             child = Session(
                 user_id=user_id,
                 parent_session_id=parent_id,

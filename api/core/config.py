@@ -240,10 +240,20 @@ class Settings(BaseSettings):
     # surface stays consistent regardless of how it's accessed.
     subagent_limits: SubagentLimitsConfig = Field(default_factory=SubagentLimitsConfig)
 
-    # ─── C3 Mailbox Supervisor (PR-3a) ────────────────────────────────────
-    # `mailbox_supervisor_enabled` is the deployment-time feature flag.
-    # PR-3a ships with default=False (影子模式 — supervisor task not started);
-    # PR-5 翻 true 后 MailboxSupervisor 正式接管 child→parent 终态分发。
+    # ─── C3 Mailbox Supervisor (PR-3a..PR-6) ──────────────────────────────
+    # `mailbox_supervisor_enabled` was the deployment-time feature flag used
+    # during the C3 mailbox rollout. PR-6 (spec §11.7) retires the legacy
+    # plane: SessionService now unconditionally writes
+    # ``subagent_control_plane='mailbox'`` regardless of this flag's value,
+    # and main.py always builds the SupervisorRegistry. The flag default is
+    # True so any existing wiring that still reads it (e.g.,
+    # ``AgentTaskRunner._mailbox_supervisor_enabled``) keeps mailbox
+    # behavior; setting it to False is no longer a supported rollback path
+    # (the §11.6 runbook is decommissioned by the PR-6 alembic migration
+    # ``c3pr6_retire_legacy_control_plane`` that rewrites every existing
+    # ``subagent_control_plane='legacy'`` row to ``'mailbox'``). Kept as a
+    # Settings attribute purely for back-compat with test fixtures that
+    # pass an explicit Settings stub.
     # `mailbox_pod_id` is the consumer-group consumer-name prefix. Empty value
     # degrades to socket.gethostname() via resolve_mailbox_pod_id() — for
     # production prefer injecting the k8s downward-API pod name.
@@ -251,7 +261,7 @@ class Settings(BaseSettings):
     # spec §4.3 constants (1000ms, batch=32); kept here only so ops can tune
     # without code changes. Unit tests pass block_ms=0 explicitly because
     # fakeredis async XREADGROUP doesn't wake on a concurrent XADD.
-    mailbox_supervisor_enabled: bool = False
+    mailbox_supervisor_enabled: bool = True
     mailbox_pod_id: str = ""
     mailbox_xreadgroup_block_ms: int = Field(_MAILBOX_XREADGROUP_BLOCK_MS, gt=0)
     mailbox_xreadgroup_count: int = Field(_MAILBOX_XREADGROUP_COUNT, gt=0)

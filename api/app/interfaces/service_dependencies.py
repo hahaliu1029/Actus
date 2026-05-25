@@ -152,16 +152,13 @@ def get_session_service(request: HTTPConnection) -> SessionService:
         fs_reconciler=fs_reconciler,
         execution_supervisor=supervisor,
         subagent_limits=get_subagent_limits(),
-        # codex r9 [R9-1] + r10 [R10-1, HIGH CONTRACT] — wire a LIVE,
-        # env-file-aware reader that bypasses ``get_settings`` @lru_cache
-        # but stays consistent with the Settings ``env_file=".env"``
-        # source. A bare ``os.environ`` read would diverge: ops sets the
-        # flag in ``.env`` → ``main.py`` reads via ``settings`` → builds
-        # SupervisorRegistry; new child still goes legacy because env
-        # var wasn't exported into the process environment. Constructing
-        # a fresh ``Settings()`` per call honors both .env and env vars
-        # and gives rollback-without-restart semantics.
-        mailbox_flag_reader=_read_mailbox_supervisor_enabled_uncached,
+        # C3 PR-6 (spec §11.7) — legacy retired; SessionService no longer
+        # consults a runtime flag. The ``mailbox_flag_reader`` kwarg used
+        # to wire the rollback-aware live env reader is no longer passed.
+        # SessionService unconditionally writes
+        # ``subagent_control_plane='mailbox'``; the §11.6 rollback runbook
+        # is decommissioned together with the alembic migration that
+        # upgrades any historic ``legacy`` rows.
     )
 
 
@@ -610,9 +607,9 @@ def build_supervisor_registry(
             "locked tests are in "
             "tests/app/interfaces/test_build_supervisor_registry_pr4_gate.py "
             "(test_pr_4_5_readiness_gate_is_open + "
-            "test_factory_wires_pr_4_5_callback_bridge). To temporarily "
-            "disable mailbox supervisor entirely, set "
-            "MAILBOX_SUPERVISOR_ENABLED=False in your .env."
+            "test_factory_wires_pr_4_5_callback_bridge). Post-PR-6 the "
+            "MAILBOX_SUPERVISOR_ENABLED env-var rollback is decommissioned; "
+            "the mailbox plane is the only supported control plane."
         )
     from app.application.services.mailbox_supervisor import (
         MailboxSupervisor,
@@ -842,72 +839,6 @@ from app.domain.services.supervisor_terminate_marker import (  # noqa: E402
 )
 
 
-# codex r14 [R14-4, MEDIUM ARCH] — startup snapshot of
-# ``mailbox_supervisor_enabled``. The supervisor registry is only
-# built at lifespan startup based on ``get_settings()``; if startup
-# was False (no registry), letting the live reader return True at
-# runtime would create mailbox children with no consumer (orphan
-# state until restart). The downgrade-only reader pattern enforces:
-#   - startup True  ⇒ runtime read can return True OR False
-#                     (operator may toggle to False to roll back)
-#   - startup False ⇒ runtime read ALWAYS returns False, even if
-#                     ``.env`` later flips to True (operator must
-#                     restart to enable; reflected in the docstring
-#                     and ops runbook §11.6).
-_PR4_5_STARTUP_MAILBOX_ENABLED: bool | None = None
-# codex r15 [R15-3, MEDIUM ARCH] — snapshot the startup value at
-# module import so a runtime ``.env`` toggle from False→True without
-# restart cannot upgrade the runtime reader; codex flagged that the
-# lazy "first call" snapshot lost the actual lifespan-startup value
-# if the first child creation happened AFTER an operator edit.
-try:
-    from core.config import Settings as _PR4_5_StartupSettings  # noqa: E402
-    _PR4_5_STARTUP_MAILBOX_ENABLED = bool(
-        _PR4_5_StartupSettings().mailbox_supervisor_enabled
-    )
-except Exception:  # noqa: BLE001 — fail closed if Settings can't construct
-    _PR4_5_STARTUP_MAILBOX_ENABLED = False
-
-
-def _read_mailbox_supervisor_enabled_uncached() -> bool:
-    """codex r10 [R10-1] / r14 [R14-4] — env-file-aware,
-    cache-bypassing read of ``mailbox_supervisor_enabled`` with
-    downgrade-only semantics.
-
-    * The ``.env`` file is honored (matches ``main.py``'s
-      ``settings`` source).
-    * The ``@lru_cache`` on ``get_settings()`` is bypassed so the
-      rollback runbook §11.6 ("flip
-      ``MAILBOX_SUPERVISOR_ENABLED=false`` and the next new child
-      immediately goes legacy") works without ``cache_clear()`` or a
-      pod restart.
-    * Runtime UPGRADE from False to True is intentionally NOT
-      honored — enabling the mailbox plane requires a pod restart
-      so the SupervisorRegistry is constructed alongside it. The
-      first call snapshots the startup value via
-      ``Settings().mailbox_supervisor_enabled``; subsequent calls
-      AND the snapshot together via boolean AND.
-
-    Construction cost is negligible — Pydantic BaseSettings reads a
-    handful of env vars + the .env file; SessionService creates new
-    children at human-typing rate, not per-message.
-    """
-    global _PR4_5_STARTUP_MAILBOX_ENABLED
-    from core.config import Settings
-    current = Settings().mailbox_supervisor_enabled
-    if _PR4_5_STARTUP_MAILBOX_ENABLED is None:
-        _PR4_5_STARTUP_MAILBOX_ENABLED = current
-    # Downgrade-only: must be True at startup AND currently.
-    return bool(_PR4_5_STARTUP_MAILBOX_ENABLED and current)
-
-
-def _reset_mailbox_startup_snapshot_for_tests() -> None:
-    """Test helper — clear the startup snapshot so a fresh
-    Settings() value can be picked up. Not used in production."""
-    global _PR4_5_STARTUP_MAILBOX_ENABLED
-    _PR4_5_STARTUP_MAILBOX_ENABLED = None
-
-
 def _reset_agent_service_callback_state_for_tests() -> None:
     """Test helper — clear the holder + event so the unbound branch is
     exercisable. Not used in production; do NOT call from app code.
@@ -1083,10 +1014,11 @@ _supervisor_registry_lock = threading.Lock()
 def get_supervisor_registry(request: HTTPConnection) -> "SupervisorRegistry | None":
     """Return the lifespan-scoped :class:`SupervisorRegistry`.
 
-    Returns ``None`` when the mailbox plane is disabled
-    (``mailbox_supervisor_enabled=False`` — the PR-3a default). The DI
-    callers (``get_agent_service`` indirectly) accept ``None`` and skip
-    runner-side wiring.
+    Post-PR-6 the registry is built unconditionally at lifespan startup
+    (the ``mailbox_supervisor_enabled`` rollback is decommissioned per
+    spec §11.7). The return type stays ``Optional`` for defensiveness:
+    tests using stub ``app.state`` and lifespan-bypass code paths still
+    return ``None`` and DI callers handle that gracefully.
     """
     return getattr(request.app.state, "supervisor_registry", None)
 
