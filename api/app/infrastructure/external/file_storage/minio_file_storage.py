@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io as _io
 import logging
 import os.path
@@ -206,6 +207,54 @@ class MinioFileStorage(FileStorage):
         except Exception as e:
             logger.error(f"删除文件[{file_id}]失败: {str(e)}")
             raise
+
+    async def put_content_addressed_bytes(
+        self,
+        *,
+        prefix: str,
+        content: bytes,
+        filename: str | None = None,
+    ) -> str:
+        """[C2 PR-4 §6.3] Content-addressed bytes upload to MinIO.
+
+        Used by the coordinator dispatch_node for:
+        - SpawnManifest JSON  (filename='manifest.json' → digest-prefixed key)
+        - PathLease seed content (no filename → SHA-256 hex basename)
+        - rationale_ref artifacts (NeedsAuthorizationDetails.proposed_write_plan)
+
+        Key shape (r1 P1#6 fix — always content-addressed):
+        - ``filename is None`` → ``{prefix}{digest_hex}``
+        - ``filename`` given   → ``{prefix}{digest_hex[:16]}-{filename}``
+
+        Why include the digest even with filename: PR-7 crash recovery may
+        re-dispatch a coordinator run; if the serialized bytes diverge
+        (dict ordering drift, timestamp embedding) and the key were purely
+        ``{prefix}{filename}``, the second write would silently overwrite
+        the first. Including the digest prefix preserves the
+        "content-addressed" contract the API name promises while keeping
+        a human-readable suffix for ops/debugging.
+
+        Returns the full object key. Same content + same prefix + same
+        filename → same key → MinIO PUT is idempotent at the wire level.
+
+        Note: This method does NOT touch the ``files`` table — content-addressed
+        artifacts are coordinator-internal blobs, not user-facing File records.
+        The ORM ``File`` model is only populated by ``upload_file`` for the
+        user's chat-attached uploads.
+        """
+        digest = hashlib.sha256(content).hexdigest()
+        if filename is None:
+            key = f"{prefix}{digest}"
+        else:
+            key = f"{prefix}{digest[:16]}-{filename}"
+        await self.minio_store.upload_fileobj(
+            bucket_name=self.bucket,
+            object_name=key,
+            data=_io.BytesIO(content),
+            length=len(content),
+            content_type="application/octet-stream",
+        )
+        return key
 
     async def get_presigned_url(
         self, file: File, expiry_seconds: int = 86400

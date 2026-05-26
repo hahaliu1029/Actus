@@ -6,17 +6,31 @@ Two-model split:
   fully-resolved WorkUnits with base_digest + seed_content_ref filled.
 """
 from __future__ import annotations
-from typing import Literal, Optional
-from pydantic import BaseModel, Field, model_validator
+from typing import Annotated, Literal, Optional
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+
+from app.domain.models.path_validation import validate_relative_path
 
 
 class ProposedPath(BaseModel):
-    path: str = Field(min_length=1, description="non-empty target path")
+    """[C2 PR-4 r1 P1#4 deep-freeze] frozen + extra=forbid so that nested
+    ``ProposedWritePlan.proposed_paths`` cannot have its elements mutated
+    out from under a "frozen" wire contract."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: Annotated[
+        str, Field(min_length=1, description="non-empty target path"),
+        AfterValidator(validate_relative_path),
+    ]
     op: Literal["add", "modify", "delete"]
 
 
 class PathLease(BaseModel):
-    path: str = Field(min_length=1, description="non-empty target path")
+    path: Annotated[
+        str, Field(min_length=1, description="non-empty target path"),
+        AfterValidator(validate_relative_path),
+    ]
     op: Literal["add", "modify", "delete"]
     base_digest: Optional[str] = None
     seed_content_ref: Optional[str] = None
@@ -54,9 +68,21 @@ class WorkUnit(BaseModel):
     expected_result_schema: Optional[str] = None
 
     @model_validator(mode="after")
-    def _write_must_have_lease(self) -> "WorkUnit":
+    def _phase_lease_consistency(self) -> "WorkUnit":
+        """[C2 PR-4 r3 P1#5] Phase ↔ lease invariants:
+        - phase=write   ⇒ non-empty write_lease (existing rule)
+        - phase=exploration ⇒ empty write_lease (NEW: prevents a planner from
+          smuggling write authorization into a read-only phase, which the
+          coordinator child prompt would silently render as authorized paths
+          and ChildScopeGate would honor at runtime).
+        """
         if self.phase == "write" and not self.write_lease:
             raise ValueError("phase=write requires non-empty write_lease")
+        if self.phase == "exploration" and self.write_lease:
+            raise ValueError(
+                "phase=exploration must have empty write_lease "
+                "(exploration children are read-only by design)"
+            )
         return self
 
 

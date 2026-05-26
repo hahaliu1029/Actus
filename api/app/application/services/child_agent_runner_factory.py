@@ -1,34 +1,156 @@
-"""C2 v1 ChildAgentTaskRunnerFactory (spec §5.3 + §8.5.1).
+"""C2 v1 ChildAgentTaskRunnerFactory — full build (spec §5.3 + §8.5.1).
 
-PR-2 skeleton: surface interface only. PR-4 wires actual construction
-with terminal_envelope_publisher_disabled=True + cancel_event injection.
+Constructs the inner ``AgentTaskRunner`` that a coordinator child wraps,
+plus a ``BuiltChildRunner`` wrapper carrying the runtime concerns
+(``cancel_event``, ``child_permission_context``) that the live
+``AgentTaskRunner`` ctor does not (and should not) accept.
+
+Why the wrapper instead of extending AgentTaskRunner.__init__:
+- ``AgentTaskRunner.__init__`` already takes ~40 kwargs covering provider,
+  storage, browser, sandbox, telemetry, permission, memory, etc. Extending
+  it with cancel_event + child_permission_context blurs the construction
+  surface (runtime vs. construction concerns).
+- ``cancel_event`` is consumed by the react_graph nodes at runtime via
+  ``config["configurable"]["cancel_event"]`` (PR-4 Task 4.5 checkpoints).
+  CoordinatorChildRunner (PR-4 Task 4.7) threads it into config when it
+  invokes the runner.
+- ``child_permission_context`` is consumed by ChildScopeGate (PE Phase 1)
+  and by finalizers attributing scope violations. It travels with the
+  child, not the runner construction.
+
+Spec-anchored behavior:
+- ``tool_filter_preset == "coordinator_step"`` →
+  ``terminal_envelope_publisher_disabled = True``
+  (§8.5.1 r6 P0-1 — CoordinatorChildRunner is the sole terminal publisher
+   for this preset; runner staying silent prevents duplicate
+   RESULT_READY/CANCEL_ACK envelopes on the wire).
+- ``tool_filter_preset == "subagent_research"`` → disabled = False
+  (default AgentTaskRunner publisher path remains in charge).
+- ``tool_filter_preset`` unknown → ``resolve_preset`` raises ``ValueError``;
+  the factory propagates it (fail closed: silently defaulting to no filter
+  would be an allowlist escape).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+from dataclasses import dataclass
+from typing import Any, FrozenSet, Optional, Protocol
 
-if TYPE_CHECKING:
-    import asyncio
+from app.domain.services.tool_filter_presets import resolve_preset
 
-    from app.domain.services.agent_task_runner import AgentTaskRunner
-    from app.domain.services.permission.child_permission_context import (
-        ChildPermissionContext,
-    )
+
+class ChildRunnerBuilder(Protocol):
+    """[C2 PR-4 r7 P1] Protocol the factory expects from its ``runner_class``
+    injection point.
+
+    The live ``AgentTaskRunner.__init__`` takes ~40 kwargs (uow_factory, llm,
+    agent_config, mcp_config, a2a_config, user_id, file_storage, browser,
+    search_engine, sandbox, ...). The factory CANNOT build it directly with
+    just the 4 kwargs below.
+
+    PR-5's runner_starter (the integration point at composition root) is
+    responsible for ``functools.partial`` -wrapping ``AgentTaskRunner`` with
+    the 36 other dependencies pre-bound, producing a callable that conforms
+    to this Protocol. That bound callable is what the factory receives as
+    ``runner_class``.
+
+    Passing the raw ``AgentTaskRunner`` class would fail with TypeError on
+    the missing required args — typing this as a Protocol surfaces the
+    wiring contract that runner_starter must satisfy.
+    """
+
+    def __call__(
+        self,
+        *,
+        session_id: str,
+        tool_filter: Optional[FrozenSet[str]],
+        mailbox_publisher: Any,
+        terminal_envelope_publisher_disabled: bool,
+    ) -> Any: ...
+
+
+@dataclass(frozen=True)
+class BuiltChildRunner:
+    """Wrapper bundling the AgentTaskRunner instance with runtime concerns
+    that travel with the child but are not AgentTaskRunner ctor inputs.
+
+    [C2 PR-4 r2 P1 deferral] The production consumer of ``BuiltChildRunner``
+    is the ``runner_starter`` (PR-5) which:
+    1. Reads ``.runner`` and wraps it in a ``CoordinatorChildInnerRunner``
+       Protocol adapter (currently AgentTaskRunner.invoke(Task) vs.
+       runner.invoke_until_done(user_message=str) — see PR-4 r2 P0).
+    2. Reads ``.cancel_event`` and threads it into the inner graph config
+       (``config["configurable"]["cancel_event"]``).
+    3. Reads ``.child_permission_context`` and passes it to ChildScopeGate
+       at tool dispatch time.
+    4. Reads ``.terminal_envelope_publisher_disabled`` as a sanity-check
+       against the runner's own ``_terminal_envelope_publisher_disabled``.
+
+    Until PR-5 ships, this wrapper is constructed only in the factory's
+    own unit tests; the production dispatch path in
+    parallel_execution_subgraph.dispatch_node uses an opaque
+    ``child_runner_starter.start(...)`` whose internals haven't landed.
+
+    ``runner``                              — the constructed AgentTaskRunner
+    ``cancel_event``                        — asyncio.Event the parent sets
+                                              to abort the child via react_graph
+                                              cancel checkpoints (Task 4.5)
+    ``child_permission_context``            — ChildPermissionContext consumed
+                                              by ChildScopeGate at tool dispatch
+    ``terminal_envelope_publisher_disabled`` — mirror of the kwarg passed to
+                                              the runner, kept on the wrapper
+                                              for downstream assertion + audit
+    """
+
+    runner: Any
+    cancel_event: asyncio.Event
+    child_permission_context: Any
+    terminal_envelope_publisher_disabled: bool
 
 
 class ChildAgentTaskRunnerFactory:
-    """Builds restricted AgentTaskRunner for coordinator_step children."""
+    """Builds the inner ``AgentTaskRunner`` for a coordinator-step child.
 
-    def __init__(self) -> None:
-        pass
+    ``runner_class`` is injected (defaults to ``AgentTaskRunner`` at the
+    composition root) so tests can swap a MagicMock without monkey-patching.
+    ``mailbox_publisher`` is the wire publisher shared across all children
+    spawned in a coordinator run.
+    """
+
+    def __init__(
+        self, *, runner_class: ChildRunnerBuilder, mailbox_publisher: Any,
+    ) -> None:
+        # ``runner_class`` is typed as ChildRunnerBuilder — see Protocol above
+        # for why the live AgentTaskRunner class itself can't be passed
+        # directly. PR-5's runner_starter wraps AgentTaskRunner via
+        # functools.partial to satisfy this contract.
+        self._runner_class = runner_class
+        self._mailbox_publisher = mailbox_publisher
 
     async def build(
         self,
         *,
         child_session_id: str,
-        child_permission_context: "ChildPermissionContext",
+        child_permission_context: Any,
         tool_filter_preset: str,
-        cancel_event: "asyncio.Event",
-    ) -> "AgentTaskRunner":
-        """[C2 PR-4 stub] Wires the actual AgentTaskRunner construction in PR-4."""
-        raise NotImplementedError("PR-4 territory")
+        cancel_event: asyncio.Event,
+    ) -> BuiltChildRunner:
+        """Construct an ``AgentTaskRunner`` configured for this preset and
+        return it wrapped in a ``BuiltChildRunner``.
+
+        Raises ``ValueError`` if ``tool_filter_preset`` is not registered.
+        """
+        tool_filter = resolve_preset(tool_filter_preset)
+        terminal_disabled = tool_filter_preset == "coordinator_step"
+        runner = self._runner_class(
+            session_id=child_session_id,
+            tool_filter=tool_filter,
+            mailbox_publisher=self._mailbox_publisher,
+            terminal_envelope_publisher_disabled=terminal_disabled,
+        )
+        return BuiltChildRunner(
+            runner=runner,
+            cancel_event=cancel_event,
+            child_permission_context=child_permission_context,
+            terminal_envelope_publisher_disabled=terminal_disabled,
+        )

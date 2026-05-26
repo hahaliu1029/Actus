@@ -86,6 +86,93 @@ MAX_ITERATIONS = 30
 from app.domain.external.file_processor import MAX_FILE_VIEW_IMAGES as _MAX_FILE_VIEW_IMAGES
 
 
+# ===========================================================================
+# C2 PR-4 §8.4 — Cooperative cancellation checkpoints
+# ===========================================================================
+# Coordinator children run inside this same react_graph. The parent cancels
+# them by setting an ``asyncio.Event`` passed through
+# ``config["configurable"]["cancel_event"]``. At well-defined checkpoints
+# the nodes call ``_should_cancel(config)`` and, on True, raise
+# ``CancelledByEventError`` with the checkpoint name. The exception unwinds
+# the node, escapes the graph (via LangGraph's normal exception propagation),
+# and is caught by ``CoordinatorChildRunner.run_work_unit`` which routes
+# to ``_finalize_by_stop_reason`` (PR-4 Task 4.7).
+#
+# Active checkpoints in react_graph (5 of the 6 spec'd here; #4 deferred):
+#   #2 react_loop_entry   — pre_llm_node top
+#   #3 llm_node_entry     — llm_node top
+#   #4 llm_chunk_boundary — DEFERRED: live llm_node uses ``ainvoke`` (atomic).
+#                           When llm_node is refactored to ``astream``, wire
+#                           the check inside the ``async for chunk in ...``
+#                           loop. The string ``llm_chunk_boundary`` is kept
+#                           in this docstring so a grep / a contract test
+#                           (test_chunk_boundary_deferred_until_streaming)
+#                           can detect a silent regression.
+#   #5 llm_return         — llm_node bottom, before ``return {...}``
+#   #6 tool_node_entry    — tool_node top
+#   #7 tool_node_return   — tool_node bottom, before final ``return Command``
+# Spec checkpoints #1 (worker start) + #8 (artifact upload pre-publish) live
+# in ``CoordinatorChildRunner`` outside react_graph.
+#
+# For the default (non-coordinator) execution path, ``configurable`` has no
+# ``cancel_event`` key, so ``_should_cancel`` returns False and every
+# checkpoint is a no-op. This keeps the legacy / subagent_research / root
+# session paths byte-identical to pre-PR-4 behavior.
+
+
+class CancelledByEventError(Exception):
+    """[C2 PR-4 §8.4] Raised at a react_graph checkpoint when the
+    coordinator-side cancel_event is already set.
+
+    The exception message carries the checkpoint name (e.g.
+    ``CancelledByEventError("react_loop_entry")``) so the
+    ``CoordinatorChildRunner`` finalizer can attribute the cancel point in
+    its grievance summary."""
+
+
+def _should_cancel(config: Any) -> bool:
+    """Return True iff ``config["configurable"]["cancel_event"]`` is an
+    event-like object whose ``is_set()`` currently returns True.
+
+    Defensive: tolerates ``None`` config, missing keys, ``None`` value, and
+    non-Event values (returns False) so a malformed configurable can never
+    raise out of the checkpoint helper itself (which would mask the actual
+    bug under a CancelledByEventError-shaped error).
+
+    [r4 P2] When ``cancel_event`` is PRESENT but has the wrong type
+    (missing callable ``is_set``), log at WARN. Silent fail-False would mask
+    a real wiring bug — e.g. PR-5 runner_starter injects a plain dict by
+    mistake; the child would never be cancellable and the symptom would only
+    surface as waiter timeouts in PR-9 E2E. The WARN surfaces the
+    misconfiguration where it happens.
+    """
+    if not config:
+        return False
+    configurable = config.get("configurable") if isinstance(config, dict) else None
+    if not configurable:
+        return False
+    ce = configurable.get("cancel_event") if isinstance(configurable, dict) else None
+    if ce is None:
+        return False
+    is_set = getattr(ce, "is_set", None)
+    if not callable(is_set):
+        logger.warning(
+            "_should_cancel: configurable.cancel_event present but lacks "
+            "callable is_set() — got %s (cancel will not propagate)",
+            type(ce).__name__,
+        )
+        return False
+    try:
+        return bool(is_set())
+    except Exception:
+        logger.warning(
+            "_should_cancel: cancel_event.is_set() raised — treating as "
+            "not-cancelled",
+            exc_info=True,
+        )
+        return False
+
+
 def _extract_shell_images(result_str: str) -> tuple[str, list[dict]]:
     """Extract base64 image data URLs from shell output.
 
@@ -1023,8 +1110,15 @@ def build_react_graph(
 
     # ---- Nodes --------------------------------------------------------- #
 
-    async def pre_llm_node(state: ReactGraphState) -> dict:
-        """Trim messages for LLM input. state['messages'] is unchanged."""
+    async def pre_llm_node(state: ReactGraphState, config: RunnableConfig) -> dict:
+        """Trim messages for LLM input. state['messages'] is unchanged.
+
+        [C2 PR-4 §8.4 #2 react_loop_entry] First cancel checkpoint of the
+        ReAct loop iteration. Raising here aborts the iteration BEFORE
+        ``context_assembler.assemble`` runs (which can do expensive
+        trimming + LLM-summary work for long histories)."""
+        if _should_cancel(config):
+            raise CancelledByEventError("react_loop_entry")
         if assembler is None:
             return {"llm_input_messages": list(state["messages"])}
         result = assembler.assemble(list(state["messages"]))
@@ -1033,7 +1127,15 @@ def build_react_graph(
         return {"llm_input_messages": result.messages}
 
     async def llm_node(state: ReactGraphState, config: RunnableConfig) -> dict:
-        """Call the LLM with current messages."""
+        """Call the LLM with current messages.
+
+        [C2 PR-4 §8.4 #3 llm_node_entry] Cancel checkpoint at LLM call
+        boundary. Raising here aborts BEFORE ``llm_with_tools.ainvoke``
+        spends a token. The atomic ``ainvoke`` (NOT a streaming
+        ``astream``) is why #4 llm_chunk_boundary is deferred until a
+        future streaming refactor (see module top docstring)."""
+        if _should_cancel(config):
+            raise CancelledByEventError("llm_node_entry")
         import time as _time
         messages = list(state.get("llm_input_messages") or state["messages"])
 
@@ -1113,6 +1215,13 @@ def build_react_graph(
             new_events.append(
                 MessageEvent(role="assistant", message=display_message)
             )
+
+        # [C2 PR-4 §8.4 #5 llm_return] Cancel checkpoint at llm_node exit.
+        # If the parent cancelled DURING the ``ainvoke`` (possible because
+        # ``ainvoke`` released the event loop), abort before the response
+        # propagates to tool_node where it would consume more compute.
+        if _should_cancel(config):
+            raise CancelledByEventError("llm_return")
 
         return {
             "messages": [response],
@@ -2096,6 +2205,11 @@ def build_react_graph(
         update=...)`` when a tool call reaches an Asked outcome. This
         replaces the dict return + ``route_after_tool`` conditional edge.
         """
+        # [C2 PR-4 §8.4 #6 tool_node_entry] Cancel checkpoint at tool dispatch
+        # entry. Raising here aborts BEFORE any tool execution side effect
+        # (file_write, shell_execute, ...) is attempted.
+        if _should_cancel(config):
+            raise CancelledByEventError("tool_node_entry")
         import time as _time
         configurable = (config or {}).get("configurable", {}) if config else {}
         guide_injector = configurable.get("skill_guide_injector")
@@ -2933,6 +3047,13 @@ def build_react_graph(
             if should_interrupt or update.get("attempt_count", 0) >= MAX_ITERATIONS
             else "pre_llm_node"
         )
+        # [C2 PR-4 §8.4 #7 tool_node_return] Cancel checkpoint at tool_node
+        # exit. By here the tool already executed; raising abandons the
+        # tool's just-built ToolMessage rather than feeding it to the next
+        # llm_node iteration. The cancel finalizer doesn't care about the
+        # residual message — it builds CANCEL_ACK from the existing state.
+        if _should_cancel(config):
+            raise CancelledByEventError("tool_node_return")
         return Command(goto=goto, update=update)
 
     # ---- Routing ------------------------------------------------------- #

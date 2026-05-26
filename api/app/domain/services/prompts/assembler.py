@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 from app.domain.services.prompts.budget import SystemPromptBudget
 from app.domain.services.prompts.section import (
@@ -206,3 +206,58 @@ class PromptAssembler:
             version_hash=version_hash,
             metadata=aggregated_metadata,
         )
+
+    # ----------------------------------------------------------------------
+    # C2 PR-4 §8.7 — Coordinator child minimal prompt
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def build_minimal_for_coordinator_child(
+        *,
+        objective: str,
+        phase: "Literal['exploration', 'write']",
+        allowed_paths: list[str],
+        expected_result_schema: str | None = None,
+    ) -> str:
+        """Static helper — composes the restricted prompt for a coordinator
+        child (spec §8.7) without going through the registry pipeline.
+
+        Why staticmethod instead of an ``assemble()`` call:
+        - The child prompt is fixed-shape and does not need priority-based
+          section budget arbitration.
+        - The child must NOT receive skill_context / tool_summary /
+          conversation_summaries — those are root-only concerns.
+        - Bypassing the registry keeps the child's prompt deterministic and
+          minimal; the parent reducer (PR-5) compares observed child
+          behavior against the spec'd allowlist, so prompt minimality is
+          a security invariant, not just a UX choice.
+
+        Returns the assembled prompt text. Caller (CoordinatorChildRunner)
+        feeds the string directly to the inner runner."""
+        from app.domain.services.prompts.sections.coordinator_work_unit import (
+            build_coordinator_work_unit_section,
+        )
+        work_unit_block = build_coordinator_work_unit_section(
+            objective=objective,
+            phase=phase,
+            allowed_paths=allowed_paths,
+            expected_result_schema=expected_result_schema,
+        )
+        # Identity + restricted-behavior preamble. Kept inline (not pulled
+        # from existing Section classes) because those classes wire to the
+        # full root prompt schema (memory, skills, output_format JSON shape)
+        # which the coordinator child must NOT inherit — see docstring above.
+        identity = (
+            "# Coordinator Step Worker\n\n"
+            "You are a restricted worker spawned by a coordinator. Your scope "
+            "is bounded by the work unit below. Stay within the authorized "
+            "paths and allowed tools."
+        )
+        behavior = (
+            "## Behavior\n\n"
+            "- Read what you need to understand the objective.\n"
+            "- For WRITE phase: make the necessary file changes, then return.\n"
+            "- For EXPLORATION phase: analyze and return a proposed_write_plan.\n"
+            "- Do NOT attempt tools or paths outside your authorization.\n"
+            "- Stop as soon as the objective is met. No exploratory tangents."
+        )
+        return "\n\n---\n\n".join([identity, behavior, work_unit_block])

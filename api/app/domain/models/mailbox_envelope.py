@@ -17,6 +17,9 @@ from typing import Any, Final, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.domain.models.needs_authorization_details import NeedsAuthorizationDetails
+from app.domain.models.patch_manifest import PatchManifest
+
 
 class MailboxEnvelopeType(str, Enum):
     """C1 ADR §6.3 frozen — 10 types, no in-place renames."""
@@ -171,6 +174,47 @@ class ResultReadyPayload(BaseModel):
     outcome: ResultReadyOutcome
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     cost_summary: CostAggregate = Field(default_factory=CostAggregate)
+    # [C2 PR-4 §6.2] coordinator child writes; tied to outcome by the
+    # `_outcome_field_matrix` validator below.
+    patch_manifest: Optional[PatchManifest] = None
+    # [C2 PR-4 §6.2 + r14 P1-2] structured grievance; required when
+    # outcome=NEEDS_AUTHORIZATION. Free-text rationale lives in
+    # ``needs_authorization_details.proposed_write_plan.rationale_ref``
+    # (MinIO), not inline, per spec §11 envelope store minimality.
+    needs_authorization_details: Optional[NeedsAuthorizationDetails] = None
+
+    @model_validator(mode="after")
+    def _outcome_field_matrix(self) -> "ResultReadyPayload":
+        """[C2 PR-4 r3 P2#3] outcome ↔ optional-fields matrix:
+
+        - NEEDS_AUTHORIZATION   ⇒ needs_authorization_details MUST be set
+                                  (the reducer / orchestrator routes on it)
+        - non-NEEDS_AUTHORIZATION ⇒ needs_authorization_details MUST be None
+                                  (carrying it on SUCCESS would let a producer
+                                  smuggle an authorization request through a
+                                  completion envelope, confusing the reducer)
+        - patch_manifest is allowed on SUCCESS only (other outcomes have no
+          meaningful write set to apply)
+        """
+        if self.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION:
+            if self.needs_authorization_details is None:
+                raise ValueError(
+                    "outcome=NEEDS_AUTHORIZATION requires "
+                    "needs_authorization_details"
+                )
+        else:
+            if self.needs_authorization_details is not None:
+                raise ValueError(
+                    f"outcome={self.outcome.value} forbids "
+                    "needs_authorization_details (only NEEDS_AUTHORIZATION "
+                    "may carry it)"
+                )
+        if self.patch_manifest is not None and self.outcome != ResultReadyOutcome.SUCCESS:
+            raise ValueError(
+                f"outcome={self.outcome.value} forbids patch_manifest "
+                "(only SUCCESS may carry one)"
+            )
+        return self
 
 
 class CancelRequestPayload(BaseModel):

@@ -68,7 +68,18 @@ logger = logging.getLogger(__name__)
 
 
 class WorkerResult:
-    """PR-3 minimal carrier; PR-4 promotes to Pydantic BaseModel + patch_manifest."""
+    """[C2 PR-4 r4 P1] Carrier for the child's terminal envelope contents.
+
+    Worker_node propagates patch_manifest / needs_authorization_details /
+    cost_summary / summary from the validated ResultReadyPayload (PR-4 wire
+    schema). PR-5 reducer reads ``patch_manifest`` for apply; PR-6 cost/quota
+    aggregates ``cost_summary``; PR-5 reducer routes NEEDS_AUTHORIZATION via
+    ``needs_authorization_details``.
+
+    A dataclass would be nicer, but matching the existing dataclass-less PR-3
+    minimal shape keeps the diff focused. PR-5 can promote to a frozen
+    Pydantic schema during the reducer integration.
+    """
 
     def __init__(
         self,
@@ -78,14 +89,18 @@ class WorkerResult:
         outcome: ResultReadyOutcome,
         cost_summary: Optional[CostAggregate] = None,
         error_summary: Optional[str] = None,
+        summary: Optional[str] = None,
+        patch_manifest: Optional[Any] = None,
+        needs_authorization_details: Optional[Any] = None,
     ) -> None:
         self.work_unit_id = work_unit_id
         self.child_session_id = child_session_id
         self.outcome = outcome
         self.cost_summary = cost_summary or CostAggregate()
         self.error_summary = error_summary
-        self.patch_manifest = None  # PR-4
-        self.needs_authorization_details = None  # PR-4
+        self.summary = summary
+        self.patch_manifest = patch_manifest
+        self.needs_authorization_details = needs_authorization_details
 
 
 class ParallelSubgraphState(TypedDict, total=False):
@@ -476,16 +491,29 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
         cancel_event=cancel_event,
     )
 
+    # [r4 P1 fix] Propagate PR-4 wire-schema fields (patch_manifest /
+    # needs_authorization_details / cost_summary / summary) into the
+    # WorkerResult so PR-5 reducer + PR-6 cost aggregator have something to
+    # consume. Validating envelope.payload through ResultReadyPayload gives
+    # us strongly-typed access to the new optional fields.
+    summary: Optional[str] = None
+    cost_summary: Optional[CostAggregate] = None
+    patch_manifest: Optional[Any] = None
+    needs_authorization_details: Optional[Any] = None
+
     if envelope.type == MailboxEnvelopeType.RESULT_READY:
-        raw_outcome = (
-            envelope.payload.get("outcome")
-            if isinstance(envelope.payload, dict)
-            else getattr(envelope.payload, "outcome", None)
-        )
-        outcome = (
-            ResultReadyOutcome(raw_outcome) if isinstance(raw_outcome, str)
-            else (raw_outcome or ResultReadyOutcome.FAILED)
-        )
+        from app.domain.models.mailbox_envelope import ResultReadyPayload
+        if isinstance(envelope.payload, ResultReadyPayload):
+            rr_payload = envelope.payload
+        else:
+            # Redis JSON round-trip lands payload as dict; revalidate to
+            # typed model so the new optional fields land on WorkerResult.
+            rr_payload = ResultReadyPayload.model_validate(envelope.payload)
+        outcome = rr_payload.outcome
+        summary = rr_payload.summary
+        cost_summary = rr_payload.cost_summary
+        patch_manifest = rr_payload.patch_manifest
+        needs_authorization_details = rr_payload.needs_authorization_details
     elif envelope.type == MailboxEnvelopeType.CANCEL_ACK:
         final_state = (
             envelope.payload.get("final_state")
@@ -498,6 +526,14 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
             outcome = ResultReadyOutcome.TIMED_OUT
         else:
             outcome = ResultReadyOutcome.FAILED
+        # CancelAckPayload has its own ``summary`` field — surface it for
+        # SSE/audit downstream (PR-8).
+        cancel_summary = (
+            envelope.payload.get("summary")
+            if isinstance(envelope.payload, dict)
+            else getattr(envelope.payload, "summary", None)
+        )
+        summary = cancel_summary
     else:
         outcome = ResultReadyOutcome.FAILED
 
@@ -505,6 +541,10 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
         work_unit_id=state_per_send["work_unit_id"],
         child_session_id=state_per_send["child_session_id"],
         outcome=outcome,
+        cost_summary=cost_summary,
+        summary=summary,
+        patch_manifest=patch_manifest,
+        needs_authorization_details=needs_authorization_details,
     )
     return {"worker_results": [result]}
 

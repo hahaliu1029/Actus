@@ -22,6 +22,7 @@ from app.application.services.continuation_intent_classifier import (
     ContinuationIntentClassifier,
 )
 from app.domain.services.permission.child_scope_violation import ChildScopeViolation
+from app.domain.services.graphs.react_graph import CancelledByEventError
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
@@ -284,6 +285,15 @@ class AgentTaskRunner(TaskRunner):
         supervisor_registry: Optional[SupervisorRegistryPort] = None,  # C3 PR-3c: per-pod MailboxSupervisor registry (None when mailbox plane disabled)
         mailbox_supervisor_enabled: bool = False,  # C3 PR-3c: deployment-time flag mirror (false unless wired by application layer)
         mailbox_publisher: Optional[MailboxPublisher] = None,  # C3 PR-4.5: child-side envelope publisher (None when mailbox plane disabled or this runner is a root)
+        # [C2 PR-4 §8.5.1 r6 P0-1] When True, ``_maybe_stop_child_publisher``
+        # skips the terminal envelope publish (RESULT_READY / CANCEL_ACK).
+        # Heartbeat task cleanup, SPAWN_ACK emission, and PROGRESS_UPDATE
+        # publishing still happen — only the terminal handoff is gated.
+        # Set to True for coordinator_step children whose finalizer
+        # (``CoordinatorChildRunner._finalize_*``) is the sole terminal
+        # envelope publisher; default False preserves the legacy publisher
+        # path for subagent_research children and roots.
+        terminal_envelope_publisher_disabled: bool = False,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -314,6 +324,10 @@ class AgentTaskRunner(TaskRunner):
         # heartbeat task + its asyncio handle are stopped in the terminal path.
         from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
         self._mailbox_publisher: Optional[MailboxPublisher] = mailbox_publisher
+        # [C2 PR-4 §8.5.1 r6 P0-1] terminal publisher gate (see ctor docstring).
+        self._terminal_envelope_publisher_disabled: bool = (
+            terminal_envelope_publisher_disabled
+        )
         # codex r3 [R3-5, HIGH ARCH] — store only the LAST session row
         # fetched inside ``_is_mailbox_plane_child``. The predicate is
         # NOT cached: §11.6 rollback can change control_plane mid-run.
@@ -3681,6 +3695,20 @@ class AgentTaskRunner(TaskRunner):
         # codex r4 [R4-2, HIGH PERF] — unconditional heartbeat cleanup.
         await self._cleanup_heartbeat_task()
 
+        # [C2 PR-4 §8.5.1 r6 P0-1] coordinator_step children whose flag is set
+        # publish their own terminal envelope via
+        # ``CoordinatorChildRunner._finalize_*``. The default runner path
+        # MUST stay silent or the wire carries two terminal envelopes for
+        # the same correlation_id. Gate placed AFTER heartbeat cleanup so
+        # the PROGRESS_UPDATE emitter is always stopped.
+        if getattr(self, "_terminal_envelope_publisher_disabled", False):
+            logger.debug(
+                "terminal envelope publish skipped for session=%s: "
+                "publisher disabled (coordinator_step child)",
+                self._session_id,
+            )
+            return
+
         publisher = getattr(self, "_mailbox_publisher", None)
         if publisher is None:
             return
@@ -4124,6 +4152,29 @@ class AgentTaskRunner(TaskRunner):
                 # runner's catch-all so CoordinatorChildRunner finalizer (PR-4) can
                 # convert to RESULT_READY(needs_authorization). NOT a runner crash
                 # — semantically a typed deny from the permission engine.
+                raise
+            except CancelledByEventError:
+                # [C2 PR-4 §8.4 r3 P1#1] Same shape as ChildScopeViolation:
+                # cancel checkpoint exceptions must reach CoordinatorChildRunner
+                # so it can route to _finalize_by_stop_reason → CANCEL_ACK or
+                # NEEDS_AUTHORIZATION(budget_exhausted). Without this explicit
+                # re-raise, the catch-all below would swallow the cancel as
+                # "runner error" and emit RESULT_READY(FAILED) instead.
+                #
+                # [r6 P1 deferred to PR-5] Re-raising here SKIPS the normal
+                # terminal-status DB write in the catch-all below (and the
+                # user_cancel path at line ~4140). The child session row stays
+                # in RUNNING until something terminalizes it. CoordinatorChildRunner
+                # publishes the envelope but does NOT touch the child session
+                # DB row. PR-5's runner_starter adapter is responsible for:
+                #   1. catching this propagated CancelledByEventError,
+                #   2. calling session_service.update_status(child_session_id,
+                #      SessionStatus.COMPLETED, terminal_reason="user_cancel")
+                #      (or equivalent budget reason),
+                #   3. emitting the DoneEvent so reconnect/tree views observe
+                #      the child as terminal.
+                # Without this PR-5 wiring, tree/status views can show a live
+                # child after the wire has already terminalized.
                 raise
             except Exception as e:
                 logger.exception(f"AgentTaskRunner运行出错: {str(e)}")

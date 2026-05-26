@@ -69,10 +69,8 @@ class TestSkeletonCtorAcceptsForwardDeps:
         assert r._mailbox_subscriber is not None
 
 
-class TestRunWorkUnitDeferredToPr4:
-    @pytest.mark.anyio
-    async def test_raises_notimplemented(self) -> None:
-        ce = asyncio.Event()
-        r = CoordinatorChildRunner(cancel_event=ce)
-        with pytest.raises(NotImplementedError):
-            await r.run_work_unit()
+# [PR-4 Task 4.7] PR-3's `TestRunWorkUnitDeferredToPr4.test_raises_notimplemented`
+# has been removed: run_work_unit is now a full implementation. Finalizer
+# matrix coverage lives in tests/application/services/
+# test_coordinator_child_runner_finalizers.py. Re-adding a NotImplementedError
+# gate would block the PR-4 worker contract.

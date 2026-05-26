@@ -101,6 +101,79 @@ async def test_worker_node_cancel_ack_cancelled_normalizes_to_cancelled() -> Non
     assert result["worker_results"][0].outcome == ResultReadyOutcome.CANCELLED
 
 
+# ---------------------------------------------------------------------------
+# [r4 P1] PR-4 wire-schema field propagation into WorkerResult
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_worker_node_propagates_patch_manifest() -> None:
+    """[r4 P1] RESULT_READY(SUCCESS) with PatchManifest → WorkerResult.patch_manifest
+    is set. Without this, PR-5 reducer would see None and never apply patches."""
+    from app.domain.models.patch_manifest import FilePatchEntry, PatchManifest
+    pm = PatchManifest(
+        patch_id="r1:wu1:p", coordinator_run_id="r1", work_unit_id="wu1",
+        files=(FilePatchEntry(
+            path="a/b.py", op="add",
+            new_digest="a" * 64, content_ref="minio://r", content_size=10,
+        ),),
+    )
+    payload = ResultReadyPayload(
+        summary="done", outcome=ResultReadyOutcome.SUCCESS, patch_manifest=pm,
+    ).model_dump(mode="python")
+    env = _mk_envelope(MailboxEnvelopeType.RESULT_READY, payload)
+    result = await worker_node(_state_send(), _config(envelope=env))
+    wr = result["worker_results"][0]
+    assert wr.patch_manifest is not None
+    assert wr.patch_manifest.patch_id == "r1:wu1:p"
+    assert wr.summary == "done"
+
+
+@pytest.mark.anyio
+async def test_worker_node_propagates_needs_authorization_details() -> None:
+    """[r4 P1] RESULT_READY(NEEDS_AUTH) with details → WorkerResult.needs_authorization_details
+    set. Without this, PR-5 reducer can't route NEEDS_AUTH to the human."""
+    from app.domain.models.needs_authorization_details import (
+        NeedsAuthorizationDetails,
+    )
+    details = NeedsAuthorizationDetails(reason="hard_blocked")
+    payload = ResultReadyPayload(
+        summary="blocked", outcome=ResultReadyOutcome.NEEDS_AUTHORIZATION,
+        needs_authorization_details=details,
+    ).model_dump(mode="python")
+    env = _mk_envelope(MailboxEnvelopeType.RESULT_READY, payload)
+    result = await worker_node(_state_send(), _config(envelope=env))
+    wr = result["worker_results"][0]
+    assert wr.needs_authorization_details is not None
+    assert wr.needs_authorization_details.reason == "hard_blocked"
+
+
+@pytest.mark.anyio
+async def test_worker_node_propagates_cost_summary() -> None:
+    """[r4 P1] cost_summary must reach WorkerResult so PR-6 cost aggregator
+    can sum per-child totals into the parent coordinator's run budget."""
+    payload = ResultReadyPayload(
+        summary="done", outcome=ResultReadyOutcome.SUCCESS,
+    ).model_dump(mode="python")
+    env = _mk_envelope(MailboxEnvelopeType.RESULT_READY, payload)
+    result = await worker_node(_state_send(), _config(envelope=env))
+    wr = result["worker_results"][0]
+    assert wr.cost_summary is not None
+
+
+@pytest.mark.anyio
+async def test_worker_node_cancel_ack_propagates_summary() -> None:
+    """[r4 P1 corollary] CANCEL_ACK summary surfaces for SSE/audit (PR-8)."""
+    payload = CancelAckPayload(
+        final_state="cancelled", summary="parent_cancel",
+    ).model_dump(mode="python")
+    env = _mk_envelope(MailboxEnvelopeType.CANCEL_ACK, payload)
+    result = await worker_node(_state_send(), _config(envelope=env))
+    wr = result["worker_results"][0]
+    assert wr.outcome == ResultReadyOutcome.CANCELLED
+    assert wr.summary == "parent_cancel"
+
+
 @pytest.mark.anyio
 async def test_worker_node_cancel_ack_force_terminated_normalizes_to_timed_out() -> None:
     payload = CancelAckPayload(final_state="force_terminated").model_dump(mode="python")
