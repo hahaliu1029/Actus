@@ -68,6 +68,8 @@ class ResultReadyOutcome(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"  # C2 PR-3 §6.2 — wallclock budget / force_terminate
+    NEEDS_AUTHORIZATION = "needs_authorization"  # C2 PR-3 §6.2 — child stopped on user approval gate
 
 
 class ApprovalDecidedBy(str, Enum):
@@ -76,12 +78,55 @@ class ApprovalDecidedBy(str, Enum):
     TIMEOUT = "timeout"
 
 
+class CoordinatorBudgetSnapshot(BaseModel):
+    """C2 PR-3 §6.2 — per-child budget snapshot inside SpawnRequest."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    max_tool_calls: int
+    max_token_cost_usd: float
+    max_wallclock_seconds: int
+
+
+class CoordinatorChildContext(BaseModel):
+    """C2 PR-3 §6.2 — coordinator-specific spawn payload addendum.
+
+    Only present when agent_kind == "coordinator_step" (enforced by
+    ``SpawnRequestPayload._coordinator_context_iff_coordinator_step``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    coordinator_run_id: str
+    work_unit_id: str
+    parent_session_id: str
+    spawn_manifest_ref: str
+    spawn_manifest_sha256: str
+    session_mode_revision: int
+    budget: CoordinatorBudgetSnapshot
+
+
 class SpawnRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    agent_kind: Literal["research", "general"] = "research"
+    # C2 PR-3 §6.2 — agent_kind widened with "coordinator_step"; defaults preserved.
+    agent_kind: Literal["research", "general", "coordinator_step"] = "research"
     task_prompt: str
     parent_correlation_id: Optional[str] = None
     quota_token: Optional[str] = None
+    # C2 PR-3 §6.2 — coordinator addendum; iff agent_kind == "coordinator_step".
+    coordinator_context: Optional[CoordinatorChildContext] = None
+
+    @model_validator(mode="after")
+    def _coordinator_context_iff_coordinator_step(self) -> "SpawnRequestPayload":
+        if self.agent_kind == "coordinator_step":
+            if self.coordinator_context is None:
+                raise ValueError(
+                    "coordinator_context required when agent_kind=coordinator_step"
+                )
+        else:
+            if self.coordinator_context is not None:
+                raise ValueError(
+                    "coordinator_context only valid for agent_kind=coordinator_step"
+                )
+        return self
 
 
 class SpawnAckPayload(BaseModel):

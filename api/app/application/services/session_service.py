@@ -105,6 +105,12 @@ class SessionService:
         parent_session_id: str,
         tool_filter_preset: Optional[str] = None,
         title: str | None = None,
+        # C2 PR-3 §7.5 P0-3 — coordinator-step children carry the run/work-unit
+        # ids in the same INSERT so the partial unique index
+        # ``ux_sessions_coordinator_wu`` enforces idempotent dispatch.
+        # Both kwargs must be supplied together or both omitted.
+        coordinator_run_id: Optional[str] = None,
+        work_unit_id: Optional[str] = None,
     ) -> Session:
         """C1a (PR-2): owner-checked + FOR UPDATE locked + spawn cap enforced.
 
@@ -146,6 +152,14 @@ class SessionService:
             raise ValueError(
                 "create_session_with_parent: tool_filter_preset is required "
                 "for child sessions (T12 / Phase 1 PR-X)."
+            )
+        # C2 PR-3 §7.5 P0-3 — both coordinator ids must be supplied together
+        # or both omitted. Forbids mid-state where only one is set.
+        if (coordinator_run_id is None) != (work_unit_id is None):
+            raise ValueError(
+                "create_session_with_parent: coordinator_run_id and work_unit_id "
+                "must be supplied together (got coordinator_run_id="
+                f"{coordinator_run_id!r}, work_unit_id={work_unit_id!r})."
             )
         from app.domain.services.tool_filter_presets import TOOL_FILTER_PRESETS
 
@@ -221,6 +235,9 @@ class SessionService:
                 subagent_control_plane=control_plane,
                 tool_filter_preset=tool_filter_preset,
                 title=title or "新对话",
+                # C2 PR-3 §7.5 P0-3 — atomic same-row write of coordinator lineage.
+                coordinator_run_id=coordinator_run_id,
+                work_unit_id=work_unit_id,
             )
             await uow.session.save(child)
             logger.info(
@@ -228,6 +245,42 @@ class SessionService:
                 child.id, parent_id, control_plane,
             )
             return child
+
+    # ── C2 PR-3 §7.5 P0-3 — coordinator attempt bump (UoW-bounded) ─────────
+
+    async def peek_coordinator_attempt(
+        self, *, session_id: str, step_id: str,
+    ) -> Optional[int]:
+        """C2 PR-3 §7.5 P0-3 — READ ``coordinator_attempts[step_id]`` inside a UoW.
+
+        UoW commit-on-exit is harmless here (SELECT only) but keeps the call
+        symmetric with ``bump_coordinator_attempt``. Returns ``None`` when the
+        row is missing OR the JSONB key has never been written.
+
+        Called by ``dispatch_node`` BEFORE deciding whether to bump or
+        rehydrate — see [r1 P0-2 fix] for the no-UoW-boundary regression.
+        """
+        async with self._uow_factory() as uow:
+            return await uow.session.peek_coordinator_attempt(
+                session_id=session_id, step_id=step_id,
+            )
+
+    async def bump_coordinator_attempt(
+        self, *, session_id: str, step_id: str,
+    ) -> int:
+        """C2 PR-3 §7.5 P0-3 — atomic JSONB increment, committed via UoW.
+
+        Returns the new attempt_ix (``>= 1``). Critical: the UoW commit fires
+        on ``__aexit__`` so the new attempt counter is durable BEFORE
+        ``dispatch_node`` creates any child session rows (which use this
+        ``SessionService``'s own UoW for their INSERT). Without this commit
+        ordering, a crash between bump and child-create would leave a stale
+        counter that violates the PEEK-before-BUMP crash recovery contract.
+        """
+        async with self._uow_factory() as uow:
+            return await uow.session.bump_coordinator_attempt(
+                session_id=session_id, step_id=step_id,
+            )
 
     def _spawn_fs_reconciler_walk(self, user_id: str) -> None:
         reconciler = self._fs_reconciler

@@ -60,6 +60,71 @@ logger = logging.getLogger(__name__)
 _BROWSER_COMPACT_TOOLS = frozenset(["browser_view", "browser_navigate"])
 
 
+async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
+    """C2 PR-3 §7.2 — invoke parallel_execution_subgraph for a coordinator step.
+
+    The subgraph's ``dispatch_node`` is responsible for ``coordinator_run_id``
+    derivation (``peek`` → ``bump`` flow on ``sessions.coordinator_attempts``
+    JSONB). main_graph does NOT pre-compute the run id — it only forwards
+    ``step.id`` + the planner's ``ParallelWorkUnitGroupRequest.work_units``.
+    """
+    cfg = (config.get("configurable") or {}) if config else {}
+    subgraph = cfg.get("parallel_execution_subgraph")
+    if subgraph is None:
+        raise RuntimeError(
+            "executor_node: parallel dispatch branch entered without "
+            "configurable.parallel_execution_subgraph wired. "
+            "(PR-3 cold code; PR-9 flips ACTUS_C2_COORDINATOR_ENABLED + wires "
+            "the subgraph + collaborators into composition/DI.)"
+        )
+    # C2 PR-3 §7.2 [r1 P0-3 + r2 P1-3 fix] — id derivation.
+    #
+    # ``parent_session_id``: MainGraphState carries ``session_id`` (not
+    # ``parent_session_id``); planner_react.py:1493-1510 confirms input shape.
+    #
+    # ``user_id``: planner_react.py:1264-1265 places ``user_id`` in
+    # ``configurable`` (not state). Fall back to cfg for the live shape.
+    #
+    # ``root_session_id``: MainGraphState has no ``root_session_id`` field.
+    # Phase 1 ``max_subagent_depth=1`` invariant guarantees the parent IS the
+    # root (see ``SessionService.create_session_with_parent`` guard:
+    # ``parent.parent_session_id is not None or parent.worker_type != "root"
+    # -> SpawnCapExceeded``). When Phase 2 lifts max_subagent_depth, the
+    # planner graph state will need an explicit ``root_session_id`` and this
+    # fallback must be removed in tandem.
+    parent_session_id = state.get("session_id")
+    user_id = state.get("user_id") or cfg.get("user_id")
+    root_session_id = state.get("root_session_id") or parent_session_id
+    if not parent_session_id:
+        raise RuntimeError(
+            "executor_node parallel branch: state.session_id is required"
+        )
+    if not user_id:
+        raise RuntimeError(
+            "executor_node parallel branch: user_id required "
+            "(state.user_id or configurable.user_id)"
+        )
+    final_state = await subgraph.ainvoke(
+        {
+            "coordinator_run_id": None,
+            "step_id": step.id,
+            "work_unit_requests": list(step.parallel_work_units.work_units),
+            "work_units": [],
+            "parent_session_id": parent_session_id,
+            "user_id": user_id,
+            "root_session_id": root_session_id,
+            "child_session_ids": {},
+            "orchestrator_task": None,
+            "worker_results": [],
+            "apply_plan": None,
+            "group_outcome": None,
+            "step_result_candidate": None,
+        },
+        config={"configurable": cfg},
+    )
+    return final_state.get("step_result_candidate", "") or ""
+
+
 def _assign_fallback_step_id(plan_id: str, index: int) -> str:
     """[C2 PR-1 §4.2 r7 P0-2] Deterministic fallback when LLM omits StepDef.id.
 
@@ -486,6 +551,27 @@ def build_main_graph(
                     "messages": state.get("messages", []),
                 },
                 goto=END,
+            )
+
+        # ── C2 PR-3 §7.2 — parallel dispatch branch ──────────────────────────
+        # When the planner emits ``Step.parallel_work_units``, route execution
+        # to the coordinator subgraph instead of react_graph. Hard-gated by
+        # ``assert_coordinator_enabled()`` so an env var typo cannot silently
+        # enable the cold code path.
+        if getattr(step, "parallel_work_units", None) is not None:
+            from app.domain.services.coordinator_feature_flag import (
+                assert_coordinator_enabled,
+            )
+            assert_coordinator_enabled()
+            step_result_candidate = await _run_parallel_backend(state, config, step)
+            return Command(
+                update={
+                    "current_step": step,
+                    "events": [],
+                    "messages": state.get("messages", []),
+                    "step_result": step_result_candidate,
+                },
+                goto="updater_node",
             )
 
         # Phase 3: 获取当前 step 的编译后 react_graph（渐进式 Skill 加载）

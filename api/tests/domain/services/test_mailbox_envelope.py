@@ -108,7 +108,10 @@ def test_progress_update_payload_requires_kind_and_visibility():
 
 
 def test_result_ready_outcome_enumeration():
-    assert {o.value for o in ResultReadyOutcome} == {"success", "failed", "cancelled"}
+    # C2 PR-3 §6.2 widened the enum with TIMED_OUT + NEEDS_AUTHORIZATION (additive).
+    assert {o.value for o in ResultReadyOutcome} == {
+        "success", "failed", "cancelled", "timed_out", "needs_authorization",
+    }
 
 
 def test_approval_request_correlation_id_required():

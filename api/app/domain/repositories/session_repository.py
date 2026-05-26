@@ -336,3 +336,33 @@ class SessionRepository(Protocol):
         """C1a: owner-scoped fetch. Returns None for missing OR foreign-user
         (collapse 403/404 to a single 404 to defeat ID enumeration)."""
         ...
+
+    # ── C2 PR-3 §7.5 P0-3 — coordinator attempt counter (JSONB) ────────────
+
+    async def peek_coordinator_attempt(
+        self, *, session_id: str, step_id: str,
+    ) -> Optional[int]:
+        """C2 PR-3 §7.5 P0-3 — READ current attempt_ix without bumping.
+
+        Returns ``None`` when ``step_id`` has never been dispatched (key missing
+        from ``coordinator_attempts`` JSONB) or session row absent. Otherwise
+        returns the current attempt_ix (``>= 1``).
+
+        ``dispatch_node`` uses this for crash recovery detection BEFORE deciding
+        whether to bump (atomic write) or rehydrate (read existing run).
+        """
+        ...
+
+    async def bump_coordinator_attempt(
+        self, *, session_id: str, step_id: str,
+    ) -> int:
+        """C2 PR-3 §7.5 P0-3 — atomic JSONB increment; returns new attempt_ix
+        (``>= 1``).
+
+        Called by ``dispatch_node`` only when a first-time dispatch (peek
+        returned None) or a replan-bump (no existing run found at peeked
+        attempt_ix) is needed. SQL writes ``coordinator_attempts`` JSONB via
+        ``jsonb_build_object`` + ``COALESCE`` for an atomic
+        read-modify-write under PostgreSQL row-level lock.
+        """
+        ...

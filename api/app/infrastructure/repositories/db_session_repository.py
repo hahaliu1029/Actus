@@ -975,3 +975,54 @@ class DBSessionRepository(SessionRepository):
         result = await self.db_session.execute(stmt)
         record = result.scalar_one_or_none()
         return record.to_domain() if record is not None else None
+
+    # ── C2 PR-3 §7.5 P0-3 — coordinator attempt counter (JSONB) ────────────
+
+    async def peek_coordinator_attempt(
+        self, *, session_id: str, step_id: str,
+    ) -> Optional[int]:
+        """READ ``coordinator_attempts[step_id]`` without bumping.
+
+        Returns ``None`` when the session row is absent OR the JSONB key is
+        missing (i.e. step never dispatched). Returns the persisted int
+        otherwise.
+        """
+        stmt = sa.text(
+            "SELECT (coordinator_attempts->>:step_id)::int AS attempt_ix "
+            "FROM sessions WHERE id = :session_id"
+        )
+        result = await self.db_session.execute(
+            stmt, {"step_id": step_id, "session_id": session_id},
+        )
+        row = result.fetchone()
+        if row is None:
+            return None
+        # JSONB key absent → SQL ``->>`` yields NULL → row[0] is None.
+        return row[0]
+
+    async def bump_coordinator_attempt(
+        self, *, session_id: str, step_id: str,
+    ) -> int:
+        """Atomic JSONB increment of ``coordinator_attempts[step_id]``.
+
+        Caller commits via UnitOfWork. Returns the new attempt_ix (``>= 1``).
+        Raises ``ValueError`` when the session row is missing.
+        """
+        stmt = sa.text(
+            "UPDATE sessions "
+            "SET coordinator_attempts = coordinator_attempts || jsonb_build_object("
+            "  :step_id, "
+            "  COALESCE((coordinator_attempts->>:step_id)::int, 0) + 1"
+            ") "
+            "WHERE id = :session_id "
+            "RETURNING (coordinator_attempts->>:step_id)::int AS attempt_ix"
+        )
+        result = await self.db_session.execute(
+            stmt, {"step_id": step_id, "session_id": session_id},
+        )
+        row = result.fetchone()
+        if row is None:
+            raise ValueError(
+                f"bump_coordinator_attempt: session {session_id!r} not found"
+            )
+        return row[0]
