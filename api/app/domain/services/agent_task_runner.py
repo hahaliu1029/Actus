@@ -21,6 +21,7 @@ from langchain_core.language_models import BaseChatModel
 from app.application.services.continuation_intent_classifier import (
     ContinuationIntentClassifier,
 )
+from app.domain.services.permission.child_scope_violation import ChildScopeViolation
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
@@ -4118,6 +4119,12 @@ class AgentTaskRunner(TaskRunner):
                 )
                 raise
 
+            except ChildScopeViolation:
+                # [C2 PR-2 §5.4] Child scope violations must propagate past this
+                # runner's catch-all so CoordinatorChildRunner finalizer (PR-4) can
+                # convert to RESULT_READY(needs_authorization). NOT a runner crash
+                # — semantically a typed deny from the permission engine.
+                raise
             except Exception as e:
                 logger.exception(f"AgentTaskRunner运行出错: {str(e)}")
                 await self._put_and_add_event(

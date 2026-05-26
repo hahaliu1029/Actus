@@ -11,12 +11,12 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class ProposedPath(BaseModel):
-    path: str
+    path: str = Field(min_length=1, description="non-empty target path")
     op: Literal["add", "modify", "delete"]
 
 
 class PathLease(BaseModel):
-    path: str
+    path: str = Field(min_length=1, description="non-empty target path")
     op: Literal["add", "modify", "delete"]
     base_digest: Optional[str] = None
     seed_content_ref: Optional[str] = None

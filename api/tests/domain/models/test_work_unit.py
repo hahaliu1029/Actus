@@ -53,3 +53,28 @@ class TestParallelRunSpec:
                                   phase="exploration", allowed_tools=["file_read"], write_lease=[])],
         )
         assert spec.coordinator_run_id.startswith("s1:")
+
+
+class TestPathLeaseEmptyPathRejected:
+    """[C2 PR-2 codex R5 P2] PathLease.path must be non-empty to prevent
+    empty-string lease matching `filepath=""` and bypassing scope enforcement."""
+
+    def test_empty_path_rejected(self):
+        with pytest.raises(ValidationError):
+            PathLease(path="", op="modify", base_digest="abc")
+
+    def test_whitespace_only_path_accepted(self):
+        """Whitespace-only paths are NOT special-cased — min_length=1 only
+        forbids the empty string. Path normalization is PR-5 territory."""
+        # This documents the current minimal contract; if PR-5 wants to
+        # tighten further, that's a separate change.
+        lease = PathLease(path=" ", op="modify", base_digest="abc")
+        assert lease.path == " "
+
+
+class TestProposedPathEmptyPathRejected:
+    """[C2 PR-2 codex R5 P2] ProposedPath.path must be non-empty."""
+
+    def test_empty_path_rejected(self):
+        with pytest.raises(ValidationError):
+            ProposedPath(path="", op="modify")

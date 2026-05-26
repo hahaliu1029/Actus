@@ -53,6 +53,7 @@ from app.domain.models.tool_result import (
     ToolResult,
 )
 from app.domain.services.json_envelope import unwrap_message_envelope
+from app.domain.services.permission.child_scope_violation import ChildScopeViolation
 from app.domain.services.permission.errors import (
     PEInfrastructureUnavailable,
     PolicyConflict,
@@ -1784,6 +1785,11 @@ def build_react_graph(
                     tc, args, tool_source, infra_outcome, _tool_start,
                 )
                 continue
+            except ChildScopeViolation:
+                # [C2 PR-2 §5.4] Child scope violations must propagate past this
+                # catch-all so CoordinatorChildRunner finalizer (PR-4) can convert
+                # to RESULT_READY(needs_authorization). NOT a crash — semantically a deny.
+                raise
             except Exception as exc:
                 logger.exception(
                     "PE.evaluate unexpected exception for tool '%s'", tool_name

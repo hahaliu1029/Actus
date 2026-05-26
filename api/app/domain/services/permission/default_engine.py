@@ -104,6 +104,10 @@ class DefaultPermissionEngine(PermissionEngine):
         self._sources: Mapping[str, "PermissionSource"] = sources or {}
         self._decision_recorder = decision_recorder or (lambda *a, **kw: None)
         self._confirmation_timeout_seconds: int = confirmation_timeout_seconds
+        # [C2 PR-2 §5.4] ChildScopeGate — pure stateless 4-way intersection.
+        # evaluate() prologue invokes it when ctx.child_permission_context is non-None.
+        from app.domain.services.permission.child_scope_gate import ChildScopeGate
+        self._child_scope_gate = ChildScopeGate()
 
     def register_source(self, name: str, source: "PermissionSource") -> None:
         """Post-construction source injection (PE-1 §2.6).
@@ -307,6 +311,42 @@ class DefaultPermissionEngine(PermissionEngine):
           8. Stage P.2: SmartApprove with PRE + POST mode_revision recheck (C-P0-10)
           9. Fall through → enqueue ConfirmationDetail + return Asked
         """
+        # [C2 PR-2 §5.4] Prologue: child scope gate BEFORE any source loop / writer touch.
+        # INV-1b/2/3 safe — gate is pure function. None child_ctx => root session => skip.
+        #
+        # COLD CODE (PR-2): no production caller currently sets
+        # ctx.child_permission_context; PR-3 ChildAgentRunnerFactory.build is
+        # responsible for plumbing it through. Until then this branch is
+        # unreachable at runtime — but the contract here is what PR-3+ tests
+        # will exercise. Do NOT remove this branch even though it's currently
+        # dead; PR-3 needs it. See ChildScopeGate module docstring for
+        # PR-3 acceptance criteria (pre-PE bypass + replay revalidation).
+        cctx = ctx.child_permission_context
+        if cctx is not None:
+            from app.domain.services.permission.child_scope_gate import (
+                ScopeDecision,
+                extract_target_path,
+            )
+            from app.domain.services.permission.child_scope_violation import (
+                ChildScopeViolation,
+            )
+            decision = await self._child_scope_gate.check_in_scope(call, ctx, cctx)
+            if decision != ScopeDecision.IN_SCOPE:
+                # Use shared helper so violation.target_path matches the path the
+                # gate consulted for lease lookup (filepath canonical, path fallback).
+                target_path = extract_target_path(call)
+                self._record_decision(
+                    "permission_engine.child_scope_violation",
+                    "deny",
+                    reason=decision.value,
+                    attrs=self._build_attrs(call, ctx, "child_scope_prologue"),
+                )
+                raise ChildScopeViolation(
+                    decision,
+                    tool_name=call.tool_name,
+                    target_path=target_path,
+                )
+
         # 1. Lifecycle terminal modes
         if ctx.session_mode in _LIFECYCLE_TERMINAL_MODES:
             self._record_decision(

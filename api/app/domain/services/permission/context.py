@@ -14,6 +14,9 @@ from app.domain.models.session import SessionStatus
 from app.domain.models.tool_result import ToolOutcome
 
 if TYPE_CHECKING:
+    from app.domain.services.permission.child_permission_context import (
+        ChildPermissionContext,
+    )
     from app.domain.services.permission.confirmation_queue import ConfirmationDetail
 
 
@@ -37,6 +40,8 @@ class EvaluationContext:
     request_id: str = ""
     # multi-agent slot — Phase 3+ scope, not used in PE-0
     parent_agent_id: Optional[str] = None
+    # [C2 PR-2 §5.4] None when root session; injected by ChildAgentRunnerFactory
+    child_permission_context: Optional["ChildPermissionContext"] = None
 
 
 @dataclass(frozen=True)
