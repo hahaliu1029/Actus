@@ -102,6 +102,10 @@ services:
       LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
       LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
       LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-actus}
+      # C2 CoordinatorTaskRunner v1 feature flag (spec §6.4). Default off until
+      # PR-9 acceptance; flip per CONTRIBUTING.md "C2 CoordinatorTaskRunner
+      # Deployment" rollout checklist.
+      ACTUS_C2_COORDINATOR_ENABLED: ${ACTUS_C2_COORDINATOR_ENABLED:-false}
       WECHAT_APP_ID: ${WECHAT_APP_ID:-}
       WECHAT_APP_SECRET: ${WECHAT_APP_SECRET:-}
       WECHAT_REDIRECT_URI: ${WECHAT_REDIRECT_URI:-}

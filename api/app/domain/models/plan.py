@@ -4,6 +4,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.domain.models.work_unit import ParallelWorkUnitGroupRequest
+
 
 class ExecutionStatus(str, Enum):
     """规划/任务执行的状态"""
@@ -17,13 +19,16 @@ class ExecutionStatus(str, Enum):
 class Step(BaseModel):
     """计划中的每一个步骤/子任务"""
 
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 子任务id
+    # [C2 PR-1 §4.2 r7 P0-2] id required, no default_factory
+    id: str
     description: str = ""  # 步骤的描述信息
     status: ExecutionStatus = ExecutionStatus.PENDING  # 子任务的执行状态
     result: Optional[str] = None  # 结果
     error: Optional[str] = None  # 错误信息
     success: bool = False  # 是否执行成功
     attachments: List[str] = Field(default_factory=list)  # 附件列表信息
+    # [C2 PR-1 §4.2 r7 P0-1] parallel_work_units != None → executor 走 parallel backend
+    parallel_work_units: Optional[ParallelWorkUnitGroupRequest] = None
 
     @property
     def done(self) -> bool:

@@ -250,7 +250,7 @@ class Settings(BaseSettings):
     # ``AgentTaskRunner._mailbox_supervisor_enabled``) keeps mailbox
     # behavior; setting it to False is no longer a supported rollback path
     # (the §11.6 runbook is decommissioned by the PR-6 alembic migration
-    # ``c3pr6_retire_legacy_control_plane`` that rewrites every existing
+    # ``c3pr6_retire_legacy_ctrl_plane`` that rewrites every existing
     # ``subagent_control_plane='legacy'`` row to ``'mailbox'``). Kept as a
     # Settings attribute purely for back-compat with test fixtures that
     # pass an explicit Settings stub.

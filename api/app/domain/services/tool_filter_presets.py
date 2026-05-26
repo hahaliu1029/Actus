@@ -37,8 +37,32 @@ SUBAGENT_RESEARCH_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
 })
 
 
+# [C2 PR-1 Task 1.6] Coordinator step worker allowlist. The coordinator child
+# session executes a single planned step under a constrained tool surface:
+# read-anything + typed file writes, but NO shell/browser/user-interaction/
+# memory_save (writes go through file tools so reducer_node can detect them).
+COORDINATOR_STEP_BASE_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
+    # READ
+    "search_web",
+    "file_read",
+    "file_list",
+    "file_view",
+    # typed WRITE only
+    "file_write",
+    "file_str_replace",
+    # META (tool/skill discovery)
+    "list_mcp_tools",
+    "get_mcp_tool",
+    "get_skill_guide",
+    # MEMORY READ
+    "memory_search",
+    "memory_get",
+})
+
+
 TOOL_FILTER_PRESETS: Mapping[str, FrozenSet[str]] = {
     "subagent_research": SUBAGENT_RESEARCH_ALLOWED_TOOLS,
+    "coordinator_step": COORDINATOR_STEP_BASE_ALLOWED_TOOLS,
 }
 
 

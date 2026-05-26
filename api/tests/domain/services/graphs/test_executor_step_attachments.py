@@ -153,12 +153,13 @@ class TestFormatPriorStepOutputs:
         assert rendered.strip() in {"无", "None", ""}
 
     def test_plan_with_no_completed_steps_returns_placeholder(self) -> None:
-        plan = Plan(steps=[Step(description="step1")])
+        plan = Plan(steps=[Step(id="s1", description="step1")])
         assert self.fn(plan).strip() in {"无", "None", ""}
 
     def test_completed_step_without_attachments_is_skipped(self) -> None:
         plan = Plan(steps=[
             Step(
+                id="s1",
                 description="step1",
                 status=ExecutionStatus.COMPLETED,
                 attachments=[],
@@ -178,6 +179,7 @@ class TestFormatPriorStepOutputs:
     def test_single_completed_step_with_attachment(self) -> None:
         plan = Plan(steps=[
             Step(
+                id="s1",
                 description="搜索国内 AI 新闻",
                 status=ExecutionStatus.COMPLETED,
                 success=True,
@@ -192,16 +194,18 @@ class TestFormatPriorStepOutputs:
     def test_multiple_completed_steps_preserve_order(self) -> None:
         plan = Plan(steps=[
             Step(
+                id="sA",
                 description="step A",
                 status=ExecutionStatus.COMPLETED,
                 attachments=["/home/ubuntu/a.md"],
             ),
             Step(
+                id="sB",
                 description="step B",
                 status=ExecutionStatus.COMPLETED,
                 attachments=["/home/ubuntu/b.md", "/home/ubuntu/b2.md"],
             ),
-            Step(description="step C (pending)"),
+            Step(id="sC", description="step C (pending)"),
         ])
         rendered = self.fn(plan)
         idx_a = rendered.find("/home/ubuntu/a.md")

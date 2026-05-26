@@ -86,6 +86,38 @@ from .skill_graph_canary import is_skill_graph_enabled
 logger = logging.getLogger(__name__)
 
 
+def _apply_plan_update(existing: Plan, response: PlanResponse) -> Plan:
+    """[C2 PR-1 §4.2 r7 P0-2] Apply a planner update preserving Step.id.
+
+    When the LLM's new ``StepDef.id`` matches an existing Step, that
+    Step's runtime state (status / result / error / success / attachments)
+    is carried over so replan does not lose progress. When the LLM omits
+    the id or invents a new one, a deterministic fallback id rooted on
+    ``existing.id`` is assigned via :func:`_assign_fallback_step_id` so
+    cross-step references stay stable across replan rounds.
+    """
+    from app.domain.services.graphs.main_graph import _assign_fallback_step_id
+
+    by_id = {s.id: s for s in existing.steps}
+    new_steps: list[Step] = []
+    for i, sd in enumerate(response.steps):
+        sid = sd.id or _assign_fallback_step_id(existing.id, i)
+        prior = by_id.get(sid)
+        new_steps.append(
+            Step(
+                id=sid,
+                description=sd.description,
+                status=prior.status if prior is not None else ExecutionStatus.PENDING,
+                result=prior.result if prior is not None else None,
+                error=prior.error if prior is not None else None,
+                success=prior.success if prior is not None else False,
+                attachments=list(prior.attachments) if prior is not None else [],
+                parallel_work_units=sd.parallel_work_units,
+            )
+        )
+    return Plan(steps=new_steps)
+
+
 class PlannerReActFlow(BaseFlow):
     """Planner+ReAct orchestration flow backed by LangGraph."""
 
@@ -1145,12 +1177,22 @@ class PlannerReActFlow(BaseFlow):
             skill_context=self._get_skill_context_seed(),
         )
 
-        steps = [
-            Step(description=s.description)
-            for s in parsed.steps
-        ]
+        # [C2 PR-1 §4.2 r7 P0-2] Build steps via deterministic helper so
+        # StepDef.id is propagated directly; when omitted, fall back to
+        # _assign_fallback_step_id (no random UUIDs).
+        from app.domain.services.graphs.main_graph import (
+            _assign_fallback_step_id,
+            _build_plan_from_response,
+        )
+
+        steps = _build_plan_from_response(parsed).steps
         if not steps:
-            steps = [Step(description=message.message)]
+            steps = [
+                Step(
+                    id=_assign_fallback_step_id("default", 0),
+                    description=message.message,
+                )
+            ]
         plan = Plan(
             title=parsed.title or "Task",
             goal=parsed.goal or message.message,

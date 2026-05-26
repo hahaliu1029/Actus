@@ -260,10 +260,13 @@ export function ChatInput({
     ? isSessionStreaming(sessionId)
     : false;
   const isCurrentSessionRunning = sessionStatus === "running";
+  const currentSupervisorSnapshot =
+    currentSession && currentSession.session_id === sessionId
+      ? currentSession.supervisor_snapshot
+      : null;
   const isBackgroundSuspended =
-    currentSession?.session_id === sessionId &&
-    currentSession.supervisor_snapshot?.execution_mode === "background" &&
-    currentSession.supervisor_snapshot.execution_phase === "suspended";
+    currentSupervisorSnapshot?.execution_mode === "background" &&
+    currentSupervisorSnapshot.execution_phase === "suspended";
   const isTakeoverActive = sessionStatus === "takeover" || sessionStatus === "takeover_pending";
   // Check if waiting for tool confirmation — disable input so users must use the confirmation card
   const hasToolConfirmationPending = useMemo(() => {

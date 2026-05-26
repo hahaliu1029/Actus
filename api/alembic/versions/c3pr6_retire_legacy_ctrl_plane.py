@@ -1,6 +1,6 @@
 """C3 PR-6 — retire legacy subagent control plane
 
-Revision ID: c3pr6_retire_legacy_control_plane
+Revision ID: c3pr6_retire_legacy_ctrl_plane
 Revises: c3_add_mailbox_envelope_audit
 Create Date: 2026-05-24
 
@@ -46,7 +46,7 @@ from alembic import op
 
 
 # revision identifiers, used by Alembic.
-revision = "c3pr6_retire_legacy_control_plane"
+revision = "c3pr6_retire_legacy_ctrl_plane"
 down_revision = "c3_add_mailbox_envelope_audit"
 branch_labels = None
 depends_on = None
@@ -66,7 +66,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     raise NotImplementedError(
-        "C3 PR-6 legacy retirement (c3pr6_retire_legacy_control_plane) "
+        "C3 PR-6 legacy retirement (c3pr6_retire_legacy_ctrl_plane) "
         "is forward-only — the original 'legacy' / NULL / 'mailbox' "
         "distinction is unrecoverable. To roll back, restore from a "
         "pre-migration DB snapshot."

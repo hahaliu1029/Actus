@@ -78,6 +78,7 @@ def _make_flow(
 def _make_plan(num_completed: int = 2) -> Plan:
     steps = [
         Step(
+            id=f"s{i}",
             description=f"Step {i}",
             status=ExecutionStatus.COMPLETED,
             result=f"Result {i}",

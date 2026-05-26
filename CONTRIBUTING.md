@@ -204,6 +204,21 @@ mkdir -p ${MEMORY_ROOT_HOST:-~/.actus/memory}     # host bind source 必须先�
 运维路径：`python -m app.cli.memory_reconcile [--user-id UID]` 手动全库扫
 DB/fs 一致性（覆盖 pending backlog + per-user fs walk + orphan 隔离）。
 
+## C2 CoordinatorTaskRunner Deployment (spec §6.4)
+
+Rollout order — STRICT, do not reorder:
+
+1. Upgrade ALL MailboxSupervisor pods to new envelope schema version
+   (含 `SpawnRequestPayload.agent_kind=coordinator_step` + new
+   `ResultReadyOutcome` values + new `ResultReadyPayload` fields parser).
+2. Verify supervisor majority quorum on new version (ops check).
+3. THEN set `ACTUS_C2_COORDINATOR_ENABLED=true`.
+4. Coordinator producer hard-gates on flag; false → planner prompt does
+   not teach `parallel_work_units` + executor does not enter `_run_parallel_backend`.
+
+Rollback: set flag back to false → producer stops; supervisors stay on
+new version (forward compat).
+
 ## 前端开发
 
 ```bash

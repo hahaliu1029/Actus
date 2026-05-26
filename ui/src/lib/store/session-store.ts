@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 
@@ -1744,7 +1745,11 @@ export const useSessionStore = create<SessionStore>()(
 // Hook export — selector returns filtered session list (excludes probe child
 // sessions whose parent_session_id is non-null).
 export function useFilteredSessionsForList(): ListSessionItem[] {
-  return useSessionStore((s) => s.getFilteredSessionsForList());
+  const sessions = useSessionStore((s) => s.sessions);
+  return useMemo(
+    () => sessions.filter((s) => s.parent_session_id === null),
+    [sessions]
+  );
 }
 
 registerStoreResetter("session", () => {

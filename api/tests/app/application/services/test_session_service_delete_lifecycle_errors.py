@@ -44,6 +44,7 @@ def _make_uow_and_factory(session: Session):
     uow.__aexit__ = AsyncMock(return_value=None)
     uow.session = MagicMock()
     uow.session.get_by_id = AsyncMock(return_value=session)
+    uow.session.find_descendants = AsyncMock(return_value=[])
     uow.session.delete_by_id = AsyncMock()
     return uow, lambda: uow
 

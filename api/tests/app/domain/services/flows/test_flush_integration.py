@@ -80,6 +80,7 @@ def _make_plan_with_completed_steps(num_steps: int) -> Plan:
     """Create a Plan with the given number of completed steps."""
     steps = [
         Step(
+            id=f"s{i}",
             description=f"Step {i}",
             status=ExecutionStatus.COMPLETED,
             result=f"Result {i}",

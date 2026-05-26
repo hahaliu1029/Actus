@@ -28,9 +28,9 @@ class TestBuildContextAnchor:
 
     def test_anchor_with_plan(self):
         flow = self._make_flow()
-        step1 = Step(description="收集链接")
+        step1 = Step(id="s1", description="收集链接")
         step1.status = ExecutionStatus.COMPLETED
-        step2 = Step(description="生成报告")
+        step2 = Step(id="s2", description="生成报告")
         step2.status = ExecutionStatus.RUNNING
         flow.plan = Plan(
             title="新闻收集",

@@ -91,7 +91,7 @@ class TestResolvePreset:
 class TestToolFilterPresetsRegistry:
     def test_registry_contains_only_known_keys(self) -> None:
         """Pin the registry's keyset; new presets need their own test update."""
-        assert set(TOOL_FILTER_PRESETS) == {"subagent_research"}
+        assert set(TOOL_FILTER_PRESETS) == {"subagent_research", "coordinator_step"}
 
     def test_subagent_research_key_points_to_canonical_allowlist(self) -> None:
         assert TOOL_FILTER_PRESETS["subagent_research"] is (

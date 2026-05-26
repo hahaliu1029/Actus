@@ -60,6 +60,54 @@ logger = logging.getLogger(__name__)
 _BROWSER_COMPACT_TOOLS = frozenset(["browser_view", "browser_navigate"])
 
 
+def _assign_fallback_step_id(plan_id: str, index: int) -> str:
+    """[C2 PR-1 §4.2 r7 P0-2] Deterministic fallback when LLM omits StepDef.id.
+
+    Used by ``_build_plan_from_response`` and the planner_react flow to
+    produce stable, reproducible step ids without injecting random UUIDs.
+    Format: ``step_{plan_id}_{index:02d}``.
+    """
+    return f"step_{plan_id}_{index:02d}"
+
+
+def _build_plan_from_response(
+    response: PlanResponse, *, plan_id: str | None = None
+) -> Plan:
+    """[C2 PR-1 §4.2 r7 P0-2] Build a Plan from a PlanResponse.
+
+    Propagates ``StepDef.id → Step.id`` directly; when the LLM omitted the
+    id, falls back to ``_assign_fallback_step_id(plan_id, index)`` so
+    downstream cross-step references stay deterministic. Other Plan-level
+    fields (title/goal/language/message) are carried over from the
+    response by the caller after this helper produces the inner Step list.
+
+    The returned Plan uses Plan's default factory for ``id`` so the
+    caller can either accept the random Plan id or rebuild Plan with an
+    explicit id. The ``plan_id`` argument here only governs the fallback
+    step id derivation; "default" is used when caller didn't supply one.
+    """
+    pid = plan_id or "default"
+    steps: list[Step] = []
+    seen_ids: set[str] = set()
+    for i, sd in enumerate(response.steps):
+        # When LLM repeats a StepDef.id (e.g. multiple steps share "1"),
+        # fall back to the deterministic helper so updater_node's id-based
+        # step lookup doesn't collapse unrelated steps onto each other.
+        if sd.id and sd.id not in seen_ids:
+            step_id = sd.id
+        else:
+            step_id = _assign_fallback_step_id(pid, i)
+        seen_ids.add(step_id)
+        steps.append(
+            Step(
+                id=step_id,
+                description=sd.description,
+                parallel_work_units=sd.parallel_work_units,
+            )
+        )
+    return Plan(steps=steps)
+
+
 def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     """Compact step messages to reduce context size between steps.
 
@@ -342,15 +390,14 @@ def build_main_graph(
             skill_context=state.get("skill_context"),
         )
 
-        steps = [
-            Step(description=s.description)
-            for s in parsed.steps
-        ]
+        # [C2 PR-1 §4.2 r7 P0-2] Build steps via deterministic helper so
+        # StepDef.id is propagated directly; when omitted, fall back to
+        # _assign_fallback_step_id (no random UUIDs).
         plan = Plan(
             title=parsed.title or "Task",
             goal=parsed.goal or state["message"],
             language=parsed.language or state.get("language", "zh"),
-            steps=steps,
+            steps=_build_plan_from_response(parsed).steps,
             message=parsed.message or "",
             status=ExecutionStatus.RUNNING,
         )
@@ -854,12 +901,17 @@ def build_main_graph(
                 parsed_obj: PlanUpdateResponse = await structured_llm.ainvoke(update_messages)
 
                 if parsed_obj and parsed_obj.steps:
+                    # [C2 PR-1 §4.2 r7 P0-2] Reuse existing Step.id when the
+                    # LLM keeps it; fall back to _assign_fallback_step_id
+                    # rooted on the plan's id so the fallback is stable
+                    # across replan rounds within the same plan.
                     new_steps = [
                         Step(
                             description=s.description,
-                            id=s.id,
+                            id=s.id or _assign_fallback_step_id(plan.id, i),
+                            parallel_work_units=s.parallel_work_units,
                         )
-                        for s in parsed_obj.steps
+                        for i, s in enumerate(parsed_obj.steps)
                         if s.description
                     ]
 

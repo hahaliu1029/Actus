@@ -102,3 +102,57 @@ EN_BUNDLE = PromptBundle(
     planner=EN_PLANNER_REGISTRY,
     updater=EN_UPDATER_REGISTRY,
 )
+
+
+# ---- C2 PR-1 Task 1.10 — Planner teaching for parallel_work_units ------ #
+#
+# Teaching block for the planner explaining when and how to set
+# ``parallel_work_units`` on a Step (instead of authoring a single
+# ReAct task). Injection into the assembled planner prompt is deferred:
+# PR-1 ships the teaching as a discoverable constant so PR-2/PR-3
+# (when the coordinator producer + executor parallel backend land) can
+# wire it via a new Section that reads this constant. Until then, the
+# planner cannot emit ``parallel_work_units`` (LLM doesn't know the
+# schema) and the feature is gated by ``ACTUS_C2_COORDINATOR_ENABLED``
+# anyway, so deferring injection is safe.
+#
+# Injection target (when wired): append as a low-priority Section in
+# ``EN_PLANNER_REGISTRY`` after ``planner_identity_section`` so the
+# planner sees the teaching before the tool summary.
+PARALLEL_WORK_UNITS_TEACHING_EN = """
+## Parallel Work Units (advanced — use sparingly)
+
+When a step decomposes into independent sub-tasks (no cross-dependencies),
+set `parallel_work_units` on the step instead of single ReAct task. Each
+work_unit dispatches to its own restricted child agent.
+
+Use when:
+- Multiple independent file modifications (no shared mutable state)
+- Multi-angle independent research
+- Multi-file lint/format fixes
+
+Do NOT use when:
+- Sub-tasks share state / read each other's outputs
+- Cross-step reasoning required
+- Single short task (overhead not worth it)
+
+Two-phase pattern:
+- Phase 1 `exploration`: child reads, returns proposed_write_plan
+- Phase 2 `write`: child performs declared writes within lease
+
+Schema:
+{
+  "parallel_work_units": {
+    "work_units": [
+      {
+        "objective": "rewrite api/utils/foo.py",
+        "phase": "write",
+        "allowed_tools": ["file_read", "file_write"],
+        "proposed_paths": [{"path": "api/utils/foo.py", "op": "modify"}]
+      }
+    ]
+  }
+}
+
+Hard cap: 5 work_units per step.
+"""

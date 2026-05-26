@@ -6,13 +6,21 @@
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from pydantic import BaseModel, ConfigDict
+
+from app.domain.models.work_unit import ParallelWorkUnitGroupRequest
 
 
 class StepDef(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    id: str = ""
+    # [r3 P1-1] id 保持 optional；deterministic fallback 在 plan builder
+    # （Task 1.9 _assign_fallback_step_id）
+    id: Optional[str] = None
     description: str = ""
+    # [C2 PR-1] planner 输出 parallel_work_units（with_structured_output 由 LLM 填）
+    parallel_work_units: Optional[ParallelWorkUnitGroupRequest] = None
 
 
 class PlanResponse(BaseModel):

@@ -58,3 +58,31 @@ def test_subagent_control_plane_rejects_typo():
 def test_subagent_control_plane_rejects_arbitrary_string():
     with pytest.raises(ValidationError):
         Session(subagent_control_plane="external_writer_value")
+
+
+# [C2 PR-1 Task 1.8 Override 5] coordinator lineage fields on domain Session
+# (codex round-4 P2 — without these the infrastructure → domain rehydrate path
+# silently drops coordinator_run_id / work_unit_id / coordinator_attempts).
+
+def test_coordinator_fields_default_to_empty():
+    s = Session()
+    assert s.coordinator_run_id is None
+    assert s.work_unit_id is None
+    assert s.coordinator_attempts == {}
+
+
+def test_coordinator_fields_roundtrip_via_from_attributes():
+    """The ORM → domain rehydrate path uses `model_validate(orm, from_attributes=True)`.
+    Mimic that with a stub object so the regression test does not need a DB.
+    """
+
+    class _OrmLike:
+        id = "sess-c2-roundtrip"
+        coordinator_run_id = "sess-c2-roundtrip:abcd1234abcd1234:a1"
+        work_unit_id = "abcd1234abcd1234.a1.0"
+        coordinator_attempts = {"step_login_01": 2}
+
+    s = Session.model_validate(_OrmLike(), from_attributes=True)
+    assert s.coordinator_run_id == "sess-c2-roundtrip:abcd1234abcd1234:a1"
+    assert s.work_unit_id == "abcd1234abcd1234.a1.0"
+    assert s.coordinator_attempts == {"step_login_01": 2}

@@ -90,7 +90,7 @@ async def test_planner_react_flow_invoke_produces_events(mock_llm, mock_uow):
     mock_bridge = MagicMock()
     mock_bridge.final_state = {
         "plan": Plan(title="Test", goal="test", language="en",
-                     steps=[Step(description="s1")], message="ok"),
+                     steps=[Step(id="s1", description="s1")], message="ok"),
         "messages": [SystemMessage(content="sys"), HumanMessage(content="hi"),
                      AIMessage(content="done")],
         "original_request": "test",
@@ -128,7 +128,7 @@ async def test_planner_react_flow_produces_plan_event(mock_llm, mock_uow):
 
     mock_bridge = MagicMock()
     plan = Plan(title="Test", goal="test", language="en",
-                steps=[Step(description="s1")], message="ok")
+                steps=[Step(id="s1", description="s1")], message="ok")
     mock_bridge.final_state = {
         "plan": plan,
         "messages": [SystemMessage(content="sys"), AIMessage(content="done")],
@@ -181,7 +181,7 @@ async def test_persist_after_graph_saves_memory_on_interrupt(
     Checkpointer handles state persistence — no InterruptState needed."""
     flow = _make_flow(mock_llm, mock_uow)
 
-    plan = Plan(title="t", goal="g", language="zh", steps=[Step(description="s1")], message="m")
+    plan = Plan(title="t", goal="g", language="zh", steps=[Step(id="s1", description="s1")], message="m")
     step = plan.steps[0]
     msgs = [SystemMessage(content="sys"), HumanMessage(content="u")]
     final_state = {
@@ -258,7 +258,7 @@ async def test_generator_early_close_still_persists(
     """Simulates WaitEvent early-return: closing the generator triggers finally persistence."""
     flow = _make_flow(mock_llm, mock_uow)
 
-    plan = Plan(title="t", goal="g", language="zh", steps=[Step(description="s1")], message="m")
+    plan = Plan(title="t", goal="g", language="zh", steps=[Step(id="s1", description="s1")], message="m")
     wait_event = WaitEvent()
 
     # Patch GraphEventBridge to yield a WaitEvent and set should_interrupt in final_state

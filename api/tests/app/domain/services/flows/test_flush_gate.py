@@ -65,6 +65,7 @@ def _make_plan_with_completed_steps(num_steps: int) -> Plan:
     steps = []
     for i in range(num_steps):
         steps.append(Step(
+            id=f"s{i}",
             description=f"Step {i}",
             status=ExecutionStatus.COMPLETED,
             result=f"Result {i}",

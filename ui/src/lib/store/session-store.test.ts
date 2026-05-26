@@ -1,3 +1,4 @@
+import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/api/session", () => ({
@@ -32,7 +33,10 @@ vi.mock("@/lib/api/session-compaction", () => ({
 import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
 import type { ListSessionItem, Session, SupervisorSnapshot } from "@/lib/api/types";
-import { useSessionStore } from "@/lib/store/session-store";
+import {
+  useFilteredSessionsForList,
+  useSessionStore,
+} from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
 const mockedSessionApi = vi.mocked(sessionApi, { deep: true });
@@ -117,6 +121,27 @@ describe("session-store", () => {
     expect(useSessionStore.getState().sessions[0]?.supervisor_snapshot).toEqual(
       backgroundSnapshot
     );
+  });
+
+  it("useFilteredSessionsForList 在 sessions 未变化时保持引用稳定", () => {
+    const rootSession = buildListSession({ session_id: "root" });
+    const childSession = buildListSession({
+      session_id: "child",
+      parent_session_id: "root",
+      worker_type: "subagent",
+    });
+    useSessionStore.setState({
+      sessions: [rootSession, childSession],
+      isLoadingSessions: false,
+    });
+
+    const { result } = renderHook(() => useFilteredSessionsForList());
+    const first = result.current;
+
+    useSessionStore.setState({ isLoadingSessions: true });
+
+    expect(result.current).toBe(first);
+    expect(result.current).toEqual([rootSession]);
   });
 
   it("streamSessions 保留列表项 supervisor_snapshot", () => {

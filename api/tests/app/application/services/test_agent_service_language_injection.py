@@ -38,7 +38,7 @@ def _make_plan(language: str) -> Plan:
         title="Test",
         goal="do the thing",
         language=language,
-        steps=[Step(description="one step")],
+        steps=[Step(id="s1", description="one step")],
         message="",
     )
 

@@ -516,9 +516,9 @@ class TestExecutorMessageBranching:
         planner_llm = MagicMock()
         planner_llm.with_structured_output = MagicMock(return_value=AsyncMock())
 
-        step = Step(description="Step 2: analyze data")
+        step = Step(id="s2", description="Step 2: analyze data")
         plan = Plan(title="T", goal="G", language="zh", steps=[
-            Step(description="Step 1: collect", status=ExecutionStatus.COMPLETED),
+            Step(id="s1", description="Step 1: collect", status=ExecutionStatus.COMPLETED),
             step,
         ], message="ok", status=ExecutionStatus.RUNNING)
 
@@ -585,7 +585,7 @@ class TestExecutorMessageBranching:
         planner_llm = MagicMock()
         planner_llm.with_structured_output = MagicMock(return_value=AsyncMock())
 
-        step = Step(description="Login to Notion")
+        step = Step(id="s_login", description="Login to Notion")
         plan = Plan(title="T", goal="G", language="zh", steps=[step], message="ok", status=ExecutionStatus.RUNNING)
 
         graph = build_main_graph(

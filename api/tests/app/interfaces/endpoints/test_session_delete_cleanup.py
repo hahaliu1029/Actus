@@ -20,19 +20,41 @@ from app.domain.models.session import DestroyReason, Session
 
 
 class _FakeSessionRepo:
-    def __init__(self, session: Session | None) -> None:
+    def __init__(
+        self,
+        session: Session | None,
+        *,
+        descendants: list[Session] | None = None,
+    ) -> None:
         self._session = session
+        self._sessions = {
+            item.id: item
+            for item in ([session] if session else []) + (descendants or [])
+        }
+        self._descendants = descendants or []
         self.deleted_ids: list[str] = []
 
     async def get_by_id(self, session_id: str):
-        if not self._session:
-            return None
-        return self._session if self._session.id == session_id else None
+        return self._sessions.get(session_id)
+
+    async def find_descendants(
+        self,
+        ancestor_id: str,
+        *,
+        user_id: str,
+        max_depth: int,
+        limit: int,
+    ):
+        del max_depth, limit
+        return [
+            session
+            for session in self._descendants
+            if session.parent_session_id == ancestor_id and session.user_id == user_id
+        ]
 
     async def delete_by_id(self, session_id: str) -> None:
         self.deleted_ids.append(session_id)
-        if self._session and self._session.id == session_id:
-            self._session = None
+        self._sessions.pop(session_id, None)
 
 
 class _FakeUnitOfWork:
@@ -176,3 +198,33 @@ def test_delete_session_releases_suspended_background_quota() -> None:
         }
     ]
     assert repo.deleted_ids == ["s-delete-bg"]
+
+
+def test_delete_root_session_deletes_subagent_children_first() -> None:
+    _FakeTaskCls.registry.clear()
+
+    root = Session(
+        id="root-1",
+        title="root",
+        user_id="owner",
+        worker_type="root",
+    )
+    child = Session(
+        id="child-1",
+        title="child",
+        user_id="owner",
+        parent_session_id="root-1",
+        worker_type="subagent",
+        tool_filter_preset="subagent_research",
+    )
+    repo = _FakeSessionRepo(session=root, descendants=[child])
+
+    service = SessionService(
+        uow_factory=_make_uow_factory(repo),
+        task_cls=_FakeTaskCls,
+        sandbox_lifecycle_service=None,
+    )
+
+    asyncio.run(service.delete_session("root-1", user_id="owner", is_admin=False))
+
+    assert repo.deleted_ids == ["child-1", "root-1"]

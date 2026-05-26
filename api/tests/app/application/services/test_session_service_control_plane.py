@@ -3,7 +3,7 @@
 
 The PR-4.5 era ``mailbox_supervisor_enabled`` runtime feature flag was
 retired in PR-6: the §11.6 rollback runbook is decommissioned and the
-``c3pr6_retire_legacy_control_plane`` alembic migration upgrades any
+``c3pr6_retire_legacy_ctrl_plane`` alembic migration upgrades any
 historic ``legacy`` rows to ``mailbox``. The constructor still accepts
 the ``settings`` and ``mailbox_flag_reader`` kwargs (back-compat) but
 the values are not consulted; this test pins both the new contract

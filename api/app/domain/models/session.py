@@ -94,9 +94,19 @@ class Session(BaseModel):
     # boundary and never reach the DB CHECK constraint
     # (ck_sessions_subagent_control_plane_valid).
     subagent_control_plane: Optional[Literal["legacy", "mailbox"]] = None
-    tool_filter_preset: Optional[Literal["subagent_research"]] = (
+    tool_filter_preset: Optional[Literal["subagent_research", "coordinator_step"]] = (
         None  # T12 pod-restart resilience：持久化 tool_filter 预设名；NULL = 不限制
+        # [C2 PR-1 Task 1.7] 加入 'coordinator_step' — coordinator child session
+        # 的受限工具集（read + typed write，无 shell/browser/user-interaction）。
     )
+    # [C2 PR-1 Task 1.8 Override 5] coordinator run/work-unit lineage on the
+    # domain Session. The infrastructure SessionModel persists the same three
+    # columns; Pydantic `model_validate(..., from_attributes=True)` round-trips
+    # them through `to_domain` so rehydrate after pod restart keeps the
+    # coordinator child session's run/work-unit/attempt state.
+    coordinator_run_id: Optional[str] = None  # f"{session_id}:{step_id_hash16}:a{attempt_ix}"
+    work_unit_id: Optional[str] = None  # f"{step_id_hash16}.a{attempt_ix}.{i}"
+    coordinator_attempts: Dict[str, int] = Field(default_factory=dict)  # per-step attempt counter map
     sandbox_id: Optional[str] = None  # 沙箱id（仅 infrastructure ORM 兼容层使用）
     sandbox_binding: SandboxBinding = Field(
         default_factory=SandboxBinding

@@ -81,6 +81,27 @@ class SessionModel(Base):
         String(64),
         nullable=True,
     )  # T12: 持久化 tool_filter 预设名，让 _create_task 重建路径还原 allowlist；CHECK 约束见 migration
+    # ── C2 PR-1 coordinator columns (migration c2pr1_coordinator_columns) ──
+    # Persist coordinator (run_id, work_unit_id, per-step attempts) so a pod
+    # restart can rehydrate in-flight coordinator children without losing the
+    # idempotent-retry guard (partial unique index ux_sessions_coordinator_wu)
+    # or the attempts counter. NULL on rows that pre-date C2 and on non-
+    # coordinator children. See alembic migration for index + CHECK details.
+    coordinator_run_id: Mapped[Optional[str]] = mapped_column(
+        String(320), nullable=True,
+        comment="C2 v1: f'{session_id}:{step_id_hash16}:a{attempt_ix}'",
+    )
+    work_unit_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+        comment="C2 v1: f'{step_id_hash16}.a{attempt_ix}.{i}'",
+    )
+    coordinator_attempts: Mapped[Dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        default=dict,
+        comment="C2 v1 per-step attempt counter map",
+    )
     sandbox_id: Mapped[str] = mapped_column(String(255), nullable=True)  # 沙箱id
     # ── Sandbox binding columns (lifecycle state machine, I8) ──
     sandbox_state: Mapped[str] = mapped_column(
