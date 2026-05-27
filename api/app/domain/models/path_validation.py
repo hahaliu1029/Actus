@@ -51,7 +51,7 @@ def validate_relative_path(value: str) -> str:
 
 def validate_relative_path_strict(value: str) -> str:
     """[r5 P1#2] Stricter variant — same checks as ``validate_relative_path``
-    PLUS rejects absolute paths.
+    PLUS rejects absolute paths AND non-canonical relative forms.
 
     Used by ``FilePatchEntry.path`` where the path is a write target the
     child has authority to produce. A child publishing a manifest with
@@ -60,6 +60,13 @@ def validate_relative_path_strict(value: str) -> str:
     sandbox root, and an absolute path passed to ``Path('/sandbox').joinpath('/etc/foo')``
     returns ``/etc/foo`` (the second segment wins). Fail-closed here keeps
     the manifest wire schema honest about being sandbox-relative.
+
+    [codex R3 P2#6 fix] Reject non-canonical relative forms (``./x.py``,
+    ``x/./y.py``, ``x//y.py``) so the reducer's cross-worker conflict
+    detection can compare paths as raw strings. Without this two
+    workers could both write ``x.py`` and ``./x.py`` and bypass the
+    CONFLICT detection — the applier would then issue two writes to
+    the same final sandbox file.
     """
     value = validate_relative_path(value)
     if value.startswith("/"):
@@ -67,5 +74,17 @@ def validate_relative_path_strict(value: str) -> str:
             f"path must be relative (got absolute path {value!r}); "
             "PatchManifest entries are sandbox-relative — absolute paths "
             "would escape the parent sandbox boundary in PR-5 PatchApplier"
+        )
+    # posixpath.normpath strips redundant ``./``, ``/./``, ``//`` etc.
+    # Use posixpath (not os.path) so the same canonicalization applies
+    # on every platform — sandbox paths are always POSIX-style.
+    import posixpath
+    canonical = posixpath.normpath(value)
+    if canonical != value:
+        raise ValueError(
+            f"path must be in canonical form (got {value!r}, "
+            f"canonical={canonical!r}); reducer conflict detection "
+            "compares paths as raw strings and ``./x.py`` vs ``x.py`` "
+            "would both reach the same sandbox file"
         )
     return value

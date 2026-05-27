@@ -69,7 +69,17 @@ class FilePatchEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    path: Annotated[str, AfterValidator(validate_relative_path_strict)]
+    # [codex R11 P1] max_length=2048 matches
+    # ``coordinator_apply_audit.failed_at_path`` String(2048); also
+    # bounds NAME_MAX exposure in the snapshot store. Schema
+    # validator is the single source of truth for path length so the
+    # DB column length + on-disk snapshot filename + log strings stay
+    # aligned.
+    path: Annotated[
+        str,
+        Field(max_length=2048),
+        AfterValidator(validate_relative_path_strict),
+    ]
     op: Literal["add", "modify", "delete"]
     base_digest: Optional[Annotated[str, AfterValidator(_validate_sha256_hex)]] = None
     new_digest: Optional[Annotated[str, AfterValidator(_validate_sha256_hex)]] = None

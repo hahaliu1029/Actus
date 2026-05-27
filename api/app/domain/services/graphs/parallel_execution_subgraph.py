@@ -4,7 +4,7 @@ LangGraph StateGraph compiled with ``checkpointer=False``.
 
 Topology::
 
-    START -> dispatch_node -> Send x N -> worker_node -> reducer_node (placeholder) -> END
+    START -> dispatch_node -> Send x N -> worker_node -> reducer_node -> END
 
 PR-3 ships:
   - ``dispatch_node`` -- peek/bump coordinator attempt, build runtime WorkUnits,
@@ -13,7 +13,7 @@ PR-3 ships:
   - ``worker_node`` -- await terminal envelope per child via
     ``CoordinatorTerminalEnvelopeWaiter``, normalize ``CANCEL_ACK`` final_state
     to ``ResultReadyOutcome``
-  - ``reducer_node_placeholder`` -- PR-5 wires real PatchReducerService
+  - ``reducer_node`` -- C2 PR-5 §9.6 wraps PatchReducerService
 
 Cold code: the subgraph is constructed but is NOT reached at runtime unless
 ``ACTUS_C2_COORDINATOR_ENABLED=true`` AND ``Step.parallel_work_units != None``.
@@ -120,6 +120,11 @@ class ParallelSubgraphState(TypedDict, total=False):
     apply_plan: Optional[Any]       # PR-5
     group_outcome: Optional[Any]    # PR-5
     step_result_candidate: Optional[str]
+    # [codex R6 P1] ReducerDiagnostics carrier — reducer_node writes
+    # it so main_graph / PR-7 audit-diagnostics persistence have
+    # something to read. ``Any`` keeps the application-layer type
+    # (ReducerDiagnostics) out of the domain graph import surface.
+    reducer_diagnostics: Optional[Any]  # PR-5
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -485,10 +490,17 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
     waiter = cfg["terminal_waiter"]
     cancel_event = cfg["cancel_event"]
 
+    # [codex R5 P1] Pass coordinator_run_id so the waiter additionally
+    # filters by ``env.correlation_id``. PR-5 applies patch_manifests
+    # from these envelopes directly to the parent sandbox; without
+    # this filter a stale RESULT_READY from a different attempt
+    # sharing the same child_session_id could cross-contaminate the
+    # current apply plan.
     envelope = await waiter.await_terminal(
         child_session_id=state_per_send["child_session_id"],
         root_session_id=state_per_send["root_session_id"],
         cancel_event=cancel_event,
+        coordinator_run_id=state_per_send.get("coordinator_run_id"),
     )
 
     # [r4 P1 fix] Propagate PR-4 wire-schema fields (patch_manifest /
@@ -549,15 +561,67 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
     return {"worker_results": [result]}
 
 
-# ── reducer_node placeholder ─────────────────────────────────────────────────
+# ── reducer_node — wired to PatchReducerService (C2 PR-5) ───────────────────
 
 
-async def reducer_node_placeholder(state: ParallelSubgraphState, config: RunnableConfig) -> Command:
-    """PR-3 placeholder; PR-5 wires PatchReducerService."""
+async def reducer_node(
+    state: ParallelSubgraphState, config: RunnableConfig,
+) -> Command:
+    """[C2 PR-5 §9.6] Thin wrapper around ``PatchReducerService.reduce``.
+
+    Reads:
+    - ``config["configurable"]["patch_reducer_service"]`` — required.
+      Composition root binds the singleton service instance.
+    - ``config["configurable"]["parent_sandbox"]`` — optional. When
+      present the reducer's §9.3 step 5 drift check fires; when absent
+      drift detection is skipped (the applier's preflight still
+      catches stale base_digest at apply time).
+
+    Writes ``apply_plan`` / ``group_outcome`` / ``step_result_candidate``
+    into the subgraph state via ``Command(update=...)`` and routes to
+    ``END``. The outer ``_run_parallel_backend`` reads these to decide
+    whether to invoke ``PatchApplier``.
+    """
+    cfg = config["configurable"]
+    reducer = cfg["patch_reducer_service"]
+    parent_sandbox = cfg.get("parent_sandbox")
+
+    coordinator_run_id = state.get("coordinator_run_id")
+    if coordinator_run_id is None:
+        # ``dispatch_node`` is responsible for filling this. A missing
+        # value here means a topology bug — fail loudly via the step
+        # result candidate text rather than calling reduce() with None
+        # which would yield a confusing downstream error.
+        return Command(
+            update={
+                "apply_plan": None,
+                "group_outcome": None,
+                "step_result_candidate": (
+                    "[reducer] missing coordinator_run_id; dispatch_node "
+                    "did not initialize subgraph state correctly"
+                ),
+            },
+            goto=END,
+        )
+
+    output = await reducer.reduce(
+        coordinator_run_id=coordinator_run_id,
+        work_unit_ids_expected=frozenset(
+            wu.work_unit_id for wu in state["work_units"]
+        ),
+        worker_results=state["worker_results"],
+        parent_sandbox=parent_sandbox,
+    )
     return Command(
         update={
-            "step_result_candidate": "[PR-3 placeholder] reducer not yet wired",
-            "group_outcome": None,
+            "apply_plan": output.apply_plan,
+            "group_outcome": output.group_outcome,
+            "step_result_candidate": output.step_result_candidate,
+            # [codex R6 P1] Surface the reducer's diagnostics into the
+            # subgraph state so main_graph / PR-7 audit persistence
+            # have something to read (R5 lineage warnings, R4
+            # needs_authorization_details, etc.).
+            "reducer_diagnostics": output.diagnostics,
         },
         goto=END,
     )
@@ -571,7 +635,7 @@ def build_parallel_execution_subgraph() -> Any:
     g: StateGraph = StateGraph(ParallelSubgraphState)
     g.add_node("dispatch_node", dispatch_node)
     g.add_node("worker_node", worker_node)
-    g.add_node("reducer_node", reducer_node_placeholder)
+    g.add_node("reducer_node", reducer_node)
     g.add_edge(START, "dispatch_node")
     g.add_edge("worker_node", "reducer_node")
     return g.compile(checkpointer=False)

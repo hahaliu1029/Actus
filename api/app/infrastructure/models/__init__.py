@@ -1,5 +1,6 @@
 from .base import Base
 from .conversation_compaction import ConversationCompactionModel
+from .coordinator_apply_audit import CoordinatorApplyAudit
 from .cost_record_orm import CostRecordModel
 from .file import FileModel
 from .mailbox_envelope_audit import MailboxEnvelopeAuditModel
@@ -16,6 +17,7 @@ from .user import UserModel
 __all__ = [
     "Base",
     "ConversationCompactionModel",
+    "CoordinatorApplyAudit",
     "CostRecordModel",
     "SessionModel",
     "FileModel",

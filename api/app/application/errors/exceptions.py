@@ -175,3 +175,57 @@ class PromptAssemblyHTTPError(AppException):
 
     def __init__(self, msg: str):
         super().__init__(code=500, status_code=500, msg=msg)
+
+
+# ---- C2 coordinator errors (domain-internal signals) -------------------- #
+#
+# Intentionally NOT subclasses of AppException: these are domain-level
+# control-flow signals that the orchestrator catches and routes via
+# ``step_result_candidate`` / SSE events. They never reach the
+# interfaces exception handler — surfacing them as HTTP errors would
+# leak coordinator internals to the client.
+#
+# A future Phase 2 may promote some of these to user-visible errors with
+# proper AppException wrappers (e.g. CoordinatorBudgetExhausted → 429),
+# but PR-5 keeps them domain-internal.
+
+
+class CoordinatorError(Exception):
+    """Base for C2 coordinator errors (PR-5+).
+
+    Subclasses signal specific failure modes that the orchestrator
+    handles distinctly. Production code should catch the specific
+    subclass; ``CoordinatorError`` itself is the umbrella for tests
+    and broad except clauses.
+    """
+
+
+class PatchConflict(CoordinatorError):
+    """[C2 PR-5 §9.3] Cross-worker same-path write detected by the reducer.
+
+    Raised when two coordinator children's PatchManifests both touch
+    the same path — the reducer routes via ``GroupOutcome.CONFLICT``
+    instead and the orchestrator surfaces this exception type when an
+    application-layer caller (rather than the reducer itself) needs to
+    signal the same condition.
+    """
+
+
+class PatchApplyError(CoordinatorError):
+    """[C2 PR-5 §10.2] PatchApplier step failure.
+
+    Raised by application-layer callers that wrap the applier and
+    need to translate a non-SUCCESS ``ApplyOutcome`` into a control-
+    flow exception (e.g. when the orchestrator's outer task needs to
+    fail-fast rather than continue with the partial result text).
+    """
+
+
+class CoordinatorBudgetExhausted(CoordinatorError):
+    """[C2 PR-6 §14.3] Per-child or per-run budget exhausted.
+
+    Reserved for the PR-6 budget watchdogs (token / wallclock). PR-5
+    declares the type so the PR-5 → PR-6 boundary is wire-stable: the
+    applier + orchestrator don't yet raise this, but downstream test
+    fixtures can import it.
+    """

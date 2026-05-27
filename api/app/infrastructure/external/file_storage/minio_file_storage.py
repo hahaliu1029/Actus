@@ -256,6 +256,39 @@ class MinioFileStorage(FileStorage):
         )
         return key
 
+    async def get_bytes(self, ref: str) -> bytes:
+        """[C2 PR-5 codex R1 P1#2] Fetch raw bytes by content-addressed ref.
+
+        ``ref`` is the object key returned by
+        ``put_content_addressed_bytes`` (or any pre-existing key in the
+        same bucket). Used by the coordinator ``PatchApplier`` to
+        resolve ``FilePatchEntry.content_ref`` to the actual file
+        content before writing to the parent sandbox.
+
+        ``MinioStore.download_fileobj`` returns a ``BinaryIO``
+        wrapping the response body (already drained inside
+        ``anyio.to_thread.run_sync`` so the connection is released).
+        We read all bytes and close — symmetric to the apply-side
+        adapter's BinaryIO discipline.
+
+        Same-content + same-prefix → same key → idempotent reads
+        (already guaranteed by content-addressed naming).
+        """
+        stream = await self.minio_store.download_fileobj(
+            bucket_name=self.bucket,
+            object_name=ref,
+        )
+        try:
+            return stream.read()
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    # Don't mask the read result on a close failure.
+                    pass
+
     async def get_presigned_url(
         self, file: File, expiry_seconds: int = 86400
     ) -> str | None:

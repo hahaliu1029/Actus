@@ -122,7 +122,98 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
         },
         config={"configurable": cfg},
     )
-    return final_state.get("step_result_candidate", "") or ""
+    step_result_candidate = final_state.get("step_result_candidate", "") or ""
+
+    # ── C2 PR-5 §10.6: invoke PatchApplier on SUCCESS ────────────────────
+    #
+    # Branching contract: the applier fires only when ALL of the
+    # following are true:
+    #   (a) reducer reported SUCCESS
+    #   (b) an apply_plan with at least one file was built
+    #   (c) the composition root wired patch_applier + parent_sandbox +
+    #       artifact_storage into ``configurable``
+    #
+    # PR-5 ships this branch in cold code (composition root doesn't yet
+    # bind the applier ports — PR-7/8 does); production wires the live
+    # ports at the orchestrator boundary. The defensive ``is None``
+    # checks ensure PR-5 doesn't break existing tests that mock the
+    # subgraph but not the applier.
+    from app.domain.models.patch_apply_plan import GroupOutcome
+    group_outcome = final_state.get("group_outcome")
+    if group_outcome != GroupOutcome.SUCCESS:
+        return step_result_candidate
+
+    apply_plan = final_state.get("apply_plan")
+    if apply_plan is None or apply_plan.file_count == 0:
+        # SUCCESS with no files (exploration-only step) — nothing to apply
+        return step_result_candidate
+
+    applier = cfg.get("patch_applier")
+    parent_sandbox = cfg.get("parent_sandbox")
+    minio = cfg.get("artifact_storage")
+    if applier is None or parent_sandbox is None or minio is None:
+        # Cold-code path: ports not wired yet (PR-5 ships before PR-7/8).
+        # Return reducer's text without applying. The audit trail will
+        # show no apply attempt, which is the correct cold-code signal.
+        #
+        # [codex R3 P2#7] WARN log so production operators can detect a
+        # composition-root misconfig: if the coordinator feature flag is
+        # enabled but the DI ports were not bound, we will silently
+        # report "reducer succeeded" without ever applying. The log
+        # surfaces that the apply was skipped + which ports were missing.
+        missing = [
+            name for name, port in (
+                ("patch_applier", applier),
+                ("parent_sandbox", parent_sandbox),
+                ("artifact_storage", minio),
+            )
+            if port is None
+        ]
+        logger.warning(
+            "_run_parallel_backend: SUCCESS with %d files but applier "
+            "ports not wired (missing: %s); apply step SKIPPED — "
+            "expected only during PR-5 cold-code before PR-7/8 wires "
+            "the composition root.",
+            apply_plan.file_count, missing,
+        )
+        return step_result_candidate
+
+    from app.application.services.patch_applier import ApplyStatus
+    # [codex R2 P1] Thread the orchestrator's cancel_event into the
+    # applier so parent-cancel during reducer→apply or mid-apply
+    # triggers APPLY_ABORTED + rollback. Without this, the applier's
+    # cancel contract only fired in unit tests; production main_graph
+    # would continue writing the parent sandbox after the parent was
+    # cancelled.
+    apply_outcome = await applier.apply(
+        apply_plan,
+        parent_sandbox=parent_sandbox,
+        minio_client=minio,
+        cancel_event=cfg.get("cancel_event"),
+    )
+    if apply_outcome.status == ApplyStatus.SUCCESS:
+        return (
+            f"{step_result_candidate}\n"
+            f"应用成功（写入 {apply_plan.file_count} 个文件）。"
+        )
+    if apply_outcome.status == ApplyStatus.ROLLBACK_PARTIAL:
+        # Surface critical health signal — applier already emitted the
+        # HealthEvent via the emit_event port; the additional message
+        # here is what the orchestrator passes to the summarizer.
+        failed_path = (
+            apply_outcome.failed_at.path
+            if apply_outcome.failed_at else "未知路径"
+        )
+        return (
+            f"应用回滚不完整（卡在 {failed_path}）；需要人工恢复。"
+        )
+    # Other ApplyStatus (DIGEST_DRIFT / FILE_MISSING / WRITE_IO_ERROR /
+    # POST_WRITE_DIGEST_MISMATCH / MINIO_FETCH_FAILED / APPLY_ABORTED).
+    # The rollback completed (status != ROLLBACK_PARTIAL), so the sandbox
+    # is consistent — orchestrator routes via the result text. Operator
+    # text in Chinese (project convention); the machine-readable status
+    # value remains the canonical routing surface for PR-6/8.
+    return f"应用失败（状态 {apply_outcome.status.value}）"
 
 
 def _assign_fallback_step_id(plan_id: str, index: int) -> str:

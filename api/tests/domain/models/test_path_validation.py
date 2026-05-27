@@ -88,9 +88,68 @@ class TestStrictValidatorRejections:
     def test_strict_accepts_relative(self) -> None:
         assert validate_relative_path_strict("a/b.py") == "a/b.py"
 
-    def test_strict_accepts_dot_segment(self) -> None:
-        """``./foo`` is current-dir not traversal — strict allows it like loose."""
-        assert validate_relative_path_strict("./foo") == "./foo"
+    def test_strict_rejects_non_canonical_dot_segment(self) -> None:
+        """[codex R3 P2#6] Strict now rejects ``./foo`` because the
+        reducer's cross-worker conflict detection compares paths as
+        raw strings — ``foo`` and ``./foo`` would point to the same
+        sandbox file but slip past CONFLICT. Loose validator (used by
+        PathLease) continues to accept them."""
+        with pytest.raises(ValueError, match="canonical"):
+            validate_relative_path_strict("./foo")
+
+    def test_strict_rejects_redundant_dot_segment(self) -> None:
+        """``a/./b`` normalizes to ``a/b`` — non-canonical."""
+        with pytest.raises(ValueError, match="canonical"):
+            validate_relative_path_strict("a/./b")
+
+    def test_strict_rejects_double_slash(self) -> None:
+        """``a//b`` normalizes to ``a/b`` — non-canonical."""
+        with pytest.raises(ValueError, match="canonical"):
+            validate_relative_path_strict("a//b")
+
+    def test_strict_loose_divergence(self) -> None:
+        """Pin the strict-vs-loose contract: loose validator (used by
+        PathLease) keeps accepting ``./foo`` for clarity in leases;
+        strict (used by FilePatchEntry write target) does NOT."""
+        from app.domain.models.path_validation import validate_relative_path
+        assert validate_relative_path("./foo") == "./foo"
+        with pytest.raises(ValueError):
+            validate_relative_path_strict("./foo")
+
+
+class TestFilePatchEntryPathLengthCap:
+    """[codex R11 P1] FilePatchEntry.path has Field(max_length=2048)
+    aligned with coordinator_apply_audit.failed_at_path DB column +
+    snapshot store NAME_MAX bounds. Test pins the schema-level cap
+    so the validator stays the single source of truth.
+    """
+
+    def test_path_at_cap_accepted(self) -> None:
+        """A 2048-char path is the cap boundary — accepted."""
+        from app.domain.models.patch_manifest import FilePatchEntry
+        path = "a" * 2048
+        entry = FilePatchEntry(
+            path=path, op="add",
+            new_digest="a" * 64,
+            content_ref="ref",
+            content_size=1,
+        )
+        assert entry.path == path
+        assert len(entry.path) == 2048
+
+    def test_path_over_cap_rejected(self) -> None:
+        """Anything > 2048 chars must be rejected by the schema so
+        the DB ``failed_at_path String(2048)`` write can never
+        overflow."""
+        from pydantic import ValidationError
+        from app.domain.models.patch_manifest import FilePatchEntry
+        with pytest.raises(ValidationError):
+            FilePatchEntry(
+                path="a" * 2049, op="add",
+                new_digest="a" * 64,
+                content_ref="ref",
+                content_size=1,
+            )
 
 
 class TestModelsWireValidator:

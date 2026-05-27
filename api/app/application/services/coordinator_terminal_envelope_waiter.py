@@ -42,11 +42,22 @@ class CoordinatorTerminalEnvelopeWaiter:
         root_session_id: str,
         cancel_event: asyncio.Event,
         timeout: float = 600.0,
+        coordinator_run_id: str | None = None,
     ) -> MailboxEnvelope:
         """Block until a terminal envelope arrives for this child OR ``timeout``.
 
         Returns the validated ``MailboxEnvelope``. Raises ``asyncio.TimeoutError``
         when no terminal envelope is observed within ``timeout`` seconds.
+
+        ``coordinator_run_id`` is optional [codex R5 P1] — when set the
+        predicate additionally matches ``env['correlation_id']`` so the
+        waiter never accepts a stale RESULT_READY from a different
+        coordinator run sharing the same child_session_id (e.g. PR-7
+        rehydrate of a different attempt, or a re-issued child). PR-5
+        applies patch_manifests from these envelopes directly to the
+        parent sandbox, so a mismatched run_id would cross-contaminate
+        apply plans. Kept optional with default ``None`` for backward
+        compat with PR-3 tests that haven't migrated yet.
         """
         stream_key = f"actus:child:{root_session_id}:mailbox"
         consumer_group = f"coordinator:waiter:{child_session_id}"
@@ -58,10 +69,21 @@ class CoordinatorTerminalEnvelopeWaiter:
         )
 
         async def _is_terminal_for_this_child(env: dict[str, Any]) -> bool:
-            return (
-                env.get("type") in _TERMINAL_TYPE_VALUES
-                and env.get("child_session_id") == child_session_id
-            )
+            if env.get("type") not in _TERMINAL_TYPE_VALUES:
+                return False
+            if env.get("child_session_id") != child_session_id:
+                return False
+            # [codex R5 P1] When the caller provides
+            # coordinator_run_id, require the envelope's
+            # correlation_id to match. Without this guard a stale
+            # RESULT_READY from a prior run with the same
+            # child_session_id could be applied to the wrong run.
+            if (
+                coordinator_run_id is not None
+                and env.get("correlation_id") != coordinator_run_id
+            ):
+                return False
+            return True
 
         async def _consume_one() -> MailboxEnvelope:
             async for env_dict in self._subscriber.consume(
