@@ -1026,3 +1026,22 @@ class DBSessionRepository(SessionRepository):
                 f"bump_coordinator_attempt: session {session_id!r} not found"
             )
         return row[0]
+
+    async def find_children_by_coordinator_run(
+        self, *, coordinator_run_id: str, parent_session_id: str,
+    ) -> List[Session]:
+        """C2 PR-7 §12.3 — rehydrate read of (run_id, parent) → child rows.
+
+        Selects every ``sessions`` row matching both predicates, ordered by
+        ``created_at ASC`` so the (wu_id → session_id) map is reconstructed
+        in dispatch order. Returns ``[]`` when no children exist.
+        """
+        stmt = (
+            select(SessionModel)
+            .where(SessionModel.coordinator_run_id == coordinator_run_id)
+            .where(SessionModel.parent_session_id == parent_session_id)
+            .order_by(SessionModel.created_at.asc())
+        )
+        result = await self.db_session.execute(stmt)
+        records = result.scalars().all()
+        return [record.to_domain() for record in records]

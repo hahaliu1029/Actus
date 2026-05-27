@@ -284,6 +284,31 @@ docker compose exec redis redis-cli DECR "actus:coord:concurrent:<user_id>"
 2. 验证 adapter 是否对相同 `idempotency_key` 去重（grep `idempotency_key` 在 adapter 实现中的使用）；
 3. PR-7+ 的 adapter 必须配套 "PEL retry 同 envelope 不重复 rollup" 集成测试 —— 这是回归守门，落地前不能 ship 整套。
 
+### C2 PR-7 Crash recovery + rehydrate rollout
+
+PR-7 落地了 coordinator 的 crash-recovery 主路径（spec §12）：pod 重启后通过 DB + envelope store 三源恢复 ↦ `ALREADY_APPLIED:{status}:{audit_id}` 短路防重复 apply ↦ 缺失子任务硬失败 (v1：raise RuntimeError，PR-7+ 引入幂等 spawn 替换)。
+
+| Surface | PR-7 落地 | 当前生效状态 | 备注 |
+|---------|-----------|----------------|------|
+| `coordinator_result_envelope_store` table | ✅ migration `c2pr7_envelope_store` | upgrade head 后表已存在 | 7 columns + `(coordinator_run_id, work_unit_id)` UNIQUE；migration 在所有 `alembic upgrade head` 跑 |
+| `CoordinatorRehydrateService` 7-step | ✅ application/services | 仅 cold-code（PR-9 wiring 后激活） | `detect_existing_run` 返回 `RehydrateResult(child_session_ids, pending, terminal, already_applied)` |
+| `SessionRepository.find_children_by_coordinator_run` | ✅ ABC + DB impl | 已 ship | 按 `(coordinator_run_id, parent_session_id)` 排序 by `created_at` ASC |
+| MailboxSupervisor `persist_terminal` PROLOGUE | ✅ ResultReady + CancelAck | 🚧 deferred PR-9 wiring | gate 双 None：`coordinator_envelope_store` AND `session_repo`。当前 `service_dependencies.py` 未注入 `coordinator_envelope_store` → PROLOGUE silently no-op |
+| `_rehydrate_dispatch` 4 branches | ✅ subgraph | cold-code | already_applied 短路 + 终端 envelope pre-populate + 意外子任务 CANCEL_REQUEST + missing-child raise（v1 hard fail）|
+| `main_graph._run_parallel_backend` `ALREADY_APPLIED:` 短路 | ✅ 4 status 分支 | 已 ship | success / rollback_partial / crash_mid_apply / in_progress_recent 各自有 operator-facing summary |
+| `HealthEvent` rollback_partial + crash_mid_apply 告警 | ✅ rehydrate service | 已 ship | `HealthStatus.TERMINATING` + `metrics["code"]` = `coordinator_apply_rollback_partial` / `coordinator_apply_crash_mid_apply` |
+| Envelope store payload safety（whitelist + 64KB + PII + 非序列化）| ✅ 4 path | 已 ship | minimum rehydrate fields = `{outcome, patch_manifest, cost_summary, needs_authorization_details, final_state}`；写入前 strip + truncate + PII redact + JSON fallback |
+
+**PR-9 flip checklist (cleanup)**：
+1. 在 `service_dependencies.py:_factory` 注入 `coordinator_envelope_store=DbCoordinatorResultEnvelopeStoreRepository(pg_session_factory)` 和 PR-6 的 `cost_rollup_service=...`；
+2. 把 `parallel_execution_subgraph.py` `_first_time_dispatch` 的 PR-7+ TODO（daily cost cap + 缺失 child 幂等 spawn）逐项落地；
+3. 把 `coordinator_child_runner.py:235` 的 PR-9 wiring TODO（wallclock watchdog + budget callback）连同 `planner_react.py:_build_config` 的 14-dep DI 一起跑通；
+4. 翻 `ACTUS_C2_COORDINATOR_ENABLED=true` 前必须确认 §15.2 7 AST gate + 6 pytest marker + 3 E2E integration test 全过（PR-9 §15.2 spec）。
+
+**PR-7 missing-child 硬失败（v1 契约）**：
+
+`_rehydrate_dispatch` 检测到 `work_units` 中存在 wu_id 在 `existing.child_session_ids` 中找不到对应行时，会 raise `RuntimeError("rehydrate: cannot resume run ...")` 而非 silently fall through to reducer with 不完整 worker_results。原因：silently fall-through 会让 applier 提交"少了几个子任务结果"的不完整 patch plan。两种正常诱因：(a) planner 在 retry 时生成了不同的 work_unit 集合（plan 变化）；(b) 原始 dispatch 在 create_session_with_parent 循环中途 crash。PR-7+ 会引入 `_spawn_one(wu)` 幂等 spawn（依赖 `(coordinator_run_id, work_unit_id)` 上的 partial-unique INDEX）取代硬失败。
+
 ## 前端开发
 
 ```bash

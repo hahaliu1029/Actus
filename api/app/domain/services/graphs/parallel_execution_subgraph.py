@@ -51,7 +51,20 @@ import hashlib
 import json
 import logging
 import operator
-from typing import Annotated, Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Optional, TypedDict
+
+if TYPE_CHECKING:
+    # [codex R5 P2] Narrow the loose ``Any`` annotation on
+    # ``_rehydrate_dispatch(existing: Any)`` and
+    # ``_build_pre_results_from_terminal(terminal: dict[str, Any])`` so
+    # static analysis catches contract drift between this domain-graph
+    # consumer and the application-layer producer
+    # (``CoordinatorRehydrateService.detect_existing_run``).
+    # TYPE_CHECKING-only: no runtime dependency on application/.
+    from app.application.services.coordinator_rehydrate_service import (
+        RehydrateResult,
+        TerminalEnvelopeRecord,
+    )
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -324,7 +337,7 @@ async def _first_time_dispatch(
                 f"reached"
             )
 
-    # TODO(PR-7 wiring): §14.3 #2 per-user daily cost cap — call
+    # TODO(PR-7+ daily cost cap): §14.3 #2 per-user daily cost cap -- call
     # probe_quota.acquire_coordinator_daily_cost(user_id=user_id,
     # cost_usd=coordinator_limits.max_total_token_cost_usd_per_run,
     # cap_usd=coordinator_limits.max_coordinator_token_cost_usd_per_user_per_day)
@@ -649,55 +662,306 @@ async def _first_time_dispatch(
     )
 
 
+def _build_pre_results_from_terminal(
+    terminal: "dict[str, TerminalEnvelopeRecord]",
+) -> list[WorkerResult]:
+    """[C2 PR-7 §12.3] Convert persisted terminal envelopes back into WorkerResult.
+
+    The reducer consumes ``state["worker_results"]`` -- a list[WorkerResult]
+    accumulated by ``worker_node`` Send fan-in. After a crash, we restore
+    the same shape from ``coordinator_result_envelope_store`` rows so the
+    reducer sees a complete worker_results set for already-terminated wu's
+    without having to await them again.
+
+    Per [r3 P1-3] the TerminalEnvelopeRecord carries ``envelope_type`` so
+    we can correctly map RESULT_READY -> outcome from the payload and
+    CANCEL_ACK -> outcome from final_state, mirroring worker_node's live
+    decode (lines 736-770).
+    """
+    pre_results: list[WorkerResult] = []
+    for wu_id, record in terminal.items():
+        payload = record.payload if isinstance(record.payload, dict) else {}
+        if record.envelope_type == "RESULT_READY":
+            outcome_raw = payload.get("outcome", "failed")
+            try:
+                outcome = ResultReadyOutcome(outcome_raw)
+            except ValueError:
+                outcome = ResultReadyOutcome.FAILED
+            cost_raw = payload.get("cost_summary")
+            cost_summary: Optional[CostAggregate] = None
+            if isinstance(cost_raw, dict):
+                try:
+                    cost_summary = CostAggregate.model_validate(cost_raw)
+                except Exception:  # noqa: BLE001 -- degrade to default
+                    cost_summary = None
+            # [codex R2 P1] JSONB round-trip lands ``patch_manifest`` as a
+            # plain ``dict`` after psycopg decode. Downstream consumers
+            # (``patch_reducer_service.py``) do attribute access like
+            # ``pm.coordinator_run_id`` on the manifest, which fails on
+            # ``dict``. Coerce back to the pydantic ``PatchManifest`` here
+            # so the rehydrate path produces the same shape as
+            # ``worker_node`` did originally (worker_node validates via
+            # ``ResultReadyPayload.patch_manifest`` -- subgraph
+            # parallel_execution_subgraph.py:914 region).
+            pm_raw = payload.get("patch_manifest")
+            patch_manifest: Optional[Any] = None
+            if isinstance(pm_raw, dict):
+                from app.domain.models.patch_manifest import PatchManifest
+                try:
+                    patch_manifest = PatchManifest.model_validate(pm_raw)
+                except Exception:  # noqa: BLE001 -- degrade to None
+                    patch_manifest = None
+            elif pm_raw is not None:
+                # Already a typed model (e.g. mid-process replay) -- pass through.
+                patch_manifest = pm_raw
+            pre_results.append(WorkerResult(
+                work_unit_id=wu_id,
+                child_session_id=record.child_session_id,
+                outcome=outcome,
+                cost_summary=cost_summary,
+                summary=payload.get("summary"),
+                patch_manifest=patch_manifest,
+                needs_authorization_details=payload.get(
+                    "needs_authorization_details"
+                ),
+            ))
+        elif record.envelope_type == "CANCEL_ACK":
+            final_state = payload.get("final_state")
+            if final_state == "cancelled":
+                outcome = ResultReadyOutcome.CANCELLED
+            elif final_state == "force_terminated":
+                outcome = ResultReadyOutcome.TIMED_OUT
+            else:
+                outcome = ResultReadyOutcome.FAILED
+            pre_results.append(WorkerResult(
+                work_unit_id=wu_id,
+                child_session_id=record.child_session_id,
+                outcome=outcome,
+                summary=payload.get("summary"),
+            ))
+        # Unknown envelope_type -> log + skip (orphan persisted row from a
+        # future envelope_type that this code-version doesn't understand).
+        else:
+            logger.warning(
+                "rehydrate: unknown envelope_type=%r for wu_id=%s; "
+                "skipping pre_result construction",
+                record.envelope_type, wu_id,
+            )
+    return pre_results
+
+
 async def _rehydrate_dispatch(
     state: ParallelSubgraphState,
     config: dict,
-    existing: Any,
+    existing: "RehydrateResult",
     coordinator_run_id: str,
     work_units: list[WorkUnit],
 ) -> Command:
-    """Crash-recovery rehydrate -- reuse existing child sessions; PR-7 expands.
+    """[C2 PR-7 §12] Resume dispatch from a prior coordinator run.
 
-    r3 P1-1: must pre-create the waiter consumer group for each pending child
-    BEFORE returning ``Send`` to worker_node. After a pod restart the waiter
-    group from the previous incarnation is gone (consumer groups are NOT
-    persisted by Redis Streams when the supervisor recreates the stream);
-    relying on the lazy ``waiter.subscribe`` inside ``worker_node.await_terminal``
-    re-opens the fast-publish race because the in-flight terminal envelope
-    would be missed when XGROUP CREATE id=$ excludes already-buffered messages.
+    Called when ``dispatch_node`` PEEK saw a non-None attempt_ix AND
+    ``rehydrate_service.detect_existing_run`` returned a non-None
+    ``RehydrateResult``. Implements §12.3 steps 4-8:
+
+      * Step 4 (already_applied SHORT-CIRCUIT): if the apply audit row
+        is success/rollback_partial/crash_mid_apply/in_progress_recent,
+        skip worker_node + reducer entirely; main_graph reads the
+        ``step_result_candidate`` and short-circuits its apply call
+        too. Avoids re-running a successful apply / re-attempting an
+        operator-blocked crash recovery.
+
+      * Step 5 (UNEXPECTED CHILD): if a child row exists for a wu_id
+        that's NOT in the current ``work_units`` (e.g. plan changed
+        between attempts), best-effort publish a CANCEL_REQUEST so the
+        orphan child terminates cleanly. NOT load-bearing (orphan reaper
+        also catches it).
+
+      * Step 6 (MISSING CHILD): if a wu_id is in ``work_units`` but
+        has NO corresponding child row, leave it pending. TODO(PR-7+
+        partial-INSERT-unique idempotent spawn) -- the M1 v1 contract
+        treats this as "counter inflation, BUMP-AGAIN" (handled
+        upstream in dispatch_node via the bump fall-through), but
+        cleaner is a partial-unique INSERT here.
+
+      * Step 7 (TERMINAL -> pre-populate): inject the terminal-envelope-
+        derived WorkerResult objects into ``state["worker_results"]``
+        so the reducer sees them as if worker_node had completed.
+
+      * Step 8 (PENDING -> Send): for the remaining truly-pending wu_ids,
+        keep the live r3 P1-1 pre-subscribe-then-Send pattern so the
+        waiter group exists before the worker_node loop dequeues.
+
+    r4 P1-1: rehydrate path uses ``start_id="0"`` so the new consumer
+    group sees terminal envelopes already buffered in the stream BEFORE
+    this subscribe. Live ``_first_time_dispatch`` stays on default ``"$"``
+    because the child hasn't published anything yet.
     """
     cfg = config["configurable"]
-    subscriber = cfg["mailbox_subscriber"]  # fail-fast on missing DI [r2 P1-2]
+    parent_session_id = state["parent_session_id"]
     root_session_id = state["root_session_id"]
+
+    # Step 4: already_applied short-circuit (BEFORE any waiter subscribe /
+    # publish work -- minimize side effects when the apply was already
+    # committed successfully or is in a manual-recovery state).
+    if existing.already_applied is not None:
+        applied = existing.already_applied
+        candidate = f"ALREADY_APPLIED:{applied.status}:{applied.audit_id}"
+        logger.info(
+            "rehydrate: already_applied short-circuit run=%s status=%s audit=%d",
+            coordinator_run_id, applied.status, applied.audit_id,
+        )
+        return Command(
+            update={
+                "coordinator_run_id": coordinator_run_id,
+                "work_units": work_units,
+                "child_session_ids": existing.child_session_ids,
+                "step_result_candidate": candidate,
+                "group_outcome": None,
+            },
+            goto=END,
+        )
+
+    # Step 5: unexpected-child CANCEL_REQUEST (best-effort).
+    #
+    # [codex R5 P2 -- deferred to PR-7+] Cross-pod idempotency gap:
+    # ``envelope_factory.make_cancel_request`` generates a fresh UUID per
+    # call; the orchestrator's ``_published`` dedup set is instance-local
+    # and not used on the rehydrate path. Two pods concurrently
+    # rehydrating the same run can each fire CANCEL_REQUEST for the same
+    # unexpected child, producing two callback invocations on the child
+    # side (no timer-reset, but redundant downstream work). PR-7+ should
+    # derive the cancel envelope_id deterministically from
+    # ``(coordinator_run_id, work_unit_id, child_session_id, reason)`` so
+    # the supervisor's audit_repo dedup catches duplicates.
+    expected_wu_ids = {wu.work_unit_id for wu in work_units}
+    publisher = cfg.get("mailbox_publisher")
+    envelope_factory = cfg.get("envelope_factory")
+    for wu_id, child_sid in existing.child_session_ids.items():
+        if wu_id not in expected_wu_ids:
+            if publisher is None or envelope_factory is None:
+                logger.warning(
+                    "rehydrate: unexpected child wu_id=%s (sid=%s) but "
+                    "publisher/envelope_factory missing -- skipping CANCEL_REQUEST",
+                    wu_id, child_sid,
+                )
+                continue
+            try:
+                env = envelope_factory.make_cancel_request(
+                    parent_session_id=parent_session_id,
+                    child_session_id=child_sid,
+                    correlation_id=coordinator_run_id,
+                    reason="unexpected_child_after_rehydrate",
+                )
+                await publisher.publish(env)
+                logger.info(
+                    "rehydrate: published CANCEL_REQUEST for unexpected wu_id=%s",
+                    wu_id,
+                )
+            except Exception:  # noqa: BLE001 -- best-effort cancel
+                logger.exception(
+                    "rehydrate: failed to publish CANCEL_REQUEST for wu_id=%s",
+                    wu_id,
+                )
+
+    # Step 6: missing-child gap. v1 contract: rehydrate is only reached
+    # when at least one child row exists for the peeked attempt, so the
+    # work_units shape SHOULD match what was originally dispatched. A
+    # non-empty ``missing_wu_ids`` means the planner produced a different
+    # work_unit set on retry (plan changed between attempts) or the
+    # original create_session_with_parent loop crashed PARTWAY through
+    # (some children committed, some did not). Either case is a
+    # rehydrate-recovery hazard: silently routing to reducer with N-K
+    # worker_results would let the reducer build an incomplete
+    # PatchApplyPlan and the applier would commit a subset of the
+    # planned changes.
+    #
+    # [codex R1 P1] Fail loudly here so the orchestrator surfaces a
+    # human-actionable error rather than data-eating fall-through.
+    # PR-7+ will implement idempotent ``_spawn_one(wu)`` per missing
+    # wu_id (depends on a ``sessions`` partial-unique on
+    # ``(coordinator_run_id, work_unit_id)`` so the INSERT is safe under
+    # concurrent re-dispatch).
+    missing_wu_ids = [
+        wu.work_unit_id for wu in work_units
+        if wu.work_unit_id not in existing.child_session_ids
+    ]
+    if missing_wu_ids:
+        raise RuntimeError(
+            f"rehydrate: cannot resume run {coordinator_run_id!r} -- "
+            f"work_units include {missing_wu_ids!r} but no child sessions "
+            f"exist for those ids. Either the planner produced a different "
+            f"work_unit set on retry, or the original dispatch crashed "
+            f"part-way through child creation. PR-7+ will idempotently "
+            f"re-spawn; v1 surfaces this as a hard failure so the "
+            f"orchestrator can replan or operator can intervene."
+        )
+
+    # [codex R4 P1] Limbo-child guard. A wu_id is "limbo" if its child row
+    # exists (so not missing) but the child is NEITHER classified as
+    # pending/running by the rehydrate service NOR has a persisted
+    # terminal envelope. Most likely cause: PR-7's best-effort
+    # ``persist_terminal`` PROLOGUE in MailboxSupervisor swallowed an
+    # exception (warning-logged), the child was destroyed + status moved
+    # to a terminal value, but the envelope row was never written. On
+    # retry, rehydrate sees the child in a terminal status with no
+    # envelope record → would otherwise fall through to reducer with an
+    # incomplete worker_results set, producing INCOMPLETE silently.
+    # Fail loudly so operator can replan / clean up. PR-7+ should harden
+    # ``persist_terminal`` with a transactional pattern so this case
+    # becomes unreachable.
+    expected_wu_ids = {wu.work_unit_id for wu in work_units}
+    limbo_wu_ids = sorted(
+        expected_wu_ids
+        - set(existing.terminal.keys())
+        - set(existing.pending)
+        - set(missing_wu_ids)
+    )
+    if limbo_wu_ids:
+        raise RuntimeError(
+            f"rehydrate: cannot resume run {coordinator_run_id!r} -- "
+            f"work_units {limbo_wu_ids!r} have child rows in a non-pending "
+            f"non-running status but NO persisted terminal envelope. "
+            f"Likely cause: PR-7 ``persist_terminal`` PROLOGUE swallowed "
+            f"an exception on the original run, leaving the envelope_store "
+            f"row missing. Operator must inspect the affected children's "
+            f"status + supervisor logs and either reset coordinator_attempt "
+            f"or backfill the envelope row before retrying."
+        )
+
+    # Step 7: pre-populate worker_results from persisted terminal envelopes.
+    pre_results = _build_pre_results_from_terminal(existing.terminal)
+
+    # Step 8: pre-subscribe waiter group + Send only for truly-pending.
+    subscriber = cfg["mailbox_subscriber"]  # fail-fast on missing DI [r2 P1-2]
     for wu_id in existing.pending:
         child_sid = existing.child_session_ids[wu_id]
-        # r4 P1-1: rehydrate path uses ``start_id="0"`` so the new consumer
-        # group sees terminal envelopes already buffered in the stream BEFORE
-        # this subscribe (the race window between
-        # ``rehydrate_service.detect_existing_run`` and the new subscribe
-        # call). first-time dispatch stays on the default ``"$"`` because
-        # the child hasn't published anything yet.
         await subscriber.subscribe(
             stream_key=f"actus:child:{root_session_id}:mailbox",
             consumer_group=f"coordinator:waiter:{child_sid}",
             consumer_name=f"waiter-{child_sid}",
             start_id="0",
         )
+
+    pending_sends = [
+        Send("worker_node", {
+            "work_unit_id": wu_id,
+            "child_session_id": existing.child_session_ids[wu_id],
+            "coordinator_run_id": coordinator_run_id,
+            "root_session_id": root_session_id,
+        })
+        for wu_id in existing.pending
+    ]
+
     return Command(
         update={
             "coordinator_run_id": coordinator_run_id,
             "work_units": work_units,
             "child_session_ids": existing.child_session_ids,
+            "worker_results": pre_results,
         },
-        goto=[
-            Send("worker_node", {
-                "work_unit_id": wu_id,
-                "child_session_id": existing.child_session_ids[wu_id],
-                "coordinator_run_id": coordinator_run_id,
-                "root_session_id": root_session_id,
-            })
-            for wu_id in existing.pending
-        ],
+        # If no pending (all wu_ids had terminal envelopes already), skip
+        # the worker_node fan-out and go straight to reducer_node.
+        goto=pending_sends if pending_sends else "reducer_node",
     )
 
 

@@ -6,11 +6,21 @@ artifact_storage, session_service, runner_starter, mailbox_publisher, orchestrat
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from app.domain.models.work_unit import ProposedPath, WorkUnitRequest
 from app.domain.services.graphs.parallel_execution_subgraph import dispatch_node
+
+
+def _expected_wu_ids(step_id: str, attempt_ix: int, count: int) -> list[str]:
+    """Mirror ``_build_work_units_from_requests`` id derivation so rehydrate
+    tests can populate ``existing.child_session_ids`` with the actual wu_ids
+    dispatch_node will compute (post-codex R1 P1 fix: missing wu_ids in
+    work_units now raise instead of silently falling through)."""
+    hash16 = hashlib.sha256(step_id.encode("utf-8")).hexdigest()[:16]
+    return [f"{hash16}.a{attempt_ix}.{i}" for i in range(count)]
 
 
 def _mk_session(sid: str) -> MagicMock:
@@ -124,12 +134,20 @@ async def test_peek_returning_attempt_with_no_rehydrate_falls_back_to_bump() -> 
 
 @pytest.mark.anyio
 async def test_peek_then_rehydrate_found_skips_bump_and_spawn() -> None:
-    """Crash-recovery path: peek == 2, rehydrate returns existing → reuse, no bump."""
+    """Crash-recovery path: peek == 2, rehydrate returns existing → reuse, no bump.
+
+    [codex R1 P1] existing.child_session_ids MUST cover every wu_id in
+    work_units or _rehydrate_dispatch raises (missing-child contract).
+    Use _expected_wu_ids to mirror the production hash derivation.
+    """
     config = _base_config(peek_returns=2)
     rehydrate = config["configurable"]["rehydrate_service"]
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=2, count=2)
     existing = MagicMock()
-    existing.child_session_ids = {"wu_id_unused": "c1"}
-    existing.pending = ["wu_id_unused"]
+    existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2"}
+    existing.pending = wu_ids
+    existing.terminal = {}
+    existing.already_applied = None
     rehydrate.detect_existing_run = AsyncMock(return_value=existing)
 
     state = _base_state()
@@ -139,7 +157,8 @@ async def test_peek_then_rehydrate_found_skips_bump_and_spawn() -> None:
     cfg["session_service"].bump_coordinator_attempt.assert_not_awaited()
     cfg["session_service"].create_session_with_parent.assert_not_called()
     cfg["mailbox_publisher"].publish.assert_not_called()
-    assert len(cmd.goto) == 1
+    # Both wu_ids are pending → 2 Send(worker_node) entries on goto.
+    assert len(cmd.goto) == 2
 
 
 @pytest.mark.anyio
@@ -277,11 +296,17 @@ async def test_rehydrate_pre_creates_waiter_group_for_each_pending_child() -> No
     group for each pending child BEFORE returning Send to worker_node. After
     pod restart the previous waiter group is gone and the lazy
     waiter.subscribe inside worker_node.await_terminal would race the
-    fast-publishing child (id=$ excludes already-buffered RESULT_READY)."""
+    fast-publishing child (id=$ excludes already-buffered RESULT_READY).
+
+    [codex R1 P1] wu_ids must match _build_work_units_from_requests output.
+    """
     config = _base_config(peek_returns=3)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=3, count=2)
     existing = MagicMock()
-    existing.child_session_ids = {"wu1": "c1", "wu2": "c2"}
-    existing.pending = ["wu1", "wu2"]
+    existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2"}
+    existing.pending = wu_ids
+    existing.terminal = {}
+    existing.already_applied = None
     config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
         return_value=existing,
     )
@@ -299,16 +324,28 @@ async def test_rehydrate_pre_creates_waiter_group_for_each_pending_child() -> No
 
 @pytest.mark.anyio
 async def test_rehydrate_fails_fast_when_mailbox_subscriber_missing_from_cfg() -> None:
-    """[r3 P1-1 fix] rehydrate path also fails fast on missing subscriber DI."""
+    """[r3 P1-1 fix] rehydrate path also fails fast on missing subscriber DI.
+
+    [codex R1 P1] wu_ids match the production derivation; use a
+    single-request state so existing.child_session_ids stays minimal.
+    """
     config = _base_config(peek_returns=2)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=2, count=1)
     existing = MagicMock()
-    existing.child_session_ids = {"wu1": "c1"}
-    existing.pending = ["wu1"]
+    existing.child_session_ids = {wu_ids[0]: "c1"}
+    existing.pending = wu_ids
+    existing.terminal = {}
+    existing.already_applied = None
     config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
         return_value=existing,
     )
     del config["configurable"]["mailbox_subscriber"]
-    state = _base_state()
+    state = _base_state(work_unit_requests=[
+        WorkUnitRequest(
+            objective="explore Z", phase="exploration",
+            allowed_tools=["file_read"],
+        ),
+    ])
     with pytest.raises(KeyError) as ei:
         await dispatch_node(state, config)
     assert "mailbox_subscriber" in str(ei.value)
@@ -334,15 +371,27 @@ async def test_orchestrator_factory_build_receives_parent_session_id() -> None:
 async def test_rehydrate_subscribes_with_start_id_zero_to_read_backlog() -> None:
     """[r4 P1-1 fix] rehydrate subscribe must use start_id='0' so the new
     consumer group reads terminal envelopes already buffered in the stream
-    BEFORE rehydrate ran. id='$' would skip them and waiter would timeout."""
+    BEFORE rehydrate ran. id='$' would skip them and waiter would timeout.
+
+    [codex R1 P1] wu_ids must match _build_work_units_from_requests so
+    missing-child contract isn't tripped.
+    """
     config = _base_config(peek_returns=3)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=3, count=1)
     existing = MagicMock()
-    existing.child_session_ids = {"wu1": "c1"}
-    existing.pending = ["wu1"]
+    existing.child_session_ids = {wu_ids[0]: "c1"}
+    existing.pending = wu_ids
+    existing.terminal = {}
+    existing.already_applied = None
     config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
         return_value=existing,
     )
-    state = _base_state()
+    state = _base_state(work_unit_requests=[
+        WorkUnitRequest(
+            objective="explore W", phase="exploration",
+            allowed_tools=["file_read"],
+        ),
+    ])
     await dispatch_node(state, config)
     sub = config["configurable"]["mailbox_subscriber"]
     rehydrate_subscribe_call = sub.subscribe.await_args_list[0]

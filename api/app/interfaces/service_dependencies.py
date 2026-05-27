@@ -718,6 +718,22 @@ def build_supervisor_registry(
     )
 
     def _factory(root_session_id: str) -> MailboxSupervisor:
+        # [C2 deferred wiring -- PR-9 composition root]
+        # The following SupervisorContext fields are intentionally LEFT
+        # UNSET at the live composition root; PR-9 wires them all together
+        # when ``ACTUS_C2_COORDINATOR_ENABLED`` flips:
+        #   - ``cost_rollup_service`` (PR-6 §14.4) -- Protocol-only stub
+        #     today; concrete impl + wiring deferred to PR-9.
+        #   - ``coordinator_envelope_store`` (PR-7 §12.4) -- concrete impl
+        #     exists at ``DbCoordinatorResultEnvelopeStoreRepository`` but
+        #     wiring deferred for atomic PR-9 flip.
+        # While unset (None default), the PR-6 cost-rollup PROLOGUE and
+        # PR-7 persist-terminal PROLOGUE both silently no-op. The
+        # supervisor otherwise functions identically to pre-coordinator
+        # behavior. See ``mailbox_supervisor.py`` ResultReadyHandler /
+        # CancelAckHandler ``_side_effect`` gates
+        # ``if ctx.X is not None and ctx.session_repo is not None`` for
+        # the runtime check.
         ctx = SupervisorContext(
             root_session_id=root_session_id,
             pod_id=pod_id,

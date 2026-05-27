@@ -124,6 +124,45 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
     )
     step_result_candidate = final_state.get("step_result_candidate", "") or ""
 
+    # ── C2 PR-7 §12.5: apply re-entry short-circuit ─────────────────────
+    #
+    # When dispatch_node's rehydrate_service.detect_existing_run returns
+    # a non-None ``already_applied`` (success | rollback_partial |
+    # crash_mid_apply | in_progress_recent), the subgraph short-circuits
+    # to END with ``step_result_candidate = "ALREADY_APPLIED:{status}:{audit_id}"``.
+    # main_graph must then SKIP the patch_applier branch below — we are
+    # NOT re-running an apply that already committed (success), an
+    # operator-locked failure path (rollback_partial / crash_mid_apply),
+    # or a concurrent attempt by another pod (in_progress_recent).
+    #
+    # The HealthEvent for rollback_partial + crash_mid_apply was already
+    # emitted by ``CoordinatorRehydrateService._check_already_applied``;
+    # this branch only formats the operator-facing summary string.
+    if step_result_candidate.startswith("ALREADY_APPLIED:"):
+        parts = step_result_candidate.split(":", 2)
+        status = parts[1] if len(parts) > 1 else "unknown"
+        audit_id = parts[2] if len(parts) > 2 else "unknown"
+        if status == "success":
+            return f"Apply already succeeded (audit {audit_id})."
+        if status == "rollback_partial":
+            # Spec §10.4: 不 auto-retry; HealthEvent 已由 rehydrate_service emit。
+            return (
+                f"Apply rollback_partial detected (audit {audit_id}); "
+                f"not auto-retrying — manual recovery required."
+            )
+        if status == "crash_mid_apply":
+            return (
+                f"⚠️ apply 中途 pod crash（audit {audit_id} "
+                f"in_progress > 5min）。Workspace 可能不一致，请人工检查 "
+                f"+ 清理 audit row 后重试。"
+            )
+        if status == "in_progress_recent":
+            return (
+                "apply 仍在执行（另一 pod？），等 Redis lock 释放后重试。"
+            )
+        # Unknown status — surface verbatim so operator can diagnose.
+        return step_result_candidate
+
     # ── C2 PR-5 §10.6: invoke PatchApplier on SUCCESS ────────────────────
     #
     # Branching contract: the applier fires only when ALL of the

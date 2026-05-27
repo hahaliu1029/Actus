@@ -31,6 +31,12 @@ if TYPE_CHECKING:  # pragma: no cover — type-only to avoid runtime import cycl
     # so the supervisor module stays importable from the cost rollup module
     # if the rollup impl ever needs to grow supervisor-aware helpers.
     from app.application.services.cost_rollup_service import CostRollupService
+    # [C2 PR-7 §12.4] coordinator_envelope_store — Optional in SupervisorContext.
+    # Late import here keeps the application-layer module-load path lean and
+    # mirrors the cost_rollup_service guard pattern.
+    from app.domain.repositories.coordinator_result_envelope_store_repository import (
+        CoordinatorResultEnvelopeStoreRepository,
+    )
 
 from app.domain.errors.sandbox_lifecycle import (
     SandboxAlreadyDestroyed,
@@ -251,6 +257,19 @@ class SupervisorContext:
     # abort destroy + audit safety operations; the handler swallows
     # exceptions after logging.
     cost_rollup_service: Optional["CostRollupService"] = None
+    # [C2 PR-7 §12.4] Optional coordinator result envelope persistence hook.
+    # ``None`` on legacy / non-coordinator supervisor instances; populated by
+    # ``service_dependencies`` wiring when the coordinator feature is enabled.
+    # Both ``ResultReadyHandler`` and ``CancelAckHandler`` fire
+    # ``persist_terminal`` as a best-effort PROLOGUE for children whose
+    # ``Session.tool_filter_preset == "coordinator_step"``. A persist failure
+    # MUST NOT abort destroy + audit safety operations; the handlers swallow
+    # exceptions after logging — the run is still recoverable from the live
+    # session row even if the envelope row was lost (worst case: a duplicate
+    # work-unit re-spawn on the next rehydrate).
+    coordinator_envelope_store: Optional[
+        "CoordinatorResultEnvelopeStoreRepository"
+    ] = None
 
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -429,6 +448,61 @@ class ResultReadyHandler:
                 except Exception:  # noqa: BLE001 — best-effort rollup
                     logger.exception(
                         "result_ready cost rollup failed envelope=%s "
+                        "child_session=%s — destroy continues",
+                        envelope.envelope_id,
+                        envelope.child_session_id,
+                    )
+
+            # [C2 PR-7 §12.4] persist terminal envelope PROLOGUE — fires only
+            # for ``coordinator_step`` children. Best-effort: a persist failure
+            # MUST NOT abort the destroy + callback + mark_processed body
+            # below; the rehydrate path is correct-by-construction (it always
+            # re-queries DB on each pod-start) so missing an envelope row only
+            # forces a re-spawn at recovery time, not data loss.
+            #
+            # Gate: BOTH ``coordinator_envelope_store`` AND ``session_repo``
+            # must be wired (the latter so we can read the child's
+            # tool_filter_preset / coordinator_run_id / work_unit_id).
+            # Crucially, we re-fetch the child session HERE (not reuse the
+            # rollup-side fetch) because the cost-rollup gate may have
+            # short-circuited on missing session_repo. Independence keeps
+            # one PROLOGUE's failure from poisoning the next.
+            #
+            # The (coordinator_run_id, work_unit_id) UNIQUE constraint on
+            # ``coordinator_result_envelope_store`` means a retry replay of
+            # the same envelope raises IntegrityError — we swallow that
+            # specifically (it's the success-case of idempotent persistence).
+            if (
+                ctx.coordinator_envelope_store is not None
+                and ctx.session_repo is not None
+            ):
+                try:
+                    child_session = await ctx.session_repo.get_by_id(
+                        envelope.child_session_id
+                    )
+                    if (
+                        child_session is not None
+                        and child_session.tool_filter_preset == "coordinator_step"
+                        and child_session.coordinator_run_id is not None
+                        and child_session.work_unit_id is not None
+                    ):
+                        payload = (
+                            envelope.payload
+                            if isinstance(envelope.payload, dict)
+                            else {}
+                        )
+                        await ctx.coordinator_envelope_store.persist_terminal(
+                            coordinator_run_id=child_session.coordinator_run_id,
+                            work_unit_id=child_session.work_unit_id,
+                            child_session_id=envelope.child_session_id,
+                            envelope_type="RESULT_READY",
+                            payload=payload,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — best-effort persist
+                    logger.exception(
+                        "result_ready persist_terminal failed envelope=%s "
                         "child_session=%s — destroy continues",
                         envelope.envelope_id,
                         envelope.child_session_id,
@@ -649,6 +723,51 @@ class CancelAckHandler:
         await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
 
         async def _side_effect() -> None:
+            # [C2 PR-7 §12.4] persist terminal envelope PROLOGUE for CANCEL_ACK.
+            # Same best-effort pattern as ResultReadyHandler; see that handler
+            # for the full rationale. Unlike RESULT_READY this handler does
+            # NOT roll up cost — CancelAck on a coordinator_step child is the
+            # cooperative-cancel terminal and cost is already accruing into
+            # the parent via earlier RESULT_READY (if any). The persisted
+            # CANCEL_ACK envelope carries the final_state for rehydrate-driven
+            # replay (e.g. cancelled-mid-step → resume needs to know that
+            # work_unit was cancelled, not pending).
+            if (
+                ctx.coordinator_envelope_store is not None
+                and ctx.session_repo is not None
+            ):
+                try:
+                    child_session = await ctx.session_repo.get_by_id(
+                        envelope.child_session_id
+                    )
+                    if (
+                        child_session is not None
+                        and child_session.tool_filter_preset == "coordinator_step"
+                        and child_session.coordinator_run_id is not None
+                        and child_session.work_unit_id is not None
+                    ):
+                        payload = (
+                            envelope.payload
+                            if isinstance(envelope.payload, dict)
+                            else {}
+                        )
+                        await ctx.coordinator_envelope_store.persist_terminal(
+                            coordinator_run_id=child_session.coordinator_run_id,
+                            work_unit_id=child_session.work_unit_id,
+                            child_session_id=envelope.child_session_id,
+                            envelope_type="CANCEL_ACK",
+                            payload=payload,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — best-effort persist
+                    logger.exception(
+                        "cancel_ack persist_terminal failed envelope=%s "
+                        "child_session=%s — destroy continues",
+                        envelope.envelope_id,
+                        envelope.child_session_id,
+                    )
+
             # Codex F5 (HIGH) — telemetry.emit isolation; see
             # ResultReadyHandler for the full rationale. Without these
             # wrappers, a sink fault on the AlreadyDestroyed branch

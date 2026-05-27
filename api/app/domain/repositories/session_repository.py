@@ -366,3 +366,27 @@ class SessionRepository(Protocol):
         read-modify-write under PostgreSQL row-level lock.
         """
         ...
+
+    async def find_children_by_coordinator_run(
+        self, *, coordinator_run_id: str, parent_session_id: str,
+    ) -> List[Session]:
+        """C2 PR-7 §12.3 — rehydrate query.
+
+        Return every child session row whose
+        ``(coordinator_run_id, parent_session_id)`` matches the given pair,
+        ordered by ``created_at`` (stable across pod restarts).
+
+        Used by ``CoordinatorRehydrateService.detect_existing_run`` to
+        reconstruct the (wu_id → child_session_id) map after a pod crash.
+        The query is intentionally scoped to a single parent (not just
+        ``coordinator_run_id``) to defeat the theoretical case where two
+        unrelated parents could collide on a manually-crafted run_id; the
+        live run_id format ``"{session}:{hash16}:a{N}"`` already includes
+        the parent session, but the explicit predicate is a defense-in-depth
+        guard for that invariant.
+
+        Returns an empty list (NOT None) when no children exist — the
+        rehydrate service treats ``[]`` as "first-time dispatch, no resume
+        needed".
+        """
+        ...
