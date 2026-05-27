@@ -13,6 +13,8 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
+from app.domain.models.cost_snapshot import CostSource
+
 
 def _dec_to_str(v: Decimal) -> str:
     return format(v, "f")
@@ -46,7 +48,15 @@ class CostAggregateResponse(BaseModel):
 
 
 class CostTreeResponse(BaseModel):
-    """C1a: GET /api/sessions/{id}/cost/tree body."""
+    """C1a: GET /api/sessions/{id}/cost/tree body.
+
+    [C2 PR-6 §14.4] ``cost_source`` carries the attribution bucket label
+    derived by ``SessionCostTreeService`` from the descendant ``Session``s'
+    ``tool_filter_preset`` + ``worker_type``. Pydantic v2 serialises the
+    ``CostSource`` ``StrEnum`` to its wire string value automatically, so
+    consumers see one of: ``"none"`` / ``"direct"`` / ``"coordinator_subagent"``
+    / ``"research_subagent"`` / ``"mixed"``.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -58,3 +68,11 @@ class CostTreeResponse(BaseModel):
     depth_reached: int
     max_depth_applied: int
     truncated: bool
+    cost_source: CostSource = Field(
+        default=CostSource.NONE,
+        description=(
+            "Attribution label for the rolled-up cost: one of none | direct | "
+            "coordinator_subagent | research_subagent | mixed. Derived from "
+            "the descendants' tool_filter_preset + worker_type."
+        ),
+    )

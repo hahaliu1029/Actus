@@ -1,9 +1,43 @@
 """Atomic Redis Lua quota for active subagent research probes per user.
 
-Why atomic: a naive HLEN + HSET sequence (even pipelined) is not atomic —
-two concurrent acquires can both observe count=1 and both insert,
-yielding count=3 when max=2. Lua script runs server-side as a single
-atomic unit on Redis main thread.
+This module also exposes coordinator-scoped daily-cost + concurrency quotas
+used by C2 PR-6 §14.3 (#2 per-user daily cost cap, #3 per-user concurrency
+cap). Those methods deliberately use plain INCR/INCRBYFLOAT + conditional
+rollback rather than a Lua script (see "Coordinator quota v1 trade-off"
+below).
+
+Why atomic (probe quota only): a naive HLEN + HSET sequence (even
+pipelined) is not atomic — two concurrent acquires can both observe
+count=1 and both insert, yielding count=3 when max=2. Lua script runs
+server-side as a single atomic unit on Redis main thread.
+
+Coordinator quota v1 trade-off:
+  ``acquire_coordinator_daily_cost`` and ``acquire_coordinator_concurrency``
+  execute INCR(BYFLOAT) and a conditional rollback as two separate Redis
+  commands. This is NOT atomic — a concurrent acquire can briefly observe
+  the temporarily-overshoot counter before the rollback lands. We accept
+  this because (a) the rollback closes the window in O(ms), (b) the
+  coordinator concurrency cap is small (default 2), and (c) overshoot
+  tolerance for daily cost is bounded by a single in-flight call's
+  ``cost_usd``. If the cap is later raised or strict bounds are required,
+  promote to a Lua script.
+
+Concurrency key TTL (codex round 3 P1-5):
+  ``acquire_coordinator_concurrency`` issues ``EXPIRE`` with
+  ``CONCURRENCY_TTL_SECONDS = 21600`` (6h) after every successful INCR. The
+  TTL is a crash-recovery ceiling, NOT a normal lifecycle — the happy
+  path releases the slot via ``release_coordinator_quotas`` (DECR) in
+  ``reducer_node.finally`` long before the TTL fires. The 6h ceiling
+  comfortably exceeds the longest reasonable coordinator run
+  (``MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN = 900`` + supervisor backstop
+  ``SUBAGENT_RESULT_READY_TIMEOUT_SECONDS = 600``) plus generous
+  manual-ops grace, so a pod that crashes between the INCR at dispatch and
+  the DECR at reducer cannot permanently leak the user's slot until ops
+  manually issues ``DECR`` / ``DEL``. EXPIRE failures are logged but do
+  NOT roll back the acquire (the slot is still held; worst case it
+  outlives a crash by the 6h window). EXPIRE on every acquire re-arms the
+  TTL — multiple concurrent acquires keep the most recent expiry, which
+  is fine since the counter is decremented on each release independently.
 
 Lua behavior:
 1. Read all field/timestamp pairs from the hash (HGETALL).
@@ -31,6 +65,7 @@ Failure modes:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import time
 from typing import Final
@@ -41,6 +76,11 @@ logger = logging.getLogger(__name__)
 
 MAX_ACTIVE_PROBES_PER_USER_DEFAULT: Final[int] = 2
 PROBE_QUOTA_TTL_SECONDS: Final[int] = 900  # 15 min, exceeds D5 watchdog 600s
+# [codex R3 P1-5] 6h crash-recovery ceiling on the per-user concurrency
+# counter. See module docstring "Concurrency key TTL" for the full
+# rationale; the happy path releases via DECR in reducer_node.finally
+# long before the TTL fires.
+CONCURRENCY_TTL_SECONDS: Final[int] = 21600  # 6h
 
 # Lua script: stale-cleanup + idempotent-refresh + count-check + insert, all atomic.
 ACQUIRE_PROBE_LUA: Final[str] = """
@@ -137,3 +177,190 @@ class ProbeQuotaService:
             )
             # Don't raise — release is in finally block; stale entries
             # self-expire via TTL.
+
+    # ── Coordinator quotas (§14.3 #2 / #3) ──────────────────────────────────
+    #
+    # These methods are NOT idempotent — each caller's coordinator_run_id is
+    # unique. Callers MUST pair every successful acquire with
+    # ``release_coordinator_quotas`` inside a try/finally.
+
+    @staticmethod
+    def _daily_key(user_id: str) -> str:
+        """Per-user-per-day cost counter key.
+
+        Date is computed in UTC (explicit ``datetime.now(UTC).date()``) so
+        rollover happens at UTC midnight regardless of host timezone. Combined
+        with the 25h EXPIRE this yields a one-hour grace window where two
+        days' keys coexist (acceptable: each key has independent cap
+        accounting).
+        """
+        d = _dt.datetime.now(_dt.UTC).date().isoformat()
+        return f"actus:coord:daily_cost:{user_id}:{d}"
+
+    @staticmethod
+    def _concurrency_key(user_id: str) -> str:
+        """Per-user concurrency counter key.
+
+        TTL behavior: ``acquire_coordinator_concurrency`` issues
+        ``EXPIRE key CONCURRENCY_TTL_SECONDS`` (6h) on every successful
+        INCR. The TTL exists solely as a crash-recovery ceiling — the
+        normal lifecycle releases via DECR in
+        ``release_coordinator_quotas`` (called from
+        ``reducer_node.finally``) long before the TTL fires. The 6h
+        ceiling deliberately exceeds the longest reasonable coordinator
+        run (``MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN = 900`` + supervisor
+        backstop ``SUBAGENT_RESULT_READY_TIMEOUT_SECONDS = 600`` + ops
+        grace) so a pod crash between dispatch and reducer cannot
+        permanently pin the user's slots.
+
+        If DECR drives the value below 0 due to a release-without-
+        acquire bug, that is an observability problem surfaced through
+        monitoring, not a hidden silent state.
+        """
+        return f"actus:coord:concurrent:{user_id}"
+
+    async def acquire_coordinator_daily_cost(
+        self, *, user_id: str, cost_usd: float, cap_usd: float
+    ) -> bool:
+        """Reserve ``cost_usd`` against the user's daily cost cap.
+
+        Semantics: INCRBYFLOAT then compare. If the new value strictly
+        exceeds ``cap_usd``, roll back with INCRBYFLOAT(-cost_usd) and
+        return False. Reaching the cap exactly is allowed (predicate is
+        strict ``>``). On success, refresh a 25h TTL so the daily key
+        survives midnight rollover with overlap.
+
+        Fail-closed: any Redis error during the initial INCRBYFLOAT →
+        return False (matches probe ``acquire`` semantics).
+        """
+        key = self._daily_key(user_id)
+        client = self._redis.client
+        try:
+            new_val = await client.incrbyfloat(key, cost_usd)
+        except Exception as exc:
+            logger.warning(
+                "acquire_coordinator_daily_cost failed (fail-closed): "
+                "user_id=%s cost_usd=%s err=%s",
+                user_id, cost_usd, exc,
+            )
+            return False
+
+        if float(new_val) > cap_usd:
+            # Over cap → rollback. Rollback errors are logged but do not
+            # change the rejection outcome.
+            try:
+                await client.incrbyfloat(key, -cost_usd)
+            except Exception as exc:
+                logger.warning(
+                    "acquire_coordinator_daily_cost rollback failed "
+                    "(counter leak until TTL): user_id=%s cost_usd=%s err=%s",
+                    user_id, cost_usd, exc,
+                )
+            return False
+
+        # Under or at cap → refresh TTL. expire errors are non-fatal: the
+        # counter still reflects the reservation; worst case the key
+        # persists slightly longer than 25h.
+        try:
+            await client.expire(key, 25 * 3600)
+        except Exception as exc:
+            logger.warning(
+                "acquire_coordinator_daily_cost expire failed: "
+                "user_id=%s err=%s",
+                user_id, exc,
+            )
+        return True
+
+    async def acquire_coordinator_concurrency(
+        self, *, user_id: str, cap: int
+    ) -> bool:
+        """Reserve one concurrency slot against the user's cap.
+
+        Semantics: INCR then compare. If the new value strictly exceeds
+        ``cap``, roll back with DECR and return False. Reaching the cap
+        exactly is allowed (predicate is strict ``>``).
+
+        Fail-closed: any Redis error during the initial INCR → return
+        False.
+
+        [codex R3 P1-5] On successful acquire, refresh the concurrency
+        key with ``EXPIRE key CONCURRENCY_TTL_SECONDS`` (6h). This is a
+        crash-recovery ceiling, NOT a normal lifecycle (the happy path
+        releases via DECR in ``release_coordinator_quotas`` long before
+        the TTL fires). Without this, a pod that crashes between INCR
+        here and the matching DECR inside ``reducer_node.finally`` would
+        permanently leak the slot until ops issued a manual ``DECR`` /
+        ``DEL``. EXPIRE failure is logged but does NOT roll back the
+        acquire — the slot is still legitimately held, worst case it
+        outlives a crash by the 6h window.
+        """
+        key = self._concurrency_key(user_id)
+        client = self._redis.client
+        try:
+            new_val = await client.incr(key)
+        except Exception as exc:
+            logger.warning(
+                "acquire_coordinator_concurrency failed (fail-closed): "
+                "user_id=%s err=%s",
+                user_id, exc,
+            )
+            return False
+
+        if int(new_val) > cap:
+            try:
+                await client.decr(key)
+            except Exception as exc:
+                logger.warning(
+                    "acquire_coordinator_concurrency rollback failed "
+                    "(counter leak): user_id=%s err=%s",
+                    user_id, exc,
+                )
+            return False
+
+        # Crash-recovery TTL: re-arm the 6h ceiling on every successful
+        # acquire. Failure is non-fatal — slot is still held; worst case
+        # the key persists slightly beyond the TTL window.
+        try:
+            await client.expire(key, CONCURRENCY_TTL_SECONDS)
+        except Exception as exc:
+            logger.warning(
+                "acquire_coordinator_concurrency: EXPIRE failed user=%s "
+                "— slot still acquired but may not auto-release on "
+                "pod crash before reducer DECR runs: %s",
+                user_id, exc,
+            )
+        return True
+
+    async def release_coordinator_quotas(
+        self, *, user_id: str, cost_usd: float = 0.0
+    ) -> None:
+        """Release a coordinator quota reservation. Best-effort.
+
+        Always decrements the concurrency counter. If ``cost_usd > 0``,
+        additionally rolls back that amount from the daily counter.
+        Negative or zero ``cost_usd`` is treated as "no daily rollback
+        desired" — the caller signals intent by passing the positive
+        cost they previously reserved.
+
+        Each Redis op is wrapped independently: if INCRBYFLOAT raises,
+        the DECR still runs (and vice versa). All errors are logged and
+        swallowed (matches the existing ``release`` pattern).
+        """
+        client = self._redis.client
+        if cost_usd > 0:
+            try:
+                await client.incrbyfloat(self._daily_key(user_id), -cost_usd)
+            except Exception as exc:
+                logger.warning(
+                    "release_coordinator_quotas daily rollback failed: "
+                    "user_id=%s cost_usd=%s err=%s",
+                    user_id, cost_usd, exc,
+                )
+        try:
+            await client.decr(self._concurrency_key(user_id))
+        except Exception as exc:
+            logger.warning(
+                "release_coordinator_quotas concurrency decr failed: "
+                "user_id=%s err=%s",
+                user_id, exc,
+            )

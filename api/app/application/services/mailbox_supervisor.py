@@ -21,9 +21,16 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Protocol
 
 from redis.asyncio import Redis
+
+if TYPE_CHECKING:  # pragma: no cover — type-only to avoid runtime import cycle
+    # [C2 PR-6 §14.4] CostRollupService is consumed by ``ResultReadyHandler``
+    # via ``SupervisorContext.cost_rollup_service``. Kept under TYPE_CHECKING
+    # so the supervisor module stays importable from the cost rollup module
+    # if the rollup impl ever needs to grow supervisor-aware helpers.
+    from app.application.services.cost_rollup_service import CostRollupService
 
 from app.domain.errors.sandbox_lifecycle import (
     SandboxAlreadyDestroyed,
@@ -234,6 +241,16 @@ class SupervisorContext:
     # supervisor to ``self.stop()`` only — backward-compatible.
     session_repo: Optional[SessionRepository] = None
     stop_self_callback: Optional[Callable[[], Awaitable[None]]] = None
+    # [C2 PR-6 §14.4] Optional cost rollup hook. ``None`` on legacy /
+    # non-coordinator supervisor instances; populated by service_dependencies
+    # wiring when the coordinator feature is enabled. ``ResultReadyHandler``
+    # fires ``rollup_to_parent`` as a best-effort PROLOGUE in its
+    # ``_side_effect`` for children whose ``Session.tool_filter_preset ==
+    # "coordinator_step"`` (gate also requires ``session_repo`` so the
+    # handler can look the child session up). A rollup failure MUST NOT
+    # abort destroy + audit safety operations; the handler swallows
+    # exceptions after logging.
+    cost_rollup_service: Optional["CostRollupService"] = None
 
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -362,6 +379,61 @@ class ResultReadyHandler:
         await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
 
         async def _side_effect() -> None:
+            # [C2 PR-6 §14.4] cost rollup PROLOGUE — fires only for
+            # ``coordinator_step`` children with a parent_session_id set.
+            # Best-effort: a rollup failure MUST NOT abort the load-bearing
+            # destroy + callback + mark_processed body below (destroy is the
+            # last point we hold the child session row, so cost data should
+            # be rolled up first — but rollup is observability, destroy is
+            # safety). All exceptions are logged + swallowed except
+            # ``asyncio.CancelledError`` which always propagates.
+            #
+            # Gate: both ``cost_rollup_service`` AND ``session_repo`` must
+            # be wired. Legacy / pre-PR-6 supervisor contexts leave both
+            # None and the prologue silently no-ops.
+            #
+            # Implementations are required to be idempotent (see
+            # ``CostRollupService.rollup_to_parent`` docstring) because
+            # XAUTOCLAIM may redeliver after a transient destroy failure
+            # and the prologue will re-fire each replay.
+            if ctx.cost_rollup_service is not None and ctx.session_repo is not None:
+                try:
+                    child_session = await ctx.session_repo.get_by_id(
+                        envelope.child_session_id
+                    )
+                    if (
+                        child_session is not None
+                        and child_session.tool_filter_preset == "coordinator_step"
+                        and child_session.parent_session_id is not None
+                    ):
+                        cost_summary = (
+                            envelope.payload.get("cost_summary", {})
+                            if isinstance(envelope.payload, dict)
+                            else {}
+                        )
+                        await ctx.cost_rollup_service.rollup_to_parent(
+                            parent_session_id=child_session.parent_session_id,
+                            cost=cost_summary,
+                            source="coordinator_subagent",
+                            # [codex R2 P1-5] Pass envelope_id as the
+                            # idempotency key so concrete implementations
+                            # can dedupe on supervisor PEL retry. The
+                            # envelope_id is unique per RESULT_READY
+                            # event (mint-once on the child side), so
+                            # XAUTOCLAIM-driven replay of the same event
+                            # cannot double-count cost.
+                            idempotency_key=envelope.envelope_id,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — best-effort rollup
+                    logger.exception(
+                        "result_ready cost rollup failed envelope=%s "
+                        "child_session=%s — destroy continues",
+                        envelope.envelope_id,
+                        envelope.child_session_id,
+                    )
+
             # Codex F5 (HIGH) — every ``telemetry.emit`` inside this block
             # is wrapped so an OTel / sink fault never escapes the
             # side_effect. A raised emit would propagate up to

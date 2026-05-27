@@ -84,6 +84,75 @@ async def test_subscribe_propagates_other_errors() -> None:
     assert "connection refused" in str(ei.value)
 
 
+# ── destroy_group (Round 6 P2 — per-run consumer group cleanup) ──────────────
+
+
+@pytest.mark.anyio
+async def test_destroy_group_invokes_xgroup_destroy() -> None:
+    """Happy path: destroy_group calls Redis XGROUP DESTROY with the exact
+    stream_key + consumer_group argument pair."""
+    redis = AsyncMock()
+    sub = RedisMailboxSubscriber(redis=redis)
+    await sub.destroy_group(
+        stream_key="actus:child:root1:mailbox",
+        consumer_group="coordinator:r1",
+    )
+    redis.xgroup_destroy.assert_awaited_once_with(
+        "actus:child:root1:mailbox",
+        "coordinator:r1",
+    )
+
+
+@pytest.mark.anyio
+async def test_destroy_group_swallows_nogroup() -> None:
+    """Group already destroyed (NOGROUP) → idempotent no-op, must not raise."""
+    from redis.exceptions import ResponseError
+    redis = AsyncMock()
+    redis.xgroup_destroy.side_effect = ResponseError(
+        "NOGROUP No such consumer group 'coordinator:r1' for key 'actus:child:root1:mailbox'",
+    )
+    sub = RedisMailboxSubscriber(redis=redis)
+    # Must not raise.
+    await sub.destroy_group(
+        stream_key="actus:child:root1:mailbox",
+        consumer_group="coordinator:r1",
+    )
+
+
+@pytest.mark.anyio
+async def test_destroy_group_swallows_no_such_key() -> None:
+    """Stream key gone (NO SUCH KEY) → idempotent no-op, must not raise."""
+    from redis.exceptions import ResponseError
+    redis = AsyncMock()
+    redis.xgroup_destroy.side_effect = ResponseError(
+        "ERR no such key",
+    )
+    sub = RedisMailboxSubscriber(redis=redis)
+    await sub.destroy_group(
+        stream_key="actus:child:root1:mailbox",
+        consumer_group="coordinator:r1",
+    )
+
+
+@pytest.mark.anyio
+async def test_destroy_group_propagates_other_response_errors() -> None:
+    """Unexpected ResponseError (e.g. WRONGTYPE) must propagate so the
+    orchestrator's finally-block can log it — silently swallowing here
+    would mask Redis state corruption."""
+    from redis.exceptions import ResponseError
+    redis = AsyncMock()
+    redis.xgroup_destroy.side_effect = ResponseError(
+        "WRONGTYPE Operation against a key holding the wrong kind of value",
+    )
+    sub = RedisMailboxSubscriber(redis=redis)
+    with pytest.raises(ResponseError) as ei:
+        await sub.destroy_group(
+            stream_key="actus:child:root1:mailbox",
+            consumer_group="coordinator:r1",
+        )
+    assert "WRONGTYPE" in str(ei.value)
+
+
 @pytest.mark.anyio
 async def test_consume_yields_only_matching_envelopes_and_acks_all() -> None:
     redis = AsyncMock()

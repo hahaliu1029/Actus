@@ -1227,6 +1227,71 @@ class PlannerReActFlow(BaseFlow):
 
     def _build_config(self) -> dict:
         """Build the LangGraph config dict shared by invoke() and resume()."""
+        # TODO(PR-9 integration): When ACTUS_C2_COORDINATOR_ENABLED=true,
+        # this method MUST also wire the C2 coordinator dispatch path into
+        # ``configurable`` so the parallel-execution subgraph and child
+        # runners have everything they need.
+        #
+        # Subgraph / orchestration deps (consumed by
+        # ``parallel_execution_subgraph.py`` ``dispatch_node`` /
+        # ``worker_node`` / ``reducer_node`` + ``main_graph._run_parallel_backend``):
+        #
+        #   - "parallel_execution_subgraph": built via
+        #     ``build_parallel_execution_subgraph()`` (PR-6, isolated).
+        #   - "session_service": existing UoW-managed write API used by
+        #     ``dispatch_node`` to ``create_session_with_parent`` and by
+        #     ``_rehydrate_dispatch`` to ``bump_coordinator_attempt`` /
+        #     fetch the child session map.
+        #   - "rehydrate_service": pod-restart rehydrate path
+        #     (``parallel_execution_subgraph.py:214``).
+        #   - "child_runner_starter": runner_starter adapter (PR-5) that
+        #     wraps ``AgentTaskRunner`` in the
+        #     ``CoordinatorChildInnerRunner`` Protocol.
+        #   - "mailbox_publisher" / "mailbox_subscriber": the live Redis
+        #     publisher and subscriber adapters (consumed at lines
+        #     ``parallel_execution_subgraph.py:269`` and ``:468``).
+        #   - "envelope_factory": ``CoordinatorEnvelopeFactory`` —
+        #     defaultable but the explicit DI wire avoids per-call
+        #     ``CoordinatorEnvelopeFactory()`` ctor.
+        #   - "orchestrator_factory" / "terminal_waiter" / "probe_quota":
+        #     DI from interfaces/service_dependencies — PR-6 ships the
+        #     classes; PR-9 wires the singletons.
+        #   - "coordinator_limits": ``load_coordinator_limits_from_env()``
+        #     (PR-6 §14.3 constants + per-env override validation).
+        #   - "session_repository": already exists in
+        #     service_dependencies; thread for the descendants cap.
+        #   - "cancel_event": parent cancel ``asyncio.Event``; orchestrator
+        #     + child runners share it so user cancel fans out.
+        #   - "user_id": already wired at line ~1322 (
+        #     ``self._user_id``); read by ``_run_parallel_backend`` (
+        #     ``main_graph.py:96``) + ``dispatch_node`` for the user-scoped
+        #     concurrency cap / descendants count. Listed here for
+        #     completeness — no new wiring needed in PR-9, just confirm
+        #     ``self._user_id`` continues to be populated for the
+        #     coordinator-enabled call site.
+        #
+        # Apply path deps (consumed by ``main_graph._run_parallel_backend``
+        # post-reducer):
+        #
+        #   - "patch_reducer_service": invoked from ``reducer_node`` to
+        #     deduplicate + finalize PatchApplyPlan.
+        #   - "patch_applier": invoked by main_graph after reducer when
+        #     ``apply_plan.is_apply_required is True``.
+        #   - "parent_sandbox": needed by ``dispatch_node`` for
+        #     ``compute_digest`` / ``read_file`` (base_digest +
+        #     seed_content_ref enrichment) and by ``reducer_node`` for
+        #     §9.3 step-5 drift detection.
+        #   - "artifact_storage": MinIO put for spawn manifests + seed
+        #     content (``put_content_addressed_bytes``).
+        #
+        # All PR-6 components are isolated/standalone and DO NOT require
+        # this wiring to ship in PR-6; they activate only when PR-9
+        # flips the feature flag and dispatch starts driving the
+        # parallel subgraph. See ``coordinator_child_runner.py:235``
+        # for the matching wiring TODO on the child side
+        # (BudgetEnforcementCallback + CoordinatorChildWallclockWatchdog
+        # — both shipped in PR-6, both dead-coded until PR-9 binds them
+        # to the inner_runner's LLM callbacks list).
         from app.domain.services.execution_watchdog import ExecutionControl, ExecutionWatchdog
 
         # Read tool confirmation settings from AgentConfig (config.yaml, user-editable)

@@ -51,6 +51,11 @@ class CoordinatorChildCancelListener:
         self._stream_key = f"actus:child:{root_session_id}:mailbox"
         self._consumer_group = f"coordinator:child:{child_session_id}"
         self._consumer_name = f"{child_session_id}-listener"
+        # [Round 7 P2] Track whether subscribe() succeeded so shutdown() can
+        # destroy the per-listener consumer group without emitting a spurious
+        # NOGROUP roundtrip when subscribe never ran (e.g. start() raised
+        # before subscribe, or start() was never called).
+        self._subscribed: bool = False
 
     async def start(self) -> None:
         await self._subscriber.subscribe(
@@ -58,6 +63,7 @@ class CoordinatorChildCancelListener:
             consumer_group=self._consumer_group,
             consumer_name=self._consumer_name,
         )
+        self._subscribed = True
         self.ready_event.set()
         self._task = asyncio.create_task(self._listen_loop_forever())
         # r5 P1-3: attach done-callback to surface fatal listener death.
@@ -79,13 +85,32 @@ class CoordinatorChildCancelListener:
             )
 
     async def shutdown(self, timeout: float = 1.0) -> None:
-        if self._task is None or self._task.done():
-            return
-        self._task.cancel()
-        try:
-            await asyncio.wait_for(self._task, timeout=timeout)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            try:
+                await asyncio.wait_for(self._task, timeout=timeout)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        # [Round 7 P2] Destroy the per-listener consumer group so it doesn't
+        # accumulate as a dead XPENDING/group-metadata entry under the
+        # long-lived root stream. Skip when ``_subscribed=False`` (subscribe
+        # never ran — nothing to destroy). Best-effort: log + swallow on any
+        # error — the group is per-listener and idempotent destroy is the
+        # adapter contract. Positioned AFTER the task drain so any in-flight
+        # XACK on the listener task completes before the group is torn down.
+        if self._subscribed:
+            try:
+                await self._subscriber.destroy_group(
+                    stream_key=self._stream_key,
+                    consumer_group=self._consumer_group,
+                )
+            except Exception:
+                logger.warning(
+                    "CoordinatorChildCancelListener: destroy_group failed"
+                    " group=%s — dead group may accumulate in Redis",
+                    self._consumer_group,
+                    exc_info=True,
+                )
 
     async def _predicate(self, env: dict[str, Any]) -> bool:
         return (

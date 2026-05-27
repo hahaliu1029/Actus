@@ -15,14 +15,26 @@ Timeout enforced via ``asyncio.wait_for`` because ``subscriber.consume`` is a
 ``while True`` loop that would otherwise block forever when no terminal envelope
 arrives. ``cancel_event`` is informational (the child uses it to stop + emit
 CANCEL_ACK); the waiter keeps consuming until terminal arrives or timeout fires.
+
+[Round 7 P2] After the waiter's job is done (terminal arrives, timeout, or
+exception), the per-waiter consumer group is destroyed in a ``finally`` block
+so dead groups don't accumulate under the long-lived root mailbox stream.
+The destroy is gated on a ``subscribed=True`` flag — if ``subscribe`` itself
+raised, no group exists yet and ``destroy_group`` would emit a spurious
+NOGROUP roundtrip. ``destroy_group`` failures are logged + swallowed so the
+caller-facing exception (TimeoutError, etc.) propagates unmodified.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from app.domain.external.mailbox_subscriber import MailboxSubscriber
 from app.domain.models.mailbox_envelope import MailboxEnvelope, MailboxEnvelopeType
+
+
+logger = logging.getLogger(__name__)
 
 
 _TERMINAL_TYPE_VALUES: frozenset[str] = frozenset({
@@ -62,11 +74,13 @@ class CoordinatorTerminalEnvelopeWaiter:
         stream_key = f"actus:child:{root_session_id}:mailbox"
         consumer_group = f"coordinator:waiter:{child_session_id}"
         consumer_name = f"waiter-{child_session_id}"
+        subscribed = False
         await self._subscriber.subscribe(
             stream_key=stream_key,
             consumer_group=consumer_group,
             consumer_name=consumer_name,
         )
+        subscribed = True
 
         async def _is_terminal_for_this_child(env: dict[str, Any]) -> bool:
             if env.get("type") not in _TERMINAL_TYPE_VALUES:
@@ -98,8 +112,30 @@ class CoordinatorTerminalEnvelopeWaiter:
             )
 
         try:
-            return await asyncio.wait_for(_consume_one(), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(
-                f"no terminal envelope for {child_session_id} after {timeout}s"
-            )
+            try:
+                return await asyncio.wait_for(_consume_one(), timeout=timeout)
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError(
+                    f"no terminal envelope for {child_session_id} after {timeout}s"
+                )
+        finally:
+            # [Round 7 P2] Destroy the per-waiter consumer group so it doesn't
+            # accumulate as a dead XPENDING/group-metadata entry under the
+            # long-lived root stream. Skip when ``subscribed=False`` (subscribe
+            # itself raised — nothing to destroy). Best-effort: log + swallow
+            # on any error — the group is per-waiter and idempotent destroy is
+            # the adapter contract.
+            if subscribed:
+                try:
+                    await self._subscriber.destroy_group(
+                        stream_key=stream_key,
+                        consumer_group=consumer_group,
+                    )
+                except Exception:
+                    logger.warning(
+                        "CoordinatorTerminalEnvelopeWaiter: destroy_group"
+                        " failed child=%s group=%s — dead group may accumulate"
+                        " in Redis",
+                        child_session_id, consumer_group,
+                        exc_info=True,
+                    )

@@ -115,5 +115,10 @@ async def get_session_cost_tree(
         depth_reached=agg.depth_reached,
         max_depth_applied=agg.max_depth_applied,
         truncated=agg.truncated or (effective_depth < depth),
+        # [C2 PR-6 §14.4] Surface the attribution label the service derived
+        # from the descendants' tool_filter_preset + worker_type buckets.
+        # Pydantic v2 serialises the ``CostSource`` StrEnum to its wire
+        # string value (e.g. ``"coordinator_subagent"``) automatically.
+        cost_source=agg.cost_source,
     )
     return Response.success(data=payload)

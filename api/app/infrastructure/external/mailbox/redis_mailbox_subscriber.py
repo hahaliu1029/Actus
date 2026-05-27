@@ -18,6 +18,7 @@ import logging
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 from app.domain.external.mailbox_subscriber import MailboxSubscriber
 
@@ -53,6 +54,27 @@ class RedisMailboxSubscriber(MailboxSubscriber):
             "RedisMailboxSubscriber: subscribed group=%s on stream=%s as consumer=%s start_id=%s",
             consumer_group, stream_key, consumer_name, start_id,
         )
+
+    async def destroy_group(
+        self,
+        *,
+        stream_key: str,
+        consumer_group: str,
+    ) -> None:
+        """[Round 6 P2] Destroy the per-run consumer group so it doesn't
+        accumulate as a dead XPENDING/group-metadata entry under the
+        long-lived root stream. Idempotent on NOGROUP / NOKEY (already
+        destroyed or stream gone — both fine); other ResponseErrors
+        propagate so the orchestrator can log them.
+        """
+        try:
+            await self._redis.xgroup_destroy(stream_key, consumer_group)
+        except ResponseError as exc:
+            msg = str(exc).upper()
+            if "NOGROUP" in msg or "NO SUCH KEY" in msg or "NOKEY" in msg:
+                # Already destroyed / stream gone — idempotent re-destroy.
+                return
+            raise
 
     async def consume(
         self,

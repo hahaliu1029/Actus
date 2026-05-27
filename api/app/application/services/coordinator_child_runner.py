@@ -232,6 +232,27 @@ class CoordinatorChildRunner:
 
         try:
             try:
+                # TODO(PR-9 wiring): wrap ``inner_runner.invoke_until_done`` in
+                # ``start_wallclock_watchdog(runner=self,
+                # max_wallclock_seconds=coordinator_limits.
+                # max_wallclock_seconds_per_child)`` so spec §14.3 #5 (wall
+                # clock budget for the child) actually trips. The
+                # ``CoordinatorChildWallclockWatchdog`` is shipped in PR-6
+                # but its task is not started anywhere yet — wiring lands
+                # in a follow-up integration task (likely PR-9) once the
+                # ``runner_starter`` adapter (PR-5) is extended to accept a
+                # ``max_wallclock_seconds`` argument that this runner can
+                # thread through. Until then, ``StopReason.WALLCLOCK_BUDGET``
+                # only ever fires via the supervisor's 600s backstop, and
+                # the §14.3 #5 internal cap is dead code.
+                #
+                # Similarly, ``BudgetEnforcementCallback`` (the token-cost
+                # gate from §14.3 #1, also shipped in PR-6) needs to be
+                # bound to the inner_runner's LLM callbacks list at
+                # construction time. The runner_starter adapter is the
+                # natural place to thread it. Until that lands, token-cost
+                # checks happen only post-hoc via cost_summary aggregation,
+                # not as an in-flight LLM-call guard.
                 done_event = await self._inner_runner.invoke_until_done(
                     user_message=self._build_child_prompt(work_unit, spawn_manifest),
                 )

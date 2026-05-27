@@ -56,3 +56,24 @@ class MailboxSubscriber(Protocol):
         ``None`` means run forever (production listener loop).
         """
         ...
+
+    async def destroy_group(
+        self,
+        *,
+        stream_key: str,
+        consumer_group: str,
+    ) -> None:
+        """Destroy the consumer group on the stream (idempotent).
+
+        NOGROUP / NOKEY (group or stream already absent) MUST be swallowed
+        so a re-destroy after pod restart is a no-op. Other Redis errors
+        propagate so the orchestrator's finally-block can log them.
+
+        The orchestrator calls this in its run() finally so the dead
+        consumer group entry doesn't accumulate over many runs against
+        the same long-lived root stream (Round 6 P2). Distinct from
+        ``RedisMailboxConsumer.destroy_stream`` which destroys + deletes
+        the entire stream key — here we only destroy the per-run group
+        and leave the shared root stream intact for siblings.
+        """
+        ...

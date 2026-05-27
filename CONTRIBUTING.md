@@ -219,6 +219,71 @@ Rollout order — STRICT, do not reorder:
 Rollback: set flag back to false → producer stops; supervisors stay on
 new version (forward compat).
 
+### C2 Coordinator env override review
+
+打开 `ACTUS_C2_COORDINATOR_ENABLED=true` 之前，请逐项 review 以下硬上限 env：
+
+**PR-6 enforcement status标签：**
+- ✅ **gated in PR-6** — dispatch / orchestrator 路径在本 PR 已读取该 env 并按其值触发拒绝/超时。
+- 🚧 **deferred to PR-9 wiring** — 本 PR 仅落地 service / callback 实现，dispatch 与 inner_runner LLM callbacks 的接入由 PR-9 完成；flag flip 前调整该 env 值无运行时效果。
+
+| Env var | 默认值 | PR-6 状态 | Override 注意事项 |
+|---|---|---|---|
+| `ACTUS_COORDINATOR_MAX_WORK_UNITS_PER_RUN` | `5` | ✅ gated | `_first_time_dispatch` preflight（`parallel_execution_subgraph.py:297`）按 `>` 拒绝。设置 > 7 易触发 mailbox supervisor 退化（fan-out 放大 + 单 root_session 流量集中）；> 10 会撞 `MAX_DESCENDANTS_PER_ROOT=10` 静态上限并被 descendants cap 拒绝。 |
+| `ACTUS_COORDINATOR_MAX_TOTAL_TOKEN_COST_USD_PER_RUN` | `2.00` | 🚧 deferred | `BudgetEnforcementCallback` 已落地（`budget_enforcement_callback.py`），但未绑定到 inner_runner 的 LLM callbacks 链。PR-9 wiring 接入后才会按累计 USD `>= cap` 触发 `request_stop(StopReason.TOKEN_BUDGET)` → `NEEDS_AUTHORIZATION(reason="budget_exhausted")`。与 LLM provider 余额 / 速率限制协调，过大会让 budget watchdog 在 LLM 限流之后才触发，浪费 token。 |
+| `ACTUS_COORDINATOR_MAX_TOKEN_COST_USD_PER_CHILD` | `0.50` | 🚧 deferred | 同 `TOTAL_TOKEN_COST_USD_PER_RUN`：service exists, wiring 待 PR-9。建议保持 `child * max_work_units_per_run >= total_run`，避免 PR-9 接入后某些 child 提前被切但 total 未到。 |
+| `ACTUS_COORDINATOR_MAX_WALLCLOCK_SECONDS_PER_CHILD` | `300` | 🚧 deferred | `coordinator_child_wallclock_watchdog.start_wallclock_watchdog` 已落地，但 `CoordinatorChildRunner.run_work_unit` 尚未调用它（见 `coordinator_child_runner.py:235` TODO）。PR-9 wiring 接入后才会触发 `StopReason.WALLCLOCK_BUDGET`。`load_coordinator_limits_from_env()` 已经在 PR-6 强制不变式 `< SUBAGENT_RESULT_READY_TIMEOUT_SECONDS (600s)`：违反时 silent fallback 到默认（避免 wiring 落地后 child 错过内部 cap → 被 supervisor backstop 杀掉错配 `TIMED_OUT`）。 |
+| `ACTUS_COORDINATOR_MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN` | `900` | 🚧 deferred | `_run_with_observer` 当前固定使用 `timeout_seconds=600` 默认参数，**未**从 `CoordinatorLimits` 读取。PR-9 wiring 接入后该 env 才会替换该默认值。值的语义仍是 "整个 coordinator run（含所有 work_unit + reducer）的总墙钟硬上限"；调高时确认 SSE 连接 + 客户端超时配置同步放宽；调低会让长任务的 reducer 整合阶段被强制截断。 |
+| `ACTUS_COORDINATOR_MAX_CONCURRENT_RUNS_PER_USER` | `2` | ✅ gated | `_first_time_dispatch` 调用 `probe_quota.acquire_coordinator_concurrency`（`parallel_execution_subgraph.py:307`），基于 Redis 原子 `INCR` + `> cap` rollback。调高时确认 Redis 容量 + 用户事件配额；调低后已被 acquire 的 slot 由 `release_coordinator_quotas` 自然回落。**Pod crash recovery**：concurrency key 在每次成功 acquire 时刷 6h TTL（`CONCURRENCY_TTL_SECONDS = 21600`，codex round 3 P1-5），兜底 "dispatch INCR 后 pod crash、reducer DECR 永远不运行" 导致永久 slot 泄漏的场景；正常生命周期下 `reducer_node.finally` 的 DECR 在 TTL 触发前就已经释放槽位，TTL 只是 ceiling，不是常规清理路径。 |
+| `ACTUS_COORDINATOR_MAX_TOKEN_COST_USD_PER_USER_PER_DAY` | `50.00` | 🚧 deferred | **PR-6 仅落地 service method**（`ProbeQuotaService.acquire_coordinator_daily_cost`，基于 Redis `INCRBYFLOAT` + 负向回滚 + 25h TTL，key 为 `actus:coord:daily_cost:{user_id}:{utc-date}`）；**dispatch 调用点延后到 PR-7+ wiring**（见 `parallel_execution_subgraph.py` `_first_time_dispatch` 的 TODO），flag flip 前该 cap 并未在生产路径生效，调整本 env 值在 PR-6 阶段无运行时效果。过低会让正常用户在跨日临近时被 reject；rollback 路径会自动负向 INCRBYFLOAT 抹掉超额。 |
+| `ACTUS_COORDINATOR_MAX_TOOL_CALLS_PER_CHILD` | `25` | 🚧 deferred | 当前 dispatch 通过 `CoordinatorEnvelopeFactory.make_spawn_request` 的默认 `CoordinatorBudgetSnapshot(max_tool_calls=25, ...)` 写入 SPAWN_REQUEST envelope，child 收到但 PR-6 没有实际 enforcement（依赖 PR-9 wiring 的 BudgetEnforcementCallback / runner 内部计数）。env 当前**不会**影响 envelope 默认值（factory 默认是 hardcoded `25`）；PR-9 wiring 之前调整本 env 无运行时效果。 |
+
+任何覆盖都建议在 staging 环境跑一次 dispatch preflight + budget watchdog 烟测，确认日志中无 `coordinator_limits: ... non-positive, using default` 或 `>= supervisor backstop` 警告。✅ rows 立即生效；🚧 rows 在 PR-9 wiring 落地前是惰性的（只影响 `CoordinatorLimits` 实例内字段，未被消费者读取）。
+
+### C2 Coordinator OTel monitoring
+
+`CoordinatorMetrics`（`infrastructure/observability/coordinator_telemetry.py`）发出 4 个 OTel instrument。打开 `ACTUS_C2_COORDINATOR_ENABLED=true` 之前请先把它们接入 Prometheus / Grafana / Phoenix dashboards：
+
+| Metric | Type | Unit | 建议告警 |
+|---|---|---|---|
+| `actus_coordinator_run_cost_usd` | Counter | usd | `rate(... [5m]) > 0.5` 触发支出速率告警 |
+| `actus_coordinator_tool_calls` | Counter | 1 | `rate(... [1m]) > 30` 警示 tool-call 循环 |
+| `actus_coordinator_duration_seconds` | Histogram | s | `p99 > 540s` 接近 supervisor 600s backstop |
+| `actus_coordinator_budget_exhaustion_total` | Counter | 1 | `rate(... [10m]) > 0` 子任务触顶 budget |
+
+Instrument 在 PR-6 已落地；call-site wiring（counter `add`、histogram `record`）随 PR-9 与 `ACTUS_C2_COORDINATOR_ENABLED=true` flip 同步落地。
+
+### C2 Coordinator concurrency leak recovery
+
+`ProbeQuotaService` 的 per-user concurrency 计数器（`actus:coord:concurrent:{user_id}`）内置 6h auto-expire（`CONCURRENCY_TTL_SECONDS=21600`）：dispatch INCR 成功之后立即刷 TTL，pod 即使在 `acquire_coordinator_concurrency()` 与 `release_coordinator_quotas()` 之间崩溃，6h 内 Redis 也会自动收回 slot。
+
+若用户反馈 "concurrency cap reached" 但你确认无活跃 coordinator run：
+
+```bash
+# 1) 排查 — 当前计数 + 剩余 TTL：
+docker compose exec redis redis-cli GET "actus:coord:concurrent:<user_id>"
+docker compose exec redis redis-cli TTL "actus:coord:concurrent:<user_id>"
+
+# 2) 手动恢复（确认无 live coordinator 时）：
+# 完全清掉：
+docker compose exec redis redis-cli DEL "actus:coord:concurrent:<user_id>"
+# 或单步 DECR 回到真实并发数：
+docker compose exec redis redis-cli DECR "actus:coord:concurrent:<user_id>"
+```
+
+操作前用 `GET` 复核当前计数；操作后再 `GET` 一次确认结果。`DEL` 比 `DECR` 安全（避免误判后变负值），但会丢掉 TTL —— 下次正常 acquire 时会重新设置。
+
+### C2 Cost rollup PEL retry behavior
+
+`MailboxSupervisor.ResultReadyHandler` 在 destroy sandbox 之前先跑 cost rollup PROLOGUE。如果 destroy 抛 `SandboxLifecycleError`，supervisor 会在 Redis PEL（Pending Entry List）保留 envelope，`XAUTOCLAIM` 后续重投递 → rollup 会重复触发。
+
+`CostRollupService.rollup_to_parent(*, parent_session_id, cost, source, idempotency_key)` 契约要求幂等：`idempotency_key` 是 mailbox envelope 的 `envelope_id`（UUID，跨重试稳定）。具体 adapter（PR-7+ 落地）必须基于此 key 去重 —— UNIQUE 约束 或 "first-write wins" CostRecord 行 都可，但**禁止**累加。
+
+若发现 parent session 成本被重复计入：
+1. 查 supervisor 审计日志中是否有 `XAUTOCLAIM` 触发的 envelope redelivery；
+2. 验证 adapter 是否对相同 `idempotency_key` 去重（grep `idempotency_key` 在 adapter 实现中的使用）；
+3. PR-7+ 的 adapter 必须配套 "PEL retry 同 envelope 不重复 rollup" 集成测试 —— 这是回归守门，落地前不能 ship 整套。
+
 ## 前端开发
 
 ```bash
