@@ -66,6 +66,7 @@ from app.domain.models.mailbox_envelope import (
     ProducerRole,
 )
 from app.domain.models.session import DestroyReason
+from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.repositories.mailbox_envelope_audit_repository import (
     MailboxEnvelopeAuditRepository,
 )
@@ -274,6 +275,120 @@ class SupervisorContext:
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
 
+    # ── C2 PR-8 §13.4 lineage helpers (used by CoordinatorProgressUpdateHandler) ──
+    #
+    # All three methods are instance methods on the dataclass (NOT injected
+    # Callables) so legacy SupervisorContext instantiation sites — which
+    # don't know about PR-8 — get the default behaviour for free without
+    # widening the dataclass field count. Override callers (e.g. PR-9
+    # service_dependencies once it wants to emit telemetry on the wrap path)
+    # can rebind on the instance with ``ctx.relay_progress_with_lineage = ...``
+    # because the dataclass isn't ``frozen``.
+
+    # Bounded walk depth — guards against pathological cycles or
+    # mis-rehydrated session rows that point parent → self. The C1a session
+    # tree is structurally shallow (root → planner → coordinator children),
+    # so 32 hops is two orders of magnitude over any legitimate depth.
+    _COMPUTE_ROOT_MAX_HOPS: int = 32
+
+    async def compute_root_session_id(self, child_session) -> Optional[str]:
+        """Walk ``parent_session_id`` to the top of the session tree.
+
+        Returns the root session id (the deepest ancestor with no parent).
+        If ``child_session.parent_session_id`` is None, returns
+        ``child_session.id`` (the child is its own root). If the walk breaks
+        mid-chain (the next parent row is missing from ``session_repo`` —
+        could be a deleted ancestor on a long-running orphan), returns the
+        last known ancestor id as a best-effort lineage anchor; this is a
+        stable identifier that downstream consumers can still group by.
+
+        The depth cap (``_COMPUTE_ROOT_MAX_HOPS``) defuses any cycle by
+        returning whatever the cursor landed on when the cap was hit. The
+        result is ``Optional[str]`` to match the
+        :class:`CoordinatorLineageMixin` field type — emitting events with
+        ``root_session_id=None`` is acceptable when the supervisor
+        genuinely cannot reconstruct lineage.
+        """
+        if child_session.parent_session_id is None:
+            return child_session.id
+        if self.session_repo is None:
+            return child_session.id
+
+        current_id: Optional[str] = child_session.id
+        next_parent_id: Optional[str] = child_session.parent_session_id
+        for _ in range(self._COMPUTE_ROOT_MAX_HOPS):
+            if next_parent_id is None:
+                return current_id
+            parent = await self.session_repo.get_by_id(next_parent_id)
+            if parent is None:
+                # Walk broke — the next_parent_id is the last known anchor
+                # in the lineage; return it rather than the deeper current_id
+                # so downstream consumers see the actual chain endpoint.
+                return next_parent_id
+            current_id = next_parent_id
+            next_parent_id = parent.parent_session_id
+        # Cap exceeded — return whatever ancestor we last landed on. Logged
+        # because hitting the cap indicates a pathological session tree
+        # (cycle or extreme depth) and should be investigated.
+        logger.warning(
+            "compute_root_session_id hit walk cap (%d) starting from %s — "
+            "returning best-effort cursor %s",
+            self._COMPUTE_ROOT_MAX_HOPS,
+            child_session.id,
+            current_id,
+        )
+        return current_id
+
+    async def relay_progress_default(self, envelope: "MailboxEnvelope") -> None:
+        """Forward PROGRESS_UPDATE unchanged — the legacy stub path.
+
+        Identical behaviour to ``_StubNonTerminalHandler.handle``'s body so
+        non-coordinator children keep their pre-C2 fan-out shape.
+        """
+        await self.agent_service_callback(envelope)
+
+    async def relay_progress_with_lineage(
+        self,
+        envelope: "MailboxEnvelope",
+        lineage: dict,
+    ) -> None:
+        """Forward PROGRESS_UPDATE with coordinator lineage injected.
+
+        :class:`MailboxEnvelope` is a frozen Pydantic model, so we cannot
+        mutate ``envelope.payload`` in place. Build a new envelope with
+        ``payload = {**old, "_lineage": lineage}`` and forward that. The
+        downstream consumer (``agent_service_callback`` → SSE bridge → PR-8
+        ``coordinator_progress_update`` event emit, wired in Task 8.4) reads
+        ``payload["_lineage"]`` to populate the
+        :class:`CoordinatorLineageMixin` fields on the emitted event.
+
+        The ``_lineage`` prefix (underscore) marks this as an in-band
+        supervisor-injected hint; the wire-form
+        :class:`ProgressUpdatePayload` does NOT carry it on the producer
+        side — only the supervisor adds it on the consume path. Validation
+        is bypassed for the rebuilt envelope (the original validated the
+        payload via ``model_validator`` already; we just extend the dict).
+        """
+        decorated_payload = {**envelope.payload, "_lineage": lineage}
+        # The Pydantic model_validator on MailboxEnvelope rejects unknown
+        # payload keys when re-validating against the PROGRESS_UPDATE schema
+        # (ProgressUpdatePayload has ``extra="forbid"``). Use
+        # ``model_construct`` to skip re-validation — the original envelope
+        # already passed validation, and we are deliberately adding an
+        # out-of-band supervisor hint that the downstream consumer reads.
+        forwarded = MailboxEnvelope.model_construct(
+            envelope_id=envelope.envelope_id,
+            type=envelope.type,
+            parent_session_id=envelope.parent_session_id,
+            child_session_id=envelope.child_session_id,
+            correlation_id=envelope.correlation_id,
+            emitted_at=envelope.emitted_at,
+            producer_role=envelope.producer_role,
+            payload=decorated_payload,
+            reclaim_count=envelope.reclaim_count,
+        )
+        await self.agent_service_callback(forwarded)
+
 
 @dataclass
 class HandlerOutcome:
@@ -422,7 +537,7 @@ class ResultReadyHandler:
                     )
                     if (
                         child_session is not None
-                        and child_session.tool_filter_preset == "coordinator_step"
+                        and child_session.tool_filter_preset == COORDINATOR_STEP_PRESET
                         and child_session.parent_session_id is not None
                     ):
                         cost_summary = (
@@ -482,7 +597,7 @@ class ResultReadyHandler:
                     )
                     if (
                         child_session is not None
-                        and child_session.tool_filter_preset == "coordinator_step"
+                        and child_session.tool_filter_preset == COORDINATOR_STEP_PRESET
                         and child_session.coordinator_run_id is not None
                         and child_session.work_unit_id is not None
                     ):
@@ -742,7 +857,7 @@ class CancelAckHandler:
                     )
                     if (
                         child_session is not None
-                        and child_session.tool_filter_preset == "coordinator_step"
+                        and child_session.tool_filter_preset == COORDINATOR_STEP_PRESET
                         and child_session.coordinator_run_id is not None
                         and child_session.work_unit_id is not None
                     ):
@@ -1561,6 +1676,17 @@ def build_default_dispatch_table() -> dict[MailboxEnvelopeType, EnvelopeHandler]
     and ACK-drop legitimate envelopes. CI enforcement: see the unit test that
     counts entries.
     """
+    # Late import — ``coordinator_progress_handler`` imports
+    # ``HandlerOutcome`` from this module via late-import in the handler
+    # body. Importing it at the top of ``mailbox_supervisor`` would still
+    # work (no module-load-time cycle since the handler's
+    # ``HandlerOutcome`` import is deferred), but the late-import here
+    # mirrors the cost_rollup_service / coordinator_envelope_store
+    # precedent and keeps the supervisor's top of file lean.
+    from app.application.services.coordinator_progress_handler import (
+        CoordinatorProgressUpdateHandler,
+    )
+
     stub_nonterminal = _StubNonTerminalHandler()
     return {
         MailboxEnvelopeType.RESULT_READY: ResultReadyHandler(),
@@ -1569,7 +1695,10 @@ def build_default_dispatch_table() -> dict[MailboxEnvelopeType, EnvelopeHandler]
         MailboxEnvelopeType.APPROVAL_REQUEST: ApprovalRequestHandler(),
         MailboxEnvelopeType.SPAWN_REQUEST: stub_nonterminal,
         MailboxEnvelopeType.SPAWN_ACK: stub_nonterminal,
-        MailboxEnvelopeType.PROGRESS_UPDATE: stub_nonterminal,
+        # [C2 PR-8 Task 8.3 §13.4] PROGRESS_UPDATE now wraps coordinator-step
+        # children with lineage tagging; non-coordinator children fall through
+        # to the same stub-forward path the legacy handler took.
+        MailboxEnvelopeType.PROGRESS_UPDATE: CoordinatorProgressUpdateHandler(),
         MailboxEnvelopeType.APPROVAL_RESPONSE: stub_nonterminal,
         MailboxEnvelopeType.DEPENDENCY_BLOCKED: stub_nonterminal,
         MailboxEnvelopeType.HANDOFF_REQUEST: HandoffRequestHandler(),

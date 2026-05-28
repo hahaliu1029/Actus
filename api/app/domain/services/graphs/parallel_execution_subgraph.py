@@ -75,6 +75,7 @@ from app.domain.models.mailbox_envelope import (
     MailboxEnvelopeType,
     ResultReadyOutcome,
 )
+from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.models.work_unit import PathLease, WorkUnit
 
 logger = logging.getLogger(__name__)
@@ -453,7 +454,7 @@ async def _first_time_dispatch(
             child = await session_service.create_session_with_parent(
                 user_id=user_id,
                 parent_session_id=parent_session_id,
-                tool_filter_preset="coordinator_step",
+                tool_filter_preset=COORDINATOR_STEP_PRESET,
                 coordinator_run_id=coordinator_run_id,
                 work_unit_id=wu.work_unit_id,
             )
@@ -634,6 +635,60 @@ async def _first_time_dispatch(
                 )
 
         raise
+
+    # C2 PR-8 §13 Task 8.4 — emit CoordinatorDispatchEvent + N
+    # CoordinatorWorkerSpawnedEvent so the parent SSE timeline can render
+    # the fan-out. BEST-EFFORT: try/except so a queue/serialization failure
+    # never aborts dispatch (state has already committed side effects). The
+    # except clause MUST stay above the Command(...) return because the
+    # rollback path at line ~564 deliberately bypasses emit (no events for
+    # a dispatch that never completed).
+    event_queue: Optional[asyncio.Queue] = (
+        config.get("configurable", {}).get("event_queue")
+    )
+    if event_queue is not None:
+        # [codex R4 P1] Use put_nowait (synchronous, non-cancellable) instead of
+        # await put. The dispatch has already created N child sessions, N runners,
+        # N SPAWN_REQUEST publishes, and started the orchestrator task on the
+        # happy-path side of the BaseException rollback above. An await between
+        # those committed side effects and the Command return is a CancelledError
+        # window (CancelledError subclasses BaseException, NOT Exception, on
+        # Py3.12) — a cancel would suppress the state handoff and leave the
+        # resources orphaned. Production event_queue is asyncio.Queue with
+        # default maxsize=0 (unbounded — see event_bridge.py); put_nowait never
+        # raises QueueFull there. The try/except still catches a defensive bounded
+        # queue (raises QueueFull) or other unexpected errors.
+        try:
+            from app.domain.models.event import (
+                CoordinatorDispatchEvent,
+                CoordinatorWorkerSpawnedEvent,
+            )
+            event_queue.put_nowait(CoordinatorDispatchEvent(
+                step_id=state.get("step_id", "unknown"),
+                work_unit_count=len(enriched_units),
+                work_unit_ids=[wu.work_unit_id for wu in enriched_units],
+                phases=[wu.phase for wu in enriched_units],
+                coordinator_run_id=coordinator_run_id,
+                root_session_id=root_session_id,
+                parent_session_id=parent_session_id,
+            ))
+            for wu in enriched_units:
+                event_queue.put_nowait(CoordinatorWorkerSpawnedEvent(
+                    objective=wu.objective,
+                    phase=wu.phase,
+                    allowed_tools=list(wu.allowed_tools),
+                    write_lease_count=len(wu.write_lease),
+                    coordinator_run_id=coordinator_run_id,
+                    work_unit_id=wu.work_unit_id,
+                    child_session_id=child_session_ids[wu.work_unit_id],
+                    root_session_id=root_session_id,
+                    parent_session_id=parent_session_id,
+                ))
+        except Exception as exc:
+            logger.warning(
+                "_first_time_dispatch: emit coordinator events failed "
+                "run=%s: %s", coordinator_run_id, exc,
+            )
 
     # Step 10 -- fan out via Send x N.
     return Command(
@@ -1118,6 +1173,56 @@ async def reducer_node(
             worker_results=state["worker_results"],
             parent_sandbox=parent_sandbox,
         )
+
+        # C2 PR-8 §13 Task 8.4 — emit CoordinatorReduceEvent. BEST-EFFORT:
+        # try/except so a queue/serialization failure does not mask the
+        # reducer output. cost_summary is sourced via getattr because
+        # PR-5 ReducerOutput does not yet carry it (PR-9+ will wire it);
+        # default to an empty CostAggregate so the wire schema validates.
+        # conflict_paths defaults to [] for the same reason — diagnostics
+        # do not yet carry per-path conflict surface; PR-9 can wire it.
+        event_queue: Optional[asyncio.Queue] = cfg.get("event_queue")
+        if event_queue is not None:
+            # [codex R4 P2] put_nowait (synchronous) — see _first_time_dispatch's
+            # explanatory comment. Reducer has already completed reduce() before
+            # this point; an awaited put_nowait could be cancelled before the
+            # Command update propagates apply_plan/group_outcome/diagnostics.
+            try:
+                from app.domain.models.event import CoordinatorReduceEvent
+                diagnostics_summary = "ok" if output.diagnostics else ""
+                # [codex PR-8 R2 P2] Coalesce ``None`` to ``CostAggregate()`` —
+                # ReducerOutput currently has no ``cost_summary`` attribute so
+                # ``getattr`` returns the default. When PR-9 adds
+                # ``cost_summary: Optional[CostAggregate] = None`` to
+                # ReducerOutput, plain ``getattr(..., CostAggregate())`` would
+                # return ``None`` (attribute exists, value is None) and the
+                # required ``cost_total: CostAggregate`` field on
+                # CoordinatorReduceEvent would raise a validation error —
+                # swallowed by this try/except, silently breaking the wire
+                # contract. ``or CostAggregate()`` keeps the fallback safe
+                # under both the current and the PR-9 shape.
+                cost_total = (
+                    getattr(output, "cost_summary", None) or CostAggregate()
+                )
+                event_queue.put_nowait(CoordinatorReduceEvent(
+                    group_outcome=output.group_outcome,
+                    per_worker_outcomes={
+                        wr.work_unit_id: wr.outcome
+                        for wr in state["worker_results"]
+                    },
+                    diagnostics_summary=diagnostics_summary,
+                    cost_total=cost_total,
+                    conflict_paths=[],
+                    coordinator_run_id=coordinator_run_id,
+                    root_session_id=state.get("root_session_id"),
+                    parent_session_id=state.get("parent_session_id"),
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "reducer_node: emit CoordinatorReduceEvent failed "
+                    "run=%s: %s", coordinator_run_id, exc,
+                )
+
         return Command(
             update={
                 "apply_plan": output.apply_plan,

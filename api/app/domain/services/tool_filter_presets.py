@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import FrozenSet, Mapping, Optional
 
+from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
+
 
 SUBAGENT_RESEARCH_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "search_web",
@@ -62,7 +64,7 @@ COORDINATOR_STEP_BASE_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
 
 TOOL_FILTER_PRESETS: Mapping[str, FrozenSet[str]] = {
     "subagent_research": SUBAGENT_RESEARCH_ALLOWED_TOOLS,
-    "coordinator_step": COORDINATOR_STEP_BASE_ALLOWED_TOOLS,
+    COORDINATOR_STEP_PRESET: COORDINATOR_STEP_BASE_ALLOWED_TOOLS,
 }
 
 

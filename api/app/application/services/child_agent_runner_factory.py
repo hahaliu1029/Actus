@@ -36,6 +36,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Optional, Protocol
 
+from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.services.tool_filter_presets import resolve_preset
 
 
@@ -141,7 +142,7 @@ class ChildAgentTaskRunnerFactory:
         Raises ``ValueError`` if ``tool_filter_preset`` is not registered.
         """
         tool_filter = resolve_preset(tool_filter_preset)
-        terminal_disabled = tool_filter_preset == "coordinator_step"
+        terminal_disabled = tool_filter_preset == COORDINATOR_STEP_PRESET
         runner = self._runner_class(
             session_id=child_session_id,
             tool_filter=tool_filter,

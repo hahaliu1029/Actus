@@ -777,6 +777,40 @@ class PatchApplier:
                 logger.error(
                     "PatchApplier snapshot discard failed: %s", exc,
                 )
+
+        # C2 PR-8 §13 Task 8.4 — emit CoordinatorApplyEvent. BEST-EFFORT:
+        # try/except so a queue/serialization failure does not change the
+        # ApplyOutcome we return. Lineage root/parent_session_id are NOT
+        # populated here — frontend correlates by ``coordinator_run_id``
+        # to the parallel CoordinatorDispatchEvent lineage. CoordinatorLineageMixin
+        # allows all 5 fields to be None.
+        if self._emit_event is not None:
+            try:
+                from app.domain.models.event import CoordinatorApplyEvent
+                # [codex PR-8 R2 P2 -- deferred to PR-9+] CoordinatorApplyEvent.lineage
+                # (root_session_id / parent_session_id) is currently left as default None
+                # because PatchApplier._finalize doesn't have those values in scope.
+                # Frontend correlates apply events via coordinator_run_id, so this is
+                # behaviorally OK. A future refactor could thread lineage through
+                # PatchApplier.apply(..., lineage: dict[str, str|None]) from
+                # main_graph._run_parallel_backend (which has the values), then unpack
+                # **lineage_dict into the event constructor here for stronger lineage
+                # parity with dispatch/reduce/sibling_cancel events.
+                await self._emit_event(CoordinatorApplyEvent(
+                    apply_status=status.value,
+                    file_count=len(applied),
+                    total_bytes=plan.total_size_bytes,
+                    failed_at_path=failed.path if failed else None,
+                    rollback_status=rollback_status,
+                    coordinator_run_id=plan.coordinator_run_id,
+                ))
+            except Exception as emit_exc:
+                logger.warning(
+                    "PatchApplier emit_event(CoordinatorApplyEvent) "
+                    "raised run=%s: %s",
+                    plan.coordinator_run_id, emit_exc,
+                )
+
         return ApplyOutcome(
             status=status,
             applied_files=tuple(applied),

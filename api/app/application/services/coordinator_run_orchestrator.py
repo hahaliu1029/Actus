@@ -145,7 +145,12 @@ def should_trigger_sibling_cancel(envelope: MailboxEnvelope) -> bool:
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 
-EmitEvent = Callable[[dict[str, Any]], Awaitable[None]]
+# [C2 PR-8 §13 Task 8.4] Widened from ``Callable[[dict], Awaitable[None]]``
+# (PR-6 placeholder shape) to ``Callable[[Any], Awaitable[None]]`` so the
+# orchestrator can emit typed ``CoordinatorSiblingCancelEvent``. The
+# composition root binds this to ``event_queue.put`` which accepts any
+# domain event; the only previous caller passed an ad-hoc dict.
+EmitEvent = Callable[[Any], Awaitable[None]]
 
 
 class CoordinatorRunOrchestrator:
@@ -601,17 +606,35 @@ class CoordinatorRunOrchestrator:
             coordinator_run_id=coordinator_run_id,
             reason=reason,
         )
-        if self._emit_event is not None and cancelled:
+        # C2 PR-8 §13 Task 8.4 — emit typed CoordinatorSiblingCancelEvent.
+        #
+        # Guard ``outcome is not None`` because the event schema requires a
+        # non-None ResultReadyOutcome (the cascade represents a triggered
+        # cancel, and "unknown outcome" is not a meaningful frontend
+        # signal). When ``outcome is None`` we still publish the
+        # CANCEL_REQUEST envelopes above but skip the SSE event — this is
+        # a defensive edge that the observer loop normally avoids by
+        # extracting a real outcome before reaching here.
+        if (
+            self._emit_event is not None
+            and cancelled
+            and outcome is not None
+        ):
             try:
-                await self._emit_event({
-                    "coordinator_run_id": coordinator_run_id,
-                    "triggered_by_wu": triggered_by_wu,
-                    "triggered_by_outcome": outcome,
-                    "cancelled_wu_ids": sorted(cancelled),
-                })
+                from app.domain.models.event import (
+                    CoordinatorSiblingCancelEvent,
+                )
+                await self._emit_event(CoordinatorSiblingCancelEvent(
+                    triggered_by_work_unit_id=triggered_by_wu,
+                    triggered_by_outcome=outcome,
+                    cancelled_work_unit_ids=sorted(cancelled),
+                    reason=reason,
+                    coordinator_run_id=coordinator_run_id,
+                ))
             except Exception as exc:
                 logger.warning(
-                    "CoordinatorRunOrchestrator: emit_event raised run=%s: %s",
+                    "CoordinatorRunOrchestrator: emit "
+                    "CoordinatorSiblingCancelEvent raised run=%s: %s",
                     coordinator_run_id, exc,
                 )
 

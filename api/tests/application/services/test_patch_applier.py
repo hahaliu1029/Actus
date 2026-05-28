@@ -511,14 +511,25 @@ async def test_rollback_partial_emits_health_event(
     assert out.rollback_status == "partial"
     assert out.failed_at is not None
     assert "write 2 fails" in out.failed_at.reason
-    assert emit_event.await_count == 1
-    emitted = emit_event.await_args.args[0]
-    assert isinstance(emitted, HealthEvent)
-    assert emitted.status == HealthStatus.TERMINATING
-    assert emitted.metrics is not None
+    # [C2 PR-8 §13 Task 8.4] _finalize now also emits a CoordinatorApplyEvent,
+    # so emit_event is awaited twice on rollback_partial: once for the
+    # HealthEvent (TERMINATING) and once for the CoordinatorApplyEvent.
+    from app.domain.models.event import CoordinatorApplyEvent
+    assert emit_event.await_count == 2
+    emitted_payloads = [c.args[0] for c in emit_event.await_args_list]
+    health_evs = [e for e in emitted_payloads if isinstance(e, HealthEvent)]
+    apply_evs = [
+        e for e in emitted_payloads if isinstance(e, CoordinatorApplyEvent)
+    ]
+    assert len(health_evs) == 1
+    assert health_evs[0].status == HealthStatus.TERMINATING
+    assert health_evs[0].metrics is not None
     assert (
-        emitted.metrics["code"] == "coordinator_apply_rollback_partial"
+        health_evs[0].metrics["code"] == "coordinator_apply_rollback_partial"
     )
+    assert len(apply_evs) == 1
+    assert apply_evs[0].apply_status == "rollback_partial"
+    assert apply_evs[0].coordinator_run_id == "r1"
 
 
 # ─── Audit lifecycle ────────────────────────────────────────────────────────

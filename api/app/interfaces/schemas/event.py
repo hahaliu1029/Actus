@@ -7,6 +7,11 @@ from app.domain.models.event import (
     ControlEvent,
     ControlScope,
     ControlSource,
+    CoordinatorApplyEvent,
+    CoordinatorDispatchEvent,
+    CoordinatorReduceEvent,
+    CoordinatorSiblingCancelEvent,
+    CoordinatorWorkerSpawnedEvent,
     Event,
     HealthEvent,
     HealthStatus,
@@ -18,6 +23,7 @@ from app.domain.models.event import (
     ToolEventStatus,
 )
 from app.domain.models.file import File
+from app.domain.models.mailbox_envelope import CostAggregate
 from app.domain.models.plan import ExecutionStatus
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -521,6 +527,134 @@ class SandboxStateChangedSSEEvent(BaseSSEEvent):
         )
 
 
+# ---------------------------------------------------------------------------
+# [C2 PR-8 §13] Coordinator SSE events.
+#
+# Each domain-side ``Coordinator*Event`` composes ``CoordinatorLineageMixin``,
+# which carries five optional lineage tags. The matching EventData subclasses
+# below declare every domain-event field (lineage + event-specific payload) so
+# ``BaseEventData.from_event`` — which spreads
+# ``event.model_dump(..., exclude={"id","type","created_at","seq"})`` into the
+# data constructor — can populate them without ``TypeError``.
+#
+# Field-type choices are deliberately JSON-safe: enums are declared as ``str``
+# (model_dump(mode="json") emits enum ``.value``), nested ``CostAggregate``
+# stays typed because Pydantic re-validates dicts back into the model.
+# ---------------------------------------------------------------------------
+
+
+class CoordinatorDispatchEventData(BaseEventData):
+    """[C2 PR-8 §13.3] Coordinator dispatch payload."""
+
+    root_session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    child_session_id: Optional[str] = None
+    coordinator_run_id: Optional[str] = None
+    work_unit_id: Optional[str] = None
+    step_id: str
+    work_unit_count: int
+    work_unit_ids: List[str]
+    phases: List[str]
+
+
+class CoordinatorDispatchSSEEvent(BaseSSEEvent):
+    """[C2 PR-8 §13.3] Coordinator dispatch SSE event."""
+
+    event: Literal["coordinator_dispatch"] = "coordinator_dispatch"
+    data: CoordinatorDispatchEventData
+
+
+class CoordinatorWorkerSpawnedEventData(BaseEventData):
+    """[C2 PR-8 §13.3] Worker-spawned payload."""
+
+    root_session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    child_session_id: Optional[str] = None
+    coordinator_run_id: Optional[str] = None
+    work_unit_id: Optional[str] = None
+    objective: str
+    phase: str
+    allowed_tools: List[str]
+    write_lease_count: int
+
+
+class CoordinatorWorkerSpawnedSSEEvent(BaseSSEEvent):
+    """[C2 PR-8 §13.3] Worker-spawned SSE event."""
+
+    event: Literal["coordinator_worker_spawned"] = "coordinator_worker_spawned"
+    data: CoordinatorWorkerSpawnedEventData
+
+
+class CoordinatorReduceEventData(BaseEventData):
+    """[C2 PR-8 §13.3] Reduce payload.
+
+    ``group_outcome`` and per-worker outcome values arrive as enum ``.value``
+    strings from ``model_dump(mode="json")``; ``cost_total`` round-trips back
+    into ``CostAggregate`` via Pydantic validation.
+    """
+
+    root_session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    child_session_id: Optional[str] = None
+    coordinator_run_id: Optional[str] = None
+    work_unit_id: Optional[str] = None
+    group_outcome: str
+    per_worker_outcomes: Dict[str, str]
+    diagnostics_summary: str
+    conflict_paths: List[str] = Field(default_factory=list)
+    cost_total: CostAggregate
+
+
+class CoordinatorReduceSSEEvent(BaseSSEEvent):
+    """[C2 PR-8 §13.3] Reduce SSE event."""
+
+    event: Literal["coordinator_reduce"] = "coordinator_reduce"
+    data: CoordinatorReduceEventData
+
+
+class CoordinatorApplyEventData(BaseEventData):
+    """[C2 PR-8 §13.3] Patch-apply progress payload."""
+
+    root_session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    child_session_id: Optional[str] = None
+    coordinator_run_id: Optional[str] = None
+    work_unit_id: Optional[str] = None
+    apply_status: str
+    file_count: int = 0
+    total_bytes: int = 0
+    failed_at_path: Optional[str] = None
+    rollback_status: Optional[str] = None
+
+
+class CoordinatorApplySSEEvent(BaseSSEEvent):
+    """[C2 PR-8 §13.3] Patch-apply SSE event."""
+
+    event: Literal["coordinator_apply"] = "coordinator_apply"
+    data: CoordinatorApplyEventData
+
+
+class CoordinatorSiblingCancelEventData(BaseEventData):
+    """[C2 PR-8 §13.3] Sibling-cancel payload."""
+
+    root_session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    child_session_id: Optional[str] = None
+    coordinator_run_id: Optional[str] = None
+    work_unit_id: Optional[str] = None
+    triggered_by_work_unit_id: str
+    triggered_by_outcome: str
+    cancelled_work_unit_ids: List[str]
+    reason: str
+
+
+class CoordinatorSiblingCancelSSEEvent(BaseSSEEvent):
+    """[C2 PR-8 §13.3] Sibling-cancel SSE event."""
+
+    event: Literal["coordinator_sibling_cancel"] = "coordinator_sibling_cancel"
+    data: CoordinatorSiblingCancelEventData
+
+
 # 定义Agent流式事件类型集合
 AgentSSEEvent = Union[
     CommonSSEEvent,
@@ -537,6 +671,11 @@ AgentSSEEvent = Union[
     HealthSSEEvent,
     ToolConfirmationSSEEvent,
     SandboxStateChangedSSEEvent,
+    CoordinatorDispatchSSEEvent,
+    CoordinatorWorkerSpawnedSSEEvent,
+    CoordinatorReduceSSEEvent,
+    CoordinatorApplySSEEvent,
+    CoordinatorSiblingCancelSSEEvent,
 ]
 
 

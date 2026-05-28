@@ -23,6 +23,7 @@ from app.application.services.cost_aggregation_service import (
     CostAggregationService,
 )
 from app.domain.models.cost_snapshot import CostSource, SessionCostSnapshot
+from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.services.subagent_limits import MAX_DESCENDANTS_PER_ROOT, MAX_SUBAGENT_DEPTH
 
 if TYPE_CHECKING:
@@ -155,7 +156,7 @@ class SessionCostTreeService:
                 # query for self+kept descendant ids, but guard anyway).
                 continue
             preset = session.tool_filter_preset
-            if preset == "coordinator_step":
+            if preset == COORDINATOR_STEP_PRESET:
                 coord_total += row.total_usd
             elif preset == "subagent_research":
                 research_total += row.total_usd

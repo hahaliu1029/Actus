@@ -414,10 +414,14 @@ class TestEmitEventHook:
     sibling-cancel decisions so downstream SSE surface can render them."""
 
     async def test_emit_event_called_on_sibling_cancel(self) -> None:
-        publisher = AsyncMock()
-        emitted: list[dict[str, Any]] = []
+        # [C2 PR-8 §13 Task 8.4] Orchestrator now emits a typed
+        # CoordinatorSiblingCancelEvent (was a placeholder dict in PR-6).
+        from app.domain.models.event import CoordinatorSiblingCancelEvent
 
-        async def emit(event: dict[str, Any]) -> None:
+        publisher = AsyncMock()
+        emitted: list[Any] = []
+
+        async def emit(event: Any) -> None:
             emitted.append(event)
 
         env = _result_ready_env(
@@ -440,10 +444,11 @@ class TestEmitEventHook:
         )
         assert len(emitted) == 1
         ev = emitted[0]
-        assert ev["coordinator_run_id"] == "r1"
-        assert ev["triggered_by_wu"] == "wu1"
-        assert ev["triggered_by_outcome"] == ResultReadyOutcome.FAILED
-        assert ev["cancelled_wu_ids"] == ["wu2"]
+        assert isinstance(ev, CoordinatorSiblingCancelEvent)
+        assert ev.coordinator_run_id == "r1"
+        assert ev.triggered_by_work_unit_id == "wu1"
+        assert ev.triggered_by_outcome == ResultReadyOutcome.FAILED
+        assert ev.cancelled_work_unit_ids == ["wu2"]
 
     async def test_emit_event_not_called_on_success_terminal(self) -> None:
         publisher = AsyncMock()

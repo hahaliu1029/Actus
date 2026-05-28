@@ -727,6 +727,17 @@ def build_supervisor_registry(
         #   - ``coordinator_envelope_store`` (PR-7 §12.4) -- concrete impl
         #     exists at ``DbCoordinatorResultEnvelopeStoreRepository`` but
         #     wiring deferred for atomic PR-9 flip.
+        #   - ``PatchApplier._emit_event`` (PR-8 §13.5) -- wired to the per-run
+        #     ``event_queue.put`` callback when the applier is constructed
+        #     inside ``_run_parallel_backend``. Today the live call site passes
+        #     None / a noop; the CoordinatorApplyEvent emit therefore silently
+        #     no-ops in production. PR-9 wires this via the composition root
+        #     when the feature flag flips.
+        #   - ``CoordinatorRunOrchestrator._emit_event`` (PR-8 §13.6) -- wired
+        #     via ``orchestrator_factory.build(..., emit_event=event_queue.put)``
+        #     inside ``_first_time_dispatch``. Today the factory call passes
+        #     no emit_event; the CoordinatorSiblingCancelEvent emit therefore
+        #     silently no-ops. PR-9 wires this when the flag flips.
         # While unset (None default), the PR-6 cost-rollup PROLOGUE and
         # PR-7 persist-terminal PROLOGUE both silently no-op. The
         # supervisor otherwise functions identically to pre-coordinator

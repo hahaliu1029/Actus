@@ -6,7 +6,9 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 from .file import File
+from .mailbox_envelope import CostAggregate, ResultReadyOutcome
 from .message import SkillConfirmationAction
+from .patch_apply_plan import GroupOutcome
 from .plan import Plan, Step
 from .search import SearchResultItem
 from .tool_result import ToolResult
@@ -356,6 +358,83 @@ class OwnerConflictEvent(BaseEvent):
     payload: OwnerConflictPayload
 
 
+# ---------------------------------------------------------------------------
+# C2 PR-8 §13 — Coordinator SSE events
+#
+# Five new events surface the coordinator/child lineage to the frontend so a
+# parent session can render the fan-out timeline. ``CoordinatorLineageMixin``
+# carries the optional lineage tag fields; every coordinator event composes it
+# alongside :class:`BaseEvent`. Lineage fields are all ``Optional[str] = None``
+# so an event emitted from the root session still validates.
+# ---------------------------------------------------------------------------
+
+
+class CoordinatorLineageMixin(BaseModel):
+    """[C2 PR-8 §13.2] Optional lineage tagging.
+
+    All fields default to ``None`` so the mixin is safe to compose into events
+    emitted from the root session (no coordinator context yet).
+    """
+
+    root_session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    child_session_id: Optional[str] = None
+    coordinator_run_id: Optional[str] = None
+    work_unit_id: Optional[str] = None
+
+
+class CoordinatorDispatchEvent(BaseEvent, CoordinatorLineageMixin):
+    """[C2 PR-8 §13.3] Coordinator about to spawn ``work_unit_count`` children."""
+
+    type: Literal["coordinator_dispatch"] = "coordinator_dispatch"
+    step_id: str
+    work_unit_count: int
+    work_unit_ids: List[str]
+    phases: List[Literal["exploration", "write"]]
+
+
+class CoordinatorWorkerSpawnedEvent(BaseEvent, CoordinatorLineageMixin):
+    """[C2 PR-8 §13.3] A child session was spawned for a work unit."""
+
+    type: Literal["coordinator_worker_spawned"] = "coordinator_worker_spawned"
+    objective: str
+    phase: Literal["exploration", "write"]
+    allowed_tools: List[str]
+    write_lease_count: int
+
+
+class CoordinatorReduceEvent(BaseEvent, CoordinatorLineageMixin):
+    """[C2 PR-8 §13.3] Reducer emitted the group-level outcome."""
+
+    type: Literal["coordinator_reduce"] = "coordinator_reduce"
+    group_outcome: GroupOutcome
+    per_worker_outcomes: Dict[str, ResultReadyOutcome]
+    diagnostics_summary: str
+    conflict_paths: List[str] = Field(default_factory=list)
+    cost_total: CostAggregate
+
+
+class CoordinatorApplyEvent(BaseEvent, CoordinatorLineageMixin):
+    """[C2 PR-8 §13.3] Patch-apply phase progress."""
+
+    type: Literal["coordinator_apply"] = "coordinator_apply"
+    apply_status: str  # ApplyStatus value
+    file_count: int = 0
+    total_bytes: int = 0
+    failed_at_path: Optional[str] = None
+    rollback_status: Optional[str] = None
+
+
+class CoordinatorSiblingCancelEvent(BaseEvent, CoordinatorLineageMixin):
+    """[C2 PR-8 §13.3] Fail-fast / authorization-gate sibling cancellation."""
+
+    type: Literal["coordinator_sibling_cancel"] = "coordinator_sibling_cancel"
+    triggered_by_work_unit_id: str
+    triggered_by_outcome: ResultReadyOutcome
+    cancelled_work_unit_ids: List[str]
+    reason: str
+
+
 # 定义应用事件类型声明
 Event = Annotated[
     Union[
@@ -375,6 +454,11 @@ Event = Annotated[
         SandboxStateChangedEvent,
         ExecutionStateChangedEvent,  # B3-core PR-1
         OwnerConflictEvent,           # B3-core PR-1
+        CoordinatorDispatchEvent,     # C2 PR-8
+        CoordinatorWorkerSpawnedEvent,  # C2 PR-8
+        CoordinatorReduceEvent,       # C2 PR-8
+        CoordinatorApplyEvent,        # C2 PR-8
+        CoordinatorSiblingCancelEvent,  # C2 PR-8
         DoneEvent,
     ],
     Field(discriminator="type"),
