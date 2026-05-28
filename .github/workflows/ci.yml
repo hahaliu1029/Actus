@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, develop]
   pull_request:
-    branches: [main, dev]
+    branches: [main, develop]
 
 jobs:
   backend-test:
@@ -81,7 +81,14 @@ jobs:
           REDIS_DB: 0
           JWT_SECRET_KEY: ci-test-secret-key
           ENV: test
-        run: uv run pytest api/tests/ -v
+        # C2 PR-9 marker-split execution: first run everything EXCEPT
+        # coordinator_recovery (AST gates + unit + non-recovery integration),
+        # then run ONLY coordinator_recovery (E2E integration set; PR-9a's
+        # scaffolds register as skips here pending PR-9b infrastructure).
+        run: |
+          cd api
+          uv run pytest -m "not coordinator_recovery and not slow and not sandbox and not browser_eval" --tb=short
+          uv run pytest -m "coordinator_recovery and not slow and not sandbox and not browser_eval" --tb=short
 
   sandbox-adversarial:
     name: Sandbox Mount Adversarial Tests

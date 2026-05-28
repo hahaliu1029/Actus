@@ -102,3 +102,6 @@ api/tests/evals/reminder_bench_results.json
 # someone accidentally placing a private dataset inside tests/ while iterating.
 api/tests/eval/memory_gate/real/
 api/tests/eval/**/real/
+
+# Playwright MCP session traces
+.playwright-mcp/

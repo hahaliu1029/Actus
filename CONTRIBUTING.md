@@ -309,6 +309,69 @@ PR-7 落地了 coordinator 的 crash-recovery 主路径（spec §12）：pod 重
 
 `_rehydrate_dispatch` 检测到 `work_units` 中存在 wu_id 在 `existing.child_session_ids` 中找不到对应行时，会 raise `RuntimeError("rehydrate: cannot resume run ...")` 而非 silently fall through to reducer with 不完整 worker_results。原因：silently fall-through 会让 applier 提交"少了几个子任务结果"的不完整 patch plan。两种正常诱因：(a) planner 在 retry 时生成了不同的 work_unit 集合（plan 变化）；(b) 原始 dispatch 在 create_session_with_parent 循环中途 crash。PR-7+ 会引入 `_spawn_one(wu)` 幂等 spawn（依赖 `(coordinator_run_id, work_unit_id)` 上的 partial-unique INDEX）取代硬失败。
 
+## C2 PR-9 Acceptance — Flip `ACTUS_C2_COORDINATOR_ENABLED=true`
+
+> **Note on PR-9a / PR-9b nomenclature:** The plan at
+> `docs/superpowers/plans/2026-05-25-c2-coordinator-task-runner-plan.md`
+> defines a single PR-9 (lines 9390-10220). At implementation time, the
+> tests + scaffolds + flip-SOP slice shipped as **PR-9a**; the remaining
+> coordinator wirings (fixture harness, 4 deferred composition-root
+> `_emit_event`/repo callables, `reducer_node` cost_total source,
+> `CoordinatorApplyEvent` lineage threading) are tracked separately as
+> **PR-9b**. PR-9b does not yet have its own plan document — when work
+> begins, write a `docs/superpowers/plans/<date>-c2-coordinator-pr9b-*.md`
+> follow-up plan and link it here.
+
+PR-9 ships in two phases. Read both before flipping the flag.
+
+### PR-9a (this PR) — scaffolds + invariants
+
+Shipped:
+- 7 AST + schema gates enforcing static C2 invariants (`tests/domain/**/test_executor_*.py`, `tests/domain/services/graphs/test_two_clock_extended_parallel.py`, `tests/application/services/test_reducer_purity.py`, `tests/application/services/test_coordinator_no_sandbox_destroy.py`, `tests/domain/services/permission/test_child_scope_gate_prologue.py`, `tests/domain/models/test_coordinator_lineage_mixin_enforced.py`, `tests/integration/test_coordinator_apply_audit_partial_unique.py`).
+- 3 E2E integration test scaffolds (`tests/integration/test_coordinator_e2e_*.py`) — currently `@pytest.mark.skip` pending PR-9b infrastructure.
+- 6 pytest markers (`coordinator_pure`, `coordinator_graph`, `coordinator_worker`, `coordinator_mailbox`, `coordinator_apply`, `coordinator_recovery`).
+- CI yml marker-split execution.
+
+NOT yet shipped (PR-9b scope):
+- 7 fixtures the E2E tests need: `async_client`, `async_session` (or `async_session_factory` re-spec), `redis_real`, `minio_real`, `sandbox_real`, `fixture_mock_llm_3_workers`, `env_with_coordinator_flag_on`.
+- 4 deferred composition-root wirings at `api/app/interfaces/service_dependencies.py:715-755`:
+  - `SupervisorContext.cost_rollup_service` (PR-6 §14.4)
+  - `SupervisorContext.coordinator_envelope_store` (PR-7 §12.4)
+  - `PatchApplier._emit_event` (PR-8 §13.5)
+  - `CoordinatorRunOrchestrator._emit_event` (PR-8 §13.6)
+- `reducer_node` cost_total source wiring (`api/app/domain/services/graphs/parallel_execution_subgraph.py` inline comment, PR-8 R2 P2).
+- `CoordinatorApplyEvent` lineage threading (`api/app/application/services/patch_applier.py:790` inline comment, PR-8 R1 P2).
+
+While the flag stays `false`, the coordinator emit sites silently no-op and the supervisor behaves identically to pre-coordinator code.
+
+### Acceptance gate (before flipping `ACTUS_C2_COORDINATOR_ENABLED=true`)
+
+1. PR-1..8 + PR-9a merged to `develop` (already done by this PR's prerequisites).
+2. PR-9b merged: fixtures land, 4 emit_event/repo wirings flip to non-None at the composition root, cost_total + lineage TODOs closed.
+3. All 7 AST gates pass: `cd api && uv run pytest -m "not coordinator_recovery and not slow and not sandbox and not browser_eval" --tb=short` exits 0.
+4. All 3 E2E tests pass (no longer skipped): `cd api && uv run pytest -m "coordinator_recovery and not slow and not sandbox and not browser_eval" --tb=short` exits 0 with 3 passed.
+5. All `MailboxSupervisor` pods upgraded to the new envelope schema (operator check).
+6. PR-9b codex xhigh review verdict READY (P0 = P1 = P2 = 0).
+
+### Flip procedure
+
+1. Update `.env` (or k8s ConfigMap): `ACTUS_C2_COORDINATOR_ENABLED=true`.
+2. Roll restart `api` pods.
+3. Monitor (PR-9b call-site wiring required for live signal):
+   - `actus_coordinator_run_cost_usd` — emitted from `CoordinatorRunOrchestrator` (call-site wiring lands in PR-9b together with the deferred `_emit_event` wirings).
+   - `actus_coordinator_budget_exhaustion_total` — emitted from `BudgetEnforcementCallback` (same PR-9b dependency).
+
+   Precondition: drive a synthetic coordinator run (a planner step with 2-3 `parallel_work_units`) and verify `actus_coordinator_run_cost_usd > 0` via the metrics endpoint. If the counter is flat after a known coordinator run, the call-site wiring hasn't landed yet — DO NOT rely on flat readings to declare "no coordinator runs."
+4. 24h observation window after the synthetic-run smoke check passes.
+5. Rollback if anomaly: revert `ACTUS_C2_COORDINATOR_ENABLED=false`, roll restart `api` pods.
+
+### Rollback safety
+
+- Today (PR-2/PR-3 planner teaching wiring deferred): the `PARALLEL_WORK_UNITS_TEACHING_{EN,ZH}` constants in `api/app/domain/services/prompts/bundles/{zh,en}.py` are defined but not yet injected into the planner prompt registry — so the planner LLM doesn't know the `parallel_work_units` schema and can't emit it, regardless of `ACTUS_C2_COORDINATOR_ENABLED`. Once PR-2/PR-3 inject the teaching, the flag-gating below becomes the active control.
+- Defense in depth: if any cold-code path or stale prompt ever produced `parallel_work_units` while the flag is `false`, the executor's `assert_coordinator_enabled()` at `api/app/domain/services/graphs/main_graph.py:695` raises `RuntimeError` — fail-loud rather than silent-dispatch.
+- Mid-run rollback caveat: flipping the flag back to `false` mid-run is NOT graceful. The supervisor continues consuming envelopes already dispatched, but any rehydrate-on-restart will hit `assert_coordinator_enabled()` and fail-fast. Drain in-flight coordinator runs (or wait for them to reach terminal) before flipping `false`.
+- No data loss across flips; `coordinator_apply_audit`, `coordinator_result_envelope_store`, `coordinator_run_state` tables persist independently of the flag.
+
 ## 前端开发
 
 ```bash
