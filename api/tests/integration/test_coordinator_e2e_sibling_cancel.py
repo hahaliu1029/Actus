@@ -33,6 +33,12 @@ beyond ``db_session`` / ``async_session_factory``):
     ``ACTUS_C2_COORDINATOR_ENABLED=true``.
 
 Deferred coordinator wiring (see ``service_dependencies.py:715-755`` TODO):
+  - [BLOCKER -- PR-9b-D discovery] The child-runner PRODUCTION wiring itself is
+    incomplete: ``service_dependencies.py:1126`` injects the BARE
+    ``AgentTaskRunner`` class; the ``functools.partial(AgentTaskRunner, llm +
+    ~10 required deps)`` was deferred (old plan "PR-5") and never shipped, so a
+    flag-on child spawn raises ``TypeError``. This is the PRIMARY blocker and is
+    OUT OF PR-9b scope -- tracked for the "C2 coordinator finish" follow-up epic.
   - ``SupervisorContext.cost_rollup_service`` (PR-6 §14.4) -- Protocol-only
     stub today.
   - ``SupervisorContext.coordinator_envelope_store`` (PR-7 §12.4) -- concrete
@@ -62,7 +68,21 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio, pytest.mark.coordinato
 
 
 @pytest.mark.skip(
-    reason="PR-9b: fixture infrastructure pending -- see module docstring GAP NOTICE"
+    reason=(
+        "[C2-E2E-DEFERRED] Coordinator live E2E is blocked on UNFINISHED "
+        "PRODUCTION wiring, not just test infra: the child-runner dispatch is "
+        "cold code -- service_dependencies.py:1126 injects the bare "
+        "AgentTaskRunner class (the functools.partial binding llm + ~10 "
+        "required deps was deferred to the old plan's 'PR-5' and never shipped), "
+        "so a flag-on coordinator child spawn raises TypeError "
+        "(child_agent_runner_factory.py:146 calls it with 4 kwargs; "
+        "AgentTaskRunner.__init__ needs ~11). Re-enabling requires the dedicated "
+        "'C2 coordinator finish' follow-up epic (production child-runner wiring "
+        "+ fake-LLM injection seam + setup_responses / X-Test-User-Id / "
+        "atomic_write_file harness gaps + CI MinIO/Docker provisioning). "
+        "Locked honest-skip by "
+        "tests/structure/test_coordinator_e2e_skip_honesty.py."
+    )
 )
 async def test_e2e_first_failed_cancels_siblings(
     async_client, async_session, redis_real, minio_real, sandbox_real,

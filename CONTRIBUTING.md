@@ -446,3 +446,69 @@ docs: refresh deployment and API docs
 
 - 普通问题请使用 Issue：<https://github.com/hahaliu1029/Actus/issues>
 - 安全问题请不要公开提交，请参考 [SECURITY.md](SECURITY.md)
+
+## C2 Coordinator Rollout SOP
+
+### Concept anchors (do NOT drift from these)
+
+1. **`cost_rollup_service` is a metric / observability hook, NOT a cost source.**
+   The authoritative cost source is the `cost_records` ledger via
+   `CostCallbackHandler` + `flush_pending()`. `CoordinatorReduceEvent.cost_total`
+   is computed by `CostRollupService.aggregate(...)`, which queries the ledger.
+   The legacy `rollup_to_parent(...)` push call is preserved for telemetry but
+   does NOT participate in coordinator event payload computation.
+
+2. **Business lineage is the system contract; OTel is observability.**
+   `root_session_id / parent_session_id / child_session_id / coordinator_run_id /
+   work_unit_id` are authoritative for SSE, DB joins, rehydrate, idempotency,
+   UI grouping. OTel `traceparent` / span context is for logs / metrics / traces
+   only and MUST NOT participate in business correlation.
+
+3. **`CoordinatorApplyEvent` is group-level.** It carries 3 lineage fields
+   (`root_session_id`, `parent_session_id`, `coordinator_run_id`). Per-child
+   fields (`child_session_id`, `work_unit_id`) stay `None` — they belong on
+   per-worker events.
+
+### Flag flip checklist
+
+> **⚠️ Not yet runnable (as of PR-9b-D / R1).** This is the *target* flip-gate.
+> Two referenced tests do not exist yet: `tests/integration/test_coordinator_dark_launch.py`
+> and `tests/structure/test_coordinator_e2e_unskipped.py` are produced by the
+> deferred **"C2 coordinator finish" follow-up epic** (which also unskips the 3
+> E2E tests and completes the production child-runner wiring — see
+> `tests/structure/test_coordinator_e2e_skip_honesty.py` for why they are
+> currently skipped). Until that epic lands, this command exits file-not-found
+> and `ACTUS_C2_COORDINATOR_ENABLED` MUST stay `false`.
+
+Run these two commands on the candidate commit; both must pass:
+
+1. **Coordinator acceptance** — exactly 6 passed, 0 skipped (1 dark-launch + 3 E2E + 2 structural guard tests):
+
+   ```bash
+   cd api && uv run pytest \
+     tests/integration/test_coordinator_dark_launch.py \
+     tests/integration/test_coordinator_e2e_apply_rollback.py \
+     tests/integration/test_coordinator_e2e_3_work_units.py \
+     tests/integration/test_coordinator_e2e_sibling_cancel.py \
+     tests/structure/test_coordinator_e2e_unskipped.py \
+     --tb=short -rs --strict-markers --strict-config
+   ```
+
+2. **Non-coordinator-recovery regression** — no new failures vs. `develop`
+   baseline:
+
+   ```bash
+   cd api && uv run pytest \
+     -m "not slow and not sandbox and not browser_eval and not coordinator_recovery" \
+     --tb=short --strict-markers --strict-config
+   ```
+
+Then flip `ACTUS_C2_COORDINATOR_ENABLED=true` via deploy config.
+
+### Rollback caveat
+
+Flipping `ACTUS_C2_COORDINATOR_ENABLED=false` while a coordinator run is
+in-flight is **NOT a graceful abort**. Wiring stays live; in-flight runs continue
+to emit events and drain to terminal state. The flag only gates the entry to
+**new** coordinator dispatches. To fully drain before rollback, wait for all
+sessions with a `parallel_work_units` step to reach terminal status, then flip.
