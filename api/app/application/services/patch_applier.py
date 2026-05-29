@@ -159,6 +159,7 @@ def _truncate_reason(reason: Optional[str]) -> Optional[str]:
     return sanitized[:keep] + " ...[truncated]"
 
 if TYPE_CHECKING:
+    from app.application.services.group_lineage import GroupLineageFields
     from app.application.services.rollback_snapshot_store import (
         FileSnapshot,
         RollbackSnapshotStore,
@@ -268,6 +269,7 @@ class PatchApplier:
         parent_sandbox: "ParentSandboxPort",
         minio_client: "ArtifactStoragePort",
         cancel_event: Optional[asyncio.Event] = None,
+        lineage: Optional["GroupLineageFields"] = None,
     ) -> ApplyOutcome:
         """Apply ``plan`` to ``parent_sandbox``; return ``ApplyOutcome``.
 
@@ -275,6 +277,15 @@ class PatchApplier:
         lock's auto-expire TTL (Redis releases it after 10 minutes if
         our pod hangs); ``blocking=False`` means we fail-fast if another
         apply is in flight for the same run_id (idempotency guard).
+
+        [PR-9b-B INV-B4] ``lineage`` carries the group-level
+        ``root_session_id`` / ``parent_session_id`` so the emitted
+        ``CoordinatorApplyEvent`` carries full lineage parity with the
+        dispatch/reduce/sibling-cancel events. ``None`` (legacy callers)
+        leaves those event fields at their default ``None``; only
+        ``coordinator_run_id`` is then populated. Per-child fields
+        (``child_session_id`` / ``work_unit_id``) are never set on the
+        apply event because apply is a group-level operation.
         """
         started_at = time.time()
         lock_key = f"coordinator:apply:{plan.coordinator_run_id}"
@@ -283,6 +294,7 @@ class PatchApplier:
         ):
             return await self._apply_locked(
                 plan, parent_sandbox, minio_client, cancel_event, started_at,
+                lineage=lineage,
             )
 
     async def _apply_locked(
@@ -292,6 +304,8 @@ class PatchApplier:
         minio_client: "ArtifactStoragePort",
         cancel_event: Optional[asyncio.Event],
         started_at: float,
+        *,
+        lineage: Optional["GroupLineageFields"] = None,
     ) -> ApplyOutcome:
         # ── Step 2: cancel-before-write fast-path ────────────────────────
         # Nothing has been written, no audit row exists — return cleanly
@@ -344,6 +358,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                         )
                     cur = await parent_sandbox.compute_digest(e.path)
                     if cur != e.base_digest:
@@ -357,6 +372,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                         )
                     # Snapshot AFTER digest match — saves wasted
                     # snapshot write on the abort path.
@@ -379,6 +395,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                         )
         except Exception as preflight_exc:
             # No writes have happened yet (only snapshot reads), so no
@@ -394,6 +411,7 @@ class PatchApplier:
                 snapshots_to_discard=snapshots,
                 started_at=started_at,
                 plan=plan,
+                lineage=lineage,
             )
 
         # ── Step 4: actual apply ─────────────────────────────────────────
@@ -416,6 +434,7 @@ class PatchApplier:
                     snapshots_to_discard=snapshots,
                     started_at=started_at,
                     plan=plan,
+                    lineage=lineage,
                     rollback_status=rb,
                     rollback_failed_paths=rb_failed,
                 )
@@ -447,6 +466,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                             rollback_status=rb,
                             rollback_failed_paths=rb_failed,
                         )
@@ -483,6 +503,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                             rollback_status=rb,
                             rollback_failed_paths=rb_failed,
                         )
@@ -509,6 +530,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                             rollback_status=rb,
                             rollback_failed_paths=rb_failed,
                         )
@@ -547,6 +569,7 @@ class PatchApplier:
                             snapshots_to_discard=snapshots,
                             started_at=started_at,
                             plan=plan,
+                            lineage=lineage,
                             rollback_status=rb,
                             rollback_failed_paths=rb_failed,
                         )
@@ -603,6 +626,7 @@ class PatchApplier:
                     snapshots_to_discard=snapshots,
                     started_at=started_at,
                     plan=plan,
+                    lineage=lineage,
                     rollback_status=rb,
                     rollback_failed_paths=rb_failed,
                 )
@@ -615,6 +639,7 @@ class PatchApplier:
             snapshots_to_discard=snapshots,
             started_at=started_at,
             plan=plan,
+            lineage=lineage,
         )
 
     # ── helpers ──────────────────────────────────────────────────────────
@@ -725,6 +750,7 @@ class PatchApplier:
         plan: "PatchApplyPlan",
         rollback_status: Optional[str] = None,
         rollback_failed_paths: Optional[list[str]] = None,
+        lineage: Optional["GroupLineageFields"] = None,
     ) -> ApplyOutcome:
         """Write the terminal audit row + clean up snapshots + return.
 
@@ -780,30 +806,35 @@ class PatchApplier:
 
         # C2 PR-8 §13 Task 8.4 — emit CoordinatorApplyEvent. BEST-EFFORT:
         # try/except so a queue/serialization failure does not change the
-        # ApplyOutcome we return. Lineage root/parent_session_id are NOT
-        # populated here — frontend correlates by ``coordinator_run_id``
-        # to the parallel CoordinatorDispatchEvent lineage. CoordinatorLineageMixin
-        # allows all 5 fields to be None.
+        # ApplyOutcome we return. CoordinatorLineageMixin allows all 5
+        # lineage fields to be None.
+        #
+        # [PR-9b-B INV-B4] When ``lineage`` is supplied by the caller
+        # (main_graph._run_parallel_backend → B6), thread the group-level
+        # ``root_session_id`` / ``parent_session_id`` onto the event for
+        # full lineage parity with dispatch/reduce/sibling_cancel events.
+        # Apply is a group-level operation, so the per-child fields
+        # (``child_session_id`` / ``work_unit_id``) are deliberately NOT
+        # set. Legacy callers (lineage=None) leave root/parent as the
+        # mixin default None; frontend then correlates apply events via
+        # ``coordinator_run_id`` to the parallel CoordinatorDispatchEvent.
         if self._emit_event is not None:
             try:
                 from app.domain.models.event import CoordinatorApplyEvent
-                # [codex PR-8 R2 P2 -- deferred to PR-9+] CoordinatorApplyEvent.lineage
-                # (root_session_id / parent_session_id) is currently left as default None
-                # because PatchApplier._finalize doesn't have those values in scope.
-                # Frontend correlates apply events via coordinator_run_id, so this is
-                # behaviorally OK. A future refactor could thread lineage through
-                # PatchApplier.apply(..., lineage: dict[str, str|None]) from
-                # main_graph._run_parallel_backend (which has the values), then unpack
-                # **lineage_dict into the event constructor here for stronger lineage
-                # parity with dispatch/reduce/sibling_cancel events.
-                await self._emit_event(CoordinatorApplyEvent(
-                    apply_status=status.value,
-                    file_count=len(applied),
-                    total_bytes=plan.total_size_bytes,
-                    failed_at_path=failed.path if failed else None,
-                    rollback_status=rollback_status,
-                    coordinator_run_id=plan.coordinator_run_id,
-                ))
+                event_kwargs: dict[str, Any] = {
+                    "apply_status": status.value,
+                    "file_count": len(applied),
+                    "total_bytes": plan.total_size_bytes,
+                    "failed_at_path": failed.path if failed else None,
+                    "rollback_status": rollback_status,
+                    "coordinator_run_id": plan.coordinator_run_id,
+                }
+                if lineage is not None:
+                    if lineage.root_session_id is not None:
+                        event_kwargs["root_session_id"] = lineage.root_session_id
+                    if lineage.parent_session_id is not None:
+                        event_kwargs["parent_session_id"] = lineage.parent_session_id
+                await self._emit_event(CoordinatorApplyEvent(**event_kwargs))
             except Exception as emit_exc:
                 logger.warning(
                     "PatchApplier emit_event(CoordinatorApplyEvent) "

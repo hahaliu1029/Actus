@@ -4,6 +4,7 @@ This module preserves the same public interface (constructor, invoke, done)
 so that AgentTaskRunner requires minimal changes.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import (
@@ -28,6 +29,10 @@ if TYPE_CHECKING:
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from app.application.services.coordinator_runtime_deps import (
+    _CoordinatorRuntimeDeps,
+    _NullCoordinatorRuntimeDeps,
+)
 from app.domain.external.browser import Browser
 from app.domain.external.sandbox import SandboxHandle
 from app.domain.external.search import SearchEngine
@@ -174,6 +179,11 @@ class PlannerReActFlow(BaseFlow):
         execution_supervisor: Any = None,
         permission_engine: "PermissionEngine | None" = None,
         session_state_machine: "SessionStateMachine | None" = None,
+        # PR-9b-A A5: lifespan-scoped coordinator runtime deps. Default is the
+        # frozen NullCoordinatorRuntimeDeps sentinel so legacy callers (tests
+        # + non-coordinator paths) inject zero coord cfg keys; production
+        # construction wires a real ``_CoordinatorRuntimeDeps`` aggregate.
+        _coord_deps: _CoordinatorRuntimeDeps | _NullCoordinatorRuntimeDeps = _NullCoordinatorRuntimeDeps(),
     ) -> None:
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
@@ -326,6 +336,16 @@ class PlannerReActFlow(BaseFlow):
             max_same_failures=self._execution_config.max_same_tool_failures,
         )
         self._execution_metrics = ExecutionMetrics()
+
+        # PR-9b-A A5: process-scoped coordinator runtime deps + per-run
+        # cancel_event. The cancel_event is initialized to None here; the
+        # owning ``AgentTaskRunner.invoke`` writes a fresh ``asyncio.Event``
+        # onto this attribute at the start of each task — see
+        # ``AgentTaskRunner._prime_planner_cancel_event_for_coord_deps``
+        # (PR-9b-A audit round-1 P1 fix for INV-A6 — "each non-None"). Tests
+        # set it directly on the instance to assert the cfg-building contract.
+        self._coord_deps = _coord_deps
+        self._cancel_event: Optional[asyncio.Event] = None
 
     @property
     def summary_llm(self):
@@ -1427,6 +1447,39 @@ class PlannerReActFlow(BaseFlow):
         callbacks.extend(build_observability_callbacks())
         if callbacks:
             cfg["callbacks"] = callbacks
+
+        # PR-9b-A A5: parallel-subgraph runtime deps (always-live wiring;
+        # flag at main_graph.py:695 gates ENTRY to _run_parallel_backend,
+        # not WIRING). When _coord_deps is the NullCoordinatorRuntimeDeps
+        # sentinel (legacy tests + non-coordinator paths), the 18 cfg keys
+        # are SKIPPED — INV-A10 guarantees zero side-effect ctors fire on
+        # construction in that branch.
+        if not isinstance(self._coord_deps, _NullCoordinatorRuntimeDeps):
+            cd = self._coord_deps
+            cfg["configurable"].update({
+                "parallel_execution_subgraph": cd.parallel_execution_subgraph,
+                "session_service": cd.session_service,
+                "rehydrate_service": cd.rehydrate_service,
+                "child_runner_starter": cd.child_runner_starter,
+                "mailbox_publisher": cd.mailbox_publisher,
+                "mailbox_subscriber": cd.mailbox_subscriber,
+                "envelope_factory": cd.envelope_factory,
+                "orchestrator_factory": cd.orchestrator_factory,
+                "terminal_waiter": cd.terminal_waiter,
+                "probe_quota": cd.probe_quota,
+                "coordinator_limits": cd.coordinator_limits,
+                "session_repository": cd.session_repository,
+                "cancel_event": self._cancel_event,  # per-run, not in _coord_deps
+                "patch_reducer_service": cd.patch_reducer_service,
+                "patch_applier_deps": cd.patch_applier_deps,
+                "parent_sandbox": self._sandbox,  # per-run, not in _coord_deps
+                "artifact_storage": cd.artifact_storage,
+                "cost_rollup_service": cd.cost_rollup_service,
+            })
+            # event_queue is intentionally NOT here — GraphEventBridge merges
+            # {"event_queue": q} into configurable AT INVOCATION TIME
+            # (event_bridge.py:74-79); main_graph.py:123 then passes the
+            # merged cfg into parallel_execution_subgraph invocation.
         return cfg
 
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:

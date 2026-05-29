@@ -165,6 +165,18 @@ def test_apply_maps_to_sse() -> None:
     assert sse.data.total_bytes == 1024
     assert sse.data.failed_at_path is None
     assert sse.data.rollback_status is None
+    # [PR-9b-B Task B7 / INV-B5] Apply-event wire parity: the mapper MUST
+    # preserve every lineage tag end-to-end (root/parent/child/work_unit +
+    # coordinator_run_id). Production apply events are group-level and leave
+    # child_session_id/work_unit_id None — that construction semantic is
+    # locked in test_patch_applier_apply_lineage (Task B5). Here we feed all
+    # five tags via _lineage_kwargs() to prove the apply mapper drops none of
+    # them, mirroring test_dispatch_maps_to_sse.
+    assert sse.data.root_session_id == "root-1"
+    assert sse.data.parent_session_id == "parent-1"
+    assert sse.data.child_session_id == "child-1"
+    assert sse.data.work_unit_id == "wu-1"
+    assert sse.data.event_id == event.id
 
 
 def test_sibling_cancel_maps_to_sse() -> None:

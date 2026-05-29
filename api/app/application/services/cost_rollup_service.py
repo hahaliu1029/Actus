@@ -16,7 +16,10 @@ accounting persistence belongs alongside the cost aggregation service
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
+
+from app.domain.models.mailbox_envelope import CostAggregate
 
 
 class CostRollupService(Protocol):
@@ -59,3 +62,36 @@ class CostRollupService(Protocol):
         the contract the supervisor passes for that dedup.
         """
         ...
+
+    async def aggregate(
+        self,
+        *,
+        coordinator_run_id: str,
+        child_session_ids: list[str],
+    ) -> "AggregateResult":
+        """[PR-9b-B] Pull cost from durable cost_records ledger.
+
+        Authoritative source for CoordinatorReduceEvent.cost_total. Returns
+        AggregateResult(cost, missing_children) where ``missing_children`` is
+        the list of child_session_ids that contributed ZERO rows to the SUM
+        (either ledger empty or sessions.coordinator_run_id mismatched).
+
+        The reducer caller uses ``missing_children`` to set
+        ``diagnostics_summary='cost_unavailable: <ids>'`` per INV-B3 — zero
+        cost from non-empty children is observable, not silently swallowed.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class AggregateResult:
+    """[PR-9b-B] Pull-cost result + diagnostic carrier.
+
+    Single source of truth for whether a child contributed cost AND whether
+    a coordinator_run_id mismatch / empty-ledger case occurred. The reducer
+    in parallel_execution_subgraph reads BOTH fields to construct the
+    CoordinatorReduceEvent.
+    """
+
+    cost: CostAggregate
+    missing_children: tuple[str, ...] = ()

@@ -382,6 +382,7 @@ class CoordinatorRunOrchestrator:
                     child_to_wu=child_to_wu,
                     child_session_ids=child_session_ids,
                     coordinator_run_id=coordinator_run_id,
+                    root_session_id=root_session_id,
                 ),
                 name=f"coord-orch-observer-{coordinator_run_id}",
             )
@@ -469,6 +470,7 @@ class CoordinatorRunOrchestrator:
         child_to_wu: dict[str, str],
         child_session_ids: dict[str, str],
         coordinator_run_id: str,
+        root_session_id: str,
     ) -> None:
         """Consume mailbox envelopes for this run.
 
@@ -532,6 +534,7 @@ class CoordinatorRunOrchestrator:
                         pending=pending,
                         child_session_ids=child_session_ids,
                         coordinator_run_id=coordinator_run_id,
+                        root_session_id=root_session_id,
                     )
 
                 if not pending:
@@ -595,6 +598,7 @@ class CoordinatorRunOrchestrator:
         pending: set[str],
         child_session_ids: dict[str, str],
         coordinator_run_id: str,
+        root_session_id: Optional[str] = None,
     ) -> None:
         """Cancel all remaining ``pending`` siblings + fire ``emit_event``."""
         remaining = sorted(pending)
@@ -624,12 +628,24 @@ class CoordinatorRunOrchestrator:
                 from app.domain.models.event import (
                     CoordinatorSiblingCancelEvent,
                 )
+                # [PR-9b-B codex F3 — MEDIUM] Thread lineage onto the only live
+                # coordinator event that was previously un-attributed. Now that
+                # A6 wired ``emit_event`` to the orchestrator this event reaches
+                # SSE; ``CoordinatorSiblingCancelEvent`` mixes in
+                # ``CoordinatorLineageMixin`` so it accepts root/parent. The
+                # cancel is group-level (like apply/reduce) so child_session_id
+                # / work_unit_id stay None. ``parent_session_id`` is the ctor
+                # invariant (``self._parent_session_id``, required non-empty);
+                # ``root_session_id`` is threaded from ``run(...)`` through the
+                # observer loop.
                 await self._emit_event(CoordinatorSiblingCancelEvent(
                     triggered_by_work_unit_id=triggered_by_wu,
                     triggered_by_outcome=outcome,
                     cancelled_work_unit_ids=sorted(cancelled),
                     reason=reason,
                     coordinator_run_id=coordinator_run_id,
+                    root_session_id=root_session_id,
+                    parent_session_id=self._parent_session_id,
                 ))
             except Exception as exc:
                 logger.warning(

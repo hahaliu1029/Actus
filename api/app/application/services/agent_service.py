@@ -220,6 +220,14 @@ class AgentService:
         # ``AgentTaskRunner`` so mailbox-plane children can publish
         # SPAWN_ACK / RESULT_READY / CANCEL_ACK / PROGRESS_UPDATE
         # envelopes back to the supervisor.
+        coord_deps: object | None = None,
+        # PR-9b-A Task A8 — lifespan-scoped ``_CoordinatorRuntimeDeps``
+        # aggregator. Forwarded into every ``AgentTaskRunner`` constructed
+        # in ``_create_task`` and from there into
+        # ``PlannerReActFlow.__init__(_coord_deps=...)``. Default ``None``
+        # preserves the legacy/test path: the runner falls back to
+        # ``_NullCoordinatorRuntimeDeps`` so ``_build_config()`` SKIPS the
+        # 18 coordinator cfg keys when wiring is absent.
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -243,6 +251,10 @@ class AgentService:
         self._memory_gate_rebuild_fn = memory_gate_rebuild_fn
         self._supervisor_registry = supervisor_registry
         self._mailbox_publisher = mailbox_publisher
+        # PR-9b-A Task A8 — lifespan-scoped coordinator runtime deps.
+        # Forwarded to every AgentTaskRunner constructed by _create_task,
+        # which threads it into PlannerReActFlow.__init__(_coord_deps=...).
+        self._coord_deps = coord_deps
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -757,6 +769,13 @@ class AgentService:
             # ``__new__``-bypass tests; production wiring threads the
             # ``RedisMailboxPublisher`` through from ``_build_agent_service``.
             mailbox_publisher=getattr(self, "_mailbox_publisher", None),
+            # PR-9b-A Task A8: lifespan-scoped _CoordinatorRuntimeDeps
+            # aggregator. AgentTaskRunner forwards this as
+            # ``_coord_deps`` into PlannerReActFlow.__init__. When the
+            # aggregator is None (legacy/test path), AgentTaskRunner falls
+            # back to ``_NullCoordinatorRuntimeDeps`` so _build_config()
+            # SKIPS the 18 coordinator cfg keys.
+            coord_deps=getattr(self, "_coord_deps", None),
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);

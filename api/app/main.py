@@ -295,14 +295,86 @@ async def lifespan(app: FastAPI):
             RedisMailboxPublisher,
         )
         from app.interfaces.service_dependencies import (
+            build_coordinator_runtime_deps,
             build_supervisor_registry,
         )
 
         mailbox_publisher = RedisMailboxPublisher(redis_client.client)
+
+        # PR-9b-A Task A8 — coordinator runtime deps composition root.
+        # Wiring is **always-live**: the runtime feature flag
+        # ``ACTUS_C2_COORDINATOR_ENABLED`` gates ENTRY at
+        # ``main_graph.py:695`` (whether coordinator behaviour fires), NOT
+        # WIRING (whether the deps are threaded through). The helper
+        # populates ``app.state.cost_rollup_service``,
+        # ``app.state.coordinator_envelope_store``,
+        # ``app.state.patch_applier_deps`` (and many more) — required by the
+        # two new ``build_supervisor_registry`` kwargs immediately below.
+        #
+        # The narrow ``except RuntimeError`` below ONLY catches the specific
+        # lifespan-mock test-env condition where the canonical
+        # ``app.infrastructure.storage.postgres.get_postgres`` singleton has
+        # not been initialised. ``Postgres.session_factory`` raises
+        # ``RuntimeError("Postgres数据库客户端未初始化，请先调用init方法进行初始化。")``
+        # at ``postgres.py:82`` in that case. Any other exception
+        # (ImportError, TypeError, missing attribute, ...) is a real bug
+        # and MUST propagate so lifespan fails loudly rather than silently
+        # downgrading to the null-deps fallback.
+        coord_deps = None
+        try:
+            coord_deps = build_coordinator_runtime_deps(
+                app_state=app.state,
+                redis_client=redis_client,
+            )
+            logger.info(
+                "_CoordinatorRuntimeDeps composition root initialised "
+                "(PR-9b-A: 17 lifespan-scoped singletons on app.state)"
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if (
+                "数据库客户端未初始化" not in msg
+                and "client not initialised" not in msg.lower()
+                and "client not initialized" not in msg.lower()
+            ):
+                # Real production failure (e.g. coordinator-limit env parse
+                # error raising RuntimeError) — surface loudly. Do NOT
+                # silently fall back to null-deps; that would mask a config
+                # bug as a "lifespan-mock context".
+                raise
+            # Test-env path: ``app.main.get_postgres`` is patched but the
+            # canonical ``app.infrastructure.storage.postgres.get_postgres``
+            # is not, so ``Postgres.session_factory`` raises. Log and fall
+            # through to the null-deps sentinel so the rest of lifespan
+            # still drives existing assertions; production lifespan always
+            # initialises the canonical client before reaching here.
+            logger.warning(
+                "build_coordinator_runtime_deps skipped — Postgres client "
+                "not initialized (expected only in lifespan-mock test "
+                "contexts): %s",
+                exc,
+            )
+            from app.application.services.coordinator_runtime_deps import (
+                _NullCoordinatorRuntimeDeps,
+            )
+
+            coord_deps = _NullCoordinatorRuntimeDeps()
+            app.state.coord_deps = coord_deps
+            app.state.coordinator_envelope_store = getattr(
+                app.state, "coordinator_envelope_store", None,
+            )
+            app.state.cost_rollup_service = getattr(
+                app.state, "cost_rollup_service", None,
+            )
+            app.state.patch_applier_deps = getattr(
+                app.state, "patch_applier_deps", None,
+            )
         supervisor_registry = build_supervisor_registry(
             redis_client=redis_client,
             publisher=mailbox_publisher,
             sandbox_lifecycle_service=_DeferredLifecycle(),
+            coordinator_envelope_store=app.state.coordinator_envelope_store,
+            cost_rollup_service=app.state.cost_rollup_service,
         )
         logger.info(
             "SupervisorRegistry 单例初始化完成 (C3 PR-6 — mailbox plane mandatory)"
@@ -337,6 +409,10 @@ async def lifespan(app: FastAPI):
             file_memory_store=getattr(app.state, "file_memory_store", None),
             sandbox_lifecycle_service=sandbox_lifecycle_service,
             supervisor_registry=supervisor_registry,
+            # PR-9b-A Task A8: forward the lifespan-scoped
+            # ``_CoordinatorRuntimeDeps`` aggregator built above into the
+            # AgentService → AgentTaskRunner → PlannerReActFlow chain.
+            coord_deps=app.state.coord_deps,
         )
         logger.info("AgentService 单例初始化完成")
 

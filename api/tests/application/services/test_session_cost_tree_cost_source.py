@@ -383,3 +383,95 @@ class TestTotals:
         # But the existing aggregate-level total still saw the row
         # (the rollup is exhaustive; only the attribution is selective).
         assert agg.total_cost.total_usd == Decimal("9.99")
+
+
+# ── [PR-9b-B Task B9] CostRollupService decoupling regression guard ──────────
+# The session-cost-tree path (cost_aggregation_service + session_cost_tree_service)
+# reads cost_records directly via its own legacy aggregation and MUST stay
+# decoupled from the coordinator pull-cost service (CostRollupService) added in
+# PR-9b-B. If a future refactor reroutes session-cost-tree through
+# CostRollupService, this guard fails — forcing an explicit decision instead of
+# silent coupling between two independent cost-aggregation subsystems.
+
+
+async def test_session_cost_tree_modules_do_not_depend_on_cost_rollup_service() -> None:
+    """[PR-9b-B B9] Neither session-cost-tree module IMPORTS the coordinator
+    ``CostRollupService`` class or the ``cost_rollup_service`` /
+    ``db_cost_rollup_service`` modules.
+
+    [PR-9b-B codex F3 — MEDIUM/TEST] AST-based, not a source-substring scan.
+    A substring check (``"CostRollupService" not in src``) is brittle (a
+    comment/docstring/string mentioning the name trips it) AND incomplete (an
+    aliased import — ``from ... import CostRollupService as X`` — would still
+    bind the symbol but a naive bound-name scan could miss it; a TYPE_CHECKING
+    ref also trips a substring scan even though it's not a runtime dependency).
+
+    Instead we parse each module's source and walk ONLY ``ast.Import`` /
+    ``ast.ImportFrom`` nodes, checking the IMPORTED name (not the bound alias),
+    so:
+      * comments / docstrings / arbitrary string literals never trip it, and
+      * a real import IS caught regardless of ``as``-aliasing.
+    Pure-AST (no DB). Follows the imported module object so the lock survives
+    file moves.
+    """
+    import ast
+    import inspect
+
+    from app.application.services import (
+        cost_aggregation_service,
+        session_cost_tree_service,
+    )
+
+    # The coordinator pull-cost surface this path must stay decoupled from:
+    # the Protocol/class name, plus the two modules that define/implement it.
+    _BANNED_NAMES = {"CostRollupService"}
+    _BANNED_MODULES = {
+        "cost_rollup_service",
+        "db_cost_rollup_service",
+    }
+
+    def _module_tail(dotted: str) -> str:
+        """Last dotted segment, e.g. ``a.b.cost_rollup_service`` → tail."""
+        return dotted.rsplit(".", 1)[-1]
+
+    def _violations_for(module) -> list[str]:
+        src = inspect.getsource(module)
+        tree = ast.parse(src)
+        found: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                # ``import a.b.cost_rollup_service`` / ``... as x`` — inspect the
+                # module path's tail, NOT the bound alias.
+                for alias in node.names:
+                    if _module_tail(alias.name) in _BANNED_MODULES:
+                        found.append(
+                            f"line {node.lineno}: import {alias.name}"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                # ``from <module> import <name> [as alias]`` — a violation if
+                # EITHER the source module is a banned module OR an imported
+                # name is the banned class. Check imported names, not aliases.
+                mod_tail = _module_tail(node.module) if node.module else ""
+                if mod_tail in _BANNED_MODULES:
+                    found.append(
+                        f"line {node.lineno}: from {node.module} import ..."
+                    )
+                for alias in node.names:
+                    if alias.name in _BANNED_NAMES:
+                        found.append(
+                            f"line {node.lineno}: from {node.module} "
+                            f"import {alias.name}"
+                        )
+        return found
+
+    for module in (cost_aggregation_service, session_cost_tree_service):
+        violations = _violations_for(module)
+        assert not violations, (
+            f"{module.__name__} imports the coordinator pull-cost surface — "
+            "the session-cost-tree path has its OWN ledger aggregation and "
+            "MUST stay decoupled from CostRollupService (PR-9b-B B9). A real "
+            "violation looks like `from app.application.services."
+            "cost_rollup_service import CostRollupService` (or an aliased / "
+            "db_cost_rollup_service variant). Found:\n  - "
+            + "\n  - ".join(violations)
+        )

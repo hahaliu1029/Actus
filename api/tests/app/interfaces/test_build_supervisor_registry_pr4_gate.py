@@ -90,6 +90,13 @@ def test_factory_wires_pr_4_5_callback_bridge() -> None:
             redis_client=redis_client,
             publisher=publisher,
             sandbox_lifecycle_service=lifecycle,
+            # PR-9b-A4 INV-A1/A2 — composition-root must always populate
+            # these coordinator slots; the gate test passes MagicMocks
+            # because it only locks the agent_service_callback identity,
+            # not the coordinator port wiring (covered by
+            # tests/application/composition/test_coordinator_composition_root_wiring.py).
+            coordinator_envelope_store=MagicMock(),
+            cost_rollup_service=MagicMock(),
         )
         # Trigger the inner _factory closure by spawning a supervisor.
         registry._factory("root-test")  # type: ignore[attr-defined]
@@ -127,6 +134,12 @@ def test_legacy_gate_message_still_load_bearing(monkeypatch) -> None:
             redis_client=redis_client_stub,
             publisher=publisher_stub,
             sandbox_lifecycle_service=lifecycle_stub,
+            # PR-9b-A4 INV-A1/A2 — required kwargs after signature
+            # extension. This test asserts the gate-False RuntimeError
+            # fires BEFORE the factory body runs, so the values are
+            # irrelevant; they must just satisfy the signature.
+            coordinator_envelope_store=MagicMock(),
+            cost_rollup_service=MagicMock(),
         )
 
     msg = str(exc_info.value).lower()

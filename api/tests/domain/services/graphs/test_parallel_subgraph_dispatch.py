@@ -511,3 +511,38 @@ async def test_coordinator_run_id_format_is_session_hash_attempt() -> None:
     assert run_id.endswith(":a7")
     parts = run_id.split(":")
     assert len(parts[1]) == 16
+
+
+@pytest.mark.anyio
+async def test_dispatch_threads_parent_sandbox_into_runner_starter_start() -> None:
+    """PR-9b-A audit round-1 P1 (Fix 1) — ``_first_time_dispatch`` MUST forward
+    ``cfg['parent_sandbox']`` into every ``runner_starter.start(...)`` call.
+
+    ``DefaultCoordinatorChildRunnerStarter.start`` declares ``parent_sandbox``
+    as a required kwarg (api/app/application/services/coordinator_child_runner_starter.py:124-135).
+    A future drop of this thread would crash first flag-on dispatch with
+    ``TypeError: start() missing 1 required keyword-only argument:
+    'parent_sandbox'`` BEFORE any SPAWN_REQUEST publishes — this regression
+    test fails fast at the call-site instead.
+    """
+    config = _base_config(peek_returns=None)
+    parent_sandbox = config["configurable"]["parent_sandbox"]
+    state = _base_state()
+
+    await dispatch_node(state, config)
+
+    starter = config["configurable"]["child_runner_starter"]
+    assert starter.start.await_count == 2
+    # Every start(...) call must carry the same parent_sandbox instance
+    # that was published into cfg by PlannerReActFlow._build_config.
+    for call in starter.start.await_args_list:
+        kwargs = call.kwargs
+        assert "parent_sandbox" in kwargs, (
+            "runner_starter.start(...) call missing parent_sandbox kwarg; "
+            f"got kwargs={list(kwargs.keys())}"
+        )
+        assert kwargs["parent_sandbox"] is parent_sandbox, (
+            "runner_starter.start(...) parent_sandbox must be the per-run "
+            "cfg['parent_sandbox'] (the planner's self._sandbox); "
+            f"got {kwargs['parent_sandbox']!r} vs cfg's {parent_sandbox!r}"
+        )

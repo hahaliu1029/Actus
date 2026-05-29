@@ -9,6 +9,7 @@ from typing import Any
 
 from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
+from app.application.services.cost_rollup_service import CostRollupService
 from app.application.services.file_service import FileService
 from app.application.services.memory_management_service import MemoryManagementService
 from app.application.services.session_service import SessionService
@@ -33,6 +34,9 @@ from app.infrastructure.external.health_checker.redis_health_checker import (
 )
 from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.models.app_config import LLMConfig, SkillRiskPolicy
+from app.domain.repositories.coordinator_result_envelope_store_repository import (
+    CoordinatorResultEnvelopeStoreRepository,
+)
 from app.application.services.agent_service import _ConfigSnapshot
 from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
 from app.infrastructure.external.llm.actus_responses_model import ActusResponsesModel
@@ -544,6 +548,8 @@ def build_supervisor_registry(
     redis_client: RedisClient,
     publisher: MailboxPublisher,
     sandbox_lifecycle_service: object,
+    coordinator_envelope_store: CoordinatorResultEnvelopeStoreRepository,
+    cost_rollup_service: CostRollupService,
 ) -> "SupervisorRegistry":
     """C3 PR-3c — construct the per-pod :class:`SupervisorRegistry` singleton.
 
@@ -719,14 +725,13 @@ def build_supervisor_registry(
 
     def _factory(root_session_id: str) -> MailboxSupervisor:
         # [C2 deferred wiring -- PR-9 composition root]
-        # The following SupervisorContext fields are intentionally LEFT
-        # UNSET at the live composition root; PR-9 wires them all together
-        # when ``ACTUS_C2_COORDINATOR_ENABLED`` flips:
-        #   - ``cost_rollup_service`` (PR-6 §14.4) -- Protocol-only stub
-        #     today; concrete impl + wiring deferred to PR-9.
-        #   - ``coordinator_envelope_store`` (PR-7 §12.4) -- concrete impl
-        #     exists at ``DbCoordinatorResultEnvelopeStoreRepository`` but
-        #     wiring deferred for atomic PR-9 flip.
+        # The following SupervisorContext-adjacent emit hooks remain
+        # deferred to PR-9b-A6; the SupervisorContext ports for
+        # ``cost_rollup_service`` (PR-6 §14.4) and
+        # ``coordinator_envelope_store`` (PR-7 §12.4) are now wired
+        # below (PR-9b-A4 INV-A1/A2). Wiring is always-live; the runtime
+        # feature flag (``ACTUS_C2_COORDINATOR_ENABLED``) gates ENTRY
+        # (whether coordinator behaviour fires), not WIRING.
         #   - ``PatchApplier._emit_event`` (PR-8 §13.5) -- wired to the per-run
         #     ``event_queue.put`` callback when the applier is constructed
         #     inside ``_run_parallel_backend``. Today the live call site passes
@@ -738,10 +743,10 @@ def build_supervisor_registry(
         #     inside ``_first_time_dispatch``. Today the factory call passes
         #     no emit_event; the CoordinatorSiblingCancelEvent emit therefore
         #     silently no-ops. PR-9 wires this when the flag flips.
-        # While unset (None default), the PR-6 cost-rollup PROLOGUE and
-        # PR-7 persist-terminal PROLOGUE both silently no-op. The
-        # supervisor otherwise functions identically to pre-coordinator
-        # behavior. See ``mailbox_supervisor.py`` ResultReadyHandler /
+        # The PR-6 cost-rollup PROLOGUE and PR-7 persist-terminal
+        # PROLOGUE no longer silently no-op in production: their
+        # SupervisorContext slots are populated unconditionally by this
+        # factory. See ``mailbox_supervisor.py`` ResultReadyHandler /
         # CancelAckHandler ``_side_effect`` gates
         # ``if ctx.X is not None and ctx.session_repo is not None`` for
         # the runtime check.
@@ -769,6 +774,14 @@ def build_supervisor_registry(
             # stop check. Adapter holds session_factory and opens a
             # short-lived AsyncSession per query.
             session_repo=supervisor_session_repo,  # type: ignore[arg-type]
+            # PR-9b-A4 (INV-A1 / INV-A2) — coordinator ports wired at the
+            # composition root. Wiring is always-live; the feature flag
+            # only gates ENTRY (whether coordinator behaviour fires), not
+            # WIRING (whether deps are threaded through). The
+            # SupervisorContext fields remain Optional so legacy unit
+            # tests that construct contexts without DI still work.
+            coordinator_envelope_store=coordinator_envelope_store,
+            cost_rollup_service=cost_rollup_service,
         )
         return MailboxSupervisor(
             ctx,
@@ -777,6 +790,401 @@ def build_supervisor_registry(
         )
 
     return SupervisorRegistry(supervisor_factory=_factory)
+
+
+def build_coordinator_runtime_deps(
+    *,
+    app_state: Any,
+    redis_client: RedisClient,
+) -> Any:
+    """[PR-9b-A Task A8] Composition root for the lifespan-scoped
+    ``_CoordinatorRuntimeDeps`` aggregator.
+
+    Constructs every lifespan-scoped singleton the coordinator dispatch path
+    needs, stores each on ``app_state.*`` for downstream DI lookups, and
+    returns the populated ``_CoordinatorRuntimeDeps`` value object.
+
+    Wiring is **always-live**: the runtime feature flag
+    (``ACTUS_C2_COORDINATOR_ENABLED``) gates **ENTRY** (whether coordinator
+    behaviour fires at ``main_graph.py:695``) — NOT **WIRING** (whether the
+    deps are threaded through). Per spec §704 + plan INV-A1, the composition
+    root MUST populate these singletons regardless of the C2 flag so a
+    config flip is purely a runtime decision, never a redeploy.
+
+    The helper is intentionally side-effect-free apart from constructing
+    objects and writing to ``app_state``: no DB / Redis / file-system I/O
+    runs here. Network-touching reconcile loops are wired separately by the
+    lifespan handler (see ``main.py``).
+    """
+    # ── Imports (lazy to keep module load time bounded) ─────────────────────
+    from app.application.services.child_agent_runner_factory import (
+        ChildAgentTaskRunnerFactory,
+    )
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+    from app.application.services.coordinator_envelope_factory import (
+        CoordinatorEnvelopeFactory,
+    )
+    from app.application.services.coordinator_rehydrate_service import (
+        CoordinatorRehydrateService,
+    )
+    from app.application.services.coordinator_runtime_deps import (
+        _CoordinatorRuntimeDeps,
+    )
+    from app.application.services.coordinator_terminal_envelope_waiter import (
+        CoordinatorTerminalEnvelopeWaiter,
+    )
+    from app.application.services.db_cost_rollup_service import (
+        DbCostRollupService,
+    )
+    from app.application.services.patch_applier_deps import PatchApplierDeps
+    from app.application.services.patch_reducer_service import PatchReducerService
+    from app.application.services.rollback_snapshot_store import (
+        LocalFSRollbackSnapshotStore,
+    )
+    from app.application.services.session_service import SessionService
+    from app.domain.services.coordinator_limits import load_coordinator_limits_from_env
+    from app.domain.services.graphs.parallel_execution_subgraph import (
+        build_parallel_execution_subgraph,
+    )
+    from app.infrastructure.cache.probe_quota import ProbeQuotaService
+    from app.infrastructure.external.file_storage.minio_file_storage import (
+        MinioFileStorage,
+    )
+    from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+        RedisMailboxPublisher,
+    )
+    from app.infrastructure.external.mailbox.redis_mailbox_subscriber import (
+        RedisMailboxSubscriber,
+    )
+    from app.infrastructure.repositories.db_coordinator_apply_audit_repository import (
+        DbCoordinatorApplyAuditRepository,
+    )
+    from app.infrastructure.repositories.db_coordinator_result_envelope_store_repository import (
+        DbCoordinatorResultEnvelopeStoreRepository,
+    )
+    from app.infrastructure.repositories.db_session_repository import (
+        DBSessionRepository,
+    )
+
+    # ── Resolve session_factory ──────────────────────────────────────────────
+    pg_session_factory = get_postgres().session_factory
+    raw_redis = redis_client.client
+
+    # ── 1. Compiled parallel-execution subgraph (singleton; ``checkpointer=False``
+    #      because outer graph owns checkpoint). ─────────────────────────────
+    parallel_execution_subgraph = build_parallel_execution_subgraph()
+
+    # ── 2. CoordinatorEnvelopeFactory — pure, stateless. ────────────────────
+    envelope_factory = CoordinatorEnvelopeFactory()
+
+    # ── 3. Mailbox publisher / subscriber — share the raw Redis client with
+    #      the supervisor registry's publisher (single transport wire). ─────
+    mailbox_publisher = RedisMailboxPublisher(raw_redis)
+    mailbox_subscriber = RedisMailboxSubscriber(raw_redis)
+
+    # ── 4. CoordinatorTerminalEnvelopeWaiter — pure wrapper over subscriber. ─
+    terminal_waiter = CoordinatorTerminalEnvelopeWaiter(
+        subscriber=mailbox_subscriber,
+    )
+
+    # ── 5. Repositories (DB-backed, short-session pattern). ─────────────────
+    coordinator_envelope_store = DbCoordinatorResultEnvelopeStoreRepository(
+        session_factory=pg_session_factory,
+    )
+    coordinator_apply_audit_repo = DbCoordinatorApplyAuditRepository(
+        session_factory=pg_session_factory,
+    )
+
+    # The ``session_repository`` slot is the lightweight session-factory-bound
+    # adapter the orchestrator + child_runner_starter consume for read-only
+    # queries (read_mode_revision, find_descendants, ...). We reuse the same
+    # short-session pattern as the supervisor's adapter so both paths share
+    # one source of truth for parent/child reads.
+    class _CoordinatorSessionRepoAdapter:
+        """Session-per-call SessionRepository adapter for coordinator paths.
+
+        Mirrors ``_SupervisorSessionRepoAdapter`` (see ``build_supervisor_registry``)
+        and the DbMailboxEnvelopeAuditRepository session-per-call pattern.
+        """
+
+        __slots__ = ("_sf",)
+
+        def __init__(self, session_factory) -> None:  # type: ignore[no-untyped-def]
+            self._sf = session_factory
+
+        async def read_mode_revision(self, session_id: str) -> int:
+            # Direct call: ``DBSessionRepository.read_mode_revision`` is part
+            # of the SessionRepository Protocol (see
+            # ``domain/repositories/session_repository.py:282``); if it is
+            # ever removed the AttributeError must propagate loudly rather
+            # than silently returning 0 for everyone.
+            async with self._sf() as s:
+                repo = DBSessionRepository(db_session=s)
+                return await repo.read_mode_revision(session_id)
+
+        async def find_children_by_coordinator_run(
+            self, *, coordinator_run_id: str, parent_session_id: str,
+        ):
+            # Direct call: ``DBSessionRepository.find_children_by_coordinator_run``
+            # is part of the SessionRepository Protocol (see
+            # ``domain/repositories/session_repository.py:370``). An empty-list
+            # fallback would silently mask the supervisor's fail-closed posture
+            # for rehydrate — let AttributeError propagate instead.
+            async with self._sf() as s:
+                repo = DBSessionRepository(db_session=s)
+                return await repo.find_children_by_coordinator_run(
+                    coordinator_run_id=coordinator_run_id,
+                    parent_session_id=parent_session_id,
+                )
+
+        async def get_by_id(self, session_id: str):
+            async with self._sf() as s:
+                repo = DBSessionRepository(db_session=s)
+                return await repo.get_by_id(session_id)
+
+        async def find_descendants(  # type: ignore[no-untyped-def]
+            self, ancestor_id: str, *, user_id: str, max_depth: int, limit: int,
+        ):
+            async with self._sf() as s:
+                repo = DBSessionRepository(db_session=s)
+                return await repo.find_descendants(
+                    ancestor_id, user_id=user_id, max_depth=max_depth, limit=limit,
+                )
+
+        async def count_descendants(
+            self, ancestor_id: str, *, user_id: str, cap: int,
+        ) -> int:
+            # [PR-9b-A codex R2#1] parallel_execution_subgraph.py:376 calls
+            # ``session_repo.count_descendants(...)`` during the descendants-cap
+            # preflight; without this method the first flag-on dispatch raises
+            # AttributeError. ``DBSessionRepository.count_descendants`` is the
+            # source of truth at infrastructure/repositories/db_session_repository.py:937.
+            async with self._sf() as s:
+                repo = DBSessionRepository(db_session=s)
+                return await repo.count_descendants(
+                    ancestor_id, user_id=user_id, cap=cap,
+                )
+
+    session_repository_adapter = _CoordinatorSessionRepoAdapter(pg_session_factory)
+
+    # ── 6. CoordinatorRehydrateService — wraps repo + envelope_store + audit. ─
+    rehydrate_service = CoordinatorRehydrateService(
+        session_repository=session_repository_adapter,
+        envelope_store=coordinator_envelope_store,
+        audit_repository=coordinator_apply_audit_repo,
+        publisher=mailbox_publisher,
+    )
+
+    # ── 7. CoordinatorRunOrchestrator factory — per-run wrapper around the
+    #      lifespan-scoped publisher + envelope_factory + subscriber.
+    #      Per spec §11.3-§11.4, one orchestrator is constructed per
+    #      coordinator run; the *factory* captures the lifespan deps.
+    #
+    #      PR-9b-A audit round-1 P1: the consumer at
+    #      ``parallel_execution_subgraph._first_time_dispatch`` invokes
+    #      ``orchestrator_factory.build(...)`` — a plain function has no
+    #      ``.build`` attribute and would AttributeError on first flag-on
+    #      dispatch. Wrap the closure-style factory in a tiny class so the
+    #      ``.build(...)`` surface matches the consumer 1:1.
+    #
+    #      ``root_session_id`` IS accepted by ``build(...)`` (the consumer
+    #      passes it for parity with ``orchestrator.run(root_session_id=...)``
+    #      one line below in the dispatch path) but is NOT forwarded into
+    #      ``CoordinatorRunOrchestrator.__init__`` — the orchestrator ctor
+    #      (coordinator_run_orchestrator.py:185-216) does not accept it
+    #      because the orchestrator reads root_session_id from the per-run
+    #      ``run(...)`` kwarg (coordinator_run_orchestrator.py:230) instead.
+    class _OrchestratorFactory:
+        """Per-run CoordinatorRunOrchestrator factory.
+
+        Captures the lifespan-scoped publisher / envelope_factory /
+        mailbox_subscriber once at composition-root time and produces a
+        fresh orchestrator from per-run parameters on every
+        ``.build(...)`` call. Spec §11.3-§11.4 mandates one orchestrator
+        per coordinator run.
+        """
+
+        def __init__(
+            self,
+            *,
+            mailbox_publisher,
+            envelope_factory,
+            mailbox_subscriber,
+        ) -> None:
+            self._mailbox_publisher = mailbox_publisher
+            self._envelope_factory = envelope_factory
+            self._mailbox_subscriber = mailbox_subscriber
+
+        def build(
+            self,
+            *,
+            parent_session_id: str,
+            coordinator_run_id: str,
+            root_session_id: str | None = None,
+            emit_event=None,
+        ):
+            from app.application.services.coordinator_run_orchestrator import (
+                CoordinatorRunOrchestrator,
+            )
+
+            # ``root_session_id`` is accepted for consumer-call-shape parity
+            # (dispatch_node passes it next to ``orchestrator.run(...)``) but
+            # the orchestrator ctor does not store it — ``run(...)`` receives
+            # it as a per-call kwarg instead.
+            _ = root_session_id
+            return CoordinatorRunOrchestrator(
+                publisher=self._mailbox_publisher,
+                parent_session_id=parent_session_id,
+                coordinator_run_id=coordinator_run_id,
+                envelope_factory=self._envelope_factory,
+                mailbox_subscriber=self._mailbox_subscriber,
+                emit_event=emit_event,
+            )
+
+    _orchestrator_factory = _OrchestratorFactory(
+        mailbox_publisher=mailbox_publisher,
+        envelope_factory=envelope_factory,
+        mailbox_subscriber=mailbox_subscriber,
+    )
+
+    # ── 8. SessionService (coordinator path). ───────────────────────────────
+    coordinator_session_service = SessionService(
+        uow_factory=get_uow,
+        task_cls=RedisStreamTask,
+        sandbox_lifecycle_service=getattr(app_state, "sandbox_lifecycle_service", None),
+        fs_reconciler=getattr(app_state, "fs_reconciler", None),
+        execution_supervisor=getattr(app_state, "supervisor", None),
+        subagent_limits=get_subagent_limits(),
+    )
+
+    # ── 9. ProbeQuotaService — Redis-backed per-user active-probe quota. ────
+    probe_quota = ProbeQuotaService(redis_client=redis_client)
+
+    # ── 10. CoordinatorLimits (env-overridable singleton). ──────────────────
+    coordinator_limits = load_coordinator_limits_from_env()
+
+    # ── 11. PatchReducerService — pure, stateless. ──────────────────────────
+    patch_reducer_service = PatchReducerService()
+
+    # ── 12. PatchApplierDeps — three lifespan ports. ────────────────────────
+    snapshot_store = LocalFSRollbackSnapshotStore()
+    patch_applier_deps = PatchApplierDeps(
+        snapshot_store=snapshot_store,
+        audit_repo=coordinator_apply_audit_repo,
+        redis=raw_redis,
+    )
+
+    # ── 13. ArtifactStorage — MinIO-backed content-addressed blob store.
+    #      The MinioFileStorage class implements the ArtifactStoragePort
+    #      Protocol (put_content_addressed_bytes + get_bytes). It's reused
+    #      here as the lifespan singleton for the coordinator path.
+    minio_store = get_minio()
+    artifact_storage = MinioFileStorage(
+        bucket=settings.minio_bucket_name,
+        minio_store=minio_store,
+        uow_factory=get_uow,
+    )
+
+    # ── 14. DbCostRollupService — pull-cost authority + push-only metric hook.
+    #      [PR-9b-B Task B3] Supersedes PR-9b-A's MetricHookCostRollupService
+    #      stub. DbCostRollupService implements BOTH:
+    #        * ``aggregate(...)`` — pull authority for
+    #          ``CoordinatorReduceEvent.cost_total`` (INV-B3: queries
+    #          cost_records JOIN sessions filtered by coordinator_run_id +
+    #          child_session_ids; mismatched-run rows excluded + surfaced
+    #          via ``missing_children`` for the reducer's diagnostics).
+    #        * ``rollup_to_parent(...)`` — push-only hook preserved from A3
+    #          (idempotent on idempotency_key, never raises). ─────────────
+    class _NoopMetricSink:
+        """Inert metric sink — the metric pipeline destination is wired
+        separately. Calls to ``rollup_to_parent`` traverse the same code
+        path but the underlying ``record()`` is a no-op until the real
+        sink lands. This keeps the lifespan composition root
+        flag-on-deploy-safe.
+        """
+
+        def record(self, **kwargs) -> None:  # noqa: ANN003, D401
+            return None
+
+    metric_sink = getattr(app_state, "metric_sink", None) or _NoopMetricSink()
+    app_state.metric_sink = metric_sink
+    cost_rollup_service = DbCostRollupService(
+        async_session_factory=pg_session_factory,
+        metric_sink=metric_sink,
+    )
+
+    # ── 15. ChildAgentTaskRunnerFactory + DefaultCoordinatorChildRunnerStarter.
+    #      The ``runner_class`` injection is the *bound* AgentTaskRunner
+    #      partial; until PR-5 ships the partial wiring, we inject the bare
+    #      AgentTaskRunner class as the spec requires the Protocol shape.
+    #      Production composition replaces this with the partial-bound build.
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner_factory = ChildAgentTaskRunnerFactory(
+        runner_class=AgentTaskRunner,  # PR-5 will wrap via functools.partial
+        mailbox_publisher=mailbox_publisher,
+    )
+    child_runner_starter = DefaultCoordinatorChildRunnerStarter(
+        runner_factory=runner_factory,
+        mailbox_publisher=mailbox_publisher,
+        mailbox_subscriber=mailbox_subscriber,
+        envelope_factory=envelope_factory,
+        session_repository=session_repository_adapter,  # type: ignore[arg-type]
+        coordinator_envelope_store=coordinator_envelope_store,
+        cost_rollup_service=cost_rollup_service,
+        artifact_storage=artifact_storage,
+        coordinator_limits=coordinator_limits,
+    )
+
+    # ── 16. Pin everything on app_state so downstream DI / lifespan teardown
+    #      can resolve them. The plan calls out these four explicitly:
+    #      ``cost_rollup_service`` / ``coordinator_envelope_store`` /
+    #      ``patch_applier_deps`` / ``supervisor_registry`` (the last one is
+    #      wired by main.py lifespan directly via build_supervisor_registry).
+    app_state.parallel_execution_subgraph = parallel_execution_subgraph
+    app_state.coordinator_envelope_factory = envelope_factory
+    app_state.coordinator_mailbox_publisher = mailbox_publisher
+    app_state.coordinator_mailbox_subscriber = mailbox_subscriber
+    app_state.coordinator_terminal_waiter = terminal_waiter
+    app_state.coordinator_envelope_store = coordinator_envelope_store
+    app_state.coordinator_apply_audit_repo = coordinator_apply_audit_repo
+    app_state.coordinator_session_repository = session_repository_adapter
+    app_state.coordinator_rehydrate_service = rehydrate_service
+    app_state.coordinator_orchestrator_factory = _orchestrator_factory
+    app_state.coordinator_session_service = coordinator_session_service
+    app_state.coordinator_probe_quota = probe_quota
+    app_state.coordinator_limits = coordinator_limits
+    app_state.patch_reducer_service = patch_reducer_service
+    app_state.snapshot_store = snapshot_store
+    app_state.patch_applier_deps = patch_applier_deps
+    app_state.coordinator_artifact_storage = artifact_storage
+    app_state.cost_rollup_service = cost_rollup_service
+    app_state.coordinator_child_runner_starter = child_runner_starter
+
+    # ── 17. Assemble the immutable _CoordinatorRuntimeDeps value object. ────
+    coord_deps = _CoordinatorRuntimeDeps(
+        parallel_execution_subgraph=parallel_execution_subgraph,
+        session_service=coordinator_session_service,
+        rehydrate_service=rehydrate_service,
+        child_runner_starter=child_runner_starter,
+        mailbox_publisher=mailbox_publisher,
+        mailbox_subscriber=mailbox_subscriber,
+        envelope_factory=envelope_factory,
+        orchestrator_factory=_orchestrator_factory,
+        terminal_waiter=terminal_waiter,
+        probe_quota=probe_quota,
+        coordinator_limits=coordinator_limits,
+        session_repository=session_repository_adapter,
+        patch_reducer_service=patch_reducer_service,
+        patch_applier_deps=patch_applier_deps,
+        artifact_storage=artifact_storage,
+        cost_rollup_service=cost_rollup_service,
+        coordinator_envelope_store=coordinator_envelope_store,
+    )
+    app_state.coord_deps = coord_deps
+    return coord_deps
 
 
 async def _pr3c_noop_callback(envelope) -> None:  # noqa: ANN001
@@ -1059,6 +1467,7 @@ def _build_agent_service(
     file_memory_store: object | None = None,
     sandbox_lifecycle_service: object | None = None,
     supervisor_registry: "SupervisorRegistry | None" = None,
+    coord_deps: object | None = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
@@ -1188,6 +1597,9 @@ def _build_agent_service(
         sandbox_lifecycle_service=sandbox_lifecycle_service,
         supervisor_registry=supervisor_registry,
         mailbox_publisher=mailbox_publisher,
+        # PR-9b-A Task A8: lifespan-scoped coordinator runtime deps.
+        # Forwarded to every AgentTaskRunner constructed by _create_task.
+        coord_deps=coord_deps,
     )
     agent_svc._supervisor = supervisor
     # C3 PR-4.5 — bind AgentService into the supervisor callback bridge

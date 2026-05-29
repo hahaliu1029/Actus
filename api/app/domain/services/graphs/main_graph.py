@@ -28,6 +28,13 @@ from langgraph.types import Command, RetryPolicy, interrupt
 from app.domain.models.app_config import AgentConfig
 
 from app.application.errors.exceptions import ServerRequestsError
+# PR-9b-A6 — PatchApplier construction at run time inside
+# ``_run_parallel_backend``. The existing late import of ``ApplyStatus``
+# (below, inside the function body) established the domain → application
+# import as an accepted exception; hoisting the class symbol up keeps
+# the per-run ctor call readable.
+from app.application.services.group_lineage import GroupLineageFields
+from app.application.services.patch_applier import PatchApplier
 from app.domain.models.file import File
 from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef
 from app.domain.models.event import (
@@ -169,14 +176,22 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
     # following are true:
     #   (a) reducer reported SUCCESS
     #   (b) an apply_plan with at least one file was built
-    #   (c) the composition root wired patch_applier + parent_sandbox +
-    #       artifact_storage into ``configurable``
+    #   (c) the composition root wired ``patch_applier_deps`` (PR-9b-A6)
+    #       + parent_sandbox + artifact_storage into ``configurable``
     #
-    # PR-5 ships this branch in cold code (composition root doesn't yet
-    # bind the applier ports — PR-7/8 does); production wires the live
-    # ports at the orchestrator boundary. The defensive ``is None``
-    # checks ensure PR-5 doesn't break existing tests that mock the
-    # subgraph but not the applier.
+    # PR-9b-A6 swap: spec §5.1.4 originally specified a singleton
+    # ``patch_applier`` cfg key. The production reality (codex R3 audit)
+    # requires PER-RUN construction so the ``emit_event`` callable can
+    # close over the per-stream ``event_queue`` bound by GraphEventBridge
+    # at invocation time (event_bridge.py:74-79). main_graph now builds
+    # PatchApplier per-coordinator-run from ``cfg['patch_applier_deps']``
+    # (lifespan-scoped PatchApplierDeps holding snapshot_store / audit_repo
+    # / redis) + an async ``_emit_event_into_queue`` closure.
+    #
+    # Legacy ``cfg.get('patch_applier')`` is still consulted as a
+    # backward-compat fallback for existing unit tests that pre-construct
+    # a fake applier and inject it directly (test_run_parallel_backend_apply_*).
+    # Production composition root only wires ``patch_applier_deps``.
     from app.domain.models.patch_apply_plan import GroupOutcome
     group_outcome = final_state.get("group_outcome")
     if group_outcome != GroupOutcome.SUCCESS:
@@ -187,9 +202,45 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
         # SUCCESS with no files (exploration-only step) — nothing to apply
         return step_result_candidate
 
-    applier = cfg.get("patch_applier")
+    # PR-9b-A6: prefer per-run construction from PatchApplierDeps. Falls back
+    # to a singleton ``patch_applier`` only when the new key is absent.
     parent_sandbox = cfg.get("parent_sandbox")
     minio = cfg.get("artifact_storage")
+    deps = cfg.get("patch_applier_deps")
+    legacy_applier = cfg.get("patch_applier")
+
+    applier = legacy_applier
+    if deps is not None:
+        # PR-9b-A6 production path — per-run PatchApplier with an emit
+        # closure over the per-stream event_queue. Fail loud when the
+        # event_queue is absent: GraphEventBridge must always merge it
+        # into the coordinator-path configurable (INV-A3 regression
+        # guard); a silent drop would lose CoordinatorApplyEvent +
+        # HealthEvent emits.
+        event_queue = cfg.get("event_queue")
+        if event_queue is None:
+            raise RuntimeError(
+                "coordinator path entered without event_queue in "
+                "configurable — GraphEventBridge wiring regression "
+                "at event_bridge.py:74-79"
+            )
+
+        async def _emit_event_into_queue(event: object) -> None:
+            # [INV-A3] put_nowait avoids the cancellation window from
+            # awaiting a full queue. The PatchApplier's terminal emits
+            # (CoordinatorApplyEvent at _finalize, HealthEvent on
+            # rollback_partial) flow through this closure. Emit failures
+            # are swallowed by PatchApplier's own try/except so the
+            # ApplyOutcome reaches main_graph unchanged (INV-A4).
+            event_queue.put_nowait(event)
+
+        applier = PatchApplier(
+            snapshot_store=deps.snapshot_store,
+            audit_repo=deps.audit_repo,
+            redis=deps.redis,
+            emit_event=_emit_event_into_queue,
+        )
+
     if applier is None or parent_sandbox is None or minio is None:
         # Cold-code path: ports not wired yet (PR-5 ships before PR-7/8).
         # Return reducer's text without applying. The audit trail will
@@ -202,7 +253,7 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
         # surfaces that the apply was skipped + which ports were missing.
         missing = [
             name for name, port in (
-                ("patch_applier", applier),
+                ("patch_applier_deps_or_applier", applier),
                 ("parent_sandbox", parent_sandbox),
                 ("artifact_storage", minio),
             )
@@ -224,11 +275,20 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
     # cancel contract only fired in unit tests; production main_graph
     # would continue writing the parent sandbox after the parent was
     # cancelled.
+    # [PR-9b-B Task B6 / INV-B4] Thread group-scope lineage into apply so the
+    # group-level CoordinatorApplyEvent carries root/parent parity. Reuse the
+    # locals already derived above (session_id → parent mapping + root fallback);
+    # do NOT re-read state here — MainGraphState has no ``parent_session_id`` key.
+    lineage = GroupLineageFields(
+        root_session_id=root_session_id,
+        parent_session_id=parent_session_id,
+    )
     apply_outcome = await applier.apply(
         apply_plan,
         parent_sandbox=parent_sandbox,
         minio_client=minio,
         cancel_event=cfg.get("cancel_event"),
+        lineage=lineage,
     )
     if apply_outcome.status == ApplyStatus.SUCCESS:
         return (

@@ -153,6 +153,21 @@ class ParallelSubgraphState(TypedDict, total=False):
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+def _append_diag(existing: str, addition: str) -> str:
+    """[PR-9b-B Task B4] Append a diagnostic clause to a diagnostics_summary
+    string in a stable, observable way.
+
+    The reducer's ``diagnostics_summary`` is a free-form string field on
+    ``CoordinatorReduceEvent`` consumed by observability tooling. When the
+    cost-pull path (INV-B1) reports ``cost_unavailable``, we want the
+    addition to be visible without clobbering the prior summary (e.g.
+    ``"ok"`` from a clean reducer run).
+    """
+    if not existing:
+        return addition
+    return f"{existing}; {addition}"
+
+
 def _build_work_units_from_requests(
     work_unit_requests: list[Any],
     step_id_hash16: str,
@@ -508,6 +523,17 @@ async def _first_time_dispatch(
         # (``_publish_result_ready`` / ``_publish_cancel_ack``) can build envelopes
         # without parsing the coordinator_run_id string. The runner ctor already
         # accepts ``parent_session_id`` at the skeleton level (Task 3.4).
+        #
+        # PR-9b-A audit round-1 P1: ``parent_sandbox`` MUST be threaded through
+        # ``runner_starter.start(...)`` — A2's
+        # ``DefaultCoordinatorChildRunnerStarter.start`` ctor (api/app/application/
+        # services/coordinator_child_runner_starter.py:124-135) declares it as a
+        # required kwarg (per-run; comes from cfg["parent_sandbox"]). Without
+        # this kwarg the first flag-on dispatch would crash with TypeError
+        # before any SPAWN_REQUEST publishes. The value is injected into cfg by
+        # ``PlannerReActFlow._build_config`` at planner_react.py:1472
+        # (``"parent_sandbox": self._sandbox``).
+        parent_sandbox = cfg.get("parent_sandbox")
         for wu in enriched_units:
             await runner_starter.start(
                 coordinator_run_id=coordinator_run_id,
@@ -517,6 +543,7 @@ async def _first_time_dispatch(
                 cancel_event=cancel_event,
                 root_session_id=root_session_id,
                 parent_session_id=parent_session_id,
+                parent_sandbox=parent_sandbox,
             )
 
         # Step 8 -- publish SPAWN_REQUEST x N.
@@ -543,10 +570,29 @@ async def _first_time_dispatch(
         # stream key from ``envelope.parent_session_id``; an empty string would
         # publish CANCEL_REQUEST to ``actus:child::mailbox`` and never reach
         # the child.
+        #
+        # PR-9b-A6: bind ``emit_event`` to the per-stream ``event_queue`` so
+        # the orchestrator's CoordinatorSiblingCancelEvent is captured by the
+        # SSE timeline. The closure mirrors the pattern in
+        # ``main_graph._run_parallel_backend`` (INV-A3): async signature
+        # using synchronous ``put_nowait`` to avoid the cancellation window
+        # from awaiting a full queue. When event_queue is absent (legacy
+        # tests / non-coordinator paths) ``emit_event`` is left as None and
+        # the orchestrator silently no-ops (matches PR-8 behaviour).
+        orch_event_queue = cfg.get("event_queue")
+        orch_emit_event = None
+        if orch_event_queue is not None:
+            async def _orch_emit_into_queue(event: object) -> None:
+                # [INV-A3] put_nowait — sync, cancellation-safe.
+                orch_event_queue.put_nowait(event)
+
+            orch_emit_event = _orch_emit_into_queue
+
         orchestrator = orchestrator_factory.build(
             coordinator_run_id=coordinator_run_id,
             root_session_id=root_session_id,
             parent_session_id=parent_session_id,
+            emit_event=orch_emit_event,
         )
         orchestrator_task = asyncio.create_task(orchestrator.run(
             coordinator_run_id=coordinator_run_id,
@@ -1174,13 +1220,47 @@ async def reducer_node(
             parent_sandbox=parent_sandbox,
         )
 
-        # C2 PR-8 §13 Task 8.4 — emit CoordinatorReduceEvent. BEST-EFFORT:
-        # try/except so a queue/serialization failure does not mask the
-        # reducer output. cost_summary is sourced via getattr because
-        # PR-5 ReducerOutput does not yet carry it (PR-9+ will wire it);
-        # default to an empty CostAggregate so the wire schema validates.
-        # conflict_paths defaults to [] for the same reason — diagnostics
-        # do not yet carry per-path conflict surface; PR-9 can wire it.
+        # [PR-9b-B codex F1 — HIGH] Build the LOAD-BEARING handoff Command from
+        # ``output`` BEFORE the best-effort telemetry block below. ``reduce()``
+        # has already produced apply_plan/group_outcome/step_result_candidate;
+        # those drive the downstream apply branch and MUST reach the graph. By
+        # materialising ``command`` here (independent of telemetry) we guarantee
+        # the handoff value exists no matter what the cost-aggregate pull or the
+        # CoordinatorReduceEvent emit does — see the cancellation rationale on
+        # the telemetry block.
+        command = Command(
+            update={
+                "apply_plan": output.apply_plan,
+                "group_outcome": output.group_outcome,
+                "step_result_candidate": output.step_result_candidate,
+                # [codex R6 P1] Surface the reducer's diagnostics into the
+                # subgraph state so main_graph / PR-7 audit persistence
+                # have something to read (R5 lineage warnings, R4
+                # needs_authorization_details, etc.).
+                "reducer_diagnostics": output.diagnostics,
+            },
+            goto=END,
+        )
+
+        # C2 PR-8 §13 Task 8.4 + PR-9b-B Task B4 — emit CoordinatorReduceEvent.
+        # BEST-EFFORT: try/except so a queue/serialization failure does not
+        # mask the reducer output.
+        #
+        # [PR-9b-B Task B4] Cost authority is the durable cost_records ledger
+        # (INV-B1), pulled via ``cost_rollup_service.aggregate(...)`` rather
+        # than the worker envelope's per-child cost_summary attribute. The
+        # previous silent-zero fallback (INV-B2 violation — coalescing a
+        # missing/None reducer attribute into a fresh ``CostAggregate()``)
+        # is removed. Both INV-B3 failure modes are LOUD (never a silent
+        # zero), but they differ in what cost_total carries:
+        #   • aggregate() RAISES → cost_total = CostAggregate() (zero) +
+        #     diagnostics_summary 'cost_unavailable: aggregate raised'.
+        #   • aggregate() SUCCEEDS with non-empty missing_children → the
+        #     partial ledger cost is emitted AS-IS (the present children's
+        #     cost IS authoritative) AND diagnostics_summary carries
+        #     'cost_unavailable: missing_children=[...]'. Plan INV-B3 requires
+        #     SURFACING the gap, not zeroing the partial (see the B4 test
+        #     test_reducer_node_emit_missing_children_surfaces_diagnostic).
         event_queue: Optional[asyncio.Queue] = cfg.get("event_queue")
         if event_queue is not None:
             # [codex R4 P2] put_nowait (synchronous) — see _first_time_dispatch's
@@ -1190,20 +1270,76 @@ async def reducer_node(
             try:
                 from app.domain.models.event import CoordinatorReduceEvent
                 diagnostics_summary = "ok" if output.diagnostics else ""
-                # [codex PR-8 R2 P2] Coalesce ``None`` to ``CostAggregate()`` —
-                # ReducerOutput currently has no ``cost_summary`` attribute so
-                # ``getattr`` returns the default. When PR-9 adds
-                # ``cost_summary: Optional[CostAggregate] = None`` to
-                # ReducerOutput, plain ``getattr(..., CostAggregate())`` would
-                # return ``None`` (attribute exists, value is None) and the
-                # required ``cost_total: CostAggregate`` field on
-                # CoordinatorReduceEvent would raise a validation error —
-                # swallowed by this try/except, silently breaking the wire
-                # contract. ``or CostAggregate()`` keeps the fallback safe
-                # under both the current and the PR-9 shape.
-                cost_total = (
-                    getattr(output, "cost_summary", None) or CostAggregate()
+
+                # INV-B1 cost-pull: derive cost_total from the ledger via
+                # cost_rollup_service.aggregate(...) — NOT from the worker
+                # envelope's cost_summary.
+                cost_rollup_service = cfg.get("cost_rollup_service")
+                # [PR-9b-B codex F2 — HIGH] Source the aggregate's child id
+                # list from the FULL dispatched set (state["child_session_ids"],
+                # work_unit_id -> child_session_id for every dispatched child),
+                # NOT just the children that produced a WorkerResult. In an
+                # INCOMPLETE-group / rehydrate-skipped-envelope scenario a child
+                # that was dispatched but has no WorkerResult would otherwise be
+                # excluded from BOTH the cost SUM and ``missing_children`` —
+                # cost_total would undercount yet look authoritative with NO
+                # cost_unavailable diagnostic (fail-open vs INV-B3). Driving the
+                # id list off the dispatched set means such a child surfaces in
+                # ``missing_children`` (it has no cost rows) → the
+                # cost_unavailable diagnostic fires (INV-B3 satisfied).
+                child_session_ids = list(
+                    state.get("child_session_ids", {}).values()
                 )
+                cost_total: CostAggregate
+                missing_children: tuple[str, ...] = ()
+                if cost_rollup_service is None:
+                    # No service wired → can't authoritatively compute cost.
+                    # Surface as cost_unavailable rather than silently zeroing.
+                    cost_total = CostAggregate()
+                    diagnostics_summary = _append_diag(
+                        diagnostics_summary,
+                        "cost_unavailable: cost_rollup_service unavailable",
+                    )
+                else:
+                    try:
+                        agg_result = await cost_rollup_service.aggregate(
+                            coordinator_run_id=coordinator_run_id,
+                            child_session_ids=child_session_ids,
+                        )
+                        cost_total = agg_result.cost
+                        missing_children = tuple(agg_result.missing_children)
+                    except Exception as agg_exc:
+                        logger.warning(
+                            "reducer_node: cost aggregate(...) failed "
+                            "run=%s: %s — surfacing cost_unavailable",
+                            coordinator_run_id, agg_exc,
+                        )
+                        cost_total = CostAggregate()
+                        missing_children = tuple(child_session_ids)
+                        # [PR-9b-B codex F2 — MEDIUM/SEC] Emit a STABLE,
+                        # non-sensitive code into the client-visible diagnostic.
+                        # ``diagnostics_summary`` rides CoordinatorReduceEvent →
+                        # EventMapper → SSE, so interpolating the raw exception
+                        # (``{agg_exc}``) would leak SQLAlchemy text + bound
+                        # params (session IDs). The detailed exception stays in
+                        # the server-side logger.warning above ONLY.
+                        diagnostics_summary = _append_diag(
+                            diagnostics_summary,
+                            "cost_unavailable: aggregate_error",
+                        )
+
+                # INV-B3: missing_children non-empty MUST surface even on
+                # the aggregate-success path.
+                if (
+                    missing_children
+                    and "cost_unavailable" not in diagnostics_summary
+                ):
+                    diagnostics_summary = _append_diag(
+                        diagnostics_summary,
+                        f"cost_unavailable: missing_children="
+                        f"{list(missing_children)}",
+                    )
+
                 event_queue.put_nowait(CoordinatorReduceEvent(
                     group_outcome=output.group_outcome,
                     per_worker_outcomes={
@@ -1223,19 +1359,7 @@ async def reducer_node(
                     "run=%s: %s", coordinator_run_id, exc,
                 )
 
-        return Command(
-            update={
-                "apply_plan": output.apply_plan,
-                "group_outcome": output.group_outcome,
-                "step_result_candidate": output.step_result_candidate,
-                # [codex R6 P1] Surface the reducer's diagnostics into the
-                # subgraph state so main_graph / PR-7 audit persistence
-                # have something to read (R5 lineage warnings, R4
-                # needs_authorization_details, etc.).
-                "reducer_diagnostics": output.diagnostics,
-            },
-            goto=END,
-        )
+        return command
     finally:
         if (
             probe_quota is not None

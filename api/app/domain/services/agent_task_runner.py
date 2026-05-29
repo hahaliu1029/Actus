@@ -294,6 +294,12 @@ class AgentTaskRunner(TaskRunner):
         # envelope publisher; default False preserves the legacy publisher
         # path for subagent_research children and roots.
         terminal_envelope_publisher_disabled: bool = False,
+        # PR-9b-A Task A8: lifespan-scoped ``_CoordinatorRuntimeDeps``
+        # aggregator forwarded from AgentService → PlannerReActFlow.
+        # Default ``None`` triggers the null-deps sentinel inside the
+        # planner ctor — preserves legacy/test behavior so callers that
+        # don't wire coordinator infrastructure SKIP the 18 coord cfg keys.
+        coord_deps: Any = None,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -314,6 +320,12 @@ class AgentTaskRunner(TaskRunner):
             supervisor_registry
         )
         self._mailbox_supervisor_enabled: bool = mailbox_supervisor_enabled
+        # PR-9b-A Task A8 — lifespan-scoped coordinator runtime deps.
+        # Forwarded into PlannerReActFlow via _coord_deps below; None means
+        # the planner uses its built-in ``_NullCoordinatorRuntimeDeps``
+        # default so legacy callers (tests, non-coordinator runs) work
+        # unchanged.
+        self._coord_deps_for_planner: Any = coord_deps
         self._cached_is_root_session: Optional[bool] = None
         self._supervisor_spawned: bool = False  # set after first successful spawn (informational only — spawn is idempotent)
         # C3 PR-4.5 — child-side envelope publisher state.
@@ -575,6 +587,14 @@ class AgentTaskRunner(TaskRunner):
             execution_supervisor=self._execution_supervisor,
             permission_engine=self._permission_engine,
             session_state_machine=self._session_state_machine,
+            # PR-9b-A Task A8 — forward the lifespan-scoped coord deps to
+            # PlannerReActFlow. When None, the planner's default
+            # ``_NullCoordinatorRuntimeDeps`` kicks in (legacy/test path).
+            **(
+                {"_coord_deps": self._coord_deps_for_planner}
+                if self._coord_deps_for_planner is not None
+                else {}
+            ),
         )
 
     def _build_prompt_telemetry(self) -> Any:
@@ -3408,6 +3428,48 @@ class AgentTaskRunner(TaskRunner):
         self._cached_is_root_session = is_root
         return is_root
 
+    def _prime_planner_cancel_event_for_coord_deps(self) -> None:
+        """PR-9b-A audit round-1 P1 (Fix 3 — INV-A6) writer for
+        ``PlannerReActFlow._cancel_event``.
+
+        A5 introduced ``self._cancel_event: Any = None`` on the planner as a
+        deferred placeholder; no caller actually wrote it, leaving the
+        per-run coordinator cfg key ``cancel_event`` projected as ``None``
+        and violating INV-A6 ("each non-None"). The downstream consumers —
+        ``runner_starter.start(cancel_event=...)``,
+        ``orchestrator.run(cancel_event=...)``, and (via cfg) the per-run
+        PatchApplier — all observe this same Event instance, so the writer
+        MUST happen exactly once per ``invoke()`` BEFORE
+        ``PlannerReActFlow._build_config()`` is called (which is invoked
+        downstream from ``self._flow.invoke(message)``).
+
+        Option A (chosen): the runner owns + writes the Event; threading is
+        Planner-instance -> cfg projection -> dispatch node. Lower fidelity
+        than passing cancel_event as an explicit ``invoke(*, cancel_event=)``
+        kwarg, but avoids touching ``PlannerReActFlow.invoke`` signature and
+        every test that constructs one.
+
+        No-op when ``self._coord_deps_for_planner is None`` (legacy /
+        non-coordinator path). In that branch ``_build_config`` skips the
+        18 coordinator keys wholesale via the
+        ``_NullCoordinatorRuntimeDeps`` ``isinstance`` guard, so writing a
+        cancel_event would only add allocations without effect.
+
+        ``hasattr(self._flow, "_cancel_event")`` defends against test mocks
+        that swap ``self._flow`` for a ``MagicMock`` — the priming is
+        opportunistic infra wiring, not a hard contract for legacy flows.
+        """
+        if getattr(self, "_coord_deps_for_planner", None) is None:
+            return
+        flow = getattr(self, "_flow", None)
+        if flow is None or not hasattr(flow, "_cancel_event"):
+            return
+        # Always allocate a fresh Event so a previously-cancelled or
+        # previously-set event from an earlier invoke cannot leak forward.
+        # The Event lives on the planner instance and is observed by every
+        # downstream consumer through the cfg projection.
+        flow._cancel_event = asyncio.Event()
+
     async def _maybe_spawn_mailbox_supervisor(self) -> None:
         """C3 PR-3c spawn hook (idempotent).
 
@@ -3838,6 +3900,18 @@ class AgentTaskRunner(TaskRunner):
             # 2.确保沙箱、mcp、a2a均初始化完成
             logger.info(f"AgentTaskRunner任务处理开始")
             await self._sandbox.ensure_sandbox()
+            # PR-9b-A audit round-1 P1 (Fix 3 / INV-A6) — prime the planner's
+            # per-run cancel_event so ``PlannerReActFlow._build_config()``
+            # injects a real ``asyncio.Event`` (not ``None``) into the 18-key
+            # coordinator cfg projection. The downstream dispatch path threads
+            # this same Event through ``runner_starter.start(cancel_event=...)``,
+            # ``orchestrator.run(cancel_event=...)``, and (via cfg) into
+            # PatchApplier — they MUST all observe the same instance.
+            #
+            # No-op when ``coord_deps`` is null (legacy / non-coordinator path):
+            # the cfg projection is skipped wholesale in that branch by the
+            # planner's ``isinstance(... , _NullCoordinatorRuntimeDeps)`` guard.
+            self._prime_planner_cancel_event_for_coord_deps()
             # C3 PR-4.5 (codex r1 [R1-4, HIGH CONTRACT]) — emit SPAWN_ACK
             # AFTER ensure_sandbox() succeeds. The envelope payload sets
             # ``sandbox_ready=True`` which the supervisor interprets as
