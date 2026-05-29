@@ -73,5 +73,7 @@ members = [
 
 [dependency-groups]
 dev = [
+    "asgi-lifespan>=2.1.0",
     "fakeredis>=2.35.1",
+    "pytest-xdist>=3.5.0",
 ]

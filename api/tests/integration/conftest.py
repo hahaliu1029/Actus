@@ -43,6 +43,52 @@ def _run_migrations() -> None:
     command.upgrade(alembic_cfg, "head")
 
 
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    """[PR-9b-C C8 / INV-C5] Fail fast if ``-m coordinator_recovery`` runs under xdist.
+
+    The coordinator E2E harness shares mutable global state across tests — Redis
+    DB 15 (``redis_client`` ``flushdb()``-es before/after each test, conftest.py:597)
+    and the ``coordinator_truncation`` ``TRUNCATE`` reset. Under ``-n>1`` those
+    tests run concurrently in separate worker processes against the SAME Redis DB
+    + the SAME Postgres, so one worker's flush/truncate clobbers another worker's
+    in-flight rows. There is no per-worker DB/Redis isolation in this harness, so
+    parallelism is unsafe — we refuse it at collection time with a clear message
+    instead of letting it produce flaky, non-reproducible failures.
+
+    Worker-count signal: we read BOTH ``PYTEST_XDIST_WORKER_COUNT`` (the env var
+    pytest-xdist documents as the per-worker count) AND
+    ``config.option.numprocesses`` (the ``-n`` value, which IS reliably populated
+    during ``pytest_collection_modifyitems`` — empirically the env var is unset at
+    collection time in the pinned xdist version, only being exported later for
+    test execution). Taking the max of the two makes the guard fire regardless of
+    which signal a future xdist version chooses to expose at collection.
+
+    Ordering (codex R3-F2, HIGH): decorated ``@pytest.hookimpl(trylast=True)`` so
+    pytest's BUILT-IN markexpr-deselection hook (which removes ``-m``-deselected
+    items from ``items``) runs FIRST. Without ``trylast`` this hook inspected
+    ``items`` while recovery-marked items were still present, so a legitimate
+    parallel NON-recovery run (``pytest -n2 -m "not coordinator_recovery"``)
+    falsely tripped the guard — the recovery items it raised on were about to be
+    deselected and would never have RUN. By running last we only ever see items
+    that will actually execute, so the guard fires iff a recovery item survives
+    deselection under ``-n>1``.
+    """
+    import os
+
+    env_count = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "0") or "0")
+    opt_count = getattr(config.option, "numprocesses", None) or 0
+    worker_count = max(env_count, int(opt_count))
+    if worker_count > 1:
+        for item in items:
+            if "coordinator_recovery" in item.keywords:
+                raise RuntimeError(
+                    "xdist parallelism is NOT supported with the -m coordinator_recovery "
+                    "marker; the fixture harness uses shared Redis DB 15 + truncation which "
+                    "collide under -n>1. Run single-worker (-n0) instead."
+                )
+
+
 @pytest.fixture(scope="module")
 def anyio_backend():
     return "asyncio"
@@ -1177,3 +1223,26 @@ async def full_supervisor_stack(
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+# ── [PR-9b-C] Coordinator E2E fixture re-exports ─────────────────────────────
+#
+# The 7 coordinator fixtures live in ``tests/integration/coordinator_fixtures``
+# (built in Tasks C2-C7) to keep this conftest focused.  They are re-imported
+# here so pytest resolves them by name for any test under
+# ``tests/integration/``.  ``async_session`` consumes ``async_session_factory``
+# and ``redis_real`` consumes ``redis_client`` — both defined above in this
+# module; fixtures resolve by name at collection time regardless of import
+# order, so the import lives at module end next to the supervisor fixtures.
+from tests.integration.coordinator_fixtures import (  # noqa: E402,F401
+    async_client,
+    async_session,
+    coordinator_truncation,
+    env_with_coordinator_flag_on,
+    fixture_mock_llm_3_workers,
+    fixture_mock_llm_parallel_planner,
+    fresh_test_user,
+    minio_real,
+    redis_real,
+    sandbox_real,
+)
