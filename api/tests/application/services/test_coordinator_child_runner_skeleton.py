@@ -68,6 +68,20 @@ class TestSkeletonCtorAcceptsForwardDeps:
         assert r._envelope_factory is not None
         assert r._mailbox_subscriber is not None
 
+    # [C2 finish-core F1.4 / §5.1.2] child_sandbox Port — the ParentSandboxPort
+    # over the child handle, consumed by seed-install (§5.1.4) + patch-extraction
+    # (§5.1.5). Keyword-only with a None default so every existing caller
+    # (skeleton/finalizer tests) stays constructible.
+    def test_accepts_child_sandbox_port(self) -> None:
+        import asyncio
+        from unittest.mock import MagicMock
+        from app.application.services.coordinator_child_runner import (
+            CoordinatorChildRunner,
+        )
+        port = MagicMock()
+        r = CoordinatorChildRunner(cancel_event=asyncio.Event(), child_sandbox=port)
+        assert r._child_sandbox is port
+
 
 # [PR-4 Task 4.7] PR-3's `TestRunWorkUnitDeferredToPr4.test_raises_notimplemented`
 # has been removed: run_work_unit is now a full implementation. Finalizer

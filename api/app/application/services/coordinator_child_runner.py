@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, Mapping, Optional, TYPE_CHECKING
 
@@ -99,8 +100,28 @@ class CoordinatorChildInnerRunner(Protocol):
     obscure AttributeError on the wrong type.
     """
 
-    async def invoke_until_done(self, *, user_message: str) -> object:  # noqa: D401
+    async def invoke_until_done(self, *, user_message: str) -> "ChildRunResult":  # noqa: D401
         ...
+
+
+@dataclass(frozen=True)
+class ChildRunResult:
+    """[C2 finish-core §5.1.1] Return value of
+    ``CoordinatorChildInnerRunner.invoke_until_done``.
+
+    ``done_event`` is the child's terminal output event (a ``DoneEvent`` on
+    natural completion). ``tool_calls`` are the child's ``ToolEvent``s
+    (status=CALLING) captured off the output stream — the data channel
+    ``_extract_patch_files_from_history`` (§5.1.5) uses to find which paths
+    the child wrote (``DoneEvent`` itself carries only ``metrics``).
+
+    The in-repo consumer (``run_work_unit``) currently binds the whole result
+    and passes it through unchanged; rewiring it to unpack ``.tool_calls`` /
+    ``.done_event`` is staged for F2.3 (patch-extraction).
+    """
+
+    done_event: Any
+    tool_calls: tuple[Any, ...] = ()
 
 
 # [r7 P2#3] Narrow the value type to the closed NeedsAuthorizationDetails
@@ -133,6 +154,7 @@ class CoordinatorChildRunner:
         inner_runner: Any = None,
         publisher: Any = None,
         parent_sandbox: Any = None,
+        child_sandbox: Any = None,  # [finish-core §5.1.2] ParentSandboxPort over the child handle
         artifact_storage: Any = None,
         envelope_factory: Any = None,
         parent_session_id: str = "",
@@ -144,6 +166,7 @@ class CoordinatorChildRunner:
         self._inner_runner = inner_runner
         self._publisher = publisher
         self._parent_sandbox = parent_sandbox
+        self._child_sandbox = child_sandbox  # seed-install (§5.1.4) + patch-extraction (§5.1.5)
         self._artifact_storage = artifact_storage
         # Lazy default for envelope_factory keeps the PR-3 skeleton ctor
         # signature (which allowed envelope_factory=None) working.
@@ -253,6 +276,11 @@ class CoordinatorChildRunner:
                 # natural place to thread it. Until that lands, token-cost
                 # checks happen only post-hoc via cost_summary aggregation,
                 # not as an in-flight LLM-call guard.
+                #
+                # TODO(F2.3): result is a ChildRunResult; .tool_calls/.done_event
+                # unpacking lands in F2.3 patch-extraction. Bound whole here
+                # intentionally for now (passed through _finalize_success →
+                # _extract_patch_files_from_history, which currently ignore it).
                 done_event = await self._inner_runner.invoke_until_done(
                     user_message=self._build_child_prompt(work_unit, spawn_manifest),
                 )

@@ -4,8 +4,9 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
@@ -792,10 +793,77 @@ def build_supervisor_registry(
     return SupervisorRegistry(supervisor_factory=_factory)
 
 
+@dataclass(frozen=True)
+class ChildRunnerSharedDeps:
+    """[C2 finish-core §5.1 — R1 fix] The process-shared deps a child runner
+    needs, resolved LAZILY (post-lifespan) from the live AgentService."""
+    uow_factory: object
+    llm: object
+    agent_config: object
+    mcp_config: object
+    a2a_config: object
+    file_storage: object
+    search_engine: object
+    checkpointer_pool: object
+    execution_supervisor: object
+
+
+def _make_shared_child_runner_builder(
+    *, resolve_child_runner_deps: Callable[[], "ChildRunnerSharedDeps"]
+) -> "ChildRunnerBuilder":
+    """[C2 finish-core §5.1 Shape-1-variant — R1 fix] Return a ChildRunnerBuilder
+    callable that resolves the shared deps at child-build time. The child
+    agent_config is derived once (cached) with tool_confirmation.enabled=False
+    (§5.1.7) so the lease-bound child never blocks on human confirmation. The
+    child is NOT given coord_deps (must not be a nested coordinator)."""
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    _cache: dict = {}
+
+    def _build(
+        *, session_id, tool_filter, mailbox_publisher,
+        terminal_envelope_publisher_disabled, sandbox, browser, user_id,
+        cost_callback_handler,
+    ):
+        deps = resolve_child_runner_deps()  # live, post-lifespan
+        child_agent_config = _cache.get("child_agent_config")
+        if child_agent_config is None:
+            child_agent_config = deps.agent_config.model_copy(update={
+                "tool_confirmation": deps.agent_config.tool_confirmation.model_copy(
+                    update={"enabled": False}
+                ),
+            })
+            _cache["child_agent_config"] = child_agent_config
+        return AgentTaskRunner(
+            uow_factory=deps.uow_factory,
+            llm=deps.llm,
+            agent_config=child_agent_config,
+            mcp_config=deps.mcp_config,
+            a2a_config=deps.a2a_config,
+            session_id=session_id,
+            user_id=user_id,
+            file_storage=deps.file_storage,
+            browser=browser,
+            search_engine=deps.search_engine,
+            sandbox=sandbox,
+            checkpointer_pool=deps.checkpointer_pool,
+            cost_callback_handler=cost_callback_handler,
+            tool_filter=tool_filter,
+            mailbox_publisher=mailbox_publisher,
+            terminal_envelope_publisher_disabled=terminal_envelope_publisher_disabled,
+            coord_deps=None,  # child is NOT a nested coordinator
+        )
+
+    return _build
+
+
 def build_coordinator_runtime_deps(
     *,
     app_state: Any,
     redis_client: RedisClient,
+    resolve_child_runner_deps: Any = None,   # () -> ChildRunnerSharedDeps (lazy, post-lifespan)
+    sandbox_lifecycle_service: Any = None,    # _DeferredLifecycle proxy
+    child_runner_task_cls: Any = None,        # RedisStreamTask
 ) -> Any:
     """[PR-9b-A Task A8] Composition root for the lifespan-scoped
     ``_CoordinatorRuntimeDeps`` aggregator.
@@ -1116,15 +1184,32 @@ def build_coordinator_runtime_deps(
     )
 
     # ── 15. ChildAgentTaskRunnerFactory + DefaultCoordinatorChildRunnerStarter.
-    #      The ``runner_class`` injection is the *bound* AgentTaskRunner
-    #      partial; until PR-5 ships the partial wiring, we inject the bare
-    #      AgentTaskRunner class as the spec requires the Protocol shape.
-    #      Production composition replaces this with the partial-bound build.
-    from app.domain.services.agent_task_runner import AgentTaskRunner
-
+    #      [C2 finish-core F1.7 — R1 fix] The ``runner_class`` injection is the
+    #      shared child-runner builder (a ChildRunnerBuilder callable, NOT the
+    #      bare AgentTaskRunner class — that would TypeError on the missing
+    #      required ctor args). The builder resolves the process-shared deps
+    #      LAZILY via ``resolve_child_runner_deps`` (post-lifespan, off the live
+    #      AgentService) and forces ``tool_confirmation.enabled=False`` on the
+    #      child-scoped agent_config (§5.1.7).
+    #
+    #      When ``resolve_child_runner_deps`` is None (the 2-kwarg comp-root
+    #      test callers that never dispatch a child), an unwired sentinel
+    #      builder is injected so construction stays TypeError-free; it raises
+    #      loudly only if a child is actually dispatched without wiring.
+    def _unwired_builder(**_kw):
+        raise RuntimeError(
+            "coordinator child runner builder not wired (resolve_child_runner_deps "
+            "is None) — production lifespan must pass it; tests that don't dispatch "
+            "a child never reach here."
+        )
+    runner_class = (
+        _make_shared_child_runner_builder(resolve_child_runner_deps=resolve_child_runner_deps)
+        if resolve_child_runner_deps is not None else _unwired_builder
+    )
     runner_factory = ChildAgentTaskRunnerFactory(
-        runner_class=AgentTaskRunner,  # PR-5 will wrap via functools.partial
+        runner_class=runner_class,
         mailbox_publisher=mailbox_publisher,
+        task_cls=child_runner_task_cls,
     )
     child_runner_starter = DefaultCoordinatorChildRunnerStarter(
         runner_factory=runner_factory,
@@ -1136,6 +1221,8 @@ def build_coordinator_runtime_deps(
         cost_rollup_service=cost_rollup_service,
         artifact_storage=artifact_storage,
         coordinator_limits=coordinator_limits,
+        sandbox_lifecycle_service=sandbox_lifecycle_service,
+        resolve_child_runner_deps=resolve_child_runner_deps,
     )
 
     # ── 16. Pin everything on app_state so downstream DI / lifespan teardown

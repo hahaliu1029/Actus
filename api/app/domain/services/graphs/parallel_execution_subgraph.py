@@ -544,6 +544,7 @@ async def _first_time_dispatch(
                 root_session_id=root_session_id,
                 parent_session_id=parent_session_id,
                 parent_sandbox=parent_sandbox,
+                user_id=user_id,
             )
 
         # Step 8 -- publish SPAWN_REQUEST x N.

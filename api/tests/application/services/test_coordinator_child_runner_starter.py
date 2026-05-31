@@ -70,6 +70,53 @@ def _manifest_bytes() -> bytes:
     }).encode("utf-8")
 
 
+def _fake_lifecycle():
+    from unittest.mock import AsyncMock, MagicMock
+
+    handle = MagicMock()
+    handle.get_browser = AsyncMock(return_value=MagicMock())
+    svc = MagicMock()
+    svc.bind_new = AsyncMock(return_value=handle)
+    return svc
+
+
+def _fake_resolve():
+    import types
+    from unittest.mock import MagicMock
+
+    return types.SimpleNamespace(
+        execution_supervisor=MagicMock(),
+        uow_factory=lambda: MagicMock(),
+    )
+
+
+def _make_starter(
+    *,
+    runner_factory=None,
+    lifecycle=None,
+    publisher=None,
+    envelope_factory=None,
+    resolve=None,
+):
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+
+    return DefaultCoordinatorChildRunnerStarter(
+        runner_factory=runner_factory or _FakeRunnerFactory(),
+        mailbox_publisher=publisher or MagicMock(),
+        mailbox_subscriber=MagicMock(),
+        envelope_factory=envelope_factory or MagicMock(),
+        session_repository=_FakeSessionRepository(),
+        coordinator_envelope_store=MagicMock(),
+        cost_rollup_service=MagicMock(),
+        artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
+        coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=lifecycle or _fake_lifecycle(),
+        resolve_child_runner_deps=resolve or _fake_resolve,
+    )
+
+
 async def test_start_invokes_run_work_unit_with_decoded_manifest(monkeypatch):
     from app.application.services.coordinator_child_runner_starter import (
         DefaultCoordinatorChildRunnerStarter,
@@ -102,6 +149,8 @@ async def test_start_invokes_run_work_unit_with_decoded_manifest(monkeypatch):
         cost_rollup_service=MagicMock(),
         artifact_storage=artifact,
         coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
     )
 
     await starter.start(
@@ -113,6 +162,7 @@ async def test_start_invokes_run_work_unit_with_decoded_manifest(monkeypatch):
         root_session_id="root-1",
         parent_session_id="parent-1",
         parent_sandbox=MagicMock(),
+        user_id="user-1",
     )
 
     for _ in range(50):
@@ -166,6 +216,8 @@ async def test_start_sets_task_name_and_registers_in_active(monkeypatch):
         cost_rollup_service=MagicMock(),
         artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
         coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
     )
     await starter.start(
         coordinator_run_id="run-2",
@@ -176,6 +228,7 @@ async def test_start_sets_task_name_and_registers_in_active(monkeypatch):
         root_session_id="root-2",
         parent_session_id="parent-2",
         parent_sandbox=MagicMock(),
+        user_id="user-2",
     )
     await started.wait()
     assert "child-2" in starter._active_tasks
@@ -213,6 +266,8 @@ async def test_done_callback_pops_on_success(monkeypatch):
         cost_rollup_service=MagicMock(),
         artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
         coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
     )
     await starter.start(
         coordinator_run_id="run-3",
@@ -223,6 +278,7 @@ async def test_done_callback_pops_on_success(monkeypatch):
         root_session_id="root-3",
         parent_session_id="parent-3",
         parent_sandbox=MagicMock(),
+        user_id="user-3",
     )
     for _ in range(50):
         if "child-3" not in starter._active_tasks:
@@ -256,6 +312,8 @@ async def test_done_callback_pops_and_logs_on_exception(monkeypatch, caplog):
         cost_rollup_service=MagicMock(),
         artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
         coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
     )
     with caplog.at_level(logging.ERROR):
         await starter.start(
@@ -267,6 +325,7 @@ async def test_done_callback_pops_and_logs_on_exception(monkeypatch, caplog):
             root_session_id="root-4",
             parent_session_id="parent-4",
             parent_sandbox=MagicMock(),
+            user_id="user-4",
         )
         for _ in range(50):
             if "child-4" not in starter._active_tasks:
@@ -306,6 +365,8 @@ async def test_done_callback_handles_cancelled_without_raising(monkeypatch, capl
         cost_rollup_service=MagicMock(),
         artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
         coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
     )
     await starter.start(
         coordinator_run_id="run-5",
@@ -316,6 +377,7 @@ async def test_done_callback_handles_cancelled_without_raising(monkeypatch, capl
         root_session_id="root-5",
         parent_session_id="parent-5",
         parent_sandbox=MagicMock(),
+        user_id="user-5",
     )
     await started.wait()
     task = starter._active_tasks["child-5"]
@@ -333,3 +395,81 @@ async def test_done_callback_handles_cancelled_without_raising(monkeypatch, capl
 
     assert "child-5" not in starter._active_tasks
     assert not any("crashed unhandled" in r.message for r in caplog.records)
+
+
+async def test_start_provisions_child_sandbox_and_cost_handler(monkeypatch):
+    """bind_new is called with the child session + user_id; the per-child cost
+    handler + per-child sandbox/browser flow into factory.build; the
+    CoordinatorChildRunner receives a child_sandbox Port (A1)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    lifecycle = _fake_lifecycle()
+    built = MagicMock()
+    runner_factory = MagicMock()
+    runner_factory.build = AsyncMock(return_value=built)
+    captured = {}
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter."
+        "build_supervisor_aware_callback_handler",
+        lambda supervisor, session_id, user_id, uow_factory: captured.setdefault(
+            "cost", (session_id, user_id)
+        ) or MagicMock(),
+    )
+    # CoordinatorChildRunner is real here; its run_work_unit will run on the built
+    # mock runner. To keep the test fast + isolated, monkeypatch it to a no-op fake:
+    class _NoopChildRunner:
+        def __init__(self, **kwargs): captured["ctor"] = kwargs
+        async def run_work_unit(self, **kwargs): return None
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter.CoordinatorChildRunner",
+        _NoopChildRunner,
+    )
+    starter = _make_starter(runner_factory=runner_factory, lifecycle=lifecycle)
+    await starter.start(
+        coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1", spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(), root_session_id="root-1",
+        parent_session_id="parent-1", parent_sandbox=MagicMock(),
+        user_id="user-1",
+    )
+    lifecycle.bind_new.assert_awaited_once_with("child-1", user_id="user-1")
+    assert captured["cost"] == ("child-1", "user-1")
+    bk = runner_factory.build.call_args.kwargs
+    assert bk["user_id"] == "user-1"
+    assert "sandbox" in bk and "browser" in bk and "cost_callback_handler" in bk
+    assert captured["ctor"].get("child_sandbox") is not None  # A1: child_sandbox Port threaded
+    # A1: the child gets its OWN sandbox port, never the parent's handle.
+    assert captured["ctor"]["child_sandbox"] is not captured["ctor"]["parent_sandbox"]
+
+
+async def test_start_failure_after_bind_new_publishes_failed_and_does_not_destroy(monkeypatch):
+    """A factory.build failure after bind_new publishes a FAILED RESULT_READY
+    for the work_unit AND issues NO sandbox destroy (M1); start does not raise."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    lifecycle = _fake_lifecycle()  # has bind_new; NO destroy attribute used
+    handle = lifecycle.bind_new.return_value  # the handle _fake_lifecycle hands out
+    handle.destroy = AsyncMock()
+    runner_factory = MagicMock()
+    runner_factory.build = AsyncMock(side_effect=RuntimeError("build boom"))
+    publisher = MagicMock()
+    publisher.publish = AsyncMock()
+    envelope_factory = MagicMock()
+    envelope_factory.make_result_ready = MagicMock(return_value="ENVELOPE")
+    starter = _make_starter(
+        runner_factory=runner_factory, lifecycle=lifecycle,
+        publisher=publisher, envelope_factory=envelope_factory,
+    )
+    await starter.start(  # must NOT raise
+        coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1", spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(), root_session_id="root-1",
+        parent_session_id="parent-1", parent_sandbox=MagicMock(),
+        user_id="user-1",
+    )
+    publisher.publish.assert_awaited()  # FAILED envelope published
+    lifecycle.bind_new.assert_awaited_once()
+    # M1: the starter never destroys — real regression gates, not just
+    # "fake has no destroy attr" (a MagicMock would auto-create the call).
+    handle.destroy.assert_not_called()
+    lifecycle.destroy.assert_not_called()

@@ -67,6 +67,10 @@ class ChildRunnerBuilder(Protocol):
         tool_filter: Optional[FrozenSet[str]],
         mailbox_publisher: Any,
         terminal_envelope_publisher_disabled: bool,
+        sandbox: Any,
+        browser: Any,
+        user_id: str,
+        cost_callback_handler: Any,
     ) -> Any: ...
 
 
@@ -119,7 +123,7 @@ class ChildAgentTaskRunnerFactory:
     """
 
     def __init__(
-        self, *, runner_class: ChildRunnerBuilder, mailbox_publisher: Any,
+        self, *, runner_class: ChildRunnerBuilder, mailbox_publisher: Any, task_cls: Any,
     ) -> None:
         # ``runner_class`` is typed as ChildRunnerBuilder — see Protocol above
         # for why the live AgentTaskRunner class itself can't be passed
@@ -127,6 +131,10 @@ class ChildAgentTaskRunnerFactory:
         # functools.partial to satisfy this contract.
         self._runner_class = runner_class
         self._mailbox_publisher = mailbox_publisher
+        # ``task_cls`` is the RedisStreamTask class the invoke-adapter drives
+        # (Task.create(task_runner=...)); injected so tests can substitute a
+        # MagicMock without monkey-patching the adapter's import.
+        self._task_cls = task_cls
 
     async def build(
         self,
@@ -135,22 +143,37 @@ class ChildAgentTaskRunnerFactory:
         child_permission_context: Any,
         tool_filter_preset: str,
         cancel_event: asyncio.Event,
+        sandbox: Any,
+        browser: Any,
+        user_id: str,
+        cost_callback_handler: Any,
     ) -> BuiltChildRunner:
-        """Construct an ``AgentTaskRunner`` configured for this preset and
-        return it wrapped in a ``BuiltChildRunner``.
+        """Build the child AgentTaskRunner via the shared runner builder and
+        wrap it in the invoke-adapter (§5.1 Shape-1-variant). The adapter ctor
+        performs the cancel-event wiring (set_coordinator_cancel_event).
 
         Raises ``ValueError`` if ``tool_filter_preset`` is not registered.
         """
+        from app.application.services.agent_task_runner_invoke_adapter import (
+            AgentTaskRunnerInvokeAdapter,
+        )
         tool_filter = resolve_preset(tool_filter_preset)
         terminal_disabled = tool_filter_preset == COORDINATOR_STEP_PRESET
-        runner = self._runner_class(
+        raw_runner = self._runner_class(
             session_id=child_session_id,
             tool_filter=tool_filter,
             mailbox_publisher=self._mailbox_publisher,
             terminal_envelope_publisher_disabled=terminal_disabled,
+            sandbox=sandbox,
+            browser=browser,
+            user_id=user_id,
+            cost_callback_handler=cost_callback_handler,
+        )
+        adapter = AgentTaskRunnerInvokeAdapter(
+            runner=raw_runner, cancel_event=cancel_event, task_cls=self._task_cls,
         )
         return BuiltChildRunner(
-            runner=runner,
+            runner=adapter,
             cancel_event=cancel_event,
             child_permission_context=child_permission_context,
             terminal_envelope_publisher_disabled=terminal_disabled,

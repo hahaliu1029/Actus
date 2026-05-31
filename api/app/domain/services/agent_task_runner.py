@@ -3464,11 +3464,22 @@ class AgentTaskRunner(TaskRunner):
         flow = getattr(self, "_flow", None)
         if flow is None or not hasattr(flow, "_cancel_event"):
             return
+        if getattr(flow, "_cancel_event_externally_injected", False):
+            # [C2 finish-core §5.1.1] An adapter already injected a coordinator
+            # cancel_event — never clobber it.
+            return
         # Always allocate a fresh Event so a previously-cancelled or
         # previously-set event from an earlier invoke cannot leak forward.
         # The Event lives on the planner instance and is observed by every
         # downstream consumer through the cfg projection.
         flow._cancel_event = asyncio.Event()
+
+    def set_coordinator_cancel_event(self, event: "asyncio.Event") -> None:
+        """[C2 finish-core §5.1.1 G1a] Forward the coordinator per-work-unit
+        cancel_event into the child PlannerReActFlow so react_graph cancel
+        checkpoints observe it. The child runner has coord_deps=None, so its
+        own prime is a no-op and this injection survives."""
+        self._flow.set_cancel_event(event)
 
     async def _maybe_spawn_mailbox_supervisor(self) -> None:
         """C3 PR-3c spawn hook (idempotent).

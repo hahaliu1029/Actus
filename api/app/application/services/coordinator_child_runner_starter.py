@@ -16,7 +16,13 @@ import logging
 from typing import TYPE_CHECKING, Any, Protocol
 
 from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+from app.application.services.cost_callback_factory import (
+    build_supervisor_aware_callback_handler,
+)
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
+from app.infrastructure.external.sandbox.parent_sandbox_adapter import (
+    ParentSandboxAdapter,
+)
 from app.domain.models.work_unit import PathLease  # PathLease lives on work_unit, NOT child_permission_context
 from app.domain.services.permission.child_permission_context import (
     ChildBudget,
@@ -59,6 +65,7 @@ class CoordinatorChildRunnerStarter(Protocol):
         root_session_id: str,
         parent_session_id: str,
         parent_sandbox: Any,  # per-run; comes from cfg["parent_sandbox"]
+        user_id: str,
     ) -> None: ...
 
 
@@ -109,6 +116,8 @@ class DefaultCoordinatorChildRunnerStarter:
         cost_rollup_service: "CostRollupService",
         artifact_storage: "ArtifactStoragePort",
         coordinator_limits: "CoordinatorLimits",
+        sandbox_lifecycle_service: Any,  # _DeferredLifecycle proxy or SandboxLifecycleService
+        resolve_child_runner_deps: Any = None,  # () -> ChildRunnerSharedDeps; lazy (supervisor+uow for cost handler). Default None is INTENTIONAL: F1.7 build_coordinator_runtime_deps constructs this starter with None for the 2-kwarg comp-root test callers that never dispatch a child (so .start()/_resolve_child_runner_deps() is never reached). A real dispatch path is always wired by F1.7 -- do NOT add a hard __init__ guard (it would break those callers).
     ) -> None:
         self._runner_factory = runner_factory
         self._mailbox_publisher = mailbox_publisher
@@ -119,6 +128,8 @@ class DefaultCoordinatorChildRunnerStarter:
         self._cost_rollup_service = cost_rollup_service
         self._artifact_storage = artifact_storage
         self._coordinator_limits = coordinator_limits
+        self._sandbox_lifecycle_service = sandbox_lifecycle_service
+        self._resolve_child_runner_deps = resolve_child_runner_deps
         self._active_tasks: dict[str, asyncio.Task] = {}
 
     async def start(
@@ -132,6 +143,7 @@ class DefaultCoordinatorChildRunnerStarter:
         root_session_id: str,
         parent_session_id: str,
         parent_sandbox: Any,  # per-run; provided by dispatch_node from cfg
+        user_id: str,
     ) -> None:
         # 1. Fetch + decode SpawnManifest.
         raw = await self._artifact_storage.get_bytes(spawn_manifest_ref)
@@ -165,39 +177,99 @@ class DefaultCoordinatorChildRunnerStarter:
             budget=budget,
             lease_expiry=None,
         )
-        # 5-6. Build inner runner.
-        built = await self._runner_factory.build(
-            child_session_id=child_session_id,
-            child_permission_context=child_permission_context,
-            tool_filter_preset=COORDINATOR_STEP_PRESET,
-            cancel_event=cancel_event,
-        )
-        # 7. CoordinatorChildRunner — ctor signature verified at
-        # api/app/application/services/coordinator_child_runner.py:129-141.
-        child_runner = CoordinatorChildRunner(
-            cancel_event=cancel_event,
-            inner_runner=built.runner,
-            publisher=self._mailbox_publisher,
-            parent_sandbox=parent_sandbox,
-            artifact_storage=self._artifact_storage,
-            envelope_factory=self._envelope_factory,
-            parent_session_id=parent_session_id,
-            coordinator_run_id=coordinator_run_id,
-            mailbox_subscriber=self._mailbox_subscriber,
-        )
-        # 8. Spawn background task (fire-then-track).
-        task = asyncio.create_task(child_runner.run_work_unit(
-            coordinator_run_id=coordinator_run_id,
-            work_unit=work_unit,
-            child_session_id=child_session_id,
-            spawn_manifest=spawn_manifest,
-            cancel_event=cancel_event,
-            root_session_id=root_session_id,
-        ))
-        # 9-11. Name, register, done-callback.
-        task.set_name(f"coord-child-{child_session_id}")
-        self._active_tasks[child_session_id] = task
-        task.add_done_callback(self._on_task_done)
+        # 5-11. Provision + spawn under an M1-safe leak-guard. Steps 1-4
+        # (manifest decode / revision / budget / ChildPermissionContext)
+        # stay OUTSIDE: a malformed manifest or revision-read failure must
+        # propagate to dispatch loudly — there is no sandbox to reap yet.
+        try:
+            # 5. Provision the per-child sandbox (A1) + browser + cost handler.
+            child_handle = await self._sandbox_lifecycle_service.bind_new(
+                child_session_id, user_id=user_id
+            )
+            child_browser = await child_handle.get_browser()
+            child_sandbox_port = ParentSandboxAdapter(child_handle)
+            _shared = self._resolve_child_runner_deps()  # lazy resolve (post-lifespan)
+            cost_callback_handler = build_supervisor_aware_callback_handler(
+                _shared.execution_supervisor,
+                child_session_id,
+                user_id,
+                _shared.uow_factory,
+            )
+            # 6. Build the adapter-wrapped inner runner with per-child deps.
+            built = await self._runner_factory.build(
+                child_session_id=child_session_id,
+                child_permission_context=child_permission_context,
+                tool_filter_preset=COORDINATOR_STEP_PRESET,
+                cancel_event=cancel_event,
+                sandbox=child_handle,
+                browser=child_browser,
+                user_id=user_id,
+                cost_callback_handler=cost_callback_handler,
+            )
+            # 7. CoordinatorChildRunner — child_sandbox Port for seed/extraction.
+            child_runner = CoordinatorChildRunner(
+                cancel_event=cancel_event,
+                inner_runner=built.runner,
+                publisher=self._mailbox_publisher,
+                parent_sandbox=parent_sandbox,
+                child_sandbox=child_sandbox_port,
+                artifact_storage=self._artifact_storage,
+                envelope_factory=self._envelope_factory,
+                parent_session_id=parent_session_id,
+                coordinator_run_id=coordinator_run_id,
+                mailbox_subscriber=self._mailbox_subscriber,
+            )
+            # 8. Spawn background task (fire-then-track).
+            task = asyncio.create_task(child_runner.run_work_unit(
+                coordinator_run_id=coordinator_run_id,
+                work_unit=work_unit,
+                child_session_id=child_session_id,
+                spawn_manifest=spawn_manifest,
+                cancel_event=cancel_event,
+                root_session_id=root_session_id,
+            ))
+            # 9-11. Name, register, done-callback.
+            task.set_name(f"coord-child-{child_session_id}")
+            self._active_tasks[child_session_id] = task
+            task.add_done_callback(self._on_task_done)
+        except BaseException as exc:  # noqa: BLE001
+            # [finish-core §5.1.3 INV-F1.4a] M1-safe: never destroy the child
+            # sandbox here. Publish a FAILED terminal envelope so the
+            # MailboxSupervisor cascade reaps the orphan; swallow so dispatch
+            # keeps starting siblings and the orchestrator observes the terminal.
+            logger.warning(
+                "coordinator child start failed for %s (wu=%s); publishing "
+                "FAILED envelope, NO self-destroy (M1)",
+                child_session_id,
+                getattr(work_unit, "work_unit_id", "?"),
+                exc_info=exc,
+            )
+            try:
+                failure_publisher = CoordinatorChildRunner(
+                    cancel_event=cancel_event,
+                    publisher=self._mailbox_publisher,
+                    envelope_factory=self._envelope_factory,
+                    parent_session_id=parent_session_id,
+                    coordinator_run_id=coordinator_run_id,
+                    mailbox_subscriber=self._mailbox_subscriber,
+                )
+                await failure_publisher._finalize_failed(
+                    coordinator_run_id, work_unit, child_session_id, exc,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "leak-guard FAILED-publish ALSO failed for child=%s (wu=%s); "
+                    "orphan sandbox will be reaped by supervisor timeout "
+                    "(original start failure logged above)",
+                    child_session_id,
+                    getattr(work_unit, "work_unit_id", "?"),
+                )
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                # [R3 hardening] FAILED envelope is published above so the
+                # supervisor reaps the bound sandbox; never swallow a true
+                # cancellation/interrupt — propagate it.
+                raise
+            return
 
     def _on_task_done(self, task: asyncio.Task) -> None:
         name = task.get_name()

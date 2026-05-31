@@ -346,6 +346,16 @@ class PlannerReActFlow(BaseFlow):
         # set it directly on the instance to assert the cfg-building contract.
         self._coord_deps = _coord_deps
         self._cancel_event: Optional[asyncio.Event] = None
+        # [C2 finish-core §5.1.1] Set True by set_cancel_event so a coord
+        # (parent) re-invoke's prime cannot clobber an adapter-injected event.
+        self._cancel_event_externally_injected: bool = False
+
+    def set_cancel_event(self, event: "asyncio.Event") -> None:
+        """[C2 finish-core §5.1.1 G1a] External seam: the coordinator invoke-
+        adapter injects the per-work-unit cancel_event into a CHILD flow
+        (coord_deps Null) so react_graph cancel checkpoints observe it."""
+        self._cancel_event = event
+        self._cancel_event_externally_injected = True
 
     @property
     def summary_llm(self):
@@ -1480,6 +1490,12 @@ class PlannerReActFlow(BaseFlow):
             # {"event_queue": q} into configurable AT INVOCATION TIME
             # (event_bridge.py:74-79); main_graph.py:123 then passes the
             # merged cfg into parallel_execution_subgraph invocation.
+        elif self._cancel_event is not None:
+            # [C2 finish-core §5.1.1 INV-F1.11] Coordinator CHILD path:
+            # coord_deps is Null (child must not be a nested coordinator) but
+            # the invoke-adapter called set_cancel_event(...). Inject ONLY the
+            # cancel_event so react_graph._should_cancel trips on parent cancel.
+            cfg["configurable"]["cancel_event"] = self._cancel_event
         return cfg
 
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:

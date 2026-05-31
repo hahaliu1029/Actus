@@ -285,6 +285,21 @@ async def lifespan(app: FastAPI):
                     return
                 await svc.destroy(session_id, reason)
 
+            async def bind_new(self, session_id: str, *, user_id=None):
+                # C2 finish-core F1.7 — the coordinator child_runner_starter
+                # binds a fresh per-child sandbox lease via this proxy. The
+                # forward reference is filled immediately after
+                # SandboxLifecycleService construction (a few lines below), so
+                # any real child dispatch happens well after bind. A None svc
+                # here is a composition-order bug, not a normal startup race.
+                svc = _pending_lifecycle_ref.get("svc")
+                if svc is None:
+                    raise RuntimeError(
+                        "coordinator child bind_new before SandboxLifecycleService "
+                        "ready — composition order bug"
+                    )
+                return await svc.bind_new(session_id, user_id=user_id)
+
         # C3 PR-6 (spec §11.7) — mailbox plane is the only supported
         # control plane. SupervisorRegistry is built unconditionally;
         # the ``mailbox_supervisor_enabled`` env-var rollback gate is
@@ -320,11 +335,45 @@ async def lifespan(app: FastAPI):
         # (ImportError, TypeError, missing attribute, ...) is a real bug
         # and MUST propagate so lifespan fails loudly rather than silently
         # downgrading to the null-deps fallback.
+        # C2 finish-core F1.7 — one shared _DeferredLifecycle instance is
+        # reused by BOTH the coordinator child_runner_starter (bind_new) and
+        # the supervisor registry (destroy); both resolve the live
+        # SandboxLifecycleService lazily through ``_pending_lifecycle_ref``
+        # which is filled immediately after construction below.
+        deferred_lifecycle = _DeferredLifecycle()
+        from app.infrastructure.external.task.redis_stream_task import (
+            RedisStreamTask,
+        )
+
+        def _resolve_child_runner_deps():
+            # Pragmatic coupling: reads AgentService internals to assemble child deps (no public accessor); resolved lazily post-lifespan when app.state.agent_service is live.
+            # C2 finish-core F1.7 — resolve the process-shared child-runner deps
+            # LAZILY off the live AgentService (built later in this lifespan).
+            # Only invoked at child-build time (a real coordinator dispatch),
+            # which is always well after AgentService construction.
+            from app.interfaces.service_dependencies import ChildRunnerSharedDeps
+            svc = app.state.agent_service
+            snap = svc._config_snapshot
+            return ChildRunnerSharedDeps(
+                uow_factory=get_uow,
+                llm=snap.llm,
+                agent_config=snap.agent_config,
+                mcp_config=snap.mcp_config,
+                a2a_config=snap.a2a_config,
+                file_storage=svc._file_storage,
+                search_engine=svc._search_engine,
+                checkpointer_pool=svc._checkpointer_pool,
+                execution_supervisor=svc._supervisor,
+            )
+
         coord_deps = None
         try:
             coord_deps = build_coordinator_runtime_deps(
                 app_state=app.state,
                 redis_client=redis_client,
+                resolve_child_runner_deps=_resolve_child_runner_deps,
+                sandbox_lifecycle_service=deferred_lifecycle,
+                child_runner_task_cls=RedisStreamTask,
             )
             logger.info(
                 "_CoordinatorRuntimeDeps composition root initialised "
@@ -372,7 +421,9 @@ async def lifespan(app: FastAPI):
         supervisor_registry = build_supervisor_registry(
             redis_client=redis_client,
             publisher=mailbox_publisher,
-            sandbox_lifecycle_service=_DeferredLifecycle(),
+            # C2 finish-core F1.7 — same deferred lifecycle instance as the
+            # coordinator child_runner_starter (single source of truth).
+            sandbox_lifecycle_service=deferred_lifecycle,
             coordinator_envelope_store=app.state.coordinator_envelope_store,
             cost_rollup_service=app.state.cost_rollup_service,
         )

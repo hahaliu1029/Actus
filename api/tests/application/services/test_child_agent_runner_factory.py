@@ -27,6 +27,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.application.services.agent_task_runner_invoke_adapter import (
+    AgentTaskRunnerInvokeAdapter,
+)
 from app.application.services.child_agent_runner_factory import (
     BuiltChildRunner,
     ChildAgentTaskRunnerFactory,
@@ -55,6 +58,7 @@ async def test_build_coordinator_step_disables_terminal_publisher() -> None:
     publisher = MagicMock(name="MailboxPublisher")
     factory = ChildAgentTaskRunnerFactory(
         runner_class=runner_class, mailbox_publisher=publisher,
+        task_cls=MagicMock(),
     )
     ce = asyncio.Event()
     built = await factory.build(
@@ -62,6 +66,10 @@ async def test_build_coordinator_step_disables_terminal_publisher() -> None:
         child_permission_context=_mk_cctx(),
         tool_filter_preset="coordinator_step",
         cancel_event=ce,
+        sandbox=MagicMock(),
+        browser=MagicMock(),
+        user_id="u1",
+        cost_callback_handler=MagicMock(),
     )
     assert isinstance(built, BuiltChildRunner)
     runner_class.assert_called_once()
@@ -79,6 +87,7 @@ async def test_build_subagent_research_keeps_default_publisher() -> None:
     publisher = MagicMock(name="MailboxPublisher")
     factory = ChildAgentTaskRunnerFactory(
         runner_class=runner_class, mailbox_publisher=publisher,
+        task_cls=MagicMock(),
     )
     ce = asyncio.Event()
     await factory.build(
@@ -86,6 +95,10 @@ async def test_build_subagent_research_keeps_default_publisher() -> None:
         child_permission_context=_mk_cctx(),
         tool_filter_preset="subagent_research",
         cancel_event=ce,
+        sandbox=MagicMock(),
+        browser=MagicMock(),
+        user_id="u1",
+        cost_callback_handler=MagicMock(),
     )
     kw = runner_class.call_args.kwargs
     assert kw["terminal_envelope_publisher_disabled"] is False
@@ -98,12 +111,17 @@ async def test_build_resolves_tool_filter_from_preset() -> None:
     runner_class = MagicMock(name="AgentTaskRunner")
     factory = ChildAgentTaskRunnerFactory(
         runner_class=runner_class, mailbox_publisher=MagicMock(),
+        task_cls=MagicMock(),
     )
     await factory.build(
         child_session_id="c1",
         child_permission_context=_mk_cctx(),
         tool_filter_preset="coordinator_step",
         cancel_event=asyncio.Event(),
+        sandbox=MagicMock(),
+        browser=MagicMock(),
+        user_id="u1",
+        cost_callback_handler=MagicMock(),
     )
     kw = runner_class.call_args.kwargs
     tf = kw["tool_filter"]
@@ -118,6 +136,7 @@ async def test_build_unknown_preset_raises_value_error() -> None:
     runner_class = MagicMock(name="AgentTaskRunner")
     factory = ChildAgentTaskRunnerFactory(
         runner_class=runner_class, mailbox_publisher=MagicMock(),
+        task_cls=MagicMock(),
     )
     with pytest.raises(ValueError):
         await factory.build(
@@ -125,6 +144,10 @@ async def test_build_unknown_preset_raises_value_error() -> None:
             child_permission_context=_mk_cctx(),
             tool_filter_preset="totally_made_up_preset",
             cancel_event=asyncio.Event(),
+            sandbox=MagicMock(),
+            browser=MagicMock(),
+            user_id="u1",
+            cost_callback_handler=MagicMock(),
         )
 
 
@@ -134,9 +157,11 @@ async def test_built_wrapper_carries_runtime_deps() -> None:
     consumes them to assemble config + run finalizers."""
     runner_class = MagicMock(name="AgentTaskRunner")
     runner_instance = MagicMock(name="runner-inst")
+    runner_instance.set_coordinator_cancel_event = MagicMock()
     runner_class.return_value = runner_instance
     factory = ChildAgentTaskRunnerFactory(
         runner_class=runner_class, mailbox_publisher=MagicMock(),
+        task_cls=MagicMock(),
     )
     ce = asyncio.Event()
     cctx = _mk_cctx()
@@ -145,8 +170,17 @@ async def test_built_wrapper_carries_runtime_deps() -> None:
         child_permission_context=cctx,
         tool_filter_preset="coordinator_step",
         cancel_event=ce,
+        sandbox=MagicMock(),
+        browser=MagicMock(),
+        user_id="u1",
+        cost_callback_handler=MagicMock(),
     )
-    assert built.runner is runner_instance
+    # F1.3: build wraps the raw runner in the invoke-adapter; built.runner is
+    # the adapter, not the raw runner instance. The raw runner is reachable as
+    # the adapter's ._runner and received the cancel-event wiring.
+    assert isinstance(built.runner, AgentTaskRunnerInvokeAdapter)
+    assert built.runner._runner is runner_instance
+    runner_instance.set_coordinator_cancel_event.assert_called_once_with(ce)
     assert built.cancel_event is ce
     assert built.child_permission_context is cctx
     assert built.terminal_envelope_publisher_disabled is True
@@ -161,8 +195,54 @@ def test_factory_ctor_stores_deps() -> None:
     so repeated build() calls reuse the same dependencies."""
     runner_class = MagicMock()
     publisher = MagicMock()
+    task_cls = MagicMock()
     factory = ChildAgentTaskRunnerFactory(
         runner_class=runner_class, mailbox_publisher=publisher,
+        task_cls=task_cls,
     )
     assert getattr(factory, "_runner_class") is runner_class
     assert getattr(factory, "_mailbox_publisher") is publisher
+    assert getattr(factory, "_task_cls") is task_cls
+
+
+async def test_build_forwards_per_child_deps_and_wraps_in_adapter():
+    import asyncio
+    from unittest.mock import MagicMock
+    from app.application.services.child_agent_runner_factory import (
+        ChildAgentTaskRunnerFactory,
+    )
+    from app.application.services.agent_task_runner_invoke_adapter import (
+        AgentTaskRunnerInvokeAdapter,
+    )
+
+    raw_runner = MagicMock()
+    raw_runner.set_coordinator_cancel_event = MagicMock()
+    builder = MagicMock(return_value=raw_runner)  # the shared runner builder
+    fake_task_cls = MagicMock()
+    factory = ChildAgentTaskRunnerFactory(
+        runner_class=builder, mailbox_publisher=MagicMock(), task_cls=fake_task_cls,
+    )
+    ce = asyncio.Event()
+    sandbox = MagicMock()
+    browser = MagicMock()
+    cost_handler = MagicMock()
+    built = await factory.build(
+        child_session_id="c1",
+        child_permission_context=_mk_cctx(),
+        tool_filter_preset="coordinator_step",
+        cancel_event=ce,
+        sandbox=sandbox,
+        browser=browser,
+        user_id="u1",
+        cost_callback_handler=cost_handler,
+    )
+    # builder received the per-child deps
+    kw = builder.call_args.kwargs
+    assert kw["sandbox"] is sandbox
+    assert kw["browser"] is browser
+    assert kw["user_id"] == "u1"
+    assert kw["cost_callback_handler"] is cost_handler
+    assert kw["terminal_envelope_publisher_disabled"] is True
+    # returned runner is the invoke-adapter, not the raw runner
+    assert isinstance(built.runner, AgentTaskRunnerInvokeAdapter)
+    raw_runner.set_coordinator_cancel_event.assert_called_once_with(ce)
