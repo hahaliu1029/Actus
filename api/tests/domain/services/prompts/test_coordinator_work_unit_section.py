@@ -22,7 +22,7 @@ class TestSectionExplorationPhase:
     def test_exploration_keywords_present(self) -> None:
         s = build_coordinator_work_unit_section(
             objective="research auth", phase="exploration",
-            allowed_paths=["/a", "/b"],
+            allowed_paths=["/a", "/b"], work_unit_id="wu-test",
         )
         assert "EXPLORATION" in s
         assert "proposed_write_plan" in s
@@ -32,6 +32,7 @@ class TestSectionExplorationPhase:
     def test_exploration_warns_no_writes(self) -> None:
         s = build_coordinator_work_unit_section(
             objective="x", phase="exploration", allowed_paths=[],
+            work_unit_id="wu-test",
         )
         # The exploration guidance MUST say "CANNOT write"; otherwise the
         # LLM may attempt file_write and trip ChildScopeGate denials.
@@ -42,6 +43,7 @@ class TestSectionWritePhase:
     def test_write_keywords_present(self) -> None:
         s = build_coordinator_work_unit_section(
             objective="patch", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         assert "WRITE" in s
         assert "/x" in s
@@ -53,6 +55,7 @@ class TestSectionWritePhase:
         builder must not crash if it does."""
         s = build_coordinator_work_unit_section(
             objective="x", phase="write", allowed_paths=[],
+            work_unit_id="wu-test",
         )
         assert s
 
@@ -65,21 +68,21 @@ class TestSectionPhaseValidation:
         with pytest.raises(ValueError, match="phase must be"):
             build_coordinator_work_unit_section(
                 objective="x", phase="EXPLORATION",  # type: ignore[arg-type]
-                allowed_paths=["/x"],
+                allowed_paths=["/x"], work_unit_id="wu-test",
             )
 
     def test_empty_phase_raises(self) -> None:
         with pytest.raises(ValueError, match="phase must be"):
             build_coordinator_work_unit_section(
                 objective="x", phase="",  # type: ignore[arg-type]
-                allowed_paths=["/x"],
+                allowed_paths=["/x"], work_unit_id="wu-test",
             )
 
     def test_arbitrary_phase_raises(self) -> None:
         with pytest.raises(ValueError, match="phase must be"):
             build_coordinator_work_unit_section(
                 objective="x", phase="readonly",  # type: ignore[arg-type]
-                allowed_paths=["/x"],
+                allowed_paths=["/x"], work_unit_id="wu-test",
             )
 
 
@@ -87,6 +90,7 @@ class TestSectionExpectedResultSchema:
     def test_schema_appended_when_supplied(self) -> None:
         s = build_coordinator_work_unit_section(
             objective="x", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
             expected_result_schema='{"success": bool, "msg": str}',
         )
         assert "Expected result schema" in s
@@ -95,6 +99,7 @@ class TestSectionExpectedResultSchema:
     def test_schema_omitted_when_none(self) -> None:
         s = build_coordinator_work_unit_section(
             objective="x", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
             expected_result_schema=None,
         )
         assert "Expected result schema" not in s
@@ -104,6 +109,7 @@ class TestAssemblerStaticHelper:
     def test_returns_string(self) -> None:
         out = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="write", allowed_paths=["/a"],
+            work_unit_id="wu-test",
         )
         assert isinstance(out, str)
         assert out
@@ -111,6 +117,7 @@ class TestAssemblerStaticHelper:
     def test_includes_identity_block(self) -> None:
         out = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="exploration", allowed_paths=[],
+            work_unit_id="wu-test",
         )
         assert "Coordinator Step Worker" in out
         assert "restricted" in out.lower()
@@ -118,6 +125,7 @@ class TestAssemblerStaticHelper:
     def test_includes_behavior_block(self) -> None:
         out = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         assert "## Behavior" in out
         assert "Stop as soon as the objective is met" in out
@@ -125,6 +133,7 @@ class TestAssemblerStaticHelper:
     def test_includes_work_unit_block(self) -> None:
         out = PromptAssembler.build_minimal_for_coordinator_child(
             objective="finalize patch", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         assert "finalize patch" in out
         assert "/x" in out
@@ -132,12 +141,14 @@ class TestAssemblerStaticHelper:
     def test_uses_canonical_section_separator(self) -> None:
         out = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         assert "\n\n---\n\n" in out
 
     def test_is_static_method_no_instance_state_needed(self) -> None:
         out = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         assert out
 
@@ -146,10 +157,33 @@ class TestAssemblerStaticHelperPhasesDifferContent:
     def test_exploration_and_write_produce_distinct_prompts(self) -> None:
         explor = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="exploration", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         write = PromptAssembler.build_minimal_for_coordinator_child(
             objective="x", phase="write", allowed_paths=["/x"],
+            work_unit_id="wu-test",
         )
         assert explor != write
         assert "EXPLORATION" in explor
         assert "WRITE" in write
+
+
+class TestWorkUnitIdRendered:
+    """[F2.1 / spec §5.1.6 / INV-F1.7] work_unit_id is threaded into the child
+    prompt verbatim so the PR-F4 routing fake LLM can exact-match on it. It is
+    a REQUIRED kwarg (no default) — a default-empty would let the routing fake's
+    exact-match be silently defeated."""
+
+    def test_assembler_renders_work_unit_id_verbatim(self) -> None:
+        out = PromptAssembler.build_minimal_for_coordinator_child(
+            objective="x", phase="write", allowed_paths=["a.py"],
+            work_unit_id="wu-abc-123",
+        )
+        assert "wu-abc-123" in out
+
+    def test_section_renders_work_unit_id(self) -> None:
+        out = build_coordinator_work_unit_section(
+            objective="x", phase="write", allowed_paths=["a.py"],
+            work_unit_id="wu-xyz",
+        )
+        assert "wu-xyz" in out

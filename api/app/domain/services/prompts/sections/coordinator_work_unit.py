@@ -40,6 +40,7 @@ def build_coordinator_work_unit_section(
     objective: str,
     phase: Literal["exploration", "write"],
     allowed_paths: list[str],
+    work_unit_id: str,
     expected_result_schema: str | None = None,
 ) -> str:
     """Build the markdown body for the coordinator child's work-unit block.
@@ -68,6 +69,7 @@ def build_coordinator_work_unit_section(
 
     return (
         f"## Your Work Unit\n\n"
+        f"**Work Unit**: {work_unit_id}\n\n"
         f"**Objective**: {objective}\n\n"
         f"**Phase**: {phase}\n\n"
         f"**Authorized paths**:\n{paths_block}\n\n"

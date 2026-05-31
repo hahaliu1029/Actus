@@ -216,6 +216,7 @@ class PromptAssembler:
         objective: str,
         phase: "Literal['exploration', 'write']",
         allowed_paths: list[str],
+        work_unit_id: str,
         expected_result_schema: str | None = None,
     ) -> str:
         """Static helper — composes the restricted prompt for a coordinator
@@ -240,6 +241,7 @@ class PromptAssembler:
             objective=objective,
             phase=phase,
             allowed_paths=allowed_paths,
+            work_unit_id=work_unit_id,
             expected_result_schema=expected_result_schema,
         )
         # Identity + restricted-behavior preamble. Kept inline (not pulled

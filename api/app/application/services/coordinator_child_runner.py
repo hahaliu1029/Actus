@@ -37,6 +37,7 @@ Spec-anchored invariants pinned in tests:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
@@ -68,6 +69,15 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+class _SeedInstallError(Exception):
+    """[finish-core §5.1.4] Raised when child seed-install fails (fetch /
+    write / digest mismatch). Routed to _finalize_failed (reason seed_*)."""
+
+
+class _OutOfLeaseWriteError(Exception):
+    """[finish-core §5.1.5] A child wrote a path outside its write_lease."""
 
 
 class StopReason(StrEnum):
@@ -254,6 +264,29 @@ class CoordinatorChildRunner:
             return main_result
 
         try:
+            # [finish-core §5.1.4] Seed-install BEFORE the ReAct loop. A
+            # _SeedInstallError finalizes FAILED (reason seed_*) and NEVER
+            # self-destroys (M1) — _finalize_failed only publishes
+            # RESULT_READY(FAILED). INV-F1.4b. It short-circuits the run
+            # (returns) before the inner invoke.
+            #
+            # [F2 P1] Placed INSIDE this outer try so the single
+            # ``finally: _safe_listener_shutdown`` below reaps the cancel
+            # listener on EVERY seed exit too — including an
+            # ``asyncio.CancelledError`` raised mid-seed (parent cancels
+            # during _install_seed's awaits), which is NOT a _SeedInstallError
+            # and would otherwise escape with the listener still running. The
+            # listener is now reaped EXACTLY ONCE on: _SeedInstallError,
+            # CancelledError-during-seed, invoke failure, and natural success.
+            try:
+                await self._install_seed(work_unit)
+            except _SeedInstallError as exc:
+                return await self._finalize_failed(
+                    coordinator_run_id, work_unit, child_session_id, exc,
+                )
+
+            # [F2 P1] inner invoke try — nested in the same outer try whose
+            # finally reaps the listener on every exit (success/failure/cancel).
             try:
                 # TODO(PR-9 wiring): wrap ``inner_runner.invoke_until_done`` in
                 # ``start_wallclock_watchdog(runner=self,
@@ -354,18 +387,63 @@ class CoordinatorChildRunner:
         self, run_id: str, wu: "WorkUnit", child_id: str, done_event: Any,
     ) -> ResultReadyPayload:
         """[spec §8.3 write] Extract writes from inner runner history, build
-        PatchManifest, publish RESULT_READY(SUCCESS)."""
-        files = await self._extract_patch_files_from_history(run_id, wu, done_event)
-        patch_manifest = PatchManifest(
-            patch_id=f"{run_id}:{wu.work_unit_id}:p",
-            coordinator_run_id=run_id,
-            work_unit_id=wu.work_unit_id,
-            files=tuple(files),
-        )
+        PatchManifest, publish RESULT_READY(SUCCESS).
+
+        [F2 P0] Extraction (``_extract_patch_files_from_history``) can raise
+        ``_OutOfLeaseWriteError`` (child wrote outside its lease) and
+        PatchManifest/FilePatchEntry construction can raise
+        ``pydantic.ValidationError`` (e.g. a path that violates the wire
+        schema) or sandbox/artifact errors. These run inside ``run_work_unit``'s
+        outer ``try`` which only has a ``finally`` (no ``except``), so an
+        escape here would leave NO terminal envelope published — the child
+        would crash in the starter's done-callback and the parent waiter would
+        strand. Wrap ONLY the extraction + manifest build (NOT the final
+        ``_publish_result_ready``, to avoid swallowing a publish failure and
+        re-publishing) so a write-phase failure degrades to a terminal
+        NEEDS_AUTHORIZATION / FAILED envelope instead."""
+        try:
+            files = await self._extract_patch_files_from_history(run_id, wu, done_event)
+            patch_manifest = PatchManifest(
+                patch_id=f"{run_id}:{wu.work_unit_id}:p",
+                coordinator_run_id=run_id,
+                work_unit_id=wu.work_unit_id,
+                files=tuple(files),
+            )
+        except _OutOfLeaseWriteError as exc:
+            return await self._finalize_needs_authorization_out_of_lease(
+                run_id, wu, child_id, exc,
+            )
+        except Exception as exc:  # noqa: BLE001 — ValidationError + sandbox/artifact errors
+            return await self._finalize_failed(run_id, wu, child_id, exc)
+        # [F2 P0] _publish_result_ready intentionally OUTSIDE the try above so a
+        # publish failure is not swallowed + re-published as FAILED.
         payload = ResultReadyPayload(
             summary=f"completed {wu.work_unit_id}",
             outcome=ResultReadyOutcome.SUCCESS,
             patch_manifest=patch_manifest,
+        )
+        await self._publish_result_ready(child_id, payload)
+        return payload
+
+    async def _finalize_needs_authorization_out_of_lease(
+        self, run_id: str, wu: "WorkUnit", child_id: str,
+        exc: "_OutOfLeaseWriteError",
+    ) -> ResultReadyPayload:
+        """[F2 P0] A write-phase child wrote a path outside its write_lease
+        (defensive lease enforcement caught it during patch extraction).
+        Publish a terminal RESULT_READY(NEEDS_AUTHORIZATION) with reason
+        ``out_of_path_lease`` — the same reason the ChildScopeGate would emit
+        for the runtime equivalent (see _SCOPE_DECISION_TO_REASON) — so the
+        reducer/orchestrator treats it like any other out-of-lease grievance
+        instead of seeing the child crash with no envelope."""
+        details = NeedsAuthorizationDetails(
+            reason="out_of_path_lease",
+            observed_evidence=str(exc),
+        )
+        payload = ResultReadyPayload(
+            summary=f"out-of-lease write: {wu.work_unit_id}",
+            outcome=ResultReadyOutcome.NEEDS_AUTHORIZATION,
+            needs_authorization_details=details,
         )
         await self._publish_result_ready(child_id, payload)
         return payload
@@ -387,6 +465,43 @@ class CoordinatorChildRunner:
         )
         await self._publish_result_ready(child_id, payload)
         return payload
+
+    async def _install_seed(self, wu: "WorkUnit") -> None:
+        """[finish-core §5.1.4 G1d] Install parent base bytes into the child
+        sandbox before the ReAct loop so the child reads real content, and
+        verify the installed digest matches the lease's base_digest. op=add
+        leases have no seed (seed_content_ref is None by invariant)."""
+        if self._child_sandbox is None:
+            return  # legacy/test path with no child sandbox
+        for lease in wu.write_lease:
+            if lease.op not in ("modify", "delete") or lease.seed_content_ref is None:
+                continue
+            try:
+                seed_bytes = await self._artifact_storage.get_bytes(
+                    lease.seed_content_ref
+                )
+                await self._child_sandbox.atomic_write_file(lease.path, seed_bytes)
+                observed = await self._child_sandbox.compute_digest(lease.path)
+            except Exception as exc:  # noqa: BLE001
+                raise _SeedInstallError(
+                    f"seed_install_failed: lease={lease.path}: {exc}"
+                ) from exc
+            # Fail closed: a seeded lease (op modify/delete with a
+            # seed_content_ref) MUST carry a base_digest to verify against.
+            # Without this guard, ``observed != None`` could silently pass
+            # (e.g. compute_digest also returning None), skipping verification.
+            # Dispatch always fills base_digest for modify, so valid leases are
+            # unaffected — only a malformed lease now fails closed here.
+            if lease.base_digest is None:
+                raise _SeedInstallError(
+                    f"seed_missing_base_digest: lease={lease.path} "
+                    "(cannot verify seed)"
+                )
+            if observed != lease.base_digest:
+                raise _SeedInstallError(
+                    f"seed_digest_mismatch: lease={lease.path} "
+                    f"expected={lease.base_digest} observed={observed}"
+                )
 
     async def _finalize_failed(
         self, run_id: str, wu: "WorkUnit", child_id: str, exc: Exception,
@@ -536,23 +651,81 @@ class CoordinatorChildRunner:
             objective=wu.objective,
             phase=wu.phase,
             allowed_paths=[lease.path for lease in wu.write_lease],
+            work_unit_id=wu.work_unit_id,
             expected_result_schema=wu.expected_result_schema,
         )
 
     async def _extract_patch_files_from_history(
         self, run_id: str, wu: "WorkUnit", done_event: Any,
     ) -> list[Any]:
-        """[PR-4 minimal] Returns an empty list. PR-5 wires the real extraction:
-        iterate inner_runner.tool_call_history, filter typed writes
-        (file_write / file_str_replace), read final content from the child
-        sandbox, SHA-256, upload via artifact_storage, build FilePatchEntry list.
+        """[finish-core §5.1.5 G1e] Build FilePatchEntry list from the child's
+        typed-write tool calls (ChildRunResult.tool_calls) + final bytes read
+        from the child sandbox. Out-of-lease writes are rejected (defensive
+        lease enforcement; runtime PE gate is deferred — §5.1.7)."""
+        from app.domain.models.patch_manifest import FilePatchEntry
 
-        Returning [] here is acceptable for PR-4: the reducer (PR-5) treats
-        an empty patch_manifest as "no writes" — same semantics as a child
-        that genuinely produced no file changes. Tests verify the surrounding
-        envelope structure; the file-extraction logic is the PR-5 deliverable.
-        """
-        return []
+        result = done_event  # ChildRunResult (§5.1.1)
+        tool_calls = getattr(result, "tool_calls", ()) or ()
+        lease_by_path = {lease.path: lease for lease in wu.write_lease}
+
+        # Last-write-wins, preserve first-seen order.
+        written_paths: list[str] = []
+        seen: set[str] = set()
+        for ev in tool_calls:
+            if getattr(ev, "function_name", None) not in ("file_write", "file_str_replace"):
+                continue
+            args = getattr(ev, "function_args", {}) or {}
+            # [F2 P1] Mirror ChildScopeGate.extract_target_path EXACTLY
+            # (value-based ``filepath`` precedence, NOT key-presence): a None
+            # ``filepath`` *value* falls back to ``path``, same as the gate's
+            # ``path = args.get("filepath"); if path is None: path = args.get("path")``.
+            # An empty-string ``filepath`` is NOT None, so it does NOT fall
+            # back to ``path`` and is then dropped by the ``not path`` guard
+            # below — matching the gate's "" -> missing-target behavior. A
+            # key-presence check (``if "filepath" in args``) diverged from the
+            # gate for ``{"filepath": None, "path": "x"}``: the gate authorizes
+            # the write against "x" while key-presence would skip it entirely.
+            path = args.get("filepath")
+            if path is None:
+                path = args.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            if path not in seen:
+                seen.add(path)
+                written_paths.append(path)
+
+        files: list[FilePatchEntry] = []
+        for path in written_paths:
+            lease = lease_by_path.get(path)
+            if lease is None:
+                raise _OutOfLeaseWriteError(
+                    f"child wrote out-of-lease path: {path!r} "
+                    f"(allowed: {sorted(lease_by_path)})"
+                )
+            if lease.op not in ("add", "modify"):
+                # R1 P1: typed writes (file_write/file_str_replace) only ever
+                # produce add/modify. A write to a delete-leased path is a
+                # contract violation AND FilePatchEntry rejects
+                # new_digest/content_ref/content_size for op=delete
+                # (patch_manifest.py:106-112).
+                raise _OutOfLeaseWriteError(
+                    f"child wrote to a non-writable lease (op={lease.op}): {path!r}"
+                )
+            content = await self._child_sandbox.read_file(path)
+            new_digest = hashlib.sha256(content).hexdigest()
+            content_ref = await self._artifact_storage.put_content_addressed_bytes(
+                prefix=f"coordinator/{run_id}/{wu.work_unit_id}/patch/",
+                content=content,
+            )
+            files.append(FilePatchEntry(
+                path=path,
+                op=lease.op,
+                base_digest=lease.base_digest if lease.op == "modify" else None,
+                new_digest=new_digest,
+                content_ref=content_ref,
+                content_size=len(content),
+            ))
+        return files
 
     def _extract_proposed_write_plan(self, done_event: Any) -> ProposedWritePlan:
         """[PR-4 minimal] Returns an empty proposal. PR-6 wires the real
