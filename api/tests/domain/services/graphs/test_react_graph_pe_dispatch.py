@@ -639,7 +639,7 @@ class TestPeSkillSourceRouting:
     """P1#3: non-native tool calls (skill/mcp/a2a) must NOT be evaluated by PE.
 
     They should be executed directly (equivalent to AllowSuccess from PE), so
-    the R3 Skill Stage P and legacy mcp/a2a approval pipelines remain reachable.
+    the legacy mcp/a2a approval pipelines remain reachable.
     """
 
     async def test_skill_tool_bypasses_pe(self):
@@ -1252,4 +1252,104 @@ class TestPeDispatchAllowSuccessLiveModeRecheck:
         ), (
             "P1#2 round-34 FAIL: ToolMessage must indicate SSM unavailability; "
             f"got {content!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PE-1b: fail-closed guard — dynamic skill reaching legacy via mixed batch
+# ---------------------------------------------------------------------------
+#
+# After PE-1b deletes the legacy R3 Skill Stage P branch, a dynamic SkillTool
+# batched with a non-PE-eligible call (mcp/a2a/skill-creator/guide) makes the
+# WHOLE batch fall back to the legacy tool_node (per-batch gate returns None).
+# The legacy native gate explicitly excludes skills (``source != "skill"``), so
+# without a guard the skill would fall through to direct, UNCONFIRMED execution.
+# The fail-closed guard denies it instead; the agent re-issues the skill in its
+# own batch, which _pe_dispatch then routes through PE + SkillSource.
+
+def _build_tool_node_fn_with_skill():
+    """Build tool_node with a dynamic skill tool + an mcp tool, recording
+    whether each tool body actually executes."""
+    from langchain_core.tools import tool as lc_tool
+    from app.domain.services.graphs.react_graph import build_react_graph
+
+    executed = {"skill": False, "mcp": False}
+
+    @lc_tool
+    async def dyn_skill(x: str = "") -> str:
+        """A dynamic skill tool."""
+        executed["skill"] = True
+        return "skill ran"
+
+    @lc_tool
+    async def mcp_x(y: str = "") -> str:
+        """An mcp tool (non-PE-eligible in PE-1)."""
+        executed["mcp"] = True
+        return "mcp ran"
+
+    stub_llm = AsyncMock()
+    stub_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+    )
+    stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+
+    graph = build_react_graph(stub_llm, [dyn_skill, mcp_x])
+    return graph.nodes["tool_node"].bound.afunc, executed
+
+
+def _skill_mcp_resolver(name):
+    """resolve_tool_source stub: dyn_skill→skill/skill, mcp_x→mcp/mcp."""
+    from app.domain.services.tools.tool_source_resolver import ToolSource
+
+    if name == "dyn_skill":
+        return ToolSource(source="skill", category="skill", canonical_name="dyn_skill")
+    if name == "mcp_x":
+        return ToolSource(source="mcp", category="mcp", canonical_name="mcp_x")
+    return ToolSource(source="native", category="unknown", canonical_name=name)
+
+
+class TestSkillMixedBatchFailClosed:
+    async def test_dynamic_skill_in_mixed_batch_is_denied_not_executed(self):
+        """A skill + non-PE-eligible (mcp) batch falls to legacy; the skill must
+        be DENIED fail-closed, never executed (regression guard for the
+        bypass window opened by deleting the R3 Skill Stage P branch)."""
+        from langchain_core.messages import ToolMessage
+
+        tool_node_fn, executed = _build_tool_node_fn_with_skill()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+
+        state = _make_state("dyn_skill", {"x": "1"}, call_id="skill_call")
+        state["messages"] = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "skill_call", "name": "dyn_skill", "args": {"x": "1"}, "type": "tool_call"},
+                    {"id": "mcp_call", "name": "mcp_x", "args": {"y": "2"}, "type": "tool_call"},
+                ],
+            )
+        ]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _skill_mcp_resolver,
+        ):
+            result = await tool_node_fn(state, config)
+
+        # mcp_x is non-PE-eligible → whole batch fell back to legacy (PE never ran).
+        assert len(fake_pe.calls) == 0, "mixed batch should fall to legacy, not PE"
+        # SECURITY: the skill body must NOT have executed.
+        assert executed["skill"] is False, (
+            "dynamic skill executed UNCONFIRMED in legacy — fail-closed guard missing"
+        )
+        # A denial ToolMessage (not the skill's output) must be produced.
+        messages = result.update.get("messages", [])
+        skill_msgs = [
+            m for m in messages
+            if isinstance(m, ToolMessage) and m.tool_call_id == "skill_call"
+        ]
+        assert skill_msgs, "no ToolMessage produced for the denied skill call"
+        assert "skill ran" not in (skill_msgs[0].content or ""), (
+            "skill ToolMessage carries executed output — it was not denied"
         )

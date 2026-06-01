@@ -1354,7 +1354,7 @@ class PlannerReActFlow(BaseFlow):
                 # When PE is active (permission_engine injected), this slot is present but
                 # the legacy SmartApprove branch is unreachable (PE takes the tool_node path).
                 "_legacy_sa_writer": self._approval_state_writer,
-                "skill_tool": self._skill_tool,  # R3: for pre-Stage-P risk refresh
+                "skill_tool": self._skill_tool,  # PE SkillSource metadata build + fail-closed skill guard
                 "confirmation_manager": self._confirmation_manager,
                 "user_id": self._user_id,
                 "session_id": self._session_id,

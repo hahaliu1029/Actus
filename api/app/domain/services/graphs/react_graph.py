@@ -1297,9 +1297,9 @@ def build_react_graph(
         # PE-1 §2.5 (T15 P1#2 fix) + Round 2 P1#2: per-call gate. If ANY
         # pending tool_call in the batch is non-PE-eligible (mcp/a2a, skill
         # creator/guide, or skill/native with operator flag off), delegate
-        # the WHOLE batch to the legacy tool_node path which preserves R3
-        # Skill Stage P / legacy mcp/a2a / skill creator + guide confirmation
-        # pipelines. PE only handles batches where every pending call
+        # the WHOLE batch to the legacy tool_node path which preserves the
+        # fail-closed skill guard / legacy mcp/a2a / skill creator + guide
+        # confirmation pipelines. PE only handles batches where every pending call
         # qualifies for PE — otherwise we'd bypass legacy per-source
         # confirmation for mixed cases.
         #
@@ -1533,7 +1533,6 @@ def build_react_graph(
             # user "session" or "always" approval would cover ANY args for that
             # tool (P2#2 fix: arg_digest must always be present for correct
             # cache-key scoping by ApprovalStateReader).
-            risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
             assessment: Any = None
             if not _bypass_risk_gate and tool_source.source == "native":
                 assessment = _risk_assessor.assess(tool_name, args)
@@ -2549,155 +2548,44 @@ def build_react_graph(
             _session_id = configurable.get("session_id") or ""
             _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
 
-            # R3: Pre-Stage-P risk refresh for skill tools.
-            # If the bundle changed since init, rescan and use the fresh risk level
-            # so approval decisions are never based on stale metadata.
-            if (
-                tool_source
-                and tool_source.source == "skill"
-                and _tc_enabled
-            ):
-                _r3_skill_tool = configurable.get("skill_tool")
-                if _r3_skill_tool:
-                    _refreshed_risk = _r3_skill_tool.refresh_risk_if_stale(tool_name)
-                    if _refreshed_risk:
-                        risk_level_meta = _refreshed_risk
-                        # Also update tool_fn.metadata so the rest of the pipeline sees it
-                        _meta = getattr(tool_fn, "metadata", None) or {}
-                        _meta["risk_level"] = _refreshed_risk
-                        tool_fn.metadata = _meta
-
-            # ========== R3: Skill Stage P branch ==========
+            # PE-1b fail-closed guard: a dynamic SkillTool (source == category ==
+            # "skill") only reaches the legacy path via a mixed-batch fallback — a
+            # non-PE-eligible call (mcp/a2a/skill creator/guide) in the same batch
+            # forced the whole batch off PE (per-batch gate → None). PE-1b deleted
+            # the legacy R3 skill confirmation and the native gate below excludes
+            # skills, so without this guard the skill would execute UNCONFIRMED. Deny
+            # fail-closed; the agent re-issues the skill in its own batch, which
+            # _pe_dispatch routes through PE + SkillSource. Keys on source/category
+            # only (never skill risk metadata) so INV-6 stays satisfied; skill
+            # creator/guide (category != "skill") are unaffected.
             if (
                 not _bypass_risk_gate
                 and _tc_enabled
                 and tool_source
                 and tool_source.source == "skill"
-                and risk_level_meta
-                and risk_level_meta in ("high", "medium")
+                and tool_source.category == "skill"
             ):
-                from app.domain.services.skill_risk_assessor import SkillRiskAssessor
-                from app.domain.models.skill import SkillRuntimeType
-
-                _skill_meta = getattr(tool_fn, "metadata", None) or {}
-                _skill_risk_level = RiskLevel[risk_level_meta.upper()]
-                _skill_assessor = SkillRiskAssessor()
-                assessment = _skill_assessor.assess(
-                    tool_name=tool_name,
-                    tool_args=args,
-                    risk_level=_skill_risk_level,
-                    runtime_type=SkillRuntimeType(
-                        _skill_meta.get("runtime_type", "native")
+                _fail_closed = Denied(
+                    content=(
+                        f"Skill 工具 '{tool_name}' 无法与非权限引擎工具（MCP/A2A 等）"
+                        "在同一批次中执行；请在单独的步骤中调用该 Skill。"
                     ),
-                    trust_origin=_skill_meta.get("trust_origin", "user_installed"),
+                    reason=DecisionReason(
+                        type="approval_policy",
+                        code="skill_mixed_batch_fail_closed",
+                        message=(
+                            "dynamic skill reached legacy via mixed-batch fallback; "
+                            "PE confirmation required"
+                        ),
+                    ),
                 )
+                await _finalize_outcome(
+                    tc, args, tool_source, _fail_closed, _tool_start
+                )
+                continue
 
-                # P.1: ApprovalStateReader (R5b-2: 取代 ApprovalCache 读路径)
-                cache_decision = "no_match"
-                approval_state_reader = configurable.get("approval_state_reader")
-                _user_id = configurable.get("user_id") or ""
-                if approval_state_reader and _user_id and _session_id:
-                    try:
-                        cache_decision = await approval_state_reader.check(
-                            user_id=_user_id,
-                            session_id=_session_id,
-                            tool_name=tool_name,
-                            arg_digest=assessment.arg_digest,
-                            primary_arg=assessment.primary_arg,
-                            dir_arg=assessment.dir_arg,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Stage P.1 ApprovalStateReader crashed for skill %s (fail-open)",
-                            tool_name,
-                        )
-                        cache_decision = "no_match"
-
-                if cache_decision == "allow":
-                    pass  # fall through to execution
-
-                elif cache_decision == "deny":
-                    _denied = Denied(
-                        content=f"Skill '{tool_name}' 被审批策略拒绝",
-                        reason=DecisionReason(
-                            type="approval_policy",
-                            code="cache_deny",
-                            message=f"risk_level={risk_level_meta}",
-                        ),
-                    )
-                    await _finalize_outcome(tc, args, tool_source, _denied, _tool_start)
-                    continue
-
-                else:
-                    # P.3: risk_enforce backstop (>= MEDIUM → user confirmation)
-                    _timeout_seconds = configurable.get(
-                        "tool_confirmation_timeout_seconds", 300
-                    )
-                    confirmation_event = ToolConfirmationEvent(
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        tool_args=args,
-                        risk_level=assessment.final_level.name.lower(),
-                        risk_reason=assessment.risk_reason,
-                        matched_patterns=assessment.matched_patterns,
-                        suggested_alternative=assessment.suggested_alternative,
-                        timeout_seconds=_timeout_seconds,
-                    )
-                    if event_queue:
-                        await event_queue.put(confirmation_event)
-
-                    if confirmation_manager:
-                        from app.domain.services.confirmation_manager import (
-                            ConfirmationDetail,
-                        )
-                        _detail = ConfirmationDetail(
-                            session_id=_session_id,
-                            tool_call_id=call_id,
-                            user_id=_user_id,
-                            tool_name=tool_name,
-                            tool_args=args,
-                            risk_level=assessment.final_level.name.lower(),
-                            arg_digest=assessment.arg_digest,
-                            primary_arg=assessment.primary_arg,
-                            dir_arg=assessment.dir_arg,
-                            matched_patterns=assessment.matched_patterns,
-                            deadline_ts=_time.time() + confirmation_event.timeout_seconds,
-                        )
-                        await confirmation_manager.store(_detail)
-
-                    _pending_outcome = Asked(
-                        content="等待用户确认 Skill 工具执行",
-                        reason=DecisionReason(
-                            type="risk_enforce",
-                            code=assessment.final_level.name.lower(),
-                            message=assessment.risk_reason or "",
-                        ),
-                    )
-                    _pending_artifact = ToolArtifact(
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        tool_source=tool_source,
-                        outcome=_pending_outcome,
-                    )
-                    _update = {
-                        "messages": new_messages + new_deferred_human,
-                        "events": new_events,
-                        "attempt_count": state["attempt_count"] + 1,
-                        "failure_count": state["failure_count"] + new_failures,
-                        "completed_tool_call_prefix": (
-                            list(already_done) + new_completed_ids
-                        ),
-                        "pending_ask_outcome": _pending_outcome.model_dump(mode="json"),
-                        "pending_ask_tool_call_id": call_id,
-                        "pending_ask_artifact": _pending_artifact.model_dump(
-                            mode="json", by_alias=True
-                        ),
-                        "pending_ask_tool_args": dict(args),
-                    }
-                    return Command(goto="interrupt_helper", update=_update)
-
-            # ========== End R3 Skill Stage P ==========
-            # Original native tool gate — skip for skill tools (handled above)
+            # Original native tool gate — skill tools are handled by the fail-closed
+            # guard above; this gate only assesses native tools.
             if (
                 not _bypass_risk_gate
                 and _tc_enabled
