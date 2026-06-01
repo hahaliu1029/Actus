@@ -328,11 +328,11 @@ PR-9 ships in two phases. Read both before flipping the flag.
 
 Shipped:
 - 7 AST + schema gates enforcing static C2 invariants (`tests/domain/**/test_executor_*.py`, `tests/domain/services/graphs/test_two_clock_extended_parallel.py`, `tests/application/services/test_reducer_purity.py`, `tests/application/services/test_coordinator_no_sandbox_destroy.py`, `tests/domain/services/permission/test_child_scope_gate_prologue.py`, `tests/domain/models/test_coordinator_lineage_mixin_enforced.py`, `tests/integration/test_coordinator_apply_audit_partial_unique.py`).
-- 3 E2E integration test scaffolds (`tests/integration/test_coordinator_e2e_*.py`) — currently `@pytest.mark.skip` pending PR-9b infrastructure.
+- 3 E2E integration test scaffolds (`tests/integration/test_coordinator_e2e_*.py`) — shipped `@pytest.mark.skip` in PR-9a; **unskipped + rewritten by the C2 finish-core epic (PR-F5)** to run flag-on in the `coordinator-e2e` CI job.
 - 6 pytest markers (`coordinator_pure`, `coordinator_graph`, `coordinator_worker`, `coordinator_mailbox`, `coordinator_apply`, `coordinator_recovery`).
 - CI yml marker-split execution.
 
-NOT yet shipped (PR-9b scope):
+NOT yet shipped *as of PR-9a* (ALL closed since — by PR-9b + the C2 finish-core epic PR-F1..F5; see "C2 finish-core (2026-05-30)" below. Kept for historical context):
 - 7 fixtures the E2E tests need: `async_client`, `async_session` (or `async_session_factory` re-spec), `redis_real`, `minio_real`, `sandbox_real`, `fixture_mock_llm_3_workers`, `env_with_coordinator_flag_on`.
 - 4 deferred composition-root wirings at `api/app/interfaces/service_dependencies.py:715-755`:
   - `SupervisorContext.cost_rollup_service` (PR-6 §14.4)
@@ -345,6 +345,13 @@ NOT yet shipped (PR-9b scope):
 While the flag stays `false`, the coordinator emit sites silently no-op and the supervisor behaves identically to pre-coordinator code.
 
 ### Acceptance gate (before flipping `ACTUS_C2_COORDINATOR_ENABLED=true`)
+
+> **Superseded (2026-06-01) by "C2 finish-core (2026-05-30)" + the "Flag flip
+> checklist" below.** PR-9b + the finish-core epic shipped the fixtures, the 4
+> emit/repo wirings, cost_total, and lineage; the canonical pre-flip command set
+> is now the **Flag flip checklist** (7 passed, 0 skipped). The PR-9a-era steps
+> below are retained for history — the "3 passed" in step 4 predates the
+> dark-launch + parametrized unskip-guard and is no longer the live count.
 
 1. PR-1..8 + PR-9a merged to `develop` (already done by this PR's prerequisites).
 2. PR-9b merged: fixtures land, 4 emit_event/repo wirings flip to non-None at the composition root, cost_total + lineage TODOs closed.
@@ -371,6 +378,22 @@ While the flag stays `false`, the coordinator emit sites silently no-op and the 
 - Defense in depth: if any cold-code path or stale prompt ever produced `parallel_work_units` while the flag is `false`, the executor's `assert_coordinator_enabled()` at `api/app/domain/services/graphs/main_graph.py:695` raises `RuntimeError` — fail-loud rather than silent-dispatch.
 - Mid-run rollback caveat: flipping the flag back to `false` mid-run is NOT graceful. The supervisor continues consuming envelopes already dispatched, but any rehydrate-on-restart will hit `assert_coordinator_enabled()` and fail-fast. Drain in-flight coordinator runs (or wait for them to reach terminal) before flipping `false`.
 - No data loss across flips; `coordinator_apply_audit`, `coordinator_result_envelope_store`, `coordinator_run_state` tables persist independently of the flag.
+
+### C2 finish-core (2026-05-30) — flag-ready in CI, NOT flipped in production
+
+The "C2 coordinator finish" epic (PR-F1..F5) closed the flag-on blocking gaps:
+the child-runner is fully wired (invoke-adapter + per-child sandbox + cost +
+cancel seam), apply/recovery is live (adapter factory + G2b path contract +
+rehydrate emit + orchestrator group-create hoist), and a dedicated
+`coordinator-e2e` CI job runs the 3 E2E + a flag-OFF dark-launch + the reverse
+unskip guard GREEN flag-on against real pg+redis+minio+sandbox with a fake LLM.
+
+**`ACTUS_C2_COORDINATOR_ENABLED=true` runs ONLY in test/CI. Production stays
+default-off.** Remaining deferrals (NOT done): production flip, live-provider
+acceptance, canary/rollout automation, dashboard/SSE-timeline UI, N≥10 perf,
+full ChildScopeGate live-wiring (child confirmation is disabled; lease safety via
+tool_filter + patch-extraction lease-check + reducer), `atomic_write_file` true
+atomicity, in-flight wallclock/token budget wiring, multi-level spawn.
 
 ## 前端开发
 
@@ -471,18 +494,18 @@ docs: refresh deployment and API docs
 
 ### Flag flip checklist
 
-> **⚠️ Not yet runnable (as of PR-9b-D / R1).** This is the *target* flip-gate.
-> Two referenced tests do not exist yet: `tests/integration/test_coordinator_dark_launch.py`
-> and `tests/structure/test_coordinator_e2e_unskipped.py` are produced by the
-> deferred **"C2 coordinator finish" follow-up epic** (which also unskips the 3
-> E2E tests and completes the production child-runner wiring — see
-> `tests/structure/test_coordinator_e2e_skip_honesty.py` for why they are
-> currently skipped). Until that epic lands, this command exits file-not-found
-> and `ACTUS_C2_COORDINATOR_ENABLED` MUST stay `false`.
+> **✅ Now runnable (C2 finish-core epic, PR-F5).** The C2 finish-core epic landed
+> `tests/integration/test_coordinator_dark_launch.py` and
+> `tests/structure/test_coordinator_e2e_unskipped.py`, unskipped + rewrote the 3
+> E2E tests, and retired `tests/structure/test_coordinator_e2e_skip_honesty.py`
+> (replaced by the inverse unskip guard). These run flag-on in the dedicated
+> `coordinator-e2e` CI job. `ACTUS_C2_COORDINATOR_ENABLED` still stays `false` in
+> production — the flag is exercised only in test/CI (see "C2 finish-core
+> (2026-05-30) — flag-ready in CI, NOT flipped in production" above).
 
 Run these two commands on the candidate commit; both must pass:
 
-1. **Coordinator acceptance** — exactly 6 passed, 0 skipped (1 dark-launch + 3 E2E + 2 structural guard tests):
+1. **Coordinator acceptance** — exactly 7 passed, 0 skipped (1 dark-launch + 3 E2E + 3 structural guard items — `test_coordinator_e2e_unskipped.py` is parametrized over the 3 enumerated E2E files):
 
    ```bash
    cd api && uv run pytest \
@@ -500,7 +523,7 @@ Run these two commands on the candidate commit; both must pass:
    ```bash
    cd api && uv run pytest \
      -m "not slow and not sandbox and not browser_eval and not coordinator_recovery" \
-     --tb=short --strict-markers --strict-config
+     --tb=short --strict-config
    ```
 
 Then flip `ACTUS_C2_COORDINATOR_ENABLED=true` via deploy config.

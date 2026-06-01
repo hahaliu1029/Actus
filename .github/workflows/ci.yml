@@ -81,14 +81,75 @@ jobs:
           REDIS_DB: 0
           JWT_SECRET_KEY: ci-test-secret-key
           ENV: test
-        # C2 PR-9 marker-split execution: first run everything EXCEPT
-        # coordinator_recovery (AST gates + unit + non-recovery integration),
-        # then run ONLY coordinator_recovery (E2E integration set; PR-9a's
-        # scaffolds register as skips here pending PR-9b infrastructure).
+        # C2 finish-core marker-split: backend-test runs everything EXCEPT
+        # coordinator_recovery (AST gates + unit + non-recovery integration).
+        # The dedicated `coordinator-e2e` job below runs the coordinator_recovery
+        # set flag-ON against real pg+redis+minio+sandbox (test-only flag flip).
         run: |
           cd api
           uv run pytest -m "not coordinator_recovery and not slow and not sandbox and not browser_eval" --tb=short
-          uv run pytest -m "coordinator_recovery and not slow and not sandbox and not browser_eval" --tb=short
+
+  coordinator-e2e:
+    name: Coordinator E2E (flag-on)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: manus_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+      # GitHub Actions `services:` can't pass MinIO's `server /data` command,
+      # so run MinIO as a step + create the bucket the app writes.
+      - name: Start MinIO + create bucket
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
+          docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
+            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb -p local/a2a-mcp"
+      - name: Pre-pull sandbox image
+        run: docker pull actus-sandbox:latest || docker build -t actus-sandbox:latest sandbox/
+      - name: Run coordinator E2E (flag-on)
+        env:
+          SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          REDIS_DB: 0
+          JWT_SECRET_KEY: ci-test-secret-key
+          ENV: test
+          MINIO_ENDPOINT: localhost:9000
+          MINIO_ACCESS_KEY: minioadmin
+          MINIO_SECRET_KEY: minioadmin
+          MINIO_SECURE: "false"            # default True -> HTTPS to HTTP MinIO fails
+          MINIO_BUCKET_NAME: a2a-mcp        # matches settings default; bucket created above
+          SANDBOX_IMAGE: actus-sandbox:latest  # default None -> DockerSandbox.create fails
+          ACTUS_C2_COORDINATOR_ENABLED: "true"
+        # NOTE: no --strict-markers here. Collection imports the WHOLE test tree
+        # before -m deselection, and pre-existing unrelated files use unregistered
+        # markers (`asyncio`, `network`); --strict-markers would promote those to
+        # collection ERRORS and fail the job. The coordinator markers ARE
+        # registered in api/pytest.ini and the `-m "coordinator_recovery ..."`
+        # selection self-validates (0 selected if it were typo'd). Matches the
+        # backend-test job, which also runs without --strict-markers.
+        run: |
+          cd api
+          uv run pytest -m "coordinator_recovery and not slow and not browser_eval" --tb=short -rs
 
   sandbox-adversarial:
     name: Sandbox Mount Adversarial Tests
