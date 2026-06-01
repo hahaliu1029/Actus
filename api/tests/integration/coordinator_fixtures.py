@@ -187,6 +187,191 @@ class PricedPlannerFakeListChatModel(PricedFakeListChatModel):
         return RunnableLambda(lambda _messages: plan)
 
 
+class PricedRoutingFakeChatModel(PricedFakeListChatModel):
+    """[C2 finish-core §5.5 G5] ONE fake injected as _ConfigSnapshot.llm, shared
+    by the parent planner + every child's planner + every child's ReAct.
+
+    - with_structured_output(PlanResponse): routes BY CONTEXT — a parent call
+      (no selector line in messages) → the parallel plan; a child call (messages
+      carry the registered selector, e.g. the objective line) → a NON-parallel
+      single-step plan so the child proceeds into ReAct (not back into the
+      coordinator branch). PlanUpdateResponse → keep-complete (no steps);
+      ConversationSummaryResponse → empty.
+    - bind_tools(...): routes child ReAct calls by the selector to a per-selector
+      deque of scripted AIMessages (call-1 tool calls, call-2 final). Per-selector
+      asyncio.Lock so concurrent children don't drift.
+    - Inherits priced identity + usage_metadata (INV-C2 → non-zero cost).
+    Fail-fast on unscripted / 0-or-multi selector match / exhaustion.
+    """
+
+    responses: list[str] = [""]
+
+    def model_post_init(self, _ctx) -> None:
+        object.__setattr__(self, "_planner_response", None)
+        object.__setattr__(self, "_child_decks", {})
+        object.__setattr__(self, "_locks", {})
+        object.__setattr__(self, "_selectors", [])
+        object.__setattr__(self, "parent_plan_calls", 0)
+        object.__setattr__(self, "child_plan_calls", 0)
+        object.__setattr__(self, "build_llm_call_count", 0)
+
+    def setup_responses(self, *, planner_response, child_responses=None, **legacy):
+        from collections import deque
+        object.__setattr__(self, "_planner_response", planner_response)
+        step0 = planner_response["steps"][0]
+        units = step0.get("parallel_work_units", {}).get("work_units", []) if step0.get("parallel_work_units") else []
+        if child_responses is None:
+            child_responses = {}
+            for i, unit in enumerate(units, start=1):
+                turns = legacy.get(f"child_{i}_write_calls")
+                if turns is not None:
+                    child_responses[unit["objective"]] = turns
+        decks, locks, selectors = {}, {}, []
+        for selector, turns in child_responses.items():
+            if "\n" in selector or "**Objective**:" in selector:
+                raise ValueError(
+                    f"routing fake: selector {selector!r} must be a single line "
+                    "without the '**Objective**:' marker (avoids ambiguous routing)"
+                )
+            decks[selector] = deque(self._build_child_turns(turns))
+            locks[selector] = asyncio.Lock()
+            selectors.append(selector)
+        object.__setattr__(self, "_child_decks", decks)
+        object.__setattr__(self, "_locks", locks)
+        object.__setattr__(self, "_selectors", selectors)
+
+    def _build_child_turns(self, turns):
+        from langchain_core.messages import AIMessage
+        msgs = []
+        for t in turns:
+            if "tool" in t:
+                msgs.append(AIMessage(
+                    content="",
+                    tool_calls=[{"name": t["tool"], "args": t["args"], "id": f"tc-{len(msgs)}"}],
+                    usage_metadata={"input_tokens": self.input_tokens,
+                                    "output_tokens": self.output_tokens,
+                                    "total_tokens": self.input_tokens + self.output_tokens},
+                ))
+            else:
+                msgs.append(("control", t))
+        msgs.append(AIMessage(
+            content="done",
+            usage_metadata={"input_tokens": self.input_tokens,
+                            "output_tokens": self.output_tokens,
+                            "total_tokens": self.input_tokens + self.output_tokens},
+        ))
+        return msgs
+
+    def _match_selector(self, messages):
+        text = "\n".join(getattr(m, "content", "") or "" for m in messages)
+        targets = {f"**Objective**: {s}": s for s in self._selectors}
+        hits: list[str] = []
+        for line in text.splitlines():
+            s = targets.get(line.strip())
+            if s is not None and s not in hits:
+                hits.append(s)
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) == 0:
+            return None
+        raise AssertionError(f"routing fake: multi-selector match {hits} in messages")
+
+    def with_structured_output(self, schema=None, **kwargs):  # type: ignore[override]
+        from langchain_core.runnables import RunnableLambda
+
+        async def _route(messages):
+            name = getattr(schema, "__name__", "")
+            if name == "PlanResponse":
+                selector = self._match_selector(messages)
+                if selector is None:
+                    object.__setattr__(self, "parent_plan_calls", self.parent_plan_calls + 1)
+                    return self._build_parent_plan()
+                object.__setattr__(self, "child_plan_calls", self.child_plan_calls + 1)
+                return self._build_child_single_step_plan(selector)
+            if name == "PlanUpdateResponse":
+                return self._build_keep_complete_update()
+            if name == "ConversationSummaryResponse":
+                return self._build_empty_summary()
+            raise AssertionError(f"routing fake: unscripted structured schema {name}")
+
+        return RunnableLambda(_route)
+
+    def bind_tools(self, tools, **kwargs):  # type: ignore[override]
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise NotImplementedError(
+            "PricedRoutingFakeChatModel is async-only in the coordinator graph "
+            "(the graph uses ainvoke → _agenerate)."
+        )
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        selector = self._match_selector(messages)
+        if selector is None or selector not in self._child_decks:
+            raise AssertionError("routing fake: no child deck for selector in messages")
+        async with self._locks[selector]:
+            deck = self._child_decks[selector]
+            if not deck:
+                raise AssertionError(f"routing fake: deck exhausted for {selector!r}")
+            turn = deck.popleft()
+        if isinstance(turn, tuple) and turn[0] == "control":
+            turn = await self._apply_control(turn[1])
+        return ChatResult(generations=[ChatGeneration(message=turn)])
+
+    async def _apply_control(self, spec):
+        from langchain_core.messages import AIMessage
+        if "sleep_seconds" in spec:
+            await asyncio.sleep(spec["sleep_seconds"])
+            return AIMessage(content="done", usage_metadata={
+                "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+                "total_tokens": self.input_tokens + self.output_tokens})
+        exc_type = {"RuntimeError": RuntimeError}.get(spec.get("exc_type"), RuntimeError)
+        raise exc_type(spec.get("exc_msg", "scripted child failure"))
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        # [finish-core R1-P2] The ONLY `astream` caller on the shared snap.llm is
+        # the post-graph background summary (agent_task_runner._do_postprocess
+        # Phase 3 → run_background_summary → summary_llm.astream). The child/ReAct
+        # path uses ainvoke→_agenerate (selector-routed, fail-fast); the in-graph
+        # summary uses with_structured_output. So `astream` is unambiguously the
+        # background-summary surface — yield ONE priced benign summary chunk so
+        # that surface (user-visible summary + its background_summary cost entry)
+        # is COVERED instead of silently degrading on a no-selector AssertionError.
+        from langchain_core.outputs import ChatGenerationChunk
+        from langchain_core.messages import AIMessageChunk
+        chunk = ChatGenerationChunk(message=AIMessageChunk(
+            content="summary",
+            usage_metadata={"input_tokens": self.input_tokens,
+                            "output_tokens": self.output_tokens,
+                            "total_tokens": self.input_tokens + self.output_tokens},
+        ))
+        if run_manager is not None:
+            await run_manager.on_llm_new_token("summary", chunk=chunk)
+        yield chunk
+
+    def _build_parent_plan(self):
+        from app.domain.models.llm_responses import PlanResponse
+        return PlanResponse.model_validate(self._planner_response | {
+            "title": "coordinator", "goal": "parallel", "language": "zh", "message": "ok",
+        })
+
+    def _build_child_single_step_plan(self, selector):
+        from app.domain.models.llm_responses import PlanResponse, StepDef
+        return PlanResponse(
+            title="child", goal=selector, language="zh", message="ok",
+            steps=[StepDef(description=f"do: {selector}")],
+        )
+
+    def _build_keep_complete_update(self):
+        from app.domain.models.llm_responses import PlanUpdateResponse
+        return PlanUpdateResponse(steps=[])
+
+    def _build_empty_summary(self):
+        from app.domain.models.llm_responses import ConversationSummaryResponse
+        return ConversationSummaryResponse()
+
+
 # ── C2 async_session (INV-C1) ───────────────────────────────────────────────
 
 
@@ -640,3 +825,73 @@ async def fresh_test_user(async_session_factory):
         session.add(user)
         await session.commit()
     yield user
+
+
+# ── F4.2 routing-fake injection + JWT auth + dependency-ordered client ────────
+
+
+@pytest.fixture
+def inject_routing_fake_llm(monkeypatch):
+    """[finish-core §5.6/§5.9] Patch _build_llm so the lifespan-built
+    _ConfigSnapshot.llm IS the routing fake. MUST be requested BEFORE the app
+    fixture (async_client) so the patch lands before lifespan builds AgentService.
+    Yields the fake so the test scripts it via setup_responses(...). The patched
+    builder increments fake.build_llm_call_count so coord_async_client can PROVE
+    the patch was consumed by the lifespan (R1-P1 ordering self-check)."""
+    fake = PricedRoutingFakeChatModel()
+    import app.interfaces.service_dependencies as deps
+
+    def _counting_build_llm(*a, **k):
+        object.__setattr__(fake, "build_llm_call_count", fake.build_llm_call_count + 1)
+        return fake
+
+    monkeypatch.setattr(deps, "_build_llm", _counting_build_llm)
+    # Ensure summary_llm stays None so ConversationSummaryResponse routes to snap.llm.
+    # (default config leaves summary_model unset; assert if a test config sets it.)
+    yield fake
+
+
+@pytest.fixture
+def coord_jwt_headers(fresh_test_user):
+    """Authorization header with a real JWT for a COMMITTED user (G6)."""
+    from core.security import create_access_token
+
+    token = create_access_token({"sub": str(fresh_test_user.id)})
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+async def coord_async_client(inject_routing_fake_llm, async_client):
+    """[R7 P1] Dependency-ordered wrapper. Requesting `inject_routing_fake_llm`
+    BEFORE `async_client` guarantees the `_build_llm` monkeypatch is applied
+    BEFORE `async_client`'s lifespan builds the AgentService snapshot — pytest
+    instantiates a fixture's own dependencies in signature order, so this is a
+    real ordering contract (param-order on the TEST is not). The coordinator
+    E2E / smoke / dark-launch use THIS client (not `async_client`)."""
+    # [finish-core R1-P1] Self-verifying ordering invariant: by the time this
+    # fixture body runs, async_client's lifespan has already entered and built
+    # the AgentService snapshot. If the _build_llm patch landed FIRST (correct
+    # order), the patched builder ran >=1 time during lifespan. A zero count
+    # means the snapshot was built with the REAL builder (ordering regressed) —
+    # fail LOUDLY here instead of silently running the harness against a real LLM.
+    assert inject_routing_fake_llm.build_llm_call_count >= 1, (
+        "routing-fake injection did not land before the lifespan built the "
+        "AgentService snapshot (build_llm_call_count == 0); coord_async_client "
+        "fixture ordering is broken — the harness would run against a real LLM"
+    )
+    yield async_client
+
+
+# ── F4.3 session-sandbox bind helper (module-level, NOT a fixture) ────────────
+
+
+async def bind_session_sandbox_adapter(app, session_id, user_id):
+    """[R6 P0] Bind the SESSION's sandbox (the coordinator parent path) and wrap
+    it in ParentSandboxAdapter so the E2E seeds/asserts the SAME sandbox the
+    apply writes. Call AFTER POST /api/sessions, BEFORE the chat that dispatches.
+    Paths are subdir-relative per G2b (e.g. 'workspace/a.py')."""
+    from app.infrastructure.external.sandbox.parent_sandbox_adapter import (
+        ParentSandboxAdapter,
+    )
+    handle = await app.state.sandbox_lifecycle_service.bind_new(session_id, user_id=user_id)
+    return ParentSandboxAdapter(handle)
