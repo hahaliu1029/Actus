@@ -99,6 +99,7 @@ class CoordinatorRehydrateService:
         *,
         coordinator_run_id: str,
         parent_session_id: str,
+        emit_event: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> Optional[RehydrateResult]:
         """Run the 7-step rehydrate algorithm.
 
@@ -184,7 +185,9 @@ class CoordinatorRehydrateService:
 
         # Step 8: check apply audit row, emit HealthEvent for the two
         # crash-recovery alerts.
-        already_applied = await self._check_already_applied(coordinator_run_id)
+        already_applied = await self._check_already_applied(
+            coordinator_run_id, emit_event=emit_event,
+        )
 
         return RehydrateResult(
             child_session_ids=wu_to_session,
@@ -194,7 +197,7 @@ class CoordinatorRehydrateService:
         )
 
     async def _check_already_applied(
-        self, coordinator_run_id: str,
+        self, coordinator_run_id: str, *, emit_event=None,
     ) -> Optional[AlreadyAppliedInfo]:
         audit = await self._ar.find_latest_for_run(coordinator_run_id)
         if audit is None:
@@ -210,6 +213,7 @@ class CoordinatorRehydrateService:
                 ),
                 coordinator_run_id=coordinator_run_id,
                 audit_id=audit.id,
+                emit_event=emit_event,
             )
             return AlreadyAppliedInfo(
                 status="rollback_partial", audit_id=audit.id,
@@ -231,6 +235,7 @@ class CoordinatorRehydrateService:
                     ),
                     coordinator_run_id=coordinator_run_id,
                     audit_id=audit.id,
+                    emit_event=emit_event,
                 )
                 return AlreadyAppliedInfo(
                     status="crash_mid_apply", audit_id=audit.id,
@@ -249,18 +254,33 @@ class CoordinatorRehydrateService:
         reason: str,
         coordinator_run_id: str,
         audit_id: int,
+        emit_event=None,
     ) -> None:
-        if self._emit_event is None:
+        # Prefer the call-time emitter (per-run event queue closure) over the
+        # construction-time singleton; production builds the service with
+        # ``emit_event=None`` so the call-time emitter is the live path. Never
+        # mutate ``self._emit_event`` — the singleton stays untouched.
+        emitter = emit_event or self._emit_event
+        if emitter is None:
             return
         # Late import — keeps the application module's load path lean and
         # mirrors patch_applier.py:687-704 emit pattern (live HealthEvent
         # signature uses status/reason/action/metrics — NOT level/message).
         from app.domain.models.event import HealthEvent, HealthStatus
         try:
-            await self._emit_event(HealthEvent(
-                status=HealthStatus.TERMINATING,
+            # [finish-core R1-P1] Rehydrate recovery alerts are INFORMATIONAL:
+            # the current (retry) session is NOT terminating — main_graph's
+            # ALREADY_APPLIED short-circuit only returns an operator-facing
+            # summary string and the step completes normally. Emitting
+            # ``TERMINATING`` would make the frontend
+            # (``session-store.ts`` resolveStatusFromEvent) sticky-map the live
+            # session to ``timed_out``. ``DEGRADED`` is frontend-informational
+            # (keeps current status); the specific condition is carried in
+            # ``metrics.code`` for operators / dashboards.
+            await emitter(HealthEvent(
+                status=HealthStatus.DEGRADED,
                 reason=reason,
-                action="hard_terminate",
+                action="manual_recovery_required",
                 metrics={
                     "code": code,
                     "coordinator_run_id": coordinator_run_id,

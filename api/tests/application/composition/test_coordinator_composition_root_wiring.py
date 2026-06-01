@@ -435,3 +435,84 @@ def test_orchestrator_factory_build_accepts_consumer_kwargs():
     # the orchestrator receives it via ``run(root_session_id=...)`` at
     # invocation time (coordinator_run_orchestrator.py:230).
     assert "root_session_id" not in captured
+
+
+def test_real_parent_sandbox_adapter_factory_resolves_and_wraps():
+    """[finish-core §5.2 G2 / INV-F2.1 regression] The PRODUCTION factory from
+    ``build_coordinator_runtime_deps`` must import + construct
+    ``ParentSandboxAdapter`` without ``NameError`` and return an object
+    satisfying ``ParentSandboxPort``.
+
+    The construct-only wiring tests above MISS this: a closure free name
+    (``ParentSandboxAdapter`` inside ``_parent_sandbox_adapter_factory``)
+    resolves at CALL time, not construction time. Those tests only build
+    coord_deps (store the un-called closure); the planner ``_build_config``
+    tests substitute a Mock factory. So no test invokes the REAL factory —
+    a missing module-level import would fire ``NameError`` only on the first
+    real coordinator dispatch in production. This test INVOKES the real
+    factory so the missing import is caught at test time.
+    """
+    from types import SimpleNamespace
+
+    from app.infrastructure.external.sandbox.parent_sandbox_adapter import (
+        ParentSandboxAdapter,
+    )
+    from app.interfaces.service_dependencies import (
+        build_coordinator_runtime_deps,
+    )
+
+    fake_state = SimpleNamespace()
+    fake_redis = MagicMock()
+    fake_redis.client = MagicMock()
+
+    fake_postgres = MagicMock()
+    fake_postgres.session_factory = MagicMock()
+
+    fake_minio = MagicMock()
+
+    with patch(
+        "app.interfaces.service_dependencies.get_postgres",
+        return_value=fake_postgres,
+    ), patch(
+        "app.infrastructure.storage.postgres.get_postgres",
+        return_value=fake_postgres,
+    ), patch(
+        "app.interfaces.service_dependencies.get_minio",
+        return_value=fake_minio,
+    ):
+        coord_deps = build_coordinator_runtime_deps(
+            app_state=fake_state,
+            redis_client=fake_redis,
+        )
+
+    # INVOKE the real factory (not a mock) so the closure's free name
+    # ``ParentSandboxAdapter`` is actually resolved + constructed. A missing
+    # module-level import surfaces here as NameError (proven RED).
+    wrapped = coord_deps.parent_sandbox_adapter_factory(
+        MagicMock(name="sandbox_handle")
+    )
+
+    # The factory must yield the concrete adapter. We assert the concrete type
+    # rather than ``isinstance(wrapped, ParentSandboxPort)`` because the Port is
+    # a plain ``typing.Protocol`` (NOT ``@runtime_checkable``) — both
+    # ``isinstance`` and ``issubclass`` against it raise
+    # ``TypeError: Instance and class checks can only be used with
+    # @runtime_checkable protocols``. ``ParentSandboxAdapter`` declares
+    # ``ParentSandboxPort`` as its base (parent_sandbox_adapter.py:54), so a
+    # concrete-type check is the stable proxy for "satisfies the Port".
+    assert type(wrapped) is ParentSandboxAdapter, (
+        "production parent_sandbox_adapter_factory must return a "
+        f"ParentSandboxAdapter; got {type(wrapped).__name__}"
+    )
+    # Structural sanity: the returned object exposes the full narrow Port
+    # surface the domain consumer (dispatch_node / PatchApplier) calls.
+    for method_name in (
+        "compute_digest",
+        "exists",
+        "read_file",
+        "atomic_write_file",
+        "delete_file",
+    ):
+        assert callable(getattr(wrapped, method_name, None)), (
+            f"adapter is missing ParentSandboxPort method: {method_name}"
+        )

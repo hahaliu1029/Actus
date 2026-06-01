@@ -27,6 +27,7 @@ FIELD_NAMES = (
     "artifact_storage",
     "cost_rollup_service",
     "coordinator_envelope_store",
+    "parent_sandbox_adapter_factory",
 )
 
 

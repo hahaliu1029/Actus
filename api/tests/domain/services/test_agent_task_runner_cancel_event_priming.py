@@ -144,8 +144,17 @@ def test_primed_event_flows_through_build_config_into_cfg() -> None:
         "probe_quota", "coordinator_limits", "session_repository",
         "patch_reducer_service", "patch_applier_deps", "artifact_storage",
         "cost_rollup_service", "coordinator_envelope_store",
+        "parent_sandbox_adapter_factory",
     )
     sentinels = {f: MagicMock(name=f) for f in field_names}
+    # [finish-core §5.2 G2] _build_config() invokes this factory to wrap the
+    # raw parent SandboxHandle into a ParentSandboxPort, so the dep MUST be
+    # callable. A bare MagicMock is callable; an explicit side_effect keeps the
+    # output distinct from the raw handle (matches production semantics).
+    sentinels["parent_sandbox_adapter_factory"] = MagicMock(
+        name="parent_sandbox_adapter_factory",
+        side_effect=lambda h: MagicMock(name="wrapped_parent_sandbox"),
+    )
     coord_deps = _CoordinatorRuntimeDeps(**sentinels)
 
     flow = PlannerReActFlow(

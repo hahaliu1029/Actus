@@ -164,14 +164,17 @@ async def test_read_file_404_translates_to_FileNotFoundError(
 
 async def test_atomic_write_file_uploads_bytes(fake_sandbox: MagicMock) -> None:
     adapter = ParentSandboxAdapter(fake_sandbox)
-    await adapter.atomic_write_file("x.py", b"new content")
+    # Path carries a directory component (real coordinator manifest paths
+    # always do) so it clears the F3.2 INV-F2.3 (c) bare-filename guard.
+    await adapter.atomic_write_file("workspace/x.py", b"new content")
     assert fake_sandbox.upload_file.await_count == 1
     call_args = fake_sandbox.upload_file.await_args
     # First positional arg is the BinaryIO stream
     stream = call_args.args[0]
     assert isinstance(stream, io.BytesIO)
     assert stream.getvalue() == b"new content"
-    assert call_args.args[1] == "x.py"
+    # Path passes through unchanged — no /workspace-root join (path-transparency).
+    assert call_args.args[1] == "workspace/x.py"
 
 
 async def test_atomic_write_file_raises_OSError_on_failure(
@@ -182,8 +185,10 @@ async def test_atomic_write_file_raises_OSError_on_failure(
     this test pins the contract that adapter failures match that family."""
     fake_sandbox.upload_file = AsyncMock(return_value=_fail("disk full"))
     adapter = ParentSandboxAdapter(fake_sandbox)
+    # Non-bare path so the OSError under test is the upload-failure branch,
+    # not the F3.2 INV-F2.3 (c) bare-filename ValueError guard.
     with pytest.raises(OSError, match="disk full"):
-        await adapter.atomic_write_file("x.py", b"x")
+        await adapter.atomic_write_file("workspace/x.py", b"x")
 
 
 async def test_delete_file_raises_OSError_on_failure(

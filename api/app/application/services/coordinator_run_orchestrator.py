@@ -233,6 +233,7 @@ class CoordinatorRunOrchestrator:
         child_session_ids: dict[str, str],
         cancel_event: asyncio.Event,
         timeout_seconds: float = 600.0,
+        observer_group_precreated: bool = False,
     ) -> None:
         """Drive the coordinator run loop.
 
@@ -240,6 +241,11 @@ class CoordinatorRunOrchestrator:
           verbatim, including "all-failed → raise RuntimeError" semantics).
         - ``subscriber is set`` → PR-6 observer + cancel_watcher concurrent
           loops gated by ``timeout_seconds``.
+
+        ``observer_group_precreated`` (finish-core §5.4 G4-min): when True,
+        ``dispatch_node`` already created the observer consumer group
+        SYNCHRONOUSLY before any child task launched, so ``_run_with_observer``
+        must NOT subscribe again. Only forwarded to the observer path.
         """
         if self._subscriber is None:
             await self._run_parent_cancel_only(
@@ -258,6 +264,7 @@ class CoordinatorRunOrchestrator:
             child_session_ids=child_session_ids,
             cancel_event=cancel_event,
             timeout_seconds=timeout_seconds,
+            observer_group_precreated=observer_group_precreated,
         )
 
     # ── PR-3 path (preserved verbatim from skeleton) ─────────────────────
@@ -332,6 +339,7 @@ class CoordinatorRunOrchestrator:
         child_session_ids: dict[str, str],
         cancel_event: asyncio.Event,
         timeout_seconds: float,
+        observer_group_precreated: bool = False,
     ) -> None:
         # Mutable working copy: observer + watcher both narrow ``pending``
         # as wus are accounted for.
@@ -351,24 +359,30 @@ class CoordinatorRunOrchestrator:
         subscriber = self._subscriber
         assert subscriber is not None  # narrowed by caller
         subscribed = True
-        try:
-            await subscriber.subscribe(
-                stream_key=stream_key,
-                consumer_group=consumer_group,
-                consumer_name=consumer_name,
-                start_id="$",
-            )
-        except Exception as exc:
-            subscribed = False
-            # Subscribe failure is non-fatal for parent cancel: skip the
-            # observer (its `consume` would hit NOGROUP and exit silently
-            # via the catch-all, which would trip asyncio.wait FIRST_COMPLETED
-            # and cancel the watcher before parent_cancel could fire). Only
-            # spawn the watcher so cancel_event is still honoured.
-            logger.warning(
-                "CoordinatorRunOrchestrator: subscribe failed run=%s: %s",
-                coordinator_run_id, exc,
-            )
+        if not observer_group_precreated:
+            try:
+                await subscriber.subscribe(
+                    stream_key=stream_key,
+                    consumer_group=consumer_group,
+                    consumer_name=consumer_name,
+                    start_id="$",
+                )
+            except Exception as exc:
+                subscribed = False
+                # Subscribe failure is non-fatal for parent cancel: skip the
+                # observer (its `consume` would hit NOGROUP and exit silently
+                # via the catch-all, which would trip asyncio.wait
+                # FIRST_COMPLETED and cancel the watcher before parent_cancel
+                # could fire). Only spawn the watcher so cancel_event is still
+                # honoured.
+                logger.warning(
+                    "CoordinatorRunOrchestrator: subscribe failed run=%s: %s",
+                    coordinator_run_id, exc,
+                )
+        # else: dispatch pre-created the group (§5.4 G4-min); ``subscribed``
+        # stays True so the observer spawns AND the finally: destroy_group
+        # still fires on completion (dispatch owns ONLY the
+        # pre-orchestrator-start rollback).
 
         tasks: list[asyncio.Task[None]] = []
         if subscribed:

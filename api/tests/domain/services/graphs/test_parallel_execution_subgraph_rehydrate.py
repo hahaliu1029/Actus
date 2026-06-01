@@ -17,6 +17,7 @@ from app.domain.services.graphs.parallel_execution_subgraph import (
     WorkerResult,
     _build_pre_results_from_terminal,
     _rehydrate_dispatch,
+    dispatch_node,
 )
 
 pytestmark = pytest.mark.anyio
@@ -436,6 +437,75 @@ class TestRehydrateDispatchBranches:
                 "r1",
                 [_make_wu("wu1"), _make_wu("wu2")],
             )
+
+    async def test_dispatch_node_threads_rehydrate_emit_closure(
+        self, monkeypatch,
+    ) -> None:
+        """[finish-core R3] On the crash-recovery branch (peek attempt >= 1 +
+        event_queue present), dispatch_node must build a per-run async emit
+        closure and pass it into rehydrate_service.detect_existing_run via
+        ``emit_event=``. Guards parallel_execution_subgraph.py:257-267 — if the
+        kwarg/closure is dropped, the HealthEvent alert never reaches the queue.
+        """
+        import asyncio
+
+        captured: dict = {}
+
+        async def _detect(**kwargs):
+            captured.update(kwargs)
+            return RehydrateResult(
+                child_session_ids={}, pending=[], terminal={},
+                already_applied=None,
+            )
+
+        rehydrate_service = MagicMock()
+        rehydrate_service.detect_existing_run = AsyncMock(side_effect=_detect)
+
+        session_service = MagicMock()
+        # peek returns >= 1 -> crash-recovery branch
+        session_service.peek_coordinator_attempt = AsyncMock(return_value=1)
+        # bump must NOT be needed on this branch, but stub defensively.
+        session_service.bump_coordinator_attempt = AsyncMock(return_value=1)
+
+        # Patch the post-detection router so we isolate the wiring under test
+        # (we only care that detect_existing_run got the closure; routing is
+        # covered by the TestRehydrateDispatchBranches suite above).
+        routed: dict = {}
+
+        async def _stub_rehydrate_dispatch(state, config, existing, run_id, wus):
+            routed["called"] = True
+            from langgraph.graph import END
+            from langgraph.types import Command
+            return Command(goto=END, update={})
+
+        monkeypatch.setattr(
+            "app.domain.services.graphs.parallel_execution_subgraph."
+            "_rehydrate_dispatch",
+            _stub_rehydrate_dispatch,
+        )
+
+        event_queue: asyncio.Queue = asyncio.Queue()
+        config = {
+            "configurable": {
+                "session_service": session_service,
+                "rehydrate_service": rehydrate_service,
+                "event_queue": event_queue,
+            }
+        }
+
+        await dispatch_node(_make_state(), config)
+
+        # detect_existing_run was reached and threaded a non-None emitter.
+        assert rehydrate_service.detect_existing_run.await_count == 1
+        emit = captured.get("emit_event")
+        assert emit is not None
+        assert asyncio.iscoroutinefunction(emit)
+        # Bonus: invoking the captured emitter lands the event on the queue.
+        sentinel_event = object()
+        await emit(sentinel_event)
+        assert event_queue.get_nowait() is sentinel_event
+        # And the post-detection router was actually reached.
+        assert routed.get("called") is True
 
     async def test_missing_child_raises_even_when_only_terminals(self) -> None:
         """Defense-in-depth: a wu_id in work_units with NO corresponding

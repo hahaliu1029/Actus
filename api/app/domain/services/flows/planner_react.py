@@ -1482,7 +1482,9 @@ class PlannerReActFlow(BaseFlow):
                 "cancel_event": self._cancel_event,  # per-run, not in _coord_deps
                 "patch_reducer_service": cd.patch_reducer_service,
                 "patch_applier_deps": cd.patch_applier_deps,
-                "parent_sandbox": self._sandbox,  # per-run, not in _coord_deps
+                "parent_sandbox": self._coord_deps.parent_sandbox_adapter_factory(
+                    self._sandbox
+                ),  # [finish-core §5.2 G2] Port, not raw handle (domain stays infra-free)
                 "artifact_storage": cd.artifact_storage,
                 "cost_rollup_service": cd.cost_rollup_service,
             })

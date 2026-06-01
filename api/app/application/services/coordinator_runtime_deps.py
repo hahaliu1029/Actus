@@ -1,11 +1,21 @@
 """[PR-9b-A] Lifespan-scoped coordinator runtime deps container.
 
-Aggregates **17 fields** (singletons). Of those, ``coordinator_envelope_store``
-is consumed only by ``SupervisorContext`` at ``_factory`` time (NOT by the
-coordinator graph), so ``PlannerReActFlow._build_config()`` only copies the
-**other 16 deps** into ``configurable``. It then ADDS 2 per-run keys
-(``cancel_event`` + ``parent_sandbox``) — final total: **16 + 2 = 18
-coordinator cfg keys**.
+Aggregates **18 fields** (singletons). ``PlannerReActFlow._build_config()``
+copies the **first 16 deps** into ``configurable``. The 17th
+(``coordinator_envelope_store``) and 18th (``parent_sandbox_adapter_factory``)
+are NOT copied as their own cfg keys:
+
+- ``coordinator_envelope_store`` is consumed only by ``SupervisorContext`` at
+  ``_factory`` time (NOT by the coordinator graph).
+- ``parent_sandbox_adapter_factory`` is CONSUMED at ``_build_config`` time to
+  WRAP the per-run raw ``SandboxHandle`` into a ``ParentSandboxPort`` — it is
+  the transform applied to the ``parent_sandbox`` value, not a key of its own.
+  (finish-core §5.2 G2: keeps the domain flow infra-free — the flow injects a
+  factory instead of importing ``ParentSandboxAdapter`` from infrastructure.)
+
+``_build_config()`` then ADDS 2 per-run keys (``cancel_event`` +
+``parent_sandbox``) — final total: **16 + 2 = 18 coordinator cfg keys**
+(unchanged by the 18th dep; the factory is consumed, not emitted).
 
 ``_NullCoordinatorRuntimeDeps`` is the legacy-test null object that yields
 ``None`` for every field; ``_build_config()`` detects it as a sentinel and
@@ -37,6 +47,7 @@ class _CoordinatorRuntimeDeps:
     artifact_storage: object
     cost_rollup_service: object
     coordinator_envelope_store: object
+    parent_sandbox_adapter_factory: object  # Callable[[SandboxHandle], ParentSandboxPort]
 
 
 @dataclass(frozen=True)
@@ -77,3 +88,5 @@ class _NullCoordinatorRuntimeDeps:
     def cost_rollup_service(self) -> None: return None
     @property
     def coordinator_envelope_store(self) -> None: return None
+    @property
+    def parent_sandbox_adapter_factory(self) -> None: return None

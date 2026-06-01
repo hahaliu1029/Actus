@@ -227,10 +227,21 @@ async def test_waiter_consumer_group_pre_created_before_runner_start() -> None:
     await dispatch_node(state, config)
     cfg = config["configurable"]
     subscribe_calls = cfg["mailbox_subscriber"].subscribe.await_args_list
-    # 2 work units → 2 waiter groups pre-created.
-    assert len(subscribe_calls) == 2
+    # 2 work units → 2 waiter groups pre-created, PLUS the orchestrator's
+    # observer group hoisted here (finish-core §5.4 G4-min, INV-F4.1).
+    assert len(subscribe_calls) == 3
     groups = {call.kwargs["consumer_group"] for call in subscribe_calls}
-    assert groups == {"coordinator:waiter:c1", "coordinator:waiter:c2"}
+    # Both waiter groups present.
+    assert {"coordinator:waiter:c1", "coordinator:waiter:c2"} <= groups
+    # Exactly one additional non-waiter ``coordinator:`` group = the
+    # orchestrator observer group. Its run_id is generated as
+    # ``parent:hash16:a{n}`` by _create_task, so assert structurally rather
+    # than hardcoding the hash.
+    orch_groups = {
+        g for g in groups
+        if g.startswith("coordinator:") and not g.startswith("coordinator:waiter:")
+    }
+    assert len(orch_groups) == 1, f"expected one orchestrator group, got {orch_groups}"
     for call in subscribe_calls:
         assert call.kwargs["stream_key"] == "actus:child:root1:mailbox"
 

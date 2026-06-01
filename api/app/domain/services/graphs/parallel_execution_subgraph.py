@@ -254,9 +254,16 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
         candidate_run_id = (
             f"{parent_session_id}:{step_id_hash16}:a{current_attempt_ix}"
         )
+        rehydrate_emit = None
+        _rq = cfg.get("event_queue")
+        if _rq is not None:
+            async def _rehydrate_emit(event: object) -> None:
+                _rq.put_nowait(event)  # put_nowait — sync, cancellation-safe (matches _orch_emit_into_queue)
+            rehydrate_emit = _rehydrate_emit
         existing = await rehydrate_service.detect_existing_run(
             coordinator_run_id=candidate_run_id,
             parent_session_id=parent_session_id,
+            emit_event=rehydrate_emit,
         )
         if existing is not None:
             work_units = _build_work_units_from_requests(
@@ -382,6 +389,14 @@ async def _first_time_dispatch(
     # Python scope-wise it is accessible from the except clause
     # because both share the enclosing function frame.
     created_waiter_groups: list[tuple[str, str]] = []
+    # [finish-core §5.4 G4-min] Init BEFORE the try so the except clause can
+    # reference both unconditionally. Without this, a failure before they are
+    # assigned would raise UnboundLocalError and MASK the original dispatch
+    # error. ``orchestrator_task`` is also returned on the success path (state
+    # key), so None is the correct pre-launch sentinel for the INV-F4.3
+    # ownership check.
+    orchestrator_task = None
+    orchestrator_group_created: Optional[tuple[str, str]] = None
     try:
         # 3) Descendants cap — DB count + projected delta. If concurrency was
         # acquired in step 2 but this rejects, release the concurrency slot to
@@ -518,6 +533,26 @@ async def _first_time_dispatch(
             # re-raising.
             created_waiter_groups.append((stream_key, consumer_group))
 
+        # [finish-core §5.4 G4-min, INV-F4.1] Pre-create the orchestrator's
+        # observer group SYNCHRONOUSLY before ANY child task launches, so a
+        # fast child's terminal envelope published between runner_starter.start
+        # and the orchestrator's consume() is still captured (Redis consumer
+        # groups with start_id="$" capture every message appended AFTER the
+        # group is created). dispatch owns this group + its
+        # pre-orchestrator-start rollback (INV-F4.3); the orchestrator owns the
+        # normal-completion destroy (its finally fires; ``subscribed`` stays
+        # True because run() skips its own subscribe via
+        # observer_group_precreated=True).
+        orchestrator_stream_key = f"actus:child:{root_session_id}:mailbox"
+        orchestrator_group = f"coordinator:{coordinator_run_id}"
+        await subscriber.subscribe(
+            stream_key=orchestrator_stream_key,
+            consumer_group=orchestrator_group,
+            consumer_name=f"orch-{coordinator_run_id}",
+            start_id="$",
+        )
+        orchestrator_group_created = (orchestrator_stream_key, orchestrator_group)
+
         # Step 7 -- start N runner tasks.
         # r4 P1-2: pass ``parent_session_id`` so PR-4's runner finalizers
         # (``_publish_result_ready`` / ``_publish_cancel_ack``) can build envelopes
@@ -601,6 +636,10 @@ async def _first_time_dispatch(
             work_units_pending=[wu.work_unit_id for wu in enriched_units],
             child_session_ids=child_session_ids,
             cancel_event=cancel_event,
+            # [finish-core §5.4 G4-min] dispatch pre-created the observer group
+            # above; tell run() to skip its own subscribe but KEEP its
+            # finally: destroy_group (it now owns the normal-completion teardown).
+            observer_group_precreated=True,
         ))
         # r6 P1-1: attach done_callback to surface unhandled orchestrator
         # exceptions (e.g., r5 P1-2 "all CANCEL_REQUEST publishes failed" raise).
@@ -679,6 +718,21 @@ async def _first_time_dispatch(
                     "via outer raise",
                     consumer_group,
                     exc_info=True,
+                )
+
+        # [finish-core §5.4 G4-min, INV-F4.3] Destroy the pre-created
+        # orchestrator group ONLY if the orchestrator task was never launched
+        # (dispatch failed between pre-create and create_task). If the task
+        # exists, the orchestrator's own finally owns the destroy — do NOT
+        # double-destroy here.
+        if orchestrator_group_created is not None and orchestrator_task is None:
+            sk, cg = orchestrator_group_created
+            try:
+                await subscriber.destroy_group(stream_key=sk, consumer_group=cg)
+            except BaseException:  # noqa: BLE001 — best-effort; preserve original raise
+                logger.warning(
+                    "dispatch rollback: orchestrator destroy_group failed group=%s",
+                    cg, exc_info=True,
                 )
 
         raise

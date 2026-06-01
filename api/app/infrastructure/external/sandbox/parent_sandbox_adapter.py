@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 from app.domain.external.parent_sandbox import ParentSandboxPort
@@ -185,6 +186,17 @@ class ParentSandboxAdapter(ParentSandboxPort):
         applier's per-entry try/except catches it and routes to the
         ``WRITE_IO_ERROR`` branch with rollback.
         """
+        # [finish-core §5.2 G2b (c)] A bare filename → sandbox os.makedirs("")
+        # raises. Reject loudly here so the failure is attributable, not a
+        # cryptic FileNotFoundError from the remote service. Path-transparency
+        # is preserved: any path with a directory component (relative or
+        # absolute) passes through unchanged — no ``/workspace`` join.
+        if os.path.dirname(path) == "":
+            raise ValueError(
+                f"bare filename rejected (no directory component): {path!r}; "
+                f"coordinator manifest paths must include a directory "
+                f"(e.g. 'workspace/foo.py')"
+            )
         result = await self._sandbox.upload_file(io.BytesIO(content), path)
         if not result.success:
             raise OSError(

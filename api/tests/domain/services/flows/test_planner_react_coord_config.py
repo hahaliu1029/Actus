@@ -48,6 +48,15 @@ def _build_flow_with_real_coord_deps():
         "patch_reducer_service", "patch_applier_deps", "artifact_storage",
         "cost_rollup_service", "coordinator_envelope_store",
     )}
+    # [finish-core §5.2 G2] The factory dep must be CALLABLE — _build_config
+    # invokes it as parent_sandbox_adapter_factory(self._sandbox) to wrap the
+    # raw handle into a ParentSandboxPort. A bare MagicMock is callable and
+    # returns a distinct child mock (≠ the raw handle), so cfg["parent_sandbox"]
+    # is the wrapped value, satisfying INV-F2.1.
+    sentinels["parent_sandbox_adapter_factory"] = MagicMock(
+        name="parent_sandbox_adapter_factory",
+        side_effect=lambda h: MagicMock(name="wrapped_parent_sandbox"),
+    )
     coord_deps = _CoordinatorRuntimeDeps(**sentinels)
 
     flow = PlannerReActFlow(
@@ -89,9 +98,23 @@ def test_build_config_does_not_inject_event_queue():
     assert "event_queue" not in cfg["configurable"]
 
 
+def test_build_config_does_not_leak_factory_as_cfg_key():
+    """[finish-core R3] The adapter factory is CONSUMED to wrap parent_sandbox;
+    it must NOT appear as its own configurable key (no 19th key)."""
+    flow, _ = _build_flow_with_real_coord_deps()
+    cfg = flow._build_config()
+    assert "parent_sandbox_adapter_factory" not in cfg["configurable"]
+
+
 def test_build_config_threads_per_run_objects():
-    """cancel_event and parent_sandbox come from per-run flow attrs, not _coord_deps."""
+    """cancel_event comes from a per-run flow attr; parent_sandbox is now the
+    adapter-factory OUTPUT (a ParentSandboxPort), NOT the raw handle."""
     flow, _ = _build_flow_with_real_coord_deps()
     cfg = flow._build_config()
     assert cfg["configurable"]["cancel_event"] is flow._cancel_event
-    assert cfg["configurable"]["parent_sandbox"] is flow._sandbox
+    # [finish-core §5.2 G2] parent_sandbox is the wrapped Port, NOT the raw
+    # handle — the factory is invoked with the per-run raw handle.
+    assert cfg["configurable"]["parent_sandbox"] is not flow._sandbox
+    flow._coord_deps.parent_sandbox_adapter_factory.assert_called_with(
+        flow._sandbox
+    )

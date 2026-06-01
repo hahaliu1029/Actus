@@ -169,7 +169,10 @@ async def test_already_applied_rollback_partial_emits_health_event():
     emitted = emitter.await_args.args[0]
     from app.domain.models.event import HealthEvent, HealthStatus
     assert isinstance(emitted, HealthEvent)
-    assert emitted.status == HealthStatus.TERMINATING
+    # [finish-core R1-P1] DEGRADED (informational), NOT TERMINATING — a rehydrate
+    # recovery alert must not sticky-map the live session to timed_out on the
+    # frontend (the session continues; main_graph only returns operator text).
+    assert emitted.status == HealthStatus.DEGRADED
     assert emitted.metrics["code"] == "coordinator_apply_rollback_partial"
 
 

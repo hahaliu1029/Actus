@@ -43,6 +43,7 @@ from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
 from app.infrastructure.external.llm.actus_responses_model import ActusResponsesModel
 from langchain_core.language_models import BaseChatModel
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
+from app.infrastructure.external.sandbox.parent_sandbox_adapter import ParentSandboxAdapter
 from app.infrastructure.external.github_search_client import GitHubSearchClient
 from app.infrastructure.external.event_recovery.redis_event_recovery import RedisEventRecovery
 from app.infrastructure.external.search.bing_search import BingSearchEngine
@@ -1250,6 +1251,12 @@ def build_coordinator_runtime_deps(
     app_state.cost_rollup_service = cost_rollup_service
     app_state.coordinator_child_runner_starter = child_runner_starter
 
+    # [finish-core §5.2 G2] Adapter factory: wraps a per-run raw SandboxHandle
+    # into a ParentSandboxPort. Injected as a coord dep so the domain flow
+    # (planner_react._build_config) never imports infrastructure to wrap it.
+    def _parent_sandbox_adapter_factory(handle):  # noqa: ANN001, ANN202
+        return ParentSandboxAdapter(handle)
+
     # ── 17. Assemble the immutable _CoordinatorRuntimeDeps value object. ────
     coord_deps = _CoordinatorRuntimeDeps(
         parallel_execution_subgraph=parallel_execution_subgraph,
@@ -1269,6 +1276,7 @@ def build_coordinator_runtime_deps(
         artifact_storage=artifact_storage,
         cost_rollup_service=cost_rollup_service,
         coordinator_envelope_store=coordinator_envelope_store,
+        parent_sandbox_adapter_factory=_parent_sandbox_adapter_factory,
     )
     app_state.coord_deps = coord_deps
     return coord_deps
