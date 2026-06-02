@@ -166,7 +166,7 @@ def build_permission_engine(
         ``build_decision_recorder()`` here.  Defaults to None (no-op inside PE).
     sources:
         PE-1 §2.6: Mapping of tool_source → PermissionSource. Must contain
-        at least every entry in PE_SUPPORTED_SOURCES_AFTER_PE_1. Caller
+        at least every entry in PE_SUPPORTED_SOURCES. Caller
         constructs (typically NativeSource() + SkillSource(refresher, redis)
         wired with the per-task Redis client).
     """
@@ -250,13 +250,13 @@ def validate_pe_source_registry(sources: "Mapping[str, Any]") -> None:
         PermissionConfigurationError,
     )
     from app.domain.services.permission.sources import (
-        PE_SUPPORTED_SOURCES_AFTER_PE_1,
+        PE_SUPPORTED_SOURCES,
     )
 
-    missing = PE_SUPPORTED_SOURCES_AFTER_PE_1 - set(sources or {})
+    missing = PE_SUPPORTED_SOURCES - set(sources or {})
     if missing:
         raise PermissionConfigurationError(
-            "PE_SUPPORTED_SOURCES_AFTER_PE_1 claims "
-            f"{sorted(PE_SUPPORTED_SOURCES_AFTER_PE_1)} but DI registered "
+            "PE_SUPPORTED_SOURCES claims "
+            f"{sorted(PE_SUPPORTED_SOURCES)} but DI registered "
             f"only {sorted((sources or {}).keys())}. Missing: {sorted(missing)}."
         )

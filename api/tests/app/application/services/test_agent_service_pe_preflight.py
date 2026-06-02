@@ -713,10 +713,19 @@ async def test_preflight_non_native_tool_routes_to_legacy(monkeypatch) -> None:
     assert state.claim_nonce is None
 
 
-async def test_preflight_mcp_tool_routes_to_legacy(monkeypatch) -> None:
-    """P1#1: mcp_ prefixed tools also route to legacy path."""
+async def test_preflight_mcp_tool_with_flag_off_routes_to_legacy(monkeypatch) -> None:
+    """PE-2: mcp_ prefixed tools route to legacy when the per-source PE flag is off.
+
+    PE-2 makes mcp PE-eligible by default (permission_engine_mcp_enabled=True).
+    To preserve the legacy-routing intent of this test we explicitly disable the
+    per-source flag — emulating an operator who has not enabled McpSource for
+    their deployment. The mcp flag-ON case is covered by
+    ``test_preflight_mcp_tool_with_flag_on_routes_to_pe``.
+    """
     mcp_detail = _StubDetail(tool_name="mcp_my_server_tool")
     service, fakes = _make_service(detail=mcp_detail, pe_enabled=True)
+    # PE-2: explicitly disable per-source PE for mcp so the legacy gate fires.
+    service._config_snapshot.agent_config.tool_confirmation.permission_engine_mcp_enabled = False
     fake_session = Session(id="s_test", user_id="u_test", status=SessionStatus.RUNNING)
 
     async def _fake_get_accessible_session(*args, **kwargs):
@@ -760,9 +769,80 @@ async def test_preflight_mcp_tool_routes_to_legacy(monkeypatch) -> None:
         tool_confirmation=tc,
     )
 
-    assert legacy_called, "MCP tool must route to legacy confirmation path"
+    assert legacy_called, "MCP tool with flag off must route to legacy confirmation path"
     fakes.pe.preflight_resume.assert_not_awaited()
     assert state.claim_nonce is None
+
+
+async def test_preflight_mcp_tool_with_flag_on_routes_to_pe(monkeypatch) -> None:
+    """PE-2: mcp_ prefixed tools route through PE when the per-source flag is on.
+
+    After PE-2 makes mcp PE-eligible (permission_engine_mcp_enabled defaults to
+    True), a real mcp tool resolves to source='mcp' / category='mcp' and must be
+    handled by pe.preflight_resume rather than the legacy path. Mirrors the
+    assertion style of ``test_preflight_delegates_to_pe_when_pe_available``.
+    """
+    mcp_detail = _StubDetail(tool_name="mcp_my_server_tool")
+    service, fakes = _make_service(detail=mcp_detail, pe_enabled=True)
+    fake_session = Session(id="s_test", user_id="u_test", status=SessionStatus.RUNNING)
+
+    async def _fake_get_accessible_session(*args, **kwargs):
+        return fake_session
+
+    monkeypatch.setattr(service, "_get_accessible_session", _fake_get_accessible_session)
+
+    def _fake_build_pe_ssm(snap):
+        return fakes.pe, fakes.ssm
+
+    monkeypatch.setattr(service, "_build_pe_ssm_for_resume", _fake_build_pe_ssm)
+
+    # Legacy path must NOT be taken; track it to assert it stays empty.
+    legacy_called = []
+
+    async def _fake_legacy(*, session_id, user_id, is_admin, tool_confirmation):
+        legacy_called.append(True)
+        fake_task = MagicMock()
+        return _ResumeToolConfirmationState(
+            session=fake_session,
+            detail=mcp_detail,
+            task=fake_task,
+            decision_id=None,
+            persistent_scope=False,
+            action="approve",
+            scope="once",
+            tool_call_id="tc_test",
+            owner_user_id=user_id,
+            session_id=session_id,
+            claim_nonce=None,
+        )
+
+    monkeypatch.setattr(
+        service, "_preflight_resume_tool_confirmation_legacy", _fake_legacy
+    )
+
+    # Provide a done task so the PE path completes without _create_task.
+    fake_task = MagicMock()
+    fake_task.done = True
+    fake_task.output_stream = MagicMock()
+    fake_task.output_stream.get = AsyncMock(return_value=(None, None))
+
+    async def _fake_get_task(session):
+        return fake_task
+
+    monkeypatch.setattr(service, "_get_task", _fake_get_task)
+
+    tc = _make_tool_confirmation(action="approve", scope="once", tool_call_id="tc_test")
+    state = await service.preflight_resume_tool_confirmation(
+        session_id="s_test",
+        user_id="u_test",
+        is_admin=False,
+        tool_confirmation=tc,
+    )
+
+    # PE path: preflight_resume was called; legacy path was NOT taken.
+    fakes.pe.preflight_resume.assert_awaited_once()
+    assert legacy_called == [], "MCP tool with flag on must NOT route to legacy"
+    assert state.claim_nonce == "n" * 32
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,22 @@ def _filter_enabled_mcp_config(mcp_config: Optional[MCPConfig]) -> MCPConfig:
     )
 
 
+def _mcp_tool_namespace(server_name: str) -> str:
+    """The shared tool-name prefix a server contributes (mirrors get_all_tools /
+    invoke prefixing). Two servers with the same namespace would collide on every
+    tool name (and, post-PE-2, on permission keys)."""
+    return server_name if server_name.startswith("mcp_") else f"mcp_{server_name}"
+
+
+def _mcp_namespaces_conflict(a: str, b: str) -> bool:
+    """Two MCP tool-name namespaces conflict (ambiguous invoke() dispatch +
+    shared PE permission keys) if they're equal OR one is a '_'-boundary prefix
+    of the other. Mirrors invoke()'s startswith(prefix + '_') matching."""
+    if a == b:
+        return True
+    return a.startswith(b + "_") or b.startswith(a + "_")
+
+
 class MCPClientManager:
     """MCP客户端管理器"""
 
@@ -91,14 +107,49 @@ class MCPClientManager:
         """只读属性，返回每个MCP服务器的连接错误信息"""
         return self._errors
 
+    def _validate_no_tool_namespace_collisions(self) -> None:
+        """Reject configs where two ENABLED MCP servers map to CONFLICTING tool-name
+        namespaces — either equal (e.g. 'foo' and 'mcp_foo' both → 'mcp_foo') OR a
+        '_'-boundary prefix-overlap (e.g. 'foo' → 'mcp_foo' and 'foo_bar' →
+        'mcp_foo_bar', where invoke() would match 'mcp_foo_bar_*'.startswith('mcp_foo_')
+        and mis-dispatch). Both classes collide on tool names + (post-PE-2) on
+        permission keys. Pairwise (O(n²)) over ENABLED servers so a config where one
+        of a conflicting pair is disabled keeps working unchanged."""
+        if self._mcp_config is None:
+            return
+        # (server_name, namespace) for ENABLED servers only.
+        entries = [
+            (server_name, _mcp_tool_namespace(server_name))
+            for server_name, server_config in self._mcp_config.mcpServers.items()
+            if server_config.enabled
+        ]
+        for i in range(len(entries)):
+            name_a, ns_a = entries[i]
+            for j in range(i + 1, len(entries)):
+                name_b, ns_b = entries[j]
+                if not _mcp_namespaces_conflict(ns_a, ns_b):
+                    continue
+                kind = "equal" if ns_a == ns_b else "prefix-overlap"
+                raise ValueError(
+                    f"MCP server name collision ({kind}): '{name_a}' (namespace "
+                    f"'{ns_a}_*') and '{name_b}' (namespace '{ns_b}_*') map to "
+                    f"conflicting tool-name namespaces. invoke() would dispatch "
+                    f"ambiguously and they would share PE permission keys. "
+                    f"Rename one server so neither namespace equals nor is a "
+                    f"'_'-boundary prefix of the other."
+                )
+
     async def initialize(self) -> None:
         """初始化函数，用于连接所有配置的MCP服务器"""
         # 1.检查下是否已经初始化成功
         if self._initialized:
             return
 
+        # 2.加载前校验：拒绝会在工具名/权限键上冲突的服务配置（快速失败）
+        self._validate_no_tool_namespace_collisions()
+
         try:
-            # 2.记录日志并连接MCP服务器
+            # 3.记录日志并连接MCP服务器
             logger.info(
                 f"从config.yaml中加载了{len(self._mcp_config.mcpServers)}个MCP服务器"
             )
@@ -108,7 +159,7 @@ class MCPClientManager:
         except BaseException as e:
             if _is_fatal_error(e):
                 raise
-            # 3.记录错误信息并直接抛出
+            # 4.记录错误信息并直接抛出
             logger.error(f"MCP客户端管理器加载失败: {str(e)}")
             raise
 
@@ -334,11 +385,8 @@ class MCPClientManager:
         for server_name, tools in self._tools.items():
             # 3.循环取出每个MCP服务的工具列表
             for tool in tools:
-                # 4.修改工具名字加上mcp_前缀+服务名字
-                if server_name.startswith("mcp_"):
-                    tool_name = f"{server_name}_{tool.name}"
-                else:
-                    tool_name = f"mcp_{server_name}_{tool.name}"
+                # 4.修改工具名字加上mcp_前缀+服务名字（前缀规则统一走 _mcp_tool_namespace）
+                tool_name = f"{_mcp_tool_namespace(server_name)}_{tool.name}"
 
                 # 5.生成OpenAI工具描述
                 tool_schema = {
@@ -362,12 +410,8 @@ class MCPClientManager:
 
             # 2.循环遍历当前的所有mcp服务配置
             for server_name in self._mcp_config.mcpServers.keys():
-                # 3.为server_name组装前缀
-                expected_prefix = (
-                    server_name
-                    if server_name.startswith("mcp_")
-                    else f"mcp_{server_name}"
-                )
+                # 3.为server_name组装前缀（前缀规则统一走 _mcp_tool_namespace）
+                expected_prefix = _mcp_tool_namespace(server_name)
 
                 # 4.判断工具名字是否以该服务名字为开头
                 if tool_name.startswith(f"{expected_prefix}_"):

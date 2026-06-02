@@ -89,17 +89,16 @@ INV5_CALLSITE_SAFETY_NET_WHITELIST: tuple[
 ] = (
     (
         "_pe_dispatch",
-        1375,
+        1486,  # post-PE-2 per-call escape _invoke_wrapper (was 1375, drifted)
         "PE-3",
         "PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2 per-call escape: "
-        "the pre-loop guard now routes any non-PE-eligible call (mcp/a2a, "
-        "skill creator/guide, or skill/native with operator flag off) and "
+        "the pre-loop guard routes any non-PE-eligible call (a2a, skill "
+        "creator/guide, or skill/native/mcp with operator flag off) and "
         "any unknown source to the legacy tool_node path for the WHOLE "
         "batch via ``is_pe_eligible_tool_source``, so this per-call branch "
         "is documented unreachable. The body is retained as a defensive "
         "fail-open (logged at ERROR) to avoid stalling the graph if a "
-        "caller-side invariant ever regresses. PE-2/3 will lift mcp/a2a "
-        "sources into PE and remove this branch. Documented at "
-        "react_graph.py:1341-1358.",
+        "caller-side invariant ever regresses. PE-3 lifts a2a into PE and "
+        "removes this branch.",
     ),
 )

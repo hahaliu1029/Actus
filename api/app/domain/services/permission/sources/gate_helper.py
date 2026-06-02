@@ -4,8 +4,7 @@ Replaces 10 native-only callsites (spec §2.5 table) with a single
 two-level gate: (1) source registered in PE_SUPPORTED_SOURCES, (2)
 source-specific flag enabled.
 
-PE-2 will add "mcp" to the supported set in the same PR that ships
-MCPSource. PE-3 adds "a2a".
+Current supported sources: native, skill, mcp. PE-3 adds "a2a".
 
 Spec §2.3; Round 1 P0#3.
 """
@@ -15,10 +14,9 @@ from __future__ import annotations
 from typing import Any
 
 # Single source of truth for "which sources flow through PE at this rev?"
-# PE-2 PR appends "mcp"; PE-3 PR appends "a2a". CI invariants
-# (validate_pe_source_registry at DI time) ensure DI registers every
-# entry in this set.
-PE_SUPPORTED_SOURCES_AFTER_PE_1: frozenset[str] = frozenset({"native", "skill"})
+# PE-3 PR appends "a2a". CI invariants (validate_pe_source_registry at DI
+# time) ensure DI registers every entry in this set.
+PE_SUPPORTED_SOURCES: frozenset[str] = frozenset({"native", "skill", "mcp"})
 
 # Mapping from source string to the corresponding ToolConfirmationConfig
 # flag attribute. Centralized to keep is_pe_enabled_for_source O(1)
@@ -26,7 +24,7 @@ PE_SUPPORTED_SOURCES_AFTER_PE_1: frozenset[str] = frozenset({"native", "skill"})
 _SOURCE_FLAG_ATTR: dict[str, str] = {
     "native": "permission_engine_native_enabled",
     "skill": "permission_engine_skill_enabled",
-    # PE-2 PR: "mcp": "permission_engine_mcp_enabled",
+    "mcp": "permission_engine_mcp_enabled",
     # PE-3 PR: "a2a": "permission_engine_a2a_enabled",
 }
 
@@ -36,7 +34,7 @@ def is_pe_enabled_for_source(source: str, config: Any) -> bool:
 
     Returns False (caller routes to legacy path) when:
       - master switch off (``config.enabled is False``)
-      - source not in ``PE_SUPPORTED_SOURCES_AFTER_PE_1`` (e.g., mcp/a2a in PE-1)
+      - source not in ``PE_SUPPORTED_SOURCES`` (e.g., a2a until PE-3)
       - unknown source string (typo / future source not yet planned)
       - source-specific flag off
 
@@ -48,7 +46,7 @@ def is_pe_enabled_for_source(source: str, config: Any) -> bool:
     """
     if not getattr(config, "enabled", True):
         return False
-    if source not in PE_SUPPORTED_SOURCES_AFTER_PE_1:
+    if source not in PE_SUPPORTED_SOURCES:
         return False
     flag_attr = _SOURCE_FLAG_ATTR.get(source)
     if flag_attr is None:
@@ -72,18 +70,20 @@ def is_pe_eligible_tool_source(tool_source: Any, config: Any) -> bool:
 
     Allowing source-only gating would route the creator / guide tools into
     PE, where ``_pe_dispatch`` would then emit
-    ``AllowError(code="skill_metadata_unresolvable")``. PE-2 / PE-3 may
-    register separate source adapters for those categories, but for PE-1
-    they must bypass PE → legacy.
+    ``AllowError(code="skill_metadata_unresolvable")``. PE-2 registers
+    McpSource for ``category="mcp"`` real remote tools (the mcp-discovery
+    meta-tools are carved out below); PE-3 will add an a2a adapter. The
+    skill creator / guide categories still bypass PE → legacy.
 
     Returns False (caller routes to legacy path) when:
       - ``tool_source`` is None (caller already gave up on resolution; this
         also gives the unknown-source case a single funnel so HTTP preflight,
         graph dispatch, and the batch guard all agree)
-      - source not in ``PE_SUPPORTED_SOURCES_AFTER_PE_1``
+      - source not in ``PE_SUPPORTED_SOURCES``
       - source-specific flag off (or master switch off, via
         ``is_pe_enabled_for_source``)
       - ``source="skill"`` but ``category != "skill"`` (creator / guide)
+      - ``source="mcp"`` but ``category != "mcp"`` (discovery meta-tools)
 
     Returns True only when every gate passes.
     """
@@ -98,5 +98,16 @@ def is_pe_eligible_tool_source(tool_source: Any, config: Any) -> bool:
     if source == "skill":
         category = getattr(tool_source, "category", None)
         if category != "skill":
+            return False
+    # PE-2 §5: mcp discovery meta-tools (list_mcp_tools / get_mcp_tool) are
+    # capability-discovery actions, NOT external permissioned actions — they
+    # extend the next step's bindable tool set rather than producing an external
+    # side effect, so they are NOT PE-eligible. Only category=="mcp" real remote
+    # tools route through PE → McpSource. (get_mcp_tool mutates the activated set;
+    # that is not a permissioned side effect — content-injection scanning of the
+    # fetched description is a separate follow-up, spec §12.)
+    if source == "mcp":
+        category = getattr(tool_source, "category", None)
+        if category != "mcp":
             return False
     return True

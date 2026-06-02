@@ -11,7 +11,7 @@ from app.domain.services.permission.errors import (
     WriterIntegrityError,
 )
 from app.domain.services.permission.sources import (
-    PE_SUPPORTED_SOURCES_AFTER_PE_1,
+    PE_SUPPORTED_SOURCES,
 )
 from app.infrastructure.observability.context import (
     reset_trace_context,
@@ -199,7 +199,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             content={
                 "error": "unsupported_tool_source",
                 "source": exc.source,
-                "supported_sources": sorted(PE_SUPPORTED_SOURCES_AFTER_PE_1),
+                "supported_sources": sorted(PE_SUPPORTED_SOURCES),
             },
             headers=_request_id_headers(request) or None,
         )

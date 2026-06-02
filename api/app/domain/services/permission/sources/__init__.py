@@ -6,10 +6,11 @@ from app.domain.services.permission.source_metadata import (
 )
 from app.domain.services.permission.sources.base import PermissionSource
 from app.domain.services.permission.sources.gate_helper import (
-    PE_SUPPORTED_SOURCES_AFTER_PE_1,
+    PE_SUPPORTED_SOURCES,
     is_pe_eligible_tool_source,
     is_pe_enabled_for_source,
 )
+from app.domain.services.permission.sources.mcp_source import McpSource
 from app.domain.services.permission.sources.native_source import NativeSource
 from app.domain.services.permission.sources.skill_metadata import (
     SkillRiskRefreshResult,
@@ -22,10 +23,11 @@ __all__ = [
     "SourceMetadata",
     "PermissionSource",
     "NativeSource",
+    "McpSource",
     "SkillSource",
     "SkillRiskRefreshResult",
     "build_skill_call_metadata",
-    "PE_SUPPORTED_SOURCES_AFTER_PE_1",
+    "PE_SUPPORTED_SOURCES",
     "is_pe_enabled_for_source",
     "is_pe_eligible_tool_source",
 ]

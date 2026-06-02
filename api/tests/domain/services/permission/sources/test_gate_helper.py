@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.domain.services.permission.sources.gate_helper import (
-    PE_SUPPORTED_SOURCES_AFTER_PE_1,
+    PE_SUPPORTED_SOURCES,
     is_pe_eligible_tool_source,
     is_pe_enabled_for_source,
 )
@@ -41,14 +41,14 @@ class _StubToolSource:
 
 
 class TestRegisteredSetMembership:
-    def test_pe_1_registers_native_and_skill_only(self):
-        assert PE_SUPPORTED_SOURCES_AFTER_PE_1 == frozenset({"native", "skill"})
+    def test_pe_2_registers_native_skill_mcp(self):
+        assert PE_SUPPORTED_SOURCES == frozenset({"native", "skill", "mcp"})
 
-    def test_mcp_not_in_pe_1(self):
-        assert "mcp" not in PE_SUPPORTED_SOURCES_AFTER_PE_1
+    def test_mcp_in_supported_set(self):
+        assert "mcp" in PE_SUPPORTED_SOURCES
 
     def test_a2a_not_in_pe_1(self):
-        assert "a2a" not in PE_SUPPORTED_SOURCES_AFTER_PE_1
+        assert "a2a" not in PE_SUPPORTED_SOURCES
 
 
 class TestGateHelperBehavior:
@@ -60,11 +60,11 @@ class TestGateHelperBehavior:
         tc = _StubTC()
         assert is_pe_enabled_for_source("skill", tc) is True
 
-    def test_mcp_not_in_supported_set_returns_false_even_if_flag_on(self):
-        """flag default true but mcp not yet PE-supported → False (legacy fallback)."""
+    def test_mcp_supported_and_flag_on_returns_true(self):
+        """mcp is now PE-supported (PE-2); flag default true → True."""
         tc = _StubTC()
         assert tc.permission_engine_mcp_enabled is True
-        assert is_pe_enabled_for_source("mcp", tc) is False
+        assert is_pe_enabled_for_source("mcp", tc) is True
 
     def test_a2a_not_in_supported_set_returns_false_even_if_flag_on(self):
         tc = _StubTC()
@@ -125,14 +125,15 @@ class TestIsPeEligibleToolSource:
         ts = _StubToolSource(source="skill", category="skill guide")
         assert is_pe_eligible_tool_source(ts, tc) is False
 
-    def test_mcp_source_returns_false(self):
-        """MCP is not in PE_SUPPORTED_SOURCES_AFTER_PE_1 (PE-2 PR adds it)."""
+    def test_mcp_real_tool_is_eligible(self):
+        """MCP is now in PE_SUPPORTED_SOURCES (PE-2); a real mcp tool
+        (category='mcp') is PE-eligible → True."""
         tc = _StubTC()
         ts = _StubToolSource(source="mcp", category="mcp")
-        assert is_pe_eligible_tool_source(ts, tc) is False
+        assert is_pe_eligible_tool_source(ts, tc) is True
 
     def test_a2a_source_returns_false(self):
-        """A2A is not in PE_SUPPORTED_SOURCES_AFTER_PE_1 (PE-3 PR adds it)."""
+        """A2A is not in PE_SUPPORTED_SOURCES (PE-3 PR adds it)."""
         tc = _StubTC()
         ts = _StubToolSource(source="a2a", category="a2a")
         assert is_pe_eligible_tool_source(ts, tc) is False

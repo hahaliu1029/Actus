@@ -62,6 +62,7 @@ from app.domain.services.permission.errors import (
 )
 from app.domain.services.permission.sources import (
     is_pe_eligible_tool_source,
+    is_pe_enabled_for_source,
 )
 from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
 from app.domain.services.tools.tool_source_resolver import (
@@ -2548,6 +2549,13 @@ def build_react_graph(
             _session_id = configurable.get("session_id") or ""
             _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
 
+            # PE-2 §6: full config + PE-present flags for the MCP mixed-batch guard.
+            _tc_config = configurable.get("tool_confirmation_config")
+            _pe_present = (
+                configurable.get("permission_engine") is not None
+                and configurable.get("session_state_machine") is not None
+            )
+
             # PE-1b fail-closed guard: a dynamic SkillTool (source == category ==
             # "skill") only reaches the legacy path via a mixed-batch fallback — a
             # non-PE-eligible call (mcp/a2a/skill creator/guide) in the same batch
@@ -2582,6 +2590,39 @@ def build_react_graph(
                 await _finalize_outcome(
                     tc, args, tool_source, _fail_closed, _tool_start
                 )
+                continue
+
+            # PE-2 §6: a PE-eligible MCP real tool must never execute via the
+            # legacy fallback. A mixed batch (mcp + a2a / skill-creator / discovery)
+            # forces the WHOLE batch to legacy (react_graph.py per-batch gate →
+            # None); without this guard the MCP call reaches the direct-execute
+            # point below and runs UNCONFIRMED, bypassing any user ASK/DENY policy
+            # the PE path honors. MCP-specific (source/category) so native/skill/
+            # a2a are untouched; gated on PE-present + mcp flag so flag-OFF /
+            # master-OFF / PE-absent fall through to legacy passthrough (§8 soft
+            # rollback). INV-6 clean (source/category + flag only). The agent
+            # re-sends the MCP tool alone (driven by .content) → _pe_dispatch
+            # routes it through PE + McpSource.
+            if (
+                not _bypass_risk_gate
+                and tool_source
+                and tool_source.source == "mcp"
+                and tool_source.category == "mcp"
+                and _pe_present
+                and is_pe_enabled_for_source("mcp", _tc_config)
+            ):
+                _fail_closed = Denied(
+                    content=(
+                        f"MCP 工具 '{tool_name}' 无法与非权限引擎工具（A2A / skill creator 等）"
+                        "在同一批次中执行；请在单独的步骤中调用该 MCP 工具。"
+                    ),
+                    reason=DecisionReason(
+                        type="approval_policy",
+                        code="mcp_mixed_batch_fail_closed",
+                        message="MCP reached legacy via mixed-batch fallback; PE routing required",
+                    ),
+                )
+                await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
                 continue
 
             # Original native tool gate — skill tools are handled by the fail-closed

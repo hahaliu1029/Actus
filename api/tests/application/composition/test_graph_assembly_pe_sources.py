@@ -13,8 +13,9 @@ from app.application.composition.graph_assembly import (
 )
 from app.domain.services.permission.errors import PermissionConfigurationError
 from app.domain.services.permission.sources import (
+    McpSource,
     NativeSource,
-    PE_SUPPORTED_SOURCES_AFTER_PE_1,
+    PE_SUPPORTED_SOURCES,
     SkillSource,
 )
 
@@ -48,7 +49,8 @@ def _stub_uow_factory():
 class TestValidateSourceRegistry:
     def test_passes_when_all_supported_sources_registered(self):
         sources = {"native": NativeSource(),
-                   "skill": SkillSource(refresher=MagicMock(), redis=MagicMock())}
+                   "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
+                   "mcp": McpSource()}
         # Should not raise
         validate_pe_source_registry(sources)
 
@@ -69,12 +71,14 @@ class TestValidateSourceRegistry:
             validate_pe_source_registry({})
 
     def test_extra_sources_beyond_supported_set_pass(self):
-        """Adding 'mcp' before PE-2 should not fail validation — we only
-        check that supported set is covered."""
+        """Registering an unsupported-yet source (a2a, PE-3) alongside the
+        required set must not fail — validate only checks for MISSING required
+        sources, not extras."""
         sources = {
             "native": NativeSource(),
             "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
-            "mcp": MagicMock(),  # not yet supported, but harmless
+            "mcp": McpSource(),
+            "a2a": MagicMock(),  # not yet supported, but harmless
         }
         validate_pe_source_registry(sources)
 

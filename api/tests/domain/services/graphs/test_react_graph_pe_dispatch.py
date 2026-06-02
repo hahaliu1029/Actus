@@ -124,6 +124,7 @@ def _make_config(
     extra: dict | None = None,
     pe_native_enabled: bool = True,
     pe_skill_enabled: bool = True,
+    pe_mcp_enabled: bool = True,
 ):
     """Build a minimal RunnableConfig configurable dict.
 
@@ -139,6 +140,7 @@ def _make_config(
         enabled=True,
         permission_engine_native_enabled=pe_native_enabled,
         permission_engine_skill_enabled=pe_skill_enabled,
+        permission_engine_mcp_enabled=pe_mcp_enabled,
     )
 
     configurable: dict = {
@@ -1260,20 +1262,22 @@ class TestPeDispatchAllowSuccessLiveModeRecheck:
 # ---------------------------------------------------------------------------
 #
 # After PE-1b deletes the legacy R3 Skill Stage P branch, a dynamic SkillTool
-# batched with a non-PE-eligible call (mcp/a2a/skill-creator/guide) makes the
-# WHOLE batch fall back to the legacy tool_node (per-batch gate returns None).
+# batched with a non-PE-eligible call (a2a / skill-creator / skill-guide /
+# mcp-discovery meta-tool — note real category=="mcp" tools became PE-eligible
+# in PE-2) makes the WHOLE batch fall back to the legacy tool_node (per-batch
+# gate returns None).
 # The legacy native gate explicitly excludes skills (``source != "skill"``), so
 # without a guard the skill would fall through to direct, UNCONFIRMED execution.
 # The fail-closed guard denies it instead; the agent re-issues the skill in its
 # own batch, which _pe_dispatch then routes through PE + SkillSource.
 
 def _build_tool_node_fn_with_skill():
-    """Build tool_node with a dynamic skill tool + an mcp tool, recording
+    """Build tool_node with a dynamic skill tool + an a2a tool, recording
     whether each tool body actually executes."""
     from langchain_core.tools import tool as lc_tool
     from app.domain.services.graphs.react_graph import build_react_graph
 
-    executed = {"skill": False, "mcp": False}
+    executed = {"skill": False, "a2a": False}
 
     @lc_tool
     async def dyn_skill(x: str = "") -> str:
@@ -1282,10 +1286,10 @@ def _build_tool_node_fn_with_skill():
         return "skill ran"
 
     @lc_tool
-    async def mcp_x(y: str = "") -> str:
-        """An mcp tool (non-PE-eligible in PE-1)."""
-        executed["mcp"] = True
-        return "mcp ran"
+    async def a2a_x(y: str = "") -> str:
+        """An a2a tool (non-PE-eligible through PE-2)."""
+        executed["a2a"] = True
+        return "a2a ran"
 
     stub_llm = AsyncMock()
     stub_llm.ainvoke = AsyncMock(
@@ -1293,24 +1297,24 @@ def _build_tool_node_fn_with_skill():
     )
     stub_llm.bind_tools = MagicMock(return_value=stub_llm)
 
-    graph = build_react_graph(stub_llm, [dyn_skill, mcp_x])
+    graph = build_react_graph(stub_llm, [dyn_skill, a2a_x])
     return graph.nodes["tool_node"].bound.afunc, executed
 
 
-def _skill_mcp_resolver(name):
-    """resolve_tool_source stub: dyn_skill→skill/skill, mcp_x→mcp/mcp."""
+def _skill_a2a_resolver(name):
+    """resolve_tool_source stub: dyn_skill→skill/skill, a2a_x→a2a/a2a."""
     from app.domain.services.tools.tool_source_resolver import ToolSource
 
     if name == "dyn_skill":
         return ToolSource(source="skill", category="skill", canonical_name="dyn_skill")
-    if name == "mcp_x":
-        return ToolSource(source="mcp", category="mcp", canonical_name="mcp_x")
+    if name == "a2a_x":
+        return ToolSource(source="a2a", category="a2a", canonical_name="a2a_x")
     return ToolSource(source="native", category="unknown", canonical_name=name)
 
 
 class TestSkillMixedBatchFailClosed:
     async def test_dynamic_skill_in_mixed_batch_is_denied_not_executed(self):
-        """A skill + non-PE-eligible (mcp) batch falls to legacy; the skill must
+        """A skill + non-PE-eligible (a2a) batch falls to legacy; the skill must
         be DENIED fail-closed, never executed (regression guard for the
         bypass window opened by deleting the R3 Skill Stage P branch)."""
         from langchain_core.messages import ToolMessage
@@ -1325,7 +1329,7 @@ class TestSkillMixedBatchFailClosed:
                 content="",
                 tool_calls=[
                     {"id": "skill_call", "name": "dyn_skill", "args": {"x": "1"}, "type": "tool_call"},
-                    {"id": "mcp_call", "name": "mcp_x", "args": {"y": "2"}, "type": "tool_call"},
+                    {"id": "a2a_call", "name": "a2a_x", "args": {"y": "2"}, "type": "tool_call"},
                 ],
             )
         ]
@@ -1333,11 +1337,11 @@ class TestSkillMixedBatchFailClosed:
 
         with patch(
             "app.domain.services.graphs.react_graph.resolve_tool_source",
-            _skill_mcp_resolver,
+            _skill_a2a_resolver,
         ):
             result = await tool_node_fn(state, config)
 
-        # mcp_x is non-PE-eligible → whole batch fell back to legacy (PE never ran).
+        # a2a_x is non-PE-eligible → whole batch fell back to legacy (PE never ran).
         assert len(fake_pe.calls) == 0, "mixed batch should fall to legacy, not PE"
         # SECURITY: the skill body must NOT have executed.
         assert executed["skill"] is False, (
@@ -1352,4 +1356,289 @@ class TestSkillMixedBatchFailClosed:
         assert skill_msgs, "no ToolMessage produced for the denied skill call"
         assert "skill ran" not in (skill_msgs[0].content or ""), (
             "skill ToolMessage carries executed output — it was not denied"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PE-2 §6: MCP mixed-batch fail-closed guard
+# ---------------------------------------------------------------------------
+
+def _build_tool_node_fn_with_mcp():
+    """Build tool_node with a real MCP tool + an a2a foil + a discovery tool,
+    recording execution of each."""
+    from langchain_core.tools import tool as lc_tool
+    from app.domain.services.graphs.react_graph import build_react_graph
+
+    executed = {"mcp": False, "a2a": False, "disc": False}
+
+    @lc_tool
+    async def mcp_real(q: str = "") -> str:
+        """A real MCP tool."""
+        executed["mcp"] = True
+        return "mcp ran"
+
+    @lc_tool
+    async def a2a_x(y: str = "") -> str:
+        """An a2a tool (non-PE-eligible through PE-2)."""
+        executed["a2a"] = True
+        return "a2a ran"
+
+    @lc_tool
+    async def list_mcp_tools(server_name: str = "") -> str:
+        """MCP discovery meta-tool."""
+        executed["disc"] = True
+        return "disc ran"
+
+    stub_llm = AsyncMock()
+    stub_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+    )
+    stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+
+    graph = build_react_graph(stub_llm, [mcp_real, a2a_x, list_mcp_tools])
+    return graph.nodes["tool_node"].bound.afunc, executed
+
+
+def _mcp_a2a_resolver(name):
+    from app.domain.services.tools.tool_source_resolver import ToolSource
+    if name == "mcp_real":
+        return ToolSource(source="mcp", category="mcp", canonical_name="mcp_real")
+    if name == "a2a_x":
+        return ToolSource(source="a2a", category="a2a", canonical_name="a2a_x")
+    if name == "list_mcp_tools":
+        return ToolSource(source="mcp", category="mcp discovery", canonical_name="list_mcp_tools")
+    return ToolSource(source="native", category="unknown", canonical_name=name)
+
+
+class TestMcpMixedBatchFailClosed:
+    async def test_mcp_in_mixed_batch_is_denied_not_executed(self):
+        """mcp_real + a2a batch falls to legacy; the MCP tool must be DENIED
+        fail-closed, never executed (closes the unconfirmed-bypass window)."""
+        from langchain_core.messages import ToolMessage
+
+        tool_node_fn, executed = _build_tool_node_fn_with_mcp()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+
+        state = _make_state("mcp_real", {"q": "1"}, call_id="mcp_call")
+        state["messages"] = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "mcp_call", "name": "mcp_real", "args": {"q": "1"}, "type": "tool_call"},
+                    {"id": "a2a_call", "name": "a2a_x", "args": {"y": "2"}, "type": "tool_call"},
+                ],
+            )
+        ]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _mcp_a2a_resolver,
+        ):
+            result = await tool_node_fn(state, config)
+
+        # a2a_x is non-PE-eligible → whole batch fell back to legacy (PE never ran).
+        assert len(fake_pe.calls) == 0, "mixed batch should fall to legacy, not PE"
+        assert executed["mcp"] is False, "MCP executed UNCONFIRMED in legacy — guard missing"
+        messages = result.update.get("messages", [])
+        mcp_msgs = [
+            m for m in messages
+            if isinstance(m, ToolMessage) and m.tool_call_id == "mcp_call"
+        ]
+        assert mcp_msgs, "no ToolMessage produced for the denied MCP call"
+        assert "mcp ran" not in (mcp_msgs[0].content or ""), "MCP was not denied"
+        # prove it is THE §6 guard's typed Denied (status error + the guard's
+        # distinctive MCP message — the skill guard says "Skill 工具"), not some
+        # unrelated denial. (Artifact reason code = mcp_mixed_batch_fail_closed.)
+        assert mcp_msgs[0].status == "error"
+        assert "MCP 工具" in (mcp_msgs[0].content or "")
+
+    async def test_mcp_guard_off_when_flag_off(self):
+        """flag-OFF: the guard must NOT fire → MCP passes through legacy (§8 rollback)."""
+        tool_node_fn, executed = _build_tool_node_fn_with_mcp()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("mcp_real", {"q": "1"}, call_id="mcp_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "mcp_call", "name": "mcp_real", "args": {"q": "1"}, "type": "tool_call"},
+                {"id": "a2a_call", "name": "a2a_x", "args": {"y": "2"}, "type": "tool_call"},
+            ])
+        ]
+        config = _make_config(
+            fake_pe, fake_ssm, pe_mcp_enabled=False,
+            extra={"tool_confirmation_enabled": True},
+        )
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _mcp_a2a_resolver,
+        ):
+            await tool_node_fn(state, config)
+        assert executed["mcp"] is True, "flag-off MCP must execute via legacy passthrough"
+
+    async def test_mcp_discovery_in_mixed_batch_not_denied(self):
+        """A discovery meta-tool (category 'mcp discovery') must NOT trip the
+        guard (source=='mcp' but category!='mcp') — it passes through legacy."""
+        tool_node_fn, executed = _build_tool_node_fn_with_mcp()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("list_mcp_tools", {"server_name": ""}, call_id="disc_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+                {"id": "a2a_call", "name": "a2a_x", "args": {"y": "2"}, "type": "tool_call"},
+            ])
+        ]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _mcp_a2a_resolver,
+        ):
+            await tool_node_fn(state, config)
+        assert executed["disc"] is True, "discovery meta-tool must not be denied by the MCP guard"
+
+
+# ---------------------------------------------------------------------------
+# PE-2 Task 6: MCP-through-PE happy path (pure MCP batch routes through PE)
+# ---------------------------------------------------------------------------
+#
+# Complement to TestMcpMixedBatchFailClosed: a *pure* MCP batch (single mcp
+# tool, no non-PE-eligible foil) is fully PE-eligible, so the per-batch gate
+# does NOT short-circuit to legacy — pe.evaluate IS called for the MCP tool and
+# the spec carries tool_source=="mcp". This proves PE-2's positive direction:
+# MCP is now internalized into the PermissionEngine, not just guarded.
+
+
+class TestMcpThroughPeDispatch:
+    async def test_pure_mcp_batch_routes_through_pe(self):
+        """A real MCP tool alone is PE-eligible → pe.evaluate is called once."""
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import ToolSource
+
+        @lc_tool
+        async def mcp_real(q: str = "") -> str:
+            """A real MCP tool."""
+            return "mcp ran"
+
+        stub_llm = AsyncMock()
+        stub_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+        )
+        stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+        graph = build_react_graph(stub_llm, [mcp_real])
+        tool_node_fn = graph.nodes["tool_node"].bound.afunc
+
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("mcp_real", {"q": "1"}, call_id="mcp_call")
+        config = _make_config(fake_pe, fake_ssm)
+
+        def _mcp_resolver(name):
+            if name == "mcp_real":
+                return ToolSource(source="mcp", category="mcp", canonical_name="mcp_real")
+            return ToolSource(source="native", category="unknown", canonical_name=name)
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _mcp_resolver,
+        ):
+            await tool_node_fn(state, config)
+
+        assert len(fake_pe.calls) == 1, "pe.evaluate must be called for the MCP tool"
+        spec, _ctx = fake_pe.calls[0]
+        assert spec.tool_source == "mcp"
+
+
+# ---------------------------------------------------------------------------
+# PE-2 Task 8: MCP-through-PE infra-failure mode (SSM read fails → AllowError)
+# ---------------------------------------------------------------------------
+#
+# Spec §2.4: today an MCP call reaches _invoke_wrapper with ZERO permission
+# dependency. After PE-2, a real MCP call first reads SSM + pe.evaluate
+# (policy/reader). When that infra transiently FAILS, the call must become
+# AllowError (does NOT execute) instead of running. This test LOCKS the
+# "fail → don't execute" semantic for the MCP-through-PE path. It mirrors the
+# native-path reference test ``test_ssm_read_failure_is_fail_closed``: SSM read
+# precedes evaluate in _pe_dispatch, so the MCP path produces the SAME
+# [SSM_UNAVAILABLE] / code="ssm_read_failure" AllowError as the native path.
+
+
+class TestMcpPeInfraFailure:
+    async def test_mcp_ssm_failure_yields_allow_error_not_executed(self):
+        """PE-2 §2.4: with MCP now on the PE path, an SSM read failure must
+        produce AllowError (NOT execute the tool) — fail → don't run."""
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import ToolSource
+
+        executed = {"mcp": False}
+
+        @lc_tool
+        async def mcp_real(q: str = "") -> str:
+            """real mcp tool"""
+            executed["mcp"] = True
+            return "mcp ran"
+
+        stub_llm = AsyncMock()
+        stub_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+        )
+        stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+        graph = build_react_graph(stub_llm, [mcp_real])
+        tool_node_fn = graph.nodes["tool_node"].bound.afunc
+
+        fake_pe = FakeRecordingPE()
+        # Inline failing SSM — mirrors test_ssm_read_failure_is_fail_closed.
+        failing_ssm = AsyncMock()
+        failing_ssm.get_mode_with_revision = AsyncMock(
+            side_effect=RuntimeError("DB connection lost")
+        )
+        state = _make_state("mcp_real", {"q": "1"}, call_id="mcp_call")
+        config = _make_config(fake_pe, failing_ssm)
+
+        def _resolver(name):
+            if name == "mcp_real":
+                return ToolSource(source="mcp", category="mcp", canonical_name="mcp_real")
+            return ToolSource(source="native", category="unknown", canonical_name=name)
+
+        # belt-and-suspenders: spy _invoke_wrapper too (mirrors the reference
+        # native test) — the body-flag remains the primary load-bearing check.
+        invoke_wrapper_called: list[bool] = []
+        original_module = __import__(
+            "app.domain.services.graphs.react_graph",
+            fromlist=["_invoke_wrapper"],
+        )
+
+        async def _spy_invoke_wrapper(*args, **kwargs):
+            invoke_wrapper_called.append(True)
+            return await original_module._invoke_wrapper(*args, **kwargs)
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source", _resolver
+        ), patch(
+            "app.domain.services.graphs.react_graph._invoke_wrapper",
+            side_effect=_spy_invoke_wrapper,
+        ):
+            result = await tool_node_fn(state, config)
+
+        # prove the typed AllowError outcome, not just "not executed".
+        # SSM read precedes evaluate in _pe_dispatch, so the MCP path produces the
+        # SAME [SSM_UNAVAILABLE] / code="ssm_read_failure" AllowError as the native
+        # path — identical to test_ssm_read_failure_is_fail_closed.
+        from langchain_core.messages import ToolMessage
+        assert executed["mcp"] is False, "MCP must NOT execute when PE infra fails"
+        assert not invoke_wrapper_called, (
+            "_invoke_wrapper must NOT be called when the SSM read fails"
+        )
+        assert len(fake_pe.calls) == 0, "evaluate must not be reached when SSM read fails"
+        messages = result.update.get("messages", [])
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        assert tool_messages and tool_messages[0].status == "error", (
+            "SSM failure on the MCP-through-PE path must emit an error ToolMessage"
+        )
+        assert (
+            "SSM_UNAVAILABLE" in tool_messages[0].content
+            or "unavailable" in tool_messages[0].content.lower()
         )

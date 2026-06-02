@@ -79,7 +79,7 @@ class PEInfrastructureUnavailable(PermissionError):
 
 
 class PermissionConfigurationError(PermissionError):
-    """PE source registry doesn't match PE_SUPPORTED_SOURCES_AFTER_PE_1 claim.
+    """PE source registry doesn't match PE_SUPPORTED_SOURCES claim.
 
     Raised at DI / factory time by validate_pe_source_registry() when the
     sources Mapping is missing entries that is_pe_enabled_for_source would

@@ -53,8 +53,8 @@ def test_skill_call_metadata_content_hash_optional():
 
 
 def test_source_metadata_type_alias_resolves_to_skill_call_metadata():
-    """PE-1 only registers skill; SourceMetadata = SkillCallMetadata for now.
-    PE-2 will extend to Union (SkillCallMetadata | McpCallMetadata)."""
+    """SourceMetadata = SkillCallMetadata. PE-2's McpSource is stateless (no
+    metadata), so the alias is unchanged; PE-3 may widen to a Union."""
     meta: SourceMetadata = SkillCallMetadata(  # type: ignore[assignment]
         tool_name="t",
         skill_id="s",

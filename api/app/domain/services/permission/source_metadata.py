@@ -61,5 +61,6 @@ class SkillCallMetadata:
 
 
 SourceMetadata: TypeAlias = "SkillCallMetadata"
-# PE-2 will widen to: SourceMetadata = SkillCallMetadata | McpCallMetadata
-# PE-3 will widen to: SourceMetadata = SkillCallMetadata | McpCallMetadata | A2ACallMetadata
+# PE-2 did NOT add McpCallMetadata: McpSource is stateless (constant LOW, no
+# on-disk scan / no metadata), so SourceMetadata stays SkillCallMetadata.
+# PE-3 may widen to a Union if A2ASource needs typed per-call metadata.

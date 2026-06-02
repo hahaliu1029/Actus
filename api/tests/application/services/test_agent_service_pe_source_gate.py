@@ -56,3 +56,30 @@ class TestHTTPPreflightHardcodeRemoved:
         # else (in tests, comments) must not exist in source.
         # We strict-match the literal arg form to avoid noise from variables.
         assert 'tool_source="native"' not in src
+
+
+class TestMcpSourceRegisteredAtBothPEBuildSites:
+    def test_mcp_source_registered_at_both_pe_build_sites(self):
+        """PE-2 regression — McpSource must be registered at BOTH
+        PermissionEngine build sites in agent_service:
+
+        - ``_pe_sources`` in ``_create_task`` (initial turn)
+        - ``_pe_sources_r`` in ``_build_pe_ssm_for_resume`` (resume turn)
+
+        WHY: if a future refactor silently drops the resume-path
+        registration, a fresh MCP tool call made during a *resumed* turn
+        would hit a PermissionEngine that has no 'mcp' source registered and
+        raise ``UnsupportedSource`` — re-introducing the exact behavior gap
+        PE-2 closed. Asserting the literal appears exactly twice makes the
+        guard genuinely fail (count drops to 1) if either site is removed.
+        """
+        src = _agent_service_src()
+        # Both PE build sites register the mcp source object.
+        assert src.count('"mcp": McpSource()') == 2, (
+            "McpSource must be registered at BOTH PE build sites "
+            "(_pe_sources in _create_task + _pe_sources_r in "
+            "_build_pe_ssm_for_resume); dropping one re-introduces "
+            "UnsupportedSource for a fresh MCP call on the resume path"
+        )
+        # And McpSource is imported (from the permission sources package).
+        assert "McpSource" in src

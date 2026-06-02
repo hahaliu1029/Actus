@@ -14,6 +14,7 @@ from typing import Any, Callable, FrozenSet, Optional
 from langchain_core.tools import StructuredTool
 
 from app.domain.models.tool_result import AllowSuccess, ToolOutcome
+from app.domain.services.tools.mcp import _mcp_tool_namespace
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
@@ -62,7 +63,7 @@ def create_mcp_discovery_tools(
                 continue
             if server_name:
                 # Normalize: accept both "amap-maps" and "mcp_amap-maps"
-                prefix = server_name if server_name.startswith("mcp_") else f"mcp_{server_name}"
+                prefix = _mcp_tool_namespace(server_name)
                 if not name.startswith(f"{prefix}_"):
                     continue
             # Phase 1 minimal subagent — tool_filter enforcement:

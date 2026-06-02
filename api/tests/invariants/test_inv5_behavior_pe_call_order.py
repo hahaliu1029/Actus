@@ -215,6 +215,7 @@ class _RecordingPEWithSources:
         self._sources = {
             "native": _FakeRecordingSource("native"),
             "skill": _FakeRecordingSource("skill"),
+            "mcp": _FakeRecordingSource("mcp"),
         }
         self.evaluate_calls: list = []
 
@@ -414,3 +415,86 @@ async def test_skill_tool_call_routes_through_skill_source():
         f"Native source must not be touched for a skill tool call, "
         f"got {native_source.assess_risk_calls}"
     )
+
+
+# ---------- PE-2 INV-5 extension: McpSource route ----------
+
+
+def _make_mcp_config(fake_pe, fake_ssm, *, user_id="u", session_id="s") -> dict:
+    """Like _make_skill_config but for MCP: tool_confirmation_config MUST
+    carry permission_engine_mcp_enabled=True (the flag trap —
+    is_pe_enabled_for_source defaults a missing flag to False, which would
+    silently route MCP to legacy and make this test a false pass)."""
+    from types import SimpleNamespace
+    tc_cfg = SimpleNamespace(
+        enabled=True,
+        permission_engine_native_enabled=True,
+        permission_engine_skill_enabled=True,
+        permission_engine_mcp_enabled=True,
+    )
+    return {"configurable": {
+        "permission_engine": fake_pe,
+        "session_state_machine": fake_ssm,
+        "tool_confirmation_config": tc_cfg,
+        "user_id": user_id, "session_id": session_id, "thread_id": session_id,
+    }}
+
+
+def _build_mcp_tool_node_fn(mcp_tool_name: str):
+    """Clone of _build_skill_tool_node_fn: build tool_node with one
+    StructuredTool annotated source='mcp' category='mcp' so resolve_tool_source
+    routes it to McpSource (no patch needed). Drops the skill _tool_bindings /
+    metadata wiring — McpSource is stateless and needs no metadata. Imports are
+    local (mirrors the skill builder's local-import style)."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import StructuredTool
+    from pydantic import create_model
+    from app.domain.services.graphs.react_graph import build_react_graph
+    from app.domain.services.tools.tool_source_resolver import (
+        annotate_and_register_tool_source,
+    )
+
+    async def _invoke(**kwargs):
+        from app.domain.models.tool_result import AllowSuccess
+        out = AllowSuccess(content="mcp ran", data={})
+        return out.content, out
+
+    args_model = create_model("McpInv5Args", q=(str, ""))
+    lc_tool = StructuredTool.from_function(
+        coroutine=_invoke,
+        name=mcp_tool_name,
+        description="fake mcp tool for INV-5 routing test",
+        args_schema=args_model,
+        response_format="content_and_artifact",
+    )
+    annotate_and_register_tool_source(lc_tool, source="mcp", category="mcp")
+
+    stub_llm = AsyncMock()
+    stub_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+    )
+    stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+    graph = build_react_graph(stub_llm, [lc_tool])
+    return graph.nodes["tool_node"].bound.afunc
+
+
+async def test_mcp_tool_call_routes_through_mcp_source():
+    """PE-2 INV-5 extension: an MCP tool invoked through the react_graph PE path
+    hits McpSource.assess_risk exactly once; native untouched. Direct clone of
+    test_skill_tool_call_routes_through_skill_source with source='mcp'."""
+    mcp_tool_name = "mcp_test_inv5_search"
+    tool_node_fn = _build_mcp_tool_node_fn(mcp_tool_name)
+    fake_pe = _RecordingPEWithSources()
+    fake_ssm = _make_fake_ssm()
+
+    state = _make_state(mcp_tool_name, {"q": "1"}, call_id="tc-mcp-1")
+    config = _make_mcp_config(fake_pe, fake_ssm, session_id="sess-inv5-mcp")
+
+    await tool_node_fn(state, config)
+
+    assert len(fake_pe.evaluate_calls) == 1, (
+        f"expected 1 pe.evaluate for MCP tool, got {len(fake_pe.evaluate_calls)}"
+    )
+    assert fake_pe.evaluate_calls[0].tool_source == "mcp"
+    assert fake_pe._sources["mcp"].assess_risk_calls == 1, "McpSource must run once"
+    assert fake_pe._sources["native"].assess_risk_calls == 0, "native untouched"

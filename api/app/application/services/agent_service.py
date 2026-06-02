@@ -535,7 +535,7 @@ class AgentService:
         # source is enabled — previously only native triggered the build, so
         # skill-only operators silently fell back to legacy R3 with no PE.
         from app.domain.services.permission.sources import (
-            PE_SUPPORTED_SOURCES_AFTER_PE_1,
+            PE_SUPPORTED_SOURCES,
             is_pe_enabled_for_source,
         )
 
@@ -543,7 +543,7 @@ class AgentService:
             _tc_at_create is not None
             and any(
                 is_pe_enabled_for_source(src, _tc_at_create)
-                for src in PE_SUPPORTED_SOURCES_AFTER_PE_1
+                for src in PE_SUPPORTED_SOURCES
             )
         ) or (
             # When no tool_confirmation config is present at all, mirror
@@ -613,6 +613,7 @@ class AgentService:
                     SkillRiskRefresher,
                 )
                 from app.domain.services.permission.sources import (
+                    McpSource,
                     NativeSource,
                     SkillSource,
                 )
@@ -632,7 +633,10 @@ class AgentService:
                     and _skill_tool_for_source is not None
                     else None
                 )
-                _pe_sources: dict[str, Any] = {"native": NativeSource()}
+                _pe_sources: dict[str, Any] = {
+                    "native": NativeSource(),
+                    "mcp": McpSource(),
+                }
                 if _skill_source is not None:
                     _pe_sources["skill"] = _skill_source
 
@@ -1138,7 +1142,7 @@ class AgentService:
         that is NOT PE-eligible under the current
         ``ToolConfirmationConfig``. A tool is PE-eligible iff
         ``is_pe_eligible_tool_source(tool_source, tc)`` returns True — which
-        requires the source to be in ``PE_SUPPORTED_SOURCES_AFTER_PE_1``,
+        requires the source to be in ``PE_SUPPORTED_SOURCES``,
         the per-source flag enabled, AND (for ``source="skill"``) the
         category to be ``"skill"`` so creator/guide tools fall back to
         legacy (Round 2 P1#2).
@@ -1263,7 +1267,7 @@ class AgentService:
         # preflight_resume_tool_confirmation when we know the pending tool's
         # actual source.
         from app.domain.services.permission.sources import (
-            PE_SUPPORTED_SOURCES_AFTER_PE_1,
+            PE_SUPPORTED_SOURCES,
             is_pe_enabled_for_source,
         )
 
@@ -1273,7 +1277,7 @@ class AgentService:
                 return None, None  # confirmation master switch off
             if not any(
                 is_pe_enabled_for_source(src, tc)
-                for src in PE_SUPPORTED_SOURCES_AFTER_PE_1
+                for src in PE_SUPPORTED_SOURCES
             ):
                 return None, None  # all per-source PE flags off
 
@@ -1358,6 +1362,7 @@ class AgentService:
                 SkillRiskRefresher,
             )
             from app.domain.services.permission.sources import (
+                McpSource,
                 NativeSource,
                 SkillSource,
             )
@@ -1377,7 +1382,10 @@ class AgentService:
                 and _skill_tool_for_source_r is not None
                 else None
             )
-            _pe_sources_r: dict[str, Any] = {"native": NativeSource()}
+            _pe_sources_r: dict[str, Any] = {
+                "native": NativeSource(),
+                "mcp": McpSource(),
+            }
             if _skill_source_r is not None:
                 _pe_sources_r["skill"] = _skill_source_r
 
@@ -1508,7 +1516,7 @@ class AgentService:
 
         # PE-1 §3.2 + Round 2 P1#1/P1#2: source+category-aware per-call gate.
         # PE-0 was native-only; PE-1 supports native + skill
-        # (PE_SUPPORTED_SOURCES_AFTER_PE_1). For any source that is NOT
+        # (PE_SUPPORTED_SOURCES). For any source that is NOT
         # enabled at the per-source flag level — OR for skill creator /
         # skill guide tools (``source="skill"`` but ``category != "skill"``,
         # which ``SkillSource.build_skill_call_metadata`` cannot resolve) —
