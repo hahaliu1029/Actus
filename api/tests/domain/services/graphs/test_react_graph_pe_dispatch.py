@@ -1846,3 +1846,406 @@ class TestA2aThroughPE:
         messages = result.update.get("messages", [])
         a2a_msgs = [m for m in messages if isinstance(m, ToolMessage) and m.tool_call_id == "a2a_call"]
         assert a2a_msgs and a2a_msgs[0].status == "error"
+
+
+# ---------------------------------------------------------------------------
+# PE-4b §3: native mixed-batch fail-closed guard
+# ---------------------------------------------------------------------------
+
+def _build_tool_node_fn_with_native():
+    """Build tool_node with a REAL native tool (file_write) + an mcp-discovery
+    meta-tool (the non-PE-eligible foil), recording execution of each."""
+    from langchain_core.tools import tool as lc_tool
+    from app.domain.services.graphs.react_graph import build_react_graph
+
+    executed = {"native": False, "disc": False}
+
+    @lc_tool
+    async def file_write(path: str, content: str = "") -> str:
+        """Write to a file (real native tool)."""
+        executed["native"] = True
+        return f"wrote {path}"
+
+    @lc_tool
+    async def list_mcp_tools(server_name: str = "") -> str:
+        """MCP discovery meta-tool (non-PE-eligible foil)."""
+        executed["disc"] = True
+        return "disc ran"
+
+    stub_llm = AsyncMock()
+    stub_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+    )
+    stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+
+    graph = build_react_graph(stub_llm, [file_write, list_mcp_tools])
+    return graph.nodes["tool_node"].bound.afunc, executed
+
+
+def _native_disc_resolver(name):
+    from app.domain.services.tools.tool_source_resolver import ToolSource
+    if name == "file_write":
+        return ToolSource(source="native", category="file", canonical_name="file_write")
+    if name == "list_mcp_tools":
+        return ToolSource(source="mcp", category="mcp discovery", canonical_name="list_mcp_tools")
+    return ToolSource(source="native", category="unknown", canonical_name=name)
+
+
+class TestNativeMixedBatchFailClosed:
+    async def test_native_in_mixed_batch_is_denied_not_executed(self):
+        """file_write + mcp-discovery batch falls to legacy; the REAL native tool
+        must be DENIED fail-closed, never executed (closes the unconfirmed-bypass
+        window left by the meta-tool direct-execute passthrough)."""
+        from langchain_core.messages import ToolMessage
+
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+
+        state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "native_call", "name": "file_write", "args": {"path": "/x.txt", "content": "c"}, "type": "tool_call"},
+                    {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+                ],
+            )
+        ]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            result = await tool_node_fn(state, config)
+
+        # mcp-discovery is non-PE-eligible → whole batch fell back to legacy (PE never ran).
+        assert len(fake_pe.calls) == 0, "mixed batch should fall to legacy, not PE"
+        assert executed["native"] is False, "native executed UNCONFIRMED in legacy — guard missing"
+        messages = result.update.get("messages", [])
+        native_msgs = [
+            m for m in messages
+            if isinstance(m, ToolMessage) and m.tool_call_id == "native_call"
+        ]
+        assert native_msgs, "no ToolMessage produced for the denied native call"
+        assert "wrote /x.txt" not in (native_msgs[0].content or ""), "native was not denied"
+        # prove it is THE PE-4b guard's typed Denied (status error + the guard's
+        # distinctive native message — differs from skill/mcp/a2a). Artifact reason
+        # code = native_mixed_batch_fail_closed.
+        assert native_msgs[0].status == "error"
+        assert "原生工具" in (native_msgs[0].content or "")
+        # §9: the non-eligible foil (mcp-discovery) must PASS THROUGH legacy, NOT
+        # be denied by the native guard (guard is source=="native"-specific).
+        assert executed["disc"] is True, (
+            "the mcp-discovery foil must execute via legacy passthrough — "
+            "the native guard must only deny the native call, not the discovery sibling"
+        )
+
+    async def test_unknown_native_in_mixed_batch_not_denied(self):
+        """A native-source tool with category 'unknown' (the :2438 unresolvable
+        sentinel) is a permanent passthrough — the guard's `category != "unknown"`
+        sub-check must let it execute via legacy, NOT deny it."""
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import ToolSource
+
+        executed = {"unknown": False, "disc": False}
+
+        @lc_tool
+        async def some_unknown_tool(x: str = "") -> str:
+            """A tool that resolves to native/unknown (sentinel)."""
+            executed["unknown"] = True
+            return "unknown ran"
+
+        @lc_tool
+        async def list_mcp_tools(server_name: str = "") -> str:
+            """MCP discovery meta-tool (non-PE-eligible foil)."""
+            executed["disc"] = True
+            return "disc ran"
+
+        stub_llm = AsyncMock()
+        stub_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+        )
+        stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+        graph = build_react_graph(stub_llm, [some_unknown_tool, list_mcp_tools])
+        tool_node_fn = graph.nodes["tool_node"].bound.afunc
+
+        def _unknown_resolver(name):
+            if name == "some_unknown_tool":
+                return ToolSource(source="native", category="unknown", canonical_name="some_unknown_tool")
+            if name == "list_mcp_tools":
+                return ToolSource(source="mcp", category="mcp discovery", canonical_name="list_mcp_tools")
+            return ToolSource(source="native", category="unknown", canonical_name=name)
+
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("some_unknown_tool", {"x": "1"}, call_id="unknown_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "unknown_call", "name": "some_unknown_tool", "args": {"x": "1"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _unknown_resolver,
+        ):
+            await tool_node_fn(state, config)
+
+        # unknown-native is the permanent passthrough — guard must NOT deny it.
+        assert executed["unknown"] is True, (
+            "native/unknown sentinel must pass through legacy (category != 'unknown' "
+            "exclusion); the guard wrongly denied it"
+        )
+        # PE never ran (foil is non-PE-eligible → whole batch fell to legacy).
+        assert len(fake_pe.calls) == 0
+
+    async def test_memory_native_in_mixed_batch_is_denied(self):
+        """R3 matrix lock: the guard keys on source=="native", not on a
+        file/shell/browser whitelist. A memory-category native tool
+        (memory_save) in a mixed batch must also be DENIED fail-closed."""
+        from langchain_core.messages import ToolMessage
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+        from app.domain.services.tools.tool_source_resolver import ToolSource
+
+        executed = {"mem": False, "disc": False}
+
+        @lc_tool
+        async def memory_save(text: str = "", tags: str = "") -> str:
+            """A memory-category native tool."""
+            executed["mem"] = True
+            return "saved"
+
+        @lc_tool
+        async def list_mcp_tools(server_name: str = "") -> str:
+            """MCP discovery meta-tool (non-PE-eligible foil)."""
+            executed["disc"] = True
+            return "disc ran"
+
+        stub_llm = AsyncMock()
+        stub_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+        )
+        stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+        graph = build_react_graph(stub_llm, [memory_save, list_mcp_tools])
+        tool_node_fn = graph.nodes["tool_node"].bound.afunc
+
+        def _mem_resolver(name):
+            if name == "memory_save":
+                return ToolSource(source="native", category="memory", canonical_name="memory_save")
+            if name == "list_mcp_tools":
+                return ToolSource(source="mcp", category="mcp discovery", canonical_name="list_mcp_tools")
+            return ToolSource(source="native", category="unknown", canonical_name=name)
+
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("memory_save", {"text": "hi"}, call_id="mem_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "mem_call", "name": "memory_save", "args": {"text": "hi"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _mem_resolver,
+        ):
+            result = await tool_node_fn(state, config)
+
+        assert executed["mem"] is False, "memory_save executed UNCONFIRMED — guard missing for non-file native"
+        messages = result.update.get("messages", [])
+        mem_msgs = [m for m in messages if isinstance(m, ToolMessage) and m.tool_call_id == "mem_call"]
+        assert mem_msgs and mem_msgs[0].status == "error"
+        assert "原生工具" in (mem_msgs[0].content or "")
+        assert executed["disc"] is True, "the mcp-discovery foil must pass through legacy"
+
+    async def test_native_guard_off_when_master_disabled(self):
+        """master-off (tool_confirmation_enabled=False) → _tc_enabled False →
+        guard inert → native direct-executes (confirmation disabled = run all)."""
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "native_call", "name": "file_write", "args": {"path": "/x.txt", "content": "c"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        # master OFF: tool_confirmation_enabled=False → _tc_enabled False → guard skipped
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": False})
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            await tool_node_fn(state, config)
+        assert executed["native"] is True, (
+            "master-off native must direct-execute (confirmation disabled), not be denied"
+        )
+
+    async def test_native_guard_off_when_pe_absent(self):
+        """PE-absent (permission_engine / session_state_machine not wired) →
+        _pe_present False → guard inert → native passes through legacy."""
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "native_call", "name": "file_write", "args": {"path": "/x.txt", "content": "c"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        # PE absent: None for permission_engine + session_state_machine → _pe_present False.
+        config = _make_config(None, None, extra={"tool_confirmation_enabled": True})
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            await tool_node_fn(state, config)
+        assert executed["native"] is True, (
+            "PE-absent native should pass through legacy (no guard)"
+        )
+
+    async def test_native_guard_off_when_flag_off(self):
+        """flag-OFF: pe_native_enabled=False → is_pe_enabled_for_source('native')
+        False → guard inert → native falls through to the legacy native risk gate
+        / direct-execute (§8 rollback while the flag still exists in PE-4b).
+
+        file_write carries no risk_level metadata → the legacy native risk gate is
+        skipped → it reaches the :2964 direct-execute and runs. Asserting
+        executed["native"] is True proves the new guard did NOT divert it."""
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm()
+        state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "native_call", "name": "file_write", "args": {"path": "/x.txt", "content": "c"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        # native flag OFF → is_pe_enabled_for_source("native") False → guard inert.
+        # pe_native_enabled= sets BOTH the configurable-level dup AND tc_cfg attr
+        # (see _make_config), mirroring the mcp/a2a flag-off tests.
+        config = _make_config(
+            fake_pe, fake_ssm,
+            pe_native_enabled=False,
+            extra={"tool_confirmation_enabled": True},
+        )
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            await tool_node_fn(state, config)
+        # guard inert → native executes via legacy passthrough (today's behavior)
+        assert executed["native"] is True, "flag-off native should pass through legacy (rollback)"
+
+    async def test_preapproved_native_executes_when_session_running(self):
+        """Pre-approved native (call_id ∈ approved_tool_call_ids) in a mixed batch,
+        replayed while session is RUNNING → executes (the guard excludes
+        _bypass_risk_gate; the recheck passes in live mode)."""
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm(mode=SessionStatus.RUNNING)  # live
+        state = _make_state("file_write", {"path": "/ok.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "native_call", "name": "file_write", "args": {"path": "/ok.txt", "content": "c"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        state["approved_tool_call_ids"] = ["native_call"]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            await tool_node_fn(state, config)
+        assert len(fake_pe.calls) == 0, "mixed batch → legacy, PE never ran"
+        assert executed["native"] is True, (
+            "pre-approved native in live mode must execute (guard excludes "
+            "_bypass_risk_gate; recheck passes)"
+        )
+
+    async def test_preapproved_native_denied_when_session_in_takeover(self):
+        """Pre-approved native, replayed while session is in TAKEOVER (non-live) →
+        Denied(non_live_replay), wrapper NOT invoked. Parity with the PE path
+        (:1762) and TestPeDispatchApprovedIdModeCheck (:948)."""
+        from langchain_core.messages import ToolMessage
+
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        fake_pe = FakeRecordingPE()
+        fake_ssm = _make_fake_ssm(mode=SessionStatus.TAKEOVER)  # non-live
+        state = _make_state("file_write", {"path": "/bad.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "native_call", "name": "file_write", "args": {"path": "/bad.txt", "content": "c"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        state["approved_tool_call_ids"] = ["native_call"]
+        config = _make_config(fake_pe, fake_ssm, extra={"tool_confirmation_enabled": True})
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            result = await tool_node_fn(state, config)
+        assert executed["native"] is False, (
+            "pre-approved native in TAKEOVER must NOT execute (non-live recheck)"
+        )
+        messages = result.update.get("messages", [])
+        native_msgs = [m for m in messages if isinstance(m, ToolMessage) and m.tool_call_id == "native_call"]
+        assert native_msgs and native_msgs[0].status == "error"
+        content = native_msgs[0].content or ""
+        assert (
+            "session_mode_changed_before_replay" in content
+            or "LEGACY_REPLAY_DENIED" in content
+            or "TAKEOVER" in content
+        ), f"content must mention mode change, got {content!r}"
+
+    async def test_preapproved_native_ssm_failure_fail_closed(self):
+        """Pre-approved native replay where SSM.get_mode_with_revision raises →
+        the legacy native live-mode recheck must fail CLOSED: AllowError
+        (code="ssm_read_failure"), [SSM_UNAVAILABLE] error ToolMessage, the tool
+        NEVER executes. Parity with the PE-path recheck
+        (test_pe_dispatch_allow_success_fail_closed_when_recheck_ssm_raises) and
+        the mcp/a2a SSM-failure tests."""
+        from langchain_core.messages import ToolMessage
+
+        tool_node_fn, executed = _build_tool_node_fn_with_native()
+        fake_pe = FakeRecordingPE()
+        failing_ssm = AsyncMock()
+        failing_ssm.get_mode_with_revision = AsyncMock(
+            side_effect=RuntimeError("DB connection lost")
+        )
+        state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
+        state["messages"] = [
+            AIMessage(content="", tool_calls=[
+                {"id": "native_call", "name": "file_write", "args": {"path": "/x.txt", "content": "c"}, "type": "tool_call"},
+                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
+            ])
+        ]
+        state["approved_tool_call_ids"] = ["native_call"]
+        config = _make_config(fake_pe, failing_ssm, extra={"tool_confirmation_enabled": True})
+        with patch(
+            "app.domain.services.graphs.react_graph.resolve_tool_source",
+            _native_disc_resolver,
+        ):
+            result = await tool_node_fn(state, config)
+        assert executed["native"] is False, (
+            "pre-approved native must NOT execute when the live-mode recheck SSM "
+            "read fails (fail-closed)"
+        )
+        messages = result.update.get("messages", [])
+        native_msgs = [m for m in messages if isinstance(m, ToolMessage) and m.tool_call_id == "native_call"]
+        assert native_msgs and native_msgs[0].status == "error"
+        content = native_msgs[0].content or ""
+        assert "SSM_UNAVAILABLE" in content or "unavailable" in content.lower(), (
+            f"content must surface the [SSM_UNAVAILABLE] fail-closed error, got {content!r}"
+        )

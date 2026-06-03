@@ -2503,6 +2503,117 @@ def build_react_graph(
                 await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
                 continue
 
+            # PE-4b §3: parity with the PE pre-approved replay recheck (:1762).
+            # A native+meta batch can legitimately enter legacy pre-approved
+            # replay: meta forces batch fallback → HTTP preflight routes to legacy
+            # → interrupt_helper writes approved_tool_call_ids (no claim_nonce,
+            # :3235) → replay falls back again → the native call must execute.
+            # The mixed-batch guard below correctly excludes _bypass_risk_gate so
+            # pre-approved native is NOT denied by it. BUT the legacy direct-execute
+            # (:2964) does not recheck session live-mode, while the PE path does.
+            # A native tool approved while the session was RUNNING/WAITING may, by
+            # replay time, have entered TAKEOVER/FINISHING/COMPLETED — executing in
+            # a non-live session is incorrect. Guard the legacy pre-approved
+            # native direct-execute the same way. Native-specific (source) so the
+            # skill/mcp/a2a pre-approved replays are unaffected.
+            if _bypass_risk_gate and tool_source and tool_source.source == "native":
+                from app.domain.models.session import SessionStatus as _NativeReplayStatus
+                _native_live_modes = (
+                    _NativeReplayStatus.RUNNING,
+                    _NativeReplayStatus.WAITING,
+                )
+                try:
+                    _native_mode, _ = await _ssm.get_mode_with_revision(_session_id)
+                except Exception:
+                    logger.warning(
+                        "tool_node legacy pre-approved native recheck: "
+                        "SSM.get_mode_with_revision failed for session %s "
+                        "(fail-closed before wrapper)",
+                        _session_id,
+                    )
+                    _native_ssm_err = AllowError(
+                        content=(
+                            "[SSM_UNAVAILABLE] 会话状态暂时不可用，请重试"
+                            "（session state unavailable before pre-approved native replay）"
+                        ),
+                        reason=DecisionReason(
+                            type="exception",
+                            code="ssm_read_failure",
+                            message=(
+                                "SSM.get_mode_with_revision failed during legacy "
+                                "pre-approved native live-mode recheck; failing closed"
+                            ),
+                        ),
+                        retryable=True,
+                    )
+                    await _finalize_outcome(
+                        tc, args, tool_source, _native_ssm_err, _tool_start
+                    )
+                    continue
+                if _native_mode not in _native_live_modes:
+                    logger.warning(
+                        "tool_node legacy pre-approved native replay: session %s "
+                        "is in non-live mode %s at replay time; converting "
+                        "pre-approval to Denied for tool_call_id=%s",
+                        _session_id,
+                        _native_mode.value,
+                        call_id,
+                    )
+                    _native_mode_denied = Denied(
+                        content=(
+                            "[LEGACY_REPLAY_DENIED] 会话已切换至非活跃模式，"
+                            "已审批的原生工具调用被拒绝"
+                            f"（session mode changed to {_native_mode.value} before replay）"
+                        ),
+                        reason=DecisionReason(
+                            type="approval_policy",
+                            code="session_mode_changed_before_replay",
+                            message=f"session is {_native_mode.value} at legacy-approved native replay time",
+                        ),
+                    )
+                    await _finalize_outcome(
+                        tc, args, tool_source, _native_mode_denied, _tool_start
+                    )
+                    continue
+
+            # PE-4b §3: a PE-eligible REAL native tool must never execute via the
+            # legacy fallback. A mixed batch (native + skill-creator/guide /
+            # mcp-discovery / unknown) forces the WHOLE batch to legacy (per-batch
+            # gate → None); without this guard the native call reaches the
+            # direct-execute point below and runs UNCONFIRMED, bypassing the PE
+            # risk gate. Native-specific (source) so skill/mcp/a2a are untouched.
+            # category != "unknown" excludes the :2438 unresolvable sentinel
+            # (ToolSource(source="native", category="unknown")) — a permanent
+            # passthrough, NOT a real native tool. Gated on PE-present + native
+            # flag so flag-OFF / master-OFF / PE-absent fall through to the legacy
+            # native risk gate (§8 soft rollback). INV-6 clean (source + flag only,
+            # never reads skill risk metadata). _bypass_risk_gate (pre-approved
+            # replay) is intentionally excluded — see the pre-approved native
+            # recheck above. The agent re-sends the native tool alone (driven by
+            # .content) → _pe_dispatch routes it through PE.
+            if (
+                not _bypass_risk_gate
+                and _tc_enabled
+                and tool_source
+                and tool_source.source == "native"
+                and tool_source.category != "unknown"
+                and _pe_present
+                and is_pe_enabled_for_source("native", _tc_config)
+            ):
+                _fail_closed = Denied(
+                    content=(
+                        f"原生工具 '{tool_name}' 无法与非权限引擎工具（skill creator / "
+                        "MCP discovery 等）在同一批次中执行；请在单独的步骤中调用该工具。"
+                    ),
+                    reason=DecisionReason(
+                        type="approval_policy",
+                        code="native_mixed_batch_fail_closed",
+                        message="native reached legacy via mixed-batch fallback; PE routing required",
+                    ),
+                )
+                await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
+                continue
+
             # Original native tool gate — skill tools are handled by the fail-closed
             # guard above; this gate only assesses native tools.
             if (
