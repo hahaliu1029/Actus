@@ -20,17 +20,25 @@ def _agent_service_src() -> str:
     return inspect.getsource(m)
 
 
-class TestCreateTaskGateIsSourceAware:
-    def test_create_task_no_longer_uses_native_only_flag_only(self):
-        """spec §2.5: _flag_pe_active_at_create must no longer compute
-        as ``tc.enabled and permission_engine_native_enabled``. It should
-        use ``is_pe_enabled_for_source`` for at least 'native' and 'skill'."""
+class TestCreateTaskGateIsMasterOnly:
+    def test_create_gate_collapsed_to_master_switch(self):
+        """PE-4c: per-source flags retired. The create gate degenerates to
+        'build PE iff no tool_confirmation config OR master enabled'. The
+        per-source ``any(is_pe_enabled_for_source(...))`` comprehension and
+        its ``PE_SUPPORTED_SOURCES`` import are gone."""
         src = _agent_service_src()
-        assert "is_pe_enabled_for_source" in src
-        # We accept both: explicit any(...) loop OR per-source checks; but
-        # the legacy boolean alias '_flag_pe_active_at_create = _flag_tc_enabled and _flag_pe_native'
-        # must be gone.
-        assert "_flag_pe_active_at_create = _flag_tc_enabled and _flag_pe_native" not in src
+        # Per-source loop is gone from the create/resume gates.
+        assert "any(\n                is_pe_enabled_for_source" not in src
+        assert "for src in PE_SUPPORTED_SOURCES" not in src
+        # The collapsed master-only form is present (create + resume).
+        assert "_tc_at_create is None" in src
+        assert "all per-source PE flags off" not in src
+
+    def test_create_gate_still_builds_pe_when_no_config(self):
+        """Invariant (a): a no-config session (tc is None) still activates PE."""
+        src = _agent_service_src()
+        # The no-config default-on branch must survive the collapse.
+        assert "_tc_at_create is None" in src
 
 
 class TestPermissionConfigurationErrorEscapesBroadExcept:
@@ -107,3 +115,64 @@ class TestA2aSourceRegisteredAtBothPEBuildSites:
             "UnsupportedSource for a fresh A2A call on the resume path"
         )
         assert "A2aSource" in src
+
+
+class TestCreateGateInvariantsPreservedAfterCollapse:
+    """PE-4c: the master-only gate collapse must preserve two invariants."""
+
+    def test_invariant_a_no_config_session_builds_pe(self):
+        """(a) tc is None → PE is still built (default-on)."""
+        src = _agent_service_src()
+        # The create gate's no-config branch (default-on) is present.
+        assert "_tc_at_create is None or getattr(_tc_at_create" in src
+
+    def test_invariant_b_master_off_returns_none_none_on_resume(self):
+        """(b) master enabled=False on the resume path → (None, None)."""
+        src = _agent_service_src()
+        # The resume gate returns (None, None) on master-off.
+        assert 'return None, None  # confirmation master switch off' in src
+        # And the per-source 'all flags off' early-return is gone.
+        assert "all per-source PE flags off" not in src
+
+
+class TestCreateGateFailsClosedWhenPECannotBuild:
+    """PE-4c P1 (codex-found): with the legacy native risk gate deleted, PE is the
+    SOLE confirmation path. When the master switch is on (or default-on) but the PE
+    cannot be built — missing writer/reader/confirmation_queue, OR the build throws
+    — the create path must fail CLOSED (raise), NOT silently leave
+    permission_engine=None (which would let risk-bearing native tools like
+    shell_execute run UNCONFIRMED via tool_node's direct-execute passthrough)."""
+
+    def test_silent_fail_open_fallback_is_removed(self):
+        """The pre-fix silent fallback (set PE=None, run legacy) must be GONE — its
+        promised 'legacy confirmation path' was deleted in PE-4c."""
+        src = _agent_service_src()
+        assert (
+            "legacy confirmation path will be used for this session" not in src
+        ), "PE-4c must not silently fall back to the (deleted) legacy path"
+
+    def test_missing_pe_dependency_fails_closed(self):
+        """master-on + a missing PE dependency → raise (not silent PE=None)."""
+        src = _agent_service_src()
+        # The dep-missing guard raises with the PE-4c fail-closed message.
+        assert (
+            "without the confirmation boundary (PE-4c fail-closed)" in src
+        ), "missing-dependency path must raise PermissionConfigurationError"
+        assert "missing: {_missing_pe_deps}" in src
+
+    def test_pe_build_exception_fails_closed(self):
+        """master-on + the PE build raising → re-raise (not silent PE=None)."""
+        src = _agent_service_src()
+        # The build except re-raises instead of swallowing to PE=None.
+        assert "failing closed (PE-4c)." in src
+        assert (
+            "Failed to build the PermissionEngine while tool_confirmation" in src
+        )
+
+    def test_explicit_master_off_escape_hatch_documented(self):
+        """The only way to run without confirmation is the explicit master-off
+        escape hatch — never an implicit infra-degradation fallthrough."""
+        src = _agent_service_src()
+        # NB: assert within a single string literal (the source splits "... Set "
+        # and "tool_confirmation.enabled=False ..." across two adjacent literals).
+        assert "tool_confirmation.enabled=False to run without confirmation" in src

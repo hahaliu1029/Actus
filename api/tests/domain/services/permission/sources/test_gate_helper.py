@@ -19,12 +19,11 @@ from app.domain.services.permission.sources.gate_helper import (
 
 @dataclass
 class _StubTC:
-    """Mimics ToolConfirmationConfig surface used by the gate."""
+    """Mimics ToolConfirmationConfig surface used by the gate.
+
+    PE-4c: per-source flags deleted; only the master ``enabled`` switch remains.
+    """
     enabled: bool = True
-    permission_engine_native_enabled: bool = True
-    permission_engine_skill_enabled: bool = True
-    permission_engine_mcp_enabled: bool = True
-    permission_engine_a2a_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -61,15 +60,13 @@ class TestGateHelperBehavior:
         assert is_pe_enabled_for_source("skill", tc) is True
 
     def test_mcp_supported_and_flag_on_returns_true(self):
-        """mcp is now PE-supported (PE-2); flag default true → True."""
+        """mcp is PE-supported (PE-2); master on → True (PE-4c: per-source flag gone)."""
         tc = _StubTC()
-        assert tc.permission_engine_mcp_enabled is True
         assert is_pe_enabled_for_source("mcp", tc) is True
 
     def test_a2a_supported_and_flag_on_returns_true(self):
-        """a2a is now PE-supported (PE-3); flag default true → True."""
+        """a2a is PE-supported (PE-3); master on → True (PE-4c: per-source flag gone)."""
         tc = _StubTC()
-        assert tc.permission_engine_a2a_enabled is True
         assert is_pe_enabled_for_source("a2a", tc) is True
 
     def test_unknown_source_returns_false(self):
@@ -82,17 +79,12 @@ class TestGateHelperBehavior:
         assert is_pe_enabled_for_source("native", tc) is False
         assert is_pe_enabled_for_source("skill", tc) is False
 
-    def test_native_flag_off_returns_false(self):
-        tc = _StubTC(permission_engine_native_enabled=False)
-        assert is_pe_enabled_for_source("native", tc) is False
-        # skill flag is independent
-        assert is_pe_enabled_for_source("skill", tc) is True
-
-    def test_skill_flag_off_returns_false(self):
-        tc = _StubTC(permission_engine_skill_enabled=False)
-        assert is_pe_enabled_for_source("skill", tc) is False
-        # native flag is independent
-        assert is_pe_enabled_for_source("native", tc) is True
+    def test_all_registered_sources_enabled_when_master_on(self):
+        """PE-4c: with the per-source flags gone, every registered source is
+        PE-enabled iff the master switch is on."""
+        tc = _StubTC()
+        for src in PE_SUPPORTED_SOURCES:
+            assert is_pe_enabled_for_source(src, tc) is True
 
 
 class TestIsPeEligibleToolSource:
@@ -161,21 +153,11 @@ class TestIsPeEligibleToolSource:
         ts_skill = _StubToolSource(source="skill", category="skill")
         assert is_pe_eligible_tool_source(ts_skill, tc) is False
 
-    def test_native_flag_off_blocks_native(self):
-        tc = _StubTC(permission_engine_native_enabled=False)
-        ts = _StubToolSource(source="native", category="file")
-        assert is_pe_eligible_tool_source(ts, tc) is False
-
-    def test_skill_flag_off_blocks_dynamic_skill(self):
-        tc = _StubTC(permission_engine_skill_enabled=False)
-        ts = _StubToolSource(source="skill", category="skill")
-        assert is_pe_eligible_tool_source(ts, tc) is False
-
     def test_skill_creator_blocked_even_when_skill_flag_on(self):
-        """The category gate is independent of the flag gate: creator/guide
-        tools must always bypass PE even when the skill flag is on, because
+        """The category gate is independent of the master switch: creator/guide
+        tools must always bypass PE even when confirmation is on, because
         ``build_skill_call_metadata`` cannot resolve them."""
-        tc = _StubTC(permission_engine_skill_enabled=True)
+        tc = _StubTC()
         ts_creator = _StubToolSource(source="skill", category="skill creator")
         ts_guide = _StubToolSource(source="skill", category="skill guide")
         assert is_pe_eligible_tool_source(ts_creator, tc) is False

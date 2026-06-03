@@ -263,7 +263,6 @@ class AgentTaskRunner(TaskRunner):
         memory_gate_batch_cap: int = 20,
         memory_notification_emitter=None,  # PR-4+8: MemoryNotificationEmitter
         approval_state_reader=None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
-        approval_state_writer=None,  # P2#8: ApprovalStateWriter | None（legacy SmartApprove grant写）
         confirmation_manager=None,  # Task 17: ConfirmationManager | None
         initial_language: str = "zh",  # B5 #29: bootstrap hint from AgentService._create_task
         tool_runtime: ToolRuntimeConfig | None = None,  # R2 CS2: wrapper cap + smart-approve timeout
@@ -367,7 +366,6 @@ class AgentTaskRunner(TaskRunner):
         self._on_session_complete = on_session_complete
         self._was_background = was_background
         self._approval_state_reader = approval_state_reader
-        self._approval_state_writer = approval_state_writer  # P2#8
         self._confirmation_manager = confirmation_manager
         self._permission_engine = permission_engine
         self._session_state_machine = session_state_machine
@@ -575,7 +573,6 @@ class AgentTaskRunner(TaskRunner):
             memory_gate_batch_cap=self._memory_gate_batch_cap,
             memory_notification_emitter=self._memory_notification_emitter,
             approval_state_reader=self._approval_state_reader,
-            approval_state_writer=self._approval_state_writer,  # P2#8: legacy SmartApprove grant
             confirmation_manager=self._confirmation_manager,
             prompt_assembler=prompt_assembler,
             tool_runtime=self._tool_runtime,

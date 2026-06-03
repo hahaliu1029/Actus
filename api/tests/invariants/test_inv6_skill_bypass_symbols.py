@@ -7,12 +7,11 @@ whole-file whitelist:
 
   - The PE source adapter + skill-risk owner files may use any skill risk symbol.
   - ``tool_result.py`` may name the ``risk_enforce`` ``DecisionReason`` type.
-  - ``react_graph.py`` may use ``risk_level_meta`` / ``risk_enforce`` for its
-    NATIVE legacy fallback gate ONLY. The skill-only symbols (see
-    ``REACT_GRAPH_SKILL_BANNED``) are hard-banned there, so a reintroduced R3
-    skill branch is caught. react_graph.py's narrow allowance is removed entirely
-    in PE-2/PE-3, when the whole-batch fallback that still needs the native gate
-    is retired.
+  - ``react_graph.py`` had a narrow allowance for ``risk_level_meta`` /
+    ``risk_enforce`` for its NATIVE legacy fallback gate. The skill-only symbols
+    (see ``REACT_GRAPH_SKILL_BANNED``) are hard-banned there, so a reintroduced
+    R3 skill branch is caught. react_graph.py's narrow allowance is removed
+    entirely in PE-4c, when the native risk gate is deleted.
 
 Spec §5.3 (PE-1 warning-only → PE-1b hard fail).
 """
@@ -31,9 +30,9 @@ FORBIDDEN_SYMBOLS: tuple[str, ...] = (
 )
 
 # PE-1b: skill-only bypass symbols that react_graph.py must NEVER consume.
-# Unlike risk_level_meta / risk_enforce — which the native legacy fallback gate
-# still uses legitimately until PE-2/PE-3 retire the whole-batch fallback — these
-# four are unambiguously reads of *skill* risk metadata. Their reappearance in
+# PE-4c deleted the native risk gate, so react_graph no longer has any
+# functional reader of risk_level_meta / risk_enforce. These four symbols are
+# unambiguously reads of *skill* risk metadata; their reappearance in
 # react_graph.py means the deleted R3 Skill Stage P branch has crept back.
 REACT_GRAPH_SKILL_BANNED: tuple[str, ...] = (
     "SkillRiskAssessor",
@@ -69,9 +68,6 @@ ALLOW: dict[str, frozenset[str]] = {
     "api/app/domain/services/skill_risk_assessor.py": frozenset(),
     # DecisionReason type definition — legitimately names the risk_enforce reason.
     "api/app/domain/models/tool_result.py": frozenset({"risk_enforce"}),
-    # NATIVE legacy fallback gate ONLY — risk_level_meta + risk_enforce for native
-    # tools. SkillRiskAssessor stays banned (R3 deleted). Removed in PE-2/PE-3.
-    _REACT_GRAPH_REL: frozenset({"risk_level_meta", "risk_enforce"}),
 }
 
 
@@ -128,13 +124,12 @@ def test_inv6_no_skill_bypass_symbols_outside_allow():
     )
 
 
-def test_inv6_react_graph_allowance_is_native_only():
-    """react_graph.py's allowance is the NATIVE fallback subset only: it must
-    NOT exempt SkillRiskAssessor (the R3 skill branch is deleted). Guards
-    against someone widening the allowance to re-admit a skill bypass."""
-    allowed = ALLOW[_REACT_GRAPH_REL]
-    assert "SkillRiskAssessor" not in allowed
-    assert allowed == frozenset({"risk_level_meta", "risk_enforce"})
+def test_inv6_react_graph_allowance_removed():
+    """PE-4c: react_graph has ZERO functional readers of risk_level_meta /
+    risk_enforce (the native risk gate + the dead assignment are deleted), so
+    its INV-6 allowance is REMOVED entirely. Re-adding it would re-admit a
+    native risk-metadata reader without review."""
+    assert _REACT_GRAPH_REL not in ALLOW
 
 
 def test_inv6_allow_map_contents_documented():
@@ -146,7 +141,6 @@ def test_inv6_allow_map_contents_documented():
         "api/app/domain/services/permission/default_engine.py",
         "api/app/domain/services/skill_risk_assessor.py",
         "api/app/domain/models/tool_result.py",
-        _REACT_GRAPH_REL,
     }
 
 

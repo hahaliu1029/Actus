@@ -59,24 +59,24 @@ INV4_SOFT_KNOWN_OFFENDERS: tuple[tuple[str, str], ...] = (
 INV5_REACT_GRAPH_PATH = "api/app/domain/services/graphs/react_graph.py"
 
 # INV-5: functions in react_graph that are exempt from PE-dominance check.
-# tool_node: legacy fallback path — when PE is enabled it delegates immediately
-#   to _pe_dispatch (line ~1654) which enforces PE dominance. The remaining
-#   body handles the legacy (PE-disabled) path and is expected to call
-#   _invoke_wrapper without pe.evaluate. The PE-4 cleanup epic removes this
-#   legacy body.
+# tool_node: when PE is enabled it delegates immediately to _pe_dispatch which
+#   enforces PE dominance. The residual tool_node body retains TWO permanent /
+#   long-lived non-PE-dominated _invoke_wrapper callsites that are NOT removed by
+#   PE-4:
+#     1. meta-tool / unknown direct-execute passthrough (skill-creator/guide,
+#        mcp-discovery, unresolvable-source sentinel) — non-PE-eligible carve-outs
+#        by design, permanent.
+#     2. legacy-approved interrupt-replay bridge (pre-approved native
+#        direct-execute / missing-claim_nonce path) — sunsets with the legacy
+#        interrupt fallback, a LATER epic (NOT PE-4).
+#   The earlier "PE-4 removes this legacy body" claim was over-optimistic; PE-4
+#   removed the native risk gate + per-source flags, not the whole legacy body.
 # _legacy_*: any function starting with _legacy_ is also exempt.
 INV5_SKIP_FUNCTION_NAMES: frozenset[str] = frozenset({
     "tool_node",
 })
 
 # INV-5 per-callsite documented safety-net whitelist.
-#
-# Some `_invoke_wrapper` callsites inside otherwise-PE-enforced functions are
-# documented unreachable safety nets — they execute only if an earlier guard
-# fails. These callsites legitimately lack a `pe.evaluate` / `pe_resume_outcomes`
-# dominator because they are the *fallback* for the case where the upstream
-# routing guard misclassified a call. They are expected to be unreachable after
-# the guard, and the PE-4 cleanup epic removes them along with the legacy path.
 #
 # Format: tuple of (function_name, callsite_lineno, sunset_ref, justification).
 # The PE-0 round 32 strict end_lineno dominance filter surfaced these; before
@@ -88,19 +88,10 @@ INV5_SKIP_FUNCTION_NAMES: frozenset[str] = frozenset({
 INV5_CALLSITE_SAFETY_NET_WHITELIST: tuple[
     tuple[str, int, str, str], ...
 ] = (
-    (
-        "_pe_dispatch",
-        1331,  # per-call escape _invoke_wrapper (PE-4a re-anchored after _run_policy_chain deletion; verify against INV-5 static)
-        "PE-4",
-        "PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2 per-call escape: "
-        "the pre-loop guard routes any non-PE-eligible call (skill creator/"
-        "guide, mcp discovery, or any source with its operator flag off) and "
-        "any unknown source to the legacy tool_node path for the WHOLE batch "
-        "via ``is_pe_eligible_tool_source``, so this per-call branch is "
-        "documented unreachable. Retained as a defensive fail-open (logged at "
-        "ERROR) to avoid stalling the graph if a caller-side invariant ever "
-        "regresses. As of PE-3 all four real sources (native/skill/mcp/a2a) "
-        "are PE-eligible; this branch + the legacy body are fully retired in "
-        "the PE-4 cleanup epic.",
-    ),
+    # PE-4c: the lone _pe_dispatch per-call safety-net (formerly a fail-open
+    # _invoke_wrapper) was converted to fail-CLOSED (Denied), so it no longer
+    # executes a tool without PE dominance — and the whitelist entry that
+    # exempted it is removed. No documented fail-open safety-net callsites
+    # remain. Re-adding any entry here is a SECURITY decision (codex review
+    # required per feedback_pr_boundary_codex_audit.md).
 )

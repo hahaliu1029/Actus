@@ -40,10 +40,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.application.errors.exceptions import ConflictError
 from app.application.services.agent_service import AgentService
-from app.domain.services.confirmation_manager import (
+from app.domain.services.permission.confirmation_queue import (
     ZSET_KEY,
     ConfirmationDetail,
-    ConfirmationManager,
+    ConfirmationQueue as ConfirmationManager,
 )
 from app.domain.services.tools.tool_source_resolver import ToolSource
 from app.infrastructure.repositories.db_uow import DBUnitOfWork

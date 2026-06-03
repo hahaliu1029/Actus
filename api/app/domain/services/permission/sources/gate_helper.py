@@ -2,7 +2,7 @@
 
 Replaces 10 native-only callsites (spec §2.5 table) with a single
 two-level gate: (1) source registered in PE_SUPPORTED_SOURCES, (2)
-source-specific flag enabled.
+[PE-4c] per-source flags retired — master switch only.
 
 Current supported sources: native, skill, mcp, a2a.
 
@@ -18,41 +18,24 @@ from typing import Any
 # time) ensure DI registers every entry in this set.
 PE_SUPPORTED_SOURCES: frozenset[str] = frozenset({"native", "skill", "mcp", "a2a"})
 
-# Mapping from source string to the corresponding ToolConfirmationConfig
-# flag attribute. Centralized to keep is_pe_enabled_for_source O(1)
-# without per-call dict allocation.
-_SOURCE_FLAG_ATTR: dict[str, str] = {
-    "native": "permission_engine_native_enabled",
-    "skill": "permission_engine_skill_enabled",
-    "mcp": "permission_engine_mcp_enabled",
-    "a2a": "permission_engine_a2a_enabled",
-}
-
-
 def is_pe_enabled_for_source(source: str, config: Any) -> bool:
-    """Two-level gate.
+    """Master-switch + registered-source gate (PE-4c: per-source flags retired).
 
     Returns False (caller routes to legacy path) when:
       - master switch off (``config.enabled is False``)
-      - source not in ``PE_SUPPORTED_SOURCES`` (e.g., a not-yet-supported future source)
-      - unknown source string (typo / future source not yet planned)
-      - source-specific flag off
+      - source not in ``PE_SUPPORTED_SOURCES`` (e.g., a not-yet-supported
+        future source, or a typo)
 
-    Returns True only when both gates pass.
-
-    The two-level design lets us ship per-source feature flags WHILE keeping
-    a registered-set guard so an enabled flag for an unimplemented source
-    cannot accidentally route calls into PE.
+    Returns True when both gates pass. The per-source kill-switch flags
+    (``permission_engine_{native,skill,mcp,a2a}_enabled``) were deleted in
+    PE-4c — every registered source flows through PE whenever the master
+    ``enabled`` switch is on. The ``PE_SUPPORTED_SOURCES`` membership guard
+    remains so an unimplemented future source cannot accidentally route into
+    PE before its Source adapter is registered at DI.
     """
     if not getattr(config, "enabled", True):
         return False
-    if source not in PE_SUPPORTED_SOURCES:
-        return False
-    flag_attr = _SOURCE_FLAG_ATTR.get(source)
-    if flag_attr is None:
-        # supported set entry missing from flag map = code bug; fail-closed.
-        return False
-    return bool(getattr(config, flag_attr, False))
+    return source in PE_SUPPORTED_SOURCES
 
 
 def is_pe_eligible_tool_source(tool_source: Any, config: Any) -> bool:

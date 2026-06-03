@@ -26,8 +26,9 @@ in ``_run()`` which delegates to ``asyncio.run()`` (mirrors
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
@@ -35,7 +36,8 @@ from langchain_core.tools import tool as langchain_tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from app.domain.models.tool_result import AllowSuccess
+from app.domain.models.session import SessionStatus
+from app.domain.models.tool_result import AllowSuccess, Asked, DecisionReason
 from app.domain.services.risk_assessor import (
     RiskAssessment,
     RiskAssessor,
@@ -161,15 +163,77 @@ _INITIAL_STATE_DEFAULTS = {
 }
 
 
+class _NodeSplitFakePE:
+    """Per-tool fake PermissionEngine for the Day-4 E2E interrupt/resume gate.
+
+    PE-4c retired the legacy native risk gate; high-risk native tools now route
+    through the PermissionEngine. This fake returns ``Asked`` for any ``risk_*``
+    tool (→ tool_node writes ``pending_ask_*`` → ``interrupt_helper`` →
+    GraphInterrupt) and ``AllowSuccess`` for safe tools (→ direct execute via
+    ``_invoke_wrapper``).
+
+    The resume payload (``{"action": ...}``) carries no ``claim_nonce``, so
+    ``interrupt_helper`` falls back to the still-live legacy resume bridge
+    (approve → ``approved_tool_call_ids`` replay; deny/timeout_fallback →
+    synthesized ``Denied`` ToolMessage) — the exact resume semantics these tests
+    have always asserted. The full-graph interrupt→checkpointer→resume cycle
+    (this file's unique coverage) is preserved; the PE ``commit_resume`` path is
+    covered separately by ``test_interrupt_helper_pe_commit.py``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def evaluate(self, call: Any, ctx: Any) -> Any:
+        self.calls.append(call)
+        if (getattr(call, "tool_name", "") or "").startswith("risk_"):
+            return Asked(
+                content="confirm high-risk native tool",
+                reason=DecisionReason(
+                    type="risk_enforce",
+                    code="high",
+                    message="test high-risk native",
+                ),
+            )
+        return AllowSuccess(content="auto", data={})
+
+    async def preflight_resume(self, *a: Any, **kw: Any) -> None:
+        return None
+
+    async def commit_resume(self, *a: Any, **kw: Any) -> None:
+        return None
+
+
+def _make_fake_ssm(mode: SessionStatus = SessionStatus.RUNNING, revision: int = 1):
+    """AsyncMock SSM returning ``(mode, revision)`` from ``get_mode_with_revision``.
+
+    Live mode (RUNNING) so the PE-path pre-wrapper live-mode recheck and the
+    PE-4b pre-approved-native replay recheck both pass.
+    """
+    ssm = AsyncMock()
+    ssm.get_mode_with_revision = AsyncMock(return_value=(mode, revision))
+    return ssm
+
+
 def _make_config(thread_id: str) -> dict:
+    """PE-4c: wire a PermissionEngine + SSM so high-risk native tools route
+    through PE → Asked → interrupt_helper (the legacy native risk gate this file
+    used to rely on is deleted). ``tool_confirmation_config`` exposes only the
+    master ``enabled`` switch after PE-4c. The resume payload carries no
+    ``claim_nonce`` so interrupt_helper uses the legacy resume bridge."""
     return {
         "configurable": {
             "thread_id": thread_id,
             "tool_confirmation_enabled": True,
             "smart_approve_enabled": False,
-            # No approval_cache, no confirmation_manager, no event_queue —
-            # the dispatcher handles their absence by routing directly to
-            # interrupt_helper.
+            # PE-4c: PE + SSM wired so native tools route through _pe_dispatch.
+            # No approval_cache / confirmation_manager / event_queue — the
+            # dispatcher handles their absence (queue reads are optional).
+            "permission_engine": _NodeSplitFakePE(),
+            "session_state_machine": _make_fake_ssm(),
+            "tool_confirmation_config": SimpleNamespace(enabled=True),
+            "user_id": "u",
+            "session_id": thread_id,
         }
     }
 

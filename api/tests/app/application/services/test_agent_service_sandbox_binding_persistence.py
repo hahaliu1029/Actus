@@ -129,6 +129,11 @@ async def test_create_task_with_lifecycle_does_not_overwrite_new_binding(monkeyp
         sandbox_lifecycle_service=lifecycle,
     )
     service._supervisor = MagicMock()
+    # PE-4c: master-off so _create_task skips the PE build (this test verifies
+    # sandbox-binding persistence, not confirmation). _default_snapshot()'s
+    # AgentConfig.tool_confirmation defaults to enabled=True (default-on), which
+    # would hit the PE-4c fail-closed raise since no PE deps are wired here.
+    service._config_snapshot.agent_config.tool_confirmation.enabled = False
 
     monkeypatch.setattr(
         "app.application.services.agent_service.AgentTaskRunner",

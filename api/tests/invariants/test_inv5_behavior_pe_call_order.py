@@ -90,16 +90,11 @@ def _make_config(fake_pe, fake_ssm, *, user_id: str = "u", session_id: str = "s"
     source=native."""
     from types import SimpleNamespace
 
-    tc_cfg = SimpleNamespace(
-        enabled=True,
-        permission_engine_native_enabled=True,
-        permission_engine_skill_enabled=True,
-    )
+    tc_cfg = SimpleNamespace(enabled=True)
     return {
         "configurable": {
             "permission_engine": fake_pe,
             "session_state_machine": fake_ssm,
-            "permission_engine_native_enabled": True,
             "tool_confirmation_config": tc_cfg,
             "user_id": user_id,
             "session_id": session_id,
@@ -349,17 +344,11 @@ def _make_skill_config(
     """
     from types import SimpleNamespace
 
-    tc_cfg = SimpleNamespace(
-        enabled=True,
-        permission_engine_native_enabled=True,
-        permission_engine_skill_enabled=True,
-    )
+    tc_cfg = SimpleNamespace(enabled=True)
     return {
         "configurable": {
             "permission_engine": fake_pe,
             "session_state_machine": fake_ssm,
-            "permission_engine_native_enabled": True,
-            "permission_engine_skill_enabled": True,
             "tool_confirmation_config": tc_cfg,
             "skill_tool": fake_skill_tool,
             "user_id": user_id,
@@ -422,17 +411,10 @@ async def test_skill_tool_call_routes_through_skill_source():
 
 
 def _make_mcp_config(fake_pe, fake_ssm, *, user_id="u", session_id="s") -> dict:
-    """Like _make_skill_config but for MCP: tool_confirmation_config MUST
-    carry permission_engine_mcp_enabled=True (the flag trap —
-    is_pe_enabled_for_source defaults a missing flag to False, which would
-    silently route MCP to legacy and make this test a false pass)."""
+    """Like _make_skill_config but for MCP. PE-4c: per-source flags retired;
+    routing is master-switch only, so the gate is on iff ``enabled`` is True."""
     from types import SimpleNamespace
-    tc_cfg = SimpleNamespace(
-        enabled=True,
-        permission_engine_native_enabled=True,
-        permission_engine_skill_enabled=True,
-        permission_engine_mcp_enabled=True,
-    )
+    tc_cfg = SimpleNamespace(enabled=True)
     return {"configurable": {
         "permission_engine": fake_pe,
         "session_state_machine": fake_ssm,
@@ -505,18 +487,10 @@ async def test_mcp_tool_call_routes_through_mcp_source():
 
 
 def _make_a2a_config(fake_pe, fake_ssm, *, user_id="u", session_id="s") -> dict:
-    """Like _make_mcp_config but for A2A: tool_confirmation_config MUST
-    carry permission_engine_a2a_enabled=True (the flag trap —
-    is_pe_enabled_for_source defaults a missing flag to False, which would
-    silently route A2A to legacy and make this test a false pass)."""
+    """Like _make_mcp_config but for A2A. PE-4c: per-source flags retired;
+    routing is master-switch only, so the gate is on iff ``enabled`` is True."""
     from types import SimpleNamespace
-    tc_cfg = SimpleNamespace(
-        enabled=True,
-        permission_engine_native_enabled=True,
-        permission_engine_skill_enabled=True,
-        permission_engine_mcp_enabled=True,
-        permission_engine_a2a_enabled=True,
-    )
+    tc_cfg = SimpleNamespace(enabled=True)
     return {"configurable": {
         "permission_engine": fake_pe,
         "session_state_machine": fake_ssm,

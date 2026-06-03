@@ -428,16 +428,11 @@ def _make_state(tool_name: str, tool_args: dict, call_id: str = "tc1") -> dict:
 
 def _make_config(fake_pe, fake_ssm, *, user_id: str = "u", session_id: str = "s") -> dict:
     from types import SimpleNamespace
-    tc_cfg = SimpleNamespace(
-        enabled=True,
-        permission_engine_native_enabled=True,
-        permission_engine_skill_enabled=True,
-    )
+    tc_cfg = SimpleNamespace(enabled=True)
     return {
         "configurable": {
             "permission_engine": fake_pe,
             "session_state_machine": fake_ssm,
-            "permission_engine_native_enabled": True,
             "tool_confirmation_config": tc_cfg,
             "user_id": user_id,
             "session_id": session_id,

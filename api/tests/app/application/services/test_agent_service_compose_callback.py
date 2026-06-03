@@ -171,7 +171,9 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
     service._config_snapshot = SimpleNamespace(
         llm=object(),
         agent_config=SimpleNamespace(
-            tool_confirmation=SimpleNamespace(legacy_rule_fallback=False)
+            # PE-4c: master-off so _create_task skips the PE build (this test verifies
+            # task registration via supervisor/cancelable Task, not confirmation).
+            tool_confirmation=SimpleNamespace(enabled=False, legacy_rule_fallback=False)
         ),
         mcp_config=object(),
         a2a_config=object(),

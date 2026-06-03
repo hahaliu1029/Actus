@@ -156,7 +156,6 @@ class PlannerReActFlow(BaseFlow):
         memory_session_redis=None,  # PR-3: per-session save counter
         memory_session_save_cap: int = 20,  # PR-3
         approval_state_reader: Any = None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
-        approval_state_writer: Any = None,  # P2#8: ApprovalStateWriter | None（legacy SmartApprove grant写）
         confirmation_manager: Any = None,  # ConfirmationManager | None
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
         _allow_default_prompt_assembler: bool = False,  # B5 post-audit: test-only escape hatch
@@ -318,14 +317,9 @@ class PlannerReActFlow(BaseFlow):
         self._memory_gate_batch_cap = memory_gate_batch_cap
         self._memory_notification_emitter = memory_notification_emitter
 
-        # R5b-2 Reader 接入；ApprovalCache 已于 R5b-4 移除。
-        # P2#8: Writer is restored for the LEGACY SmartApprove path only.
-        # When PE is active (permission_engine is not None), PE Stage P.2
-        # owns grant writes and this field is unused. The legacy branch in
-        # react_graph reads this via "_legacy_sa_writer" configurable key
-        # (NOT "approval_state_writer" — keeping INV-1b intact).
+        # R5b-2 Reader 接入；ApprovalCache 已于 R5b-4 移除。Legacy writer slot
+        # retired in PE-4c (PE owns grant writes via build_permission_engine(writer=...)).
         self._approval_state_reader = approval_state_reader
-        self._approval_state_writer = approval_state_writer  # P2#8: legacy grant write
         self._confirmation_manager = confirmation_manager
 
         # D5: Execution health monitoring — persist across invoke/resume
@@ -1349,27 +1343,14 @@ class PlannerReActFlow(BaseFlow):
                 "has_file_view": self._file_processor_lookup is not None,
                 "has_memory_tools": self._has_memory_tools,
                 "approval_state_reader": self._approval_state_reader,
-                # P2#8: legacy SmartApprove approve branch writes a session grant via this slot.
-                # Key is "_legacy_sa_writer" (not "approval_state_writer") to keep INV-1b intact.
-                # When PE is active (permission_engine injected), this slot is present but
-                # the legacy SmartApprove branch is unreachable (PE takes the tool_node path).
-                "_legacy_sa_writer": self._approval_state_writer,
                 "skill_tool": self._skill_tool,  # PE SkillSource metadata build + fail-closed skill guard
                 "confirmation_manager": self._confirmation_manager,
                 "user_id": self._user_id,
                 "session_id": self._session_id,
                 "tool_confirmation_enabled": tc_enabled,
-                # PE-1 §2.5: expose every source-specific PE flag so the
-                # gate helper inside react_graph can decide per call instead
-                # of relying on a single native-only switch.
-                "permission_engine_native_enabled": bool(
-                    getattr(tc, "permission_engine_native_enabled", True)
-                ) if tc is not None else True,
-                "permission_engine_skill_enabled": bool(
-                    getattr(tc, "permission_engine_skill_enabled", True)
-                ) if tc is not None else True,
-                # tool_confirmation config object itself — handy for the gate
-                # helper without rebuilding the per-flag dict on each tool call.
+                # PE-4c: per-source flags retired. The gate helper inside
+                # react_graph reads the master ``enabled`` switch off the
+                # tool_confirmation config object itself.
                 "tool_confirmation_config": tc,
                 "smart_approve_enabled": tc_smart_approve,
                 "smart_approve_medium_only": tc_smart_approve_medium_only,
@@ -1404,16 +1385,10 @@ class PlannerReActFlow(BaseFlow):
 
         cfg["configurable"]["decision_recorder"] = build_decision_recorder()
         # PE-0 Phase 7: inject PermissionEngine + SessionStateMachine into
-        # LangGraph configurable. The flag ``permission_engine_native_enabled``
-        # mirrors AppConfig.agent_config.tool_confirmation (feature-gated);
-        # ``tc`` is already resolved above from self._agent_config.
-        # Both PE and SSM must be non-None AND the flag must be True for
-        # injection to happen — missing either means fall back to legacy path.
-        flag_native = (
-            bool(getattr(tc, "permission_engine_native_enabled", True))
-            if tc is not None
-            else True
-        )
+        # LangGraph configurable. ``tc`` is already resolved above from
+        # self._agent_config. Both PE and SSM must be non-None AND the master
+        # switch must be True for injection — missing either means fall back
+        # to legacy path. (PE-4c: per-source flags retired.)
         # P2#6: respect the tool_confirmation.enabled master switch.
         # When tc.enabled is False the operator intends dangerous tools to execute
         # without any confirmation gate (legacy semantics).  Injecting PE here while

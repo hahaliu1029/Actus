@@ -149,7 +149,7 @@ async def test_skill_medium_p1_miss_triggers_p3_confirmation():
     )
     assert pending.reason.type == "risk_enforce"
 
-    from app.domain.services.confirmation_manager import ConfirmationDetail
+    from app.domain.services.permission.confirmation_queue import ConfirmationDetail
     import time
     detail = ConfirmationDetail(
         session_id="sess1", tool_call_id="call1", user_id="user1",

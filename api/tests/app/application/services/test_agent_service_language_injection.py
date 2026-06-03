@@ -104,6 +104,10 @@ def skeletal_service_with_captured_runner(monkeypatch):
     snap.supports_vision = False
     snap.supports_pdf_input = False
     snap.vision_fallback_model = None
+    # PE-4c: master-off so _create_task skips the PE build (this test verifies
+    # initial_language derivation, not confirmation). Without this the MagicMock
+    # snapshot's tool_confirmation.enabled is a truthy mock → fail-closed raise.
+    snap.agent_config.tool_confirmation.enabled = False
     svc._config_snapshot = snap
 
     # --- task_cls.create(...) after the runner is built ---

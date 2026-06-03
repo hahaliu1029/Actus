@@ -73,7 +73,7 @@ def _wire_agent_service_for_preflight(svc, fake_pe, fake_ssm, monkeypatch):
     The path through ``preflight_resume_tool_confirmation`` before the target
     line touches:
     1. ``self._config_snapshot`` (read; ``agent_config.tool_confirmation``
-       needs ``enabled`` + ``permission_engine_native_enabled`` truthy — a
+       needs ``enabled`` truthy (PE-4c: per-source flags retired) — a
        plain MagicMock satisfies the gate because attribute access yields
        truthy Mocks).
     2. ``self._build_pe_ssm_for_resume(snap)`` → ``(pe, ssm)``.

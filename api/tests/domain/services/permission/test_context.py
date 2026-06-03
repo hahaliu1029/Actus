@@ -17,7 +17,7 @@ def _make_detail(**overrides):
     (real dataclass at api/app/domain/services/permission/confirmation_queue.py:14
     has no field-level defaults except status, so omitting any required
     field raises TypeError)."""
-    from app.domain.services.confirmation_manager import ConfirmationDetail
+    from app.domain.services.permission.confirmation_queue import ConfirmationDetail
 
     base = dict(
         session_id="s_test",

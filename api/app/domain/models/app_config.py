@@ -252,30 +252,6 @@ class ToolConfirmationConfig(BaseModel):
             "Phase 2 PermissionEngine 落地后删除本字段。"
         ),
     )
-    # PE-0 (2026-05-14): per-source kill switches for the new PermissionEngine
-    # path. Default True for all five; flip a single flag in config.yaml to
-    # fall back to legacy _run_policy_chain for that source.
-    permission_engine_native_enabled: bool = Field(
-        default=True,
-        description="PE-0 native (file/shell/browser) path; False -> legacy _run_policy_chain",
-    )
-    permission_engine_skill_enabled: bool = Field(
-        default=True,
-        description=(
-            "Drives the PE Skill source after PE-1 ship. When False, "
-            "skill tool calls fall back to the legacy R3 path inside "
-            "react_graph (line 2243-2395) until PE-1b deletes that branch. "
-            "PE-2 widens the source registry; per-source flags retire in PE-3."
-        ),
-    )
-    permission_engine_mcp_enabled: bool = Field(
-        default=True,
-        description="PE-2 MCP path",
-    )
-    permission_engine_a2a_enabled: bool = Field(
-        default=True,
-        description="PE-3 A2A path",
-    )
 
 
 class ExecutionConfig(BaseModel):

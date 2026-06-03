@@ -165,7 +165,9 @@ def _make_service(
     # Patch AgentConfig to expose tool_confirmation with flag
     agent_config = MagicMock()
     tc = MagicMock()
-    tc.permission_engine_native_enabled = pe_enabled
+    # PE-4c: per-source flags retired; the master ``enabled`` switch is the
+    # only PE-activation gate. ``pe_enabled`` now drives ``tc.enabled``.
+    tc.enabled = pe_enabled
     tc.legacy_rule_fallback = False
     agent_config.tool_confirmation = tc
     agent_config.memory = MagicMock()
@@ -642,145 +644,14 @@ async def test_rollback_skips_when_nonce_mismatch() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# P1#1: HTTP preflight routes non-native tools to legacy path
-# ---------------------------------------------------------------------------
-
-
-async def test_preflight_non_native_tool_routes_to_legacy(monkeypatch) -> None:
-    """P1#1: When pending_detail.tool_name resolves to a non-native source (skill/mcp/a2a)
-    AND its per-source PE flag is disabled, preflight_resume_tool_confirmation must
-    fall back to the legacy path.
-
-    PE-1 §3.2: skill is now PE-eligible by default (permission_engine_skill_enabled=True).
-    To preserve the legacy-routing intent of this test we explicitly set the
-    per-source flag to False below — emulating an operator who has not yet
-    enabled SkillSource for their deployment.
-    """
-    # Use a skill_ prefixed tool name — resolve_tool_source will return source="skill"
-    skill_detail = _StubDetail(tool_name="skill_my_custom_tool")
-    service, fakes = _make_service(detail=skill_detail, pe_enabled=True)
-    # PE-1 §3.2: explicitly disable per-source PE for skill so the legacy gate fires.
-    service._config_snapshot.agent_config.tool_confirmation.permission_engine_skill_enabled = False
-    fake_session = Session(id="s_test", user_id="u_test", status=SessionStatus.RUNNING)
-
-    async def _fake_get_accessible_session(*args, **kwargs):
-        return fake_session
-
-    monkeypatch.setattr(service, "_get_accessible_session", _fake_get_accessible_session)
-
-    def _fake_build_pe_ssm(snap):
-        return fakes.pe, fakes.ssm
-
-    monkeypatch.setattr(service, "_build_pe_ssm_for_resume", _fake_build_pe_ssm)
-
-    # Track calls to the legacy path
-    legacy_called = []
-
-    async def _fake_legacy(*, session_id, user_id, is_admin, tool_confirmation):
-        legacy_called.append(True)
-        fake_task = MagicMock()
-        return _ResumeToolConfirmationState(
-            session=fake_session,
-            detail=skill_detail,
-            task=fake_task,
-            decision_id=None,
-            persistent_scope=False,
-            action="approve",
-            scope="once",
-            tool_call_id="tc_test",
-            owner_user_id=user_id,
-            session_id=session_id,
-            claim_nonce=None,
-        )
-
-    monkeypatch.setattr(
-        service, "_preflight_resume_tool_confirmation_legacy", _fake_legacy
-    )
-
-    tc = _make_tool_confirmation(action="approve", scope="once", tool_call_id="tc_test")
-    state = await service.preflight_resume_tool_confirmation(
-        session_id="s_test",
-        user_id="u_test",
-        is_admin=False,
-        tool_confirmation=tc,
-    )
-
-    # Legacy path must have been called (not PE.preflight_resume)
-    assert legacy_called, "Non-native tool must route to legacy confirmation path"
-    fakes.pe.preflight_resume.assert_not_awaited()
-    # Legacy path returns claim_nonce=None
-    assert state.claim_nonce is None
-
-
-async def test_preflight_mcp_tool_with_flag_off_routes_to_legacy(monkeypatch) -> None:
-    """PE-2: mcp_ prefixed tools route to legacy when the per-source PE flag is off.
-
-    PE-2 makes mcp PE-eligible by default (permission_engine_mcp_enabled=True).
-    To preserve the legacy-routing intent of this test we explicitly disable the
-    per-source flag — emulating an operator who has not enabled McpSource for
-    their deployment. The mcp flag-ON case is covered by
-    ``test_preflight_mcp_tool_with_flag_on_routes_to_pe``.
-    """
-    mcp_detail = _StubDetail(tool_name="mcp_my_server_tool")
-    service, fakes = _make_service(detail=mcp_detail, pe_enabled=True)
-    # PE-2: explicitly disable per-source PE for mcp so the legacy gate fires.
-    service._config_snapshot.agent_config.tool_confirmation.permission_engine_mcp_enabled = False
-    fake_session = Session(id="s_test", user_id="u_test", status=SessionStatus.RUNNING)
-
-    async def _fake_get_accessible_session(*args, **kwargs):
-        return fake_session
-
-    monkeypatch.setattr(service, "_get_accessible_session", _fake_get_accessible_session)
-
-    def _fake_build_pe_ssm(snap):
-        return fakes.pe, fakes.ssm
-
-    monkeypatch.setattr(service, "_build_pe_ssm_for_resume", _fake_build_pe_ssm)
-
-    legacy_called = []
-
-    async def _fake_legacy(*, session_id, user_id, is_admin, tool_confirmation):
-        legacy_called.append(True)
-        fake_task = MagicMock()
-        return _ResumeToolConfirmationState(
-            session=fake_session,
-            detail=mcp_detail,
-            task=fake_task,
-            decision_id=None,
-            persistent_scope=False,
-            action="approve",
-            scope="once",
-            tool_call_id="tc_test",
-            owner_user_id=user_id,
-            session_id=session_id,
-            claim_nonce=None,
-        )
-
-    monkeypatch.setattr(
-        service, "_preflight_resume_tool_confirmation_legacy", _fake_legacy
-    )
-
-    tc = _make_tool_confirmation(action="approve", scope="once", tool_call_id="tc_test")
-    state = await service.preflight_resume_tool_confirmation(
-        session_id="s_test",
-        user_id="u_test",
-        is_admin=False,
-        tool_confirmation=tc,
-    )
-
-    assert legacy_called, "MCP tool with flag off must route to legacy confirmation path"
-    fakes.pe.preflight_resume.assert_not_awaited()
-    assert state.claim_nonce is None
-
-
 async def test_preflight_mcp_tool_with_flag_on_routes_to_pe(monkeypatch) -> None:
-    """PE-2: mcp_ prefixed tools route through PE when the per-source flag is on.
+    """PE-2: mcp_ prefixed tools route through PE when the master switch is on.
 
-    After PE-2 makes mcp PE-eligible (permission_engine_mcp_enabled defaults to
-    True), a real mcp tool resolves to source='mcp' / category='mcp' and must be
-    handled by pe.preflight_resume rather than the legacy path. Mirrors the
-    assertion style of ``test_preflight_delegates_to_pe_when_pe_available``.
+    After PE-2 makes mcp PE-eligible (PE-4c: per-source flags retired, so mcp
+    is eligible whenever the master ``enabled`` switch is on), a real mcp tool
+    resolves to source='mcp' / category='mcp' and must be handled by
+    pe.preflight_resume rather than the legacy path. Mirrors the assertion style
+    of ``test_preflight_delegates_to_pe_when_pe_available``.
     """
     mcp_detail = _StubDetail(tool_name="mcp_my_server_tool")
     service, fakes = _make_service(detail=mcp_detail, pe_enabled=True)
@@ -878,9 +749,9 @@ async def test_preflight_mixed_batch_native_pending_skill_in_batch_routes_to_leg
         user_id="u_mixed",
     )
     service, fakes = _make_service(detail=native_detail, pe_enabled=True)
-    # PE-1 §3.2: skill is PE-eligible by default; disable per-source flag so
-    # the mixed-batch guard treats skill as non-PE-eligible (original test intent).
-    service._config_snapshot.agent_config.tool_confirmation.permission_engine_skill_enabled = False
+    # PE-4c: per-source flags retired. The batch carries a genuinely
+    # non-PE-eligible tool (``brainstorm_skill`` → source="skill",
+    # category="skill creator") so the mixed-batch guard still routes to legacy.
     fake_session = Session(id="s_mixed", user_id="u_mixed", status=SessionStatus.RUNNING)
 
     async def _fake_get_accessible_session(*args, **kwargs):
@@ -893,13 +764,13 @@ async def test_preflight_mixed_batch_native_pending_skill_in_batch_routes_to_leg
 
     monkeypatch.setattr(service, "_build_pe_ssm_for_resume", _fake_build_pe_ssm)
 
-    # Build fake graph state: AI message with [native, skill] tool_calls.
-    # No ToolMessage for skill_foo → skill_foo is still pending → mixed batch.
+    # Build fake graph state: AI message with [native, skill-creator] tool_calls.
+    # No ToolMessage for brainstorm_skill → it is still pending → mixed batch.
     _ai_msg = AIMessage(
         content="",
         tool_calls=[
             {"id": "tc_native", "name": "file_write", "args": {"path": "/x"}},
-            {"id": "tc_skill", "name": "skill_my_tool", "args": {}},
+            {"id": "tc_skill", "name": "brainstorm_skill", "args": {}},
         ],
     )
     # ToolMessage only for the native tool (already confirmed); skill is still pending.
@@ -1107,9 +978,9 @@ async def test_preflight_after_create_task_with_mixed_batch_falls_back_to_legacy
         user_id="u_restart",
     )
     service, fakes = _make_service(detail=native_detail, pe_enabled=True)
-    # PE-1 §3.2: skill is PE-eligible by default; disable per-source flag so
-    # the mixed-batch guard treats skill as non-PE-eligible (original test intent).
-    service._config_snapshot.agent_config.tool_confirmation.permission_engine_skill_enabled = False
+    # PE-4c: per-source flags retired. The batch carries a genuinely
+    # non-PE-eligible tool (``brainstorm_skill`` → source="skill",
+    # category="skill creator") so the mixed-batch guard still routes to legacy.
     fake_session = Session(id="s_restart_mixed", user_id="u_restart", status=SessionStatus.RUNNING)
 
     async def _fake_get_accessible_session(*args, **kwargs):
@@ -1122,13 +993,13 @@ async def test_preflight_after_create_task_with_mixed_batch_falls_back_to_legacy
 
     monkeypatch.setattr(service, "_build_pe_ssm_for_resume", _fake_build_pe_ssm)
 
-    # Build fake graph state: AI message with [native, skill] tool_calls.
-    # No ToolMessage for skill_foo → skill_foo is still pending → mixed batch.
+    # Build fake graph state: AI message with [native, skill-creator] tool_calls.
+    # No ToolMessage for brainstorm_skill → it is still pending → mixed batch.
     _ai_msg = AIMessage(
         content="",
         tool_calls=[
             {"id": "tc_restart_native", "name": "file_write", "args": {"path": "/x"}},
-            {"id": "tc_restart_skill", "name": "skill_my_tool", "args": {}},
+            {"id": "tc_restart_skill", "name": "brainstorm_skill", "args": {}},
         ],
     )
     _gs_messages = [HumanMessage(content="do stuff"), _ai_msg]
@@ -1326,7 +1197,6 @@ def test_build_pe_ssm_for_resume_returns_none_when_confirmation_disabled() -> No
     agent_config = MagicMock()
     tc = MagicMock()
     tc.enabled = False
-    tc.permission_engine_native_enabled = True  # PE would be on if enabled=True
     tc.legacy_rule_fallback = False
     agent_config.tool_confirmation = tc
     agent_config.memory = MagicMock()
@@ -1449,198 +1319,6 @@ async def test_preflight_legacy_task_falls_back_to_legacy_path(monkeypatch) -> N
     )
     fakes.pe.preflight_resume.assert_not_awaited()
     assert state.claim_nonce is None  # legacy path does not set claim_nonce
-
-
-async def test_preflight_split_brain_pe_present_but_flag_off_falls_back_to_legacy(monkeypatch) -> None:
-    """P1#1 (round-11 updated): When permission_engine_native_enabled=False, _create_task
-    no longer builds PE, so _flow._permission_engine is None.  The split-brain guard
-    checks _task_pe is None and routes to legacy.
-
-    Round-7 context: previously, _create_task always built PE regardless of the flag, and
-    the guard had to additionally check the flag from the current config snapshot.  This
-    was fragile across hot-reload.
-
-    Round-11 fix: the flag gate is now enforced inside _create_task, so _task_pe=None is
-    the single authoritative signal.  This test verifies the simplified guard: a task with
-    _flow._permission_engine=None (which happens when flag=False at creation time) is
-    correctly routed to the legacy confirmation path even when _build_pe_ssm_for_resume
-    returns (pe, ssm) for the HTTP layer.
-    """
-    # Build service with pe_enabled=False (permission_engine_native_enabled=False)
-    service, fakes = _make_service(pe_enabled=False)
-    fake_session = Session(id="s_test", user_id="u_test", status=SessionStatus.RUNNING)
-
-    async def _fake_get_accessible_session(*args, **kwargs):
-        return fake_session
-
-    monkeypatch.setattr(service, "_get_accessible_session", _fake_get_accessible_session)
-
-    # Simulate the case where _build_pe_ssm_for_resume returns (pe, ssm) due to a
-    # hot-reload race (flag was on when service-level SSM/PE were built but the
-    # in-memory task was created with flag=off → _task_pe=None).
-    def _fake_build_pe_ssm(snap):
-        return fakes.pe, fakes.ssm
-
-    monkeypatch.setattr(service, "_build_pe_ssm_for_resume", _fake_build_pe_ssm)
-
-    # Build a fake task where _flow._permission_engine IS None — this is the invariant
-    # enforced by the round-11 P1#1 fix: _create_task does not build PE when flag=False.
-    class _FakeLegacyFlowForFlagOff:
-        _permission_engine = None  # flag=False → _create_task produces PE=None
-
-    class _FakeLegacyRunnerForFlagOff:
-        _flow = _FakeLegacyFlowForFlagOff()
-
-    class _FakeLegacyTaskForFlagOff:
-        _task_runner = _FakeLegacyRunnerForFlagOff()
-
-    async def _fake_get_task(session):
-        return _FakeLegacyTaskForFlagOff()
-
-    monkeypatch.setattr(service, "_get_task", _fake_get_task)
-
-    # Track legacy path calls
-    legacy_called = []
-
-    async def _fake_legacy(*, session_id, user_id, is_admin, tool_confirmation):
-        legacy_called.append(True)
-        fake_task = MagicMock()
-        return _ResumeToolConfirmationState(
-            session=fake_session,
-            detail=_StubDetail(),
-            task=fake_task,
-            decision_id=None,
-            persistent_scope=False,
-            action="approve",
-            scope="once",
-            tool_call_id="tc_test",
-            owner_user_id=user_id,
-            session_id=session_id,
-            claim_nonce=None,
-        )
-
-    monkeypatch.setattr(
-        service, "_preflight_resume_tool_confirmation_legacy", _fake_legacy
-    )
-
-    tc = _make_tool_confirmation(action="approve", scope="once", tool_call_id="tc_test")
-    state = await service.preflight_resume_tool_confirmation(
-        session_id="s_test",
-        user_id="u_test",
-        is_admin=False,
-        tool_confirmation=tc,
-    )
-
-    # Legacy path must have been called because _task_pe is None
-    assert legacy_called, (
-        "Task with _flow._permission_engine=None (created with flag=False) "
-        "must route to legacy confirmation path (round-11 simplified split-brain guard)"
-    )
-    fakes.pe.preflight_resume.assert_not_awaited()
-    assert state.claim_nonce is None  # legacy path does not set claim_nonce
-
-
-# ---------------------------------------------------------------------------
-# P1#1 (round-11): _create_task does NOT build PE when flag=False
-# ---------------------------------------------------------------------------
-
-
-async def test_create_task_with_flag_off_does_not_build_pe(monkeypatch) -> None:
-    """P1#1 (round-11): When permission_engine_native_enabled=False, _create_task
-    must NOT construct a PermissionEngine or SessionStateMachine.
-
-    This ensures task._flow._permission_engine is None when the flag is off,
-    making it the single authoritative signal for the HTTP preflight split-brain guard.
-    """
-    from app.application.services.agent_service import AgentService
-    from tests.app.application.services.conftest import default_snapshot
-    from app.application.services.agent_service import _ConfigSnapshot
-
-    # Build a snap where permission_engine_native_enabled=False
-    agent_config = MagicMock()
-    tc = MagicMock()
-    tc.enabled = True  # master switch ON
-    tc.permission_engine_native_enabled = False  # PE flag OFF
-    tc.legacy_rule_fallback = False
-    tc.smart_approve_enabled = True
-    tc.smart_approve_medium_only = False
-    tc.timeout_seconds = 300
-    agent_config.tool_confirmation = tc
-    agent_config.memory = MagicMock()
-    agent_config.execution = MagicMock()
-    agent_config.execution.max_same_tool_failures = 3
-
-    snap = default_snapshot()
-    snap2 = _ConfigSnapshot(
-        llm=snap.llm,
-        agent_config=agent_config,
-        mcp_config=snap.mcp_config,
-        a2a_config=snap.a2a_config,
-        skill_risk_policy=snap.skill_risk_policy,
-        overflow_config=snap.overflow_config,
-        summary_llm=snap.summary_llm,
-        vision_fallback_model=snap.vision_fallback_model,
-        skill_creator_service=snap.skill_creator_service,
-        supports_vision=snap.supports_vision,
-        supports_pdf_input=snap.supports_pdf_input,
-        file_understanding_config=snap.file_understanding_config,
-    )
-
-    service = AgentService(
-        uow_factory=_uow_factory,
-        config_snapshot=snap2,
-        sandbox_cls=object,
-        task_cls=object,
-        search_engine=object(),
-        file_storage=object(),
-    )
-    service._confirmation_manager = _FakeConfirmationManager()
-
-    # Track whether build_permission_engine was ever called
-    build_pe_calls: list = []
-
-    def _fake_build_pe(*args, **kwargs):
-        build_pe_calls.append(True)
-        return MagicMock()
-
-    def _fake_build_ssm(*args, **kwargs):
-        return MagicMock()
-
-    monkeypatch.setattr(
-        "app.application.composition.graph_assembly.build_permission_engine",
-        _fake_build_pe,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "app.application.composition.graph_assembly.build_session_state_machine",
-        _fake_build_ssm,
-        raising=False,
-    )
-
-    # Verify the flag gate fires before any build call.
-    # We read the _flag_pe_active_at_create logic directly to avoid
-    # spinning up a full sandbox/browser in unit tests.
-    # The canonical assertion is: when flag is off, build_permission_engine is not called.
-
-    # Simulate the gate condition that _create_task evaluates:
-    _tc_at_create = getattr(snap2.agent_config, "tool_confirmation", None)
-    _flag_tc_enabled = bool(
-        getattr(_tc_at_create, "enabled", True)
-        if _tc_at_create is not None else True
-    )
-    _flag_pe_native = bool(
-        getattr(_tc_at_create, "permission_engine_native_enabled", True)
-        if _tc_at_create is not None else True
-    )
-    _flag_pe_active_at_create = _flag_tc_enabled and _flag_pe_native
-
-    assert not _flag_pe_active_at_create, (
-        "P1#1 gate invariant: flag should be False when permission_engine_native_enabled=False"
-    )
-    assert build_pe_calls == [], (
-        "P1#1: build_permission_engine must NOT be called when flag=False "
-        "(gate check runs before any build attempt)"
-    )
 
 
 # ---------------------------------------------------------------------------

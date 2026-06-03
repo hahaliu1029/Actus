@@ -122,33 +122,20 @@ def _make_config(
     user_id="u",
     session_id="s",
     extra: dict | None = None,
-    pe_native_enabled: bool = True,
-    pe_skill_enabled: bool = True,
-    pe_mcp_enabled: bool = True,
-    pe_a2a_enabled: bool = True,
 ):
     """Build a minimal RunnableConfig configurable dict.
 
-    PE-1 §2.5: ``tool_confirmation_config`` is now required so that
-    ``is_pe_enabled_for_source`` can resolve the per-source flag inside
-    ``_pe_dispatch``. We expose a SimpleNamespace duck-typed to the real
-    ``ToolConfirmationConfig`` (only the flags consulted by the gate are
-    set).
+    PE-4c: the per-source PE flags are deleted; ``tool_confirmation_config``
+    now exposes only the master ``enabled`` switch. PE routing for a
+    registered source is enabled iff ``enabled`` is True (gate_helper).
     """
     from types import SimpleNamespace
 
-    tc_cfg = SimpleNamespace(
-        enabled=True,
-        permission_engine_native_enabled=pe_native_enabled,
-        permission_engine_skill_enabled=pe_skill_enabled,
-        permission_engine_mcp_enabled=pe_mcp_enabled,
-        permission_engine_a2a_enabled=pe_a2a_enabled,
-    )
+    tc_cfg = SimpleNamespace(enabled=True)
 
     configurable: dict = {
         "permission_engine": fake_pe,
         "session_state_machine": fake_ssm,
-        "permission_engine_native_enabled": pe_native_enabled,
         "tool_confirmation_config": tc_cfg,
         "user_id": user_id,
         "session_id": session_id,
@@ -254,27 +241,6 @@ class TestToolNodeCallsPeEvaluate:
         await tool_node_fn(state, config)
 
         assert len(fake_pe.calls) == 0, "PE should not be called when absent"
-
-    async def test_tool_node_pe_not_called_when_flag_false(self):
-        """When permission_engine_native_enabled=False, PE branch is skipped.
-
-        PE-1 §2.5: the per-source flag now lives on ``tool_confirmation_config``
-        and is consulted per-call inside ``_pe_dispatch`` (no longer a master
-        gate). ``_make_config(pe_native_enabled=False)`` flips both the
-        configurable-level flag (used by the legacy code path) AND the
-        ``tool_confirmation_config.permission_engine_native_enabled`` attribute
-        (used by ``is_pe_enabled_for_source``).
-        """
-        tool_node_fn = _build_tool_node_fn()
-        fake_pe = FakeRecordingPE()
-        fake_ssm = _make_fake_ssm()
-
-        state = _make_state("file_write", {"path": "/a"})
-        config = _make_config(fake_pe, fake_ssm, pe_native_enabled=False)
-
-        await tool_node_fn(state, config)
-
-        assert len(fake_pe.calls) == 0, "PE should not be called when flag is off"
 
 
 # ---------------------------------------------------------------------------
@@ -1447,29 +1413,6 @@ class TestMcpMixedBatchFailClosed:
         assert mcp_msgs[0].status == "error"
         assert "MCP 工具" in (mcp_msgs[0].content or "")
 
-    async def test_mcp_guard_off_when_flag_off(self):
-        """flag-OFF: the guard must NOT fire → MCP passes through legacy (§8 rollback)."""
-        tool_node_fn, executed = _build_tool_node_fn_with_mcp()
-        fake_pe = FakeRecordingPE()
-        fake_ssm = _make_fake_ssm()
-        state = _make_state("mcp_real", {"q": "1"}, call_id="mcp_call")
-        state["messages"] = [
-            AIMessage(content="", tool_calls=[
-                {"id": "mcp_call", "name": "mcp_real", "args": {"q": "1"}, "type": "tool_call"},
-                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
-            ])
-        ]
-        config = _make_config(
-            fake_pe, fake_ssm, pe_mcp_enabled=False,
-            extra={"tool_confirmation_enabled": True},
-        )
-        with patch(
-            "app.domain.services.graphs.react_graph.resolve_tool_source",
-            _mcp_disc_resolver,
-        ):
-            await tool_node_fn(state, config)
-        assert executed["mcp"] is True, "flag-off MCP must execute via legacy passthrough"
-
     async def test_mcp_discovery_in_mixed_batch_not_denied(self):
         """A discovery meta-tool (category 'mcp discovery') must NOT trip the
         guard (source=='mcp' but category!='mcp') — it passes through legacy."""
@@ -1754,38 +1697,6 @@ class TestA2aMixedBatchFailClosed:
         ):
             await tool_node_fn(state, config)
         assert executed["a2a"] is True, "PE-absent A2A should pass through legacy (no guard)"
-
-    async def test_a2a_guard_off_when_flag_off(self):
-        """flag-OFF: the guard must NOT fire → A2A passes through legacy (§8 rollback)."""
-        tool_node_fn, executed = _build_tool_node_fn_with_a2a()
-        fake_pe = FakeRecordingPE()
-        fake_ssm = _make_fake_ssm()
-        state = _make_state("call_remote_agent", {"id": "a", "query": "q"}, call_id="a2a_call")
-        state["messages"] = [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {"id": "a2a_call", "name": "call_remote_agent", "args": {"id": "a", "query": "q"}, "type": "tool_call"},
-                    {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
-                ],
-            )
-        ]
-        # a2a flag OFF → is_pe_enabled_for_source("a2a") False → guard inert.
-        # `pe_a2a_enabled=` is the kwarg added to _make_config in Step 0 — it
-        # mirrors the real `pe_mcp_enabled=False` mechanism the mcp flag-off test
-        # uses (test_react_graph_pe_dispatch.py:1469-1472).
-        config = _make_config(
-            fake_pe, fake_ssm,
-            pe_a2a_enabled=False,
-            extra={"tool_confirmation_enabled": True},
-        )
-        with patch(
-            "app.domain.services.graphs.react_graph.resolve_tool_source",
-            _a2a_disc_resolver,
-        ):
-            await tool_node_fn(state, config)
-        # guard inert → a2a executes via legacy passthrough (today's behavior)
-        assert executed["a2a"] is True, "flag-off A2A should pass through legacy (rollback)"
 
 
 # ---------------------------------------------------------------------------
@@ -2092,7 +2003,18 @@ class TestNativeMixedBatchFailClosed:
 
     async def test_native_guard_off_when_pe_absent(self):
         """PE-absent (permission_engine / session_state_machine not wired) →
-        _pe_present False → guard inert → native passes through legacy."""
+        _pe_present False → guard inert → native passes through legacy.
+
+        This documents tool_node's LOCAL behavior in isolation. The
+        ``permission_engine=None`` + ``tool_confirmation_enabled=True`` shape
+        constructed here is NOT a reachable production state: PE-4c makes the
+        create path (``AgentService._create_task``) fail CLOSED — when the master
+        switch is on but the PermissionEngine cannot be built, it raises
+        ``PermissionConfigurationError`` instead of running with PE=None (see
+        ``test_agent_service_pe_source_gate.TestCreateGateFailsClosedWhenPECannotBuild``).
+        So in production a tc-enabled session always has PE wired; this passthrough
+        is only reachable with the master switch OFF (confirmation disabled by
+        explicit operator choice), where direct-execute is correct."""
         tool_node_fn, executed = _build_tool_node_fn_with_native()
         state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
         state["messages"] = [
@@ -2101,7 +2023,10 @@ class TestNativeMixedBatchFailClosed:
                 {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
             ])
         ]
-        # PE absent: None for permission_engine + session_state_machine → _pe_present False.
+        # PE absent: None for permission_engine + session_state_machine → _pe_present
+        # False. NB: production cannot reach this with tc enabled (create-path
+        # fail-closed); only master-OFF reaches PE-absent. tc-on used here purely
+        # to exercise tool_node's local guard-inert behavior in isolation.
         config = _make_config(None, None, extra={"tool_confirmation_enabled": True})
         with patch(
             "app.domain.services.graphs.react_graph.resolve_tool_source",
@@ -2111,40 +2036,6 @@ class TestNativeMixedBatchFailClosed:
         assert executed["native"] is True, (
             "PE-absent native should pass through legacy (no guard)"
         )
-
-    async def test_native_guard_off_when_flag_off(self):
-        """flag-OFF: pe_native_enabled=False → is_pe_enabled_for_source('native')
-        False → guard inert → native falls through to the legacy native risk gate
-        / direct-execute (§8 rollback while the flag still exists in PE-4b).
-
-        file_write carries no risk_level metadata → the legacy native risk gate is
-        skipped → it reaches the :2964 direct-execute and runs. Asserting
-        executed["native"] is True proves the new guard did NOT divert it."""
-        tool_node_fn, executed = _build_tool_node_fn_with_native()
-        fake_pe = FakeRecordingPE()
-        fake_ssm = _make_fake_ssm()
-        state = _make_state("file_write", {"path": "/x.txt", "content": "c"}, call_id="native_call")
-        state["messages"] = [
-            AIMessage(content="", tool_calls=[
-                {"id": "native_call", "name": "file_write", "args": {"path": "/x.txt", "content": "c"}, "type": "tool_call"},
-                {"id": "disc_call", "name": "list_mcp_tools", "args": {"server_name": ""}, "type": "tool_call"},
-            ])
-        ]
-        # native flag OFF → is_pe_enabled_for_source("native") False → guard inert.
-        # pe_native_enabled= sets BOTH the configurable-level dup AND tc_cfg attr
-        # (see _make_config), mirroring the mcp/a2a flag-off tests.
-        config = _make_config(
-            fake_pe, fake_ssm,
-            pe_native_enabled=False,
-            extra={"tool_confirmation_enabled": True},
-        )
-        with patch(
-            "app.domain.services.graphs.react_graph.resolve_tool_source",
-            _native_disc_resolver,
-        ):
-            await tool_node_fn(state, config)
-        # guard inert → native executes via legacy passthrough (today's behavior)
-        assert executed["native"] is True, "flag-off native should pass through legacy (rollback)"
 
     async def test_preapproved_native_executes_when_session_running(self):
         """Pre-approved native (call_id ∈ approved_tool_call_ids) in a mixed batch,

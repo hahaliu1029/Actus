@@ -526,40 +526,53 @@ class AgentService:
         # detect because it re-read the *current* config snapshot rather than the
         # snapshot that was in effect at task-creation time.
         #
-        # With this gate here, when permission_engine_native_enabled=False (or the
-        # tc.enabled master switch is off), we never build PE/SSM and both remain
-        # None.  The HTTP preflight split-brain check reduces to the simple and
-        # reliable: ``task._flow._permission_engine is not None``.
+        # With this gate here, when the tc.enabled master switch is off, we never
+        # build PE/SSM and both remain None.  The HTTP preflight split-brain check
+        # reduces to the simple and reliable:
+        # ``task._flow._permission_engine is not None``.
         _tc_at_create = getattr(snap.agent_config, "tool_confirmation", None)
-        # PE-1 §2.5: gate is now source-aware. Build PE/SSM if ANY supported
-        # source is enabled — previously only native triggered the build, so
-        # skill-only operators silently fell back to legacy R3 with no PE.
-        from app.domain.services.permission.sources import (
-            PE_SUPPORTED_SOURCES,
-            is_pe_enabled_for_source,
-        )
-
+        # PE-4c: per-source flags retired. Build PE/SSM iff the confirmation
+        # master switch is on, OR no tool_confirmation config is present at
+        # all (default-on). Invariant (a): no-config session still builds PE;
+        # invariant (b): master enabled=False → never build PE.
         _flag_pe_active_at_create = (
-            _tc_at_create is not None
-            and any(
-                is_pe_enabled_for_source(src, _tc_at_create)
-                for src in PE_SUPPORTED_SOURCES
-            )
-        ) or (
-            # When no tool_confirmation config is present at all, mirror
-            # the previous default-on behavior (native + skill) — operator
-            # can disable per source via explicit config.
-            _tc_at_create is None
+            _tc_at_create is None or getattr(_tc_at_create, "enabled", True)
         )
 
         ssm = None
         permission_engine = None
-        if (
-            _flag_pe_active_at_create
-            and approval_state_writer is not None
-            and approval_state_reader is not None
-            and confirmation_manager_inst is not None
-        ):
+        if _flag_pe_active_at_create:
+            # PE-4c fail-closed: PE is the SOLE tool-confirmation path (the legacy
+            # native risk gate is deleted in PE-4c). When the master switch is on
+            # (or no tool_confirmation config is present → default-on), confirmation
+            # is REQUIRED, so a missing PE dependency must fail CLOSED. Silently
+            # leaving permission_engine=None would let risk-bearing native tools
+            # (shell_execute=high, file_write/file_str_replace=medium,
+            # browser_console_exec=high) run UNCONFIRMED, because tool_node skips
+            # _pe_dispatch when PE is absent and the PE-4b native fail-closed guard
+            # only fires when PE is present. Operators who genuinely want to run
+            # without confirmation must set tool_confirmation.enabled=False
+            # explicitly (→ _flag_pe_active_at_create False → no PE, no raise).
+            if (
+                approval_state_writer is None
+                or approval_state_reader is None
+                or confirmation_manager_inst is None
+            ):
+                _missing_pe_deps = ", ".join(
+                    name
+                    for name, val in (
+                        ("approval_state_writer", approval_state_writer),
+                        ("approval_state_reader", approval_state_reader),
+                        ("confirmation_queue", confirmation_manager_inst),
+                    )
+                    if val is None
+                )
+                raise PermissionConfigurationError(
+                    "tool_confirmation is enabled but the PermissionEngine cannot "
+                    f"be built (missing: {_missing_pe_deps}); refusing to run tools "
+                    "without the confirmation boundary (PE-4c fail-closed). Set "
+                    "tool_confirmation.enabled=False to run without confirmation."
+                )
             try:
                 from app.application.composition.graph_assembly import (
                     build_decision_recorder,
@@ -662,14 +675,23 @@ class AgentService:
                 # is wrong. Surface to the caller; HTTP layer will 500 with
                 # correlation_id from the catch-all handler.
                 raise
-            except Exception:
-                logger.warning(
-                    "Failed to build PermissionEngine/SessionStateMachine; "
-                    "legacy confirmation path will be used for this session.",
+            except Exception as _pe_build_exc:
+                # PE-4c fail-closed: the legacy confirmation path this USED to fall
+                # back to is DELETED. Running risk-bearing native tools unconfirmed
+                # while the master switch is on is unacceptable, so surface the
+                # build failure as PermissionConfigurationError (HTTP catch-all →
+                # 5xx + correlation_id) instead of silently leaving
+                # permission_engine=None.
+                logger.error(
+                    "Failed to build PermissionEngine/SessionStateMachine while "
+                    "tool_confirmation is enabled; failing closed (PE-4c).",
                     exc_info=True,
                 )
-                ssm = None
-                permission_engine = None
+                raise PermissionConfigurationError(
+                    "Failed to build the PermissionEngine while tool_confirmation "
+                    "is enabled; refusing to run tools without the confirmation "
+                    "boundary (PE-4c fail-closed)."
+                ) from _pe_build_exc
 
         # B5 #29: compute bootstrap language from the already-loaded session.
         # ``_get_accessible_session`` upstream already hydrated events via
@@ -736,7 +758,6 @@ class AgentService:
             memory_gate_batch_cap=snap.memory_gate_batch_cap,
             memory_notification_emitter=self._memory_notification_emitter,
             approval_state_reader=approval_state_reader,
-            approval_state_writer=approval_state_writer,  # P2#8: legacy SmartApprove grant
             confirmation_manager=confirmation_manager_inst,
             permission_engine=permission_engine,
             session_state_machine=ssm,
@@ -1129,27 +1150,13 @@ class AgentService:
         )
 
         # Feature flag gate (mirrors PlannerReActFlow._build_config gate):
-        # P2#4: also check the master `enabled` switch — if tool_confirmation is
-        # globally disabled, preflight must return (None, None) so the graph also
-        # takes the legacy path (no split-brain when enabled=False + PE pending).
-        # PE-1 §2.5: source-aware master gate. We build PE/SSM if ANY supported
-        # source is enabled; per-call source gating happens later in
-        # preflight_resume_tool_confirmation when we know the pending tool's
-        # actual source.
-        from app.domain.services.permission.sources import (
-            PE_SUPPORTED_SOURCES,
-            is_pe_enabled_for_source,
-        )
-
+        # PE-4c: per-source flags retired. Master switch is the only gate.
+        # Invariant (b): master enabled=False → return (None, None) so the
+        # graph also takes the legacy path (no split-brain). Invariant (a):
+        # tc is None → fall through and build PE (default-on).
         tc = getattr(snap.agent_config, "tool_confirmation", None)
-        if tc is not None:
-            if not getattr(tc, "enabled", True):
-                return None, None  # confirmation master switch off
-            if not any(
-                is_pe_enabled_for_source(src, tc)
-                for src in PE_SUPPORTED_SOURCES
-            ):
-                return None, None  # all per-source PE flags off
+        if tc is not None and not getattr(tc, "enabled", True):
+            return None, None  # confirmation master switch off
 
         confirmation_queue = self._confirmation_manager
         if confirmation_queue is None:
@@ -1513,7 +1520,7 @@ class AgentService:
         # Round-11 simplification: the flag gate is now enforced inside _create_task
         # itself (P1#1 fix), so task._flow._permission_engine is None iff:
         #   (a) PE build failed, OR
-        #   (b) tc.enabled=False / permission_engine_native_enabled=False at creation time
+        #   (b) tc.enabled=False at creation time (PE-4c: per-source flags retired)
         # Both cases mean the graph will walk the legacy commit path — PE preflight
         # must NOT proceed.  Checking _task_pe is not None is now sufficient and
         # immune to config hot-reload because the flag check already ran when the task
@@ -1682,7 +1689,8 @@ class AgentService:
         # P1#2 (round-11 fix): When a new task was just created, verify that PE was
         # actually wired into it.  Between pe.preflight_resume (which writes claim_nonce
         # into Redis) and _create_task there is a window where:
-        #   - The operator toggled permission_engine_native_enabled=false, OR
+        #   - The operator toggled tc.enabled=false (PE-4c: per-source flags
+        #     retired), OR
         #   - build_permission_engine raised an exception (build failure)
         # In either case _create_task returns a task with _flow._permission_engine=None,
         # meaning the graph will walk the legacy commit path and never call
@@ -1815,7 +1823,8 @@ class AgentService:
         6. once 路径立即写 audit 证据（赢 claim 后）
 
         PE-0 Phase 8.1: This is the legacy path retained as a fallback when
-        ``permission_engine_native_enabled`` is False or PE build fails.
+        the master ``enabled`` switch is False or PE build fails (PE-4c:
+        per-source flags retired).
         Direct writer calls (write/write_audit_only/delete_grant) here are
         intentional and whitelisted under INV-1b for the legacy code path.
         """

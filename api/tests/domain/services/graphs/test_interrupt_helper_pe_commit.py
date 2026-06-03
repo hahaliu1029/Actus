@@ -97,7 +97,6 @@ def _make_config(fake_pe, fake_ssm, *, user_id="u", session_id="s"):
         "configurable": {
             "permission_engine": fake_pe,
             "session_state_machine": fake_ssm,
-            "permission_engine_native_enabled": True,
             "user_id": user_id,
             "session_id": session_id,
             "thread_id": session_id,

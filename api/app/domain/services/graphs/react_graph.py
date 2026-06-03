@@ -64,7 +64,7 @@ from app.domain.services.permission.sources import (
     is_pe_eligible_tool_source,
     is_pe_enabled_for_source,
 )
-from app.domain.services.risk_assessor import RiskAssessor, RiskLevel
+from app.domain.services.risk_assessor import RiskAssessor
 from app.domain.services.tools.tool_source_resolver import (
     ToolSource,
     ToolSourceUnknownError,
@@ -1098,9 +1098,9 @@ def build_react_graph(
     ) -> Command[Literal["pre_llm_node", "interrupt_helper", "__end__"]]:
         """PE-0 Phase 9: dispatch tool calls through PermissionEngine.evaluate.
 
-        Called only when pe + ssm + permission_engine_native_enabled are all
-        truthy. Falls back to an AllowError command on unexpected exceptions
-        to prevent silent graph stalls.
+        Called only when pe + ssm + the master ``enabled`` switch are all
+        truthy (PE-4c: per-source flags retired). Falls back to an AllowError
+        command on unexpected exceptions to prevent silent graph stalls.
         """
         import time as _time
 
@@ -1295,11 +1295,10 @@ def build_react_graph(
                 )
 
             # PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2: pre-loop should
-            # have routed any non-PE-eligible call to legacy. If we reach
-            # here with a non-PE-eligible source (or skill creator/guide),
-            # it's a caller-side invariant bug — we still execute via
-            # _invoke_wrapper to avoid stalling the graph, but log it loudly
-            # so the regression is visible.
+            # have routed any non-PE-eligible call to legacy. If we reach here
+            # with a non-PE-eligible source (or skill creator/guide), it's a
+            # caller-side invariant bug — PE-4c fails CLOSED rather than
+            # executing unconfirmed.
             _is_pe_eligible_per_call = is_pe_eligible_tool_source(
                 tool_source, _tc_for_gate
             )
@@ -1307,37 +1306,32 @@ def build_react_graph(
                 logger.error(
                     "_pe_dispatch: per-call non-PE-eligible reached PE loop "
                     "for tool '%s' (source=%s, category=%s) — pre-loop guard "
-                    "should have prevented this; investigate",
+                    "should have prevented this; failing closed (PE-4c)",
                     tool_name,
                     tool_source.source,
                     tool_source.category,
                 )
-                # Resolve tool_fn first (shared code below will check for None)
-                _non_pe_fn = tool_map.get(tool_name)
-                if _non_pe_fn is None:
-                    _non_pe_unknown = AllowError(
-                        content=f"Error: Unknown tool '{tool_name}'",
-                        reason=DecisionReason(
-                            type="exception",
-                            code="unknown_tool",
-                            message=f"Tool '{tool_name}' not in this graph's tool_map",
+                # PE-4c: fail-CLOSED. Previously this executed via _invoke_wrapper
+                # (fail-open). A non-PE-eligible call reaching the PE loop is a
+                # caller-side invariant bug; running it unconfirmed is worse than
+                # denying it. The agent re-issues the tool in its own batch, which
+                # the pre-loop gate then routes to legacy passthrough correctly.
+                _non_pe_denied = Denied(
+                    content=(
+                        f"工具 '{tool_name}' 因权限引擎资格判定不一致被拒绝执行；"
+                        "请在单独的步骤中重新调用该工具。"
+                    ),
+                    reason=DecisionReason(
+                        type="approval_policy",
+                        code="pe_eligibility_invariant_violation",
+                        message=(
+                            "non-PE-eligible call reached the PE loop; "
+                            "pre-loop gate should have routed it to legacy"
                         ),
-                    )
-                    await _finalize_pe_outcome(
-                        tc, args, tool_source, _non_pe_unknown, _tool_start
-                    )
-                    new_completed_ids.append(call_id)
-                    continue
-                _non_pe_result = await _invoke_wrapper(
-                    _non_pe_fn, tc, tool_source,
-                    session_id=_session_id,
-                    max_wrapper_output_bytes=_runtime_max_bytes,
-                )
-                _non_pe_result = _maybe_convert_shell_outcome_with_images(
-                    _non_pe_result, tool_name
+                    ),
                 )
                 await _finalize_pe_outcome(
-                    tc, args, tool_source, _non_pe_result, _tool_start
+                    tc, args, tool_source, _non_pe_denied, _tool_start
                 )
                 new_completed_ids.append(call_id)
                 continue
@@ -2068,14 +2062,11 @@ def build_react_graph(
         # through DefaultPermissionEngine instead of the legacy
         # _run_policy_chain / risk gate inline code.
         #
-        # PE-1 §2.5 + Round 2 P1#2 change: the master-entry no longer reads
-        # a single ``permission_engine_native_enabled`` flag. Per-source
-        # flags (``permission_engine_native_enabled`` /
-        # ``permission_engine_skill_enabled``) are now consulted PER CALL
+        # PE-4c: per-source flags retired — routing is consulted PER CALL
         # inside ``_pe_dispatch`` via
         # ``is_pe_eligible_tool_source(tool_source, tool_confirmation_config)``
-        # — which checks source membership + per-source flag AND filters
-        # skill creator / skill guide tools (``source="skill"`` but
+        # — which checks source membership + the master ``enabled`` switch AND
+        # filters skill creator / skill guide tools (``source="skill"`` but
         # ``category != "skill"``). Calls whose source is not PE-eligible
         # short-circuit back to the legacy tool_node path (None sentinel).
         # Legacy path is preserved verbatim below as the fail-open fallback.
@@ -2375,21 +2366,7 @@ def build_react_graph(
                 )
                 continue
 
-            # ---- Legacy risk gate (real ApprovalCache / SmartApprove) ----
-            #
-            # The Layer 1 ``_run_policy_chain`` helper exists as a typed
-            # facade but its internal stage stubs are not yet wired to
-            # real services (``_stage_s_ast_validate`` awaits N1,
-            # ``_stage_p1_approval_cache_check`` / ``_stage_p2_smart_approve``
-            # would need ``configurable`` threading). Rather than gate
-            # production on half-wired stubs, R2 keeps the legacy gate
-            # as the policy layer and only swaps the **execution + output
-            # construction** onto Layer 2 (``_invoke_wrapper``) + Layer 3
-            # (``_translate_outcome``). Result: every path that used to
-            # call ``_run_tool`` + build a raw ToolMessage now produces
-            # a typed ``ToolOutcome`` whose artifact flows through to
-            # Chunk 4's LLM adapter prefix injection.
-            risk_level_meta = (getattr(tool_fn, "metadata", None) or {}).get("risk_level")
+            # PE-4c: per-call execution context (the legacy native risk gate is removed).
             _tc_enabled = configurable.get("tool_confirmation_enabled", True)
             _session_id = configurable.get("session_id") or ""
             _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
@@ -2584,10 +2561,15 @@ def build_react_graph(
             # risk gate. Native-specific (source) so skill/mcp/a2a are untouched.
             # category != "unknown" excludes the :2438 unresolvable sentinel
             # (ToolSource(source="native", category="unknown")) — a permanent
-            # passthrough, NOT a real native tool. Gated on PE-present + native
-            # flag so flag-OFF / master-OFF / PE-absent fall through to the legacy
-            # native risk gate (§8 soft rollback). INV-6 clean (source + flag only,
-            # never reads skill risk metadata). _bypass_risk_gate (pre-approved
+            # passthrough, NOT a real native tool. Gated on _tc_enabled (master
+            # switch) + _pe_present, so master-OFF / PE-absent leave the guard inert
+            # and the native call direct-executes below. NB (PE-4c): master-ON +
+            # PE-absent is UNREACHABLE — _create_task (agent_service) fails CLOSED
+            # when confirmation is required but PE cannot be built, so PE-absent
+            # here always implies master-OFF (confirmation disabled by explicit
+            # operator choice). The legacy native risk gate that used to backstop
+            # the PE-absent case was deleted in PE-4c. INV-6 clean (source + flag
+            # only, never reads skill risk metadata). _bypass_risk_gate (pre-approved
             # replay) is intentionally excluded — see the pre-approved native
             # recheck above. The agent re-sends the native tool alone (driven by
             # .content) → _pe_dispatch routes it through PE.
@@ -2612,309 +2594,6 @@ def build_react_graph(
                     ),
                 )
                 await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
-                continue
-
-            # Original native tool gate — skill tools are handled by the fail-closed
-            # guard above; this gate only assesses native tools.
-            if (
-                not _bypass_risk_gate
-                and _tc_enabled
-                and risk_level_meta
-                and risk_level_meta in ("high", "medium")
-                and (not tool_source or tool_source.source != "skill")
-            ):
-                assessment = _risk_assessor.assess(tool_name, args)
-
-                if assessment.final_level >= RiskLevel.MEDIUM:
-                    # R5b-2 Reader 接入 + R5b-4 cleanup：ApprovalCache 已移除；
-                    # PE-0 Phase 8.3: SmartApprove 写路径已迁移至 PE Stage P.2，
-                    # react_graph 不再读 configurable writer slot。
-                    approval_state_reader = configurable.get("approval_state_reader")
-                    _user_id = configurable.get("user_id") or ""
-
-                    cache_decision = "no_match"
-                    if approval_state_reader and _user_id and _session_id:
-                        try:
-                            cache_decision = await approval_state_reader.check(
-                                user_id=_user_id,
-                                session_id=_session_id,
-                                tool_name=tool_name,
-                                arg_digest=assessment.arg_digest,
-                                primary_arg=assessment.primary_arg,
-                                dir_arg=assessment.dir_arg,
-                            )
-                        except Exception:
-                            logger.warning(
-                                "ApprovalStateReader.check failed for tool '%s', "
-                                "defaulting to no_match",
-                                tool_name,
-                            )
-                            cache_decision = "no_match"
-
-                    if cache_decision == "allow":
-                        outcome = await _invoke_wrapper(
-                            tool_fn,
-                            tc,
-                            tool_source,
-                            session_id=_session_id,
-                            max_wrapper_output_bytes=_runtime_max_bytes,
-                        )
-                        outcome = _maybe_convert_shell_outcome_with_images(
-                            outcome, tool_name
-                        )
-                        await _finalize_outcome(
-                            tc, args, tool_source, outcome, _tool_start
-                        )
-                        continue
-
-                    if cache_decision == "deny":
-                        denied_outcome = Denied(
-                            content="此操作已被永久规则拒绝",
-                            reason=DecisionReason(
-                                type="approval_policy",
-                                code="cache_always_deny",
-                                message=(
-                                    "User-configured always-deny rule matched "
-                                    "for this tool+arg pattern"
-                                ),
-                            ),
-                        )
-                        await _finalize_outcome(
-                            tc, args, tool_source, denied_outcome, _tool_start
-                        )
-                        continue
-
-                    # cache miss — try SmartApprove before interrupting
-                    _sa_resolved = False
-                    _smart_approve_enabled = configurable.get(
-                        "smart_approve_enabled", False
-                    )
-                    _sa_medium_only = configurable.get(
-                        "smart_approve_medium_only", False
-                    )
-                    if _smart_approve_enabled and not (
-                        _sa_medium_only
-                        and assessment.final_level > RiskLevel.MEDIUM
-                    ):
-                        from app.domain.services.smart_approve import (
-                            SmartApprove,
-                        )
-
-                        _summary_llm = configurable.get("summary_llm")
-                        if _summary_llm:
-                            # B5 PR-S3-2 reviewer round-2 P3: thread
-                            # the decision recorder from configurable
-                            # so SmartApprove (domain) doesn't import
-                            # the OTel helper directly. Composition
-                            # (planner_react._build_config) injects
-                            # the OTel-backed callable; tests pass
-                            # ``None`` and SmartApprove silently
-                            # skips the emit.
-                            _decision_recorder = configurable.get(
-                                "decision_recorder"
-                            )
-                            _smart = SmartApprove(
-                                llm=_summary_llm,
-                                decision_recorder=_decision_recorder,
-                            )
-                            try:
-                                _sa_decision = await asyncio.wait_for(
-                                    _smart.evaluate(
-                                        tool_name=tool_name,
-                                        tool_args=args,
-                                        risk_level=assessment.final_level.name.lower(),
-                                        matched_patterns=assessment.matched_patterns,
-                                        task_context="",
-                                    ),
-                                    timeout=(
-                                        _tool_runtime_cfg.smart_approve_timeout_seconds
-                                    ),
-                                )
-                            except asyncio.TimeoutError:
-                                logger.warning(
-                                    "SmartApprove timeout (%.1fs) for tool '%s' — "
-                                    "falling through to user-confirmation interrupt",
-                                    _tool_runtime_cfg.smart_approve_timeout_seconds,
-                                    tool_name,
-                                )
-                                _sa_decision = None
-                            if _sa_decision == "approve":
-                                logger.info(
-                                    "SmartApprove: auto-approved tool '%s', "
-                                    "granting session scope",
-                                    tool_name,
-                                )
-                                # P2#8: Restore legacy SmartApprove session grant write.
-                                # PE-0 Phase 8.3 removed the direct writer slot read, but the
-                                # legacy path (PE unwired or flag off) still runs SmartApprove
-                                # and needs to persist the "session" grant so the same tool+arg
-                                # combination doesn't ask again in the same session.
-                                # We use "_legacy_sa_writer" (injected by PlannerReActFlow._build_config)
-                                # to avoid triggering the INV-1b "approval_state_writer" string guard.
-                                _legacy_writer = configurable.get("_legacy_sa_writer")
-                                if _legacy_writer is not None:
-                                    try:
-                                        from datetime import datetime, timedelta, timezone
-                                        from app.domain.models.approval_grant import ApprovalDecision
-                                        _sa_grant = ApprovalDecision(
-                                            user_id=configurable.get("user_id") or "",
-                                            session_id=_session_id,
-                                            tool_name=tool_name,
-                                            tool_source=tool_source.source,  # type: ignore[arg-type]
-                                            arg_digest=assessment.arg_digest or "",
-                                            primary_arg=assessment.primary_arg or "",
-                                            dir_arg=assessment.dir_arg or "",
-                                            scope="session",  # type: ignore[arg-type]
-                                            effect="approve",  # type: ignore[arg-type]
-                                            source_type="smart_approve",  # type: ignore[arg-type]
-                                            confirmation_id=None,
-                                            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
-                                            risk_level=assessment.final_level.name.lower(),
-                                        )
-                                        await _legacy_writer.write(_sa_grant)
-                                        logger.debug(
-                                            "legacy SmartApprove: session grant written for tool '%s'",
-                                            tool_name,
-                                        )
-                                    except Exception as _w_err:
-                                        logger.warning(
-                                            "legacy SmartApprove: grant write failed for '%s': %s",
-                                            tool_name, _w_err,
-                                        )
-                                outcome = await _invoke_wrapper(
-                                    tool_fn,
-                                    tc,
-                                    tool_source,
-                                    session_id=_session_id,
-                                    max_wrapper_output_bytes=_runtime_max_bytes,
-                                )
-                                outcome = _maybe_convert_shell_outcome_with_images(
-                                    outcome, tool_name
-                                )
-                                await _finalize_outcome(
-                                    tc, args, tool_source, outcome, _tool_start
-                                )
-                                _sa_resolved = True
-                            elif _sa_decision == "deny":
-                                logger.info(
-                                    "SmartApprove: auto-denied tool '%s'",
-                                    tool_name,
-                                )
-                                denied_outcome = Denied(
-                                    content="此操作已被自动安全策略拒绝",
-                                    reason=DecisionReason(
-                                        type="smart_approve",
-                                        code="smart_approve_deny",
-                                        message=(
-                                            "SmartApprove LLM evaluation rejected "
-                                            "this tool call"
-                                        ),
-                                    ),
-                                )
-                                await _finalize_outcome(
-                                    tc,
-                                    args,
-                                    tool_source,
-                                    denied_outcome,
-                                    _tool_start,
-                                )
-                                _sa_resolved = True
-                            # _sa_decision == "escalate" → fall through to
-                            # interrupt_helper routing below
-
-                    if _sa_resolved:
-                        continue
-
-                    # Escalate to user: route to interrupt_helper with
-                    # typed pending_ask_* state.
-                    _timeout_seconds = configurable.get(
-                        "tool_confirmation_timeout_seconds", 300
-                    )
-                    confirmation_event = ToolConfirmationEvent(
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        tool_args=args,
-                        risk_level=assessment.final_level.name.lower(),
-                        risk_reason=assessment.risk_reason,
-                        matched_patterns=assessment.matched_patterns,
-                        suggested_alternative=assessment.suggested_alternative,
-                        timeout_seconds=_timeout_seconds,
-                    )
-                    if event_queue:
-                        await event_queue.put(confirmation_event)
-
-                    if confirmation_manager:
-                        from app.domain.services.confirmation_manager import (
-                            ConfirmationDetail,
-                        )
-
-                        _detail = ConfirmationDetail(
-                            session_id=_session_id,
-                            tool_call_id=call_id,
-                            user_id=_user_id,
-                            tool_name=tool_name,
-                            tool_args=args,
-                            risk_level=assessment.final_level.name.lower(),
-                            arg_digest=assessment.arg_digest,
-                            primary_arg=assessment.primary_arg,
-                            dir_arg=assessment.dir_arg,
-                            matched_patterns=assessment.matched_patterns,
-                            deadline_ts=_time.time()
-                            + confirmation_event.timeout_seconds,
-                        )
-                        await confirmation_manager.store(_detail)
-
-                    _pending_outcome = Asked(
-                        content="等待用户确认工具执行",
-                        reason=DecisionReason(
-                            type="risk_enforce",
-                            code=assessment.final_level.name.lower(),
-                            message=assessment.risk_reason or "",
-                        ),
-                    )
-                    _pending_artifact = ToolArtifact(
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        tool_source=tool_source,
-                        outcome=_pending_outcome,
-                    )
-
-                    _update = {
-                        "messages": new_messages + new_deferred_human,
-                        "events": new_events,
-                        "attempt_count": state["attempt_count"] + 1,
-                        "failure_count": state["failure_count"] + new_failures,
-                        "completed_tool_call_prefix": (
-                            list(already_done) + new_completed_ids
-                        ),
-                        "pending_ask_outcome": _pending_outcome.model_dump(
-                            mode="json"
-                        ),
-                        "pending_ask_tool_call_id": call_id,
-                        "pending_ask_artifact": _pending_artifact.model_dump(
-                            mode="json", by_alias=True
-                        ),
-                        "pending_ask_tool_args": dict(args),
-                    }
-                    return Command(
-                        goto="interrupt_helper",
-                        update=_update,
-                    )
-
-                # assessment < MEDIUM → execute directly
-                outcome = await _invoke_wrapper(
-                    tool_fn,
-                    tc,
-                    tool_source,
-                    session_id=_session_id,
-                    max_wrapper_output_bytes=_runtime_max_bytes,
-                )
-                outcome = _maybe_convert_shell_outcome_with_images(
-                    outcome, tool_name
-                )
-                await _finalize_outcome(
-                    tc, args, tool_source, outcome, _tool_start
-                )
                 continue
 
             # No risk metadata (or bypass via pre-approved) → execute directly
