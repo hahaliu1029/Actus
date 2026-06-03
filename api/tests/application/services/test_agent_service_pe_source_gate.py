@@ -83,3 +83,27 @@ class TestMcpSourceRegisteredAtBothPEBuildSites:
         )
         # And McpSource is imported (from the permission sources package).
         assert "McpSource" in src
+
+
+class TestA2aSourceRegisteredAtBothPEBuildSites:
+    def test_a2a_source_registered_at_both_pe_build_sites(self):
+        """PE-3 regression — A2aSource must be registered at BOTH
+        PermissionEngine build sites in agent_service:
+
+        - ``_pe_sources`` in ``_create_task`` (initial turn)
+        - ``_pe_sources_r`` in ``_build_pe_ssm_for_resume`` (resume turn)
+
+        WHY: if a future refactor silently drops the resume-path registration,
+        a fresh A2A tool call made during a *resumed* turn would hit a
+        PermissionEngine that has no 'a2a' source registered and raise
+        ``UnsupportedSource``. Asserting the literal appears exactly twice makes
+        the guard fail (count drops to 1) if either site is removed.
+        """
+        src = _agent_service_src()
+        assert src.count('"a2a": A2aSource()') == 2, (
+            "A2aSource must be registered at BOTH PE build sites "
+            "(_pe_sources in _create_task + _pe_sources_r in "
+            "_build_pe_ssm_for_resume); dropping one re-introduces "
+            "UnsupportedSource for a fresh A2A call on the resume path"
+        )
+        assert "A2aSource" in src

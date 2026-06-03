@@ -4,7 +4,7 @@ Replaces 10 native-only callsites (spec §2.5 table) with a single
 two-level gate: (1) source registered in PE_SUPPORTED_SOURCES, (2)
 source-specific flag enabled.
 
-Current supported sources: native, skill, mcp. PE-3 adds "a2a".
+Current supported sources: native, skill, mcp, a2a.
 
 Spec §2.3; Round 1 P0#3.
 """
@@ -16,7 +16,7 @@ from typing import Any
 # Single source of truth for "which sources flow through PE at this rev?"
 # PE-3 PR appends "a2a". CI invariants (validate_pe_source_registry at DI
 # time) ensure DI registers every entry in this set.
-PE_SUPPORTED_SOURCES: frozenset[str] = frozenset({"native", "skill", "mcp"})
+PE_SUPPORTED_SOURCES: frozenset[str] = frozenset({"native", "skill", "mcp", "a2a"})
 
 # Mapping from source string to the corresponding ToolConfirmationConfig
 # flag attribute. Centralized to keep is_pe_enabled_for_source O(1)
@@ -25,7 +25,7 @@ _SOURCE_FLAG_ATTR: dict[str, str] = {
     "native": "permission_engine_native_enabled",
     "skill": "permission_engine_skill_enabled",
     "mcp": "permission_engine_mcp_enabled",
-    # PE-3 PR: "a2a": "permission_engine_a2a_enabled",
+    "a2a": "permission_engine_a2a_enabled",
 }
 
 
@@ -34,7 +34,7 @@ def is_pe_enabled_for_source(source: str, config: Any) -> bool:
 
     Returns False (caller routes to legacy path) when:
       - master switch off (``config.enabled is False``)
-      - source not in ``PE_SUPPORTED_SOURCES`` (e.g., a2a until PE-3)
+      - source not in ``PE_SUPPORTED_SOURCES`` (e.g., a not-yet-supported future source)
       - unknown source string (typo / future source not yet planned)
       - source-specific flag off
 
@@ -72,8 +72,9 @@ def is_pe_eligible_tool_source(tool_source: Any, config: Any) -> bool:
     PE, where ``_pe_dispatch`` would then emit
     ``AllowError(code="skill_metadata_unresolvable")``. PE-2 registers
     McpSource for ``category="mcp"`` real remote tools (the mcp-discovery
-    meta-tools are carved out below); PE-3 will add an a2a adapter. The
-    skill creator / guide categories still bypass PE → legacy.
+    meta-tools are carved out below); PE-3 added A2aSource for ``source="a2a"``
+    (single ``category="a2a"``, no discovery split). The skill creator / guide
+    categories still bypass PE → legacy.
 
     Returns False (caller routes to legacy path) when:
       - ``tool_source`` is None (caller already gave up on resolution; this

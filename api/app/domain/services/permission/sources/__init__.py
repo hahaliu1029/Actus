@@ -10,6 +10,7 @@ from app.domain.services.permission.sources.gate_helper import (
     is_pe_eligible_tool_source,
     is_pe_enabled_for_source,
 )
+from app.domain.services.permission.sources.a2a_source import A2aSource
 from app.domain.services.permission.sources.mcp_source import McpSource
 from app.domain.services.permission.sources.native_source import NativeSource
 from app.domain.services.permission.sources.skill_metadata import (
@@ -24,6 +25,7 @@ __all__ = [
     "PermissionSource",
     "NativeSource",
     "McpSource",
+    "A2aSource",
     "SkillSource",
     "SkillRiskRefreshResult",
     "build_skill_call_metadata",

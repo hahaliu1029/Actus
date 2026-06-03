@@ -13,6 +13,7 @@ from app.application.composition.graph_assembly import (
 )
 from app.domain.services.permission.errors import PermissionConfigurationError
 from app.domain.services.permission.sources import (
+    A2aSource,
     McpSource,
     NativeSource,
     PE_SUPPORTED_SOURCES,
@@ -48,11 +49,13 @@ def _stub_uow_factory():
 
 class TestValidateSourceRegistry:
     def test_passes_when_all_supported_sources_registered(self):
-        sources = {"native": NativeSource(),
-                   "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
-                   "mcp": McpSource()}
-        # Should not raise
-        validate_pe_source_registry(sources)
+        sources = {
+            "native": NativeSource(),
+            "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
+            "mcp": McpSource(),
+            "a2a": A2aSource(),
+        }
+        validate_pe_source_registry(sources)  # must not raise
 
     def test_raises_when_skill_missing(self):
         sources = {"native": NativeSource()}
@@ -71,14 +74,15 @@ class TestValidateSourceRegistry:
             validate_pe_source_registry({})
 
     def test_extra_sources_beyond_supported_set_pass(self):
-        """Registering an unsupported-yet source (a2a, PE-3) alongside the
-        required set must not fail — validate only checks for MISSING required
-        sources, not extras."""
+        """Registering an unsupported future source alongside the required set
+        must not fail — validate only checks for MISSING required sources, not
+        extras."""
         sources = {
             "native": NativeSource(),
             "skill": SkillSource(refresher=MagicMock(), redis=MagicMock()),
             "mcp": McpSource(),
-            "a2a": MagicMock(),  # not yet supported, but harmless
+            "a2a": A2aSource(),
+            "future_x": MagicMock(),  # not in PE_SUPPORTED_SOURCES, but harmless
         }
         validate_pe_source_registry(sources)
 

@@ -613,6 +613,7 @@ class AgentService:
                     SkillRiskRefresher,
                 )
                 from app.domain.services.permission.sources import (
+                    A2aSource,
                     McpSource,
                     NativeSource,
                     SkillSource,
@@ -636,6 +637,7 @@ class AgentService:
                 _pe_sources: dict[str, Any] = {
                     "native": NativeSource(),
                     "mcp": McpSource(),
+                    "a2a": A2aSource(),
                 }
                 if _skill_source is not None:
                     _pe_sources["skill"] = _skill_source
@@ -1362,6 +1364,7 @@ class AgentService:
                 SkillRiskRefresher,
             )
             from app.domain.services.permission.sources import (
+                A2aSource,
                 McpSource,
                 NativeSource,
                 SkillSource,
@@ -1385,6 +1388,7 @@ class AgentService:
             _pe_sources_r: dict[str, Any] = {
                 "native": NativeSource(),
                 "mcp": McpSource(),
+                "a2a": A2aSource(),
             }
             if _skill_source_r is not None:
                 _pe_sources_r["skill"] = _skill_source_r

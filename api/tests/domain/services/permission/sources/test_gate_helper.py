@@ -41,14 +41,14 @@ class _StubToolSource:
 
 
 class TestRegisteredSetMembership:
-    def test_pe_2_registers_native_skill_mcp(self):
-        assert PE_SUPPORTED_SOURCES == frozenset({"native", "skill", "mcp"})
+    def test_pe_3_registers_native_skill_mcp_a2a(self):
+        assert PE_SUPPORTED_SOURCES == frozenset({"native", "skill", "mcp", "a2a"})
 
     def test_mcp_in_supported_set(self):
         assert "mcp" in PE_SUPPORTED_SOURCES
 
-    def test_a2a_not_in_pe_1(self):
-        assert "a2a" not in PE_SUPPORTED_SOURCES
+    def test_a2a_in_supported_set(self):
+        assert "a2a" in PE_SUPPORTED_SOURCES
 
 
 class TestGateHelperBehavior:
@@ -66,9 +66,11 @@ class TestGateHelperBehavior:
         assert tc.permission_engine_mcp_enabled is True
         assert is_pe_enabled_for_source("mcp", tc) is True
 
-    def test_a2a_not_in_supported_set_returns_false_even_if_flag_on(self):
+    def test_a2a_supported_and_flag_on_returns_true(self):
+        """a2a is now PE-supported (PE-3); flag default true → True."""
         tc = _StubTC()
-        assert is_pe_enabled_for_source("a2a", tc) is False
+        assert tc.permission_engine_a2a_enabled is True
+        assert is_pe_enabled_for_source("a2a", tc) is True
 
     def test_unknown_source_returns_false(self):
         tc = _StubTC()
@@ -132,11 +134,11 @@ class TestIsPeEligibleToolSource:
         ts = _StubToolSource(source="mcp", category="mcp")
         assert is_pe_eligible_tool_source(ts, tc) is True
 
-    def test_a2a_source_returns_false(self):
-        """A2A is not in PE_SUPPORTED_SOURCES (PE-3 PR adds it)."""
+    def test_a2a_tool_is_eligible(self):
+        """A2A is in PE_SUPPORTED_SOURCES (PE-3); category='a2a' → eligible."""
         tc = _StubTC()
         ts = _StubToolSource(source="a2a", category="a2a")
-        assert is_pe_eligible_tool_source(ts, tc) is False
+        assert is_pe_eligible_tool_source(ts, tc) is True
 
     def test_none_tool_source_returns_false(self):
         """Unknown tool / ToolSourceUnknownError → caller passes None → False."""

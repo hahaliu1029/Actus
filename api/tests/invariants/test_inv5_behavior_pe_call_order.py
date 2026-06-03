@@ -216,6 +216,7 @@ class _RecordingPEWithSources:
             "native": _FakeRecordingSource("native"),
             "skill": _FakeRecordingSource("skill"),
             "mcp": _FakeRecordingSource("mcp"),
+            "a2a": _FakeRecordingSource("a2a"),
         }
         self.evaluate_calls: list = []
 
@@ -497,4 +498,88 @@ async def test_mcp_tool_call_routes_through_mcp_source():
     )
     assert fake_pe.evaluate_calls[0].tool_source == "mcp"
     assert fake_pe._sources["mcp"].assess_risk_calls == 1, "McpSource must run once"
+    assert fake_pe._sources["native"].assess_risk_calls == 0, "native untouched"
+
+
+# ---------- PE-3 INV-5 extension: A2aSource route ----------
+
+
+def _make_a2a_config(fake_pe, fake_ssm, *, user_id="u", session_id="s") -> dict:
+    """Like _make_mcp_config but for A2A: tool_confirmation_config MUST
+    carry permission_engine_a2a_enabled=True (the flag trap —
+    is_pe_enabled_for_source defaults a missing flag to False, which would
+    silently route A2A to legacy and make this test a false pass)."""
+    from types import SimpleNamespace
+    tc_cfg = SimpleNamespace(
+        enabled=True,
+        permission_engine_native_enabled=True,
+        permission_engine_skill_enabled=True,
+        permission_engine_mcp_enabled=True,
+        permission_engine_a2a_enabled=True,
+    )
+    return {"configurable": {
+        "permission_engine": fake_pe,
+        "session_state_machine": fake_ssm,
+        "tool_confirmation_config": tc_cfg,
+        "user_id": user_id, "session_id": session_id, "thread_id": session_id,
+    }}
+
+
+def _build_a2a_tool_node_fn(a2a_tool_name: str):
+    """Clone of _build_mcp_tool_node_fn: build tool_node with one
+    StructuredTool annotated source='a2a' category='a2a' so resolve_tool_source
+    routes it to A2aSource (no patch needed). A2aSource is stateless and needs
+    no metadata. Imports are local (mirrors the mcp builder's local-import
+    style)."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import StructuredTool
+    from pydantic import create_model
+    from app.domain.services.graphs.react_graph import build_react_graph
+    from app.domain.services.tools.tool_source_resolver import (
+        annotate_and_register_tool_source,
+    )
+
+    async def _invoke(**kwargs):
+        from app.domain.models.tool_result import AllowSuccess
+        out = AllowSuccess(content="a2a ran", data={})
+        return out.content, out
+
+    args_model = create_model("A2aInv5Args", query=(str, ""))
+    lc_tool = StructuredTool.from_function(
+        coroutine=_invoke,
+        name=a2a_tool_name,
+        description="fake a2a tool for INV-5 routing test",
+        args_schema=args_model,
+        response_format="content_and_artifact",
+    )
+    annotate_and_register_tool_source(lc_tool, source="a2a", category="a2a")
+
+    stub_llm = AsyncMock()
+    stub_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+    )
+    stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+    graph = build_react_graph(stub_llm, [lc_tool])
+    return graph.nodes["tool_node"].bound.afunc
+
+
+async def test_a2a_tool_call_routes_through_a2a_source():
+    """PE-3 INV-5 extension: an A2A tool invoked through the react_graph PE path
+    hits A2aSource.assess_risk exactly once; native untouched. Direct clone of
+    test_mcp_tool_call_routes_through_mcp_source with source='a2a'."""
+    a2a_tool_name = "a2a_test_inv5_call"
+    tool_node_fn = _build_a2a_tool_node_fn(a2a_tool_name)
+    fake_pe = _RecordingPEWithSources()
+    fake_ssm = _make_fake_ssm()
+
+    state = _make_state(a2a_tool_name, {"query": "1"}, call_id="tc-a2a-1")
+    config = _make_a2a_config(fake_pe, fake_ssm, session_id="sess-inv5-a2a")
+
+    await tool_node_fn(state, config)
+
+    assert len(fake_pe.evaluate_calls) == 1, (
+        f"expected 1 pe.evaluate for A2A tool, got {len(fake_pe.evaluate_calls)}"
+    )
+    assert fake_pe.evaluate_calls[0].tool_source == "a2a"
+    assert fake_pe._sources["a2a"].assess_risk_calls == 1, "A2aSource must run once"
     assert fake_pe._sources["native"].assess_risk_calls == 0, "native untouched"

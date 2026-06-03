@@ -1296,10 +1296,10 @@ def build_react_graph(
         pre_approved: set[str] = set(state.get("approved_tool_call_ids", []) or [])
 
         # PE-1 §2.5 (T15 P1#2 fix) + Round 2 P1#2: per-call gate. If ANY
-        # pending tool_call in the batch is non-PE-eligible (mcp/a2a, skill
-        # creator/guide, or skill/native with operator flag off), delegate
-        # the WHOLE batch to the legacy tool_node path which preserves the
-        # fail-closed skill guard / legacy mcp/a2a / skill creator + guide
+        # pending tool_call in the batch is non-PE-eligible (e.g. skill
+        # creator/guide, mcp discovery, or any source with its operator flag
+        # off), delegate the WHOLE batch to the legacy tool_node path which
+        # preserves the fail-closed skill/mcp/a2a guards + skill creator/guide
         # confirmation pipelines. PE only handles batches where every pending call
         # qualifies for PE — otherwise we'd bypass legacy per-source
         # confirmation for mixed cases.
@@ -2558,7 +2558,8 @@ def build_react_graph(
 
             # PE-1b fail-closed guard: a dynamic SkillTool (source == category ==
             # "skill") only reaches the legacy path via a mixed-batch fallback — a
-            # non-PE-eligible call (mcp/a2a/skill creator/guide) in the same batch
+            # non-PE-eligible call (skill creator/guide, mcp discovery, or any
+            # source with its operator flag off) in the same batch
             # forced the whole batch off PE (per-batch gate → None). PE-1b deleted
             # the legacy R3 skill confirmation and the native gate below excludes
             # skills, so without this guard the skill would execute UNCONFIRMED. Deny
@@ -2620,6 +2621,38 @@ def build_react_graph(
                         type="approval_policy",
                         code="mcp_mixed_batch_fail_closed",
                         message="MCP reached legacy via mixed-batch fallback; PE routing required",
+                    ),
+                )
+                await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
+                continue
+
+            # PE-3: a PE-eligible A2A tool must never execute via the legacy
+            # fallback. A mixed batch (a2a + skill-creator/guide / mcp-discovery)
+            # forces the WHOLE batch to legacy; without this guard the A2A call
+            # reaches the direct-execute point below and runs UNCONFIRMED,
+            # bypassing any user ASK/DENY policy the PE path honors. A2A-specific
+            # (source/category) so native/skill/mcp are untouched; gated on
+            # PE-present + a2a flag so flag-OFF / master-OFF / PE-absent fall
+            # through to legacy passthrough (§8 soft rollback). INV-6 clean
+            # (source/category + flag only). Agent re-sends A2A alone (driven by
+            # .content) → _pe_dispatch routes it through PE + A2aSource.
+            if (
+                not _bypass_risk_gate
+                and tool_source
+                and tool_source.source == "a2a"
+                and tool_source.category == "a2a"
+                and _pe_present
+                and is_pe_enabled_for_source("a2a", _tc_config)
+            ):
+                _fail_closed = Denied(
+                    content=(
+                        f"A2A 工具 '{tool_name}' 无法与非权限引擎工具（skill creator / MCP discovery 等）"
+                        "在同一批次中执行；请在单独的步骤中调用该 A2A 工具。"
+                    ),
+                    reason=DecisionReason(
+                        type="approval_policy",
+                        code="a2a_mixed_batch_fail_closed",
+                        message="A2A reached legacy via mixed-batch fallback; PE routing required",
                     ),
                 )
                 await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)

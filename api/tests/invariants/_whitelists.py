@@ -62,7 +62,8 @@ INV5_REACT_GRAPH_PATH = "api/app/domain/services/graphs/react_graph.py"
 # tool_node: legacy fallback path — when PE is enabled it delegates immediately
 #   to _pe_dispatch (line ~1654) which enforces PE dominance. The remaining
 #   body handles the legacy (PE-disabled) path and is expected to call
-#   _invoke_wrapper without pe.evaluate. PE-3 will remove this legacy body.
+#   _invoke_wrapper without pe.evaluate. The PE-4 cleanup epic removes this
+#   legacy body.
 # _legacy_*: any function starting with _legacy_ is also exempt.
 INV5_SKIP_FUNCTION_NAMES: frozenset[str] = frozenset({
     "tool_node",
@@ -75,7 +76,7 @@ INV5_SKIP_FUNCTION_NAMES: frozenset[str] = frozenset({
 # fails. These callsites legitimately lack a `pe.evaluate` / `pe_resume_outcomes`
 # dominator because they are the *fallback* for the case where the upstream
 # routing guard misclassified a call. They are expected to be unreachable after
-# the guard, and PE-3 will remove them along with the legacy path.
+# the guard, and the PE-4 cleanup epic removes them along with the legacy path.
 #
 # Format: tuple of (function_name, callsite_lineno, sunset_ref, justification).
 # The PE-0 round 32 strict end_lineno dominance filter surfaced these; before
@@ -89,16 +90,17 @@ INV5_CALLSITE_SAFETY_NET_WHITELIST: tuple[
 ] = (
     (
         "_pe_dispatch",
-        1486,  # post-PE-2 per-call escape _invoke_wrapper (was 1375, drifted)
-        "PE-3",
+        1486,  # per-call escape _invoke_wrapper (verify against INV-5 static; update if Task 4 reported a shift)
+        "PE-4",
         "PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2 per-call escape: "
-        "the pre-loop guard routes any non-PE-eligible call (a2a, skill "
-        "creator/guide, or skill/native/mcp with operator flag off) and "
-        "any unknown source to the legacy tool_node path for the WHOLE "
-        "batch via ``is_pe_eligible_tool_source``, so this per-call branch "
-        "is documented unreachable. The body is retained as a defensive "
-        "fail-open (logged at ERROR) to avoid stalling the graph if a "
-        "caller-side invariant ever regresses. PE-3 lifts a2a into PE and "
-        "removes this branch.",
+        "the pre-loop guard routes any non-PE-eligible call (skill creator/"
+        "guide, mcp discovery, or any source with its operator flag off) and "
+        "any unknown source to the legacy tool_node path for the WHOLE batch "
+        "via ``is_pe_eligible_tool_source``, so this per-call branch is "
+        "documented unreachable. Retained as a defensive fail-open (logged at "
+        "ERROR) to avoid stalling the graph if a caller-side invariant ever "
+        "regresses. As of PE-3 all four real sources (native/skill/mcp/a2a) "
+        "are PE-eligible; this branch + the legacy body are fully retired in "
+        "the PE-4 cleanup epic.",
     ),
 )
