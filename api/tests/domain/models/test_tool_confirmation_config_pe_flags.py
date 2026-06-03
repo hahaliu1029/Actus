@@ -1,4 +1,4 @@
-"""ToolConfirmationConfig gains 5 PE-0 feature flags, all default True."""
+"""ToolConfirmationConfig gains 4 PE-0 feature flags, all default True."""
 
 import pytest
 from pydantic import ValidationError
@@ -12,7 +12,6 @@ def test_pe_flags_default_true():
     assert cfg.permission_engine_skill_enabled is True
     assert cfg.permission_engine_mcp_enabled is True
     assert cfg.permission_engine_a2a_enabled is True
-    assert cfg.permission_engine_a4_events_enabled is True
 
 
 def test_pe_flags_can_be_disabled():

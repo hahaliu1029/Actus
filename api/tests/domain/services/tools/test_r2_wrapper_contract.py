@@ -29,7 +29,7 @@ so later Chunks (or unrelated changes) can't silently break it:
    ``Command(goto="interrupt_helper")``.
 7. **``interrupt_helper`` must not call wrapper-layer helpers**
    (CS2.13) — ``interrupt_helper`` must not call ``_invoke_wrapper`` /
-   ``_run_policy_chain`` / ``ApprovalCache.*`` / ``ApprovalStateWriter.*``.
+   ``ApprovalCache.*`` / ``ApprovalStateWriter.*``.
    Its sole job is ``interrupt()`` + routing; wrapper execution belongs
    exclusively to ``tool_node``.
 
@@ -317,7 +317,7 @@ def test_tool_node_has_no_interrupt_call():
 def test_interrupt_helper_has_no_wrapper_calls():
     """CS2.13: ``interrupt_helper`` must not call wrapper / policy helpers.
 
-    Forbidden direct calls: ``_invoke_wrapper``, ``_run_policy_chain``.
+    Forbidden direct calls: ``_invoke_wrapper``.
     Forbidden attribute calls: ``ApprovalCache.*``, ``ApprovalStateWriter.*``.
 
     The approve path uses ``state.approved_tool_call_ids`` bypass in
@@ -330,7 +330,7 @@ def test_interrupt_helper_has_no_wrapper_calls():
     """
     tree = _parse(REACT_GRAPH_FILE)
 
-    forbidden_names = {"_invoke_wrapper", "_run_policy_chain"}
+    forbidden_names = {"_invoke_wrapper"}
     forbidden_attr_roots = {"ApprovalCache", "ApprovalStateWriter"}
 
     for node in ast.walk(tree):
@@ -342,7 +342,7 @@ def test_interrupt_helper_has_no_wrapper_calls():
         for sub in ast.walk(node):
             if not isinstance(sub, ast.Call):
                 continue
-            # Direct call by name: _invoke_wrapper(...) / _run_policy_chain(...)
+            # Direct call by name: _invoke_wrapper(...)
             if isinstance(sub.func, ast.Name):
                 assert sub.func.id not in forbidden_names, (
                     f"react_graph.py:{sub.lineno} — interrupt_helper calls "

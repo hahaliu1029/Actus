@@ -291,161 +291,6 @@ def _is_shell_category(tool_source: ToolSource) -> bool:
     return tool_source.source == "native" and tool_source.category == "shell"
 
 
-def _smart_approve_applies(tool_source: ToolSource, tool_call: ToolCall) -> bool:
-    """Whether Stage P.2 (SmartApprove) should run for this tool.
-
-    Commit 1 stub always returns True so the happy-path test exercises
-    the full S → P.1 → P.2 → None chain. Task 13 replaces this with the
-    real risk-level check (mirrors the existing ``risk_level`` metadata
-    gate at react_graph.py:443-448).
-    """
-    return True
-
-
-async def _stage_s_ast_validate(
-    tool_call: ToolCall,
-) -> ToolOutcome | None:
-    """Stage S: shell AST validator (N1).
-
-    Calls into the pure-sync ``shell_ast_validator.validate()``.
-    Returns ``Denied(reason.type="ast_validator")`` when validate() rejects,
-    ``None`` when allowed.
-    """
-    from app.domain.services.safety.shell_ast_validator import (
-        to_typed_denied,
-        validate,
-    )
-    from core.config import get_settings
-
-    args = tool_call.get("args", {}) or {}
-    command = args.get("command", "") or ""
-    exec_dir = args.get("exec_dir", "") or get_settings().sandbox_default_cwd
-    result = validate(command, effective_cwd=exec_dir)
-    if result.allowed:
-        return None
-    return to_typed_denied(result, original_command=command)
-
-
-async def _stage_p1_approval_cache_check(
-    session_ctx: _SessionContext,
-    tool_call: ToolCall,
-) -> ToolOutcome | Literal["policy_allow"] | None:
-    """Stage P.1: ApprovalCache (Redis).
-
-    Commit 1 stub returns None (no cached decision). Task 13 replaces
-    with ``configurable['approval_cache'].check(...)``.
-
-    Returns:
-      - ``Denied | Asked`` — user has already decided, short-circuit
-      - ``"policy_allow"`` — user pre-allowed, skip SmartApprove
-      - ``None`` — no cached decision, continue chain
-    """
-    return None
-
-
-async def _stage_p2_smart_approve(
-    tool_call: ToolCall,
-    session_ctx: _SessionContext,
-) -> ToolOutcome | None:
-    """Stage P.2: SmartApprove LLM evaluation.
-
-    Commit 1 stub returns None. Task 13 replaces with
-    ``SmartApprove(llm=configurable['summary_llm']).evaluate(...)``.
-    """
-    return None
-
-
-async def _run_policy_chain(
-    tool_call: ToolCall,
-    tool: BaseTool,
-    tool_source: ToolSource,
-    session_ctx: _SessionContext,
-    *,
-    smart_approve_timeout_seconds: int | None = None,
-) -> ToolOutcome | None:
-    """Stage-based Layer 1 policy evaluation.
-
-    Returns None iff all stages allow (wrapper should run). Otherwise
-    returns a ``Denied`` / ``Asked`` / ``AllowError`` that short-circuits
-    Layer 2.
-
-    Stage-level exception handling:
-    - **Stage S crash → AllowError (fail-closed)**. Shell AST is a safety
-      gate; crashing it must NOT fall through to wrapper execution.
-    - **Stage P.1 crash (e.g., Redis down) → fail-open**. Redis outages
-      shouldn't block every tool call. Log + continue.
-    - **Stage P.2 timeout/crash → fail-open**. SmartApprove is optional
-      reinforcement; its failure mustn't hold up the happy path.
-
-    Layer 1 only produces ``Denied/Asked/AllowError``; ``AllowSuccess``
-    and ``Passthrough`` come from Layer 2 (wrapper).
-
-    ``smart_approve_timeout_seconds`` comes from
-    ``AppConfig.tool_runtime.smart_approve_timeout_seconds`` via
-    ``build_react_graph(tool_runtime_config=...)``. ``None`` falls back to
-    the module constant ``_SMART_APPROVE_TIMEOUT_SECONDS`` so legacy
-    callers and existing tests keep working without plumbing the config
-    through.
-    """
-    p2_timeout = (
-        smart_approve_timeout_seconds
-        if smart_approve_timeout_seconds is not None
-        else _SMART_APPROVE_TIMEOUT_SECONDS
-    )
-    # Stage S: Safety (shell AST validator, native shell only)
-    if _is_shell_category(tool_source):
-        try:
-            ast_outcome = await _stage_s_ast_validate(tool_call)
-        except Exception as exc:
-            logger.exception("Stage S AST validator crashed for %s", tool_call["name"])
-            return AllowError(
-                content=f"AST validator 内部异常: {exc}",
-                reason=DecisionReason(
-                    type="exception",
-                    code="layer1_ast_crash",
-                    message=str(exc),
-                ),
-                retryable=False,
-            )
-        if ast_outcome is not None:
-            return ast_outcome
-
-    # Stage P.1: ApprovalCache (Redis)
-    try:
-        cached = await _stage_p1_approval_cache_check(session_ctx, tool_call)
-    except Exception:
-        logger.exception(
-            "Stage P.1 ApprovalCache crashed for %s (fail-open)", tool_call["name"]
-        )
-        cached = None
-    if isinstance(cached, (Denied, Asked)):
-        return cached
-    if cached == "policy_allow":
-        return None  # User pre-allowed, skip Stage P.2
-
-    # Stage P.2: SmartApprove (LLM)
-    if _smart_approve_applies(tool_source, tool_call):
-        try:
-            smart = await asyncio.wait_for(
-                _stage_p2_smart_approve(tool_call, session_ctx),
-                timeout=p2_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Stage P.2 SmartApprove timeout for %s (fail-open)", tool_call["name"]
-            )
-            smart = None
-        except Exception:
-            logger.exception(
-                "Stage P.2 SmartApprove crashed for %s (fail-open)", tool_call["name"]
-            )
-            smart = None
-        if isinstance(smart, (Denied, Asked)):
-            return smart
-
-    return None
-
-
 GuideInjector = Callable[[str], str | None]
 
 
@@ -1085,10 +930,10 @@ def build_react_graph(
         ``InMemorySaver`` to drive the interrupt_helper handshake.
     tool_runtime_config : R2 CS2 — ``AppConfig.tool_runtime`` plumbed in.
         Sets the SmartApprove timeout + wrapper output byte cap used by
-        Layer 1 ``_run_policy_chain`` and Layer 2 ``_invoke_wrapper``.
+        Layer 2 ``_invoke_wrapper``.
         Defaults to ``ToolRuntimeConfig()`` (1 MiB wrapper cap, 15s
         SmartApprove timeout). The values are captured in the closure
-        so every future call site that wires ``_run_policy_chain`` /
+        so every future call site that wires
         ``_invoke_wrapper`` into the dispatcher can read them via
         ``_tool_runtime_cfg`` without re-plumbing ``build_react_graph``.
     """

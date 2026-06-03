@@ -90,7 +90,7 @@ INV5_CALLSITE_SAFETY_NET_WHITELIST: tuple[
 ] = (
     (
         "_pe_dispatch",
-        1486,  # per-call escape _invoke_wrapper (verify against INV-5 static; update if Task 4 reported a shift)
+        1331,  # per-call escape _invoke_wrapper (PE-4a re-anchored after _run_policy_chain deletion; verify against INV-5 static)
         "PE-4",
         "PE-1 §2.5 (T15 P1#2 defensive) + Round 2 P1#2 per-call escape: "
         "the pre-loop guard routes any non-PE-eligible call (skill creator/"

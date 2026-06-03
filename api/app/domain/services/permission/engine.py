@@ -1,6 +1,6 @@
 """PermissionEngine ABC.
 
-Type-safe facade over the existing _run_policy_chain (react_graph.py:260).
+Internalizes tool-call permission decisions for all sources.
 Three entry points:
 
   evaluate(call, ctx)            -> ToolOutcome

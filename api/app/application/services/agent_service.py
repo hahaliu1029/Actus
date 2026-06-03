@@ -999,137 +999,6 @@ class AgentService:
         except Exception as e:
             logger.warning(f"会话[{session_id}]后台更新未读消息计数失败: {e}")
 
-    async def _batch_has_non_native_pending(
-        self,
-        task_flow: object,
-        session_id: str,
-        pending_tool_name: str,
-    ) -> bool:
-        """Return True if the checkpointed tool_calls batch contains any non-native tool.
-
-        Mirrors ``_pe_dispatch``'s batch-level routing logic in react_graph:
-        when ANY tool in the active batch is non-native (skill/mcp/a2a),
-        ``_pe_dispatch`` falls back to the legacy tool_node path for the *whole*
-        batch — meaning it will never consume ``pe_resume_outcomes`` / claim_nonce.
-        Preflight must detect this case in advance and redirect to the legacy path
-        to avoid a split-brain where PE has claimed the queue entry but nobody
-        consumes the claim.
-
-        This is best-effort (returns False on any exception) because the graph
-        state may be unavailable (graph not built yet, checkpoint missing, etc.).
-
-        Called from two sites:
-          1. existing-task path (round-16 mixed-batch guard)
-          2. post-create path (round-17 guard — worker restart, new task created)
-        """
-        from app.domain.services.tools.tool_source_resolver import (
-            ToolSourceUnknownError as _TSUErr,
-            resolve_tool_source as _resolve,
-        )
-        from langchain_core.messages import AIMessage as _AIMsg
-        from langchain_core.messages import ToolMessage as _TMMsg
-
-        try:
-            _main_graph = getattr(task_flow, "_main_graph", None)
-            # P2#1 (round-22): When a new task is freshly created (post-restart worker
-            # recovery), _create_task builds a PlannerReActFlow but does NOT call
-            # _ensure_graphs() — so _main_graph is None at this point.  Without this
-            # guard, _main_graph is None → return False → mixed-batch guard is silently
-            # skipped → split-brain / stuck 'processing' entry.
-            #
-            # Fix (Option A): if _main_graph is None, attempt to build the graph here so
-            # the guard has a live graph to query.  If build also fails, fall through to
-            # the existing except-clause and return False (best-effort contract preserved).
-            if _main_graph is None:
-                _ensure = getattr(task_flow, "_ensure_graphs", None)
-                if _ensure is not None:
-                    await _ensure()
-                _main_graph = getattr(task_flow, "_main_graph", None)
-                if _main_graph is None:
-                    # Build failed or task_flow has no _ensure_graphs — skip guard.
-                    return False
-            _graph_config = task_flow._build_config()  # type: ignore[union-attr]
-            # Codex round-28 P1#1: use subgraphs=True so that PregelTask.state
-            # is populated with the nested ReactGraphState snapshot when the
-            # interrupt occurs inside the react_graph subgraph.
-            # Without subgraphs=True, only the outer MainGraphState is returned —
-            # its messages are planner outputs that typically have no tool_calls,
-            # causing _batch_tool_calls to be empty → guard returns False → mixed
-            # batch goes undetected → PE claim nonce is written but never consumed.
-            _graph_snap = await _main_graph.aget_state(_graph_config, subgraphs=True)
-
-            # Try to extract messages from the nested ReactGraphState first.
-            # PregelTask.state is None | RunnableConfig | StateSnapshot.
-            # When subgraphs=True and the interrupt fired inside a subgraph,
-            # the task for that subgraph will have state=StateSnapshot with
-            # its own values dict containing the react_graph messages.
-            _gs_messages: list = []
-            _snap_tasks = getattr(_graph_snap, "tasks", None) or []
-            for _task in _snap_tasks:
-                _sub_state = getattr(_task, "state", None)
-                if _sub_state is None:
-                    continue
-                _sub_values = getattr(_sub_state, "values", None) or {}
-                _sub_messages = _sub_values.get("messages", []) if isinstance(_sub_values, dict) else []
-                if _sub_messages:
-                    # Use the first subgraph task that has messages.
-                    _gs_messages = _sub_messages
-                    break
-
-            # Fallback: if no subgraph state had messages, use parent state.
-            if not _gs_messages and _graph_snap:
-                _gs_messages = ((_graph_snap.values or {}).get("messages", [])
-                                if _graph_snap else [])
-
-            # Find the most recent AIMessage that has tool_calls — this is the
-            # batch that _pe_dispatch will process on resume.
-            _batch_tool_calls: list[dict] = []
-            _batch_ai_idx: int = -1
-            for _idx, _msg in enumerate(reversed(_gs_messages)):
-                if isinstance(_msg, _AIMsg) and _msg.tool_calls:
-                    _batch_tool_calls = list(_msg.tool_calls)
-                    _batch_ai_idx = len(_gs_messages) - 1 - _idx
-                    break
-            if not _batch_tool_calls:
-                return False
-            # Determine which tool_calls are already completed by collecting
-            # tool_call_ids from ToolMessages that appear AFTER the AIMessage.
-            _already_done: set[str] = set()
-            for _tm in _gs_messages[_batch_ai_idx + 1:]:
-                if isinstance(_tm, _TMMsg) and _tm.tool_call_id:
-                    _already_done.add(_tm.tool_call_id)
-            # Check remaining pending tool_calls for non-native sources.
-            for _tc in _batch_tool_calls:
-                _tc_id = _tc.get("id", "")
-                if _tc_id in _already_done:
-                    continue
-                _tc_name = _tc.get("name", "")
-                if _tc_name == "message_ask_user":
-                    continue
-                try:
-                    _tc_src = _resolve(_tc_name).source
-                except _TSUErr:
-                    _tc_src = "native"
-                if _tc_src != "native":
-                    logger.info(
-                        "PE preflight mixed-batch guard: session=%s "
-                        "batch contains non-native tool '%s' (source=%s) "
-                        "alongside pending native tool '%s'. "
-                        "_pe_dispatch will fall back to legacy for the whole "
-                        "batch — routing preflight to legacy path to avoid "
-                        "split-brain.",
-                        session_id, _tc_name, _tc_src, pending_tool_name,
-                    )
-                    return True
-            return False
-        except Exception as _err:
-            logger.debug(
-                "PE preflight _batch_has_non_native_pending: graph state read failed for "
-                "session=%s (best-effort, returning False): %s",
-                session_id, _err,
-            )
-            return False
-
     async def _batch_has_non_pe_eligible_pending(
         self,
         task_flow: object,
@@ -1137,8 +1006,7 @@ class AgentService:
         pending_tool_name: str,
         tc: object,
     ) -> bool:
-        """PE-1 §3.2 Correction E — source-aware variant of
-        ``_batch_has_non_native_pending``.
+        """PE-1 §3.2 Correction E — source-aware batch eligibility check.
 
         Returns True if the checkpointed tool_calls batch contains any tool
         that is NOT PE-eligible under the current
@@ -1687,8 +1555,7 @@ class AgentService:
             # Fix: mirror the _pe_dispatch batch-level check here. Read the
             # active tool_calls batch from the graph checkpoint and if ANY
             # ineligible tool is present → fall back to legacy preflight for
-            # the whole batch. The _batch_has_non_native_pending helper is kept
-            # alongside for one PR-1b cycle so callers can migrate piecemeal.
+            # the whole batch.
             if await self._batch_has_non_pe_eligible_pending(
                 _task_flow, session_id, pending_detail.tool_name,
                 _tc_for_per_call_gate,

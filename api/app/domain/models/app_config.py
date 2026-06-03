@@ -276,10 +276,6 @@ class ToolConfirmationConfig(BaseModel):
         default=True,
         description="PE-3 A2A path",
     )
-    permission_engine_a4_events_enabled: bool = Field(
-        default=True,
-        description="A4-0 SessionModeChangedEvent SSE; False -> suppress emission",
-    )
 
 
 class ExecutionConfig(BaseModel):
@@ -441,9 +437,9 @@ class ToolRuntimeConfig(BaseModel):
     """R2 CS2 tool runtime limits.
 
     Plumbed from ``config.yaml → AppConfig → react_graph.build_react_graph
-    → configurable`` so Layer 1 (``_run_policy_chain``) and Layer 2
-    (``_invoke_wrapper``) can read the values at runtime instead of
-    depending on the module-level ``_SMART_APPROVE_TIMEOUT_SECONDS`` /
+    → configurable`` so Layer 2 (``_invoke_wrapper``) can read the
+    values at runtime instead of depending on the module-level
+    ``_SMART_APPROVE_TIMEOUT_SECONDS`` /
     ``_MAX_WRAPPER_OUTPUT_BYTES`` constants.
 
     Defaults match the original module constants so zero-config

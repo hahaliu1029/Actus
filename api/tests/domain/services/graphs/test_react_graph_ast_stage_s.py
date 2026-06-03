@@ -1,45 +1,11 @@
-"""N1 — _stage_s_ast_validate stub filled per spec §4.5(a)."""
+"""N1 — production tool_node shell-AST gate structural assertions.
+
+The async ``_stage_s_ast_validate`` stub + its 3 unit tests were removed in
+PE-4a (dead scaffolding deleted with ``_run_policy_chain``). The two
+remaining tests AST-scan the LIVE ``tool_node`` to lock the production N1
+shell AST validator gate.
+"""
 from __future__ import annotations
-
-import pytest
-
-from app.domain.models.tool_result import Denied
-from app.domain.services.graphs.react_graph import _stage_s_ast_validate
-
-pytestmark = pytest.mark.anyio
-
-
-async def test_stage_s_denies_dangerous_shell():
-    tool_call = {
-        "name": "shell_execute",
-        "args": {"command": "rm -rf /", "exec_dir": "/root"},
-        "id": "tc_test_1",
-    }
-    outcome = await _stage_s_ast_validate(tool_call)
-    assert isinstance(outcome, Denied)
-    assert outcome.reason.type == "ast_validator"
-    assert outcome.reason.code in {"fs_destructive", "cwd_boundary"}
-
-
-async def test_stage_s_allows_benign_shell():
-    tool_call = {
-        "name": "shell_execute",
-        "args": {"command": "ls -la", "exec_dir": "/root"},
-        "id": "tc_test_2",
-    }
-    outcome = await _stage_s_ast_validate(tool_call)
-    assert outcome is None
-
-
-async def test_stage_s_uses_default_cwd_when_exec_dir_empty():
-    tool_call = {
-        "name": "shell_execute",
-        "args": {"command": "rm -rf /etc", "exec_dir": ""},
-        "id": "tc_test_3",
-    }
-    outcome = await _stage_s_ast_validate(tool_call)
-    assert isinstance(outcome, Denied)
-    assert outcome.reason.code in {"fs_destructive", "cwd_boundary"}
 
 
 def test_production_tool_node_has_ast_validator_call_in_shell_branch():
