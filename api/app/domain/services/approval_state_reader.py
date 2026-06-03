@@ -1,18 +1,19 @@
-"""R5 CS4 Reader：grants 查询 + 优先级判定 + 过渡期 legacy fallback。
+"""R5 CS4 Reader：grants 查询 + 优先级判定。
 
-Reader 不直接依赖 SQLAlchemy。通过两个 Protocol 抽象：
-- ``ApprovalGrantQuery``：grant 数据源（线上由 ``ApprovalGrantRepository``
-  的 ``find_active_grants`` 实现）
-- ``LegacyRuleQuery``：旧 ``tool_approval_rules`` 表的 fallback 适配器
+Reader 不直接依赖 SQLAlchemy。通过 ``ApprovalGrantQuery`` Protocol 抽象
+grant 数据源（线上由 ``ApprovalGrantRepository`` 的 ``find_active_grants``
+实现）。
 
-Phase 1 优先级（design doc §Recommended Approach）：
+优先级（design doc §Recommended Approach）：
   1. ``always_deny`` 任意命中 → ``deny``
   2. ``always_allow`` 任意命中 → ``allow``
   3. ``session_allow`` 精确 ``session_id + arg_digest`` 命中 → ``allow``
   4. ``session_deny`` **不** surface（审计保留，Reader 返 ``no_match``，等
      Phase 2 PermissionEngine retry policy 再开）
-  5. 以上都 miss 且 ``legacy_rule_fallback=True`` → 查旧表
-  6. 以上都 miss → ``no_match``
+  5. 以上都 miss → ``no_match``
+
+PE-4d1：旧 ``tool_approval_rules`` 表的 legacy fallback（former Priority 5）
+已退役，Reader 只读 grants。
 """
 
 from __future__ import annotations
@@ -35,32 +36,17 @@ class ApprovalGrantQuery(Protocol):
     ) -> list[ApprovalGrant]: ...
 
 
-class LegacyRuleQuery(Protocol):
-    """过渡期旧规则表适配器协议。"""
-
-    async def check(
-        self,
-        user_id: str,
-        tool_name: str,
-        primary_arg: str,
-        dir_arg: Optional[str],
-    ) -> CheckResult: ...
-
-
 class ApprovalStateReader:
     """CS4 Reader。
 
-    AppConfig 的 ``legacy_rule_fallback: bool`` 决定是否注入 ``legacy_rule_query``。
-    Reader 自身不读环境变量，不读 config；由 DI 层根据 AppConfig 选择注入或不注入。
+    Reader 自身不读环境变量，不读 config；只读 grants 数据源。
     """
 
     def __init__(
         self,
         query: ApprovalGrantQuery,
-        legacy_rule_query: Optional[LegacyRuleQuery] = None,
     ) -> None:
         self._query = query
-        self._legacy_rule_query = legacy_rule_query
 
     async def check(
         self,
@@ -103,10 +89,5 @@ class ApprovalStateReader:
 
         # Priority 4: session_deny 不 surface（design doc §Open Questions 1）
 
-        # Priority 5: 过渡期 legacy rules fallback
-        if self._legacy_rule_query is not None:
-            return await self._legacy_rule_query.check(
-                user_id, tool_name, primary_arg, dir_arg
-            )
-
+        # PE-4d1: legacy tool_approval_rules fallback (former Priority 5) retired.
         return "no_match"

@@ -1,4 +1,4 @@
-"""R5 CS4 Reader 单元测试（mock ApprovalGrantQuery + LegacyRuleQuery）。"""
+"""R5 CS4 Reader 单元测试（mock ApprovalGrantQuery）。"""
 
 from __future__ import annotations
 
@@ -107,21 +107,17 @@ async def test_reader_ignores_session_deny_phase1() -> None:
     assert await reader.check("u1", "s1", "shell_execute", "d1", "x", None) == "no_match"
 
 
-@pytest.mark.anyio
-async def test_reader_legacy_fallback_called_when_injected() -> None:
-    """无 new grant 命中 + 注入了 legacy query → 走 legacy。"""
-    legacy = AsyncMock()
-    legacy.check = AsyncMock(return_value="allow")
-    reader = ApprovalStateReader(query=_query([]), legacy_rule_query=legacy)
-    result = await reader.check("u1", "s1", "shell_execute", "d1", "x", None)
-    assert result == "allow"
-    legacy.check.assert_awaited_once_with("u1", "shell_execute", "x", None)
+def test_reader_no_longer_accepts_legacy_rule_query() -> None:
+    """PE-4d1: the legacy tool_approval_rules fallback is retired — the
+    ctor must reject any `legacy_rule_query` kwarg."""
+    with pytest.raises(TypeError):
+        ApprovalStateReader(query=_query([]), legacy_rule_query=object())  # type: ignore[call-arg]
 
 
 @pytest.mark.anyio
-async def test_reader_legacy_fallback_off_when_not_injected() -> None:
-    """未注入 legacy query → 直接返 no_match，不调 fallback。"""
-    reader = ApprovalStateReader(query=_query([]), legacy_rule_query=None)
+async def test_reader_grants_miss_returns_no_match() -> None:
+    """PE-4d1: grants miss → no_match directly (no legacy fallback branch)."""
+    reader = ApprovalStateReader(query=_query([]))
     assert await reader.check("u1", "s1", "shell_execute", "d1", "x", None) == "no_match"
 
 

@@ -2,21 +2,20 @@
 
 覆盖：
 - ``UowApprovalGrantQuery`` 正确把入参透传给 ``uow.approval_grants.find_active_grants``
-- ``SessionLegacyRuleQuery`` always_deny 优先级 / always_allow / no_match 三条路径
+
+PE-4d1：``SessionLegacyRuleQuery`` 适配器已删除（legacy tool_approval_rules
+read path 退役）。
 """
 
 from __future__ import annotations
 
-from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.application.services.approval_state_adapters import (
-    SessionLegacyRuleQuery,
     UowApprovalGrantQuery,
 )
-from app.domain.models.tool_approval_rule import ToolApprovalRule
 
 pytestmark = pytest.mark.anyio
 
@@ -69,132 +68,3 @@ async def test_grant_query_allows_none_session_id() -> None:
     uow.approval_grants.find_active_grants.assert_awaited_once_with(
         user_id="u1", session_id=None, tool_name="shell_execute"
     )
-
-
-# ---------------- SessionLegacyRuleQuery ----------------
-
-
-class _FakeSessionCtx:
-    """async_sessionmaker() 返值的最小 async context manager mock。"""
-
-    async def __aenter__(self):
-        return MagicMock(name="session")
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return None
-
-
-def _fake_session_factory():
-    return MagicMock(return_value=_FakeSessionCtx())
-
-
-def _rule(
-    *,
-    rule: str,
-    command_pattern: str = "ls *",
-    dir_pattern: str = "",
-    tool_name: str = "shell_execute",
-) -> ToolApprovalRule:
-    return ToolApprovalRule(
-        user_id="u1",
-        tool_name=tool_name,
-        rule=rule,
-        command_pattern=command_pattern,
-        dir_pattern=dir_pattern,
-    )
-
-
-async def test_legacy_query_returns_no_match_when_no_rules(monkeypatch) -> None:
-    """空规则集 → no_match。"""
-
-    class _StubRepo:
-        def __init__(self, _session):
-            pass
-
-        async def find_by_user_and_tool(self, user_id, tool_name):
-            return []
-
-    monkeypatch.setattr(
-        "app.infrastructure.repositories.db_tool_approval_rule_repository."
-        "DBToolApprovalRuleRepository",
-        _StubRepo,
-    )
-
-    q = SessionLegacyRuleQuery(session_factory=_fake_session_factory())
-    out = await q.check("u1", "shell_execute", "ls /", "")
-    assert out == "no_match"
-
-
-async def test_legacy_query_always_deny_wins_over_allow(monkeypatch) -> None:
-    """同工具同时匹配 allow 和 deny → deny 优先（Priority 5a）。"""
-    rules = [
-        _rule(rule="always_allow", command_pattern="ls *"),
-        _rule(rule="always_deny", command_pattern="ls *"),
-    ]
-
-    class _StubRepo:
-        def __init__(self, _session):
-            pass
-
-        async def find_by_user_and_tool(self, user_id, tool_name):
-            return rules
-
-    monkeypatch.setattr(
-        "app.infrastructure.repositories.db_tool_approval_rule_repository."
-        "DBToolApprovalRuleRepository",
-        _StubRepo,
-    )
-
-    q = SessionLegacyRuleQuery(session_factory=_fake_session_factory())
-    out = await q.check("u1", "shell_execute", "ls /", "")
-    assert out == "deny"
-
-
-async def test_legacy_query_always_allow_when_only_allow_matches(monkeypatch) -> None:
-    """仅 always_allow 命中 → allow。"""
-    rules = [_rule(rule="always_allow", command_pattern="ls *")]
-
-    class _StubRepo:
-        def __init__(self, _session):
-            pass
-
-        async def find_by_user_and_tool(self, user_id, tool_name):
-            return rules
-
-    monkeypatch.setattr(
-        "app.infrastructure.repositories.db_tool_approval_rule_repository."
-        "DBToolApprovalRuleRepository",
-        _StubRepo,
-    )
-
-    q = SessionLegacyRuleQuery(session_factory=_fake_session_factory())
-    out = await q.check("u1", "shell_execute", "ls /", "")
-    assert out == "allow"
-
-
-async def test_legacy_query_dir_pattern_filters_non_matching(monkeypatch) -> None:
-    """``dir_pattern`` 非空且 dir_arg 不匹配 → 规则不命中，返 no_match。"""
-    rules = [
-        _rule(
-            rule="always_allow",
-            command_pattern="rm *",
-            dir_pattern="/tmp/*",
-        )
-    ]
-
-    class _StubRepo:
-        def __init__(self, _session):
-            pass
-
-        async def find_by_user_and_tool(self, user_id, tool_name):
-            return rules
-
-    monkeypatch.setattr(
-        "app.infrastructure.repositories.db_tool_approval_rule_repository."
-        "DBToolApprovalRuleRepository",
-        _StubRepo,
-    )
-
-    q = SessionLegacyRuleQuery(session_factory=_fake_session_factory())
-    out: Optional[str] = await q.check("u1", "shell_execute", "rm file.txt", "/etc/x")
-    assert out == "no_match"

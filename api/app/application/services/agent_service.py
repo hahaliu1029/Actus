@@ -470,24 +470,17 @@ class AgentService:
         # ApprovalStateWriter (R5b-3) 完全替换；旧 Redis-based cache 构造移除。
         #
         # R5b-2: Build ApprovalStateReader (DB-only; I7: Redis 不可用时仍可 allow/deny)
+        # PE-4d1: legacy tool_approval_rules fallback retired — reader reads
+        # grants only (Priority 1-4). No legacy query injection.
         approval_state_reader = None
         try:
             from app.application.services.approval_state_adapters import (
-                SessionLegacyRuleQuery,
                 UowApprovalGrantQuery,
             )
             from app.domain.services.approval_state_reader import ApprovalStateReader
-            from app.infrastructure.storage.postgres import get_postgres
 
             grant_query = UowApprovalGrantQuery(uow_factory=self._uow_factory)
-            legacy_query = None
-            if snap.agent_config.tool_confirmation.legacy_rule_fallback:
-                legacy_query = SessionLegacyRuleQuery(
-                    session_factory=get_postgres().session_factory,
-                )
-            approval_state_reader = ApprovalStateReader(
-                query=grant_query, legacy_rule_query=legacy_query,
-            )
+            approval_state_reader = ApprovalStateReader(query=grant_query)
         except Exception:
             logger.warning(
                 "Failed to build ApprovalStateReader; tool pre-check will "
@@ -1163,24 +1156,16 @@ class AgentService:
             return None, None
 
         # Build reader (fail-open)
+        # PE-4d1: legacy tool_approval_rules fallback retired — grants-only reader.
         approval_state_reader = None
         try:
             from app.application.services.approval_state_adapters import (
-                SessionLegacyRuleQuery,
                 UowApprovalGrantQuery,
             )
             from app.domain.services.approval_state_reader import ApprovalStateReader
-            from app.infrastructure.storage.postgres import get_postgres
 
             grant_query = UowApprovalGrantQuery(uow_factory=self._uow_factory)
-            legacy_query = None
-            if tc is not None and getattr(tc, "legacy_rule_fallback", False):
-                legacy_query = SessionLegacyRuleQuery(
-                    session_factory=get_postgres().session_factory,
-                )
-            approval_state_reader = ApprovalStateReader(
-                query=grant_query, legacy_rule_query=legacy_query,
-            )
+            approval_state_reader = ApprovalStateReader(query=grant_query)
         except Exception:
             pass
 

@@ -173,7 +173,7 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
         agent_config=SimpleNamespace(
             # PE-4c: master-off so _create_task skips the PE build (this test verifies
             # task registration via supervisor/cancelable Task, not confirmation).
-            tool_confirmation=SimpleNamespace(enabled=False, legacy_rule_fallback=False)
+            tool_confirmation=SimpleNamespace(enabled=False)
         ),
         mcp_config=object(),
         a2a_config=object(),
@@ -215,6 +215,11 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
     assert created_runners == [_TaskClass.created_with]
     assert callable(task.cancel)
     assert created_runners[0].kwargs["cost_callback_handler"] is cost_callback_handler
+    # PE-4d1 guard: ApprovalStateReader (the live grants reader, a KEEP authority)
+    # must be constructed and threaded into the runner. The create-site wraps
+    # construction in try/except — a missed/renamed kwarg would silently leave
+    # this None, disabling the grants reader. Lock NON-None here.
+    assert created_runners[0].kwargs["approval_state_reader"] is not None
     assert callback_builder_calls == [
         {
             "supervisor": service._supervisor,

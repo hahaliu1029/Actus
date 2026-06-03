@@ -168,7 +168,6 @@ def _make_service(
     # PE-4c: per-source flags retired; the master ``enabled`` switch is the
     # only PE-activation gate. ``pe_enabled`` now drives ``tc.enabled``.
     tc.enabled = pe_enabled
-    tc.legacy_rule_fallback = False
     agent_config.tool_confirmation = tc
     agent_config.memory = MagicMock()
     agent_config.execution = MagicMock()
@@ -1197,7 +1196,6 @@ def test_build_pe_ssm_for_resume_returns_none_when_confirmation_disabled() -> No
     agent_config = MagicMock()
     tc = MagicMock()
     tc.enabled = False
-    tc.legacy_rule_fallback = False
     agent_config.tool_confirmation = tc
     agent_config.memory = MagicMock()
     agent_config.execution = MagicMock()

@@ -1,16 +1,16 @@
 """R5b-1 DI wiring 单元测试：
 ``get_approval_state_writer`` / ``get_approval_state_reader`` factory 行为。
 
-不触发 ``_load_app_config`` 的真实文件 IO——通过 monkeypatch 替换为返回
-一个最小 AppConfig 的 stub。Writer factory 路径纯函数，无状态断言。
+PE-4d1：legacy ``tool_approval_rules`` fallback 退役后，reader factory 变成
+grants-only——既不读 ``_load_app_config``（曾用于读 ``legacy_rule_fallback``
+开关），也不调 ``get_postgres``（曾用于构造 ``SessionLegacyRuleQuery``）。
+本测试把这两个符号 monkeypatch 成会爆，固化"二者都不再被调用"这个契约。
+Writer factory 路径纯函数，无状态断言。
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 from app.application.services.approval_state_adapters import (
-    SessionLegacyRuleQuery,
     UowApprovalGrantQuery,
 )
 from app.application.services.approval_state_writer import ApprovalStateWriter
@@ -27,51 +27,32 @@ def test_writer_factory_returns_writer_bound_to_get_uow() -> None:
     assert writer._uow_factory is get_uow
 
 
-class _StubAppConfig:
-    """最小 stub：只暴露 agent_config.tool_confirmation.legacy_rule_fallback。"""
+def test_reader_factory_builds_grants_only_reader(monkeypatch) -> None:
+    """PE-4d1: Reader is grants-only — no SessionLegacyRuleQuery injection,
+    no legacy_rule_fallback config read, no get_postgres call.
 
-    def __init__(self, *, legacy_rule_fallback: bool) -> None:
-        tool_conf = MagicMock()
-        tool_conf.legacy_rule_fallback = legacy_rule_fallback
-        agent = MagicMock()
-        agent.tool_confirmation = tool_conf
-        self.agent_config = agent
+    Both ``_load_app_config`` (former legacy_rule_fallback read) and
+    ``get_postgres`` (former SessionLegacyRuleQuery session_factory) are
+    monkeypatched to raise: the grants-only factory must call neither, so a
+    future re-introduction of either call fails this test loudly instead of
+    silently resurrecting the legacy read path."""
 
-
-def test_reader_factory_with_legacy_fallback_enabled(monkeypatch) -> None:
-    """legacy_rule_fallback=True → Reader 注入 SessionLegacyRuleQuery。"""
-    monkeypatch.setattr(
-        service_dependencies,
-        "_load_app_config",
-        lambda: _StubAppConfig(legacy_rule_fallback=True),
-    )
-    # 避免真去初始化 Postgres 单例——只需返回有 session_factory 属性的对象
-    fake_pg = MagicMock()
-    fake_pg.session_factory = MagicMock(name="fake_session_factory")
-    monkeypatch.setattr(service_dependencies, "get_postgres", lambda: fake_pg)
-
-    reader = service_dependencies.get_approval_state_reader()
-    assert isinstance(reader, ApprovalStateReader)
-    assert isinstance(reader._query, UowApprovalGrantQuery)
-    assert isinstance(reader._legacy_rule_query, SessionLegacyRuleQuery)
-
-
-def test_reader_factory_with_legacy_fallback_disabled(monkeypatch) -> None:
-    """legacy_rule_fallback=False → Reader.legacy_rule_query is None。"""
-    monkeypatch.setattr(
-        service_dependencies,
-        "_load_app_config",
-        lambda: _StubAppConfig(legacy_rule_fallback=False),
-    )
-    # fallback 关闭时 get_postgres 不应被调用——给一个会爆的 stub 固化这个契约
-    def _boom():
+    def _boom_config():
         raise AssertionError(
-            "get_postgres should NOT be called when legacy_rule_fallback=False"
+            "get_approval_state_reader must NOT read app config after PE-4d1 "
+            "(legacy_rule_fallback retired)"
         )
 
-    monkeypatch.setattr(service_dependencies, "get_postgres", _boom)
+    def _boom_postgres():
+        raise AssertionError(
+            "get_approval_state_reader must NOT call get_postgres after PE-4d1 "
+            "(SessionLegacyRuleQuery retired)"
+        )
+
+    monkeypatch.setattr(service_dependencies, "_load_app_config", _boom_config)
+    monkeypatch.setattr(service_dependencies, "get_postgres", _boom_postgres)
 
     reader = service_dependencies.get_approval_state_reader()
     assert isinstance(reader, ApprovalStateReader)
     assert isinstance(reader._query, UowApprovalGrantQuery)
-    assert reader._legacy_rule_query is None
+    assert not hasattr(reader, "_legacy_rule_query")

@@ -360,8 +360,9 @@ def test_helper_detects_alias_bindings() -> None:
 
 
 def test_rule_6_no_env_var_legacy_fallback() -> None:
-    """``AppConfig.agent_config.tool_confirmation.legacy_rule_fallback`` 是唯一配置面。
-    禁止任何 ``os.environ.get("APPROVAL_LEGACY_RULE_FALLBACK", ...)`` 旁路。
+    """PE-4d1 退役了 ``legacy_rule_fallback`` 配置字段；本不变式现在守护：禁止任何
+    ``os.environ.get("APPROVAL_LEGACY_RULE_FALLBACK", ...)`` 环境变量旁路把已退役的
+    legacy ``tool_approval_rules`` fallback 偷偷复活。
     """
     violations: list[str] = []
     for py_path, rel in _iter_app_py_files():
