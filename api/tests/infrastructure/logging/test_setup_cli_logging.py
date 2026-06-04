@@ -149,7 +149,6 @@ def test_setup_cli_logging_is_idempotent(
     "module_name",
     [
         "app.cli.memory_reconcile",
-        "app.cli.backfill_approval_grants",
     ],
 )
 def test_cli_modules_can_resolve_setup_cli_logging(module_name: str) -> None:
@@ -171,3 +170,17 @@ def test_cli_modules_can_resolve_setup_cli_logging(module_name: str) -> None:
     # Sanity: the CLI module imports cleanly (would surface secondary
     # issues like circular imports introduced by the fix).
     assert hasattr(mod, "main")
+
+
+def test_backfill_cli_not_in_setup_cli_logging_parametrize() -> None:
+    """PE-4d3: the backfill CLI is deleted; it must not be import-resolved
+    by the parametrize list (which calls importlib.import_module on each
+    entry). A stale entry would turn the resolve test into ModuleNotFoundError.
+    """
+    import inspect
+
+    src = inspect.getsource(test_cli_modules_can_resolve_setup_cli_logging)
+    assert "app.cli.backfill_approval_grants" not in src, (
+        "backfill_approval_grants CLI was deleted in PE-4d3; remove it from "
+        "the module_name parametrize list in test_cli_modules_can_resolve_setup_cli_logging"
+    )

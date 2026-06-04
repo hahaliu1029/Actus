@@ -1,7 +1,7 @@
 """R5 CS4 approval grant 策略辅助。
 
-集中放置 grant 过期时间、命令/目录匹配等纯函数，供 Writer / Reader /
-backfill 脚本复用，保证语义一致。
+集中放置 grant 过期时间、命令/目录匹配等纯函数，供 Writer / Reader
+复用，保证语义一致。
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ def to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
     使用场景：
     - ``DBApprovalGrantRepository.create()`` 写 ``expires_at`` 前归一
     - ``DBApprovalGrantRepository.find_active_grants()`` 计算 now 的比较值
-    - ``app.cli.backfill_approval_grants._build_payload_row()`` 归一 ``created_at``
     """
     if dt is None:
         return None
@@ -53,9 +52,9 @@ def match_command_and_dir(
     pattern: str,
     dir_pattern: str,
 ) -> bool:
-    """Legacy rule / grant 命中判定。
+    """Grant 命中判定。
 
-    语义锁定到 ``ToolApprovalRule.matches`` / ``ApprovalGrant.matches``：
+    语义锁定到 ``ApprovalGrant.matches``：
     - ``primary_arg`` 必须 fnmatch ``pattern``
     - ``dir_pattern`` 为空串：不约束目录
     - ``dir_pattern`` 非空：``dir_arg`` 不能为 None 且要 fnmatch ``dir_pattern``

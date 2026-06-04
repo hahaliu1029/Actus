@@ -63,9 +63,10 @@ _LIFECYCLE_TERMINAL_MODES = {
 
 class DefaultPermissionEngine(PermissionEngine):
     """Rule-pattern matching is delegated to `ApprovalStateReader.check`,
-    which already consults both `approval_grants` and (legacy fallback)
-    `tool_approval_rules`. PE-0 does not hold any direct tool_approval_rule
-    repository — keeping the domain service free of infra imports.
+    which consults `approval_grants` only — the legacy `tool_approval_rules`
+    fallback was retired in PE-4d1 (the table was dropped in PE-4d2). The
+    engine holds no repository directly, keeping the domain service free of
+    infra imports.
 
     Policy lookup is delegated to a per-call UoW via the new
     `uow.user_tool_approval_policy` slot (added to IUnitOfWork in PE-0 —

@@ -46,10 +46,8 @@ class ApprovalGrant(BaseModel):
     def matches(self, primary_arg: str, dir_arg: Optional[str]) -> bool:
         """Shell-glob match on ``primary_arg`` + optional ``dir_arg``.
 
-        Mirrors the glob semantics of the legacy ``ToolApprovalRule.matches``.
-        PE-4d1 retired the legacy ``tool_approval_rules`` fallback, so the
-        Reader now evaluates grants only — this is the sole glob matcher on the
-        live read path.
+        Shell-glob semantics: ``primary_arg`` must fnmatch ``self.primary_arg``;
+        a non-empty ``self.dir_arg`` additionally requires ``dir_arg`` to fnmatch it.
         """
         if not fnmatch(primary_arg, self.primary_arg):
             return False

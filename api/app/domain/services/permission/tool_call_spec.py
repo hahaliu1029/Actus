@@ -17,7 +17,8 @@ class ToolCallSpec:
     ``tool_args`` should be already sanitized (no PII / secret literals).
     ``primary_arg`` / ``dir_arg`` / ``arg_digest`` follow S1 RiskAssessment
     normalization (``api/app/domain/services/risk_assessor.py``) so they
-    match ``tool_approval_rules.command_pattern`` / ``dir_pattern`` keys.
+    match the ``approval_grants`` ``primary_arg`` / ``dir_arg`` columns that
+    ``ApprovalGrant.matches`` globs against.
 
     PE-1 adds ``source_metadata`` — typed Union of source-specific metadata
     set by the caller (tool_node) before invoking pe.evaluate. SkillSource
