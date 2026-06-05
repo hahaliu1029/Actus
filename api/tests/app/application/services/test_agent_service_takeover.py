@@ -48,6 +48,10 @@ class _SessionRepo:
             self._session.completed_at = datetime.now()
             self._session.terminal_reason = terminal_reason
 
+    async def read_status_with_revision(self, session_id: str):
+        status = self._session.status if self._session else SessionStatus.RUNNING
+        return status, 0
+
     async def add_event(self, session_id: str, event) -> None:
         self.add_event_calls.append((session_id, event))
 

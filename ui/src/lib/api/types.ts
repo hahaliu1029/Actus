@@ -746,6 +746,7 @@ export type SSEEventType =
   | "compaction"
   | "done"
   | "error"
+  | "session_mode_changed"
   | "sessions";
 
 export type ToolConfirmationEventData = {
@@ -760,6 +761,19 @@ export type ToolConfirmationEventData = {
   suggested_alternative: string | null;
   approval_options: string[];
   timeout_seconds: number;
+};
+
+export type SessionModeChangedEventData = {
+  event_id?: string;
+  created_at?: number;
+  // R4#P2: the backend serializes Optional fields with model_dump_json() (no
+  // exclude_none — interfaces/schemas/event.py:78), so None is emitted as JSON
+  // `null`, NOT omitted. These must be `| null`, not merely optional.
+  seq?: number | null;
+  to: SessionStatus;
+  from_mode?: SessionStatus | null;
+  reason: string;
+  mode_revision?: number | null;
 };
 
 export type SSEEventData =
@@ -779,6 +793,7 @@ export type SSEEventData =
   | { type: "compaction"; data: CompactionEventData }
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
+  | { type: "session_mode_changed"; data: SessionModeChangedEventData }
   | { type: "sessions"; data: ListSessionResponse };
 
 export type SSEEventHandler = (event: SSEEventData) => void;

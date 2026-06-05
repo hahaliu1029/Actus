@@ -310,6 +310,24 @@ class SandboxStateChangedEvent(BaseEvent):
     reason: Optional[str] = None  # DestroyReason.value or free-text
 
 
+# A4-0: control-mode subset of SessionStatus values. Typed as str/Literal (NOT
+# SessionStatus) to avoid an import cycle — session.py imports event.py.
+ModeLiteral = Literal["running", "waiting", "takeover_pending", "takeover"]
+
+
+class SessionModeChangedEvent(BaseEvent):
+    """A4-0: unified control-mode-changed signal. Additive — emitted alongside
+    WaitEvent/ControlEvent. ``to`` is authoritative; ``from_mode``/``mode_revision``
+    are best-effort context for idempotent client reconciliation (LWW by
+    ``mode_revision``)."""
+
+    type: Literal["session_mode_changed"] = "session_mode_changed"
+    to: ModeLiteral  # new control mode (authoritative), str value
+    from_mode: Optional[ModeLiteral] = None  # prior mode if cheaply known
+    reason: str  # server-fixed constant per emit site (INV-6)
+    mode_revision: Optional[int] = None  # captured in the status-write txn
+
+
 class ExecutionStatePayload(BaseModel):
     """B3-core supervisor execution state snapshot (spec v3 §3.3)."""
 
@@ -452,6 +470,7 @@ Event = Annotated[
         HealthEvent,
         ToolConfirmationEvent,
         SandboxStateChangedEvent,
+        SessionModeChangedEvent,  # A4-0
         ExecutionStateChangedEvent,  # B3-core PR-1
         OwnerConflictEvent,           # B3-core PR-1
         CoordinatorDispatchEvent,     # C2 PR-8

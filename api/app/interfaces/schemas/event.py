@@ -17,6 +17,7 @@ from app.domain.models.event import (
     HealthStatus,
     PlanEvent,
     SandboxStateChangedEvent,
+    SessionModeChangedEvent,
     StepEvent,
     ToolConfirmationEvent,
     ToolEvent,
@@ -527,6 +528,22 @@ class SandboxStateChangedSSEEvent(BaseSSEEvent):
         )
 
 
+class SessionModeChangedEventData(BaseEventData):
+    """A4-0 unified control-mode-changed payload."""
+
+    to: str
+    from_mode: Optional[str] = None
+    reason: str
+    mode_revision: Optional[int] = None
+
+
+class SessionModeChangedSSEEvent(BaseSSEEvent):
+    """A4-0 control-mode-changed流式事件."""
+
+    event: Literal["session_mode_changed"] = "session_mode_changed"
+    data: SessionModeChangedEventData
+
+
 # ---------------------------------------------------------------------------
 # [C2 PR-8 §13] Coordinator SSE events.
 #
@@ -671,6 +688,7 @@ AgentSSEEvent = Union[
     HealthSSEEvent,
     ToolConfirmationSSEEvent,
     SandboxStateChangedSSEEvent,
+    SessionModeChangedSSEEvent,
     CoordinatorDispatchSSEEvent,
     CoordinatorWorkerSpawnedSSEEvent,
     CoordinatorReduceSSEEvent,

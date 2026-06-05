@@ -1289,3 +1289,231 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
     setMessageSpy.mockRestore();
   });
 });
+
+// A4-0 Task 11 — live reducer status path for session_mode_changed.
+// Mirrors the mockChat-driven live-event suite above (870-1000): it captures
+// onEvent via mockChat(api, true) and starts the chat through sendChat so
+// chatSessionId/isChatting are set, then fires the new event and asserts the
+// reducer's status authority — WITHOUT ending the stream.
+describe("live reducer honours session_mode_changed (status authority, no stream reset)", () => {
+  type ChatCallbacks = {
+    onEvent: SSEEventHandler;
+    onError: (error: Error) => void;
+    onClose: () => void;
+    onConnected: () => void;
+  };
+
+  function mockChat(api: SessionApi, simulateConnected: boolean): ChatCallbacks {
+    const cbs = {} as ChatCallbacks;
+    (api.chat as ReturnType<typeof vi.fn>).mockImplementation(
+      (
+        _sid: string,
+        _params: ChatParams,
+        onEvent: SSEEventHandler,
+        onError: (error: Error) => void,
+        onClose: () => void,
+        onConnected: () => void
+      ) => {
+        cbs.onEvent = onEvent;
+        cbs.onError = onError;
+        cbs.onClose = onClose;
+        cbs.onConnected = onConnected;
+        if (simulateConnected && onConnected) onConnected();
+        return () => {};
+      }
+    );
+    return cbs;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        events: [],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+      _isRecovering: false,
+    });
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("(a) updates status from the mode event and does NOT reset streaming", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "session_mode_changed",
+      data: { to: "takeover_pending", reason: "takeover_requested", mode_revision: 1 },
+    });
+
+    const st = useSessionStore.getState();
+    expect(st.currentSession?.status).toBe("takeover_pending");
+    // session_mode_changed must NOT end the stream.
+    expect(st.isChatting).toBe(true);
+    expect(st.chatSessionId).toBe("s1");
+  });
+
+  it("(b) live mode_revision LWW: a later lower-revision event does NOT regress", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "session_mode_changed",
+      data: { to: "takeover", reason: "takeover_started", mode_revision: 10 },
+    });
+    cbs.onEvent({
+      type: "session_mode_changed",
+      data: { to: "running", reason: "takeover_ended", mode_revision: 9 },
+    });
+
+    // rev 10 wins over the later rev 9 (max mode_revision LWW).
+    expect(useSessionStore.getState().currentSession?.status).toBe("takeover");
+  });
+
+  it("(c) terminal precedence: a stale mode event does NOT resurrect completed", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+
+    await useSessionStore.getState().sendChat("s1", {});
+    // Pin the current session to a terminal status before firing the mode event.
+    const stBefore = useSessionStore.getState();
+    useSessionStore.setState({
+      currentSession: { ...stBefore.currentSession!, status: "completed" },
+    });
+    cbs.onEvent({
+      type: "session_mode_changed",
+      data: { to: "takeover", reason: "takeover_started", mode_revision: 99 },
+    });
+
+    // terminal kept — a stale control mode must not resurrect a terminal session.
+    expect(useSessionStore.getState().currentSession?.status).toBe("completed");
+  });
+});
+
+describe("recoverSession honours session_mode_changed (backward override)", () => {
+  beforeEach(() => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "t",
+        status: "takeover",
+        events: [],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+    vi.clearAllMocks();
+  });
+
+  it("a backward takeover→running mode event wins over the monotonic merge", async () => {
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        {
+          event: "session_mode_changed",
+          data: {
+            to: "running",
+            reason: "takeover_ended",
+            mode_revision: 12,
+            event_id: "e1",
+          },
+        },
+      ],
+      session_status: "takeover",
+      has_more: false,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    expect(useSessionStore.getState().currentSession!.status).toBe("running");
+  });
+
+  it("zero-event recover: terminal remote keeps completed despite a stale local mode event (R10#P1)", async () => {
+    // local has a stale takeover mode event but the session actually completed
+    // (the `done` event is NOT in local.events — applySSEToSession drops it).
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "t",
+        status: "completed",
+        events: [
+          { event: "session_mode_changed", data: { to: "takeover", reason: "takeover_started", mode_revision: 5 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [],                 // zero new events → zero-event branch
+      session_status: "completed",
+      has_more: false,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    expect(useSessionStore.getState().currentSession!.status).toBe("completed");
+  });
+});
+
+describe("fetchSessionById honours session_mode_changed control transitions (R7)", () => {
+  it("end-takeover: local takeover + remote running + merged mode(running) → running", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1", title: "t", status: "takeover",
+        events: [
+          { event: "control", data: { action: "started", source: "user" } },
+        ],
+      },
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1", title: "t", status: "running",
+      events: [
+        { event: "session_mode_changed",
+          data: { to: "running", reason: "takeover_ended", mode_revision: 12, event_id: "e1" } },
+      ],
+    });
+
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(useSessionStore.getState().currentSession!.status).toBe("running");
+  });
+
+  it("reopen: local completed + remote takeover_pending + merged mode → takeover_pending", async () => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: { session_id: "s1", title: "t", status: "completed", events: [] },
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1", title: "t", status: "takeover_pending",
+      events: [
+        { event: "control", data: { action: "reopened", source: "user" } },
+        { event: "session_mode_changed",
+          data: { to: "takeover_pending", reason: "takeover_reopened", mode_revision: 20, event_id: "e2" } },
+      ],
+    });
+
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(useSessionStore.getState().currentSession!.status).toBe("takeover_pending");
+  });
+});

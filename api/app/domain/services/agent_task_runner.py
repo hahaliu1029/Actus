@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict, FrozenSet, List, Optional
 
 if TYPE_CHECKING:
@@ -57,6 +58,7 @@ from app.domain.models.event import (
     MCPToolContent,
     MessageEvent,
     SearchToolContent,
+    SessionModeChangedEvent,
     ShellToolContent,
     SkillToolContent,
     StepEvent,
@@ -105,6 +107,16 @@ from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
 _EVENT_SEQ_TTL_SECONDS = 86400
+
+
+class FlowYieldSignal(Enum):
+    """A4-0 (D4): typed replacement for _emit_flow_event's "wait"/"takeover"
+    magic strings. Plain Enum (NOT str, Enum) so a stray ``== "wait"`` check
+    can never silently keep matching — the retirement is complete and
+    enforceable. Member identity is the signal; its value is never compared."""
+
+    WAIT = auto()  # WaitEvent / ToolConfirmationEvent → session WAITING
+    TAKEOVER_REQUESTED = auto()  # ControlEvent(REQUESTED) → TAKEOVER_PENDING
 
 
 class ToolFilterProviderFailure(Exception):
@@ -2794,7 +2806,39 @@ class AgentTaskRunner(TaskRunner):
         except Exception:
             return None
 
-    async def _emit_flow_event(self, task: Task, event: BaseEvent) -> str | None:
+    async def _emit_control_mode_changed(
+        self, task: Task, *, to: SessionStatus, reason: str
+    ) -> None:
+        """A4-0: write the control-mode status, capture mode_revision in the SAME
+        transaction (INV-2 — read-your-writes), then emit a SessionModeChangedEvent
+        on the live stream. The caller emits this BEFORE its trigger Wait/Control
+        event (INV-1 — the live consumer breaks on Wait/Control). from_mode is
+        always "running" on this path (the agent loop transitions from RUNNING)."""
+        async with self._uow:
+            await self._uow.session.update_status(self._session_id, to)
+            try:
+                _, rev = await self._uow.session.read_status_with_revision(
+                    self._session_id
+                )
+            except Exception:
+                rev = None
+                logger.warning(
+                    "会话[%s]读取mode_revision失败，省略该字段",
+                    self._session_id,
+                    exc_info=True,
+                )
+        await self._put_and_add_event(
+            task,
+            SessionModeChangedEvent(
+                to=to.value,
+                from_mode="running",
+                reason=reason,
+                mode_revision=rev,
+            ),
+            persist=True,
+        )
+
+    async def _emit_flow_event(self, task: Task, event: BaseEvent) -> Optional["FlowYieldSignal"]:
         """Emit a single flow event to the task output stream and apply side effects.
 
         Handles:
@@ -2803,9 +2847,11 @@ class AgentTaskRunner(TaskRunner):
         - Side effects: TitleEvent, MessageEvent, WaitEvent, ControlEvent
 
         Returns:
-            "wait"     — caller should return immediately (WaitEvent received)
-            "takeover" — caller should return immediately (ControlEvent REQUESTED received)
-            None       — continue normally
+            FlowYieldSignal.WAIT — caller should return immediately (WaitEvent /
+                ToolConfirmationEvent received → session WAITING)
+            FlowYieldSignal.TAKEOVER_REQUESTED — caller should return immediately
+                (ControlEvent REQUESTED received → TAKEOVER_PENDING)
+            None — continue normally
         """
         emitted_events: List[Event] = []
         if isinstance(event, MessageEvent) and event.role == "assistant":
@@ -2815,6 +2861,28 @@ class AgentTaskRunner(TaskRunner):
             emitted_events.append(event)
 
         for emitted_event in emitted_events:
+            # A4-0: control-mode triggers emit a SessionModeChangedEvent BEFORE
+            # the trigger event (INV-1) and after the status commit (INV-2).
+            # Triggers are always single-element emitted_events (only assistant
+            # MessageEvents are chunked), so this reorder is local.
+            if isinstance(emitted_event, (WaitEvent, ToolConfirmationEvent)):
+                await self._emit_control_mode_changed(
+                    task, to=SessionStatus.WAITING, reason="wait"
+                )
+                await self._put_and_add_event(task, emitted_event, persist=True)
+                return FlowYieldSignal.WAIT
+            if (
+                isinstance(emitted_event, ControlEvent)
+                and emitted_event.action == ControlAction.REQUESTED
+            ):
+                await self._emit_control_mode_changed(
+                    task,
+                    to=SessionStatus.TAKEOVER_PENDING,
+                    reason="takeover_requested",
+                )
+                await self._put_and_add_event(task, emitted_event, persist=True)
+                return FlowYieldSignal.TAKEOVER_REQUESTED
+
             should_persist = not (
                 isinstance(emitted_event, MessageEvent) and emitted_event.partial
             )
@@ -2835,21 +2903,6 @@ class AgentTaskRunner(TaskRunner):
                     await self._uow.session.increment_unread_message_count(
                         self._session_id
                     )
-            elif isinstance(emitted_event, (WaitEvent, ToolConfirmationEvent)):
-                async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, SessionStatus.WAITING
-                    )
-                return "wait"
-            elif (
-                isinstance(emitted_event, ControlEvent)
-                and emitted_event.action == ControlAction.REQUESTED
-            ):
-                async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, SessionStatus.TAKEOVER_PENDING
-                    )
-                return "takeover"
             # D5: Track watchdog termination
             elif isinstance(emitted_event, HealthEvent) and emitted_event.status in (
                 HealthStatus.TERMINATING, HealthStatus.TERMINATED,
@@ -4123,7 +4176,7 @@ class AgentTaskRunner(TaskRunner):
                             await self._handle_step_skill_lock(event, message_obj.message)
                             # 8-12. 发送事件到输出流并处理各类侧效应
                             result = await self._emit_flow_event(task, event)
-                            if result in ("wait", "takeover"):
+                            if result is not None:
                                 return
 
                         # 单条消息执行结束后重置step锁定状态
@@ -4323,7 +4376,7 @@ class AgentTaskRunner(TaskRunner):
                     await self._sync_message_attachments_to_storage(event)
 
                 result = await self._emit_flow_event(task, event)
-                if result in ("wait", "takeover"):
+                if result is not None:
                     return
 
             # FINISHING: run deferred post-processing then emit DoneEvent (mirrors invoke())

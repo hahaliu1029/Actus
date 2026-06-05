@@ -155,6 +155,19 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+const CONTROL_MODE_STATUSES: ReadonlySet<string> = new Set([
+  "running",
+  "waiting",
+  "takeover_pending",
+  "takeover",
+]);
+
+const TERMINAL_OR_FINISHING_STATUSES: ReadonlySet<string> = new Set([
+  "finishing",
+  "completed",
+  "timed_out",
+]);
+
 function resolveControlStatus(
   currentStatus: Session["status"],
   data: Record<string, unknown>
@@ -209,6 +222,17 @@ function resolveStatusFromEvent(
   }
   if (event.type === "wait" || event.type === "tool_confirmation") {
     return "waiting";
+  }
+  if (event.type === "session_mode_changed") {
+    // A4-0: terminal/finishing precedence — a stale control-mode signal must
+    // never regress a session already in finishing/completed/timed_out.
+    if (TERMINAL_OR_FINISHING_STATUSES.has(currentStatus)) {
+      return currentStatus;
+    }
+    const to = asString(asRecord(event.data).to);
+    return CONTROL_MODE_STATUSES.has(to)
+      ? (to as Session["status"])
+      : currentStatus;
   }
   // D5: Watchdog health events. TERMINATED pins the session to timed_out so
   // the subsequent "done" event doesn't collapse it back to "completed".
@@ -721,7 +745,54 @@ export function pickMoreAdvancedStatus(
 const SIGNAL_EVENT_TYPES = new Set([
   "done", "error", "wait", "tool_confirmation",
   "control", "health", "finishing", "sandbox_state_changed",
+  "session_mode_changed",
 ]);
+
+/**
+ * A4-0: the authoritative control mode = the `to` of the session_mode_changed
+ * event with the MAX mode_revision (LWW). Ties / missing revisions fall back to
+ * latest-by-array-order. Returns null when no control-mode signal is present.
+ */
+export function deriveLatestControlMode(
+  events: SessionEventRecord[]
+): Session["status"] | null {
+  // NOTE: a plain `for` loop, NOT `events.forEach(...)`. Under TS `strict`,
+  // assigning the closure-captured `best` inside a forEach callback narrows it
+  // to `never` at the post-loop return (verified: `TS2339: Property 'mode' does
+  // not exist on type 'never'`). The `for` loop keeps control-flow narrowing
+  // local and compiles clean (R2#P1).
+  let best: { rev: number | null; mode: Session["status"]; idx: number } | null =
+    null;
+  for (let idx = 0; idx < events.length; idx += 1) {
+    const event = events[idx];
+    if (event.event !== "session_mode_changed") {
+      continue;
+    }
+    const data = asRecord(event.data);
+    const to = asString(data.to);
+    if (!CONTROL_MODE_STATUSES.has(to)) {
+      continue;
+    }
+    const rawRev = data.mode_revision;
+    const rev: number | null =
+      typeof rawRev === "number" && Number.isFinite(rawRev) ? rawRev : null;
+    if (best === null) {
+      best = { rev, mode: to as Session["status"], idx };
+      continue;
+    }
+    // Both sides carry a revision → LWW by revision (tie → later array order).
+    // Either side MISSING a revision (in-txn read-fail → omitted, INV-2) → fall
+    // back to event order: the later event wins (idx strictly increases).
+    const wins =
+      rev !== null && best.rev !== null
+        ? rev > best.rev || (rev === best.rev && idx > best.idx)
+        : idx > best.idx;
+    if (wins) {
+      best = { rev, mode: to as Session["status"], idx };
+    }
+  }
+  return best === null ? null : best.mode;
+}
 
 export function deriveStatusFromEvents(
   events: SessionEventRecord[]
@@ -744,9 +815,55 @@ export function deriveStatusFromEvents(
   if (!sawSignal) {
     return null;
   }
-  // E1 normalization: "finishing" in a historical event log means the session
-  // completed — the live "finishing" transient state should not persist.
-  return derived === "finishing" ? "completed" : derived;
+  // E1 normalization: a historical "finishing" means the session completed.
+  const normalizedDerived: Session["status"] =
+    derived === "finishing" ? "completed" : derived;
+  // A4-0: control mode (max mode_revision) is authoritative over event-order
+  // derivation, EXCEPT when a lifecycle/terminal status already won (terminal
+  // precedence — a stale control mode must not mask completed/timed_out).
+  const controlMode = deriveLatestControlMode(events);
+  if (
+    controlMode !== null &&
+    !TERMINAL_OR_FINISHING_STATUSES.has(normalizedDerived)
+  ) {
+    return controlMode;
+  }
+  return normalizedDerived;
+}
+
+/**
+ * A4-0 (R7): resolve a merged session status. `deriveStatusFromEvents(events)`
+ * is the order-aware authority — it already applies max-mode_revision LWW AND
+ * terminal precedence by event order. When it yields a CONTROL mode, that mode
+ * is authoritative (a stale local/remote status must not monotonically win);
+ * otherwise fall back to the caller's existing monotonic pick.
+ */
+export function resolveMergedSessionStatus(
+  events: SessionEventRecord[],
+  remoteStatus: Session["status"] | null,
+  monotonicFallback: Session["status"] | null
+): Session["status"] | null {
+  // Terminal precedence (R10#P1): the authoritative remote (DB) status wins when
+  // it is terminal/finishing. `done`/terminal events are NOT in the event list —
+  // `applySSEToSession` drops `done` (session-store.ts:417) — so the events alone
+  // cannot carry terminal context; `remoteStatus` (the DB authority) is the only
+  // reliable "is this session terminal now". A stale local control-mode event
+  // must never resurrect a completed/timed_out session.
+  if (remoteStatus !== null && TERMINAL_OR_FINISHING_STATUSES.has(remoteStatus)) {
+    return remoteStatus;
+  }
+  // R9#P1: gate the override on a REAL session_mode_changed signal.
+  // deriveStatusFromEvents ALSO derives control modes from LEGACY wait/control
+  // events, so trusting it unconditionally would let a historical wait/control
+  // pull the UI back on a log with NO A4-0 mode event (legacy/pre-A4-0 sessions).
+  // deriveLatestControlMode considers ONLY session_mode_changed events.
+  if (deriveLatestControlMode(events) === null) {
+    return monotonicFallback;
+  }
+  // A mode signal exists and the session is NOT terminal → the order-aware
+  // control mode (max mode_revision, with control inference) is authoritative
+  // over the monotonic stale-local pick.
+  return deriveStatusFromEvents(events) ?? monotonicFallback;
 }
 
 function showMessage(type: "success" | "error" | "info", text: string) {
@@ -1049,11 +1166,20 @@ export const useSessionStore = create<SessionStore>()(
               events: mergedEvents,
               last_seq: nextLastSeq,
               supervisor_snapshot: normalizedRemote.supervisor_snapshot ?? null,
-              // E2: 防止远端滞后 status 覆盖本地已推导的更晚状态（如 timed_out）
-              status: pickMoreAdvancedStatus(
-                normalizedRemote.status,
-              localSession.status
-            ) ?? normalizedRemote.status,
+              // E2 + A4-0 (R7): control-mode transitions (end-takeover→running,
+              // reopen→takeover_pending) must win over a stale local status; a
+              // later terminal/finishing event still takes precedence by order.
+              // The monotonic pick is preserved as the fallback when no mode
+              // signal is present (R9#P1).
+              status:
+                resolveMergedSessionStatus(
+                  mergedEvents,
+                  normalizedRemote.status, // remote (DB) = terminal authority (R10#P1)
+                  pickMoreAdvancedStatus(
+                    normalizedRemote.status,
+                    localSession.status
+                  ) ?? normalizedRemote.status
+                ) ?? normalizedRemote.status,
           };
 
           if (isSameSessionSnapshot(localSession, nextSession)) {
@@ -1218,9 +1344,18 @@ export const useSessionStore = create<SessionStore>()(
             ) {
               finalStatus = remoteStatus;
             } else {
-              finalStatus =
+              const monotonic =
                 pickMoreAdvancedStatus(remoteStatus, local.status) ??
                 local.status;
+              // A4-0 (R7/R10): a local control-mode event (e.g. a backward
+              // takeover→running mode) wins over the monotonic pick, UNLESS the
+              // remote (DB) status is terminal/finishing.
+              finalStatus =
+                resolveMergedSessionStatus(
+                  local.events as SessionEventRecord[],
+                  remoteStatus,
+                  monotonic
+                ) ?? monotonic;
             }
             // B3-core PR-1 — only short-circuit when nothing actually changes.
             const nextLastSeq = Math.max(remoteLastSeq, local.last_seq ?? 0);
@@ -1262,12 +1397,18 @@ export const useSessionStore = create<SessionStore>()(
             local.events as SessionEventRecord[],
             normalized
           );
-          const finalStatus =
+          const monotonicStatus =
             pickMoreAdvancedStatus(
               remoteStatus,
               eventDerivedStatus,
               local.status
             ) ?? local.status;
+          // A4-0 (R7/R10): control mode (order-aware, max mode_revision) wins over
+          // the monotonic pick, UNLESS the remote (DB) status is terminal/finishing
+          // (resolveMergedSessionStatus checks `remoteStatus` first).
+          const finalStatus =
+            resolveMergedSessionStatus(merged, remoteStatus, monotonicStatus) ??
+            monotonicStatus;
           const nextLastSeq = Math.max(remoteLastSeq, local.last_seq ?? 0);
           const nextSnapshot = mergeSupervisorSnapshotByCursor(
             remoteSnapshot,
@@ -1494,6 +1635,37 @@ export const useSessionStore = create<SessionStore>()(
             }
 
             const next = applySSEToSession(current, event);
+
+            // A4-0: session_mode_changed updates the status authority ONLY — it
+            // does not end the stream or reset streaming flags (the trigger
+            // Wait/Control event that follows owns stream-end semantics). Without
+            // this branch the event would fall through to the unknown-type
+            // fallback below and wrongly reset status to "running".
+            if (event.type === "session_mode_changed") {
+              // Terminal precedence (R10#P1): if the session is already
+              // terminal/finishing, keep it — a stale live mode event must not
+              // resurrect it. `nextStatus = resolveStatusFromEvent(currentStatus,
+              // event)` returns the (terminal) currentStatus when it is terminal
+              // (the session_mode_changed case is terminal-guarded), and `done`
+              // is not in `next.events`, so we must check nextStatus, not derive
+              // from events. Otherwise: deriveStatusFromEvents over the accumulated
+              // `next.events` is the order-aware authority (max-mode_revision LWW),
+              // matching the merge paths.
+              const liveStatus = TERMINAL_OR_FINISHING_STATUSES.has(nextStatus)
+                ? nextStatus
+                : deriveStatusFromEvents(next.events as SessionEventRecord[]) ??
+                  nextStatus;
+              const liveSessions = updateSessionListStatus(
+                state.sessions,
+                sessionId,
+                liveStatus
+              );
+              return {
+                currentSession: { ...next, status: liveStatus },
+                sessions: liveSessions,
+              };
+            }
+
             const shouldResetStreaming = state.chatSessionId === sessionId;
 
             if (
