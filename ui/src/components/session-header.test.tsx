@@ -26,7 +26,11 @@ const {
     mockLogout: vi.fn(),
     mockUseIsMobile: vi.fn(),
     mockSessionState: {
-      currentSession: { title: "任务标题", status: "running" },
+      currentSession: { title: "任务标题", status: "running" } as {
+        title: string;
+        status: string;
+        session_id?: string;
+      },
       stopSession,
       deleteSession,
       fetchSessionById,
@@ -124,5 +128,113 @@ describe("SessionHeader", () => {
   it("顶部不再显示主动接管入口", () => {
     render(<SessionHeader sessionId="sid-3" />);
     expect(screen.queryByRole("button", { name: "主动接管" })).not.toBeInTheDocument();
+  });
+
+  // ---- A4-0 follow-up (a): session_id guard regression tests ----
+
+  it("路由切到 B 但 currentSession 仍是 A(takeover) 时，不渲染结束接管", () => {
+    mockSessionState.currentSession = {
+      session_id: "A",
+      status: "takeover",
+      title: "任务标题",
+    };
+    render(<SessionHeader sessionId="B" />);
+    expect(
+      screen.queryByRole("button", { name: "结束接管" })
+    ).not.toBeInTheDocument();
+    expect(mockEndTakeover).not.toHaveBeenCalled();
+  });
+
+  it("currentSession 与路由一致且为 takeover 时，渲染结束接管并对该 sessionId 调用 endTakeover", async () => {
+    const user = userEvent.setup();
+    mockSessionState.currentSession = {
+      session_id: "B",
+      status: "takeover",
+      title: "任务标题",
+    };
+    render(<SessionHeader sessionId="B" />);
+    const btn = screen.getByRole("button", { name: "结束接管" });
+    await user.click(btn);
+    expect(mockEndTakeover).toHaveBeenCalledWith("B", {
+      handoff_mode: "continue",
+    });
+  });
+
+  it("currentSession 与路由一致但非 takeover 时，结束接管隐藏、停止/删除仍在(INV-B)", () => {
+    mockSessionState.currentSession = {
+      session_id: "B",
+      status: "running",
+      title: "任务标题",
+    };
+    render(<SessionHeader sessionId="B" />);
+    expect(
+      screen.queryByRole("button", { name: "结束接管" })
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除" })).toBeInTheDocument();
+  });
+
+  it("从不匹配(A)切到匹配(B,takeover)后，结束接管由隐藏变为显示", () => {
+    mockSessionState.currentSession = {
+      session_id: "A",
+      status: "takeover",
+      title: "任务标题",
+    };
+    const { rerender } = render(<SessionHeader sessionId="B" />);
+    expect(
+      screen.queryByRole("button", { name: "结束接管" })
+    ).not.toBeInTheDocument();
+
+    mockSessionState.currentSession = {
+      session_id: "B",
+      status: "takeover",
+      title: "任务标题",
+    };
+    rerender(<SessionHeader sessionId="B" />);
+    expect(
+      screen.getByRole("button", { name: "结束接管" })
+    ).toBeInTheDocument();
+  });
+
+  it("移动端：currentSession 不匹配路由时，下拉菜单中无结束接管项", async () => {
+    const user = userEvent.setup();
+    mockUseIsMobile.mockReturnValue(true);
+    mockSessionState.currentSession = {
+      session_id: "A",
+      status: "takeover",
+      title: "任务标题",
+    };
+    render(<SessionHeader sessionId="B" />);
+    await user.click(screen.getByRole("button", { name: "更多操作" }));
+    expect(
+      screen.queryByRole("menuitem", { name: "结束接管" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("移动端：currentSession 匹配路由且 takeover 时，下拉菜单显示结束接管项", async () => {
+    const user = userEvent.setup();
+    mockUseIsMobile.mockReturnValue(true);
+    mockSessionState.currentSession = {
+      session_id: "B",
+      status: "takeover",
+      title: "任务标题",
+    };
+    render(<SessionHeader sessionId="B" />);
+    await user.click(screen.getByRole("button", { name: "更多操作" }));
+    expect(
+      await screen.findByRole("menuitem", { name: "结束接管" })
+    ).toBeInTheDocument();
+  });
+
+  it("非回归：停止按钮始终渲染且作用于路由 sessionId(无论 currentSession 是否匹配)", async () => {
+    const user = userEvent.setup();
+    mockSessionState.currentSession = {
+      session_id: "A",
+      status: "takeover",
+      title: "任务标题",
+    };
+    render(<SessionHeader sessionId="B" />);
+    await user.click(screen.getByRole("button", { name: "停止" }));
+    expect(mockStopSession).toHaveBeenCalledWith("B");
   });
 });

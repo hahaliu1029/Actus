@@ -40,7 +40,13 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [takeoverSubmitting, setTakeoverSubmitting] = useState(false);
 
-  const status = session?.status;
+  // A4-0 follow-up (a): only trust currentSession when it is THIS route's
+  // session. During an A→B route switch, fetchSessionById(B) is async, so
+  // currentSession can still be A — deriving the takeover control from a stale
+  // A would let "结束接管" fire endTakeover(B) on the wrong session. Mirror the
+  // page's visibleSession guard (app/sessions/[id]/page.tsx).
+  const isSessionLoaded = session?.session_id === sessionId;
+  const status = isSessionLoaded ? session?.status : undefined;
   const canEndTakeover = status === "takeover";
 
   const handleStop = async () => {

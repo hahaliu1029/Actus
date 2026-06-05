@@ -1517,3 +1517,138 @@ describe("fetchSessionById honours session_mode_changed control transitions (R7)
     expect(useSessionStore.getState().currentSession!.status).toBe("takeover_pending");
   });
 });
+
+describe("live finishing→running clobber (A4-0 follow-up b)", () => {
+  type ChatCbs = {
+    onEvent: SSEEventHandler;
+    onError: (error: Error) => void;
+    onClose: () => void;
+    onConnected: () => void;
+  };
+
+  function captureChat(api: SessionApi): ChatCbs {
+    const cbs = {} as ChatCbs;
+    (api.chat as ReturnType<typeof vi.fn>).mockImplementation(
+      (
+        _sid: string,
+        _params: ChatParams,
+        onEvent: SSEEventHandler,
+        onError: (error: Error) => void,
+        onClose: () => void,
+        onConnected: () => void
+      ) => {
+        cbs.onEvent = onEvent;
+        cbs.onError = onError;
+        cbs.onClose = onClose;
+        cbs.onConnected = onConnected;
+        if (onConnected) onConnected();
+        return () => {};
+      }
+    );
+    return cbs;
+  }
+
+  const compactionData = {
+    compaction_id: "c1",
+    level: 2,
+    tokens_before: 1000,
+    tokens_after: 200,
+    messages_removed: 5,
+  };
+
+  beforeEach(() => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "t",
+        status: "running",
+        events: [],
+      },
+      // session LIST row is a ListSessionItem (no `events` field). Seeding it
+      // lets the split-brain assertion compare the list row status against the
+      // open session's status after a content event.
+      sessions: [
+        {
+          session_id: "s1",
+          title: "t",
+          parent_session_id: null,
+          worker_type: "root",
+          latest_message: "",
+          latest_message_at: null,
+          status: "running",
+          unread_message_count: 0,
+          supervisor_snapshot: null,
+        },
+      ],
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+      _isRecovering: false,
+    });
+    vi.clearAllMocks();
+  });
+
+  it("finishing 后到 compaction：开放会话仍为 finishing(核心回归)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({ type: "finishing", data: {} });
+    cbs.onEvent({ type: "compaction", data: compactionData });
+    expect(useSessionStore.getState().currentSession?.status).toBe("finishing");
+  });
+
+  it("finishing 后到任意非信号内容事件(step)：仍为 finishing(通用回归)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({ type: "finishing", data: {} });
+    cbs.onEvent({
+      type: "step",
+      data: { id: "step-1", status: "running", description: "tail step" },
+    });
+    expect(useSessionStore.getState().currentSession?.status).toBe("finishing");
+  });
+
+  it("finishing 后到 compaction：列表行与开放会话一致(无 split-brain, INV-B)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({ type: "finishing", data: {} });
+    cbs.onEvent({ type: "compaction", data: compactionData });
+    const state = useSessionStore.getState();
+    const row = state.sessions.find((s) => s.session_id === "s1");
+    expect(row?.status).toBe("finishing");
+    expect(state.currentSession?.status).toBe("finishing");
+  });
+
+  it("timed_out 经内容事件仍保留(INV-C)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "health",
+      data: { status: "terminated", reason: "watchdog terminated" },
+    });
+    cbs.onEvent({ type: "compaction", data: compactionData });
+    expect(useSessionStore.getState().currentSession?.status).toBe("timed_out");
+  });
+
+  it("finishing→compaction→done：仍以 done 终态 completed 收敛(R1 终态优先)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({ type: "finishing", data: {} });
+    cbs.onEvent({ type: "compaction", data: compactionData });
+    cbs.onEvent({ type: "done", data: {} });
+    expect(useSessionStore.getState().currentSession?.status).toBe("completed");
+  });
+
+  it("无 finishing 的 happy path：running 经 compaction 仍 running(D1 对非 finishing 为 no-op)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({ type: "compaction", data: compactionData });
+    expect(useSessionStore.getState().currentSession?.status).toBe("running");
+  });
+});

@@ -1696,14 +1696,18 @@ export const useSessionStore = create<SessionStore>()(
               };
             }
 
-            // D5: Preserve timed_out across content events (set by prior health event)
-            const fallbackStatus: Session["status"] =
-              currentStatus === "timed_out" ? "timed_out" : "running";
-
+            // A4-0 follow-up (b): nextStatus = resolveStatusFromEvent(...) is the
+            // single source of truth for the status a content event implies. It
+            // already preserves BOTH timed_out (:276-279) and finishing
+            // (:272-274). The old hand-rolled fallbackStatus only remembered
+            // timed_out, so a content/compaction event arriving while finishing
+            // regressed the open session to "running" while the list (also fed
+            // nextStatus at the top of this reducer) stayed "finishing" — a
+            // split-brain. Reusing nextStatus makes detail == list by construction.
             return {
               currentSession: {
                 ...next,
-                status: fallbackStatus,
+                status: nextStatus,
               },
               sessions: nextSessions,
             };
