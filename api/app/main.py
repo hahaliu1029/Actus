@@ -364,6 +364,7 @@ async def lifespan(app: FastAPI):
                 search_engine=svc._search_engine,
                 checkpointer_pool=svc._checkpointer_pool,
                 execution_supervisor=svc._supervisor,
+                session_state_machine=svc._ssm,
             )
 
         coord_deps = None
@@ -518,12 +519,18 @@ async def lifespan(app: FastAPI):
                 )
                 result = await db_session.execute(stmt)
                 session_ids = [str(row.id) for row in result.all()]
+                from app.application.composition.graph_assembly import (
+                    build_session_state_machine,
+                )
+
                 repo = DBSessionRepository(db_session=db_session)
+                ssm = build_session_state_machine(uow_factory=get_uow)
                 for session_id in session_ids:
-                    await repo.update_to_terminal(
+                    await ssm.terminate(
                         session_id,
                         SessionStatus.COMPLETED,
                         "server_restart",
+                        session_repo=repo,
                     )
                 await db_session.commit()
                 if session_ids:

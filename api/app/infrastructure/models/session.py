@@ -317,6 +317,7 @@ class SessionModel(Base):
                 "updated_at",
                 "created_at",
                 "sandbox_binding",
+                "status",  # A4-1 §4: status transitions go only through SSM-owned repo mutators
             },
         )
 

@@ -805,9 +805,10 @@ class DBSessionRepository(SessionRepository):
         """Atomic CAS: UPDATE sessions SET status=:to, mode_revision=mode_revision+1
         WHERE id=:sid AND status=:from. Returns True iff row updated.
 
-        INV-4 contract: in PE-0 this method is the ONLY new write path
-        added in PR; existing update_status / update_to_terminal remain
-        callable (audit-only INV-4-soft). A4-1 migrates them into SSM.
+        INV-4 contract (A4-1, SHIPPED): update_status / update_to_terminal /
+        transition_status are the canonical SQL exits for sessions.status;
+        callers must route through the SSM (ssm.set_mode / ssm.terminate) —
+        enforced hard by Gate A in tests/invariants/test_inv4_ssm_single_writer.py.
 
         ``extra_values`` (optional) merges additional column writes into the
         SAME UPDATE so terminal-side metadata (``completed_at``,

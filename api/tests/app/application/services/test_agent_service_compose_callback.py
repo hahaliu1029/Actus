@@ -192,6 +192,10 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
     )
     service._sandbox_lifecycle_service = _Lifecycle()
     service._uow_factory = lambda: _Uow(session)
+    from app.domain.services.session.default_state_machine import (
+        DefaultSessionStateMachine,
+    )
+    service._ssm = DefaultSessionStateMachine(uow_factory=service._uow_factory)
     service._file_storage = object()
     service._search_engine = object()
     service._checkpointer_pool = None

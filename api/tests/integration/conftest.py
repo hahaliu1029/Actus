@@ -497,9 +497,13 @@ async def runner_factory(db_session, sample_user):
 
     def _factory(*, session_id: str, user_id: str | None = None, **overrides):
         from app.domain.services.agent_task_runner import AgentTaskRunner
+        from app.domain.services.session.default_state_machine import (
+            DefaultSessionStateMachine,
+        )
 
         runner = AgentTaskRunner(
             uow_factory=_uow_factory,
+            session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
             llm=object(),
             agent_config=AgentConfig(
                 max_iterations=100,
@@ -553,6 +557,9 @@ async def agent_service_with_redis(db_session, redis_client, app):
     )
     from app.infrastructure.repositories.db_session_repository import DBSessionRepository
     from app.domain.services.execution_supervisor import ExecutionSupervisor
+    from app.domain.services.session.default_state_machine import (
+        DefaultSessionStateMachine,
+    )
     from app.domain.services.idle_watchdog import IdleWatchdog
     from app.infrastructure.external.task.redis_stream_task import RedisStreamTask
     from app.interfaces.dependencies.rate_limit import rate_limit_read
@@ -607,6 +614,7 @@ async def agent_service_with_redis(db_session, redis_client, app):
     supervisor = ExecutionSupervisor(
         redis_client=redis_client,
         session_repository=DBSessionRepository(db_session=db_session),
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
     )
     service._supervisor = supervisor
     app.state.supervisor = supervisor

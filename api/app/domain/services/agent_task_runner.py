@@ -84,6 +84,7 @@ from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.graphs.background_summary import run_background_summary
+from app.domain.services.session.session_state_machine import SessionStateMachine
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.brainstorm_skill import BrainstormSkillTool
 from app.domain.services.tools.create_skill import CreateSkillTool
@@ -605,6 +606,19 @@ class AgentTaskRunner(TaskRunner):
                 else {}
             ),
         )
+
+    def _require_state_machine(self) -> SessionStateMachine:
+        # A4-1 §6: production write paths always inject an SSM. The ctor param
+        # stays Optional (non-write-path fixtures legitimately pass None), so
+        # this guard converts a missing PRODUCTION injection into a loud
+        # failure at the first status write instead of a None AttributeError.
+        ssm = self._session_state_machine
+        if ssm is None:
+            raise RuntimeError(
+                "AgentTaskRunner status write requires a SessionStateMachine "
+                "but none was injected (INV-4: SSM is the sole status writer)"
+            )
+        return ssm
 
     def _build_prompt_telemetry(self) -> Any:
         """Construct the ``JsonlPromptTelemetry`` instance used by
@@ -2815,7 +2829,9 @@ class AgentTaskRunner(TaskRunner):
         event (INV-1 — the live consumer breaks on Wait/Control). from_mode is
         always "running" on this path (the agent loop transitions from RUNNING)."""
         async with self._uow:
-            await self._uow.session.update_status(self._session_id, to)
+            await self._require_state_machine().set_mode(
+                self._session_id, to, reason=reason, session_repo=self._uow.session
+            )
             try:
                 _, rev = await self._uow.session.read_status_with_revision(
                     self._session_id
@@ -3195,10 +3211,11 @@ class AgentTaskRunner(TaskRunner):
             # status we want failure to be observed via the terminal task's
             # done callback.
             async with self._uow_factory() as uow:
-                transitioned = await uow.session.update_to_terminal(
+                transitioned = await self._require_state_machine().terminate(
                     self._session_id,
                     status,
                     terminal_reason or self._default_terminal_reason(status),
+                    session_repo=uow.session,
                 )
                 await uow.db_session.commit()  # raise on failure
 
@@ -3948,8 +3965,11 @@ class AgentTaskRunner(TaskRunner):
         try:
             # 1.任务一启动先推进会话状态，避免前端长期显示pending
             async with self._uow:
-                await self._uow.session.update_status(
-                    self._session_id, SessionStatus.RUNNING
+                await self._require_state_machine().set_mode(
+                    self._session_id,
+                    SessionStatus.RUNNING,
+                    reason="invoke_start",
+                    session_repo=self._uow.session,
                 )
 
             # C3 PR-3c — spawn the per-pod MailboxSupervisor right after the
@@ -4185,8 +4205,11 @@ class AgentTaskRunner(TaskRunner):
                     # Phase B: 无消息且有延迟后处理 -> FINISHING
                     if self._flow and getattr(self._flow, '_deferred_final_state', None):
                         async with self._uow:
-                            await self._uow.session.update_status(
-                                self._session_id, SessionStatus.FINISHING
+                            await self._require_state_machine().set_mode(
+                                self._session_id,
+                                SessionStatus.FINISHING,
+                                reason="finishing",
+                                session_repo=self._uow.session,
                             )
                         await self._put_and_add_event(task, FinishingEvent())
 
@@ -4228,8 +4251,11 @@ class AgentTaskRunner(TaskRunner):
                             self._flow._deferred_final_state = None
                             self._flow._deferred_summaries = None
                             async with self._uow:
-                                await self._uow.session.update_status(
-                                    self._session_id, SessionStatus.RUNNING
+                                await self._require_state_machine().set_mode(
+                                    self._session_id,
+                                    SessionStatus.RUNNING,
+                                    reason="postproc_resume",
+                                    session_repo=self._uow.session,
                                 )
                             continue
                         else:
@@ -4382,8 +4408,11 @@ class AgentTaskRunner(TaskRunner):
             # FINISHING: run deferred post-processing then emit DoneEvent (mirrors invoke())
             if self._flow and getattr(self._flow, "_deferred_final_state", None):
                 async with self._uow:
-                    await self._uow.session.update_status(
-                        self._session_id, SessionStatus.FINISHING
+                    await self._require_state_machine().set_mode(
+                        self._session_id,
+                        SessionStatus.FINISHING,
+                        reason="finishing",
+                        session_repo=self._uow.session,
                     )
                 await self._put_and_add_event(task, FinishingEvent())
 
@@ -4432,8 +4461,11 @@ class AgentTaskRunner(TaskRunner):
                     self._flow._deferred_final_state = None
                     self._flow._deferred_summaries = None
                     async with self._uow:
-                        await self._uow.session.update_status(
-                            self._session_id, SessionStatus.RUNNING
+                        await self._require_state_machine().set_mode(
+                            self._session_id,
+                            SessionStatus.RUNNING,
+                            reason="postproc_resume",
+                            session_repo=self._uow.session,
                         )
                     # resume() is single-shot (no outer while loop), so the follow-up
                     # message already enqueued will be picked up by the next invoke().

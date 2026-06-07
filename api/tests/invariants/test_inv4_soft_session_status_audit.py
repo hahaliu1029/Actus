@@ -1,28 +1,32 @@
 # api/tests/invariants/test_inv4_soft_session_status_audit.py
-"""INV-4-soft: report (but NOT fail) every direct sessions.status write
-that bypasses the SessionStateMachine / repository layer.
+"""INV-4-hard SHIPPED — best-effort raw-SQL/ORM-attr defense behind the
+AST gates.
 
-WHY: PE-0 keeps existing update_status / update_to_terminal in
-db_session_repository.py to avoid scope creep; A4-1 makes this hard.
-Soft gate ensures no NEW direct-SQL / ORM-attr status writes are added
-outside the known DB layer.
+This test scans for direct sessions.status writes (raw SQL / ORM attr
+assignment) that bypass the SessionStateMachine / repository layer.
+
+WHY: the hard INV-4 guarantee is enforced by the AST gates in
+tests/invariants/test_inv4_ssm_single_writer.py (Gate A/B); this regex
+scan is a best-effort, non-exhaustive second line of defense against NEW
+direct-SQL / ORM-attr status writes outside the known DB layer.
 
 WHAT: grep for raw SQL `UPDATE sessions SET status` or ORM attribute
 assignment `sessions.status =`. Does NOT flag repository method calls
-like `repo.update_status(...)` — those are the correct call pattern.
+like `repo.update_status(...)` — Gate A (the AST gate) owns that check
+(non-SSM callers of the repo mutators are banned hard there).
 
 SKIP: db_session_repository.py (the one file allowed to do direct writes)
       SSM internals (domain/services/session/)
 
-FAIL CONDITION: any violation NOT in the known-offender list triggers
-a hard test failure so new direct writes are caught immediately.
+FAIL CONDITION: any direct-SQL / ORM-attr violation triggers a hard test
+failure so new direct writes are caught immediately.
 """
 
 import re
 from pathlib import Path
 
 from tests.invariants._whitelists import (
-    API_APP, INV4_SOFT_KNOWN_OFFENDERS, REPO_ROOT,
+    API_APP, REPO_ROOT,
 )
 
 # Only flag direct SQL/ORM-level status writes — NOT repository method calls.
@@ -46,9 +50,10 @@ _EXEMPT_FILES = {
 def test_no_new_direct_session_status_writes():
     """No direct sessions.status SQL/ORM writes outside the DB repo layer.
 
-    This is a hard gate: if a file not in the known-offenders list performs
-    a direct write, the build fails. Existing offenders are tracked in
-    _whitelists.INV4_SOFT_KNOWN_OFFENDERS with A4-1 sunset references.
+    Best-effort defense: if a file performs a direct raw-SQL / ORM-attr
+    status write outside the blessed repo layer, the build fails. This is
+    NOT exhaustive — the hard INV-4 guarantee is the AST gates (Gate A/B
+    in test_inv4_ssm_single_writer.py).
     """
     violations: list[str] = []
     for path in sorted(API_APP.rglob("*.py")):
@@ -67,16 +72,14 @@ def test_no_new_direct_session_status_writes():
                 ln = src[: m.start()].count("\n") + 1
                 violations.append(f"{rel}:{ln} — {m.group(0).strip()}")
 
-    # Build the known offender set (path:line format)
-    known_keys = {entry for entry, _ in INV4_SOFT_KNOWN_OFFENDERS}
-
-    # Remove known offenders from violations
-    new_violations = [v for v in violations if v.split(" —")[0] not in known_keys]
+    # A4-1c: the soft known-offender whitelist was retired (it was vestigial
+    # — zero real matches). This regex stays as a best-effort raw-SQL/ORM-attr
+    # defense (NOT exhaustive; the hard guarantee is the INV-4 AST gates).
+    new_violations = violations
 
     assert not new_violations, (
-        "INV-4-soft: NEW direct sessions.status writes detected outside the "
-        "repository layer. Route writes through SessionRepository.update_status() "
-        "or SessionStateMachine.transition_status(), or add to "
-        "_whitelists.INV4_SOFT_KNOWN_OFFENDERS with an A4-1 sunset ref:\n"
+        "INV-4-hard (best-effort defense): NEW direct sessions.status writes "
+        "detected outside the repository layer. Route status writes through "
+        "`ssm.set_mode` / `ssm.terminate` (INV-4-hard, Gate A/B):\n"
         + "\n".join(new_violations)
     )

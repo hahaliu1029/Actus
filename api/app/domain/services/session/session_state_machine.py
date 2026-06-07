@@ -2,8 +2,9 @@
 
 INV-3 (PE-0 CI gate): no method on this ABC or its impls may call
 ApprovalStateWriter.write / write_audit_only / delete_grant.
-INV-4-soft (PE-0): non-SSM writes to sessions.status are warning-only.
-INV-4-hard (A4-1): writes outside SSM fail CI.
+INV-4-hard (A4-1, SHIPPED): the SSM subpackage is the sole CALLER of the
+sessions.status repo mutators; non-SSM status writes fail CI (Gate A/B in
+tests/invariants/test_inv4_ssm_single_writer.py).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Mapping
 
 from app.domain.models.session import SessionStatus
+from app.domain.repositories.session_repository import SessionRepository
 
 
 class SessionStateMachine(ABC):
@@ -63,3 +65,41 @@ class SessionStateMachine(ABC):
         ``SessionRepository.transition_status`` so terminal metadata
         (``completed_at`` / ``terminal_reason`` / ``execution_phase``) can be
         written atomically alongside the status CAS."""
+
+    @abstractmethod
+    async def set_mode(
+        self,
+        session_id: str,
+        to: SessionStatus,
+        reason: str,
+        *,
+        session_repo: SessionRepository,
+    ) -> None:
+        """A4-1 caller-owned non-terminal status write.
+
+        Issues exactly ``session_repo.update_status(session_id, to)`` (blind
+        by-id, bumps mode_revision) and returns. Does NOT read the revision,
+        NOT emit, NOT open or commit a transaction — the CALLER owns the UoW,
+        commit, lock, and event emit. ``reason`` is carried for telemetry and
+        the future A4-2 single-emitter; unused by A4-1.
+
+        NOTE: heterogeneous transaction contract vs the dormant CAS mutators
+        above (which open their own UoW). Reconciliation is A4-2.
+        """
+
+    @abstractmethod
+    async def terminate(
+        self,
+        session_id: str,
+        to: SessionStatus,
+        terminal_reason: str,
+        *,
+        session_repo: SessionRepository,
+    ) -> bool:
+        """A4-1 caller-owned terminal status write.
+
+        Issues exactly ``session_repo.update_to_terminal(session_id, to,
+        terminal_reason)`` and returns its idempotency bool — ``False`` when the
+        row is already terminal OR its execution_phase is terminating/terminated;
+        else ``True``. Does NOT open or commit a transaction (caller-owned).
+        """

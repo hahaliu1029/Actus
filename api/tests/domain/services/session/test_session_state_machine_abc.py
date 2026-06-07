@@ -1,4 +1,4 @@
-"""SSM ABC must be uninstantiable; subclasses must implement 7 methods."""
+"""SSM ABC must be uninstantiable; subclasses must implement the required methods (9 after A4-1)."""
 
 import pytest
 
@@ -27,6 +27,8 @@ def test_required_method_names():
         "enter_finishing",
         "complete",
         "transition",
+        "set_mode",  # A4-1: caller-owned non-terminal status write
+        "terminate",  # A4-1: caller-owned terminal status write
     }
     actual = {
         name for name, attr in SessionStateMachine.__dict__.items()

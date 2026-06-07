@@ -7,6 +7,9 @@ import pytest
 
 from app.domain.models.session import Session, SessionStatus
 from app.domain.services.execution_supervisor import ExecutionSupervisor
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -519,7 +522,11 @@ async def test_terminate_watchdog_timeout_emits_bg_failed_watchdog(
             was_background=True,
         )
     )
-    supervisor = ExecutionSupervisor(redis_client=object(), session_repository=repo)
+    supervisor = ExecutionSupervisor(
+        redis_client=object(),
+        session_repository=repo,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=lambda: None),
+    )
     emitter = AsyncMock()
     revoke_calls: list[dict[str, str]] = []
 

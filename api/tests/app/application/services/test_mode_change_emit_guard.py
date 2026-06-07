@@ -1,4 +1,4 @@
-"""A4-0 T-GUARD: every control-mode update_status write must emit a
+"""A4-0 T-GUARD: every control-mode status write (update_status / set_mode) must emit a
 SessionModeChangedEvent. Scans agent_service.py (6 HTTP sites) and
 agent_task_runner.py (allowlisted RUNNING writes + the agent-loop emitter).
 A new control-mode write site not accounted for here fails CI."""
@@ -71,7 +71,7 @@ def _literal_control_update_status_sites(tree: ast.Module) -> dict[str, list[str
         if not isinstance(node, ast.Call):
             continue
         f = node.func
-        if not (isinstance(f, ast.Attribute) and f.attr == "update_status"):
+        if not (isinstance(f, ast.Attribute) and f.attr in ("update_status", "set_mode")):
             continue
         if len(node.args) < 2:
             continue
@@ -116,7 +116,7 @@ def _nonliteral_update_status_functions(tree: ast.Module) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         f = node.func
-        if not (isinstance(f, ast.Attribute) and f.attr == "update_status"):
+        if not (isinstance(f, ast.Attribute) and f.attr in ("update_status", "set_mode")):
             continue
         if len(node.args) < 2:
             continue

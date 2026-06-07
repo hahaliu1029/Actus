@@ -52,9 +52,12 @@ def test_session_delete_branch_does_not_write_done_or_completed():
 
     raise_pos = after_delete.index("raise")
     has_put_before_raise = "_put_and_add_event" in after_delete[:raise_pos]
-    has_status_before_raise = "update_status" in after_delete[:raise_pos]
+    has_status_before_raise = any(
+        tok in after_delete[:raise_pos]
+        for tok in ("update_status", "set_mode", "terminate")
+    )
 
     assert not has_put_before_raise, \
         "session_delete must raise BEFORE any _put_and_add_event call"
     assert not has_status_before_raise, \
-        "session_delete must raise BEFORE any update_status call"
+        "session_delete must raise before any status write (update_status / set_mode / terminate)"

@@ -14,6 +14,7 @@ from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.models.session import Session, SessionStatus
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
+from app.domain.services.session.session_state_machine import SessionStateMachine
 from app.domain.services._lua_scripts import (
     LUA_ADMIT,
     LUA_ADMIT_SHA,
@@ -119,6 +120,7 @@ class ExecutionSupervisor:
         max_system_bg: int = 100,
         max_user_bg: int = 5,
         supervisor_registry: SupervisorRegistryPort | None = None,
+        session_state_machine: SessionStateMachine | None = None,
     ) -> None:
         if session_repository is None and uow_factory is None:
             raise ValueError("session_repository or uow_factory is required")
@@ -145,7 +147,20 @@ class ExecutionSupervisor:
         # paths a one-line stop call below. Default None preserves
         # backwards compat for tests / pre-mailbox deployments.
         self._supervisor_registry = supervisor_registry
+        self._session_state_machine = session_state_machine
         self._init_metrics()
+
+    def _require_state_machine(self) -> SessionStateMachine:
+        # A4-1 §6: production wiring (service_dependencies.py) always injects an
+        # SSM. Optional ctor param + this guard => a missing production injection
+        # fails loud at the first terminal write, not as a None AttributeError.
+        ssm = self._session_state_machine
+        if ssm is None:
+            raise RuntimeError(
+                "ExecutionSupervisor status write requires a SessionStateMachine "
+                "but none was injected (INV-4: SSM is the sole status writer)"
+            )
+        return ssm
 
     async def _maybe_stop_supervisor_for_session(self, session_id: str) -> None:
         """C3 PR-3c (codex r6) — stop the per-pod MailboxSupervisor on
@@ -487,10 +502,8 @@ class ExecutionSupervisor:
                     and session.execution_mode == "background"
                     and session.execution_phase in ("running", "suspended")
                 ):
-                    transitioned = await uow.session.update_to_terminal(
-                        session_id,
-                        status,
-                        terminal_reason,
+                    transitioned = await self._require_state_machine().terminate(
+                        session_id, status, terminal_reason, session_repo=uow.session
                     )
                     # Raise on commit failure so post-commit side-effects
                     # below (lua_revoke / stop) only run on durable terminal.
@@ -510,10 +523,8 @@ class ExecutionSupervisor:
                 and session.execution_mode == "background"
                 and session.execution_phase in ("running", "suspended")
             ):
-                transitioned = await self._repo.update_to_terminal(
-                    session_id,
-                    status,
-                    terminal_reason,
+                transitioned = await self._require_state_machine().terminate(
+                    session_id, status, terminal_reason, session_repo=self._repo
                 )
                 emit_bg_failed_watchdog = (
                     transitioned is not False
@@ -593,10 +604,11 @@ class ExecutionSupervisor:
                         # commit failure raises and skips the registry
                         # stop side-effect for this row.
                         async with self._uow_factory() as uow:
-                            transitioned = await uow.session.update_to_terminal(
+                            transitioned = await self._require_state_machine().terminate(
                                 row.session_id,
                                 SessionStatus.TIMED_OUT,
                                 "server_restart",
+                                session_repo=uow.session,
                             )
                             await _commit_uow_if_real(uow)
                     elif self._repo is not None:
@@ -604,10 +616,11 @@ class ExecutionSupervisor:
                         # commit available — fall back to the prior
                         # behavior (acceptable because tests don't exercise
                         # commit-cancel ergonomics).
-                        transitioned = await self._repo.update_to_terminal(
+                        transitioned = await self._require_state_machine().terminate(
                             row.session_id,
                             SessionStatus.TIMED_OUT,
                             "server_restart",
+                            session_repo=self._repo,
                         )
                     # codex r11 [HIGH CONTRACT] — commit succeeded above
                     # (explicit raise on the prod path). Append to the

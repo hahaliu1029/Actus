@@ -240,6 +240,8 @@ class AgentService:
         self._file_storage = file_storage
         self._redis_client = redis_client
         self._checkpointer_pool = checkpointer_pool
+        # A4-1 §6: unconditional SSM (status-write authority on every write path)
+        self._build_unconditional_ssm()
         self._memory_flusher = memory_flusher
         self._memory_embedding_provider = memory_embedding_provider
         self._memory_session_factory = memory_session_factory
@@ -288,6 +290,26 @@ class AgentService:
             except Exception:
                 logger.warning("Failed to init ConfirmationManager at startup")
         logger.info("AgentService初始化成功")
+
+    def _build_unconditional_ssm(self) -> None:
+        # A4-1 §6: SessionStateMachine must be present on EVERY production write
+        # path, independent of the tool-confirmation master switch. It is cheap
+        # and stateless (uow_factory + optional redis + noop publisher), so we
+        # build it once here. Lazy import mirrors the existing _create_task
+        # pattern and avoids any import cycle with application.composition.
+        from app.application.composition.graph_assembly import (
+            build_session_state_machine,
+        )
+
+        self._ssm = build_session_state_machine(
+            uow_factory=self._uow_factory,
+            redis=(
+                self._redis_client.client
+                if self._redis_client and hasattr(self._redis_client, "client")
+                else None
+            ),
+            event_publisher=None,
+        )
 
     def _refresh_config(self, snapshot: _ConfigSnapshot) -> None:
         """Atomically replace config snapshot. CPython GIL guarantees single-attr assignment is atomic.
@@ -754,7 +776,7 @@ class AgentService:
             approval_state_reader=approval_state_reader,
             confirmation_manager=confirmation_manager_inst,
             permission_engine=permission_engine,
-            session_state_machine=ssm,
+            session_state_machine=self._ssm,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
             on_session_complete=self._compose_completion_callbacks(
@@ -2952,10 +2974,11 @@ class AgentService:
                     session_id,
                 )
                 async with self._uow_factory() as uow:
-                    transitioned = await uow.session.update_to_terminal(
+                    transitioned = await self._ssm.terminate(
                         session_id,
                         SessionStatus.COMPLETED,
                         "resume_state_lost",
+                        session_repo=uow.session,
                     )
                     # codex r11 [HIGH CONTRACT] — explicit commit so a
                     # swallowed CancelledError on UoW close cannot leave
@@ -3089,10 +3112,11 @@ class AgentService:
 
         # 3.更新会话任务状态
         async with self._uow_factory() as uow:
-            transitioned = await uow.session.update_to_terminal(
+            transitioned = await self._ssm.terminate(
                 session_id,
                 SessionStatus.COMPLETED,
                 "user_cancel",
+                session_repo=uow.session,
             )
             # codex r11 — explicit commit (see resume_state_lost path).
             await _commit_uow_if_real(uow)
@@ -3410,10 +3434,11 @@ end
                         takeover_id=takeover_id,
                     ),
                 )
-                transitioned = await uow.session.update_to_terminal(
+                transitioned = await self._ssm.terminate(
                     session_id,
                     SessionStatus.COMPLETED,
                     "watchdog_timeout",
+                    session_repo=uow.session,
                 )
                 # codex r11 — explicit commit (see resume_state_lost path).
                 await _commit_uow_if_real(uow)
@@ -3470,7 +3495,12 @@ end
                         takeover_id=takeover_id,
                     ),
                 )
-                await uow.session.update_status(session_id, SessionStatus.TAKEOVER_PENDING)
+                await self._ssm.set_mode(
+                    session_id,
+                    SessionStatus.TAKEOVER_PENDING,
+                    reason="takeover_lease_timeout",
+                    session_repo=uow.session,
+                )
                 try:
                     _, rev = await uow.session.read_status_with_revision(session_id)
                 except Exception:
@@ -3965,10 +3995,11 @@ end
 
         try:
             async with self._uow_factory() as uow:
-                await uow.session.update_to_terminal(
+                await self._ssm.terminate(
                     session.id,
                     SessionStatus.TIMED_OUT,
                     "resume_state_lost",
+                    session_repo=uow.session,
                 )
                 # codex r11 — explicit commit (see resume_state_lost path).
                 await _commit_uow_if_real(uow)
@@ -4095,10 +4126,11 @@ end
         )
         uow = self._uow_factory()
         async with uow:
-            transitioned = await uow.session.update_to_terminal(
+            transitioned = await self._ssm.terminate(
                 session_id,
                 SessionStatus.COMPLETED,
                 "resume_state_lost",
+                session_repo=uow.session,
             )
             # codex r11 — explicit commit (see other resume_state_lost path).
             await _commit_uow_if_real(uow)
@@ -4155,8 +4187,11 @@ end
             if task.done:
                 uow = self._uow_factory()
                 async with uow:
-                    await uow.session.update_status(
-                        session_id, SessionStatus.TAKEOVER
+                    await self._ssm.set_mode(
+                        session_id,
+                        SessionStatus.TAKEOVER,
+                        reason="takeover_started",
+                        session_repo=uow.session,
                     )
                     try:
                         _, rev = await uow.session.read_status_with_revision(session_id)
@@ -4373,7 +4408,12 @@ end
 
         from_mode = session.status.value  # source ∈ {running, waiting, takeover_pending}
         async with self._uow_factory() as uow:
-            await uow.session.update_status(session_id, SessionStatus.TAKEOVER)
+            await self._ssm.set_mode(
+                session_id,
+                SessionStatus.TAKEOVER,
+                reason="takeover_started",
+                session_repo=uow.session,
+            )
             try:
                 _, rev = await uow.session.read_status_with_revision(session_id)
             except Exception:
@@ -4506,7 +4546,12 @@ end
                 return {"status": SessionStatus.COMPLETED, "reason": "resume_failed"}
 
             async with self._uow_factory() as uow:
-                await uow.session.update_status(session_id, SessionStatus.RUNNING)
+                await self._ssm.set_mode(
+                    session_id,
+                    SessionStatus.RUNNING,
+                    reason="takeover_rejected",
+                    session_repo=uow.session,
+                )
                 try:
                     _, rev = await uow.session.read_status_with_revision(session_id)
                 except Exception:
@@ -4532,10 +4577,11 @@ end
 
         if decision_normalized == "terminate":
             async with self._uow_factory() as uow:
-                transitioned = await uow.session.update_to_terminal(
+                transitioned = await self._ssm.terminate(
                     session_id,
                     SessionStatus.COMPLETED,
                     "user_cancel",
+                    session_repo=uow.session,
                 )
                 # codex r11 — explicit commit (see resume_state_lost path).
                 await _commit_uow_if_real(uow)
@@ -4611,7 +4657,12 @@ end
                 }
 
             async with self._uow_factory() as uow:
-                await uow.session.update_status(session_id, SessionStatus.RUNNING)
+                await self._ssm.set_mode(
+                    session_id,
+                    SessionStatus.RUNNING,
+                    reason="takeover_ended",
+                    session_repo=uow.session,
+                )
                 try:
                     _, rev = await uow.session.read_status_with_revision(session_id)
                 except Exception:
@@ -4642,10 +4693,11 @@ end
 
         if mode == "complete":
             async with self._uow_factory() as uow:
-                transitioned = await uow.session.update_to_terminal(
+                transitioned = await self._ssm.terminate(
                     session_id,
                     SessionStatus.COMPLETED,
                     "natural",
+                    session_repo=uow.session,
                 )
                 # codex r11 — explicit commit (see resume_state_lost path).
                 await _commit_uow_if_real(uow)
@@ -4728,7 +4780,12 @@ end
                     source=ControlSource.USER,
                 ),
             )
-            await uow.session.update_status(session_id, SessionStatus.TAKEOVER_PENDING)
+            await self._ssm.set_mode(
+                session_id,
+                SessionStatus.TAKEOVER_PENDING,
+                reason="takeover_reopened",
+                session_repo=uow.session,
+            )
             try:
                 _, rev = await uow.session.read_status_with_revision(session_id)
             except Exception:

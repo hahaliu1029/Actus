@@ -71,6 +71,10 @@ def skeletal_service_with_captured_runner(monkeypatch):
     fake_uow.session = AsyncMock()
     fake_uow.session.save = AsyncMock()
     svc._uow_factory = MagicMock(return_value=fake_uow)
+    from app.domain.services.session.default_state_machine import (
+        DefaultSessionStateMachine,
+    )
+    svc._ssm = DefaultSessionStateMachine(uow_factory=svc._uow_factory)
 
     # --- other deps the runner constructor reads ---
     svc._file_storage = MagicMock()

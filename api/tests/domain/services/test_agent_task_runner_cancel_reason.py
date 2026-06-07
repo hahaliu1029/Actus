@@ -8,6 +8,9 @@ from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.event import MessageEvent
 from app.domain.models.session import SessionStatus
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -127,6 +130,7 @@ def _build_runner(session_id: str = "session-cancel") -> AgentTaskRunner:
         browser=object(),
         search_engine=object(),
         sandbox=_NoopSandbox(),
+        session_state_machine=DefaultSessionStateMachine(uow_factory=factory),
     )
     # Override runner._uow with the root instance so tests can observe all
     # status_updates regardless of which factory call produced the write.

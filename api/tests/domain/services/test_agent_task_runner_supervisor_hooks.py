@@ -385,7 +385,7 @@ def _lineno_of_first_update_to_running(method: ast.AST) -> int | None:
     for node in ast.walk(method):
         if isinstance(node, ast.Call):
             f = node.func
-            if isinstance(f, ast.Attribute) and f.attr == "update_status":
+            if isinstance(f, ast.Attribute) and f.attr in ("update_status", "set_mode"):
                 for arg in node.args:
                     if isinstance(arg, ast.Attribute) and arg.attr == "RUNNING":
                         return node.lineno

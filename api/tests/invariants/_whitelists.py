@@ -38,6 +38,8 @@ INV2_SSM_MUTATOR_NAMES: tuple[str, ...] = (
     "enter_finishing",
     "complete",
     "transition",
+    "set_mode",      # A4-1: PE must not drive status writes
+    "terminate",     # A4-1: PE must not drive status writes
 )
 
 # INV-3: SSM subpackage MUST NOT call ApprovalStateWriter mutators.
@@ -45,14 +47,12 @@ INV3_WRITER_MUTATOR_NAMES: tuple[str, ...] = (
     "write", "write_audit_only", "delete_grant",
 )
 
-# INV-4-soft: sessions.status writes outside SSM are warning-only.
-# Each entry must include a sunset PR / issue.
-INV4_SOFT_KNOWN_OFFENDERS: tuple[tuple[str, str], ...] = (
-    # (relative_path, sunset_ref)
-    ("api/app/infrastructure/repositories/db_session_repository.py:231",
-     "A4-1 INV-4-hard"),
-    ("api/app/infrastructure/repositories/db_session_repository.py:421",
-     "A4-1 INV-4-hard"),
+# INV-4-hard (A4-1): the three session-status repo mutators. Only the SSM
+# subpackage + the exempt repo files may CALL these (Gate A).
+INV4_SESSION_STATUS_MUTATOR_NAMES: tuple[str, ...] = (
+    "update_status",
+    "update_to_terminal",
+    "transition_status",
 )
 
 # INV-5: tool_node _invoke_wrapper callsites must be PE-dominated.

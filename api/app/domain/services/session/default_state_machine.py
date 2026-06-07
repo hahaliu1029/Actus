@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Protocol
 
 from app.domain.models.session import SessionStatus
+from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.permission.errors import SessionModeViolation
 from app.domain.services.session.session_state_machine import SessionStateMachine
@@ -153,3 +154,28 @@ class DefaultSessionStateMachine(SessionStateMachine):
             raise SessionModeViolation(
                 f"cannot complete from {current.value}"
             )
+
+    async def set_mode(
+        self,
+        session_id: str,
+        to: SessionStatus,
+        reason: str,
+        *,
+        session_repo: SessionRepository,
+    ) -> None:
+        # A4-1 caller-owned pure mutator: exactly one repo call, no UoW, no emit.
+        # `reason` is intentionally unused in A4-1 (telemetry / A4-2 single-emitter).
+        await session_repo.update_status(session_id, to)
+
+    async def terminate(
+        self,
+        session_id: str,
+        to: SessionStatus,
+        terminal_reason: str,
+        *,
+        session_repo: SessionRepository,
+    ) -> bool:
+        # A4-1 caller-owned pure mutator: returns the repo idempotency bool.
+        return await session_repo.update_to_terminal(
+            session_id, to, terminal_reason
+        )

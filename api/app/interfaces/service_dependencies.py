@@ -807,6 +807,7 @@ class ChildRunnerSharedDeps:
     search_engine: object
     checkpointer_pool: object
     execution_supervisor: object
+    session_state_machine: object = None  # A4-1 §6: status-write authority for the child runner
 
 
 def _make_shared_child_runner_builder(
@@ -853,6 +854,7 @@ def _make_shared_child_runner_builder(
             mailbox_publisher=mailbox_publisher,
             terminal_envelope_publisher_disabled=terminal_envelope_publisher_disabled,
             coord_deps=None,  # child is NOT a nested coordinator
+            session_state_machine=deps.session_state_machine,
         )
 
     return _build
@@ -1638,6 +1640,9 @@ def _build_agent_service(
         return (breaker, daily_cap)
 
     memory_gate_breaker, memory_gate_daily_cap = _build_memory_gate_deps(snapshot)
+    from app.application.composition.graph_assembly import (
+        build_session_state_machine,
+    )
     from app.domain.services.execution_supervisor import ExecutionSupervisor
     from app.infrastructure.observability import OtelMeter
 
@@ -1650,6 +1655,7 @@ def _build_agent_service(
         # paths (idle_watchdog cancel, FINISHING reconcile at boot) can call
         # ``registry.stop`` to prevent supervisor task leaks.
         supervisor_registry=supervisor_registry,
+        session_state_machine=build_session_state_machine(uow_factory=get_uow),
     )
     # Notification emitter is always constructible (DB-only, no Redis
     # dep); gate-off deployments just never call it.

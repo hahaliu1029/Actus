@@ -28,6 +28,9 @@ from app.domain.models.tool_result import ToolResult
 from app.domain.models.user_tool_enablement import ToolType
 from app.domain.models.plan import Step
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -377,6 +380,7 @@ async def test_invoke_wait_event_sets_waiting_status(monkeypatch) -> None:
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -418,6 +422,7 @@ async def test_invoke_control_requested_sets_takeover_pending_status(monkeypatch
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -461,6 +466,7 @@ async def test_invoke_applies_user_preferences_before_tool_initialization(
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(
@@ -548,6 +554,7 @@ async def test_invoke_starts_skill_sync_with_filtered_pool(monkeypatch) -> None:
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -600,6 +607,7 @@ async def test_invoke_uses_frozen_skill_pool_for_each_message(monkeypatch) -> No
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -651,6 +659,7 @@ async def test_runner_passes_overflow_config_to_flow(monkeypatch) -> None:
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -677,6 +686,7 @@ async def test_runner_passes_summary_llm_to_flow(monkeypatch) -> None:
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -701,6 +711,7 @@ async def test_initial_skills_do_not_seed_anchor(monkeypatch) -> None:
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -743,6 +754,7 @@ async def test_skill_anchor_switches_a_continue_b_continue(monkeypatch) -> None:
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -780,6 +792,7 @@ async def test_ambiguous_message_triggers_llm_but_explicit_message_does_not(monk
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -815,6 +828,7 @@ async def test_step_lock_reselects_once_when_unknown_tool_hits_threshold(monkeyp
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(
             max_iterations=100,
@@ -879,6 +893,7 @@ async def test_non_planner_flow_uses_virtual_step_id_for_skill_lock(monkeypatch)
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(
             max_iterations=100,
@@ -918,6 +933,7 @@ async def test_non_planner_flow_uses_virtual_step_id_for_skill_lock(monkeypatch)
 def test_runtime_context_includes_capped_available_tool_summary() -> None:
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),
@@ -955,6 +971,7 @@ async def test_invoke_wires_skill_context_provider_on_message_event(monkeypatch)
 
     runner = AgentTaskRunner(
         uow_factory=_uow_factory,
+        session_state_machine=DefaultSessionStateMachine(uow_factory=_uow_factory),
         llm=object(),
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         mcp_config=MCPConfig(mcpServers={}),

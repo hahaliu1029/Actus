@@ -11,6 +11,9 @@ import pytest
 from app.domain.models.session import Session
 from app.domain.models.session import SessionStatus
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -27,6 +30,7 @@ def _make_runner(
     runner._was_background = was_background
     runner._memory_notification_emitter = emitter
     runner._uow_factory = _uow_factory_for(session_state)
+    runner._session_state_machine = DefaultSessionStateMachine(uow_factory=lambda: None)
     return runner
 
 

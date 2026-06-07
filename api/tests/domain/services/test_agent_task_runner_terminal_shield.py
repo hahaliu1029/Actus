@@ -35,6 +35,9 @@ from app.domain.services.cost_callback_handler import (
     CostCallbackHandler,
     FlushResult,
 )
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -61,6 +64,13 @@ def _make_runner_for_terminal(
     runner._uow_factory = uow_factory
     runner._uow = MagicMock(name="runner._uow")  # marker for "stale UoW"
     runner._on_session_complete = on_session_complete
+    runner._session_state_machine = DefaultSessionStateMachine(uow_factory=lambda: None)
+    # A4-1 Task 10: the terminal path calls _cleanup_heartbeat_task, which reads
+    # these two attrs; the real __init__ sets both to None. The skeleton omitted
+    # them (pre-existing baseline gap → AttributeError), so set them here so the
+    # terminal-status write the migration touches is actually exercised.
+    runner._heartbeat_task = None
+    runner._heartbeat_handle = None
     return runner
 
 

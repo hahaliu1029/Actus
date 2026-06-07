@@ -14,6 +14,9 @@ from app.domain.models.event import (
 )
 from app.domain.models.session import SessionStatus
 from app.domain.services.agent_task_runner import AgentTaskRunner
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -71,6 +74,7 @@ def _make_runner(repo: _SessionRepo) -> AgentTaskRunner:
     runner = object.__new__(AgentTaskRunner)
     runner._session_id = "s1"
     runner._uow = _Uow(repo)
+    runner._session_state_machine = DefaultSessionStateMachine(uow_factory=lambda: None)
     return runner
 
 

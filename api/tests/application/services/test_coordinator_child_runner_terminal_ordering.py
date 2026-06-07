@@ -58,6 +58,9 @@ from app.domain.services.cost_callback_handler import (
     CostCallbackHandler,
     FlushResult,
 )
+from app.domain.services.session.default_state_machine import (
+    DefaultSessionStateMachine,
+)
 
 
 pytestmark = pytest.mark.anyio
@@ -165,6 +168,7 @@ def _make_runner_for_terminal_ordering(
     runner._cleanup_heartbeat_task = AsyncMock()
     # _maybe_stop_mailbox_supervisor reads _supervisor_registry + _is_root_session.
     runner._is_root_session = AsyncMock(return_value=False)
+    runner._session_state_machine = DefaultSessionStateMachine(uow_factory=lambda: None)
     return runner
 
 
