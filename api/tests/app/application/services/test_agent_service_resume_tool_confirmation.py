@@ -147,6 +147,9 @@ class _StubConfirmationManager:
         self.mark_processing_if_pending_calls: list = []
         self.mark_pending_calls: list = []
         self.cleanup_calls: list = []
+        # Records the claim_nonce PE passes on the winning claim, so tests can
+        # assert the PE-path rollback reuses the SAME nonce (end-to-end thread).
+        self.last_claim_nonce: str | None = None
 
     async def read(self, session_id: str, tool_call_id: str):
         return self._detail
@@ -155,9 +158,20 @@ class _StubConfirmationManager:
         self.mark_processing_calls.append((session_id, tool_call_id))
 
     async def mark_processing_if_pending(
-        self, session_id: str, tool_call_id: str
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        claim_nonce: str | None = None,
+        processing_started_at=None,
     ) -> bool:
+        # Signature mirrors the real ConfirmationQueue.mark_processing_if_pending
+        # (keyword-only claim_nonce / processing_started_at, added by PE-0
+        # ConfirmationQueue); default_engine.preflight passes both. Record the
+        # nonce (don't otherwise act on it) so the PE-path rollback test can
+        # assert the same nonce is threaded into the conditional rollback.
         self.mark_processing_if_pending_calls.append((session_id, tool_call_id))
+        self.last_claim_nonce = claim_nonce
         if not self._cas_outcomes:
             return True  # 默认赢得 claim
         return self._cas_outcomes.pop(0)
@@ -1047,10 +1061,16 @@ async def test_claim_envelope_loser_does_not_spawn_rollback(monkeypatch) -> None
 
 
 async def test_preflight_task_creation_failure_raises_service_unavailable(monkeypatch) -> None:
-    """Codex round-3 MEDIUM + round-4 reinforcement: task 创建失败必须抛
-    ``ServiceUnavailableError`` (503)；回滚走 ``_spawn_background_rollback``
-    (独立 task) —— 避免父 task 被 cancel 时回滚跟着被取消。"""
-    import asyncio as _asyncio
+    """task 创建失败必须抛 ``ServiceUnavailableError`` (503)；**PE 路径**下回滚走
+    ``_spawn_background_rollback_if_present`` —— 一个独立 asyncio task（父 task 被
+    cancel 时回滚不被连带取消），用 PE 在 claim 时写入的**同一个 claim_nonce** 做
+    *条件* 回滚（nonce 不匹配 / 已被 commit_resume 清理 → 跳过，避免 resurrect 脏
+    Redis hash）。PE 回滚的是 *claim*（Redis processing→pending），``decision_id=None``、
+    ``persistent_scope=False``，不删持久 grant（区别于 legacy 路径的
+    ``_spawn_background_rollback`` + grant 删除）。
+
+    (A4-2 follow-up: 本测试原为 legacy preflight 写，代码已默认走 PE 路径
+    [agent_service.py:1686]，故迁移到 PE 回滚合同。)"""
     from app.application.errors.exceptions import ServiceUnavailableError
 
     service = _make_service()
@@ -1072,16 +1092,24 @@ async def test_preflight_task_creation_failure_raises_service_unavailable(monkey
     monkeypatch.setattr(service, "_get_task", fake_get_task)
     monkeypatch.setattr(service, "_create_task", fake_create_task)
 
+    # PE preflight writes the grant during approve-evaluate before the claim;
+    # the fake writer lets preflight reach the claim + task-creation step.
     fake_writer = _FakeWriter(write_return=("dec-no-task", True))
     _patch_writer(monkeypatch, fake_writer)
 
-    spawn_calls: list[dict] = []
+    # PE path rolls the CLAIM back via the independent _if_present task. Record
+    # its kwargs (don't run the real conditional rollback — the nonce-matching /
+    # cleanup-skip logic of _rollback_resume_claim_if_present is covered by its
+    # own tests; here we lock the spawn *contract* on task-creation failure).
+    rollback_calls: list[dict] = []
 
-    def _record_spawn(**kwargs):
-        spawn_calls.append(kwargs)
-        return _asyncio.create_task(service._rollback_resume_claim(**kwargs))
+    def _record_spawn_if_present(**kwargs):
+        rollback_calls.append(kwargs)
+        return None
 
-    monkeypatch.setattr(service, "_spawn_background_rollback", _record_spawn)
+    monkeypatch.setattr(
+        service, "_spawn_background_rollback_if_present", _record_spawn_if_present
+    )
 
     conf = _Confirmation(action="approve", scope="session")
     with pytest.raises(ServiceUnavailableError) as exc_info:
@@ -1090,13 +1118,15 @@ async def test_preflight_task_creation_failure_raises_service_unavailable(monkey
         )
     assert exc_info.value.status_code == 503
 
-    # 让 spawned rollback task 完成
-    await _asyncio.sleep(0)
-    await _asyncio.sleep(0)
-
-    # Codex round-4 锁死：rollback 必须通过 spawn（独立 task）
-    assert spawn_calls, "task 创建失败路径未 spawn 回滚任务"
-    assert spawn_calls[0]["decision_id"] == "dec-no-task"
-    # spawned task 实际执行删除
-    assert fake_writer.delete_grant_calls == ["dec-no-task"]
-    assert mgr.mark_pending_calls == [("s1", "tc-1")]
+    # PE rollback contract on task-creation failure: exactly one independent
+    # conditional-rollback spawned, rolling back the CLAIM — decision_id=None,
+    # non-persistent — with the SAME claim_nonce PE wrote into the queue, so the
+    # conditional rollback can nonce-match the still-pending entry.
+    assert len(rollback_calls) == 1, "task 创建失败路径未 spawn 条件回滚任务"
+    rb = rollback_calls[0]
+    assert rb["decision_id"] is None
+    assert rb["persistent_scope"] is False
+    assert rb["session_id"] == "s1"
+    assert rb["tool_call_id"] == "tc-1"
+    assert mgr.last_claim_nonce is not None, "PE 未通过 claim 路径写 claim_nonce"
+    assert rb["claim_nonce"] == mgr.last_claim_nonce  # 同一 nonce 端到端线程化
