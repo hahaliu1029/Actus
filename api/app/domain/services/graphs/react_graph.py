@@ -261,10 +261,11 @@ def _extract_shell_images(result_str: str) -> tuple[str, list[dict]]:
 # R2 CS2 PR-B Commit 1 — tool_node helpers (Layer 1 / 2 / 3)
 # ============================================================
 #
-# Layer 1 dependency slots are Commit 1 stubs. Task 13 (tool_node dispatcher
-# rewrite) wires the real services from ``configurable`` (approval_cache,
-# summary_llm) into the policy chain. Task 44 replaces the timeout constants
-# with injected ``ToolRuntimeConfig`` values.
+# These helpers back the tool_node dispatch path. The real services are wired
+# from ``configurable`` (e.g. ``summary_llm`` for SmartApprove); tool-permission
+# dispatch now flows through the PermissionEngine (``_pe_dispatch``) for eligible
+# sources, with the legacy risk gate as fail-open fallback. Timeout constants are
+# overridden by injected ``ToolRuntimeConfig`` values.
 
 _SMART_APPROVE_TIMEOUT_SECONDS = 15
 _MAX_WRAPPER_OUTPUT_BYTES = 1 << 20  # 1 MiB
@@ -1142,8 +1143,8 @@ def build_react_graph(
 
         # PE-1 §2.5 (T15 P1#2 fix) + Round 2 P1#2: per-call gate. If ANY
         # pending tool_call in the batch is non-PE-eligible (e.g. skill
-        # creator/guide, mcp discovery, or any source with its operator flag
-        # off), delegate the WHOLE batch to the legacy tool_node path which
+        # creator/guide, mcp discovery, an unsupported source, or the master
+        # switch off), delegate the WHOLE batch to the legacy tool_node path which
         # preserves the fail-closed skill/mcp/a2a guards + skill creator/guide
         # confirmation pipelines. PE only handles batches where every pending call
         # qualifies for PE — otherwise we'd bypass legacy per-source
@@ -1176,8 +1177,8 @@ def build_react_graph(
                 _pre_src, _tc_for_gate
             ):
                 # Non-PE-eligible call detected (unknown source, unsupported
-                # source, flag off, or skill creator/guide) — fall back to
-                # legacy tool_node for the whole batch.
+                # source, master switch off, or skill creator/guide) — fall back
+                # to legacy tool_node for the whole batch.
                 logger.debug(
                     "_pe_dispatch: non-PE-eligible tool '%s' (source=%s, "
                     "category=%s) in batch → falling back to legacy "
@@ -2014,9 +2015,10 @@ def build_react_graph(
         Tool call ids in ``state.approved_tool_call_ids`` — populated by
         ``interrupt_helper`` on the ``approve`` resume path — skip the
         per-tool risk assessment gate on replay and execute directly. This is
-        the approve-resume bridge; ``ApprovalCache`` write is post-resume in
-        ``agent_service._resume_tool_confirmation``, so the dispatcher cannot
-        rely on the cache alone for the replay and needs this state flag.
+        the approve-resume bridge; the approval grant is persisted post-resume
+        (via ``ApprovalStateWriter`` in ``agent_service._resume_tool_confirmation``),
+        so the dispatcher cannot rely on a persisted record alone for the replay
+        and needs this state flag.
 
         ## Special handling for ``message_ask_user``
 
@@ -2033,9 +2035,9 @@ def build_react_graph(
         function **returns** ``Command(goto="interrupt_helper", update=...)``
         after writing the ``pending_ask_*`` state fields. The dispatcher
         itself **never** calls ``interrupt()``; that contract belongs
-        exclusively to ``interrupt_helper`` (CS2.13 invariant). Commit 2a
-        (Task 21) will replace this gate with the full Layer 1/2/3 pipeline
-        via ``_run_policy_chain`` / ``_invoke_wrapper`` / ``_translate_outcome``.
+        exclusively to ``interrupt_helper`` (CS2.13 invariant). For PE-eligible
+        batches this transitional gate is superseded by the PermissionEngine
+        dispatch (``_pe_dispatch`` → ``_invoke_wrapper`` → ``_translate_outcome``).
 
         ## Return type
 
@@ -2060,7 +2062,8 @@ def build_react_graph(
         # ---- PE-0 Phase 9 + PE-1 §2.5: Permission Engine dispatch branch ---- #
         # When PE + SSM are wired (built per-task in _create_task), route
         # through DefaultPermissionEngine instead of the legacy
-        # _run_policy_chain / risk gate inline code.
+        # risk gate inline code below (the old _run_policy_chain stack was
+        # deleted in PE-4a).
         #
         # PE-4c: per-source flags retired — routing is consulted PER CALL
         # inside ``_pe_dispatch`` via
@@ -2078,8 +2081,9 @@ def build_react_graph(
             if _pe_result is not None:
                 return _pe_result
             # _pe_result is None: batch contains zero PE-eligible tool
-            # calls (either non-PE source OR per-source flag off);
-            # fall through to legacy tool_node path below.
+            # calls (either non-PE source OR the master switch off; PE-4c
+            # retired the per-source flags); fall through to legacy tool_node
+            # path below.
 
         # ---- End PE-0 Phase 9 / PE-1 §2.5 branch ---- #
 
@@ -2380,8 +2384,8 @@ def build_react_graph(
 
             # PE-1b fail-closed guard: a dynamic SkillTool (source == category ==
             # "skill") only reaches the legacy path via a mixed-batch fallback — a
-            # non-PE-eligible call (skill creator/guide, mcp discovery, or any
-            # source with its operator flag off) in the same batch
+            # non-PE-eligible call (skill creator/guide, mcp discovery, an
+            # unsupported source, or the master switch off) in the same batch
             # forced the whole batch off PE (per-batch gate → None). PE-1b deleted
             # the legacy R3 skill confirmation and the native gate below excludes
             # skills, so without this guard the skill would execute UNCONFIRMED. Deny
@@ -2421,9 +2425,10 @@ def build_react_graph(
             # None); without this guard the MCP call reaches the direct-execute
             # point below and runs UNCONFIRMED, bypassing any user ASK/DENY policy
             # the PE path honors. MCP-specific (source/category) so native/skill/
-            # a2a are untouched; gated on PE-present + mcp flag so flag-OFF /
+            # a2a are untouched; gated on PE-present + master switch on (with mcp
+            # ∈ PE_SUPPORTED_SOURCES; PE-4c retired the per-source flags) so
             # master-OFF / PE-absent fall through to legacy passthrough (§8 soft
-            # rollback). INV-6 clean (source/category + flag only). The agent
+            # rollback). INV-6 clean (source/category only). The agent
             # re-sends the MCP tool alone (driven by .content) → _pe_dispatch
             # routes it through PE + McpSource.
             if (
@@ -2454,9 +2459,10 @@ def build_react_graph(
             # reaches the direct-execute point below and runs UNCONFIRMED,
             # bypassing any user ASK/DENY policy the PE path honors. A2A-specific
             # (source/category) so native/skill/mcp are untouched; gated on
-            # PE-present + a2a flag so flag-OFF / master-OFF / PE-absent fall
+            # PE-present + master switch on (with a2a ∈ PE_SUPPORTED_SOURCES;
+            # PE-4c retired the per-source flags) so master-OFF / PE-absent fall
             # through to legacy passthrough (§8 soft rollback). INV-6 clean
-            # (source/category + flag only). Agent re-sends A2A alone (driven by
+            # (source/category only). Agent re-sends A2A alone (driven by
             # .content) → _pe_dispatch routes it through PE + A2aSource.
             if (
                 not _bypass_risk_gate
@@ -2792,7 +2798,8 @@ def build_react_graph(
         """R2 CS2 — the only node allowed to call ``interrupt()``.
 
         Receives control from ``tool_node`` whenever a tool_call reaches an
-        ``Asked`` outcome (Layer 1 policy chain or Layer 2 wrapper). Reads
+        ``Asked`` outcome (PE evaluate via ``_pe_dispatch`` or the legacy
+        risk gate / wrapper). Reads
         the ``pending_ask_*`` state written by ``tool_node``, calls
         ``interrupt(...)`` to pause the graph, and on resume dispatches:
 
@@ -2816,7 +2823,7 @@ def build_react_graph(
 
         **CS2.13 invariant**: this function must NOT read
         ``state.messages[-1].tool_calls``, must NOT call
-        ``_invoke_wrapper`` / ``_run_policy_chain``, and must NOT execute
+        ``_invoke_wrapper`` (or any tool-dispatch helper), and must NOT execute
         wrappers. Its sole job is the interrupt handshake and routing.
         """
         _early = _interrupt_helper_early_return(state)

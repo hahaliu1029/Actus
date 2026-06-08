@@ -52,7 +52,7 @@ class ToolResult(BaseModel, Generic[T]):
 
 
 DecisionReasonType = Literal[
-    "approval_policy",   # ApprovalCache / DB rule / R5 ApprovalStateWriter
+    "approval_policy",   # ApprovalStateReader/Writer 审批决策 (grant 持久化)
     "smart_approve",     # summary_llm 产出的 approve/deny/escalate
     "ast_validator",     # N1 pre-execution 静态拒绝
     "risk_enforce",      # SkillTool.risk_mode=enforce_confirmation 内部决策

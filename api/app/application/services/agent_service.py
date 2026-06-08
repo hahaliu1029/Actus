@@ -1049,9 +1049,9 @@ class AgentService:
         ``ToolConfirmationConfig``. A tool is PE-eligible iff
         ``is_pe_eligible_tool_source(tool_source, tc)`` returns True — which
         requires the source to be in ``PE_SUPPORTED_SOURCES``,
-        the per-source flag enabled, AND (for ``source="skill"``) the
-        category to be ``"skill"`` so creator/guide tools fall back to
-        legacy (Round 2 P1#2).
+        the master ``enabled`` switch on (PE-4c retired the per-source flags),
+        AND (for ``source="skill"``) the category to be ``"skill"`` so
+        creator/guide tools fall back to legacy (Round 2 P1#2).
 
         Mirrors the routing logic ``_pe_dispatch`` uses post-PE-1: when
         any tool in the batch is not PE-eligible, ``_pe_dispatch`` falls
@@ -1401,8 +1401,9 @@ class AgentService:
 
         # PE-1 §3.2 + Round 2 P1#1/P1#2: source+category-aware per-call gate.
         # PE-0 was native-only; PE-1 supports native + skill
-        # (PE_SUPPORTED_SOURCES). For any source that is NOT
-        # enabled at the per-source flag level — OR for skill creator /
+        # (PE_SUPPORTED_SOURCES). For any source that is NOT in
+        # PE_SUPPORTED_SOURCES — or when the master switch is off (PE-4c
+        # retired the per-source flags) — OR for skill creator /
         # skill guide tools (``source="skill"`` but ``category != "skill"``,
         # which ``SkillSource.build_skill_call_metadata`` cannot resolve) —
         # OR for hallucinated / unknown tool names — we route to the legacy

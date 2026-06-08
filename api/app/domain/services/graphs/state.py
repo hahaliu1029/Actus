@@ -104,10 +104,10 @@ class ReactGraphState(TypedDict):
 
     # R2 CS2: interrupt_helper → tool_node 的 "pre-approved" 桥接.
     # approve 路径下 interrupt_helper 把 pending_id 写进这个 list.
-    # tool_node replay 时看到 tc.id 在这个 list 里, 直接 bypass Layer 1
-    # policy chain 到 Layer 2. 使用完后清空.
-    # 理由: _resume_tool_confirmation 的 ApprovalCache 写是 post-resume 顺序
-    # (agent_service.py:313-395), tool_node replay 时 cache 还没写,
+    # tool_node replay 时看到 tc.id 在这个 list 里, 直接 bypass 风险闸门
+    # 直接执行. 使用完后清空.
+    # 理由: _resume_tool_confirmation 的审批落盘 (ApprovalStateWriter) 是
+    # post-resume 顺序, tool_node replay 时持久记录还没写,
     # 必须靠 state flag 直接 bypass.
     approved_tool_call_ids: NotRequired[list[str]]
 

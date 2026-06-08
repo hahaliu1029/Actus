@@ -155,7 +155,7 @@ class OtelToolSpanCallback(AsyncCallbackHandler):
         # ``langchain_core.tools.base.BaseTool`` passes it through to
         # ``callback_manager.on_tool_start(... tool_call_id=...)``; we
         # surface it on the span so downstream joins (ToolEvent /
-        # tool_node accounting / approval cache) can correlate exactly.
+        # tool_node accounting / approval grant records) can correlate exactly.
         # ``step_id`` is NOT read from metadata: LangGraph's metadata
         # carries an unrelated ``langgraph_step`` integer counter, not
         # our ``configurable.step_id``. Instead ``traced_node`` binds

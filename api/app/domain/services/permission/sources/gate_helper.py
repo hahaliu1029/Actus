@@ -64,7 +64,8 @@ def is_pe_eligible_tool_source(tool_source: Any, config: Any) -> bool:
         also gives the unknown-source case a single funnel so HTTP preflight,
         graph dispatch, and the batch guard all agree)
       - source not in ``PE_SUPPORTED_SOURCES``
-      - source-specific flag off (or master switch off, via
+      - master switch off (PE-4c retired the per-source flags; the only
+        remaining toggle is the master ``enabled`` switch, via
         ``is_pe_enabled_for_source``)
       - ``source="skill"`` but ``category != "skill"`` (creator / guide)
       - ``source="mcp"`` but ``category != "mcp"`` (discovery meta-tools)
