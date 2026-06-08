@@ -3561,6 +3561,49 @@ class AgentTaskRunner(TaskRunner):
         own prime is a no-op and this injection survives."""
         self._flow.set_cancel_event(event)
 
+    def set_coordinator_child_permission_context(self, cpc) -> None:
+        """[C2b §4.1] Forward the child's ChildPermissionContext into the child
+        PlannerReActFlow (so react_graph's tool_node guard reads it from cfg) and
+        keep a runner-local reference for the post-RUNNING revision baseline
+        refresh (§4.2). Mirrors set_coordinator_cancel_event."""
+        self._coordinator_child_permission_context = cpc
+        self._flow.set_child_permission_context(cpc)
+
+    async def _refresh_child_permission_baseline(self) -> None:
+        """[C2b §4.2] After the child's PENDING→RUNNING bump committed, re-read
+        the live (mode, revision) and replace the cpc baseline ONLY when it is
+        the legal single-hop RUNNING (== starter_baseline + 1). Best-effort:
+        a read failure or any non-RUNNING/jumped revision keeps the lower
+        starter baseline, so the tool_node guard fail-closes to REVISION_DRIFT
+        (→ NEEDS_AUTHORIZATION, replannable) rather than crashing the child.
+        No-op for root runners (no cpc stashed)."""
+        from dataclasses import replace
+
+        cpc = getattr(self, "_coordinator_child_permission_context", None)
+        if cpc is None:
+            return
+        try:
+            mode, rev = await self._require_state_machine().get_mode_with_revision(
+                self._session_id
+            )
+        except Exception:
+            logger.warning(
+                "child baseline refresh: get_mode_with_revision failed for %s; "
+                "keeping starter baseline (guard fail-closes on drift)",
+                self._session_id, exc_info=True,
+            )
+            return
+        if mode == SessionStatus.RUNNING and rev == cpc.session_mode_revision + 1:
+            new_cpc = replace(cpc, session_mode_revision=rev)
+            self._coordinator_child_permission_context = new_cpc
+            self._flow.set_child_permission_context(new_cpc)
+        else:
+            logger.warning(
+                "child baseline refresh: unexpected (mode=%s rev=%s) vs baseline "
+                "%s for %s; keeping starter baseline (guard fail-closes on drift)",
+                mode, rev, cpc.session_mode_revision, self._session_id,
+            )
+
     async def _maybe_spawn_mailbox_supervisor(self) -> None:
         """C3 PR-3c spawn hook (idempotent).
 
@@ -3985,6 +4028,13 @@ class AgentTaskRunner(TaskRunner):
                     session_repo=self._uow.session,
                 )
 
+            # [C2b §4.2] After the child session's PENDING→RUNNING bump committed
+            # above, refresh the cpc revision baseline so the tool_node child-scope
+            # guard's live revision read matches (else the first child tool call
+            # mis-fires REVISION_DRIFT). No-op for root runners. Best-effort —
+            # never raises (design §4.2).
+            await self._refresh_child_permission_baseline()
+
             # C3 PR-3c — spawn the per-pod MailboxSupervisor right after the
             # status transition so subagent envelopes that arrive in the
             # earliest part of the loop have a consumer. Best-effort: failure
@@ -4321,11 +4371,17 @@ class AgentTaskRunner(TaskRunner):
                 )
                 raise
 
-            except ChildScopeViolation:
-                # [C2 PR-2 §5.4] Child scope violations must propagate past this
-                # runner's catch-all so CoordinatorChildRunner finalizer (PR-4) can
-                # convert to RESULT_READY(needs_authorization). NOT a runner crash
-                # — semantically a typed deny from the permission engine.
+            except ChildScopeViolation as exc:
+                # [C2 PR-2 §5.4] Typed scope denies must propagate past this
+                # runner's catch-all so the CoordinatorChildRunner finalizer
+                # (PR-4) can convert to RESULT_READY(needs_authorization).
+                # [C2b §4.4] Stash on the task BEFORE re-raising:
+                # RedisStreamTask._execute_task swallows the re-raise, so the
+                # stash lets the adapter re-raise the typed violation
+                # (→ NEEDS_AUTHORIZATION) instead of a generic FAILED.
+                _stash = getattr(task, "set_child_scope_violation", None)
+                if _stash is not None:
+                    _stash(exc)
                 raise
             except CancelledByEventError:
                 # [C2 PR-4 §8.4 r3 P1#1] Same shape as ChildScopeViolation:

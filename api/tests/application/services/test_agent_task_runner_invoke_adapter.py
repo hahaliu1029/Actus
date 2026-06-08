@@ -273,3 +273,101 @@ async def test_adapter_cancels_inner_task_when_drain_unwinds():
     assert created, "task was never created"
     assert created[0].cancelled_with == "adapter_unwind"  # inner task cancelled, not orphaned
     assert created[0].done is True
+
+
+# ---------------------------------------------------------------------------
+# C2b §4.4 — typed ChildScopeViolation propagation across the swallow
+# ---------------------------------------------------------------------------
+from app.domain.services.permission.child_scope_gate import ScopeDecision
+from app.domain.services.permission.child_scope_violation import ChildScopeViolation
+
+
+class _SwallowingFakeTask(_FakeTask):
+    """Mimics RedisStreamTask: _execute_task swallows a non-cancel Exception
+    (the runner already stashed the violation) and flips done."""
+    def __init__(self, runner):
+        super().__init__(runner)
+        self._child_scope_violation = None
+
+    @property
+    def child_scope_violation(self):
+        return self._child_scope_violation
+
+    def set_child_scope_violation(self, exc):
+        self._child_scope_violation = exc
+
+    async def invoke(self):
+        try:
+            await self._runner.run(self)
+        except ChildScopeViolation:
+            pass  # RedisStreamTask._execute_task swallows; stash survives
+        finally:
+            self.done = True
+
+
+class _ViolatingRunner(_ScriptedRunner):
+    """Stashes the violation on the task (mirrors AgentTaskRunner.invoke's
+    except block) then raises it."""
+    def __init__(self, violation):
+        super().__init__([])
+        self._violation = violation
+
+    async def run(self, task):
+        task.set_child_scope_violation(self._violation)
+        raise self._violation
+
+
+async def test_adapter_reraises_stashed_child_scope_violation():
+    viol = ChildScopeViolation(
+        ScopeDecision.OUT_OF_PATH_LEASE, tool_name="file_write",
+        target_path="/forbidden",
+    )
+    runner = _ViolatingRunner(viol)
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_SwallowingFakeTask,
+    )
+    with pytest.raises(ChildScopeViolation) as ei:
+        await adapter.invoke_until_done(user_message="x")
+    assert ei.value is viol  # the typed violation, NOT ChildInnerRunError
+
+
+async def test_cancel_event_takes_precedence_over_stashed_violation():
+    """precedence: cancel_event > child_scope_violation > ChildInnerRunError."""
+    viol = ChildScopeViolation(ScopeDecision.HARD_BLOCKED, tool_name="shell_execute")
+    cancel = asyncio.Event()
+    cancel.set()  # coordinator cancel wins
+    runner = _ViolatingRunner(viol)
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=cancel, task_cls=_SwallowingFakeTask,
+    )
+    with pytest.raises(CancelledByEventError):
+        await adapter.invoke_until_done(user_message="x")
+
+
+async def test_adapter_wires_child_permission_context_into_runner():
+    cpc = object()
+
+    class _CpcRunner(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([DoneEvent()])
+            self.cpc_attr = None
+
+        def set_coordinator_child_permission_context(self, c):
+            self.cpc_attr = c
+
+    runner = _CpcRunner()
+    AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+        child_permission_context=cpc,
+    )
+    assert runner.cpc_attr is cpc
+
+
+async def test_adapter_no_cpc_setter_is_noop():
+    """A runner stub without set_coordinator_child_permission_context (and/or no
+    cpc passed) constructs without error (getattr-defensive)."""
+    runner = _ScriptedRunner([DoneEvent()])  # no cpc setter
+    AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+        child_permission_context=object(),
+    )

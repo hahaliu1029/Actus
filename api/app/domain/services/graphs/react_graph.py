@@ -53,6 +53,11 @@ from app.domain.models.tool_result import (
     ToolResult,
 )
 from app.domain.services.json_envelope import unwrap_message_envelope
+from app.domain.services.permission.child_scope_gate import (
+    ChildScopeGate,
+    ScopeDecision,
+    extract_target_path,
+)
 from app.domain.services.permission.child_scope_violation import ChildScopeViolation
 from app.domain.services.permission.errors import (
     PEInfrastructureUnavailable,
@@ -295,6 +300,12 @@ def _is_shell_category(tool_source: ToolSource) -> bool:
 GuideInjector = Callable[[str], str | None]
 
 
+# [C2b §4.3] Stateless, re-entrant child-scope gate shared by the tool_node
+# guard. ChildScopeGate.check_in_scope is a pure function (no writer/queue/SSM
+# writes), so a single module-level instance is safe.
+_child_scope_gate = ChildScopeGate()
+
+
 def _build_tool_call_spec_from_tc(
     tc: dict,
     configurable: dict,
@@ -343,6 +354,66 @@ def _build_tool_call_spec_from_tc(
         tool_call_id=tc.get("id", ""),
         source_metadata=source_metadata,
     )
+
+
+async def _enforce_child_scope_or_raise(
+    state: ReactGraphState, configurable: dict
+) -> None:
+    """[C2b §4.3] Child-scope enforcement at tool_node entry.
+
+    When ``configurable`` carries a ``child_permission_context`` (only
+    coordinator children — root sessions never inject it), validate EVERY
+    not-yet-completed tool_call in the active batch against ``ChildScopeGate``
+    BEFORE any tool executes (batch-atomic admission). Raises
+    ``ChildScopeViolation`` on the first out-of-scope call. No-op for roots.
+
+    Pure read: a single up-front SSM ``get_mode_with_revision`` (no TOCTOU
+    re-read) + the pure ``check_in_scope`` — zero writes (INV-1).
+    """
+    cpc = configurable.get("child_permission_context")
+    if cpc is None:
+        return
+    from app.domain.services.permission.context import EvaluationContext
+
+    ssm = configurable.get("session_state_machine")
+    _session_id = configurable.get("session_id") or ""  # == cpc.child_session_id
+    mode, current_rev = await ssm.get_mode_with_revision(_session_id)
+    ctx = EvaluationContext(
+        session_mode=mode,
+        session_mode_revision=current_rev,
+        child_permission_context=cpc,
+        request_id=configurable.get("request_id", "") or "",
+    )
+    # active AIMessage.tool_calls — backward scan (mirror _pe_dispatch:1135-1138);
+    # NOT messages[-1] (on replay/partial completion the last message may not be
+    # the active AIMessage).
+    tool_calls: list[dict] = []
+    for _msg in reversed(state["messages"]):
+        if isinstance(_msg, AIMessage) and _msg.tool_calls:
+            tool_calls = _msg.tool_calls
+            break
+    already_done = set(state.get("completed_tool_call_prefix", []) or [])
+    for tc in tool_calls:
+        if tc["id"] in already_done:
+            continue
+        # resolve_tool_source THROWS ToolSourceUnknownError (does not return a
+        # sentinel) — mirror the existing catch (react_graph.py:1291) so an unknown
+        # child tool reaches the gate as OUT_OF_TOOL_ALLOWLIST instead of a
+        # pre-gate crash.
+        try:
+            tool_source = resolve_tool_source(tc["name"])
+        except ToolSourceUnknownError:
+            tool_source = ToolSource(
+                source="native", category="unknown", canonical_name=tc["name"],
+            )
+        call_spec = _build_tool_call_spec_from_tc(tc, configurable, tool_source)
+        decision = await _child_scope_gate.check_in_scope(call_spec, ctx, cpc)
+        if decision != ScopeDecision.IN_SCOPE:
+            raise ChildScopeViolation(
+                decision,
+                tool_name=tc["name"],
+                target_path=extract_target_path(call_spec),
+            )
 
 
 def _session_ctx_from(config: RunnableConfig | None) -> _SessionContext:
@@ -2058,6 +2129,12 @@ def build_react_graph(
         confirmation_manager = configurable.get("confirmation_manager")
         _tracker = configurable.get("tool_failure_tracker")
         _metrics = configurable.get("execution_metrics")
+
+        # [C2b §4.3] Child-scope guard — enforce the coordinator child's manifest
+        # allowlist + path lease + revision freshness BEFORE any tool side effect.
+        # Runs ahead of the PE/legacy fork so it covers the whole pending batch
+        # regardless of dispatch path. No-op for root sessions (no cpc in cfg).
+        await _enforce_child_scope_or_raise(state, configurable)
 
         # ---- PE-0 Phase 9 + PE-1 §2.5: Permission Engine dispatch branch ---- #
         # When PE + SSM are wired (built per-task in _create_task), route

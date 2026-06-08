@@ -1,7 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 from app.domain.external.message_queue import MessageQueue
+
+if TYPE_CHECKING:
+    from app.domain.services.permission.child_scope_violation import (
+        ChildScopeViolation,
+    )
 
 
 class TaskRunner(ABC):
@@ -46,6 +51,18 @@ class Task(Protocol):
     @property
     def cancel_reason(self) -> str:
         """返回任务最近一次取消原因"""
+        ...
+
+    @property
+    def child_scope_violation(self) -> "Optional[ChildScopeViolation]":
+        """[C2b §4.4] The typed child-scope violation stashed by
+        AgentTaskRunner before re-raising, or None. Survives
+        RedisStreamTask._execute_task's exception swallow so the
+        coordinator invoke-adapter can re-raise it."""
+        ...
+
+    def set_child_scope_violation(self, exc: "ChildScopeViolation") -> None:
+        """[C2b §4.4] Stash the typed violation on the task."""
         ...
 
     @property

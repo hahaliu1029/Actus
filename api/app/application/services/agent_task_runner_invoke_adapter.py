@@ -45,7 +45,14 @@ class ChildInnerRunError(Exception):
 class AgentTaskRunnerInvokeAdapter:
     """Wraps a fully-constructed child ``AgentTaskRunner``."""
 
-    def __init__(self, *, runner: Any, cancel_event: asyncio.Event, task_cls: Any) -> None:
+    def __init__(
+        self,
+        *,
+        runner: Any,
+        cancel_event: asyncio.Event,
+        task_cls: Any,
+        child_permission_context: Any = None,
+    ) -> None:
         self._runner = runner
         self._cancel_event = cancel_event
         self._task_cls = task_cls
@@ -55,6 +62,12 @@ class AgentTaskRunnerInvokeAdapter:
         setter = getattr(runner, "set_coordinator_cancel_event", None)
         if setter is not None:
             setter(cancel_event)
+        # [C2b §4.1] Wire the child permission context so the child graph cfg
+        # carries it (→ tool_node child-scope guard). getattr-defensive: a
+        # runner stub without the setter (legacy unit fakes) is a no-op.
+        cpc_setter = getattr(runner, "set_coordinator_child_permission_context", None)
+        if cpc_setter is not None and child_permission_context is not None:
+            cpc_setter(child_permission_context)
 
     async def invoke_until_done(self, *, user_message: str) -> ChildRunResult:
         task = self._task_cls.create(task_runner=self._runner)
@@ -101,6 +114,15 @@ class AgentTaskRunnerInvokeAdapter:
                         raise CancelledByEventError(
                             "coordinator cancel (child terminated mid-cancel)"
                         )
+                    # [C2b §4.4] A ChildScopeViolation raised inside the graph was
+                    # swallowed by RedisStreamTask._execute_task but stashed on the
+                    # task by AgentTaskRunner. Re-raise the typed violation so
+                    # CoordinatorChildRunner converts it to RESULT_READY(
+                    # NEEDS_AUTHORIZATION) instead of generic FAILED. Precedence:
+                    # cancel_event (above) > child_scope_violation > generic.
+                    _violation = getattr(task, "child_scope_violation", None)
+                    if _violation is not None:
+                        raise _violation
                     raise ChildInnerRunError(
                         "child task ended without a terminal event"
                     )

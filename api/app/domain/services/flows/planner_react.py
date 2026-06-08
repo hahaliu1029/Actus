@@ -343,6 +343,11 @@ class PlannerReActFlow(BaseFlow):
         # [C2 finish-core §5.1.1] Set True by set_cancel_event so a coord
         # (parent) re-invoke's prime cannot clobber an adapter-injected event.
         self._cancel_event_externally_injected: bool = False
+        # [C2b §4.1] Coordinator-child scope context. None for root + non-child
+        # flows; set by AgentTaskRunner.set_coordinator_child_permission_context
+        # via the invoke-adapter. _build_config injects it (+ the SSM) into the
+        # child graph cfg so react_graph's tool_node child-scope guard fires.
+        self._child_permission_context = None
 
     def set_cancel_event(self, event: "asyncio.Event") -> None:
         """[C2 finish-core §5.1.1 G1a] External seam: the coordinator invoke-
@@ -350,6 +355,13 @@ class PlannerReActFlow(BaseFlow):
         (coord_deps Null) so react_graph cancel checkpoints observe it."""
         self._cancel_event = event
         self._cancel_event_externally_injected = True
+
+    def set_child_permission_context(self, cpc) -> None:
+        """[C2b §4.1] External seam (mirror set_cancel_event): the coordinator
+        invoke-adapter injects the child's ChildPermissionContext so
+        _build_config threads it (+ the SSM) into the child graph cfg for the
+        tool_node child-scope guard."""
+        self._child_permission_context = cpc
 
     @property
     def summary_llm(self):
@@ -1473,6 +1485,21 @@ class PlannerReActFlow(BaseFlow):
             # the invoke-adapter called set_cancel_event(...). Inject ONLY the
             # cancel_event so react_graph._should_cancel trips on parent cancel.
             cfg["configurable"]["cancel_event"] = self._cancel_event
+            # [C2b §4.1] Child-scope guard wiring. Inject the ChildPermissionContext
+            # + the SSM so react_graph's tool_node child-scope guard can enforce the
+            # manifest/lease. This is INTENTIONALLY independent of the PE master
+            # switch: a coordinator child runs with tool_confirmation.enabled=False
+            # so the PE/SSM injection block above is skipped — but the guard still
+            # needs the SSM for the live revision read. Injecting the SSM alone does
+            # NOT enable PE dispatch (tool_node requires BOTH permission_engine AND
+            # session_state_machine; the child has no permission_engine).
+            if self._child_permission_context is not None:
+                cfg["configurable"]["child_permission_context"] = (
+                    self._child_permission_context
+                )
+                cfg["configurable"]["session_state_machine"] = (
+                    self._session_state_machine
+                )
         return cfg
 
     async def invoke(self, message: Message) -> AsyncGenerator[BaseEvent, None]:

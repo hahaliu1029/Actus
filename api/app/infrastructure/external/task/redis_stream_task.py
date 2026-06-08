@@ -25,6 +25,12 @@ class RedisStreamTask(Task):
         self._execution_task: Optional[asyncio.Task] = None  # 定义在后台执行的任务
         self._cancel_reason: str = "stop"
 
+        # [C2b §4.4] Typed child-scope violation stash. Set by
+        # AgentTaskRunner.invoke's `except ChildScopeViolation` BEFORE re-raising,
+        # so it survives this task's _execute_task `except Exception` swallow and
+        # the coordinator invoke-adapter can re-raise it (→ NEEDS_AUTHORIZATION).
+        self._child_scope_violation: Optional[Any] = None
+
         input_stream_name = f"task:input:{self._id}"
         output_stream_name = f"task:output:{self._id}"
 
@@ -102,6 +108,13 @@ class RedisStreamTask(Task):
     @property
     def cancel_reason(self) -> str:
         return self._cancel_reason
+
+    @property
+    def child_scope_violation(self) -> Optional[Any]:
+        return self._child_scope_violation
+
+    def set_child_scope_violation(self, exc: Any) -> None:
+        self._child_scope_violation = exc
 
     @property
     def input_stream(self) -> MessageQueue:

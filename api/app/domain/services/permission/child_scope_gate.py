@@ -1,36 +1,36 @@
-"""ChildScopeGate — 4-way intersection (spec §5.4).
+"""ChildScopeGate — coordinator-child tool authorization boundary (spec §5.4).
 
-Position: DefaultPermissionEngine.evaluate prologue (BEFORE source loop).
-Skipped when EvaluationContext.child_permission_context is None.
+Pure 6-step sequential check (the "4-way intersection" name is historical):
+allowlist -> HARD_BLOCKED -> path-lease/op -> budget-cap -> lease-expiry ->
+revision-drift. Skipped when EvaluationContext.child_permission_context is None.
 
 [r11] Tool-call cap stays in gate (per-call signal available).
 Token cost + wallclock are runner-internal (gate has no signal).
 
 INV-1b/2/3 safe: pure function; no writer/queue/SSM touches.
 
-DEFERRED to PR-3+ (cold code in PR-2):
----------------------------------------
-- WIRING: nothing in production currently constructs EvaluationContext
-  with child_permission_context set (`grep child_permission_context= app/`
-  returns no matches as of PR-2 staging). PR-3 ChildAgentRunnerFactory.build
-  is responsible for plumbing the manifest through into the engine's
-  per-task ctx. Until then this gate is cold code.
+LIVE wiring (C2b, 2026-06): two callers pass the SAME
+EvaluationContext.child_permission_context and call check_in_scope (DRY):
+- DefaultPermissionEngine.evaluate prologue — defense-in-depth (BEFORE the
+  source loop).
+- react_graph.tool_node entry guard ``_enforce_child_scope_or_raise`` — the
+  PRODUCTION path. Coordinator children run with tool_confirmation.enabled=False
+  so they never enter the PE branch; the tool_node-entry guard fires BEFORE the
+  PE/legacy fork over every pending tool_call, so message_ask_user (HARD_BLOCKED)
+  and replay paths (``pe_resume_outcomes`` / ``approved_tool_call_ids`` — the
+  guard's skip set is ``completed_tool_call_prefix`` ONLY, so pre-approved
+  replays are re-checked) are all covered. cpc reaches cfg via
+  PlannerReActFlow._build_config's child branch.
 
-- PRE-PE BYPASS: react_graph.py has a pre-PE special branch for
-  `message_ask_user` (around `_pe_dispatch` ~line 1214/1304) that executes
-  BEFORE pe.evaluate runs. `message_ask_user` is in HARD_BLOCKED_FOR_CHILDREN
-  here, but the pre-loop bypass would let a child execute it without the
-  gate ever firing. PR-3 wiring task MUST either (a) gate the pre-loop on
-  child_permission_context None, or (b) add an inline child-scope check at
-  the bypass point. Codex R5 flagged this; ticket the fix as PR-3
-  acceptance criteria.
-
-- REPLAY FAST-PATH: react_graph.py's `pe_resume_outcomes` /
-  `approved_tool_call_ids` replay paths re-execute approved tool calls
-  without re-running ChildScopeGate. Lease expiry / revision drift
-  detection therefore only fires at original evaluate time. PR-3 wiring
-  MUST add a child-scope revalidation step on replay paths when
-  child_permission_context is non-None.
+Known limitations (spec §6, deferred — NOT bugs introduced here):
+- Cumulative tool-count cap: budget is still the static ``max_tool_calls <= 0``
+  kill-switch, not a cumulative counter.
+- Intra-batch race; symlink / non-canonical lease escape (exact-string match);
+  manifest ``allowed_tools`` has no known-name validator.
+- Child session DB row termination on violation: the runner re-raises
+  ChildScopeViolation WITHOUT a terminal status write (sibling of the
+  ``CancelledByEventError`` PR-5 deferred gap), so a denied child's session row
+  stays RUNNING until the coordinator/PR-5 runner_starter adapter reaps it.
 """
 from __future__ import annotations
 

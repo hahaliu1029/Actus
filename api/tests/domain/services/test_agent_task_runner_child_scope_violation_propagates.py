@@ -9,7 +9,8 @@ import re
 
 
 def test_agent_task_runner_reraises_child_scope_violation():
-    """AST-grep: AgentTaskRunner.run loop must `raise` for ChildScopeViolation BEFORE the broad `except Exception`."""
+    """AST-grep: AgentTaskRunner.run loop must stash the typed violation on the
+    task and then `raise` it, BEFORE the broad `except Exception`."""
     from app.domain.services import agent_task_runner
 
     src = inspect.getsource(agent_task_runner)
@@ -22,12 +23,16 @@ def test_agent_task_runner_reraises_child_scope_violation():
         "ChildScopeViolation must be re-raised BEFORE the broad runner catch-all; "
         "otherwise PR-4 finalizer cannot see the typed scope deny."
     )
-    block_tail = src[last_reraise: last_reraise + 600]
-    assert re.search(
-        r"except ChildScopeViolation[^:]*:\s*(?:#[^\n]*\n\s*)*raise\b",
-        block_tail,
-    ), (
-        f"ChildScopeViolation except block must `raise`; got: {block_tail!r}"
+    block = src[last_reraise: last_reraise + 800]
+    stash_i = block.find("set_child_scope_violation")
+    assert stash_i != -1, (
+        "ChildScopeViolation except block must stash the typed violation on the "
+        "task (set_child_scope_violation) before re-raising — else RedisStreamTask "
+        "swallows it and the adapter returns generic FAILED, not NEEDS_AUTHORIZATION."
+    )
+    raise_i = block.find("raise", stash_i)
+    assert raise_i != -1 and raise_i > stash_i, (
+        "ChildScopeViolation except block must `raise` AFTER stashing the violation."
     )
 
 

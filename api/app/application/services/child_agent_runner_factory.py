@@ -171,6 +171,7 @@ class ChildAgentTaskRunnerFactory:
         )
         adapter = AgentTaskRunnerInvokeAdapter(
             runner=raw_runner, cancel_event=cancel_event, task_cls=self._task_cls,
+            child_permission_context=child_permission_context,
         )
         return BuiltChildRunner(
             runner=adapter,
