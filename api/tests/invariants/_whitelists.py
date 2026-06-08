@@ -40,6 +40,7 @@ INV2_SSM_MUTATOR_NAMES: tuple[str, ...] = (
     "transition",
     "set_mode",      # A4-1: PE must not drive status writes
     "terminate",     # A4-1: PE must not drive status writes
+    "emit_session_mode_changed",  # A4-2: PE must not emit control-mode events
 )
 
 # INV-3: SSM subpackage MUST NOT call ApprovalStateWriter mutators.

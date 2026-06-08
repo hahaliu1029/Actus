@@ -1,28 +1,21 @@
-"""DefaultSessionStateMachine — repo-backed SSM with no-op event publisher.
+"""DefaultSessionStateMachine — repo-backed SSM.
 
-event_publisher is wired here as a sink for A4-0 SessionModeChangedEvent.
-PE-0 ships it as Optional and falls back to a no-op; A4-0 will plumb
-the real SSE publisher.
+A4-2 retired the no-op SSE event publisher: control-mode SessionModeChangedEvent
+construction + dispatch now lives in SessionStateMachine.emit_session_mode_changed
+(session_state_machine.py) with a caller-owned sink. The dormant CAS
+transition()/request_takeover()/release_takeover()/enter_finishing()/complete()
+family is KEPT (no production caller, still unit-tested) but no longer publishes.
 """
 
 from __future__ import annotations
 from datetime import datetime
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping
 
 from app.domain.models.session import SessionStatus
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.permission.errors import SessionModeViolation
 from app.domain.services.session.session_state_machine import SessionStateMachine
-
-
-class SseEventPublisher(Protocol):
-    async def publish(self, session_id: str, event: dict[str, Any]) -> None: ...
-
-
-class _NoopPublisher:
-    async def publish(self, session_id: str, event: dict[str, Any]) -> None:
-        return None
 
 
 class DefaultSessionStateMachine(SessionStateMachine):
@@ -38,11 +31,9 @@ class DefaultSessionStateMachine(SessionStateMachine):
         *,
         uow_factory: Callable[[], IUnitOfWork],
         redis: Any = None,
-        event_publisher: Optional[SseEventPublisher] = None,
     ) -> None:
         self._uow_factory = uow_factory
-        self._redis = redis  # reserved for hot-path cache, A4-0 wires
-        self._publisher = event_publisher or _NoopPublisher()
+        self._redis = redis  # reserved for hot-path cache
 
     async def get_mode(self, session_id: str) -> SessionStatus:
         async with self._uow_factory() as uow:
@@ -63,28 +54,19 @@ class DefaultSessionStateMachine(SessionStateMachine):
         reason: str,
         extra_values: Mapping[str, Any] | None = None,
     ) -> bool:
-        # IUnitOfWork.__aexit__ commits on clean exit; the CAS UPDATE
-        # is therefore atomic with the SSM call boundary. flush() inside
-        # repo.transition_status guarantees rowcount is settled before
-        # we read it.
+        # IUnitOfWork.__aexit__ commits on clean exit; the CAS UPDATE is
+        # therefore atomic with the SSM call boundary. flush() inside
+        # repo.transition_status guarantees rowcount is settled before we read
+        # it. A4-2: the no-op SSE publish is retired (the rich
+        # SessionModeChangedEvent emit lives in emit_session_mode_changed);
+        # `reason` is retained for the ABC contract / dormant callers.
         async with self._uow_factory() as uow:
-            ok = await uow.session.transition_status(
+            return await uow.session.transition_status(
                 session_id=session_id,
                 from_state=from_state,
                 to_state=to_state,
                 extra_values=extra_values,
             )
-        if ok:
-            await self._publisher.publish(
-                session_id,
-                {
-                    "type": "session_mode_changed",
-                    "session_id": session_id,
-                    "to": to_state.value,
-                    "reason": reason,
-                },
-            )
-        return ok
 
     async def request_takeover(self, session_id: str, reason: str) -> None:
         ok = await self.transition(

@@ -84,6 +84,7 @@ from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.graphs.background_summary import run_background_summary
+from app.domain.services.session.mode_event import ModeChangedEventSink
 from app.domain.services.session.session_state_machine import SessionStateMachine
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.brainstorm_skill import BrainstormSkillTool
@@ -2820,13 +2821,27 @@ class AgentTaskRunner(TaskRunner):
         except Exception:
             return None
 
+    def _mode_event_sink(self, task: Task) -> ModeChangedEventSink:
+        """A4-2: the runner's caller-owned sink for SSM.emit_session_mode_changed.
+        Preserves the runner's buffered emit semantics EXACTLY —
+        _put_and_add_event does Redis seq-stamp + output_stream.put + event.id +
+        idle-touch + persist via the long-lived self._uow. The SSM owns only
+        construction; this sink owns the runtime. The sink's session_id arg
+        equals self._session_id (single write) — harmless to ignore."""
+
+        async def _sink(session_id: str, event: SessionModeChangedEvent) -> None:
+            await self._put_and_add_event(task, event, persist=True)
+
+        return _sink
+
     async def _emit_control_mode_changed(
         self, task: Task, *, to: SessionStatus, reason: str
     ) -> None:
-        """A4-0: write the control-mode status, capture mode_revision in the SAME
-        transaction (INV-2 — read-your-writes), then emit a SessionModeChangedEvent
-        on the live stream. The caller emits this BEFORE its trigger Wait/Control
-        event (INV-1 — the live consumer breaks on Wait/Control). from_mode is
+        """A4-0/A4-2: write the control-mode status, capture mode_revision in the
+        SAME transaction (INV-2 — read-your-writes), then route a
+        SessionModeChangedEvent through the SSM's single emit entry
+        (emit_session_mode_changed) with the runner's buffered sink. The caller
+        emits this BEFORE its trigger Wait/Control event (INV-1). from_mode is
         always "running" on this path (the agent loop transitions from RUNNING)."""
         async with self._uow:
             await self._require_state_machine().set_mode(
@@ -2843,15 +2858,13 @@ class AgentTaskRunner(TaskRunner):
                     self._session_id,
                     exc_info=True,
                 )
-        await self._put_and_add_event(
-            task,
-            SessionModeChangedEvent(
-                to=to.value,
-                from_mode="running",
-                reason=reason,
-                mode_revision=rev,
-            ),
-            persist=True,
+        await self._require_state_machine().emit_session_mode_changed(
+            self._session_id,
+            to=to,
+            from_mode="running",
+            reason=reason,
+            mode_revision=rev,
+            sink=self._mode_event_sink(task),
         )
 
     async def _emit_flow_event(self, task: Task, event: BaseEvent) -> Optional["FlowYieldSignal"]:

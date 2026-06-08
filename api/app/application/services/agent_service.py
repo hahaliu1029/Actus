@@ -55,6 +55,7 @@ from app.domain.models.session import SandboxBindingState, Session, SessionStatu
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.mailbox_skip_helper import _should_skip_mailbox_lifecycle
+from app.domain.services.session.mode_event import ModeChangedEventSink
 from app.domain.services.permission.confirmation_queue import ConfirmationQueue as ConfirmationManager
 from app.domain.services.permission.errors import PermissionConfigurationError
 from app.infrastructure.external.message_queue import STREAM_TTL_SECONDS
@@ -294,9 +295,9 @@ class AgentService:
     def _build_unconditional_ssm(self) -> None:
         # A4-1 §6: SessionStateMachine must be present on EVERY production write
         # path, independent of the tool-confirmation master switch. It is cheap
-        # and stateless (uow_factory + optional redis + noop publisher), so we
-        # build it once here. Lazy import mirrors the existing _create_task
-        # pattern and avoids any import cycle with application.composition.
+        # and stateless (uow_factory + optional redis), so we build it once here.
+        # Lazy import mirrors the existing _create_task pattern and avoids any
+        # import cycle with application.composition.
         from app.application.composition.graph_assembly import (
             build_session_state_machine,
         )
@@ -308,7 +309,6 @@ class AgentService:
                 if self._redis_client and hasattr(self._redis_client, "client")
                 else None
             ),
-            event_publisher=None,
         )
 
     def _refresh_config(self, snapshot: _ConfigSnapshot) -> None:
@@ -603,7 +603,6 @@ class AgentService:
                         if self._redis_client and hasattr(self._redis_client, "client")
                         else None
                     ),
-                    event_publisher=None,
                 )
                 # P1#5: read SmartApprove gate flags from tool_confirmation config.
                 # Default to enabled=True so existing sessions with no explicit
@@ -1212,7 +1211,6 @@ class AgentService:
                     if self._redis_client and hasattr(self._redis_client, "client")
                     else None
                 ),
-                event_publisher=None,
             )
             # P1#5 (resume path): mirror the _create_task gate so SmartApprove
             # is consistently absent when disabled in config.
@@ -3505,14 +3503,13 @@ end
                     _, rev = await uow.session.read_status_with_revision(session_id)
                 except Exception:
                     rev = None
-                await uow.session.add_event(
+                await self._ssm.emit_session_mode_changed(
                     session_id,
-                    SessionModeChangedEvent(
-                        to=SessionStatus.TAKEOVER_PENDING.value,
-                        from_mode="takeover",  # guard at 3448 asserts source == TAKEOVER
-                        reason="takeover_lease_timeout",
-                        mode_revision=rev,
-                    ),
+                    to=SessionStatus.TAKEOVER_PENDING,
+                    from_mode="takeover",  # guard at 3448 asserts source == TAKEOVER
+                    reason="takeover_lease_timeout",
+                    mode_revision=rev,
+                    sink=lambda sid, ev: uow.session.add_event(sid, ev),
                 )
             # 先释放 lease 再调度 pending timeout，防止释放失败时已有 timeout 在跑
             await self._force_release_takeover_lease(session_id)
@@ -3587,35 +3584,30 @@ end
             await uow.session.add_event(session_id, control_event)
         return control_event
 
-    async def _emit_session_mode_changed(
-        self,
-        session_id: str,
-        *,
-        to: str,
-        reason: str,
-        mode_revision: Optional[int],
-        from_mode: Optional[str] = None,
-        task: Optional[Task] = None,
-    ) -> None:
-        """A4-0: emit a SessionModeChangedEvent for an HTTP-takeover transition.
-        Mirrors _append_control_event's live-sink-or-DB-fallback pattern. The
-        caller captures mode_revision INSIDE the status-write txn (INV-2) and
-        passes it in; this helper never re-reads it. All payload fields are
-        server-fixed constants (INV-6 — never client-supplied)."""
-        event = SessionModeChangedEvent(
-            to=to, from_mode=from_mode, reason=reason, mode_revision=mode_revision
-        )
-        if task is not None:
-            try:
-                event.id = await task.output_stream.put(event.model_dump_json())
-            except Exception as exc:
-                logger.warning(
-                    "会话[%s]写入SessionModeChangedEvent到输出流失败，降级为仅落库: %s",
-                    session_id,
-                    exc,
-                )
-        async with self._uow_factory() as uow:
-            await uow.session.add_event(session_id, event)
+    def _sse_or_db_sink(self, task: Optional[Task]) -> ModeChangedEventSink:
+        """A4-2: the caller-owned sink for SSM.emit_session_mode_changed on the
+        HTTP-takeover paths. Mirrors _append_control_event's
+        live-sink-or-DB-fallback: if a live task is present, put to its output
+        stream (degrade-on-failure to DB-only), then ALWAYS persist via a fresh
+        _uow_factory() txn. Demoted from the old A4-0 session-mode helper (which
+        constructed the event); the SSM now owns construction, so this sink
+        dispatches a pre-built event. The caller captured mode_revision INSIDE
+        the status-write txn (INV-2) before building."""
+
+        async def _sink(session_id: str, event: SessionModeChangedEvent) -> None:
+            if task is not None:
+                try:
+                    event.id = await task.output_stream.put(event.model_dump_json())
+                except Exception as exc:
+                    logger.warning(
+                        "会话[%s]写入SessionModeChangedEvent到输出流失败，降级为仅落库: %s",
+                        session_id,
+                        exc,
+                    )
+            async with self._uow_factory() as uow:
+                await uow.session.add_event(session_id, event)
+
+        return _sink
 
     async def _append_error_event(
         self, session_id: str, *, error: str, task: Optional[Task] = None
@@ -4197,13 +4189,13 @@ end
                         _, rev = await uow.session.read_status_with_revision(session_id)
                     except Exception:
                         rev = None
-                await self._emit_session_mode_changed(
+                await self._ssm.emit_session_mode_changed(
                     session_id,
-                    to=SessionStatus.TAKEOVER.value,
+                    to=SessionStatus.TAKEOVER,
+                    from_mode="running",
                     reason="takeover_started",
                     mode_revision=rev,
-                    from_mode="running",
-                    task=task,
+                    sink=self._sse_or_db_sink(task),
                 )
                 await self._append_control_event(
                     session_id,
@@ -4418,13 +4410,13 @@ end
                 _, rev = await uow.session.read_status_with_revision(session_id)
             except Exception:
                 rev = None
-        await self._emit_session_mode_changed(
+        await self._ssm.emit_session_mode_changed(
             session_id,
-            to=SessionStatus.TAKEOVER.value,
+            to=SessionStatus.TAKEOVER,
+            from_mode=from_mode,
             reason="takeover_started",
             mode_revision=rev,
-            from_mode=from_mode,
-            task=None,
+            sink=self._sse_or_db_sink(None),
         )
         await self._append_control_event(
             session_id,
@@ -4556,13 +4548,13 @@ end
                     _, rev = await uow.session.read_status_with_revision(session_id)
                 except Exception:
                     rev = None
-            await self._emit_session_mode_changed(
+            await self._ssm.emit_session_mode_changed(
                 session_id,
-                to=SessionStatus.RUNNING.value,
+                to=SessionStatus.RUNNING,
+                from_mode="takeover_pending",  # reject_takeover requires TAKEOVER_PENDING (guard ~4447)
                 reason="takeover_rejected",
                 mode_revision=rev,
-                from_mode="takeover_pending",  # reject_takeover requires TAKEOVER_PENDING (guard ~4447), R12#P2
-                task=resumed_task,
+                sink=self._sse_or_db_sink(resumed_task),
             )
             await self._append_control_event(
                 session_id,
@@ -4667,13 +4659,13 @@ end
                     _, rev = await uow.session.read_status_with_revision(session_id)
                 except Exception:
                     rev = None
-            await self._emit_session_mode_changed(
+            await self._ssm.emit_session_mode_changed(
                 session_id,
-                to=SessionStatus.RUNNING.value,
+                to=SessionStatus.RUNNING,
+                from_mode="takeover",
                 reason="takeover_ended",
                 mode_revision=rev,
-                from_mode="takeover",
-                task=resumed_task,
+                sink=self._sse_or_db_sink(resumed_task),
             )
             await self._append_control_event(
                 session_id,
@@ -4790,18 +4782,16 @@ end
                 _, rev = await uow.session.read_status_with_revision(session_id)
             except Exception:
                 rev = None
-            await uow.session.add_event(
+            await self._ssm.emit_session_mode_changed(
                 session_id,
-                SessionModeChangedEvent(
-                    to=SessionStatus.TAKEOVER_PENDING.value,
-                    # reopen source is a terminal/non-control status (the guard
-                    # above allows COMPLETED or TIMED_OUT) — neither is in
-                    # ModeLiteral, so from_mode is omitted (None is valid for
-                    # Optional[ModeLiteral]).
-                    from_mode=None,
-                    reason="takeover_reopened",
-                    mode_revision=rev,
-                ),
+                to=SessionStatus.TAKEOVER_PENDING,
+                # reopen source is a terminal/non-control status (the guard above
+                # allows COMPLETED or TIMED_OUT) — neither is in ModeLiteral, so
+                # from_mode is None (valid for Optional[ModeLiteral]).
+                from_mode=None,
+                reason="takeover_reopened",
+                mode_revision=rev,
+                sink=lambda sid, ev: uow.session.add_event(sid, ev),
             )
 
         self._schedule_pending_timeout(session_id)

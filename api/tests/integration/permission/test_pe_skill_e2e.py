@@ -66,7 +66,7 @@ async def _build_pe_engine_with_real_deps(
     )
     queue = ConfirmationQueue(redis=raw_redis)
     ssm = DefaultSessionStateMachine(
-        uow_factory=uow_factory, redis=raw_redis, event_publisher=None,
+        uow_factory=uow_factory, redis=raw_redis,
     )
     sources = {
         "native": NativeSource(),

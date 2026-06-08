@@ -120,7 +120,6 @@ def test_build_session_state_machine_returns_default_ssm():
     ssm = build_session_state_machine(
         uow_factory=uow_factory,
         redis=raw_redis,
-        event_publisher=None,
     )
 
     assert isinstance(ssm, DefaultSessionStateMachine)

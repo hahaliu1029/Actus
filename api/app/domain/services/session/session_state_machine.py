@@ -9,10 +9,15 @@ tests/invariants/test_inv4_ssm_single_writer.py).
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from app.domain.models.session import SessionStatus
 from app.domain.repositories.session_repository import SessionRepository
+from app.domain.models.event import SessionModeChangedEvent
+from app.domain.services.session.mode_event import (
+    ModeChangedEventSink,
+    build_session_mode_changed_event,
+)
 
 
 class SessionStateMachine(ABC):
@@ -81,10 +86,14 @@ class SessionStateMachine(ABC):
         by-id, bumps mode_revision) and returns. Does NOT read the revision,
         NOT emit, NOT open or commit a transaction — the CALLER owns the UoW,
         commit, lock, and event emit. ``reason`` is carried for telemetry and
-        the future A4-2 single-emitter; unused by A4-1.
+        consumed by the A4-2 single-emitter: the caller passes it to
+        ``emit_session_mode_changed`` when building the SessionModeChangedEvent.
+        ``set_mode`` itself never emits.
 
         NOTE: heterogeneous transaction contract vs the dormant CAS mutators
-        above (which open their own UoW). Reconciliation is A4-2.
+        above (which open their own UoW). The control-mode emit is reconciled by
+        A4-2's ``emit_session_mode_changed`` (single construct-and-dispatch
+        entry with a caller-owned sink).
         """
 
     @abstractmethod
@@ -103,3 +112,26 @@ class SessionStateMachine(ABC):
         row is already terminal OR its execution_phase is terminating/terminated;
         else ``True``. Does NOT open or commit a transaction (caller-owned).
         """
+
+    async def emit_session_mode_changed(
+        self,
+        session_id: str,
+        *,
+        to: SessionStatus | str,
+        from_mode: Optional[str],
+        reason: str,
+        mode_revision: Optional[int],
+        sink: ModeChangedEventSink,
+    ) -> SessionModeChangedEvent:
+        """A4-2 SINGLE emit entry. Builds the canonical SessionModeChangedEvent
+        and dispatches it to the caller-owned sink. Does NOT read the repo, open
+        a txn, hold a uow_factory, or touch seq/idle — the CALLER owns the
+        runtime sink AND the read-your-writes mode_revision (which it MUST pass
+        in; the SSM never re-reads it, to avoid a concurrent-transition causal
+        mismatch — see spec §6.2). Concrete (not abstract): stateless, so every
+        ABC subclass inherits it."""
+        event = build_session_mode_changed_event(
+            to=to, from_mode=from_mode, reason=reason, mode_revision=mode_revision
+        )
+        await sink(session_id, event)
+        return event

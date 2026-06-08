@@ -38,6 +38,11 @@ class _NoopSessionRepository:
     async def add_event(self, session_id: str, event) -> None:
         self.add_event_calls.append((session_id, event))
 
+    async def read_status_with_revision(self, session_id: str):
+        from app.domain.models.session import SessionStatus
+
+        return SessionStatus.RUNNING, 0
+
 
 class _NoopApprovalGrantsRepo:
     """R5b-3 round-6: late-duplicate lookup 用。默认 ``find_by_confirmation_id``

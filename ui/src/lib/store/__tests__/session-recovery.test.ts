@@ -1402,6 +1402,139 @@ describe("live reducer honours session_mode_changed (status authority, no stream
   });
 });
 
+// A4-2 Debt 1 — live reducer must NOT regress a takeover / takeover_pending
+// session to running on a bare content event. The bug lives ONLY in the live
+// reducer's content-event fallback (resolveStatusFromEvent :272-280 →
+// nextStatus); deriveStatusFromEvents filters bare content via
+// SIGNAL_EVENT_TYPES and cannot reproduce it.
+describe("live reducer keeps control mode sticky across a bare content event (A4-2 Debt 1)", () => {
+  type ChatCallbacks = {
+    onEvent: SSEEventHandler;
+    onError: (error: Error) => void;
+    onClose: () => void;
+    onConnected: () => void;
+  };
+
+  function mockChat(api: SessionApi, simulateConnected: boolean): ChatCallbacks {
+    const cbs = {} as ChatCallbacks;
+    (api.chat as ReturnType<typeof vi.fn>).mockImplementation(
+      (
+        _sid: string,
+        _params: ChatParams,
+        onEvent: SSEEventHandler,
+        onError: (error: Error) => void,
+        onClose: () => void,
+        onConnected: () => void
+      ) => {
+        cbs.onEvent = onEvent;
+        cbs.onError = onError;
+        cbs.onClose = onClose;
+        cbs.onConnected = onConnected;
+        if (simulateConnected && onConnected) onConnected();
+        return () => {};
+      }
+    );
+    return cbs;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        events: [],
+      },
+      // R2-FE-001: seed the LIST row too. The live reducer regresses BOTH the
+      // open session AND the `sessions` list row (nextSessions =
+      // updateSessionListStatus(..., nextStatus)), so the split-brain assertion
+      // must cover the list row. Shape = ListSessionItem (no `events`).
+      sessions: [
+        {
+          session_id: "s1",
+          title: "test",
+          parent_session_id: null,
+          worker_type: "root",
+          latest_message: "",
+          latest_message_at: null,
+          status: "running",
+          unread_message_count: 0,
+          supervisor_snapshot: null,
+        },
+      ],
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+      _isRecovering: false,
+    });
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function rowStatus(): string | undefined {
+    return useSessionStore
+      .getState()
+      .sessions.find((s) => s.session_id === "s1")?.status;
+  }
+
+  it("stays in takeover when a bare message event arrives mid-takeover", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "session_mode_changed",
+      data: { to: "takeover", reason: "takeover_started", mode_revision: 5 },
+    });
+    expect(useSessionStore.getState().currentSession?.status).toBe("takeover");
+    expect(rowStatus()).toBe("takeover");
+
+    // Bare content event (NOT a SIGNAL_EVENT_TYPE) — must NOT regress to running.
+    cbs.onEvent({
+      type: "message",
+      data: { role: "assistant", stream_id: "s-1", message: "", attachments: [] },
+    });
+
+    // Both the open session AND the list row must stay takeover (no split-brain).
+    expect(useSessionStore.getState().currentSession?.status).toBe("takeover");
+    expect(rowStatus()).toBe("takeover");
+  });
+
+  it("stays in takeover_pending when a bare message event arrives", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = mockChat(sessionApi, true);
+
+    await useSessionStore.getState().sendChat("s1", {});
+    cbs.onEvent({
+      type: "session_mode_changed",
+      data: {
+        to: "takeover_pending",
+        reason: "takeover_requested",
+        mode_revision: 5,
+      },
+    });
+    expect(useSessionStore.getState().currentSession?.status).toBe(
+      "takeover_pending"
+    );
+    expect(rowStatus()).toBe("takeover_pending");
+
+    cbs.onEvent({
+      type: "message",
+      data: { role: "assistant", stream_id: "s-1", message: "", attachments: [] },
+    });
+
+    expect(useSessionStore.getState().currentSession?.status).toBe(
+      "takeover_pending"
+    );
+    expect(rowStatus()).toBe("takeover_pending");
+  });
+});
+
 describe("recoverSession honours session_mode_changed (backward override)", () => {
   beforeEach(() => {
     useSessionStore.setState({

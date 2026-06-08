@@ -144,6 +144,8 @@ async def test_end_takeover_emits_running_mode_changed_before_control_event(
 
     events = _mode_events(uow)
     assert any(e.to == "running" and e.reason == "takeover_ended" for e in events)
+    ended = next(e for e in events if e.reason == "takeover_ended")
+    assert ended.mode_revision == 11  # in-txn bumped revision (10 → 11)
     # INV-1: the mode-changed put precedes the ControlEvent on the live path.
     assert order.index("mode_changed") < order.index("control")
 
@@ -270,6 +272,7 @@ async def test_reopen_takeover_inline_emits_takeover_pending_mode_changed(
     assert events[0].to == "takeover_pending"
     assert events[0].reason == "takeover_reopened"
     assert events[0].from_mode is None  # source terminal (COMPLETED) → not a ModeLiteral
+    assert events[0].mode_revision == 11  # in-txn bumped revision (10 → 11)
 
 
 async def test_lease_timeout_inline_emits_takeover_pending_mode_changed(
@@ -319,3 +322,5 @@ async def test_lease_timeout_inline_emits_takeover_pending_mode_changed(
         and e.from_mode == "takeover"
         for e in events
     )
+    timed_out = next(e for e in events if e.reason == "takeover_lease_timeout")
+    assert timed_out.mode_revision == 11  # in-txn bumped revision (10 → 11)

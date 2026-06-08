@@ -10,6 +10,8 @@ from pathlib import Path
 API_ROOT = Path(__file__).resolve().parents[4]  # tests/app/application/services → api/
 AGENT_SERVICE = API_ROOT / "app" / "application" / "services" / "agent_service.py"
 RUNNER = API_ROOT / "app" / "domain" / "services" / "agent_task_runner.py"
+APP_ROOT = API_ROOT / "app"
+BUILDER_REL = "app/domain/services/session/mode_event.py"
 
 CONTROL_STATUSES = frozenset({"RUNNING", "WAITING", "TAKEOVER", "TAKEOVER_PENDING"})
 
@@ -89,17 +91,17 @@ def _literal_control_update_status_sites(tree: ast.Module) -> dict[str, list[str
 
 
 def _emits_mode_changed(func: ast.AST) -> bool:
-    """True if the function subtree calls _emit_session_mode_changed OR
-    _emit_control_mode_changed OR constructs SessionModeChangedEvent."""
+    """True if the function subtree routes its control-mode emit through the A4-2
+    single entry SSM.emit_session_mode_changed.
+
+    A4-2 FINAL (task 6, narrowed from the task-3 transitional old-OR-new form now
+    that every production site uses the SSM entry): direct
+    SessionModeChangedEvent(...) construction and the retired _emit_* helper names
+    are NO LONGER accepted — only emit_session_mode_changed counts."""
     for node in ast.walk(func):
         if isinstance(node, ast.Call):
             f = node.func
-            if isinstance(f, ast.Attribute) and f.attr in (
-                "_emit_session_mode_changed",
-                "_emit_control_mode_changed",
-            ):
-                return True
-            if isinstance(f, ast.Name) and f.id == "SessionModeChangedEvent":
+            if isinstance(f, ast.Attribute) and f.attr == "emit_session_mode_changed":
                 return True
     return False
 
@@ -228,4 +230,100 @@ def test_runner_variable_status_writes_only_in_emitter() -> None:
         f"allowlist: {sorted(extra)}. The only legitimate variable-status write is "
         f"{RUNNER_EMITTER} (which emits SessionModeChangedEvent). A new one must be "
         f"reviewed for A4-0 emission."
+    )
+
+
+def _production_py_files():
+    for path in sorted(APP_ROOT.rglob("*.py")):
+        if "/__pycache__/" in str(path):
+            continue
+        yield path
+
+
+SSM_REL = "app/domain/services/session/session_state_machine.py"
+
+
+def test_session_mode_changed_constructed_in_exactly_one_production_place() -> None:
+    """A4-2 INV — single construction authority: SessionModeChangedEvent(...) is
+    constructed in EXACTLY ONE production location — inside
+    build_session_mode_changed_event in mode_event.py. Scans api/app ONLY —
+    test files legitimately construct the event for model/schema tests and are
+    excluded. A new direct construction anywhere in app/ fails CI — route it
+    through SSM.emit_session_mode_changed instead. (R2-GUARD-001: catch BOTH
+    the bare-Name `SessionModeChangedEvent(...)` and the attribute
+    `mod.SessionModeChangedEvent(...)` form, and assert the ENCLOSING function,
+    not just the file.)"""
+    sites: list[tuple[str, str, int]] = []  # (relpath, nearest_func, lineno)
+    for path in _production_py_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = _parents(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            is_ctor = (
+                isinstance(f, ast.Name) and f.id == "SessionModeChangedEvent"
+            ) or (
+                isinstance(f, ast.Attribute) and f.attr == "SessionModeChangedEvent"
+            )
+            if is_ctor:
+                sites.append(
+                    (
+                        str(path.relative_to(API_ROOT)).replace("\\", "/"),
+                        _nearest_func(node, parents) or "<module>",
+                        node.lineno,
+                    )
+                )
+    assert len(sites) == 1, (
+        f"SessionModeChangedEvent constructed in {len(sites)} production places "
+        f"({sites}); A4-2 requires exactly one — build_session_mode_changed_event "
+        f"in mode_event.py. Route new emits through SSM.emit_session_mode_changed."
+    )
+    relpath, func, _ln = sites[0]
+    assert relpath == BUILDER_REL, (
+        f"the single construction must be in {BUILDER_REL}, found {relpath}"
+    )
+    assert func == "build_session_mode_changed_event", (
+        f"the single construction must be inside build_session_mode_changed_event, "
+        f"found enclosing function {func!r}"
+    )
+
+
+def test_builder_called_only_by_the_emit_entry() -> None:
+    """build_session_mode_changed_event is called by exactly one production
+    function at one path: SSM.emit_session_mode_changed in
+    session_state_machine.py. (R2-GUARD-001: assert path+function, not just the
+    bare function name.)"""
+    callers: set[tuple[str, str]] = set()  # (relpath, nearest_func)
+    for path in _production_py_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = _parents(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            bf = node.func
+            # R3-GUARD-ATTR-BUILDER: mirror the constructor scan — catch both the
+            # bare-Name `build_session_mode_changed_event(...)` and the attribute
+            # `mode_event.build_session_mode_changed_event(...)` call form.
+            is_builder_call = (
+                isinstance(bf, ast.Name) and bf.id == "build_session_mode_changed_event"
+            ) or (
+                isinstance(bf, ast.Attribute)
+                and bf.attr == "build_session_mode_changed_event"
+            )
+            if is_builder_call:
+                # R4-BUILDER-MODULE: record module/class-level calls too (fn is
+                # None outside a def) so a top-level builder call cannot evade the
+                # "only emit_session_mode_changed calls the builder" invariant —
+                # mirrors the constructor scan's "<module>" treatment.
+                callers.add(
+                    (
+                        str(path.relative_to(API_ROOT)).replace("\\", "/"),
+                        _nearest_func(node, parents) or "<module>",
+                    )
+                )
+    assert callers == {(SSM_REL, "emit_session_mode_changed")}, (
+        f"build_session_mode_changed_event called by {sorted(callers)}; A4-2 "
+        f"requires only SSM.emit_session_mode_changed (in session_state_machine.py) "
+        f"to call the builder."
     )

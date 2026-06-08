@@ -52,10 +52,8 @@ def _make_fake_uow_factory(transition_return=True, revision_return=None):
 class TestGetModeWithRevision:
     def test_passthrough(self):
         factory = _make_fake_uow_factory()
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         mode, rev = _run(ssm.get_mode_with_revision("s1"))
         assert mode is SessionStatus.RUNNING
@@ -65,10 +63,8 @@ class TestGetModeWithRevision:
 class TestRequestTakeover:
     def test_calls_transition_running_to_pending(self):
         factory = _make_fake_uow_factory(transition_return=True)
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         _run(ssm.request_takeover("s1", reason="user_clicked_takeover"))
         fake_repo = factory._fake_repo
@@ -82,10 +78,8 @@ class TestRequestTakeover:
             transition_return=False,
             revision_return=(SessionStatus.TAKEOVER, 6),
         )
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         with pytest.raises(SessionModeViolation):
             _run(ssm.request_takeover("s1", reason="x"))
@@ -94,10 +88,8 @@ class TestRequestTakeover:
 class TestComplete:
     def test_only_from_finishing(self):
         factory = _make_fake_uow_factory(transition_return=True)
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         _run(ssm.complete("s1"))
         kwargs = factory._fake_repo.transition_status.await_args.kwargs
@@ -114,10 +106,8 @@ class TestComplete:
         from datetime import datetime
 
         factory = _make_fake_uow_factory(transition_return=True)
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         _run(ssm.complete("s1"))
 
@@ -156,10 +146,8 @@ class TestComplete:
         terminal-metadata writes) can rely on the contract.
         """
         factory = _make_fake_uow_factory(transition_return=True)
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         payload = {"terminal_reason": "x", "execution_phase": "terminated"}
         _run(
@@ -177,10 +165,8 @@ class TestComplete:
     def test_transition_extra_values_defaults_to_none(self):
         """Non-terminal transitions must not pass spurious extra_values."""
         factory = _make_fake_uow_factory(transition_return=True)
-        pub = AsyncMock()
-
         ssm = DefaultSessionStateMachine(
-            uow_factory=factory, redis=None, event_publisher=pub,
+            uow_factory=factory, redis=None,
         )
         _run(ssm.request_takeover("s1", reason="user"))
         kwargs = factory._fake_repo.transition_status.await_args.kwargs

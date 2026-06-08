@@ -269,13 +269,17 @@ function resolveStatusFromEvent(
   if (event.type === "control") {
     return resolveControlStatus(currentStatus, asRecord(event.data));
   }
-  // Finishing guard: don't let content events revert finishing back to running
-  if (currentStatus === "finishing") {
-    return "finishing";
-  }
-  // Timed-out guard: don't let content events revert timed_out back to running
-  if (currentStatus === "timed_out") {
-    return "timed_out";
+  // Control-mode + finishing/terminal guard: bare content events must not
+  // regress a non-running control mode (takeover / takeover_pending) or a
+  // finishing/timed_out state back to running. The control mode only changes via
+  // session_mode_changed / control events (handled above, before this point).
+  if (
+    currentStatus === "finishing" ||
+    currentStatus === "timed_out" ||
+    currentStatus === "takeover" ||
+    currentStatus === "takeover_pending"
+  ) {
+    return currentStatus;
   }
   return "running";
 }

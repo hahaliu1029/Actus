@@ -81,21 +81,17 @@ def build_session_state_machine(
     *,
     uow_factory: Any,
     redis: Any = None,
-    event_publisher: Any = None,
 ) -> "SessionStateMachine":
     """Build a DefaultSessionStateMachine.
 
     Parameters
     ----------
     uow_factory:
-        Callable that returns an IUnitOfWork context manager.  Passed through
-        to DefaultSessionStateMachine for per-call DB access.
+        Callable that returns an IUnitOfWork context manager.  Passed through to
+        DefaultSessionStateMachine for per-call DB access.
     redis:
         Optional raw redis.asyncio.Redis client reserved for future hot-path
-        caching (A4-0 wires the real value; PE-0 passes None).
-    event_publisher:
-        Optional SseEventPublisher for SessionModeChangedEvent.  None →
-        DefaultSessionStateMachine falls back to its internal _NoopPublisher.
+        caching.
     """
     from app.domain.services.session.default_state_machine import (
         DefaultSessionStateMachine,
@@ -104,7 +100,6 @@ def build_session_state_machine(
     return DefaultSessionStateMachine(
         uow_factory=uow_factory,
         redis=redis,
-        event_publisher=event_publisher,
     )
 
 

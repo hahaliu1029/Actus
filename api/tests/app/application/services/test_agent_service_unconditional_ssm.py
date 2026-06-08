@@ -13,7 +13,7 @@ def test_agent_service_builds_unconditional_ssm(monkeypatch) -> None:
     captured: dict[str, object] = {}
     sentinel = object()
 
-    def _fake_build(*, uow_factory, redis=None, event_publisher=None):
+    def _fake_build(*, uow_factory, redis=None):
         captured["uow_factory"] = uow_factory
         captured["redis"] = redis
         return sentinel
