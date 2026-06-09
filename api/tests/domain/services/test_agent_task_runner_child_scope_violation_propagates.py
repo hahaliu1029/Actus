@@ -23,15 +23,23 @@ def test_agent_task_runner_reraises_child_scope_violation():
         "ChildScopeViolation must be re-raised BEFORE the broad runner catch-all; "
         "otherwise PR-4 finalizer cannot see the typed scope deny."
     )
-    block = src[last_reraise: last_reraise + 800]
+    # Bound the block to THIS except arm (up to the next except at the same
+    # 12-space indent) instead of a fragile fixed-size window — the arm grew
+    # when the C2b §6-lim2 best-effort terminal-status write landed between the
+    # stash and the re-raise, which would push `raise` past a fixed window.
+    after = src[last_reraise:]
+    next_arm = after.find("\n            except ", 1)
+    block = after if next_arm == -1 else after[:next_arm]
     stash_i = block.find("set_child_scope_violation")
     assert stash_i != -1, (
         "ChildScopeViolation except block must stash the typed violation on the "
         "task (set_child_scope_violation) before re-raising — else RedisStreamTask "
         "swallows it and the adapter returns generic FAILED, not NEEDS_AUTHORIZATION."
     )
-    raise_i = block.find("raise", stash_i)
-    assert raise_i != -1 and raise_i > stash_i, (
+    # Match a `raise` STATEMENT (line-anchored) AFTER the stash — not a
+    # "raise"/"re-raise" substring that may appear in a comment between the
+    # stash and the real re-raise.
+    assert re.search(r"\n\s+raise\b", block[stash_i:]), (
         "ChildScopeViolation except block must `raise` AFTER stashing the violation."
     )
 

@@ -4382,6 +4382,27 @@ class AgentTaskRunner(TaskRunner):
                 _stash = getattr(task, "set_child_scope_violation", None)
                 if _stash is not None:
                     _stash(exc)
+                # [C2b follow-up §6-lim2] Terminalize the child session row so a
+                # denied child does not leak as a zombie RUNNING (UI/tree, restart
+                # recovery, mailbox supervisor orphan scan all treat a non-terminal
+                # status as live). COMPLETED + "natural" is the only DB-valid
+                # terminal reason (SessionStatus has no FAILED/DENIED; the DB CHECK
+                # rejects custom reasons); the deny detail lives in the coordinator
+                # NEEDS_AUTHORIZATION envelope (NeedsAuthorizationDetails.reason).
+                # Goes through the SSM (INV-4). Best-effort + stash-first: a failed
+                # terminal write must NOT mask the typed violation, and we MUST NOT
+                # emit a DoneEvent here (a terminal task-output event would let the
+                # adapter return a success ChildRunResult, breaking typed propagation).
+                try:
+                    await self._set_terminal_status_with_notifications(
+                        SessionStatus.COMPLETED, "natural"
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "child terminal-status write failed on scope violation "
+                        "(session=%s); row may stay RUNNING until reaped",
+                        self._session_id, exc_info=True,
+                    )
                 raise
             except CancelledByEventError:
                 # [C2 PR-4 §8.4 r3 P1#1] Same shape as ChildScopeViolation:
@@ -4391,20 +4412,25 @@ class AgentTaskRunner(TaskRunner):
                 # re-raise, the catch-all below would swallow the cancel as
                 # "runner error" and emit RESULT_READY(FAILED) instead.
                 #
-                # [r6 P1 deferred to PR-5] Re-raising here SKIPS the normal
-                # terminal-status DB write in the catch-all below (and the
-                # user_cancel path at line ~4140). The child session row stays
-                # in RUNNING until something terminalizes it. CoordinatorChildRunner
-                # publishes the envelope but does NOT touch the child session
-                # DB row. PR-5's runner_starter adapter is responsible for:
-                #   1. catching this propagated CancelledByEventError,
-                #   2. calling session_service.update_status(child_session_id,
-                #      SessionStatus.COMPLETED, terminal_reason="user_cancel")
-                #      (or equivalent budget reason),
-                #   3. emitting the DoneEvent so reconnect/tree views observe
-                #      the child as terminal.
-                # Without this PR-5 wiring, tree/status views can show a live
-                # child after the wire has already terminalized.
+                # [C2b follow-up §6-lim2] Terminalize the child session row (mirror
+                # the ChildScopeViolation arm) so an event-cancelled child does not
+                # leak as zombie RUNNING. COMPLETED + "natural": the runner cannot
+                # see the coordinator stop_reason (parent-cancel vs token/wallclock
+                # budget) and the DB CHECK rejects "budget_exhausted"; the
+                # cancel/budget detail is carried by the coordinator CANCEL_ACK /
+                # NEEDS_AUTHORIZATION envelope. Do NOT set _runner_exception_terminal
+                # (that flag maps the mailbox outcome to FAILED). Best-effort + no
+                # DoneEvent (the typed-cancel path must stay terminal-event-free).
+                try:
+                    await self._set_terminal_status_with_notifications(
+                        SessionStatus.COMPLETED, "natural"
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "child terminal-status write failed on event-cancel "
+                        "(session=%s); row may stay RUNNING until reaped",
+                        self._session_id, exc_info=True,
+                    )
                 raise
             except Exception as e:
                 logger.exception(f"AgentTaskRunner运行出错: {str(e)}")

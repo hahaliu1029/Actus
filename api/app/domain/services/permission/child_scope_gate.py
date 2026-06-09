@@ -27,10 +27,13 @@ Known limitations (spec §6, deferred — NOT bugs introduced here):
   kill-switch, not a cumulative counter.
 - Intra-batch race; symlink / non-canonical lease escape (exact-string match);
   manifest ``allowed_tools`` has no known-name validator.
-- Child session DB row termination on violation: the runner re-raises
-  ChildScopeViolation WITHOUT a terminal status write (sibling of the
-  ``CancelledByEventError`` PR-5 deferred gap), so a denied child's session row
-  stays RUNNING until the coordinator/PR-5 runner_starter adapter reaps it.
+
+Resolved (C2b §6-lim2 follow-up): child session DB row termination on
+violation/event-cancel — the runner now writes ``COMPLETED`` + ``"natural"``
+through the SSM (INV-4) in both the ``ChildScopeViolation`` and
+``CancelledByEventError`` arms before re-raising, so a denied/cancelled child no
+longer leaks as a zombie ``RUNNING``. The deny/cancel/budget granularity stays
+in the coordinator envelope (NEEDS_AUTHORIZATION / CANCEL_ACK), not the DB row.
 """
 from __future__ import annotations
 

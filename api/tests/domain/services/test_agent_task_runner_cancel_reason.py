@@ -270,3 +270,113 @@ async def test_cancel_reason_session_delete_skips_done_and_completed_status() ->
         ("session-delete", SessionStatus.RUNNING),
     ]
     assert task.output_stream.events == []
+
+
+# ---------------------------------------------------------------------------
+# C2b follow-up (§6 limitation 2) — terminalize the child session row on a
+# typed scope-violation / event-cancel re-raise, WITHOUT emitting a DoneEvent
+# (emitting one would let the adapter return success and break the C2b
+# typed-propagation chain). Both paths write COMPLETED + "natural".
+# ---------------------------------------------------------------------------
+
+async def _scope_violation_flow(_message):
+    from app.domain.services.permission.child_scope_gate import ScopeDecision
+    from app.domain.services.permission.child_scope_violation import (
+        ChildScopeViolation,
+    )
+    raise ChildScopeViolation(
+        ScopeDecision.OUT_OF_PATH_LEASE, tool_name="file_write", target_path="/x"
+    )
+    if False:
+        yield None
+
+
+async def _event_cancel_flow(_message):
+    from app.domain.services.graphs.react_graph import CancelledByEventError
+    raise CancelledByEventError("tool_node_entry")
+    if False:
+        yield None
+
+
+async def test_child_scope_violation_terminalizes_completed_natural_without_done_event() -> None:
+    from app.domain.services.permission.child_scope_violation import (
+        ChildScopeViolation,
+    )
+
+    runner = _build_runner("session-scope-violation")
+    task = _DummyTask(cancel_reason="stop")
+    _prime_runner_for_loop_cancellation(runner, task)
+    runner._run_flow = _scope_violation_flow
+    task.set_child_scope_violation = MagicMock()  # adapter-stash slot
+
+    with pytest.raises(ChildScopeViolation):
+        await runner.invoke(task)
+
+    await asyncio.sleep(0)
+
+    # Child row terminalized so a denied child does not leak as zombie RUNNING.
+    assert runner._uow.session.terminal_updates == [
+        ("session-scope-violation", SessionStatus.COMPLETED, "natural"),
+    ]
+    # CRITICAL (C2b): NO DoneEvent — else the adapter returns a success
+    # ChildRunResult and the coordinator publishes SUCCESS instead of
+    # NEEDS_AUTHORIZATION, silently breaking the typed-propagation chain.
+    assert task.output_stream.events == []
+    # The typed violation was stashed for the adapter to re-raise.
+    task.set_child_scope_violation.assert_called_once()
+
+
+async def test_child_scope_violation_terminal_write_failure_still_reraises() -> None:
+    """Best-effort + stash-FIRST: a failing terminal write must NOT mask the
+    typed violation. The stash MUST run before the (failing) terminal write —
+    else a write that throws would lose the stash the adapter re-raises. We pin
+    the ORDER (not just that both ran), because the terminal write is wrapped in
+    try/except so a swapped order is otherwise behaviorally indistinguishable."""
+    from app.domain.services.permission.child_scope_violation import (
+        ChildScopeViolation,
+    )
+
+    runner = _build_runner("session-scope-violation-degraded")
+    task = _DummyTask(cancel_reason="stop")
+    _prime_runner_for_loop_cancellation(runner, task)
+    runner._run_flow = _scope_violation_flow
+
+    order: list[str] = []
+    task.set_child_scope_violation = MagicMock(
+        side_effect=lambda _exc: order.append("stash")
+    )
+
+    async def _failing_terminal(*_a, **_k):
+        order.append("terminal")
+        raise RuntimeError("db down")
+
+    runner._set_terminal_status_with_notifications = AsyncMock(
+        side_effect=_failing_terminal
+    )
+
+    with pytest.raises(ChildScopeViolation):
+        await runner.invoke(task)
+
+    # stash-first invariant: a swapped order would record ["terminal", "stash"].
+    assert order == ["stash", "terminal"]
+
+
+async def test_event_cancel_terminalizes_completed_natural_without_done_event() -> None:
+    from app.domain.services.graphs.react_graph import CancelledByEventError
+
+    runner = _build_runner("session-event-cancel")
+    task = _DummyTask(cancel_reason="stop")
+    _prime_runner_for_loop_cancellation(runner, task)
+    runner._run_flow = _event_cancel_flow
+
+    with pytest.raises(CancelledByEventError):
+        await runner.invoke(task)
+
+    await asyncio.sleep(0)
+
+    assert runner._uow.session.terminal_updates == [
+        ("session-event-cancel", SessionStatus.COMPLETED, "natural"),
+    ]
+    # The runner's event-cancel arm must stay DoneEvent-free (mirror the
+    # ChildScopeViolation arm — typed cancel propagation depends on it).
+    assert task.output_stream.events == []
