@@ -10,7 +10,11 @@ from app.domain.models.session import SandboxBindingState, Session, SessionStatu
 from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.models.skill_graph_state import SkillGraphState
 from app.domain.repositories._sentinel import _UNSET, UnsetType
-from app.domain.repositories.session_repository import BgSessionRow, SessionRepository
+from app.domain.repositories.session_repository import (
+    BgSessionRow,
+    ChildLineageRow,
+    SessionRepository,
+)
 from app.infrastructure.models import SessionModel
 from pydantic import ValidationError
 import sqlalchemy as sa
@@ -334,6 +338,45 @@ class DBSessionRepository(SessionRepository):
         )
         result = await self.db_session.execute(stmt)
         return [str(row.parent_session_id) for row in result.all()]
+
+    async def find_running_mailbox_children(self) -> list[ChildLineageRow]:
+        """C2b reaper query — see
+        :meth:`SessionRepository.find_running_mailbox_children`.
+
+        Narrow ``status = 'running'`` + ``execution_mode = 'foreground'`` (NOT the
+        ``NOT IN (terminal)`` phrasing of ``find_running_mailbox_plane_root_ids``):
+        the reaper is a destructive terminal-write, so it must exclude the live
+        WAITING/TAKEOVER* states and the background/recoverable reopened turns
+        owned by ``reconcile_running_background_at_boot``. Match-only ⇒ no
+        parent-terminal / staleness gate. See spec §4.2 / §6.
+        """
+        stmt = (
+            select(
+                SessionModel.id,
+                SessionModel.coordinator_run_id,
+                SessionModel.work_unit_id,
+            )
+            .where(SessionModel.worker_type == "subagent")
+            .where(SessionModel.subagent_control_plane == "mailbox")
+            .where(SessionModel.parent_session_id.is_not(None))
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "foreground")
+        )
+        result = await self.db_session.execute(stmt)
+        return [
+            ChildLineageRow(
+                session_id=str(row.id),
+                coordinator_run_id=(
+                    str(row.coordinator_run_id)
+                    if row.coordinator_run_id is not None
+                    else None
+                ),
+                work_unit_id=(
+                    str(row.work_unit_id) if row.work_unit_id is not None else None
+                ),
+            )
+            for row in result.all()
+        ]
 
     async def update_supervisor_fields(
         self,

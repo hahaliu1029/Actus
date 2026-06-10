@@ -24,6 +24,19 @@ class BgSessionRow(NamedTuple):
     status: SessionStatus
 
 
+class ChildLineageRow(NamedTuple):
+    """C2b reaper: a RUNNING foreground mailbox subagent child's lineage.
+
+    ``coordinator_run_id`` / ``work_unit_id`` are nullable — a non-coordinator
+    mailbox subagent (``subagent_research`` preset) has neither, and the reaper
+    skips those (match-only needs a coordinator lineage to look up an envelope).
+    """
+
+    session_id: str
+    coordinator_run_id: str | None
+    work_unit_id: str | None
+
+
 class SessionRepository(Protocol):
     """会话仓库协议定义"""
 
@@ -107,6 +120,26 @@ class SessionRepository(Protocol):
         ``parent_session_id`` as the sole lineage source; the C3 plan §6.5
         audit foci confirm mailbox subagents spawn only at depth=1, so
         ``parent_session_id`` IS the root id for these rows.
+        """
+        ...
+
+    async def find_running_mailbox_children(self) -> list[ChildLineageRow]:
+        """C2b reaper: RUNNING foreground mailbox subagent children — the
+        zombie-RUNNING candidates the startup sweep reconciles.
+
+        SELECT id, coordinator_run_id, work_unit_id FROM sessions
+         WHERE worker_type = 'subagent'
+           AND subagent_control_plane = 'mailbox'
+           AND parent_session_id IS NOT NULL
+           AND status = 'running'
+           AND execution_mode = 'foreground'.
+
+        Narrowed to ``status = 'running'`` (NOT the live WAITING/TAKEOVER* set)
+        and ``execution_mode = 'foreground'`` (background / recoverable reopened
+        turns are owned by ``reconcile_running_background_at_boot``). No
+        parent-terminal / staleness gate — match-only is safe for any parent
+        state (a still-in-flight child has no persisted envelope and is skipped).
+        See spec §4.2 / §6.
         """
         ...
 

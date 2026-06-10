@@ -569,6 +569,56 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Failed to clean stale FINISHING sessions: %s", e)
 
+        # C2b child-row reaper (durable zombie-RUNNING backstop).
+        # Terminalize coordinator-child rows still RUNNING whose terminal
+        # envelope is already persisted (the runner's best-effort row write
+        # failed, or the runner was SIGKILLed after the envelope was
+        # persisted). Match-only — never backfills; skips no-envelope
+        # children so reconcile_orphans' supervisor re-spawn trigger is
+        # preserved (spec §4.2). Mirrors the stale-FINISHING cleanup above.
+        # OUTER best-effort try: a query/DI failure logs + is swallowed so it
+        # never aborts lifespan startup.
+        try:
+            from app.application.composition.graph_assembly import (
+                build_session_state_machine,
+            )
+            from app.application.services.child_terminal_reconciler import (
+                sweep_running_mailbox_children,
+            )
+            from app.infrastructure.repositories.db_session_repository import (
+                DBSessionRepository,
+            )
+
+            child_reaper_store = getattr(
+                app.state, "coordinator_envelope_store", None
+            )
+            if child_reaper_store is None:
+                logger.info(
+                    "child_row_reaper: coordinator_envelope_store unavailable "
+                    "— skipping sweep"
+                )
+            else:
+                async with postgres_client.session_factory() as db_session:
+                    repo = DBSessionRepository(db_session=db_session)
+                    ssm = build_session_state_machine(uow_factory=get_uow)
+                    stats = await sweep_running_mailbox_children(
+                        session_repo=repo,
+                        envelope_store=child_reaper_store,
+                        state_machine=ssm,
+                        uow_factory=get_uow,
+                    )
+                    if stats.terminalized or stats.errored:
+                        logger.warning(
+                            "child_row_reaper: scanned=%d terminalized=%d "
+                            "skipped=%d errored=%d",
+                            stats.scanned,
+                            stats.terminalized,
+                            stats.skipped,
+                            stats.errored,
+                        )
+        except Exception as e:
+            logger.warning("child_row_reaper: sweep failed (swallowed): %s", e)
+
         # R3: Background scan for existing skills missing scan_report
         # Must start BEFORE yield (startup phase). After yield is shutdown.
         async def _background_skill_scan():
