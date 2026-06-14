@@ -10,12 +10,14 @@ AND ``envelope.type == "CANCEL_REQUEST"``.
 On match → ``runner.request_stop(StopReason.PARENT_CANCEL)`` (the runner-side
 sole entry that sets ``cancel_event`` + ``_stop_reason``).
 
-Pre-subscribe race (spec §8.5.3 race table):
-  If a CANCEL_REQUEST is published BEFORE the listener finishes subscribing,
-  XREADGROUP with ``id="$"`` will not deliver it. The supervisor's pre-existing
-  cancel handling + child wallclock budget watchdog (PR-6) act as backstop —
-  ``TIMED_OUT`` outcome is the accepted v1 path. PR-4 hardens with a startup
-  fence (CANCEL_ACK on graceful shutdown) but cannot fully eliminate the race.
+Pre-subscribe race (spec §8.5.3 race table — CLOSED by C2b budget §3-9 R4#1):
+  dispatch pre-creates this listener's consumer group (same loop as the
+  waiter-group hoist in parallel_execution_subgraph._first_time_dispatch), so
+  a CANCEL_REQUEST published before the listener subscribes is retained as
+  group backlog and consumed on start — subscribe here is BUSYGROUP-idempotent
+  against that pre-creation. Independently, the child wallclock watchdog is
+  LIVE (C2b budget A1) as the runaway brake; it is no longer a backstop for
+  this (closed) race.
 """
 from __future__ import annotations
 

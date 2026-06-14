@@ -52,6 +52,21 @@ class TestRequestStopSemantics:
             r.request_stop(reason)
             assert r._stop_reason == reason
 
+    def test_first_wins_both_orders(self) -> None:
+        """[spec §5-10b / INV-B4, R6#4] BOTH orders explicitly: budget-then-
+        parent AND parent-then-budget — the second request_stop never
+        overwrites _stop_reason, and the event stays set."""
+        for first, second in [
+            (StopReason.TOKEN_BUDGET, StopReason.PARENT_CANCEL),
+            (StopReason.PARENT_CANCEL, StopReason.TOKEN_BUDGET),
+        ]:
+            ce = asyncio.Event()
+            r = CoordinatorChildRunner(cancel_event=ce)
+            r.request_stop(first)
+            r.request_stop(second)
+            assert r._stop_reason == first, f"{second} overwrote {first}"
+            assert ce.is_set()
+
 
 class TestSkeletonCtorAcceptsForwardDeps:
     def test_accepts_envelope_factory_and_subscriber(self) -> None:
@@ -81,6 +96,40 @@ class TestSkeletonCtorAcceptsForwardDeps:
         port = MagicMock()
         r = CoordinatorChildRunner(cancel_event=asyncio.Event(), child_sandbox=port)
         assert r._child_sandbox is port
+
+    def test_accepts_budget_and_metrics_kwargs(self) -> None:
+        """[C2b budget D2/D10] ctor accepts optional budget +
+        coordinator_metrics; default None keeps every legacy caller valid."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from app.domain.services.permission.child_permission_context import (
+            ChildBudget,
+        )
+
+        budget = ChildBudget(
+            max_tool_calls=25, max_token_cost_usd=0.5, max_wallclock_seconds=300,
+        )
+        metrics = MagicMock()
+        r = CoordinatorChildRunner(
+            cancel_event=asyncio.Event(), budget=budget,
+            coordinator_metrics=metrics,
+        )
+        assert r._budget is budget
+        assert r._coordinator_metrics is metrics
+        assert r._budget_callback is None
+
+        legacy = CoordinatorChildRunner(cancel_event=asyncio.Event())
+        assert legacy._budget is None
+        assert legacy._coordinator_metrics is None
+
+    def test_attach_budget_callback_stores_ref(self) -> None:
+        import asyncio
+
+        r = CoordinatorChildRunner(cancel_event=asyncio.Event())
+        cb = object()
+        r.attach_budget_callback(cb)
+        assert r._budget_callback is cb
 
 
 # [PR-4 Task 4.7] PR-3's `TestRunWorkUnitDeferredToPr4.test_raises_notimplemented`

@@ -15,11 +15,19 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Protocol
 
-from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+from app.application.services.budget_enforcement_callback import (
+    BudgetEnforcementCallback,
+)
+from app.application.services.coordinator_child_runner import (
+    CoordinatorChildRunner,
+    StopReason,
+)
 from app.application.services.cost_callback_factory import (
     build_supervisor_aware_callback_handler,
 )
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
+from app.domain.services.cost_callback_handler import _infer_provider
+from app.domain.services.pricing.static_pricing import compute_cost, get_price
 from app.infrastructure.external.sandbox.parent_sandbox_adapter import (
     ParentSandboxAdapter,
 )
@@ -101,6 +109,44 @@ def _decode_path_lease(pl: dict[str, Any]) -> PathLease:
     )
 
 
+class _PreBoundPricing:
+    """[C2b budget §3-6] PricingFn impl with the price resolved ONCE at
+    construction. The callback then computes per-call cost via the shared
+    static_pricing.compute_cost — same math as CostCallbackHandler."""
+
+    def __init__(self, price: Any) -> None:
+        self._price = price
+
+    def compute_cost(self, usage_metadata: Any):
+        return compute_cost(usage_metadata, self._price)
+
+
+def _resolve_child_llm_price(llm: Any) -> Any:
+    """[C2b budget §3-6] Resolve (model, provider_id) from the BUILT child
+    llm object and look up the static price. Source contract: the llm's
+    ``_identifying_params`` — the SAME property the runtime invocation_params
+    are derived from (cost handler reads invocation_params['provider_id']
+    which the adapters fill from this property; fallback adapter delegates to
+    primary). NEVER read LLMConfig.provider — it can be None while the
+    adapter resolves a real provider_id, which would split budget (never
+    trips) from cost (bills fine).
+
+    Returns the price dict, or None on ANY resolution failure — fail-soft
+    (spec R4#3 / L4): an unpriceable child gets wallclock-only enforcement.
+    """
+    try:
+        id_params = dict(getattr(llm, "_identifying_params", None) or {})
+        model = getattr(llm, "model_name", None) or id_params.get("model") or "unknown"
+        if not isinstance(model, str):
+            return None  # MagicMock/fake leak-through guard
+        provider_id = id_params.get("provider_id")
+        if not provider_id or provider_id == "unknown":
+            provider_id = _infer_provider(model)
+        return get_price(model, provider_id)
+    except Exception:  # noqa: BLE001 — fail-soft: unpriceable ⇒ no token cb
+        return None
+
+
 class DefaultCoordinatorChildRunnerStarter:
     """Concrete starter — see module docstring for ownership semantics."""
 
@@ -118,6 +164,7 @@ class DefaultCoordinatorChildRunnerStarter:
         coordinator_limits: "CoordinatorLimits",
         sandbox_lifecycle_service: Any,  # _DeferredLifecycle proxy or SandboxLifecycleService
         resolve_child_runner_deps: Any = None,  # () -> ChildRunnerSharedDeps; lazy (supervisor+uow for cost handler). Default None is INTENTIONAL: F1.7 build_coordinator_runtime_deps constructs this starter with None for the 2-kwarg comp-root test callers that never dispatch a child (so .start()/_resolve_child_runner_deps() is never reached). A real dispatch path is always wired by F1.7 -- do NOT add a hard __init__ guard (it would break those callers).
+        coordinator_metrics: Any = None,  # [C2b budget D10] CoordinatorMetrics | None — threaded into each CoordinatorChildRunner for the budget finalizer's best-effort exhaustion counter.
     ) -> None:
         self._runner_factory = runner_factory
         self._mailbox_publisher = mailbox_publisher
@@ -130,7 +177,14 @@ class DefaultCoordinatorChildRunnerStarter:
         self._coordinator_limits = coordinator_limits
         self._sandbox_lifecycle_service = sandbox_lifecycle_service
         self._resolve_child_runner_deps = resolve_child_runner_deps
+        self._coordinator_metrics = coordinator_metrics
         self._active_tasks: dict[str, asyncio.Task] = {}
+        # [C2b budget §3-9 R3#1] child_session_id → CoordinatorChildRunner for
+        # dispatch-rollback stop. Reaped in _on_task_done alongside
+        # _active_tasks. Keyed per child; the starter is a lifespan singleton
+        # shared by concurrent runs, so rollback stop MUST be scoped by
+        # explicit ids (request_stop_started), never "stop everything".
+        self._active_runners: dict[str, Any] = {}
 
     async def start(
         self,
@@ -218,7 +272,50 @@ class DefaultCoordinatorChildRunnerStarter:
                 parent_session_id=parent_session_id,
                 coordinator_run_id=coordinator_run_id,
                 mailbox_subscriber=self._mailbox_subscriber,
+                budget=budget,                                   # [C2b budget D2/A2]
+                coordinator_metrics=self._coordinator_metrics,   # [C2b budget D10]
             )
+            # 7b. [C2b budget D1/§3-6] Late-inject the token budget callback.
+            # Constructed only NOW: its ctor needs the CoordinatorChildRunner,
+            # which did not exist at factory.build/adapter time (spec §0.4).
+            # Fail-soft ladder — any disabled rung leaves wallclock-only
+            # enforcement (watchdog wired via budget= above):
+            #   cap<=0 (direct-construction trap, env loader rejects in prod)
+            #   → no llm / unresolvable identifying_params (test fakes,
+            #     degraded assembly)
+            #   → get_price None (unpriced model — spec L4).
+            budget_cb = None
+            if budget.max_token_cost_usd <= 0:
+                logger.warning(
+                    "coordinator child %s: max_token_cost_usd=%s non-positive "
+                    "— token budget enforcement DISABLED for this child",
+                    child_session_id, budget.max_token_cost_usd,
+                )
+            else:
+                _child_llm = getattr(_shared, "llm", None)
+                _price = (
+                    _resolve_child_llm_price(_child_llm)
+                    if _child_llm is not None else None
+                )
+                if _price is None:
+                    logger.warning(
+                        "coordinator child %s: no static price for child llm "
+                        "(missing/unpriced model or provider) — token budget "
+                        "enforcement DISABLED; wallclock watchdog unaffected",
+                        child_session_id,
+                    )
+                else:
+                    budget_cb = BudgetEnforcementCallback(
+                        runner=child_runner,
+                        max_token_cost_usd=budget.max_token_cost_usd,
+                        pricing=_PreBoundPricing(_price),
+                    )
+                    child_runner.attach_budget_callback(budget_cb)
+                    # Setter chain: adapter → raw AgentTaskRunner → flow →
+                    # _build_config callbacks append (§3-3/§3-4/§3-5).
+                    built.runner.set_budget_callback(budget_cb)
+            # [C2b budget §3-9] Track for dispatch-rollback stop scope.
+            self._active_runners[child_session_id] = child_runner
             # 8. Spawn background task (fire-then-track).
             task = asyncio.create_task(child_runner.run_work_unit(
                 coordinator_run_id=coordinator_run_id,
@@ -271,11 +368,36 @@ class DefaultCoordinatorChildRunnerStarter:
                 raise
             return
 
+    def request_stop_started(
+        self,
+        child_session_ids: Any,
+        reason: StopReason = StopReason.PARENT_CANCEL,
+    ) -> None:
+        """[C2b budget §3-9 R3#1+R4#2] Dispatch-rollback stop for the children
+        a FAILED dispatch already started. After the D9 event split, the
+        run-level cancel_event no longer reaches children directly, so the
+        dispatch rollback must stop them explicitly — scoped by the EXACT ids
+        it started (the caller appends each id only after a successful
+        start), never starter-wide (concurrent runs share this singleton).
+        Best-effort per child: one bad runner does not block the rest."""
+        for sid in child_session_ids:
+            runner = self._active_runners.get(sid)
+            if runner is None:
+                continue  # already finished/reaped — nothing to stop
+            try:
+                runner.request_stop(reason)
+            except Exception:  # noqa: BLE001 — best-effort rollback stop
+                logger.warning(
+                    "request_stop_started: request_stop failed for child=%s",
+                    sid, exc_info=True,
+                )
+
     def _on_task_done(self, task: asyncio.Task) -> None:
         name = task.get_name()
         if name.startswith("coord-child-"):
             child_session_id = name.removeprefix("coord-child-")
             self._active_tasks.pop(child_session_id, None)
+            self._active_runners.pop(child_session_id, None)  # [C2b budget §3-9]
         if task.cancelled():
             return
         exc = task.exception()

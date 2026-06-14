@@ -80,7 +80,65 @@ def _fake_lifecycle():
     return svc
 
 
+import contextlib
+
+
+_STARTER_LOGGER_NAME = (
+    "app.application.services.coordinator_child_runner_starter"
+)
+
+
+@contextlib.contextmanager
+def _capture_warnings():
+    """Capture WARNING+ messages from the starter module's logger.
+
+    NOTE: this project installs ``_RedactingPropagateOnlyLogger`` as the
+    default logger class (app/infrastructure/logging/redaction.py), whose
+    ``addHandler`` is a documented no-op — handlers attached to a named
+    logger are silently dropped and records only reach the root logger via
+    ``propagate=True``. So we attach to the ROOT logger and filter by
+    ``record.name`` instead of attaching to the named starter logger.
+    """
+    records: list[str] = []
+
+    class _H(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.name == _STARTER_LOGGER_NAME:
+                records.append(record.getMessage())
+
+    root = logging.getLogger()
+    handler = _H(level=logging.WARNING)
+    root.addHandler(handler)
+    try:
+        yield records
+    finally:
+        root.removeHandler(handler)
+
+
+class _FakeChildLlm:
+    """Minimal real-shaped child llm: the starter's pricing pre-bind reads
+    model_name + _identifying_params (same source as runtime
+    invocation_params — spec §3-6). ('openai_official', 'gpt-4o') IS in the
+    static pricing table, so the happy path resolves a real price."""
+
+    model_name = "gpt-4o"
+    _identifying_params = {"model": "gpt-4o", "provider_id": "openai_official"}
+
+
 def _fake_resolve():
+    import types
+    from unittest.mock import MagicMock
+
+    return types.SimpleNamespace(
+        execution_supervisor=MagicMock(),
+        uow_factory=lambda: MagicMock(),
+        llm=_FakeChildLlm(),
+    )
+
+
+def _fake_resolve_without_llm():
+    """Legacy shape (pre-C2b): no llm attribute — exercises the fail-soft
+    'skip token callback + WARNING' path (spec R4#3)."""
     import types
     from unittest.mock import MagicMock
 
@@ -127,6 +185,9 @@ async def test_start_invokes_run_work_unit_with_decoded_manifest(monkeypatch):
     class _FakeChildRunner:
         def __init__(self, **kwargs: Any) -> None:
             captured["ctor_kwargs"] = kwargs
+
+        def attach_budget_callback(self, cb: Any) -> None:  # C2b late-inject
+            captured["attached_cb"] = cb
 
         async def run_work_unit(self, **kwargs: Any) -> None:
             captured["run_kwargs"] = kwargs
@@ -197,6 +258,7 @@ async def test_start_sets_task_name_and_registers_in_active(monkeypatch):
 
     class _BlockingChildRunner:
         def __init__(self, **kwargs: Any) -> None: ...
+        def attach_budget_callback(self, cb: Any) -> None: ...
         async def run_work_unit(self, **kwargs: Any) -> None:
             started.set()
             await asyncio.sleep(10)
@@ -248,6 +310,7 @@ async def test_done_callback_pops_on_success(monkeypatch):
 
     class _ImmediateChildRunner:
         def __init__(self, **kwargs: Any) -> None: ...
+        def attach_budget_callback(self, cb: Any) -> None: ...
         async def run_work_unit(self, **kwargs: Any) -> None:
             return None
 
@@ -294,6 +357,7 @@ async def test_done_callback_pops_and_logs_on_exception(monkeypatch, caplog):
 
     class _RaisingChildRunner:
         def __init__(self, **kwargs: Any) -> None: ...
+        def attach_budget_callback(self, cb: Any) -> None: ...
         async def run_work_unit(self, **kwargs: Any) -> None:
             raise RuntimeError("boom")
 
@@ -346,6 +410,7 @@ async def test_done_callback_handles_cancelled_without_raising(monkeypatch, capl
 
     class _BlockingChildRunner:
         def __init__(self, **kwargs: Any) -> None: ...
+        def attach_budget_callback(self, cb: Any) -> None: ...
         async def run_work_unit(self, **kwargs: Any) -> None:
             started.set()
             await asyncio.sleep(60)
@@ -419,6 +484,7 @@ async def test_start_provisions_child_sandbox_and_cost_handler(monkeypatch):
     # mock runner. To keep the test fast + isolated, monkeypatch it to a no-op fake:
     class _NoopChildRunner:
         def __init__(self, **kwargs): captured["ctor"] = kwargs
+        def attach_budget_callback(self, cb: Any) -> None: ...
         async def run_work_unit(self, **kwargs): return None
     monkeypatch.setattr(
         "app.application.services.coordinator_child_runner_starter.CoordinatorChildRunner",
@@ -473,3 +539,348 @@ async def test_start_failure_after_bind_new_publishes_failed_and_does_not_destro
     # "fake has no destroy attr" (a MagicMock would auto-create the call).
     handle.destroy.assert_not_called()
     lifecycle.destroy.assert_not_called()
+
+
+# ── C2b budget D10(b): starter ctor coordinator_metrics shape ────────────────
+
+
+async def test_starter_ctor_accepts_optional_coordinator_metrics():
+    """None-tolerant new kwarg: existing constructions (no metrics) stay
+    valid; an explicit metrics object is stored for runner threading."""
+    starter = _make_starter()
+    assert starter._coordinator_metrics is None
+
+    metrics = MagicMock(name="coordinator_metrics")
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+
+    starter2 = DefaultCoordinatorChildRunnerStarter(
+        runner_factory=_FakeRunnerFactory(),
+        mailbox_publisher=MagicMock(),
+        mailbox_subscriber=MagicMock(),
+        envelope_factory=MagicMock(),
+        session_repository=_FakeSessionRepository(),
+        coordinator_envelope_store=MagicMock(),
+        cost_rollup_service=MagicMock(),
+        artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
+        coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
+        coordinator_metrics=metrics,
+    )
+    assert starter2._coordinator_metrics is metrics
+
+
+# ── C2b budget §3-6: starter late-inject (spec §5-10) ────────────────────────
+
+
+def _capturing_child_runner(monkeypatch, captured: dict):
+    """Monkeypatch CoordinatorChildRunner with a ctor-capturing noop fake."""
+
+    class _NoopChildRunner:
+        def __init__(self, **kwargs):
+            captured["ctor"] = kwargs
+            captured["instance"] = self
+            self.attached = None
+
+        def attach_budget_callback(self, cb):
+            captured["attached"] = cb
+
+        async def run_work_unit(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter."
+        "CoordinatorChildRunner",
+        _NoopChildRunner,
+    )
+    return _NoopChildRunner
+
+
+async def _start_once(starter):
+    await starter.start(
+        coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1", spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(), root_session_id="root-1",
+        parent_session_id="parent-1", parent_sandbox=MagicMock(),
+        user_id="user-1",
+    )
+
+
+async def test_late_inject_constructs_and_wires_budget_callback(monkeypatch):
+    """[spec §5-10 happy] After step 7: a BudgetEnforcementCallback is built
+    with runner=child_runner + the per-child cap; attach_budget_callback AND
+    built.runner.set_budget_callback both receive THE SAME instance; runner
+    ctor got budget= + coordinator_metrics=."""
+    from app.application.services.budget_enforcement_callback import (
+        BudgetEnforcementCallback,
+    )
+
+    captured: dict = {}
+    _capturing_child_runner(monkeypatch, captured)
+    runner_factory = _FakeRunnerFactory()
+    metrics = MagicMock(name="metrics")
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+
+    starter = DefaultCoordinatorChildRunnerStarter(
+        runner_factory=runner_factory,
+        mailbox_publisher=MagicMock(),
+        mailbox_subscriber=MagicMock(),
+        envelope_factory=MagicMock(),
+        session_repository=_FakeSessionRepository(),
+        coordinator_envelope_store=MagicMock(),
+        cost_rollup_service=MagicMock(),
+        artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
+        coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
+        coordinator_metrics=metrics,
+    )
+    await _start_once(starter)
+
+    # Runner ctor threading (D2 + D10c).
+    budget = captured["ctor"]["budget"]
+    assert budget.max_token_cost_usd == 2.0  # _FakeCoordinatorLimits value
+    assert budget.max_wallclock_seconds == 600
+    assert captured["ctor"]["coordinator_metrics"] is metrics
+
+    # Late-inject: same callback instance to BOTH attach + setter chain.
+    cb = captured["attached"]
+    assert isinstance(cb, BudgetEnforcementCallback)
+    assert cb._cap == 2.0
+    assert cb._runner is captured["instance"]
+    runner_factory.built.runner.set_budget_callback.assert_called_once_with(cb)
+
+
+async def test_pricing_source_is_built_llm_identifying_params(monkeypatch):
+    """[spec §5-10 R6#1 source-of-truth] get_price receives (model,
+    provider_id) from the BUILT child llm's _identifying_params — NOT from
+    any LLMConfig. get_price returning None → NO callback + WARNING."""
+    captured: dict = {}
+    _capturing_child_runner(monkeypatch, captured)
+    price_calls: list = []
+
+    def fake_get_price(model, provider_id=None):
+        price_calls.append((model, provider_id))
+        return None  # unpriced → fail-soft
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter.get_price",
+        fake_get_price,
+    )
+    runner_factory = _FakeRunnerFactory()
+    starter = _make_starter(runner_factory=runner_factory)
+
+    with _capture_warnings() as records:
+        await _start_once(starter)
+
+    assert price_calls == [("gpt-4o", "openai_official")]
+    assert captured.get("attached") is None  # no callback constructed
+    runner_factory.built.runner.set_budget_callback.assert_not_called()
+    assert any("token budget" in m.lower() and "disabled" in m.lower()
+               for m in records), records
+
+
+async def test_pricing_prebound_price_flows_into_compute_cost(monkeypatch):
+    """[spec §5-10 / §3-6 PricingFn 契约，codex plan-R2#2] The price resolved
+    ONCE at construction is the SAME object handed to every per-call
+    compute_cost(usage_metadata, price) — kills a _PreBoundPricing mutant
+    that ignores the bound price or re-resolves per call."""
+    captured: dict = {}
+    _capturing_child_runner(monkeypatch, captured)
+
+    sentinel_price = {"input": 1}  # opaque — only identity matters here
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter.get_price",
+        lambda model, provider_id=None: sentinel_price,
+    )
+    cc_calls: list = []
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter.compute_cost",
+        lambda usage_metadata, price: cc_calls.append((usage_metadata, price)) or 0.0,
+    )
+    runner_factory = _FakeRunnerFactory()
+    starter = _make_starter(runner_factory=runner_factory)
+    await _start_once(starter)
+
+    cb = captured["attached"]
+    assert cb is not None, "happy path must construct the callback"
+
+    # [codex plan-R3#1] POISON get_price after construction: a mutant that
+    # re-resolves the price per call (instead of using the construction-time
+    # pre-bound dict) would call the now-raising get_price and fail here.
+    def _poisoned_get_price(model, provider_id=None):
+        raise AssertionError(
+            "get_price called AFTER construction — price must be pre-bound"
+        )
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter.get_price",
+        _poisoned_get_price,
+    )
+
+    usage = {"input_tokens": 7}
+    result = cb._pricing.compute_cost(usage)
+    assert result == 0.0
+    assert cc_calls == [(usage, sentinel_price)], (
+        "compute_cost must receive the construction-time pre-bound price, "
+        f"got {cc_calls}"
+    )
+
+
+async def test_missing_llm_fail_soft_skips_callback(monkeypatch):
+    """[spec R4#3] resolve deps WITHOUT llm → skip token callback + WARNING,
+    start() does not raise; wallclock budget still threads through."""
+    captured: dict = {}
+    _capturing_child_runner(monkeypatch, captured)
+    runner_factory = _FakeRunnerFactory()
+    starter = _make_starter(
+        runner_factory=runner_factory, resolve=_fake_resolve_without_llm,
+    )
+    with _capture_warnings() as records:
+        await _start_once(starter)
+
+    assert captured.get("attached") is None
+    runner_factory.built.runner.set_budget_callback.assert_not_called()
+    assert captured["ctor"]["budget"] is not None  # watchdog path unaffected
+    assert any("token budget" in m.lower() and "disabled" in m.lower()
+               for m in records), records
+
+
+async def test_non_positive_token_cap_skips_callback(monkeypatch):
+    """[spec L8 starter 半] max_token_cost_usd <= 0 → skip construction +
+    WARNING (a cap=0 callback would trip on the first call — dishonest)."""
+    captured: dict = {}
+    _capturing_child_runner(monkeypatch, captured)
+
+    class _ZeroTokenLimits(_FakeCoordinatorLimits):
+        max_token_cost_usd_per_child: float = 0.0
+
+    runner_factory = _FakeRunnerFactory()
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+
+    starter = DefaultCoordinatorChildRunnerStarter(
+        runner_factory=runner_factory,
+        mailbox_publisher=MagicMock(),
+        mailbox_subscriber=MagicMock(),
+        envelope_factory=MagicMock(),
+        session_repository=_FakeSessionRepository(),
+        coordinator_envelope_store=MagicMock(),
+        cost_rollup_service=MagicMock(),
+        artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
+        coordinator_limits=_ZeroTokenLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
+    )
+    with _capture_warnings() as records:
+        await _start_once(starter)
+
+    assert captured.get("attached") is None
+    runner_factory.built.runner.set_budget_callback.assert_not_called()
+    assert any("non-positive" in m.lower() for m in records), records
+
+
+# ── C2b budget §3-9 (R3#1+R4#2): request_stop_started rollback stop ──────────
+
+
+class _StopRecordingChildRunner:
+    """Real-ish stop semantics: first-wins reason + event set — what
+    request_stop_started must drive on each STARTED child."""
+
+    instances: list["_StopRecordingChildRunner"] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.cancel_event = kwargs["cancel_event"]
+        self.stop_reason = None
+        type(self).instances.append(self)
+
+    def attach_budget_callback(self, cb: Any) -> None: ...
+
+    def request_stop(self, reason: Any) -> None:
+        if self.stop_reason is None:
+            self.stop_reason = reason
+        self.cancel_event.set()
+
+    async def run_work_unit(self, **kwargs: Any) -> None:
+        await asyncio.sleep(30)  # stays RUNNING until stopped/cancelled
+
+
+async def test_request_stop_started_scoped_to_given_children(monkeypatch):
+    """[spec §5-14 starter 半 / R4#2 隔离] Stop EXACTLY the listed children —
+    a concurrent run's child on the SAME lifespan-singleton starter is
+    untouched (event unset). Unknown ids are a silent no-op."""
+    from app.application.services.coordinator_child_runner import StopReason
+
+    _StopRecordingChildRunner.instances = []
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter."
+        "CoordinatorChildRunner",
+        _StopRecordingChildRunner,
+    )
+    starter = _make_starter()
+
+    async def _start(child_sid: str, run_id: str):
+        await starter.start(
+            coordinator_run_id=run_id, work_unit=_FakeWorkUnit(f"wu-{child_sid}"),
+            child_session_id=child_sid, spawn_manifest_ref="ref",
+            cancel_event=asyncio.Event(), root_session_id="root",
+            parent_session_id="parent", parent_sandbox=MagicMock(),
+            user_id="user-1",
+        )
+
+    await _start("run1-c1", "run-1")
+    await _start("run1-c2", "run-1")
+    await _start("run2-c1", "run-2")  # concurrent run, same starter
+    r1c1, r1c2, r2c1 = _StopRecordingChildRunner.instances
+
+    starter.request_stop_started(["run1-c1", "run1-c2", "ghost-id"])
+
+    assert r1c1.stop_reason == StopReason.PARENT_CANCEL
+    assert r1c2.stop_reason == StopReason.PARENT_CANCEL
+    assert r1c1.cancel_event.is_set() and r1c2.cancel_event.is_set()
+    # R4#2: the other run's child is NOT stopped.
+    assert r2c1.stop_reason is None
+    assert not r2c1.cancel_event.is_set()
+
+    # Cleanup: cancel the three live tasks.
+    for sid in ("run1-c1", "run1-c2", "run2-c1"):
+        task = starter._active_tasks.get(sid)
+        if task is not None:
+            task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_active_runners_reaped_on_task_done(monkeypatch):
+    """_active_runners must not leak: the done-callback pops it together with
+    _active_tasks (lifespan-singleton starter would otherwise grow forever)."""
+
+    class _ImmediateChildRunner:
+        def __init__(self, **kwargs: Any) -> None: ...
+        def attach_budget_callback(self, cb: Any) -> None: ...
+        async def run_work_unit(self, **kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter."
+        "CoordinatorChildRunner",
+        _ImmediateChildRunner,
+    )
+    starter = _make_starter()
+    await starter.start(
+        coordinator_run_id="run-r", work_unit=_FakeWorkUnit("wu-r"),
+        child_session_id="child-r", spawn_manifest_ref="ref",
+        cancel_event=asyncio.Event(), root_session_id="root",
+        parent_session_id="parent", parent_sandbox=MagicMock(),
+        user_id="user-1",
+    )
+    for _ in range(50):
+        if "child-r" not in starter._active_runners:
+            break
+        await asyncio.sleep(0.01)
+    assert "child-r" not in starter._active_runners
+    assert "child-r" not in starter._active_tasks

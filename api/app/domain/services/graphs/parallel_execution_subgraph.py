@@ -389,6 +389,12 @@ async def _first_time_dispatch(
     # Python scope-wise it is accessible from the except clause
     # because both share the enclosing function frame.
     created_waiter_groups: list[tuple[str, str]] = []
+    # [C2b budget §3-9 R3#1] Children THIS dispatch successfully started —
+    # appended ONLY after each runner_starter.start returns, so when the Nth
+    # start raises the list holds exactly the N-1 started ones. The except
+    # clause stops them via starter.request_stop_started (scoped: the starter
+    # is a lifespan singleton shared by concurrent runs — R4#2).
+    started_child_session_ids: list[str] = []
     # [finish-core §5.4 G4-min] Init BEFORE the try so the except clause can
     # reference both unconditionally. Without this, a failure before they are
     # assigned would raise UnboundLocalError and MASK the original dispatch
@@ -532,6 +538,23 @@ async def _first_time_dispatch(
             # Redis. The except-clause below tears these down before
             # re-raising.
             created_waiter_groups.append((stream_key, consumer_group))
+            # [C2b budget §3-9 R4#1] Pre-create the child cancel-LISTENER
+            # group too (same start_id="$" retention property): a
+            # CANCEL_REQUEST published before the child's own listener
+            # subscribes is retained as group backlog and consumed once the
+            # listener starts — this closes the pre-subscribe race the
+            # listener docstring used to accept. The listener's own
+            # subscribe is BUSYGROUP-idempotent; its shutdown() destroys
+            # the group on the normal path, and the SAME rollback list
+            # tears it down here on dispatch failure (double-destroy is
+            # idempotent at the adapter — R5#6).
+            listener_group = f"coordinator:child:{child_sid}"
+            await subscriber.subscribe(
+                stream_key=stream_key,
+                consumer_group=listener_group,
+                consumer_name=f"{child_sid}-listener",
+            )
+            created_waiter_groups.append((stream_key, listener_group))
 
         # [finish-core §5.4 G4-min, INV-F4.1] Pre-create the orchestrator's
         # observer group SYNCHRONOUSLY before ANY child task launches, so a
@@ -570,17 +593,28 @@ async def _first_time_dispatch(
         # (``"parent_sandbox": self._sandbox``).
         parent_sandbox = cfg.get("parent_sandbox")
         for wu in enriched_units:
+            # [C2b budget §3-9 D9] PER-CHILD cancel event. The run-level
+            # cfg["cancel_event"] stays with the orchestrator (parent-cancel
+            # observation) + worker_node waiter; user/parent cancel reaches a
+            # child ONLY via the orchestrator's CANCEL_REQUEST envelope
+            # fan-out → the child's cancel listener → request_stop(
+            # PARENT_CANCEL) → this child-local event. A budget/watchdog trip
+            # sets ONLY this child's event — sibling policy is the
+            # orchestrator's RESULT_READY decision, never raw-event
+            # contagion (INV-B7/INV-B8).
+            child_cancel_event = asyncio.Event()
             await runner_starter.start(
                 coordinator_run_id=coordinator_run_id,
                 work_unit=wu,
                 child_session_id=child_session_ids[wu.work_unit_id],
                 spawn_manifest_ref=spawn_manifest_refs[wu.work_unit_id],
-                cancel_event=cancel_event,
+                cancel_event=child_cancel_event,
                 root_session_id=root_session_id,
                 parent_session_id=parent_session_id,
                 parent_sandbox=parent_sandbox,
                 user_id=user_id,
             )
+            started_child_session_ids.append(child_session_ids[wu.work_unit_id])
 
         # Step 8 -- publish SPAWN_REQUEST x N.
         from app.application.services.coordinator_envelope_factory import (
@@ -649,6 +683,26 @@ async def _first_time_dispatch(
         # supervised orchestrator lifecycle.
         orchestrator_task.add_done_callback(_log_orchestrator_task_done)
     except BaseException:
+        # [C2b budget §3-9 R3#1] FIRST: stop the children this dispatch
+        # already started. After the D9 event split the run-level event no
+        # longer reaches them, so an explicit scoped stop is the only thing
+        # standing between a failed dispatch and N orphaned RUNNING children
+        # burning budget until their watchdogs trip. Scoped to
+        # started_child_session_ids (R4#2: the starter is shared by
+        # concurrent runs). Runs BEFORE quota release (R6#5) and is
+        # best-effort — never masks the original dispatch exception.
+        if started_child_session_ids:
+            try:
+                runner_starter.request_stop_started(started_child_session_ids)
+            except BaseException:  # noqa: BLE001 — preserve original raise
+                logger.warning(
+                    "dispatch rollback: request_stop_started failed for %s "
+                    "— children fall back to their wallclock watchdogs; "
+                    "original dispatch exception preserved via outer raise",
+                    started_child_session_ids,
+                    exc_info=True,
+                )
+
         # [codex R2 P1-3] Release the slot we acquired so a downstream
         # failure (digest computation / MinIO upload / session create /
         # manifest upload / subscribe / runner start / SPAWN_REQUEST

@@ -228,6 +228,17 @@ def test_lifespan_constructs_coordinator_singletons_exactly_once():
     # (AgentService / AgentTaskRunner) sees a single source of truth.
     assert fake_state.coord_deps is coord_deps
 
+    # [C2b budget D10] CoordinatorMetrics constructed at the composition root
+    # (OtelMeter() is no-op-safe pre-setup_observability) and threaded BOTH
+    # into coord_deps AND into the starter ctor.
+    from app.infrastructure.observability.coordinator_telemetry import (
+        CoordinatorMetrics,
+    )
+
+    assert isinstance(coord_deps.coordinator_metrics, CoordinatorMetrics)
+    starter = fake_state.coordinator_child_runner_starter
+    assert starter._coordinator_metrics is coord_deps.coordinator_metrics
+
 
 def test_lifespan_threads_coord_deps_through_agent_service():
     """INV-A1 — the helper returns a real ``_CoordinatorRuntimeDeps``

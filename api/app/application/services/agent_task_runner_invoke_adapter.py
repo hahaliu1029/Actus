@@ -69,6 +69,17 @@ class AgentTaskRunnerInvokeAdapter:
         if cpc_setter is not None and child_permission_context is not None:
             cpc_setter(child_permission_context)
 
+    def set_budget_callback(self, cb: Any) -> None:
+        """[C2b budget §3-3] Forward the child's BudgetEnforcementCallback to
+        the wrapped raw AgentTaskRunner. POST-construction seam by necessity:
+        the callback ctor needs the CoordinatorChildRunner, which does not
+        exist yet when this adapter is built inside factory.build (spec §0.4
+        construction order). getattr-defensive like the ctor's cancel-event
+        wiring so legacy runner stubs are a no-op."""
+        setter = getattr(self._runner, "set_budget_callback", None)
+        if setter is not None:
+            setter(cb)
+
     async def invoke_until_done(self, *, user_message: str) -> ChildRunResult:
         task = self._task_cls.create(task_runner=self._runner)
         await task.input_stream.put(

@@ -366,7 +366,7 @@ While the flag stays `false`, the coordinator emit sites silently no-op and the 
 2. Roll restart `api` pods.
 3. Monitor (PR-9b call-site wiring required for live signal):
    - `actus_coordinator_run_cost_usd` — emitted from `CoordinatorRunOrchestrator` (call-site wiring lands in PR-9b together with the deferred `_emit_event` wirings).
-   - `actus_coordinator_budget_exhaustion_total` — emitted from `BudgetEnforcementCallback` (same PR-9b dependency).
+   - `actus_coordinator_budget_exhaustion_total` — emitted from the child runner's budget finalizer (`CoordinatorChildRunner._finalize_needs_authorization_budget`, single aggregation point for both token/wallclock reasons; wired by the C2b in-flight budget PR).
 
    Precondition: drive a synthetic coordinator run (a planner step with 2-3 `parallel_work_units`) and verify `actus_coordinator_run_cost_usd > 0` via the metrics endpoint. If the counter is flat after a known coordinator run, the call-site wiring hasn't landed yet — DO NOT rely on flat readings to declare "no coordinator runs."
 4. 24h observation window after the synthetic-run smoke check passes.

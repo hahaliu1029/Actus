@@ -348,6 +348,14 @@ class PlannerReActFlow(BaseFlow):
         # via the invoke-adapter. _build_config injects it (+ the SSM) into the
         # child graph cfg so react_graph's tool_node child-scope guard fires.
         self._child_permission_context = None
+        # [C2b budget §3-5] Child-only BudgetEnforcementCallback. None for
+        # root/parent flows; set by AgentTaskRunner.set_budget_callback via the
+        # starter→adapter→runner chain. _build_config appends it to
+        # cfg["callbacks"] when non-None — the append condition IS this
+        # None-check (no extra child gate needed: the setter's only production
+        # call chain originates in the coordinator starter, which only ever
+        # holds child instances).
+        self._budget_callback = None
 
     def set_cancel_event(self, event: "asyncio.Event") -> None:
         """[C2 finish-core §5.1.1 G1a] External seam: the coordinator invoke-
@@ -362,6 +370,13 @@ class PlannerReActFlow(BaseFlow):
         _build_config threads it (+ the SSM) into the child graph cfg for the
         tool_node child-scope guard."""
         self._child_permission_context = cpc
+
+    def set_budget_callback(self, cb) -> None:
+        """[C2b budget §3-5] External seam (mirror set_cancel_event): the
+        coordinator starter late-injects the child's BudgetEnforcementCallback
+        (via adapter → AgentTaskRunner → here) so _build_config appends it to
+        the graph callbacks list alongside the cost handler."""
+        self._budget_callback = cb
 
     @property
     def summary_llm(self):
@@ -1296,8 +1311,11 @@ class PlannerReActFlow(BaseFlow):
         #     (PR-6 §14.3 constants + per-env override validation).
         #   - "session_repository": already exists in
         #     service_dependencies; thread for the descendants cap.
-        #   - "cancel_event": parent cancel ``asyncio.Event``; orchestrator
-        #     + child runners share it so user cancel fans out.
+        #   - "cancel_event": parent cancel ``asyncio.Event``; observed by
+        #     the orchestrator + worker_node waiter. Children get their OWN
+        #     per-work-unit events (dispatch creates them — C2b budget D9);
+        #     user cancel reaches children via CANCEL_REQUEST envelope
+        #     fan-out, not via this shared object.
         #   - "user_id": already wired at line ~1322 (
         #     ``self._user_id``); read by ``_run_parallel_backend`` (
         #     ``main_graph.py:96``) + ``dispatch_node`` for the user-scoped
@@ -1442,6 +1460,11 @@ class PlannerReActFlow(BaseFlow):
         if self._cost_callback_handler is not None:
             callbacks.append(self._cost_callback_handler)
         callbacks.extend(build_observability_callbacks())
+        # [C2b budget §3-5] Budget enforcement rides the SAME list as the cost
+        # handler — independent handlers, additive dispatch (INV-B5). Child
+        # flows only (see set_budget_callback).
+        if self._budget_callback is not None:
+            callbacks.append(self._budget_callback)
         if callbacks:
             cfg["callbacks"] = callbacks
 

@@ -186,25 +186,33 @@ async def test_listener_task_fatal_exception_is_logged_not_silent(caplog) -> Non
 
 
 def test_pre_subscribe_race_contract_pinned_in_module_docstring() -> None:
-    """[r7 P2 fix] spec §8.5.3 race table — CANCEL before subscribe →
-    supervisor backstop + child wallclock budget watchdog trip TIMED_OUT.
-
-    v1 accepts this race; PR-4 hardens with a startup fence but cannot fully
-    eliminate. This test pins the design decision to the module docstring so
-    a silent refactor that removes the doc + the backstop expectation fails
-    here (replacing the prior tautological ``assert True``)."""
+    """[C2b budget §3-9 R4#1] The race contract CHANGED: dispatch now
+    pre-creates this listener's consumer group, so a CANCEL_REQUEST published
+    before subscribe is retained as group backlog — the race is CLOSED, not
+    "accepted with TIMED_OUT backstop". This test pins the NEW contract to
+    the module docstring so a silent revert of either the doc or the
+    pre-creation rationale fails here."""
     import app.application.services.coordinator_child_cancel_listener as listener_mod
 
     doc = listener_mod.__doc__ or ""
-    # Three load-bearing claims must appear in the module docstring:
+    # Load-bearing claims of the post-split contract:
     assert "Pre-subscribe race" in doc, (
         "module docstring must call out the pre-subscribe race contract"
     )
-    assert "backstop" in doc or "watchdog" in doc, (
-        "module docstring must reference the watchdog backstop"
+    assert "CLOSED" in doc, (
+        "module docstring must state the race is CLOSED by group pre-creation"
     )
-    assert "TIMED_OUT" in doc, (
-        "module docstring must reference the TIMED_OUT outcome path"
+    assert "pre-creates" in doc, (
+        "module docstring must credit dispatch group pre-creation"
+    )
+    assert "BUSYGROUP-idempotent" in doc, (
+        "module docstring must pin the idempotent re-subscribe behavior"
+    )
+    assert "watchdog" in doc, (
+        "module docstring must still reference the (now-live) watchdog brake"
+    )
+    assert "TIMED_OUT" not in doc, (
+        "old accepted-race wording must be gone — the backstop story changed"
     )
 
 

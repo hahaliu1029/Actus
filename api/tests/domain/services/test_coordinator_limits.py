@@ -62,3 +62,17 @@ class TestEnvOverride:
     def test_wallclock_below_supervisor_backstop_accepted(self):
         with patch.dict(os.environ, {"ACTUS_COORDINATOR_MAX_WALLCLOCK_SECONDS_PER_CHILD": "599"}):
             assert load_coordinator_limits_from_env().max_wallclock_seconds_per_child == 599
+
+    def test_empty_env_string_is_silent_default(self, caplog):
+        """[C2b budget §3-10] docker-compose pass-through yields "" for unset
+        vars — must behave exactly like unset (code default, NO warning;
+        pre-C2b an empty string hit float("")/int("") → spurious WARNING)."""
+        import logging
+
+        with patch.dict(os.environ, {"ACTUS_COORDINATOR_MAX_WORK_UNITS_PER_RUN": ""}):
+            with caplog.at_level(logging.WARNING):
+                limits = load_coordinator_limits_from_env()
+        assert limits.max_work_units_per_run == CoordinatorLimits().max_work_units_per_run
+        assert not [
+            r for r in caplog.records if "coordinator_limits" in r.getMessage()
+        ], f"empty string must be silent; got {[r.getMessage() for r in caplog.records]}"

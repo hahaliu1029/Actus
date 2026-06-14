@@ -406,15 +406,16 @@ class TestDispatchRollbackWaiterGroupCleanup:
         with pytest.raises(RuntimeError, match="runner start boom"):
             await _first_time_dispatch(state, config, "run1", units)
 
-        # Both pre-created waiter groups + the hoisted orchestrator group
-        # must have been destroyed. subscribe: 2 waiter + 1 orchestrator
-        # (finish-core §5.4 G4-min, INV-F4.1). destroy: same 3 — runner_starter
+        # Pre-created waiter groups + cancel-listener groups (C2b budget
+        # §3-9 R4#1) + the hoisted orchestrator group must have been
+        # destroyed. subscribe: 2 waiter + 2 listener + 1 orchestrator
+        # (finish-core §5.4 G4-min, INV-F4.1). destroy: same 5 — runner_starter
         # .start raised BEFORE the orchestrator task was created, so
         # ``orchestrator_task is None`` and dispatch owns the orchestrator
         # group teardown (INV-F4.3 rollback branch).
         subscriber = cfg["mailbox_subscriber"]
-        assert subscriber.subscribe.await_count == 3
-        assert subscriber.destroy_group.await_count == 3
+        assert subscriber.subscribe.await_count == 5
+        assert subscriber.destroy_group.await_count == 5
 
         # Verify each destroy call matches the corresponding subscribe.
         # child_session_ids are c0 and c1 (from _full_dispatch_config side
@@ -423,6 +424,8 @@ class TestDispatchRollbackWaiterGroupCleanup:
         expected_calls = {
             ("actus:child:root1:mailbox", "coordinator:waiter:c0"),
             ("actus:child:root1:mailbox", "coordinator:waiter:c1"),
+            ("actus:child:root1:mailbox", "coordinator:child:c0"),
+            ("actus:child:root1:mailbox", "coordinator:child:c1"),
             ("actus:child:root1:mailbox", "coordinator:run1"),
         }
         actual_calls = {
@@ -484,11 +487,12 @@ class TestDispatchRollbackWaiterGroupCleanup:
         # destroy_group was attempted for every pre-created group even
         # though the first attempt raised — the destroy loop catches per
         # iteration so a single bad group doesn't skip the rest. 2 waiter +
-        # 1 hoisted orchestrator group (finish-core §5.4 G4-min); the
+        # 2 cancel-listener (C2b budget §3-9 R4#1) + 1 hoisted orchestrator
+        # group (finish-core §5.4 G4-min); the
         # orchestrator destroy is wrapped in its OWN try/except BaseException
         # so its "redis destroy boom" also does NOT mask "runner start boom".
         subscriber = cfg["mailbox_subscriber"]
-        assert subscriber.destroy_group.await_count == 3
+        assert subscriber.destroy_group.await_count == 5
 
 
 class TestBackwardCompat:

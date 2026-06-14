@@ -332,3 +332,123 @@ async def test_deep_path_with_empty_generations_falls_back_to_top_level() -> Non
 
     pricing.compute_cost.assert_called_once_with({"input_tokens": 33})
     runner.request_stop.assert_called_once_with(StopReason.TOKEN_BUDGET)
+
+
+# ── D8: real AsyncCallbackManager dispatch path (spec §5-5 / §5-8) ───────────
+#
+# These tests dispatch through ``ahandle_event`` — the EXACT helper every
+# LangChain async callback manager method funnels through. A bare (non-
+# AsyncCallbackHandler) class dies silently inside it twice over:
+# ``getattr(handler, "ignore_llm")`` raises AttributeError, and the
+# ``run_id=``/``tags=`` kwargs call raises TypeError — both swallowed by the
+# manager's ``except Exception`` → the cap NEVER trips in production.
+# Dispatching through the real helper (NOT calling cb.on_llm_end directly)
+# is what kills a bare-class regression.
+
+from uuid import uuid4
+
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.callbacks.manager import ahandle_event
+
+
+async def test_budget_callback_async_handler_contract() -> None:
+    """[spec §5-5 / D8] Real manager dispatch (run_id/tags kwargs) reaches
+    on_llm_end and the cap trips. Usage uses the PRODUCTION deep-path shape
+    (R6-A5) so deleting the deep-path reader would fail this test."""
+    assert issubclass(BudgetEnforcementCallback, AsyncCallbackHandler)
+
+    runner = _mk_runner()
+    pricing = MagicMock()
+    pricing.compute_cost = MagicMock(return_value=Decimal("2.0"))
+    cb = BudgetEnforcementCallback(
+        runner=runner, max_token_cost_usd=1.0, pricing=pricing,
+    )
+
+    response = _response_with_deep_usage(
+        {"input_tokens": 100, "output_tokens": 50},
+    )
+    await ahandle_event(
+        [cb], "on_llm_end", "ignore_llm", response,
+        run_id=uuid4(), parent_run_id=None, tags=[],
+    )
+
+    runner.request_stop.assert_called_once_with(StopReason.TOKEN_BUDGET)
+
+
+async def test_handler_body_exception_swallowed_by_manager() -> None:
+    """[INV-B3 framework half] A non-pricing exception escaping on_llm_end is
+    swallowed by the manager (raise_error=False default on
+    AsyncCallbackHandler) — the LLM run is never killed."""
+
+    class _BoomResponse:
+        @property
+        def generations(self):  # outside _extract's (Index/Attr/Type)Error net
+            raise RuntimeError("boom outside the extract net")
+
+    runner = _mk_runner()
+    cb = BudgetEnforcementCallback(
+        runner=runner, max_token_cost_usd=1.0, pricing=MagicMock(),
+    )
+    assert cb.raise_error is False  # inherited AsyncCallbackHandler default
+
+    # Must NOT raise out of the manager dispatch.
+    await ahandle_event(
+        [cb], "on_llm_end", "ignore_llm", _BoomResponse(),
+        run_id=uuid4(), parent_run_id=None, tags=[],
+    )
+    runner.request_stop.assert_not_called()
+
+
+async def test_cumulative_usd_property_tracks_accumulation() -> None:
+    """[D5 evidence source] Read-only ``cumulative_usd`` exposes the running
+    total; trip does not reset it."""
+    runner = _mk_runner()
+    pricing = MagicMock()
+    pricing.compute_cost = MagicMock(
+        side_effect=[Decimal("0.30"), Decimal("0.80")],
+    )
+    cb = BudgetEnforcementCallback(
+        runner=runner, max_token_cost_usd=1.0, pricing=pricing,
+    )
+    assert cb.cumulative_usd == 0.0
+    await cb.on_llm_end(_response_with_usage({"input_tokens": 1}))
+    assert cb.cumulative_usd == pytest.approx(0.30)
+    await cb.on_llm_end(_response_with_usage({"input_tokens": 1}))
+    assert cb.cumulative_usd == pytest.approx(1.10)  # tripped, total preserved
+
+
+async def test_cost_handler_unaffected_by_budget_trip() -> None:
+    """[spec §5-8 / INV-B5] Two independent handlers in the SAME list: the
+    budget callback tripping on call #1 must not short-circuit the sibling
+    handler — it receives every subsequent on_llm_end.
+
+    The sibling is a minimal recording AsyncCallbackHandler standing in for
+    the live CostCallbackHandler (whose persistence runs on background tasks
+    — orthogonal machinery that would blur this single invariant)."""
+
+    class _RecordingHandler(AsyncCallbackHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: int = 0
+
+        async def on_llm_end(self, response, *, run_id=None,
+                             parent_run_id=None, tags=None, **kwargs) -> None:
+            self.seen += 1
+
+    runner = _mk_runner()
+    pricing = MagicMock()
+    pricing.compute_cost = MagicMock(return_value=Decimal("9.9"))
+    budget_cb = BudgetEnforcementCallback(
+        runner=runner, max_token_cost_usd=1.0, pricing=pricing,
+    )
+    sibling = _RecordingHandler()
+    response = _response_with_deep_usage({"input_tokens": 10})
+
+    for _ in range(3):  # call #1 trips; #2/#3 are post-trip
+        await ahandle_event(
+            [budget_cb, sibling], "on_llm_end", "ignore_llm", response,
+            run_id=uuid4(), parent_run_id=None, tags=[],
+        )
+
+    assert runner.request_stop.call_count == 1  # idempotent post-trip
+    assert sibling.seen == 3  # INV-B5: sibling saw EVERY call

@@ -1136,6 +1136,18 @@ def build_coordinator_runtime_deps(
     # ── 10. CoordinatorLimits (env-overridable singleton). ──────────────────
     coordinator_limits = load_coordinator_limits_from_env()
 
+    # ── 10b. CoordinatorMetrics — C2b budget D10 instrument bundle. ─────────
+    #      OtelMeter() defaults to get_meter("actus"): a no-op proxy before
+    #      setup_observability runs, so constructing here (lifespan, possibly
+    #      obs-disabled) is side-effect-safe. Threaded into the starter ctor
+    #      below + the coord_deps aggregate; the budget finalizer emits
+    #      actus_coordinator_budget_exhaustion_total through it (INV-B9).
+    from app.infrastructure.observability import OtelMeter
+    from app.infrastructure.observability.coordinator_telemetry import (
+        CoordinatorMetrics,
+    )
+    coordinator_metrics = CoordinatorMetrics(OtelMeter())
+
     # ── 11. PatchReducerService — pure, stateless. ──────────────────────────
     patch_reducer_service = PatchReducerService()
 
@@ -1226,6 +1238,7 @@ def build_coordinator_runtime_deps(
         coordinator_limits=coordinator_limits,
         sandbox_lifecycle_service=sandbox_lifecycle_service,
         resolve_child_runner_deps=resolve_child_runner_deps,
+        coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
     )
 
     # ── 16. Pin everything on app_state so downstream DI / lifespan teardown
@@ -1279,6 +1292,7 @@ def build_coordinator_runtime_deps(
         cost_rollup_service=cost_rollup_service,
         coordinator_envelope_store=coordinator_envelope_store,
         parent_sandbox_adapter_factory=_parent_sandbox_adapter_factory,
+        coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
     )
     app_state.coord_deps = coord_deps
     return coord_deps

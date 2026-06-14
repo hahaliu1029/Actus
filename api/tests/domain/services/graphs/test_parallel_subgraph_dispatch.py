@@ -227,19 +227,23 @@ async def test_waiter_consumer_group_pre_created_before_runner_start() -> None:
     await dispatch_node(state, config)
     cfg = config["configurable"]
     subscribe_calls = cfg["mailbox_subscriber"].subscribe.await_args_list
-    # 2 work units → 2 waiter groups pre-created, PLUS the orchestrator's
-    # observer group hoisted here (finish-core §5.4 G4-min, INV-F4.1).
-    assert len(subscribe_calls) == 3
+    # 2 work units → 2 waiter groups + 2 cancel-listener groups (C2b budget
+    # §3-9 R4#1) pre-created, PLUS the orchestrator's observer group hoisted
+    # here (finish-core §5.4 G4-min, INV-F4.1).
+    assert len(subscribe_calls) == 5
     groups = {call.kwargs["consumer_group"] for call in subscribe_calls}
-    # Both waiter groups present.
+    # Both waiter groups AND both listener groups present.
     assert {"coordinator:waiter:c1", "coordinator:waiter:c2"} <= groups
-    # Exactly one additional non-waiter ``coordinator:`` group = the
-    # orchestrator observer group. Its run_id is generated as
-    # ``parent:hash16:a{n}`` by _create_task, so assert structurally rather
-    # than hardcoding the hash.
+    assert {"coordinator:child:c1", "coordinator:child:c2"} <= groups
+    # Exactly one ``coordinator:`` group that is neither a waiter nor a
+    # cancel-listener group = the orchestrator observer group. Its run_id is
+    # generated as ``parent:hash16:a{n}`` by _create_task, so assert
+    # structurally rather than hardcoding the hash.
     orch_groups = {
         g for g in groups
-        if g.startswith("coordinator:") and not g.startswith("coordinator:waiter:")
+        if g.startswith("coordinator:")
+        and not g.startswith("coordinator:waiter:")
+        and not g.startswith("coordinator:child:")
     }
     assert len(orch_groups) == 1, f"expected one orchestrator group, got {orch_groups}"
     for call in subscribe_calls:
@@ -557,3 +561,137 @@ async def test_dispatch_threads_parent_sandbox_into_runner_starter_start() -> No
             "cfg['parent_sandbox'] (the planner's self._sandbox); "
             f"got {kwargs['parent_sandbox']!r} vs cfg's {parent_sandbox!r}"
         )
+
+
+# ── C2b budget D9: per-child cancel events + rollback stop ───────────────────
+
+
+@pytest.mark.anyio
+async def test_dispatch_passes_distinct_per_child_cancel_events() -> None:
+    """[spec §5-12 pairwise-distinct, R6#2] EVERY starter.start receives its
+    OWN fresh Event — pairwise distinct AND distinct from the run-level
+    cfg['cancel_event'] (which stays with the orchestrator). Kills the
+    'create one child event outside the loop' mutation."""
+    config = _base_config(peek_returns=None)
+    state = _base_state()
+
+    await dispatch_node(state, config)
+
+    cfg = config["configurable"]
+    start_calls = cfg["child_runner_starter"].start.await_args_list
+    events = [c.kwargs["cancel_event"] for c in start_calls]
+    assert len(events) == 2
+    assert events[0] is not events[1], "child events must be pairwise distinct"
+    for ev in events:
+        assert isinstance(ev, asyncio.Event)
+        assert ev is not cfg["cancel_event"], (
+            "child must NOT share the run-level event (D9 split)"
+        )
+    # The orchestrator keeps observing the RUN-LEVEL event (parent cancel).
+    orch = cfg["orchestrator_factory"].build.return_value
+    assert orch.run.call_args.kwargs["cancel_event"] is cfg["cancel_event"]
+
+
+@pytest.mark.anyio
+async def test_dispatch_precreates_listener_groups() -> None:
+    """[spec §3-9 R4#1] dispatch pre-creates the cancel-listener consumer
+    group coordinator:child:{sid} (same loop as the waiter hoist) so a
+    CANCEL_REQUEST published before the child's listener subscribes is
+    retained as group backlog — the pre-subscribe race is closed."""
+    config = _base_config(peek_returns=None)
+    state = _base_state()
+
+    await dispatch_node(state, config)
+
+    sub = config["configurable"]["mailbox_subscriber"]
+    groups = [c.kwargs["consumer_group"] for c in sub.subscribe.await_args_list]
+    assert "coordinator:child:c1" in groups
+    assert "coordinator:child:c2" in groups
+    # Waiter groups still pre-created (unchanged behavior).
+    assert "coordinator:waiter:c1" in groups
+    assert "coordinator:waiter:c2" in groups
+
+
+def _three_unit_state() -> dict:
+    return _base_state(work_unit_requests=[
+        WorkUnitRequest(
+            objective=f"explore {i}", phase="exploration",
+            allowed_tools=["file_read"],
+        )
+        for i in range(3)
+    ])
+
+
+def _config_with_quota_and_third_start_failing(call_log: list) -> dict:
+    config = _base_config(peek_returns=None)
+    cfg = config["configurable"]
+    cfg["session_service"].create_session_with_parent = AsyncMock(
+        side_effect=[_mk_session("c1"), _mk_session("c2"), _mk_session("c3")],
+    )
+    cfg["child_runner_starter"].start = AsyncMock(
+        side_effect=[None, None, RuntimeError("spawn boom")],
+    )
+    # Production request_stop_started is SYNC — model it with MagicMock so
+    # no stray un-awaited coroutine warnings.
+    cfg["child_runner_starter"].request_stop_started = MagicMock(
+        side_effect=lambda ids, **kw: call_log.append(("stop", tuple(ids))),
+    )
+    pq = AsyncMock()
+    pq.acquire_coordinator_concurrency = AsyncMock(return_value=True)
+    pq.release_coordinator_quotas = AsyncMock(
+        side_effect=lambda **kw: call_log.append(("release",)),
+    )
+    cfg["probe_quota"] = pq
+    limits = MagicMock()
+    limits.max_work_units_per_run = 5
+    limits.max_concurrent_coordinator_runs_per_user = 2
+    cfg["coordinator_limits"] = limits
+    return config
+
+
+@pytest.mark.anyio
+async def test_dispatch_rollback_stops_started_children() -> None:
+    """[spec §5-14, R3#1+R4#2+R6#5] Third start raises → rollback calls
+    request_stop_started with EXACTLY the two started ids (c3 never started),
+    BEFORE quota release; the original exception propagates; pre-created
+    listener groups are destroyed."""
+    call_log: list = []
+    config = _config_with_quota_and_third_start_failing(call_log)
+    state = _three_unit_state()
+
+    with pytest.raises(RuntimeError, match="spawn boom"):
+        await dispatch_node(state, config)
+
+    stops = [e for e in call_log if e[0] == "stop"]
+    assert stops == [("stop", ("c1", "c2"))], (
+        f"must stop exactly the STARTED children, in order; got {stops}"
+    )
+    # R6#5 order pin: stop strictly precedes quota release.
+    assert call_log.index(("stop", ("c1", "c2"))) < call_log.index(("release",))
+
+    # Listener groups (pre-created for all 3) torn down on rollback. No exact
+    # destroy-count pin (R5#6: destroy is idempotent; double-destroy benign).
+    sub = config["configurable"]["mailbox_subscriber"]
+    destroyed = {
+        c.kwargs["consumer_group"] for c in sub.destroy_group.await_args_list
+    }
+    for sid in ("c1", "c2", "c3"):
+        assert f"coordinator:child:{sid}" in destroyed
+
+
+@pytest.mark.anyio
+async def test_rollback_stop_survives_release_failure() -> None:
+    """[R6#5 半] release_coordinator_quotas raising must not skip the stop
+    (it runs FIRST) nor mask the original dispatch exception."""
+    call_log: list = []
+    config = _config_with_quota_and_third_start_failing(call_log)
+    cfg = config["configurable"]
+    cfg["probe_quota"].release_coordinator_quotas = AsyncMock(
+        side_effect=RuntimeError("redis down"),
+    )
+    state = _three_unit_state()
+
+    with pytest.raises(RuntimeError, match="spawn boom"):  # NOT "redis down"
+        await dispatch_node(state, config)
+
+    assert [e for e in call_log if e[0] == "stop"] == [("stop", ("c1", "c2"))]

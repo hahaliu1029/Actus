@@ -1,6 +1,15 @@
 """C2 v1 hard caps (spec §14.2). All caps in code, not in prompts.
-Invariant: max_wallclock_seconds_per_child < SUBAGENT_RESULT_READY_TIMEOUT_SECONDS
-(internal cap trips first → NEEDS_AUTHORIZATION; supervisor 600s backstop → TIMED_OUT).
+
+Invariant: max_wallclock_seconds_per_child < SUBAGENT_RESULT_READY_TIMEOUT_SECONDS.
+Semantics (re-anchored by C2b budget D3/§0.7): the child cap must trip BEFORE
+the parent's observer timeout (CoordinatorRunOrchestrator.run
+``timeout_seconds=600.0`` — the same 600 number) so the budget
+NEEDS_AUTHORIZATION envelope is published while the parent is still
+observing. There is NO live supervisor result-ready deadline timer consuming
+SUBAGENT_RESULT_READY_TIMEOUT_SECONDS (it is the numeric anchor only; the
+"supervisor synthesizes TIMED_OUT at 600s" wording in the frozen C2 spec does
+not match shipped code — constant unification tracked as budget-spec §7-F5).
+The real per-child runaway brake is the wallclock watchdog this cap feeds.
 """
 from __future__ import annotations
 import logging, os
@@ -38,7 +47,9 @@ def load_coordinator_limits_from_env() -> CoordinatorLimits:
     overrides: dict[str, int | float] = {}
     for key, (field, type_) in _ENV_MAP.items():
         raw = os.environ.get(key)
-        if raw is None:
+        if raw is None or raw == "":
+            # Empty string = unset (docker-compose pass-through with no
+            # value yields "") — silent default, not a WARNING.
             continue
         try:
             parsed = type_(raw)
@@ -53,8 +64,10 @@ def load_coordinator_limits_from_env() -> CoordinatorLimits:
             )
             continue
         # Hard invariant from this module's docstring: child wallclock cap
-        # must trip BEFORE the supervisor backstop so the failure surfaces as
-        # NEEDS_AUTHORIZATION (internal) instead of TIMED_OUT (external).
+        # must trip BEFORE the parent's 600s observer timeout so the budget
+        # NEEDS_AUTHORIZATION envelope is published while the parent still
+        # listens (C2b budget D3 — no live supervisor deadline timer exists;
+        # the constant is the numeric anchor for that 600).
         if (
             field == "max_wallclock_seconds_per_child"
             and parsed >= SUBAGENT_RESULT_READY_TIMEOUT_SECONDS

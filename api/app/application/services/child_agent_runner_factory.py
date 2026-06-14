@@ -76,25 +76,23 @@ class ChildRunnerBuilder(Protocol):
 
 @dataclass(frozen=True)
 class BuiltChildRunner:
-    """Wrapper bundling the AgentTaskRunner instance with runtime concerns
-    that travel with the child but are not AgentTaskRunner ctor inputs.
+    """Wrapper bundling the adapter-wrapped child runner with runtime
+    concerns that travel with the child but are not AgentTaskRunner ctor
+    inputs.
 
-    [C2 PR-4 r2 P1 deferral] The production consumer of ``BuiltChildRunner``
-    is the ``runner_starter`` (PR-5) which:
-    1. Reads ``.runner`` and wraps it in a ``CoordinatorChildInnerRunner``
-       Protocol adapter (currently AgentTaskRunner.invoke(Task) vs.
-       runner.invoke_until_done(user_message=str) — see PR-4 r2 P0).
-    2. Reads ``.cancel_event`` and threads it into the inner graph config
-       (``config["configurable"]["cancel_event"]``).
-    3. Reads ``.child_permission_context`` and passes it to ChildScopeGate
-       at tool dispatch time.
+    [C2b budget §3-8 — docstring re-anchored to shipped reality]
+    ``.runner`` is the ``AgentTaskRunnerInvokeAdapter`` ALREADY wrapping the
+    raw AgentTaskRunner (build() constructs the adapter below — the
+    PR-4-era "starter wraps it later" wording predated that). The live
+    consumer is ``DefaultCoordinatorChildRunnerStarter.start`` which:
+    1. Passes ``.runner`` (the adapter) as CoordinatorChildRunner's
+       inner_runner (the adapter satisfies CoordinatorChildInnerRunner).
+    2. Calls ``.runner.set_budget_callback(...)`` for the C2b late-injected
+       BudgetEnforcementCallback (adapter → raw runner → flow chain).
+    3. The adapter ctor itself already wired ``cancel_event`` +
+       ``child_permission_context`` into the raw runner at build() time.
     4. Reads ``.terminal_envelope_publisher_disabled`` as a sanity-check
        against the runner's own ``_terminal_envelope_publisher_disabled``.
-
-    Until PR-5 ships, this wrapper is constructed only in the factory's
-    own unit tests; the production dispatch path in
-    parallel_execution_subgraph.dispatch_node uses an opaque
-    ``child_runner_starter.start(...)`` whose internals haven't landed.
 
     ``runner``                              — the constructed AgentTaskRunner
     ``cancel_event``                        — asyncio.Event the parent sets

@@ -1,9 +1,10 @@
 """[PR-9b-A] Lifespan-scoped coordinator runtime deps container.
 
-Aggregates **18 fields** (singletons). ``PlannerReActFlow._build_config()``
+Aggregates **19 fields** (singletons). ``PlannerReActFlow._build_config()``
 copies the **first 16 deps** into ``configurable``. The 17th
-(``coordinator_envelope_store``) and 18th (``parent_sandbox_adapter_factory``)
-are NOT copied as their own cfg keys:
+(``coordinator_envelope_store``), 18th (``parent_sandbox_adapter_factory``)
+and 19th (``coordinator_metrics`` — C2b budget D10, consumed by the starter
+ctor at composition time) are NOT copied as their own cfg keys:
 
 - ``coordinator_envelope_store`` is consumed only by ``SupervisorContext`` at
   ``_factory`` time (NOT by the coordinator graph).
@@ -48,6 +49,12 @@ class _CoordinatorRuntimeDeps:
     cost_rollup_service: object
     coordinator_envelope_store: object
     parent_sandbox_adapter_factory: object  # Callable[[SandboxHandle], ParentSandboxPort]
+    # [C2b budget D10] CoordinatorMetrics instrument bundle. The ONLY
+    # defaulted field (None) so every pre-existing 18-field construction —
+    # tests and composition alike — stays source-compatible. Consumed at the
+    # composition root to thread into the starter ctor; NOT projected as a
+    # cfg key by _build_config (the graph never reads it).
+    coordinator_metrics: object = None
 
 
 @dataclass(frozen=True)
@@ -90,3 +97,5 @@ class _NullCoordinatorRuntimeDeps:
     def coordinator_envelope_store(self) -> None: return None
     @property
     def parent_sandbox_adapter_factory(self) -> None: return None
+    @property
+    def coordinator_metrics(self) -> None: return None

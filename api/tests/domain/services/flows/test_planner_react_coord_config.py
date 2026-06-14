@@ -118,3 +118,56 @@ def test_build_config_threads_per_run_objects():
     flow._coord_deps.parent_sandbox_adapter_factory.assert_called_with(
         flow._sandbox
     )
+
+
+# ── C2b budget §3-5: child-only budget callback seam ─────────────────────────
+
+
+def _build_minimal_child_flow(*, cost_callback_handler=None):
+    """A CHILD-shaped flow: default (Null) _coord_deps — the coordinator cfg
+    keys are skipped; only the budget-callback append path is under test."""
+    from app.domain.services.flows.planner_react import PlannerReActFlow
+
+    return PlannerReActFlow(
+        uow_factory=MagicMock(),
+        llm=MagicMock(),
+        agent_config=AgentConfig(
+            max_iterations=10, max_retries=3, max_search_results=5,
+        ),
+        session_id="test-child-session",
+        browser=MagicMock(),
+        sandbox=MagicMock(),
+        search_engine=MagicMock(),
+        mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
+        a2a_tool=MagicMock(manager=None),
+        skill_tool=MagicMock(),
+        cost_callback_handler=cost_callback_handler,
+    )
+
+
+def test_set_budget_callback_appends_to_config_callbacks():
+    """set_budget_callback(cb) → _build_config appends cb to cfg['callbacks'],
+    AFTER the cost handler (same list, independent handlers — INV-B5 wiring
+    face)."""
+    cost_handler = MagicMock(name="cost_handler")
+    flow = _build_minimal_child_flow(cost_callback_handler=cost_handler)
+
+    sentinel = MagicMock(name="budget_cb")
+    flow.set_budget_callback(sentinel)
+
+    cfg = flow._build_config()
+    callbacks = cfg["callbacks"]
+    assert sentinel in callbacks
+    assert callbacks[-1] is sentinel  # appended last (after cost + obs)
+    assert callbacks[0] is cost_handler  # cost handler ordering preserved
+
+
+def test_no_budget_callback_leaves_config_callbacks_unchanged():
+    """None path (root/parent flows, legacy tests): the callbacks list is
+    identical to pre-C2b behavior."""
+    cost_handler = MagicMock(name="cost_handler")
+    flow = _build_minimal_child_flow(cost_callback_handler=cost_handler)
+
+    assert flow._budget_callback is None
+    cfg = flow._build_config()
+    assert cost_handler in cfg["callbacks"]

@@ -28,6 +28,7 @@ FIELD_NAMES = (
     "cost_rollup_service",
     "coordinator_envelope_store",
     "parent_sandbox_adapter_factory",
+    "coordinator_metrics",  # [C2b budget D10] defaulted field — see test below
 )
 
 
@@ -59,3 +60,11 @@ def test_real_deps_is_frozen() -> None:
     deps = _CoordinatorRuntimeDeps(**sentinels)
     with pytest.raises(Exception):
         deps.session_service = object()  # type: ignore[misc]
+
+
+def test_coordinator_metrics_field_defaults_to_none() -> None:
+    """[C2b budget D10] coordinator_metrics is the only DEFAULTED field —
+    every pre-existing 18-field construction stays valid."""
+    sentinels = {f: object() for f in FIELD_NAMES if f != "coordinator_metrics"}
+    deps = _CoordinatorRuntimeDeps(**sentinels)
+    assert deps.coordinator_metrics is None

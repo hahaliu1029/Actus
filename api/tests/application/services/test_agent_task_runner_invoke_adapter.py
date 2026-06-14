@@ -1,4 +1,6 @@
 import asyncio
+from typing import Any
+
 import pytest
 from app.application.services.agent_task_runner_invoke_adapter import (
     AgentTaskRunnerInvokeAdapter,
@@ -371,3 +373,118 @@ async def test_adapter_no_cpc_setter_is_noop():
         runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
         child_permission_context=object(),
     )
+
+
+# ── C2b budget §3-3/§3-4: set_budget_callback setter chain ──────────────────
+
+
+def test_agent_task_runner_set_budget_callback_forwards_to_flow():
+    """[§3-4] AgentTaskRunner.set_budget_callback → flow.set_budget_callback
+    (mirror of set_coordinator_cancel_event at agent_task_runner.py:3557).
+    __new__-bypass construction: the setter must depend on nothing but
+    self._flow (same pattern as the cancel-event priming tests)."""
+    from unittest.mock import MagicMock
+
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = AgentTaskRunner.__new__(AgentTaskRunner)
+    runner._flow = MagicMock()
+    sentinel = object()
+
+    runner.set_budget_callback(sentinel)
+
+    runner._flow.set_budget_callback.assert_called_once_with(sentinel)
+
+
+def test_adapter_set_budget_callback_forwards_to_runner():
+    """[§3-3] Adapter forwards to the wrapped raw runner; getattr-defensive
+    (legacy stubs without the setter are a silent no-op, mirroring the ctor's
+    set_coordinator_cancel_event pattern)."""
+    from unittest.mock import MagicMock
+
+    runner = MagicMock()
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+    )
+    sentinel = object()
+    adapter.set_budget_callback(sentinel)
+    runner.set_budget_callback.assert_called_once_with(sentinel)
+
+    # getattr-defensive: a stub WITHOUT the setter must not raise.
+    bare = _ScriptedRunner([])  # has set_coordinator_cancel_event only
+    adapter2 = AgentTaskRunnerInvokeAdapter(
+        runner=bare, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+    )
+    adapter2.set_budget_callback(sentinel)  # no raise
+
+
+def test_set_budget_callback_chain_reaches_flow_config():
+    """[§3-3→§3-4→§3-5 接线真实性，杀'伪接线'变异] REAL chain: adapter →
+    real AgentTaskRunner (__new__-bypass) → real PlannerReActFlow →
+    _build_config() contains the callback."""
+    from unittest.mock import MagicMock
+
+    from app.domain.models.app_config import AgentConfig
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+    from app.domain.services.flows.planner_react import PlannerReActFlow
+
+    flow = PlannerReActFlow(
+        uow_factory=MagicMock(),
+        llm=MagicMock(),
+        agent_config=AgentConfig(
+            max_iterations=10, max_retries=3, max_search_results=5,
+        ),
+        session_id="chain-test",
+        browser=MagicMock(),
+        sandbox=MagicMock(),
+        search_engine=MagicMock(),
+        mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
+        a2a_tool=MagicMock(manager=None),
+        skill_tool=MagicMock(),
+    )
+    runner = AgentTaskRunner.__new__(AgentTaskRunner)
+    runner._flow = flow
+
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+    )
+    cb = MagicMock(name="budget_cb")
+    adapter.set_budget_callback(cb)
+
+    cfg = flow._build_config()
+    assert cb in cfg["callbacks"], (
+        "starter→adapter→runner→flow chain must land the budget callback in "
+        "the graph config callbacks list"
+    )
+
+
+async def test_finish_line_trip_beats_done_event():
+    """[spec §5-11 / INV-B1 终线确定性] DoneEvent ALREADY on the output stream
+    + cancel_event ALREADY set when _drain enters → loop-top cancel check
+    wins: CancelledByEventError raised, inner task cancelled with
+    'coordinator_cancel', the DoneEvent is NOT returned as success.
+
+    Relationship to test_adapter_raises_cancelled_when_event_set above: same
+    precedence semantics, but this test additionally pins the inner-task
+    cancel side effect — killing a 'raise without cancelling the inner task'
+    mutation."""
+    captured = []
+
+    class _CapturingTask(_FakeTask):
+        @classmethod
+        def create(cls, *, task_runner):
+            inst = super().create(task_runner=task_runner)
+            captured.append(inst)
+            return inst
+
+    cancel = asyncio.Event()
+    cancel.set()  # budget tripped on the final LLM call, before drain
+    runner = _ScriptedRunner([DoneEvent()])
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=cancel, task_cls=_CapturingTask,
+    )
+    with pytest.raises(CancelledByEventError):
+        await adapter.invoke_until_done(user_message="x")
+
+    assert captured, "task must have been created"
+    assert captured[-1].cancelled_with == "coordinator_cancel"

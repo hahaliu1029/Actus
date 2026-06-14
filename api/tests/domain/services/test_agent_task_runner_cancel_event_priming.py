@@ -126,8 +126,11 @@ def test_primed_event_flows_through_build_config_into_cfg() -> None:
     projects the SAME Event instance into ``cfg['configurable']['cancel_event']``.
 
     This pins the threading: ``AgentTaskRunner`` writer -> planner attribute ->
-    cfg key -> dispatch_node -> runner_starter.start(cancel_event=...) /
-    orchestrator.run(cancel_event=...) / PatchApplier.apply(cancel_event=...).
+    cfg key -> dispatch_node -> orchestrator.run(cancel_event=...) /
+    worker_node waiter / PatchApplier.apply(cancel_event=...). NOTE (C2b
+    budget D9): child runners do NOT share this event — dispatch creates a
+    fresh per-child event for each runner_starter.start; parent cancel
+    reaches children via the orchestrator's CANCEL_REQUEST envelope fan-out.
     """
     from app.application.services.coordinator_runtime_deps import (
         _CoordinatorRuntimeDeps,
@@ -187,9 +190,10 @@ def test_primed_event_flows_through_build_config_into_cfg() -> None:
     assert isinstance(projected, asyncio.Event)
     assert projected is flow._cancel_event, (
         "cfg['cancel_event'] must be the SAME Event instance the runner "
-        "primed onto flow._cancel_event — downstream consumers "
-        "(runner_starter / orchestrator / PatchApplier) all observe this "
-        "object identity for cancellation to fan out correctly"
+        "primed onto flow._cancel_event — the PARENT-RUN consumers "
+        "(orchestrator cancel-watch / worker_node waiter / PatchApplier) "
+        "observe this object identity; children get their own per-child "
+        "events from dispatch (C2b budget D9)"
     )
 
 

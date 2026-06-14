@@ -31,6 +31,10 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol
+from uuid import UUID
+
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.outputs import LLMResult
 
 if TYPE_CHECKING:
     from app.application.services.coordinator_child_runner import (
@@ -93,8 +97,19 @@ class PricingFn(Protocol):
         ...
 
 
-class BudgetEnforcementCallback:
+class BudgetEnforcementCallback(AsyncCallbackHandler):
     """Accumulates USD across LLM calls; trips ``request_stop`` at cap.
+
+    [C2b budget D8] MUST subclass ``AsyncCallbackHandler``: the LangChain
+    dispatch path is bare-class-hostile at THREE points — ``ahandle_event``
+    reads ``handler.run_inline`` outside any try (AttributeError raises),
+    the per-handler dispatch probes ``handler.ignore_llm``, and the call
+    passes ``run_id=``/``parent_run_id=``/``tags=`` kwargs (the latter two
+    swallowed by the manager's ``except Exception``). Whichever point fires,
+    a bare class never bills on the real dispatch path. ``raise_error``
+    stays at the inherited ``False`` default — handler exceptions must not
+    kill the LLM run (INV-B3; double-insured by the pricing try/except
+    below).
 
     Idempotent: after the first trip, subsequent ``on_llm_end`` calls are
     no-ops. The runner's own ``request_stop`` is also idempotent (first-wins
@@ -109,14 +124,37 @@ class BudgetEnforcementCallback:
         max_token_cost_usd: float,
         pricing: PricingFn,
     ) -> None:
+        super().__init__()
         self._runner = runner
         self._cap: float = float(max_token_cost_usd)
         self._pricing = pricing
         self._cumulative_usd: float = 0.0
         self._tripped: bool = False
 
-    async def on_llm_end(self, response: Any) -> None:
+    @property
+    def cumulative_usd(self) -> float:
+        """[C2b budget D5] Read-only running USD total — consumed by
+        ``CoordinatorChildRunner._build_budget_evidence`` so the parent's
+        NEEDS_AUTHORIZATION envelope can carry the observed spend."""
+        return self._cumulative_usd
+
+    async def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID | None = None,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """LangChain ``on_llm_end`` hook — accumulate cost; trip at cap.
+
+        [C2b budget D8] ``run_id`` is DELIBERATELY ``UUID | None = None`` —
+        an LSP-legal precondition weakening vs the base class's required
+        ``run_id``: this callback keys no state by run_id (no ``_pending``
+        map like CostCallbackHandler's), the production manager always
+        passes one, and the existing 12 unit tests call
+        ``await cb.on_llm_end(response)`` single-arg.
 
         Behavior:
         - Already tripped → return immediately.

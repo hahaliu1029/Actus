@@ -351,7 +351,9 @@ async def test_finalize_budget_exhausted_token(monkeypatch) -> None:
     payload = envf.make_result_ready.call_args.kwargs["payload"]
     assert payload.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION
     assert payload.needs_authorization_details.reason == "budget_exhausted"
-    assert "token_budget" in (payload.needs_authorization_details.observed_evidence or "")
+    assert payload.needs_authorization_details.observed_evidence == (
+        "stop_reason=token_budget"
+    )  # budget=None harness → exact legacy format (spec §5-1, R6-A1)
 
 
 async def test_finalize_budget_exhausted_wallclock(monkeypatch) -> None:
@@ -362,7 +364,103 @@ async def test_finalize_budget_exhausted_wallclock(monkeypatch) -> None:
     )
     payload = envf.make_result_ready.call_args.kwargs["payload"]
     assert payload.needs_authorization_details.reason == "budget_exhausted"
-    assert "wallclock_budget" in (payload.needs_authorization_details.observed_evidence or "")
+    assert payload.needs_authorization_details.observed_evidence == (
+        "stop_reason=wallclock_budget"
+    )  # (spec §5-2, R6-A2)
+
+
+async def _drive_finish_line_trip(
+    *, reason: StopReason, phase: str = "write", monkeypatch,
+) -> tuple[CoordinatorChildRunner, AsyncMock, MagicMock, AsyncMock]:
+    """[impl-audit R3#2] Drive a finish-line trip that lands INSIDE
+    invoke_until_done (NOT pre-invoke). The inner runner records the stop reason
+    mid-invoke and then returns a done_event WITHOUT raising — exactly the
+    adapter-returns-done window the exit guard at coordinator_child_runner.py:393
+    closes. The plain _drive(pre_stop_reason=...) sets the reason BEFORE
+    run_work_unit, which short-circuits at the PRE-invoke guard (:281-296) and
+    never reaches :393 — so a finish-line test built on it is vacuous (passes
+    even with the :393 guard deleted). This helper forces the run through the
+    inner invoke so deleting :393 actually breaks the test."""
+    inner_runner = MagicMock()
+
+    listener = MagicMock()
+    listener.ready_event = asyncio.Event()
+    listener.start = AsyncMock(side_effect=lambda: listener.ready_event.set())
+    listener.shutdown = AsyncMock()
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "CoordinatorChildCancelListener",
+        lambda **_kw: listener,
+    )
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "PromptAssembler.build_minimal_for_coordinator_child",
+        staticmethod(lambda **_kw: "prompt"),
+    )
+
+    runner, ce, publisher, envf = _mk_runner(inner_runner=inner_runner)
+
+    async def _invoke_then_trip(**_kw):
+        # stop_reason is None at the pre-invoke guard (we did NOT pre-set it),
+        # so the run reaches the inner invoke; record the trip now so the EXIT
+        # guard (:393) — not the pre-invoke guard (:283) — is what routes.
+        runner.request_stop(reason)
+        return MagicMock(name="done_event")
+
+    inner_runner.invoke_until_done = AsyncMock(side_effect=_invoke_then_trip)
+
+    await runner.run_work_unit(
+        coordinator_run_id="r1", work_unit=_mk_work_unit(phase),
+        child_session_id="c1", spawn_manifest=MagicMock(), cancel_event=ce,
+        root_session_id="root1",
+    )
+    return runner, publisher, envf, inner_runner
+
+
+async def test_finish_line_trip_with_done_returned_routes_budget(monkeypatch) -> None:
+    """[INV-B1 — impl-audit R2#1, pinned R3#2] The trip lands while the adapter
+    is already blocked inside output_stream.get() awaiting the final DoneEvent:
+    request_stop() runs mid-invoke, then DoneEvent enqueues, and get() returns
+    it — the adapter's loop-top cancel check already passed, so invoke_until_done
+    returns done WITHOUT raising. The runner's exit-point guard (:393) must still
+    route to the budget finalizer; natural success must never win over a recorded
+    trip. Trips MID-INVOKE so deleting :393 → _finalize_success → SUCCESS makes
+    this fail."""
+    _, publisher, envf, inner = await _drive_finish_line_trip(
+        reason=StopReason.TOKEN_BUDGET, monkeypatch=monkeypatch,
+    )
+    inner.invoke_until_done.assert_awaited_once()  # proves :283 passed → :393 ran
+    publisher.publish.assert_awaited_once()
+    envf.make_result_ready.assert_called_once()
+    payload = envf.make_result_ready.call_args.kwargs["payload"]
+    assert payload.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION
+    assert payload.needs_authorization_details.reason == "budget_exhausted"
+    assert payload.needs_authorization_details.observed_evidence == (
+        "stop_reason=token_budget"
+    )  # budget=None harness → exact legacy format
+
+
+async def test_finish_line_parent_cancel_with_done_returned_routes_cancelled(
+    monkeypatch,
+) -> None:
+    """[INV-B1 generalization — impl-audit R2#1, pinned R3#2] Same mid-invoke
+    finish-line interleaving with PARENT_CANCEL: the exit guard routes through
+    _finalize_by_stop_reason → cancel-ack, not success (guard must not hardcode
+    budget reasons). Deleting :393 → _finalize_success → SUCCESS, so
+    make_result_ready.assert_not_called() would fail.
+
+    Scope note (impl-audit R3#1): this pins a trip RECORDED BY the runner's
+    synchronous exit point. A PARENT_CANCEL arriving LATER, during
+    _finalize_success's own awaits, is the spec §6-L9 RESULT_READY-vs-
+    CANCEL_REQUEST benign interleaving (supervisor observes terminal
+    RESULT_READY; redundant force-terminate is benign) — out of scope here."""
+    _, publisher, envf, inner = await _drive_finish_line_trip(
+        reason=StopReason.PARENT_CANCEL, monkeypatch=monkeypatch,
+    )
+    inner.invoke_until_done.assert_awaited_once()
+    publisher.publish.assert_awaited_once()
+    envf.make_cancel_ack.assert_called_once()
+    envf.make_result_ready.assert_not_called()
 
 
 async def test_finalize_none_stop_reason_defensive_fallback(monkeypatch, caplog) -> None:
@@ -474,7 +572,9 @@ async def test_inflight_token_budget_via_react_checkpoint(monkeypatch) -> None:
     payload = envf.make_result_ready.call_args.kwargs["payload"]
     assert payload.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION
     assert payload.needs_authorization_details.reason == "budget_exhausted"
-    assert "token_budget" in (payload.needs_authorization_details.observed_evidence or "")
+    assert payload.needs_authorization_details.observed_evidence == (
+        "stop_reason=token_budget"
+    )
 
 
 async def test_inflight_wallclock_budget_via_react_checkpoint(monkeypatch) -> None:
@@ -485,7 +585,9 @@ async def test_inflight_wallclock_budget_via_react_checkpoint(monkeypatch) -> No
     )
     payload = envf.make_result_ready.call_args.kwargs["payload"]
     assert payload.needs_authorization_details.reason == "budget_exhausted"
-    assert "wallclock_budget" in (payload.needs_authorization_details.observed_evidence or "")
+    assert payload.needs_authorization_details.observed_evidence == (
+        "stop_reason=wallclock_budget"
+    )
 
 
 async def test_envelope_factory_called_with_correlation_id(monkeypatch) -> None:
@@ -496,3 +598,331 @@ async def test_envelope_factory_called_with_correlation_id(monkeypatch) -> None:
     assert call_kwargs["correlation_id"] == "r1"
     assert call_kwargs["parent_session_id"] == "p1"
     assert call_kwargs["child_session_id"] == "c1"
+
+
+# ---------------------------------------------------------------------------
+# [C2b budget] INV-B6 — budget=None legacy parity (spec §5-7, four clauses)
+# ---------------------------------------------------------------------------
+
+
+async def test_budget_none_legacy_parity(monkeypatch) -> None:
+    """INV-B6 four-clause contract when budget=None (every existing harness
+    construction in this file):
+      (i)  watchdog is NEVER started;
+      (ii) budget callback is neither required nor read;
+      (iii) finalizer outcome routing is unchanged (pinned by the whole
+           pre-existing matrix in this file — this test re-asserts one path);
+      (iv) _build_budget_evidence() keeps the old exact format.
+    """
+    wd_spy = MagicMock()
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "start_wallclock_watchdog",
+        wd_spy,
+    )
+    # (i)+(iii): natural success path, budget=None → no watchdog, SUCCESS.
+    _, publisher, envf = await _drive(phase="write", monkeypatch=monkeypatch)
+    wd_spy.assert_not_called()
+    assert (
+        envf.make_result_ready.call_args.kwargs["payload"].outcome
+        == ResultReadyOutcome.SUCCESS
+    )
+
+    # (ii)+(iv): budget trip with budget=None → old exact evidence format,
+    # no callback read (none attached — would AttributeError if read).
+    runner2, _, envf2 = await _drive(
+        inner_runner_side_effect=CancelledByEventError("react_loop_entry"),
+        pre_stop_reason=StopReason.TOKEN_BUDGET,
+        monkeypatch=monkeypatch,
+    )
+    assert runner2._build_budget_evidence() == "stop_reason=token_budget"
+    payload = envf2.make_result_ready.call_args.kwargs["payload"]
+    assert payload.needs_authorization_details.observed_evidence == (
+        "stop_reason=token_budget"
+    )
+
+
+# ---------------------------------------------------------------------------
+# [C2b budget D5] Evidence three-state contract (spec §5-6, R7#1 + R6#7)
+# ---------------------------------------------------------------------------
+
+
+class _FakeBudgetCallback:
+    """Stands in for BudgetEnforcementCallback: only the cumulative_usd
+    read-only property matters to the evidence builder."""
+
+    def __init__(self, cumulative: float) -> None:
+        self._c = cumulative
+
+    @property
+    def cumulative_usd(self) -> float:
+        return self._c
+
+
+def _mk_budget_for_evidence():
+    from app.domain.services.permission.child_permission_context import (
+        ChildBudget,
+    )
+
+    # Distinct cap vs observed values so a swapped-field mutation fails
+    # loudly (R6#7: 拒绝 observed/cap 互换).
+    return ChildBudget(
+        max_tool_calls=25, max_token_cost_usd=0.5, max_wallclock_seconds=300,
+    )
+
+
+async def test_budget_evidence_enriched_full_state(monkeypatch) -> None:
+    """State (i): budget + callback attached → full fields, values from the
+    RIGHT sources (observed == callback.cumulative_usd, cap == budget cap)."""
+    inner = MagicMock()
+
+    async def trip_then_raise(user_message: str):
+        runner_ref.request_stop(StopReason.TOKEN_BUDGET)
+        raise CancelledByEventError("react_loop_entry")
+
+    inner.invoke_until_done = AsyncMock(side_effect=trip_then_raise)
+
+    listener = MagicMock()
+    listener.ready_event = asyncio.Event()
+    listener.start = AsyncMock(side_effect=lambda: listener.ready_event.set())
+    listener.shutdown = AsyncMock()
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "CoordinatorChildCancelListener",
+        lambda **_kw: listener,
+    )
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "PromptAssembler.build_minimal_for_coordinator_child",
+        staticmethod(lambda **_kw: "prompt"),
+    )
+
+    cancel_event = asyncio.Event()
+    publisher = AsyncMock()
+    publisher.publish = AsyncMock()
+    envf = MagicMock()
+    envf.make_result_ready = MagicMock(
+        return_value=MagicMock(type=MailboxEnvelopeType.RESULT_READY),
+    )
+    envf.make_cancel_ack = MagicMock(
+        return_value=MagicMock(type=MailboxEnvelopeType.CANCEL_ACK),
+    )
+    runner_ref = CoordinatorChildRunner(
+        cancel_event=cancel_event,
+        inner_runner=inner,
+        publisher=publisher,
+        envelope_factory=envf,
+        parent_session_id="p1",
+        coordinator_run_id="r1",
+        mailbox_subscriber=MagicMock(),
+        budget=_mk_budget_for_evidence(),
+    )
+    runner_ref.attach_budget_callback(_FakeBudgetCallback(0.123456))
+
+    await runner_ref.run_work_unit(
+        coordinator_run_id="r1", work_unit=_mk_work_unit("write"),
+        child_session_id="c1", spawn_manifest=MagicMock(),
+        cancel_event=cancel_event, root_session_id="root1",
+    )
+
+    evidence = (
+        envf.make_result_ready.call_args.kwargs["payload"]
+        .needs_authorization_details.observed_evidence
+    )
+    assert "stop_reason=token_budget" in evidence
+    assert "token_cost_usd_observed=0.123456" in evidence
+    assert "token_cap_usd=0.500000" in evidence
+    assert "wallclock_cap_seconds=300" in evidence
+    # elapsed: inner invoke ran → stamp present and sane.
+    assert "wallclock_elapsed_seconds=" in evidence
+    elapsed = float(evidence.split("wallclock_elapsed_seconds=")[1].split()[0])
+    assert 0.0 <= elapsed < 60.0
+
+
+async def test_budget_evidence_wallclock_only_state(monkeypatch) -> None:
+    """State (ii): budget set, callback None (unpriced fail-soft) → caps AND
+    elapsed still emitted; token_cost_usd_observed OMITTED (R7#1).
+
+    [codex plan-R2#1] elapsed asserted EXPLICITLY with a live start stamp —
+    kills the mutant that emits wallclock_elapsed_seconds only inside the
+    `if self._budget_callback is not None:` branch. Driven at the evidence-
+    builder unit level (the inflight wallclock path with a real stamp is
+    covered end-to-end by test_child_wallclock_cap_via_async_watchdog in
+    the watchdog-wiring file)."""
+    import time as _time
+
+    runner, publisher, envf = await _drive(
+        inner_runner_side_effect=CancelledByEventError("react_loop_entry"),
+        pre_stop_reason=StopReason.WALLCLOCK_BUDGET,
+        monkeypatch=monkeypatch,
+    )
+    # _drive's harness has no budget kwarg — drive the evidence builder
+    # directly on a budget-bearing, callback-less runner with an explicit
+    # inner-invoke start stamp (the wallclock-only shape):
+    runner._budget = _mk_budget_for_evidence()
+    runner._budget_callback = None
+    runner._inner_invoke_started_monotonic = _time.monotonic() - 1.0
+    evidence = runner._build_budget_evidence()
+    assert "stop_reason=wallclock_budget" in evidence
+    assert "token_cost_usd_observed" not in evidence
+    assert "token_cap_usd=0.500000" in evidence
+    assert "wallclock_cap_seconds=300" in evidence
+    assert "wallclock_elapsed_seconds=" in evidence, (
+        "state (ii) must STILL emit elapsed — only observed is omitted"
+    )
+    elapsed = float(evidence.split("wallclock_elapsed_seconds=")[1].split()[0])
+    assert 0.9 <= elapsed < 60.0
+
+
+async def test_budget_evidence_success_path_absent(monkeypatch) -> None:
+    """Success path produces NO needs_authorization_details (existing :252
+    assertion re-pinned here for the D5 slice)."""
+    _, publisher, envf = await _drive(phase="write", monkeypatch=monkeypatch)
+    payload = envf.make_result_ready.call_args.kwargs["payload"]
+    assert payload.needs_authorization_details is None
+
+
+# ---------------------------------------------------------------------------
+# [C2b budget D10/INV-B9] budget_exhaustion metric — best-effort, finalizer-only
+# ---------------------------------------------------------------------------
+
+
+def _mk_metrics() -> MagicMock:
+    metrics = MagicMock(name="coordinator_metrics")
+    metrics.budget_exhaustion = MagicMock()
+    metrics.budget_exhaustion.add = MagicMock()
+    return metrics
+
+
+async def _drive_with_metrics(
+    *, monkeypatch, metrics, side_effect, pre_stop_reason=None,
+):
+    """_drive variant whose runner carries coordinator_metrics."""
+    inner_runner = MagicMock()
+    inner_runner.invoke_until_done = AsyncMock(side_effect=side_effect)
+
+    listener = MagicMock()
+    listener.ready_event = asyncio.Event()
+    listener.start = AsyncMock(side_effect=lambda: listener.ready_event.set())
+    listener.shutdown = AsyncMock()
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "CoordinatorChildCancelListener",
+        lambda **_kw: listener,
+    )
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "PromptAssembler.build_minimal_for_coordinator_child",
+        staticmethod(lambda **_kw: "prompt"),
+    )
+    cancel_event = asyncio.Event()
+    publisher = AsyncMock()
+    publisher.publish = AsyncMock()
+    envf = MagicMock()
+    envf.make_result_ready = MagicMock(
+        return_value=MagicMock(type=MailboxEnvelopeType.RESULT_READY),
+    )
+    envf.make_cancel_ack = MagicMock(
+        return_value=MagicMock(type=MailboxEnvelopeType.CANCEL_ACK),
+    )
+    runner = CoordinatorChildRunner(
+        cancel_event=cancel_event,
+        inner_runner=inner_runner,
+        publisher=publisher,
+        envelope_factory=envf,
+        parent_session_id="p1",
+        coordinator_run_id="r1",
+        mailbox_subscriber=MagicMock(),
+        coordinator_metrics=metrics,
+    )
+    if pre_stop_reason is not None:
+        runner.request_stop(pre_stop_reason)
+    await runner.run_work_unit(
+        coordinator_run_id="r1", work_unit=_mk_work_unit("write"),
+        child_session_id="c1", spawn_manifest=MagicMock(),
+        cancel_event=cancel_event, root_session_id="root1",
+    )
+    return runner, publisher, envf
+
+
+async def test_budget_trip_emits_exhaustion_metric(monkeypatch) -> None:
+    """[spec §5-15] Budget finalizer → budget_exhaustion.add(1, attrs) with
+    the three pinned attributes."""
+    metrics = _mk_metrics()
+    _, publisher, _ = await _drive_with_metrics(
+        monkeypatch=monkeypatch, metrics=metrics,
+        side_effect=CancelledByEventError("react_loop_entry"),
+        pre_stop_reason=StopReason.TOKEN_BUDGET,
+    )
+    publisher.publish.assert_awaited_once()
+    metrics.budget_exhaustion.add.assert_called_once_with(
+        1,
+        attributes={
+            "stop_reason": "token_budget",
+            "coordinator_run_id": "r1",
+            "work_unit_id": "wu1",
+        },
+    )
+
+
+async def test_metric_failure_does_not_block_envelope(monkeypatch) -> None:
+    """[INV-B9] Telemetry raising must neither block nor mask the terminal
+    envelope publish."""
+    metrics = _mk_metrics()
+    metrics.budget_exhaustion.add = MagicMock(side_effect=RuntimeError("otel down"))
+    _, publisher, envf = await _drive_with_metrics(
+        monkeypatch=monkeypatch, metrics=metrics,
+        side_effect=CancelledByEventError("react_loop_entry"),
+        pre_stop_reason=StopReason.WALLCLOCK_BUDGET,
+    )
+    publisher.publish.assert_awaited_once()
+    payload = envf.make_result_ready.call_args.kwargs["payload"]
+    assert payload.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION
+
+
+@pytest.mark.parametrize("path", ["success", "cancelled", "failed"])
+async def test_non_budget_finalizers_do_not_emit(monkeypatch, path) -> None:
+    """[spec §5-15 + R10#1 反向边界] success / cancelled / FAILED finalizers
+    never touch the exhaustion counter."""
+    metrics = _mk_metrics()
+    side_effects = {
+        "success": None,
+        "cancelled": CancelledByEventError("react_loop_entry"),
+        "failed": RuntimeError("kaboom"),
+    }
+    pre = StopReason.PARENT_CANCEL if path == "cancelled" else None
+    effect = side_effects[path]
+    await _drive_with_metrics(
+        monkeypatch=monkeypatch, metrics=metrics,
+        side_effect=effect if effect is not None else None,
+        pre_stop_reason=pre,
+    )
+    metrics.budget_exhaustion.add.assert_not_called()
+
+
+async def test_publish_failure_propagates_despite_metrics(monkeypatch) -> None:
+    """[R10#1] _publish_result_ready raising must PROPAGATE — kills the
+    'wrap publish inside the telemetry try/except' mutation. Driven at the
+    finalizer level directly (unit)."""
+    metrics = _mk_metrics()
+    publisher = AsyncMock()
+    publisher.publish = AsyncMock(side_effect=RuntimeError("redis down"))
+    envf = MagicMock()
+    envf.make_result_ready = MagicMock(
+        return_value=MagicMock(type=MailboxEnvelopeType.RESULT_READY),
+    )
+    runner = CoordinatorChildRunner(
+        cancel_event=asyncio.Event(),
+        publisher=publisher,
+        envelope_factory=envf,
+        parent_session_id="p1",
+        coordinator_run_id="r1",
+        mailbox_subscriber=MagicMock(),
+        coordinator_metrics=metrics,
+    )
+    runner.request_stop(StopReason.TOKEN_BUDGET)
+    with pytest.raises(RuntimeError, match="redis down"):
+        await runner._finalize_needs_authorization_budget(
+            "r1", _mk_work_unit("write"), "c1",
+        )
+    metrics.budget_exhaustion.add.assert_called_once()  # emit happened first

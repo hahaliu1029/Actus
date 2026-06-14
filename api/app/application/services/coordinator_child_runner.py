@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, Mapping, Optional, TYPE_CHECKING
@@ -58,6 +59,9 @@ from typing import Protocol, runtime_checkable
 from app.application.services.coordinator_child_cancel_listener import (
     CoordinatorChildCancelListener,
 )
+from app.application.services.coordinator_child_wallclock_watchdog import (
+    start_wallclock_watchdog,
+)
 from app.domain.services.graphs.react_graph import CancelledByEventError
 from app.domain.services.permission.child_scope_violation import (
     ChildScopeViolation,
@@ -66,6 +70,9 @@ from app.domain.services.prompts.assembler import PromptAssembler
 
 if TYPE_CHECKING:
     from app.domain.models.work_unit import WorkUnit
+    from app.domain.services.permission.child_permission_context import (
+        ChildBudget,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -170,6 +177,14 @@ class CoordinatorChildRunner:
         parent_session_id: str = "",
         coordinator_run_id: str = "",
         mailbox_subscriber: Any = None,
+        # [C2b budget D2] Per-child caps. None tolerated (legacy/unit
+        # constructions): no watchdog, no evidence enrichment — INV-B6.
+        # Deliberately ChildBudget (not the whole CoordinatorLimits): the
+        # runner must not hold global config.
+        budget: "ChildBudget | None" = None,
+        # [C2b budget D10] Optional CoordinatorMetrics for the budget
+        # finalizer's best-effort exhaustion counter (INV-B9).
+        coordinator_metrics: Any = None,
     ) -> None:
         self._cancel_event = cancel_event
         self._stop_reason: Optional[StopReason] = None
@@ -189,6 +204,23 @@ class CoordinatorChildRunner:
         self._parent_session_id = parent_session_id
         self._coordinator_run_id = coordinator_run_id
         self._mailbox_subscriber = mailbox_subscriber
+        self._budget = budget
+        self._coordinator_metrics = coordinator_metrics
+        # [C2b budget D1/D5] Reference to the child's BudgetEnforcementCallback
+        # (attach_budget_callback) so _build_budget_evidence can read
+        # cumulative_usd. The LLM-side wiring goes through the
+        # adapter→runner→flow setter chain, NOT through this reference.
+        self._budget_callback: Any = None
+        # [C2b budget D5] Monotonic stamp of inner-invoke start, for the
+        # optional wallclock_elapsed_seconds evidence field.
+        self._inner_invoke_started_monotonic: float | None = None
+
+    def attach_budget_callback(self, cb: Any) -> None:
+        """[C2b budget D1] Keep a reference to the child's
+        BudgetEnforcementCallback for D5 evidence (cumulative_usd read in
+        _build_budget_evidence). Separate from the setter chain that wires
+        the callback into the child LLM callbacks list."""
+        self._budget_callback = cb
 
     def request_stop(self, reason: StopReason) -> None:
         """Sole entry — sets cancel_event + records first-wins stop reason.
@@ -288,35 +320,47 @@ class CoordinatorChildRunner:
             # [F2 P1] inner invoke try — nested in the same outer try whose
             # finally reaps the listener on every exit (success/failure/cancel).
             try:
-                # TODO(PR-9 wiring): wrap ``inner_runner.invoke_until_done`` in
-                # ``start_wallclock_watchdog(runner=self,
-                # max_wallclock_seconds=coordinator_limits.
-                # max_wallclock_seconds_per_child)`` so spec §14.3 #5 (wall
-                # clock budget for the child) actually trips. The
-                # ``CoordinatorChildWallclockWatchdog`` is shipped in PR-6
-                # but its task is not started anywhere yet — wiring lands
-                # in a follow-up integration task (likely PR-9) once the
-                # ``runner_starter`` adapter (PR-5) is extended to accept a
-                # ``max_wallclock_seconds`` argument that this runner can
-                # thread through. Until then, ``StopReason.WALLCLOCK_BUDGET``
-                # only ever fires via the supervisor's 600s backstop, and
-                # the §14.3 #5 internal cap is dead code.
-                #
-                # Similarly, ``BudgetEnforcementCallback`` (the token-cost
-                # gate from §14.3 #1, also shipped in PR-6) needs to be
-                # bound to the inner_runner's LLM callbacks list at
-                # construction time. The runner_starter adapter is the
-                # natural place to thread it. Until that lands, token-cost
-                # checks happen only post-hoc via cost_summary aggregation,
-                # not as an in-flight LLM-call guard.
-                #
+                # [C2b budget D2/A1] Wallclock watchdog wraps ONLY the inner
+                # invoke. The inner ``finally: wd.cancel()`` runs BEFORE the
+                # except arms below (Python semantics) — so by the time ANY
+                # finalizer executes, the watchdog can no longer trip and
+                # dirty ``_stop_reason`` mid-publish (INV-B2). Seed-install
+                # and finalizer windows are deliberately uncovered (spec
+                # §6-L9 / F8).
+                wd: asyncio.Task | None = None
+                if self._budget is not None:
+                    _max_wc = self._budget.max_wallclock_seconds
+                    if _max_wc > 0:
+                        wd = start_wallclock_watchdog(
+                            runner=self, max_wallclock_seconds=_max_wc,
+                        )
+                    else:
+                        # [spec L8] Non-positive cap: production-unreachable
+                        # (env loader rejects), but direct construction can
+                        # hit it — honest DISABLED + WARNING beats a
+                        # trips-on-first-call cap=0 watchdog.
+                        logger.warning(
+                            "CoordinatorChildRunner: max_wallclock_seconds=%s "
+                            "non-positive — wallclock watchdog DISABLED for "
+                            "this child",
+                            _max_wc,
+                        )
+                # [C2b budget D5] Stamp inner-invoke start for the optional
+                # wallclock_elapsed_seconds evidence field.
+                self._inner_invoke_started_monotonic = time.monotonic()
                 # TODO(F2.3): result is a ChildRunResult; .tool_calls/.done_event
                 # unpacking lands in F2.3 patch-extraction. Bound whole here
                 # intentionally for now (passed through _finalize_success →
                 # _extract_patch_files_from_history, which currently ignore it).
-                done_event = await self._inner_runner.invoke_until_done(
-                    user_message=self._build_child_prompt(work_unit, spawn_manifest),
-                )
+                try:
+                    done_event = await self._inner_runner.invoke_until_done(
+                        user_message=self._build_child_prompt(work_unit, spawn_manifest),
+                    )
+                finally:
+                    # [INV-B2] Cancel synchronously, exception-free, BEFORE the
+                    # outer except arms (and therefore before every finalizer).
+                    if wd is not None:
+                        wd.cancel()
             except CancelledByEventError:
                 return await self._finalize_by_stop_reason(
                     coordinator_run_id, work_unit, child_session_id,
@@ -332,6 +376,38 @@ class CoordinatorChildRunner:
             except Exception as exc:
                 return await self._finalize_failed(
                     coordinator_run_id, work_unit, child_session_id, exc,
+                )
+
+            # [INV-B1 终线确定性 — impl-audit R2#1] A trip (budget/watchdog/
+            # parent cancel) can land while the adapter is ALREADY blocked
+            # inside output_stream.get() awaiting the final DoneEvent: the
+            # trip's request_stop() sets cancel_event + _stop_reason, then the
+            # DoneEvent enqueues, and get() returns it — the adapter's
+            # loop-top cancel check has already passed for that iteration, so
+            # invoke_until_done returns "done" without raising. Re-assert
+            # determinism at the runner's single exit point: any _stop_reason
+            # RECORDED BY HERE wins over natural success (spec :51's "strictly
+            # before enqueue" argument only orders the events; it does not
+            # guarantee the adapter re-checks between them). This fully covers
+            # the budget invariant (INV-B1): a budget trip can only be set
+            # DURING the inner invoke (watchdog cancelled at the inner finally
+            # above; no LLM calls after invoke returns), so it is always
+            # recorded by the time control reaches here.
+            #
+            # [impl-audit R3#1 scope] This does NOT cover a PARENT_CANCEL that
+            # arrives LATER, during _finalize_success's own awaits (the cancel
+            # listener stays live until the outer finally). That is the spec
+            # §6-L9 RESULT_READY-vs-CANCEL_REQUEST interleaving, frozen as
+            # benign: the child publishes a terminal SUCCESS for work it
+            # actually completed, the supervisor observes it as terminal, and
+            # any redundant parent force-terminate is harmless (row already
+            # terminal, reaper mapping consistent). Closing that window would
+            # need a listener freeze/terminal latch — a C2 cancel-correctness
+            # change out of this PR's scope, and contrary to §6-L9's accepted
+            # design.
+            if self._stop_reason is not None:
+                return await self._finalize_by_stop_reason(
+                    coordinator_run_id, work_unit, child_session_id,
                 )
 
             # natural ReAct done — branch by phase (spec §8.3 r13).
@@ -357,8 +433,9 @@ class CoordinatorChildRunner:
             # [r3 P2#1] Note: shutdown timeout (1.0s) only runs AFTER
             # invoke_until_done returns/raises. If invoke_until_done hangs
             # forever, this timeout does NOT unwind the listener — the
-            # wallclock budget watchdog (PR-6) is the upstream cancel that
-            # forces invoke_until_done to terminate.
+            # wallclock budget watchdog (LIVE since C2b budget wiring; D2
+            # inner-finally above) is the upstream cancel that forces
+            # invoke_until_done to terminate.
             await self._safe_listener_shutdown(listener)
 
     # ---- Finalizer matrix ------------------------------------------------ #
@@ -566,6 +643,30 @@ class CoordinatorChildRunner:
             outcome=ResultReadyOutcome.NEEDS_AUTHORIZATION,
             needs_authorization_details=details,
         )
+        # [C2b budget D10 / INV-B9] Best-effort exhaustion counter — single
+        # aggregation point for BOTH budget reasons. The try/except wraps the
+        # metric emit ONLY: a telemetry failure logs + continues, while a
+        # _publish_result_ready failure below propagates untouched (the
+        # terminal envelope is load-bearing, the metric is not).
+        if self._coordinator_metrics is not None:
+            try:
+                self._coordinator_metrics.budget_exhaustion.add(
+                    1,
+                    attributes={
+                        "stop_reason": (
+                            self._stop_reason.value
+                            if self._stop_reason else "unknown"
+                        ),
+                        "coordinator_run_id": run_id,
+                        "work_unit_id": wu.work_unit_id,
+                    },
+                )
+            except Exception:  # noqa: BLE001 — INV-B9 best-effort
+                logger.warning(
+                    "budget_exhaustion metric emit failed (best-effort; "
+                    "envelope publish unaffected)",
+                    exc_info=True,
+                )
         await self._publish_result_ready(child_id, payload)
         return payload
 
@@ -737,8 +838,33 @@ class CoordinatorChildRunner:
         )
 
     def _build_budget_evidence(self) -> str:
-        """[PR-4 minimal] Stamps the stop_reason so the parent can attribute
-        budget exhaustion to the correct watchdog (token vs. wallclock).
-        PR-6 expands with cumulative counters."""
+        """[C2b budget D5] Three-state contract (spec D5 / R7#1):
+
+        - ``budget is None`` (legacy/unit constructions): EXACT old format
+          ``stop_reason=<v>`` — INV-B6 clause (iv).
+        - ``budget`` set, ``_budget_callback is None`` (unpriced fail-soft —
+          wallclock-only enforcement): caps + elapsed emitted,
+          ``token_cost_usd_observed`` OMITTED.
+        - ``budget`` + callback attached: full fields including the observed
+          cumulative USD (read from the callback's read-only property).
+
+        Free-form space-separated ``key=value`` string — the wire field
+        (NeedsAuthorizationDetails.observed_evidence) is a plain str.
+        """
         reason_str = self._stop_reason.value if self._stop_reason else "unknown"
-        return f"stop_reason={reason_str}"
+        if self._budget is None:
+            return f"stop_reason={reason_str}"
+        parts = [f"stop_reason={reason_str}"]
+        if self._budget_callback is not None:
+            parts.append(
+                f"token_cost_usd_observed="
+                f"{float(self._budget_callback.cumulative_usd):.6f}"
+            )
+        parts.append(f"token_cap_usd={float(self._budget.max_token_cost_usd):.6f}")
+        parts.append(
+            f"wallclock_cap_seconds={self._budget.max_wallclock_seconds}"
+        )
+        if self._inner_invoke_started_monotonic is not None:
+            elapsed = time.monotonic() - self._inner_invoke_started_monotonic
+            parts.append(f"wallclock_elapsed_seconds={elapsed:.3f}")
+        return " ".join(parts)

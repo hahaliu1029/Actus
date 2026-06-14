@@ -3569,6 +3569,15 @@ class AgentTaskRunner(TaskRunner):
         self._coordinator_child_permission_context = cpc
         self._flow.set_child_permission_context(cpc)
 
+    def set_budget_callback(self, cb) -> None:
+        """[C2b budget §3-4] Forward the child's BudgetEnforcementCallback into
+        the child PlannerReActFlow so _build_config appends it to the graph
+        callbacks list. Mirrors set_coordinator_cancel_event (:3557) — called
+        by the coordinator starter via the invoke-adapter AFTER the
+        CoordinatorChildRunner exists, never at adapter-construction time
+        (the callback ctor needs the runner — spec §0.4 construction order)."""
+        self._flow.set_budget_callback(cb)
+
     async def _refresh_child_permission_baseline(self) -> None:
         """[C2b §4.2] After the child's PENDING→RUNNING bump committed, re-read
         the live (mode, revision) and replace the cpc baseline ONLY when it is
