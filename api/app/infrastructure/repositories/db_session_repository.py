@@ -7,6 +7,7 @@ from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import SandboxBindingState, Session, SessionStatus
+from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.models.skill_graph_state import SkillGraphState
 from app.domain.repositories._sentinel import _UNSET, UnsetType
@@ -361,6 +362,90 @@ class DBSessionRepository(SessionRepository):
             .where(SessionModel.parent_session_id.is_not(None))
             .where(SessionModel.status == SessionStatus.RUNNING.value)
             .where(SessionModel.execution_mode == "foreground")
+        )
+        result = await self.db_session.execute(stmt)
+        return [
+            ChildLineageRow(
+                session_id=str(row.id),
+                coordinator_run_id=(
+                    str(row.coordinator_run_id)
+                    if row.coordinator_run_id is not None
+                    else None
+                ),
+                work_unit_id=(
+                    str(row.work_unit_id) if row.work_unit_id is not None else None
+                ),
+            )
+            for row in result.all()
+        ]
+
+    async def find_running_mailbox_children_for_parent(
+        self, parent_session_id: str
+    ) -> list[ChildLineageRow]:
+        """See :meth:`SessionRepository.find_running_mailbox_children_for_parent`.
+
+        Clone of ``find_running_mailbox_children`` narrowed to ONE parent and
+        the coordinator discriminator (preset + non-null lineage). Used by the
+        user-stop cancel fanout (spec §3.1).
+        """
+        stmt = (
+            select(
+                SessionModel.id,
+                SessionModel.coordinator_run_id,
+                SessionModel.work_unit_id,
+            )
+            .where(SessionModel.parent_session_id == parent_session_id)
+            .where(SessionModel.worker_type == "subagent")
+            .where(SessionModel.subagent_control_plane == "mailbox")
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "foreground")
+            .where(SessionModel.tool_filter_preset == COORDINATOR_STEP_PRESET)
+            .where(SessionModel.coordinator_run_id.is_not(None))
+            .where(SessionModel.work_unit_id.is_not(None))
+        )
+        result = await self.db_session.execute(stmt)
+        return [
+            ChildLineageRow(
+                session_id=str(row.id),
+                coordinator_run_id=(
+                    str(row.coordinator_run_id)
+                    if row.coordinator_run_id is not None
+                    else None
+                ),
+                work_unit_id=(
+                    str(row.work_unit_id) if row.work_unit_id is not None else None
+                ),
+            )
+            for row in result.all()
+        ]
+
+    async def find_terminal_coordinator_children_with_active_sandbox(
+        self,
+    ) -> list[ChildLineageRow]:
+        """See
+        :meth:`SessionRepository.find_terminal_coordinator_children_with_active_sandbox`.
+        """
+        stmt = (
+            select(
+                SessionModel.id,
+                SessionModel.coordinator_run_id,
+                SessionModel.work_unit_id,
+            )
+            .where(SessionModel.worker_type == "subagent")
+            .where(SessionModel.subagent_control_plane == "mailbox")
+            .where(SessionModel.parent_session_id.is_not(None))
+            .where(
+                SessionModel.status.in_(
+                    (
+                        SessionStatus.COMPLETED.value,
+                        SessionStatus.TIMED_OUT.value,
+                    )
+                )
+            )
+            .where(SessionModel.sandbox_state == SandboxBindingState.ACTIVE.value)
+            .where(SessionModel.tool_filter_preset == COORDINATOR_STEP_PRESET)
+            .where(SessionModel.coordinator_run_id.is_not(None))
+            .where(SessionModel.work_unit_id.is_not(None))
         )
         result = await self.db_session.execute(stmt)
         return [

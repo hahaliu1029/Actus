@@ -870,3 +870,99 @@ def test_sandbox_binding_frozen() -> None:
     binding = SandboxBinding()
     with pytest.raises(Exception):
         binding.state = SandboxBindingState.ACTIVE  # type: ignore[misc]
+
+
+# ── C2 coordinator-cancel Part B: try_register_from_binding (tests 14–15) ──
+
+
+class _GoneSandbox(FakeSandbox):
+    """Sandbox class whose ``get`` always returns None (container removed /
+    daemon unreachable — both collapse to None in DockerSandbox.get)."""
+
+    @classmethod
+    async def get(cls, id: str):
+        return None
+
+
+async def test_try_register_active_binding_registers_and_destroy_kills_real_container() -> None:
+    session = _make_session(
+        state=SandboxBindingState.ACTIVE, sandbox_id="sbx-1", generation=2
+    )
+    service, _ = _make_service({"sess-1": session})
+    assert service._registry.get_sandbox("sess-1") is None  # fresh process
+
+    ok = await service.try_register_from_binding("sess-1")
+    assert ok is True
+    registered = service._registry.get_sandbox("sess-1")
+    assert registered is not None
+
+    # A subsequent destroy() now docker-rm's the REAL registered container
+    # (not just marking the row DESTROYED while the container leaks — R4 P1).
+    await service.destroy("sess-1", DestroyReason.TERMINAL_CHILD_REAPER)
+    assert registered._destroyed is True
+    assert session.sandbox_binding.state == SandboxBindingState.DESTROYED
+
+
+async def test_try_register_already_populated_returns_true_without_reget() -> None:
+    session = _make_session(state=SandboxBindingState.ACTIVE, sandbox_id="sbx-1")
+    service, _ = _make_service({"sess-1": session})
+    sentinel = FakeSandbox(sandbox_id="already")
+    service._registry.register("sess-1", sentinel, generation=0)
+
+    ok = await service.try_register_from_binding("sess-1")
+    assert ok is True
+    # in-process entry preserved; NOT re-fetched / replaced
+    assert service._registry.get_sandbox("sess-1") is sentinel
+
+
+async def test_try_register_container_gone_returns_false_no_state_change() -> None:
+    session = _make_session(state=SandboxBindingState.ACTIVE, sandbox_id="sbx-1")
+    service, _ = _make_service({"sess-1": session}, sandbox_cls=_GoneSandbox)
+
+    ok = await service.try_register_from_binding("sess-1")
+    assert ok is False
+    assert service._registry.get_sandbox("sess-1") is None
+    # row left ACTIVE — never silently DESTROYED (R5 P2 / INV-C7)
+    assert session.sandbox_binding.state == SandboxBindingState.ACTIVE
+
+
+async def test_try_register_unbound_returns_false() -> None:
+    session = _make_session(state=SandboxBindingState.UNBOUND)
+    service, _ = _make_service({"sess-1": session})
+    assert await service.try_register_from_binding("sess-1") is False
+
+
+async def test_try_register_missing_row_returns_false() -> None:
+    service, _ = _make_service({})
+    assert await service.try_register_from_binding("nope") is False
+
+
+async def test_try_register_false_paths_do_not_leak_locks() -> None:
+    # codex final-audit P3: a False return has no destroy() handoff, so the
+    # per-session lock created by _get_lock must be popped (mirrors destroy()'s
+    # pop-to-avoid-leak). Without the pop a startup sweep of many gone children
+    # would accumulate dead asyncio.Lock objects in _per_session_locks.
+    gone = _make_session(state=SandboxBindingState.ACTIVE, sandbox_id="sbx-1")
+    service, _ = _make_service({"sess-1": gone}, sandbox_cls=_GoneSandbox)
+    assert await service.try_register_from_binding("sess-1") is False
+    assert "sess-1" not in service._per_session_locks  # gone container path
+
+    assert await service.try_register_from_binding("nope") is False
+    assert "nope" not in service._per_session_locks  # missing-row path
+
+    unbound = _make_session(state=SandboxBindingState.UNBOUND)
+    service2, _ = _make_service({"sess-2": unbound})
+    assert await service2.try_register_from_binding("sess-2") is False
+    assert "sess-2" not in service2._per_session_locks  # wrong-state path
+
+    # Sandbox.get RAISES path (codex R2 P3): pins the except-branch _pop_lock_for
+    # specifically — without it a revert of only that branch would slip through.
+    class _RaisingSandbox(FakeSandbox):
+        @classmethod
+        async def get(cls, id: str):
+            raise RuntimeError("docker daemon unreachable")
+
+    raising = _make_session(state=SandboxBindingState.ACTIVE, sandbox_id="sbx-3")
+    service3, _ = _make_service({"sess-3": raising}, sandbox_cls=_RaisingSandbox)
+    assert await service3.try_register_from_binding("sess-3") is False
+    assert "sess-3" not in service3._per_session_locks  # Sandbox.get-raises path

@@ -1431,3 +1431,174 @@ async def test_reopen_takeover_concurrent_requests_only_one_success(
         if getattr(e, "action", None) == ControlAction.REOPENED
     ]
     assert len(reopened_events) == 1
+
+
+# ── C2 coordinator-cancel: stop_session fanout wiring (spec §5 tests 10–13) ──
+
+
+class _RecordingFanout:
+    """Records cancel_children calls; optionally raises to prove the defensive
+    try/except in stop_session (the real service never raises — INV-C2)."""
+
+    def __init__(self, order: list[str] | None = None, raises: bool = False) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._order = order
+        self._raises = raises
+
+    async def cancel_children(self, *, parent_session_id: str, reason: str):
+        self.calls.append((parent_session_id, reason))
+        if self._order is not None:
+            self._order.append("fanout")
+        if self._raises:
+            raise RuntimeError("fanout boom")
+
+
+class _OrderTask:
+    def __init__(self, order: list[str]) -> None:
+        self._order = order
+        self.cancel_reason: str | None = None
+
+    def cancel(self, reason: str = "stop") -> bool:
+        self._order.append("cancel")
+        self.cancel_reason = reason
+        return True
+
+
+async def test_stop_session_root_fans_out_before_task_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(id="s1", user_id="u1", status=SessionStatus.RUNNING)  # worker_type=root default
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    order: list[str] = []
+    fanout = _RecordingFanout(order=order)
+    service._coordinator_parent_cancel_fanout = fanout
+    task = _OrderTask(order)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return task
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    await service.stop_session("s1", "u1")
+
+    assert fanout.calls == [("s1", "parent_cancel")]
+    assert order == ["fanout", "cancel"]  # fanout BEFORE the parent task.cancel
+
+
+async def test_stop_session_fanout_raises_still_terminalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(id="s1", user_id="u1", status=SessionStatus.RUNNING)
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    service._coordinator_parent_cancel_fanout = _RecordingFanout(raises=True)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    await service.stop_session("s1", "u1")  # must NOT raise (defensive try/except)
+
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "user_cancel")
+    ]
+
+
+async def test_stop_session_non_root_skips_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        id="c1", user_id="u1", status=SessionStatus.RUNNING,
+        worker_type="subagent", parent_session_id="p1",
+    )
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    fanout = _RecordingFanout()
+    service._coordinator_parent_cancel_fanout = fanout
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    await service.stop_session("c1", "u1")
+
+    assert fanout.calls == []  # non-root -> fanout NOT called
+
+
+async def test_stop_session_legacy_fanout_none_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(id="s1", user_id="u1", status=SessionStatus.RUNNING)
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    # _make_service does not pass the kwarg -> ctor default None (INV-C4).
+    assert service._coordinator_parent_cancel_fanout is None
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    await service.stop_session("s1", "u1")  # no AttributeError
+
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "user_cancel")
+    ]
+
+
+async def test_stop_session_fanout_timeout_still_terminalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # codex final-audit P2: a hanging fanout (slow DB/Redis) must NOT block the
+    # parent's own terminalization — the asyncio.wait_for budget fires and
+    # stop_session proceeds (children fall back to the watchdog). Patch the
+    # module-level budget tiny so the test is fast + deterministic.
+    import app.application.services.agent_service as agent_service_mod
+
+    monkeypatch.setattr(
+        agent_service_mod, "_PARENT_CANCEL_FANOUT_TIMEOUT_SECONDS", 0.01
+    )
+    session = Session(id="s1", user_id="u1", status=SessionStatus.RUNNING)
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+
+    class _HangingFanout:
+        async def cancel_children(self, *, parent_session_id: str, reason: str):
+            await asyncio.sleep(5)  # >> the patched 0.01s budget
+
+    service._coordinator_parent_cancel_fanout = _HangingFanout()
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return None
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+
+    # Returns well under the 5s hang: the 0.01s budget unblocks terminalization.
+    await asyncio.wait_for(service.stop_session("s1", "u1"), timeout=2.0)
+
+    assert uow.session.update_to_terminal_calls == [
+        ("s1", SessionStatus.COMPLETED, "user_cancel")
+    ]

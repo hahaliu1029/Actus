@@ -53,6 +53,12 @@ class DestroyReason(str, Enum):
     CANCEL_ACK_OBSERVED = "cancel_ack_observed"  # child confirmed cooperative cancel
     ORPHAN_TIMEOUT = "orphan_timeout"  # supervisor stale detection
     FORCE_TERMINATE = "force_terminate"  # cascade cancel policy=TERMINATE
+    # C2 coordinator-cancel Part B — neutral reason for the startup reaper that
+    # destroys terminal coordinator children's leaked ACTIVE sandboxes. The
+    # children terminalized from MIXED causes (cancel->COMPLETED, timeout->
+    # TIMED_OUT, natural completion), so this must NOT stamp cancel_ack_observed
+    # (R4 P3). ``sandbox_destroy_reason`` has no DB CHECK -> migration-free (F0.7).
+    TERMINAL_CHILD_REAPER = "terminal_child_reaper"
 
 
 class SandboxBinding(BaseModel):

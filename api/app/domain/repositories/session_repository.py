@@ -143,6 +143,30 @@ class SessionRepository(Protocol):
         """
         ...
 
+    async def find_running_mailbox_children_for_parent(
+        self, parent_session_id: str
+    ) -> list[ChildLineageRow]:
+        """C2 cancel fanout: RUNNING coordinator children of ONE parent.
+
+        Coordinator-specific (``tool_filter_preset == 'coordinator_step'`` +
+        non-null ``coordinator_run_id``/``work_unit_id``) so non-coordinator
+        mailbox subagents (``subagent_research``, NULL lineage) are excluded —
+        they have no coordinator cancel listener (spec F0.5 / INV-C5).
+        """
+        ...
+
+    async def find_terminal_coordinator_children_with_active_sandbox(
+        self,
+    ) -> list[ChildLineageRow]:
+        """C2 cancel Part B reaper: terminal (COMPLETED/TIMED_OUT) coordinator
+        children whose sandbox binding is still ACTIVE — the leaked-sandbox set
+        (the root supervisor was killed before consuming their CANCEL_ACK, so
+        no terminal handler destroyed the per-child sandbox; spec F0.6/F0.7).
+        Inverse-status mirror of ``find_running_mailbox_children`` + active
+        sandbox + coordinator discriminator (preset + non-null lineage).
+        """
+        ...
+
     async def update_supervisor_fields(
         self,
         session_id: str,

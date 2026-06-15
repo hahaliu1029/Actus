@@ -619,6 +619,63 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("child_row_reaper: sweep failed (swallowed): %s", e)
 
+        # C2 coordinator-cancel Part B — leaked-sandbox startup reaper.
+        # On user-stop the root MailboxSupervisor is killed before consuming the
+        # cancelled children's CANCEL_ACK, so each child's per-child sandbox
+        # container is left ACTIVE with no reaper (F0.6/F0.7). This match-only
+        # startup sweep destroys those leaked containers idempotently
+        # (restart-bounded — NG8). Mirrors the C2b child-row reaper above.
+        # OUTER best-effort try: a query/DI failure logs + is swallowed so it
+        # never aborts lifespan startup.
+        try:
+            from app.application.services.sandbox_terminal_reaper import (
+                sweep_terminal_coordinator_active_sandboxes,
+            )
+            from app.infrastructure.repositories.db_session_repository import (
+                DBSessionRepository,
+            )
+
+            sandbox_reaper_svc = getattr(
+                app.state, "sandbox_lifecycle_service", None
+            )
+            if sandbox_reaper_svc is None:
+                logger.info(
+                    "sandbox_reaper: lifecycle service unavailable — skipping sweep"
+                )
+            else:
+                async with postgres_client.session_factory() as db_session:
+                    repo = DBSessionRepository(db_session=db_session)
+                    # Total budget for the sweep. NOTE: this wait_for only bounds
+                    # the async-cancellable portion — DockerSandbox.get()/destroy()
+                    # still make SYNCHRONOUS Docker SDK calls on the event loop
+                    # (docker_sandbox.py: containers.get/reload/remove), so a fully
+                    # hung Docker daemon can still block startup past this budget.
+                    # That is a PRE-EXISTING systemic exposure shared with
+                    # reconcile_orphans() above (which awaits the same Docker path
+                    # with no bound at all); the complete fix (async-safe
+                    # DockerSandbox via asyncio.to_thread + per-call client timeout)
+                    # is a deferred follow-up. On a cancellable timeout the outer
+                    # best-effort except logs + swallows; leaked sandboxes are
+                    # re-scanned next boot (restart-bounded — NG8).
+                    stats = await asyncio.wait_for(
+                        sweep_terminal_coordinator_active_sandboxes(
+                            session_repo=repo,
+                            lifecycle_service=sandbox_reaper_svc,
+                        ),
+                        timeout=30.0,
+                    )
+                    if stats.destroyed or stats.errored:
+                        logger.warning(
+                            "sandbox_reaper: scanned=%d destroyed=%d "
+                            "already_gone=%d errored=%d",
+                            stats.scanned,
+                            stats.destroyed,
+                            stats.already_gone,
+                            stats.errored,
+                        )
+        except Exception as e:
+            logger.warning("sandbox_reaper: sweep failed (swallowed): %s", e)
+
         # R3: Background scan for existing skills missing scan_report
         # Must start BEFORE yield (startup phase). After yield is shutdown.
         async def _background_skill_scan():

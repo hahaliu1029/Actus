@@ -387,6 +387,72 @@ class SandboxLifecycleService:
                 return cast(SandboxHandle, self._registry.acquire_handle(session_id))
             return await self._rehydrate_or_mark_orphan(session_id, binding)
 
+    async def try_register_from_binding(self, session_id: str) -> bool:
+        """Reaper-scoped cross-process registry rehydrate (C2 cancel Part B).
+
+        Populate the in-memory registry for ``session_id`` from its persisted
+        binding ONLY when ``Sandbox.get(binding.id)`` actually finds the
+        container. Returns True iff the registry ends up populated (already
+        present in-process, OR freshly registered from a found container);
+        False when there is nothing live to register (gone / unreachable /
+        UNBOUND / DESTROYED / missing row / null ``binding.id``).
+
+        Unlike the shared ``destroy()`` ACTIVE/SUSPENDED branch this NEVER
+        advances ``sandbox_state`` and NEVER raises on a ``None`` ``Sandbox.get``
+        — a reaper-scoped helper so the general cross-process ``destroy()``
+        registry-miss behavior (and the ``delete_session`` path that depends on
+        it) is left byte-for-byte unchanged (R5 P2 / NG9). The reaper calls this
+        before ``destroy()`` so a fresh-process destroy of a still-live child
+        container actually ``docker rm``s it instead of marking the row
+        DESTROYED while the container leaks (R4 P1).
+        """
+        async with self._get_lock(session_id):
+            if self._registry.get_sandbox(session_id) is not None:
+                # Already populated in-process — destroy() will use it.
+                return True
+            async with self._uow_factory() as uow:
+                session = await uow.session.get_by_id(session_id)
+            if session is None:
+                # No destroy() handoff on a False return — pop the lock we just
+                # created so a startup sweep of many gone children can't leak
+                # per-session locks (mirrors destroy()'s pop-to-avoid-leak).
+                self._pop_lock_for(session_id)
+                return False
+            binding = session.sandbox_binding
+            if binding.state not in (ACTIVE, SUSPENDED) or binding.id is None:
+                self._pop_lock_for(session_id)
+                return False
+            try:
+                sandbox = await self._sandbox_cls.get(binding.id)
+            except Exception:
+                # Daemon unreachable / lookup error -> not registerable; never
+                # raise (reaper-scoped). Row stays ACTIVE for the next boot.
+                logger.warning(
+                    "try_register_from_binding: Sandbox.get raised for session "
+                    "%s binding.id=%s — treating as not-registerable",
+                    session_id,
+                    binding.id,
+                    exc_info=True,
+                )
+                self._pop_lock_for(session_id)
+                return False
+            if sandbox is None:
+                # Container gone OR daemon unreachable (both collapse to None in
+                # DockerSandbox.get). Leave the row ACTIVE; never silently
+                # DESTROYED. A harmless phantom re-scanned next boot.
+                self._pop_lock_for(session_id)
+                return False
+            self._registry.register(
+                session_id, sandbox, generation=binding.generation
+            )
+            logger.info(
+                "try_register_from_binding: registry rehydrated for session %s "
+                "from binding.id=%s",
+                session_id,
+                binding.id,
+            )
+            return True
+
     async def destroy(self, session_id: str, reason: DestroyReason) -> None:
         """ACTIVE|SUSPENDED → DESTROYING → DESTROYED.
 

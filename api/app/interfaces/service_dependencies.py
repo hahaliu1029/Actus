@@ -1038,6 +1038,16 @@ def build_coordinator_runtime_deps(
                     ancestor_id, user_id=user_id, cap=cap,
                 )
 
+        async def find_running_mailbox_children_for_parent(self, parent_session_id):  # type: ignore[no-untyped-def]
+            # C2 cancel fanout: session-per-call (mirrors count_descendants).
+            # ``DBSessionRepository.find_running_mailbox_children_for_parent`` is
+            # the source of truth (db_session_repository.py).
+            async with self._sf() as s:
+                repo = DBSessionRepository(db_session=s)
+                return await repo.find_running_mailbox_children_for_parent(
+                    parent_session_id
+                )
+
     session_repository_adapter = _CoordinatorSessionRepoAdapter(pg_session_factory)
 
     # ── 6. CoordinatorRehydrateService — wraps repo + envelope_store + audit. ─
@@ -1685,6 +1695,25 @@ def _build_agent_service(
     mailbox_publisher = (
         RedisMailboxPublisher(redis_inner) if redis_inner is not None else None
     )
+    # C2 coordinator-cancel — build the parent-cancel fanout from the
+    # lifespan-scoped coord_deps. ``coord_deps is None`` (pure legacy/test)
+    # -> fanout stays None -> stop_session skips (INV-C4). The production
+    # ``_CoordinatorRuntimeDeps`` carries the real session_repository /
+    # envelope_factory / mailbox_publisher / child_runner_starter; the
+    # ``_NullCoordinatorRuntimeDeps`` sentinel yields None for every field, so
+    # the fanout's null-deps guard makes ``cancel_children`` a no-op.
+    coordinator_parent_cancel_fanout = None
+    if coord_deps is not None:
+        from app.application.services.coordinator_parent_cancel_fanout import (
+            CoordinatorParentCancelFanout,
+        )
+
+        coordinator_parent_cancel_fanout = CoordinatorParentCancelFanout(
+            session_repository=getattr(coord_deps, "session_repository", None),
+            envelope_factory=getattr(coord_deps, "envelope_factory", None),
+            mailbox_publisher=getattr(coord_deps, "mailbox_publisher", None),
+            child_runner_starter=getattr(coord_deps, "child_runner_starter", None),
+        )
     agent_svc = AgentService(
         uow_factory=get_uow,
         config_snapshot=snapshot,
@@ -1715,6 +1744,8 @@ def _build_agent_service(
         # PR-9b-A Task A8: lifespan-scoped coordinator runtime deps.
         # Forwarded to every AgentTaskRunner constructed by _create_task.
         coord_deps=coord_deps,
+        # C2 coordinator-cancel — consumed only by stop_session.
+        coordinator_parent_cancel_fanout=coordinator_parent_cancel_fanout,
     )
     agent_svc._supervisor = supervisor
     # C3 PR-4.5 — bind AgentService into the supervisor callback bridge

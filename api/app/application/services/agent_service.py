@@ -126,6 +126,13 @@ TAKEOVER_CANCEL_TIMEOUT_SECONDS = 15
 TAKEOVER_LEASE_TTL_SECONDS = 15 * 60
 _REDIS_STREAM_ID_RE = re.compile(r"^\d+-\d+$")
 
+# C2 coordinator-cancel — hard upper bound (seconds) on the user-stop child-cancel
+# fanout. The fanout never raises (INV-C2), but a slow DB enumeration / Redis
+# publish must never BLOCK the parent's own terminalization. On timeout the
+# dispatched children fall back to the <=300s watchdog (NG1). Module-level so
+# tests can monkeypatch it small.
+_PARENT_CANCEL_FANOUT_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass(frozen=True)
 class _ConfigSnapshot:
@@ -230,6 +237,12 @@ class AgentService:
         # preserves the legacy/test path: the runner falls back to
         # ``_NullCoordinatorRuntimeDeps`` so ``_build_config()`` SKIPS the
         # 18 coordinator cfg keys when wiring is absent.
+        coordinator_parent_cancel_fanout: object | None = None,
+        # C2 coordinator-cancel — optional fanout consumed ONLY by
+        # ``stop_session`` to cancel dispatched coordinator children on
+        # user-stop. None -> legacy/test path (stop_session skips). Built in
+        # ``_build_agent_service`` from ``coord_deps``; NOT threaded into
+        # ``AgentTaskRunner`` and NOT added to ``_CoordinatorRuntimeDeps``.
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -259,6 +272,8 @@ class AgentService:
         # Forwarded to every AgentTaskRunner constructed by _create_task,
         # which threads it into PlannerReActFlow.__init__(_coord_deps=...).
         self._coord_deps = coord_deps
+        # C2 coordinator-cancel — consumed only by stop_session (INV-C4 null-safe).
+        self._coordinator_parent_cancel_fanout = coordinator_parent_cancel_fanout
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -3103,6 +3118,34 @@ class AgentService:
         """
         # 1.查找会话是否存在
         session = await self._get_accessible_session(session_id, user_id, is_admin)
+
+        # C2 coordinator-cancel — fan out CANCEL_REQUEST to dispatched children
+        # BEFORE cancelling the parent's own task, so running coordinator
+        # children terminalize immediately (request_stop(PARENT_CANCEL) ->
+        # CANCEL_ACK) instead of waiting for the <=300s watchdog. The fanout
+        # service never raises (INV-C2); we additionally bound it with a short
+        # timeout (asyncio.wait_for) so a slow DB enumeration / Redis publish can
+        # never BLOCK the parent's own terminalization. The try/except is
+        # defense-in-depth: an exception OR a timeout is swallowed and the parent
+        # still terminalizes (the dispatched children fall back to the watchdog —
+        # NG1).
+        if (
+            session.worker_type == "root"
+            and self._coordinator_parent_cancel_fanout is not None
+        ):
+            try:
+                await asyncio.wait_for(
+                    self._coordinator_parent_cancel_fanout.cancel_children(
+                        parent_session_id=session_id, reason="parent_cancel"
+                    ),
+                    timeout=_PARENT_CANCEL_FANOUT_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.warning(
+                    "coordinator child cancel fanout failed or timed out for parent=%s",
+                    session_id,
+                    exc_info=True,
+                )
 
         # 2.根据会话获取任务信息
         task = await self._get_task(session)
