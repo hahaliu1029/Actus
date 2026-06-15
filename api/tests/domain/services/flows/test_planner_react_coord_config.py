@@ -30,6 +30,7 @@ EXPECTED_KEYS = {
     "parent_sandbox",
     "artifact_storage",
     "cost_rollup_service",
+    "coordinator_metrics_recorder",
 }
 
 
@@ -47,6 +48,7 @@ def _build_flow_with_real_coord_deps():
         "probe_quota", "coordinator_limits", "session_repository",
         "patch_reducer_service", "patch_applier_deps", "artifact_storage",
         "cost_rollup_service", "coordinator_envelope_store",
+        "coordinator_metrics_recorder",  # [C2b rollout WS1b] 19th cfg key
     )}
     # [finish-core §5.2 G2] The factory dep must be CALLABLE — _build_config
     # invokes it as parent_sandbox_adapter_factory(self._sandbox) to wrap the
@@ -82,7 +84,7 @@ def _build_flow_with_real_coord_deps():
     return flow, sentinels
 
 
-def test_build_config_contains_all_18_coord_keys():
+def test_build_config_contains_all_19_coord_keys():
     flow, sentinels = _build_flow_with_real_coord_deps()
     cfg = flow._build_config()
     configurable = cfg["configurable"]

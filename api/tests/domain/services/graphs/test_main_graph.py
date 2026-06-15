@@ -1015,3 +1015,64 @@ class TestCompactMessagesTruncation:
 
         truncated = result[0].content
         assert tail_marker in truncated, "Tail content should be preserved in head+tail truncation"
+
+
+async def test_updater_node_sanitizes_parallel_work_units_flag_off(monkeypatch):
+    """[WS0 §3A.4] Drive the REAL updater_node via build_main_graph: a flag-off
+    PlanUpdateResponse carrying parallel_work_units must yield an updated Step
+    with parallel_work_units=None. RED before the main_graph.py:1184-1189 edit,
+    GREEN after. Mirrors TestUpdaterNodePlanUpdate."""
+    from unittest.mock import AsyncMock, MagicMock
+    from langchain_core.messages import AIMessage
+    from app.domain.models.work_unit import ParallelWorkUnitGroupRequest, WorkUnitRequest
+    from app.domain.services.graphs.main_graph import build_main_graph
+
+    monkeypatch.delenv("ACTUS_C2_COORDINATOR_ENABLED", raising=False)
+    pwu = ParallelWorkUnitGroupRequest(
+        work_units=[WorkUnitRequest(objective="x", phase="exploration", allowed_tools=["file_read"])]
+    )
+    create_response = PlanResponse(
+        title="T", goal="G", language="zh",
+        steps=[StepDef(description="step one"), StepDef(description="step two")],
+        message="ok",
+    )
+    update_response = PlanUpdateResponse(
+        steps=[StepDef(id="2", description="updated parallel step", parallel_work_units=pwu)],
+    )
+    create_structured = AsyncMock()
+    create_structured.ainvoke = AsyncMock(return_value=create_response)
+    update_structured = AsyncMock()
+    update_structured.ainvoke = AsyncMock(return_value=update_response)
+    planner_llm = MagicMock()
+    def _wso(schema, **kwargs):
+        return create_structured if schema is PlanResponse else update_structured
+    planner_llm.with_structured_output = MagicMock(side_effect=_wso)
+
+    class MockReactGraph:
+        async def astream(self, input_state, config=None, **kwargs):
+            yield {"llm_node": {
+                "events": [],
+                "messages": [AIMessage(content='{"success": true, "result": "done", "attachments": []}')],
+                "should_interrupt": False,
+            }}
+
+    graph = build_main_graph(
+        _allow_default_prompt_assembler=True,
+        planner_llm=planner_llm,
+        react_graph=MockReactGraph(),
+        summary_llm=planner_llm,
+        uow_factory=MagicMock(),
+        session_id="sess-sanitize",
+    )
+    result = await graph.ainvoke({
+        "message": "do work", "language": "zh", "attachments": [],
+        "image_content_blocks": [], "plan": None, "current_step": None,
+        "messages": [], "execution_summary": "", "events": [],
+        "flow_status": "idle", "session_id": "sess-sanitize",
+        "should_interrupt": False, "resume_value": None,
+        "original_request": "", "skill_context": "", "conversation_summaries": [],
+    })
+    plan = result.get("plan")
+    assert plan is not None
+    # The updater-spliced step must have its parallel_work_units cleared flag-off.
+    assert all(s.parallel_work_units is None for s in plan.steps)

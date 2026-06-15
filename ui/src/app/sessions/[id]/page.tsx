@@ -17,6 +17,7 @@ import {
 
 import { ChatInput } from "@/components/chat-input";
 import { CompactionFoldIndicator } from "@/components/session/compaction-fold-indicator";
+import { CoordinatorTimelineItem } from "@/components/session/coordinator-timeline-item";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
 import { ToolConfirmationCard } from "@/components/tool-confirmation-card";
@@ -36,6 +37,13 @@ import {
 } from "@/components/ui/sheet";
 import { sessionApi } from "@/lib/api/session";
 import type { CompactionEventData, FileInfo } from "@/lib/api/types";
+import type {
+  CoordinatorApplyEventData,
+  CoordinatorDispatchEventData,
+  CoordinatorReduceEventData,
+  CoordinatorSiblingCancelEventData,
+  CoordinatorWorkerSpawnedEventData,
+} from "@/lib/api/types";
 import {
   deriveSessionProgressSummary,
   deriveWorkbenchSnapshots,
@@ -730,6 +738,22 @@ function renderEventItem(
         data={event.data as CompactionEventData}
       />
     );
+  }
+
+  if (event.event === "coordinator_dispatch") {
+    return <CoordinatorTimelineItem key={eventKey} kind="dispatch" data={event.data as CoordinatorDispatchEventData} />;
+  }
+  if (event.event === "coordinator_worker_spawned") {
+    return <CoordinatorTimelineItem key={eventKey} kind="worker_spawned" data={event.data as CoordinatorWorkerSpawnedEventData} />;
+  }
+  if (event.event === "coordinator_reduce") {
+    return <CoordinatorTimelineItem key={eventKey} kind="reduce" data={event.data as CoordinatorReduceEventData} />;
+  }
+  if (event.event === "coordinator_apply") {
+    return <CoordinatorTimelineItem key={eventKey} kind="apply" data={event.data as CoordinatorApplyEventData} />;
+  }
+  if (event.event === "coordinator_sibling_cancel") {
+    return <CoordinatorTimelineItem key={eventKey} kind="sibling_cancel" data={event.data as CoordinatorSiblingCancelEventData} />;
   }
 
   const fallbackText =

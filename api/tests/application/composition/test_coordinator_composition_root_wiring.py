@@ -239,6 +239,17 @@ def test_lifespan_constructs_coordinator_singletons_exactly_once():
     starter = fake_state.coordinator_child_runner_starter
     assert starter._coordinator_metrics is coord_deps.coordinator_metrics
 
+    # [C2b rollout WS1b] CoordinatorMetricsRecorder built at the composition
+    # root (wrapping the metrics bundle + the user_id_hash salt) and threaded
+    # BOTH into coord_deps (→ _build_config cfg → reducer run-level metrics)
+    # AND into the starter ctor (→ adapter tool_calls). Single instance.
+    from app.application.services.coordinator_metrics_recorder import (
+        CoordinatorMetricsRecorder,
+    )
+
+    assert isinstance(coord_deps.coordinator_metrics_recorder, CoordinatorMetricsRecorder)
+    assert starter._coordinator_metrics_recorder is coord_deps.coordinator_metrics_recorder
+
 
 def test_lifespan_threads_coord_deps_through_agent_service():
     """INV-A1 — the helper returns a real ``_CoordinatorRuntimeDeps``

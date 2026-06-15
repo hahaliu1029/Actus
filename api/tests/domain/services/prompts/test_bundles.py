@@ -128,11 +128,11 @@ def test_executor_registries_declare_canonical_sections_in_order() -> None:
 
 
 def test_planner_and_updater_registries_populated_in_c6() -> None:
-    """C6 scope: planner/updater registries contain 3 sections —
-    planner_identity + planner_tool_summary_legacy + conversation_summaries.
-    """
+    """WS0: planner/updater registries now carry the flag-gated
+    parallel_work_units_teaching section at index 1 (after planner_identity)."""
     expected_ids = [
         "planner_identity",
+        "parallel_work_units_teaching",
         "planner_tool_summary_legacy",
         "conversation_summaries",
     ]

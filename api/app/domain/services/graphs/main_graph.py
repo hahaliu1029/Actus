@@ -353,11 +353,23 @@ def _build_plan_from_response(
         else:
             step_id = _assign_fallback_step_id(pid, i)
         seen_ids.add(step_id)
+        # [C2b rollout WS0 §3A.4] Flag-off hard sanitation. The prompt-gate
+        # (WS0 teaching section) only REDUCES emission; parallel_work_units is
+        # in the with_structured_output schema (StepDef), so a flag-off real
+        # provider can emit it straight from the schema (F17). Clear it at the
+        # parse->Step boundary so no flag-off session reaches the executor
+        # coordinator gate (main_graph.py:751-755). This helper is shared by
+        # planner_node AND the detection planner (planner_react.py:1239), so
+        # sanitizing here covers BOTH paths. is_coordinator_enabled is domain.
+        from app.domain.services.coordinator_feature_flag import (
+            is_coordinator_enabled,
+        )
+        _pwu = sd.parallel_work_units if is_coordinator_enabled() else None
         steps.append(
             Step(
                 id=step_id,
                 description=sd.description,
-                parallel_work_units=sd.parallel_work_units,
+                parallel_work_units=_pwu,
             )
         )
     return Plan(steps=steps)
@@ -1181,11 +1193,18 @@ def build_main_graph(
                     # LLM keeps it; fall back to _assign_fallback_step_id
                     # rooted on the plan's id so the fallback is stable
                     # across replan rounds within the same plan.
+                    # [C2b rollout WS0 §3A.4] Flag-off sanitation (updater path).
+                    from app.domain.services.coordinator_feature_flag import (
+                        is_coordinator_enabled,
+                    )
+                    _coord_on = is_coordinator_enabled()
                     new_steps = [
                         Step(
                             description=s.description,
                             id=s.id or _assign_fallback_step_id(plan.id, i),
-                            parallel_work_units=s.parallel_work_units,
+                            parallel_work_units=(
+                                s.parallel_work_units if _coord_on else None
+                            ),
                         )
                         for i, s in enumerate(parsed_obj.steps)
                         if s.description

@@ -29,6 +29,7 @@ FIELD_NAMES = (
     "coordinator_envelope_store",
     "parent_sandbox_adapter_factory",
     "coordinator_metrics",  # [C2b budget D10] defaulted field — see test below
+    "coordinator_metrics_recorder",  # [C2b rollout WS1b] 2nd defaulted tail field
 )
 
 
@@ -68,3 +69,13 @@ def test_coordinator_metrics_field_defaults_to_none() -> None:
     sentinels = {f: object() for f in FIELD_NAMES if f != "coordinator_metrics"}
     deps = _CoordinatorRuntimeDeps(**sentinels)
     assert deps.coordinator_metrics is None
+
+
+def test_coordinator_metrics_recorder_field_defaults_to_none() -> None:
+    sentinels = {
+        f: object()
+        for f in FIELD_NAMES
+        if f not in ("coordinator_metrics", "coordinator_metrics_recorder")
+    }
+    deps = _CoordinatorRuntimeDeps(**sentinels)
+    assert deps.coordinator_metrics_recorder is None

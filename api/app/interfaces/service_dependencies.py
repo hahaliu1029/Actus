@@ -1157,6 +1157,17 @@ def build_coordinator_runtime_deps(
         CoordinatorMetrics,
     )
     coordinator_metrics = CoordinatorMetrics(OtelMeter())
+    # [C2b rollout WS1b] App-layer recorder wrapping the metrics bundle + the
+    # user_id_hash salt (the domain reducer must not hold the salt). Threaded
+    # BOTH into the starter ctor (→ adapter, for tool_calls) AND into
+    # coord_deps (→ _build_config cfg → reducer, for run-level metrics).
+    from app.application.services.coordinator_metrics_recorder import (
+        CoordinatorMetricsRecorder,
+    )
+    coordinator_metrics_recorder = CoordinatorMetricsRecorder(
+        metrics=coordinator_metrics,
+        user_id_hash_salt=settings.user_id_hash_salt,
+    )
 
     # ── 11. PatchReducerService — pure, stateless. ──────────────────────────
     patch_reducer_service = PatchReducerService()
@@ -1249,6 +1260,7 @@ def build_coordinator_runtime_deps(
         sandbox_lifecycle_service=sandbox_lifecycle_service,
         resolve_child_runner_deps=resolve_child_runner_deps,
         coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
+        coordinator_metrics_recorder=coordinator_metrics_recorder,  # [C2b rollout WS1b]
     )
 
     # ── 16. Pin everything on app_state so downstream DI / lifespan teardown
@@ -1303,6 +1315,7 @@ def build_coordinator_runtime_deps(
         coordinator_envelope_store=coordinator_envelope_store,
         parent_sandbox_adapter_factory=_parent_sandbox_adapter_factory,
         coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
+        coordinator_metrics_recorder=coordinator_metrics_recorder,  # [C2b rollout WS1b]
     )
     app_state.coord_deps = coord_deps
     return coord_deps

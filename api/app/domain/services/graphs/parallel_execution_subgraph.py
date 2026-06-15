@@ -51,6 +51,7 @@ import hashlib
 import json
 import logging
 import operator
+import time
 from typing import TYPE_CHECKING, Annotated, Any, Optional, TypedDict
 
 if TYPE_CHECKING:
@@ -148,6 +149,12 @@ class ParallelSubgraphState(TypedDict, total=False):
     # this False (default). reducer_node gates its quota release on
     # this flag so the rehydrate path does not DECR below zero.
     quota_acquired: bool
+    # [C2b rollout WS1b §3.3] monotonic clock captured at the START of
+    # _first_time_dispatch (before any I/O). Carried to the reducer to derive
+    # run duration AND to gate run-level metrics so a crash+rehydrate (which
+    # routes _rehydrate_dispatch, never setting this) cannot double-count
+    # run_cost_usd. total=False → absent on the rehydrate path (§3.4).
+    dispatch_started_monotonic: float
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -301,6 +308,11 @@ async def _first_time_dispatch(
     coordinator_run_id: str,
     work_units: list[WorkUnit],
 ) -> Command:
+    # [C2b rollout WS1b §3.3/§3.4] Stamp the dispatch start BEFORE any I/O
+    # (session creation / manifest upload / child start). Carried in the
+    # Command(update) below; the reducer derives duration + gates run-level
+    # metrics on its presence.
+    dispatch_started_monotonic = time.monotonic()
     cfg = config["configurable"]
     session_service = cfg["session_service"]
     runner_starter = cfg["child_runner_starter"]
@@ -859,6 +871,7 @@ async def _first_time_dispatch(
             # (which would otherwise DECR below zero / steal another
             # incarnation's slot).
             "quota_acquired": concurrency_acquired,
+            "dispatch_started_monotonic": dispatch_started_monotonic,
         },
         goto=[
             Send("worker_node", {
@@ -1466,6 +1479,43 @@ async def reducer_node(
                 logger.warning(
                     "reducer_node: emit CoordinatorReduceEvent failed "
                     "run=%s: %s", coordinator_run_id, exc,
+                )
+
+            # [C2b rollout WS1b §3.2/§3.3/§3.4] Run-level metrics — SEPARATE
+            # try AFTER the reduce-event emit so a recorder exception can't
+            # drop the load-bearing event. Gated on dispatch_started_monotonic:
+            # set ONLY by _first_time_dispatch, so a crash+rehydrate (routes
+            # _rehydrate_dispatch, no stamp) records nothing → no double-count
+            # of the monotonic run_cost_usd counter. Reuse the cost_total +
+            # diagnostics_summary computed above; do NOT re-aggregate.
+            recorder = cfg.get("coordinator_metrics_recorder")
+            start = state.get("dispatch_started_monotonic")
+            if recorder is not None and start is not None:
+                try:
+                    cost_authoritative = "cost_unavailable" not in diagnostics_summary
+                    recorder.record_run_terminal(
+                        coordinator_run_id=coordinator_run_id,
+                        user_id=state.get("user_id"),
+                        cost_usd=cost_total.total_usd,
+                        outcome=output.group_outcome.value,
+                        cost_authoritative=cost_authoritative,
+                        duration_s=time.monotonic() - start,
+                    )
+                except Exception:  # noqa: BLE001 — best-effort; never break reduce
+                    logger.warning(
+                        "reducer_node: record_run_terminal failed (best-effort) "
+                        "run=%s", coordinator_run_id, exc_info=True,
+                    )
+            elif start is not None and recorder is None:
+                # [R3 P3 dead-埋点 guard] A first-time run reached terminal
+                # (metrics SHOULD fire) but the recorder is missing from cfg →
+                # the _build_config threading was dropped, silently re-creating
+                # the dead-instrument bug. Make it LOUD.
+                logger.warning(
+                    "reducer_node: dispatch_started_monotonic set but "
+                    "coordinator_metrics_recorder absent from cfg — run-level "
+                    "metrics NOT recorded (wiring regression?) run=%s",
+                    coordinator_run_id,
                 )
 
         return command

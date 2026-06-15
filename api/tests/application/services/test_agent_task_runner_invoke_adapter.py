@@ -458,6 +458,78 @@ def test_set_budget_callback_chain_reaches_flow_config():
     )
 
 
+# ── C2b rollout WS1b §3.1: adapter _drain records tool_calls per CALLING ────
+
+
+async def test_drain_records_tool_call_per_calling_event():
+    """[C2b rollout WS1b §3.1] The adapter records ONE tool_call per CALLING
+    ToolEvent, with the run/work-unit lineage from the cpc + the literal
+    function_name (F8). Recording happens at append time (drain), NOT at
+    DoneEvent — verified by the second case (CALLING then ErrorEvent)."""
+    from unittest.mock import MagicMock
+
+    recorder = MagicMock()
+    cpc = MagicMock(coordinator_run_id="run1", work_unit_id="wu1")
+    tool_ev = ToolEvent(
+        tool_call_id="tc1", tool_name="file", function_name="file_read",
+        function_args={"filepath": "a.py"}, status=ToolEventStatus.CALLING,
+    )
+    runner = _ScriptedRunner([tool_ev, DoneEvent(metrics={"ok": 1})])
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+        child_permission_context=cpc, coordinator_metrics_recorder=recorder,
+    )
+    await adapter.invoke_until_done(user_message="do it")
+    recorder.record_tool_call.assert_called_once_with(
+        coordinator_run_id="run1", work_unit_id="wu1", function_name="file_read",
+    )
+
+
+async def test_drain_records_tool_call_even_when_child_later_errors():
+    """[F14] Recording happens at the CALLING append, NOT at DoneEvent — so a
+    child that CALLs a tool then terminates with an ErrorEvent (failed) still
+    records the tool_call before the raise. This is the F14 under-count fix."""
+    from unittest.mock import MagicMock
+
+    recorder = MagicMock()
+    cpc = MagicMock(coordinator_run_id="run1", work_unit_id="wu1")
+    tool_ev = ToolEvent(
+        tool_call_id="tc1", tool_name="shell", function_name="shell_execute",
+        function_args={"command": "ls"}, status=ToolEventStatus.CALLING,
+    )
+    runner = _ScriptedRunner([tool_ev, ErrorEvent(error="boom")])
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+        child_permission_context=cpc, coordinator_metrics_recorder=recorder,
+    )
+    with pytest.raises(ChildInnerRunError):
+        await adapter.invoke_until_done(user_message="do it")
+    recorder.record_tool_call.assert_called_once_with(
+        coordinator_run_id="run1", work_unit_id="wu1", function_name="shell_execute",
+    )
+
+
+async def test_drain_no_record_when_recorder_or_cpc_absent():
+    """Both the recorder AND the cpc must be present to record (the cpc is None
+    for non-coordinator adapter uses, e.g. subagent research). Missing either →
+    no-op (no AttributeError on a None cpc/recorder)."""
+    from unittest.mock import MagicMock
+
+    tool_ev = ToolEvent(
+        tool_call_id="tc1", tool_name="file", function_name="file_read",
+        function_args={"filepath": "a.py"}, status=ToolEventStatus.CALLING,
+    )
+    # recorder present, cpc absent → no-op
+    recorder = MagicMock()
+    runner = _ScriptedRunner([tool_ev, DoneEvent()])
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=runner, cancel_event=asyncio.Event(), task_cls=_FakeTask,
+        child_permission_context=None, coordinator_metrics_recorder=recorder,
+    )
+    await adapter.invoke_until_done(user_message="x")
+    recorder.record_tool_call.assert_not_called()
+
+
 async def test_finish_line_trip_beats_done_event():
     """[spec §5-11 / INV-B1 终线确定性] DoneEvent ALREADY on the output stream
     + cancel_event ALREADY set when _drain enters → loop-top cancel check

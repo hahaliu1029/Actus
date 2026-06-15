@@ -747,6 +747,11 @@ export type SSEEventType =
   | "done"
   | "error"
   | "session_mode_changed"
+  | "coordinator_dispatch"
+  | "coordinator_worker_spawned"
+  | "coordinator_reduce"
+  | "coordinator_apply"
+  | "coordinator_sibling_cancel"
   | "sessions";
 
 export type ToolConfirmationEventData = {
@@ -776,6 +781,75 @@ export type SessionModeChangedEventData = {
   mode_revision?: number | null;
 };
 
+// ---- C2b coordinator timeline (WS2) ----
+// Backend: api/app/interfaces/schemas/event.py:563-672. Optional[str]=None → `| null`.
+export type CoordinatorLineage = {
+  root_session_id: string | null;
+  parent_session_id: string | null;
+  child_session_id: string | null;
+  coordinator_run_id: string | null;
+  work_unit_id: string | null;
+};
+
+export type CoordinatorCostAggregate = {
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_usd: number;
+  tool_call_count: number;
+};
+
+export type CoordinatorDispatchEventData = CoordinatorLineage & {
+  event_id?: string;
+  created_at?: number;
+  seq?: number | null;
+  step_id: string;
+  work_unit_count: number;
+  work_unit_ids: string[];
+  phases: string[];
+};
+
+export type CoordinatorWorkerSpawnedEventData = CoordinatorLineage & {
+  event_id?: string;
+  created_at?: number;
+  seq?: number | null;
+  objective: string;
+  phase: string;
+  allowed_tools: string[];
+  write_lease_count: number;
+};
+
+export type CoordinatorReduceEventData = CoordinatorLineage & {
+  event_id?: string;
+  created_at?: number;
+  seq?: number | null;
+  group_outcome: string;
+  per_worker_outcomes: Record<string, string>;
+  diagnostics_summary: string;
+  conflict_paths: string[];
+  cost_total: CoordinatorCostAggregate;
+};
+
+export type CoordinatorApplyEventData = CoordinatorLineage & {
+  event_id?: string;
+  created_at?: number;
+  seq?: number | null;
+  apply_status: string;
+  file_count: number;
+  total_bytes: number;
+  failed_at_path: string | null;
+  rollback_status: string | null;
+};
+
+export type CoordinatorSiblingCancelEventData = CoordinatorLineage & {
+  event_id?: string;
+  created_at?: number;
+  seq?: number | null;
+  triggered_by_work_unit_id: string;
+  triggered_by_outcome: string;
+  cancelled_work_unit_ids: string[];
+  reason: string;
+};
+
 export type SSEEventData =
   | { type: "message"; data: ChatMessageData }
   | { type: "title"; data: TitleEvent }
@@ -794,6 +868,11 @@ export type SSEEventData =
   | { type: "done"; data: DoneEvent }
   | { type: "error"; data: ErrorEvent }
   | { type: "session_mode_changed"; data: SessionModeChangedEventData }
+  | { type: "coordinator_dispatch"; data: CoordinatorDispatchEventData }
+  | { type: "coordinator_worker_spawned"; data: CoordinatorWorkerSpawnedEventData }
+  | { type: "coordinator_reduce"; data: CoordinatorReduceEventData }
+  | { type: "coordinator_apply"; data: CoordinatorApplyEventData }
+  | { type: "coordinator_sibling_cancel"; data: CoordinatorSiblingCancelEventData }
   | { type: "sessions"; data: ListSessionResponse };
 
 export type SSEEventHandler = (event: SSEEventData) => void;

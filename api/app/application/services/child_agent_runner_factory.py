@@ -145,6 +145,7 @@ class ChildAgentTaskRunnerFactory:
         browser: Any,
         user_id: str,
         cost_callback_handler: Any,
+        coordinator_metrics_recorder: Any = None,
     ) -> BuiltChildRunner:
         """Build the child AgentTaskRunner via the shared runner builder and
         wrap it in the invoke-adapter (§5.1 Shape-1-variant). The adapter ctor
@@ -170,6 +171,7 @@ class ChildAgentTaskRunnerFactory:
         adapter = AgentTaskRunnerInvokeAdapter(
             runner=raw_runner, cancel_event=cancel_event, task_cls=self._task_cls,
             child_permission_context=child_permission_context,
+            coordinator_metrics_recorder=coordinator_metrics_recorder,
         )
         return BuiltChildRunner(
             runner=adapter,

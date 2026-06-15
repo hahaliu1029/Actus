@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 def test_en_bundle_has_teaching():
-    from app.domain.services.prompts.bundles.en import (
+    from app.domain.services.prompts.sections.parallel_work_units_teaching import (
         PARALLEL_WORK_UNITS_TEACHING_EN,
     )
 
@@ -18,7 +18,7 @@ def test_en_bundle_has_teaching():
 
 
 def test_zh_bundle_has_teaching():
-    from app.domain.services.prompts.bundles.zh import (
+    from app.domain.services.prompts.sections.parallel_work_units_teaching import (
         PARALLEL_WORK_UNITS_TEACHING_ZH,
     )
 

@@ -13,7 +13,8 @@ These tests pin the wiring contract that compositionroot relies on:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -276,3 +277,108 @@ async def test_reducer_node_no_aggregate_when_event_queue_absent() -> None:
     await reducer_node(state, config)
 
     assert cost_rollup_service.calls == []
+
+
+# ── C2b rollout WS1b §3.2/§3.3/§3.4: reducer run-level metrics ────────────────
+
+
+def _reducer_output_success() -> ReducerOutput:
+    return ReducerOutput(
+        apply_plan=None,
+        group_outcome=GroupOutcome.SUCCESS,
+        step_result_candidate="ok",
+        diagnostics=ReducerDiagnostics(),
+    )
+
+
+async def test_reducer_records_run_terminal_once_on_first_time_path() -> None:
+    """[§3.2/§3.3] When cfg carries a coordinator_metrics_recorder + event_queue
+    + cost_rollup_service, and state carries dispatch_started_monotonic (the
+    first-time-dispatch stamp), reducer_node records the run terminal exactly
+    once with authoritative cost + a positive duration."""
+    recorder = MagicMock()
+    reducer = AsyncMock()
+    reducer.reduce = AsyncMock(return_value=_reducer_output_success())
+    queue: asyncio.Queue = asyncio.Queue()
+    state = {
+        "coordinator_run_id": "r1",
+        "user_id": "u1",
+        "work_units": [_wu("wu1")],
+        "worker_results": [],
+        "child_session_ids": {},
+        "dispatch_started_monotonic": time.monotonic() - 1.0,
+    }
+    config = {"configurable": {
+        "patch_reducer_service": reducer,
+        "cost_rollup_service": _CapturingCostRollup(),
+        "event_queue": queue,
+        "coordinator_metrics_recorder": recorder,
+    }}
+
+    await reducer_node(state, config)
+
+    recorder.record_run_terminal.assert_called_once()
+    kw = recorder.record_run_terminal.call_args.kwargs
+    assert kw["coordinator_run_id"] == "r1"
+    assert kw["user_id"] == "u1"
+    assert kw["cost_usd"] == 0.0  # CostAggregate() default
+    assert kw["outcome"] == "success"  # GroupOutcome.SUCCESS.value
+    assert kw["cost_authoritative"] is True  # no cost_unavailable diagnostic
+    assert kw["duration_s"] is not None and kw["duration_s"] > 0
+
+
+async def test_reducer_no_record_without_dispatch_stamp() -> None:
+    """[§3.4] No dispatch_started_monotonic on state (rehydrate-shaped) → the
+    recorder is NEVER called, even with a recorder wired."""
+    recorder = MagicMock()
+    reducer = AsyncMock()
+    reducer.reduce = AsyncMock(return_value=_reducer_output_success())
+    queue: asyncio.Queue = asyncio.Queue()
+    state = {
+        "coordinator_run_id": "r1",
+        "user_id": "u1",
+        "work_units": [_wu("wu1")],
+        "worker_results": [],
+        "child_session_ids": {},
+        # NO dispatch_started_monotonic
+    }
+    config = {"configurable": {
+        "patch_reducer_service": reducer,
+        "cost_rollup_service": _CapturingCostRollup(),
+        "event_queue": queue,
+        "coordinator_metrics_recorder": recorder,
+    }}
+
+    await reducer_node(state, config)
+
+    recorder.record_run_terminal.assert_not_called()
+
+
+async def test_reducer_dead_metric_guard_warns_when_recorder_absent(caplog) -> None:
+    """[§3.2 dead-埋点 guard] A first-time run reaches terminal (stamp present)
+    but cfg has NO coordinator_metrics_recorder → a WARNING fires so a dropped
+    _build_config threading is LOUD, not a silently-flat counter."""
+    reducer = AsyncMock()
+    reducer.reduce = AsyncMock(return_value=_reducer_output_success())
+    queue: asyncio.Queue = asyncio.Queue()
+    state = {
+        "coordinator_run_id": "r1",
+        "user_id": "u1",
+        "work_units": [_wu("wu1")],
+        "worker_results": [],
+        "child_session_ids": {},
+        "dispatch_started_monotonic": time.monotonic(),
+    }
+    config = {"configurable": {
+        "patch_reducer_service": reducer,
+        "cost_rollup_service": _CapturingCostRollup(),
+        "event_queue": queue,
+        # NO coordinator_metrics_recorder
+    }}
+
+    with caplog.at_level("WARNING"):
+        await reducer_node(state, config)
+
+    assert any(
+        "coordinator_metrics_recorder" in r.message for r in caplog.records
+    ), "expected a dead-metric guard WARNING naming coordinator_metrics_recorder"

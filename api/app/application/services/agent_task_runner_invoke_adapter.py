@@ -52,10 +52,16 @@ class AgentTaskRunnerInvokeAdapter:
         cancel_event: asyncio.Event,
         task_cls: Any,
         child_permission_context: Any = None,
+        coordinator_metrics_recorder: Any = None,
     ) -> None:
         self._runner = runner
         self._cancel_event = cancel_event
         self._task_cls = task_cls
+        # [C2b rollout WS1b] store the cpc + recorder so _drain can record
+        # tool_calls with the run/work-unit lineage. Both None for
+        # non-coordinator adapter uses (subagent research) → _drain no-ops.
+        self._child_permission_context = child_permission_context
+        self._coordinator_metrics_recorder = coordinator_metrics_recorder
         # Wire the coordinator cancel_event into the child flow so react_graph
         # cancel checkpoints observe it (child has coord_deps=None → its own
         # prime no-ops, so this injection survives). §5.1.1 INV-F1.11.
@@ -144,6 +150,19 @@ class AgentTaskRunnerInvokeAdapter:
             event = _event_adapter.validate_json(event_str)
             if isinstance(event, ToolEvent) and event.status == ToolEventStatus.CALLING:
                 tool_calls.append(event)
+                # [C2b rollout WS1b §3.1] Record EVERY CALLING event for EVERY
+                # child regardless of terminal outcome (F14 — _finalize_success
+                # only counts successful-write children). Guarded on both the
+                # recorder AND the cpc being present (cpc is None for
+                # non-coordinator adapter uses). Best-effort lives in the recorder.
+                _rec = self._coordinator_metrics_recorder
+                _cpc = self._child_permission_context
+                if _rec is not None and _cpc is not None:
+                    _rec.record_tool_call(
+                        coordinator_run_id=_cpc.coordinator_run_id,
+                        work_unit_id=_cpc.work_unit_id,
+                        function_name=event.function_name,
+                    )
                 continue
             if isinstance(event, ErrorEvent):
                 raise ChildInnerRunError(event.error or "child runner error")

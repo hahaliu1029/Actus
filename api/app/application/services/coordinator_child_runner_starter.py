@@ -165,6 +165,7 @@ class DefaultCoordinatorChildRunnerStarter:
         sandbox_lifecycle_service: Any,  # _DeferredLifecycle proxy or SandboxLifecycleService
         resolve_child_runner_deps: Any = None,  # () -> ChildRunnerSharedDeps; lazy (supervisor+uow for cost handler). Default None is INTENTIONAL: F1.7 build_coordinator_runtime_deps constructs this starter with None for the 2-kwarg comp-root test callers that never dispatch a child (so .start()/_resolve_child_runner_deps() is never reached). A real dispatch path is always wired by F1.7 -- do NOT add a hard __init__ guard (it would break those callers).
         coordinator_metrics: Any = None,  # [C2b budget D10] CoordinatorMetrics | None — threaded into each CoordinatorChildRunner for the budget finalizer's best-effort exhaustion counter.
+        coordinator_metrics_recorder: Any = None,  # [C2b rollout WS1b] CoordinatorMetricsRecorder | None — forwarded to factory.build → adapter for the per-child tool_calls metric.
     ) -> None:
         self._runner_factory = runner_factory
         self._mailbox_publisher = mailbox_publisher
@@ -178,6 +179,7 @@ class DefaultCoordinatorChildRunnerStarter:
         self._sandbox_lifecycle_service = sandbox_lifecycle_service
         self._resolve_child_runner_deps = resolve_child_runner_deps
         self._coordinator_metrics = coordinator_metrics
+        self._coordinator_metrics_recorder = coordinator_metrics_recorder
         self._active_tasks: dict[str, asyncio.Task] = {}
         # [C2b budget §3-9 R3#1] child_session_id → CoordinatorChildRunner for
         # dispatch-rollback stop. Reaped in _on_task_done alongside
@@ -259,6 +261,7 @@ class DefaultCoordinatorChildRunnerStarter:
                 browser=child_browser,
                 user_id=user_id,
                 cost_callback_handler=cost_callback_handler,
+                coordinator_metrics_recorder=self._coordinator_metrics_recorder,
             )
             # 7. CoordinatorChildRunner — child_sandbox Port for seed/extraction.
             child_runner = CoordinatorChildRunner(

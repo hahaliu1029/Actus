@@ -1471,7 +1471,7 @@ class PlannerReActFlow(BaseFlow):
         # PR-9b-A A5: parallel-subgraph runtime deps (always-live wiring;
         # flag at main_graph.py:695 gates ENTRY to _run_parallel_backend,
         # not WIRING). When _coord_deps is the NullCoordinatorRuntimeDeps
-        # sentinel (legacy tests + non-coordinator paths), the 18 cfg keys
+        # sentinel (legacy tests + non-coordinator paths), the 19 cfg keys
         # are SKIPPED — INV-A10 guarantees zero side-effect ctors fire on
         # construction in that branch.
         if not isinstance(self._coord_deps, _NullCoordinatorRuntimeDeps):
@@ -1497,6 +1497,7 @@ class PlannerReActFlow(BaseFlow):
                 ),  # [finish-core §5.2 G2] Port, not raw handle (domain stays infra-free)
                 "artifact_storage": cd.artifact_storage,
                 "cost_rollup_service": cd.cost_rollup_service,
+                "coordinator_metrics_recorder": cd.coordinator_metrics_recorder,
             })
             # event_queue is intentionally NOT here — GraphEventBridge merges
             # {"event_queue": q} into configurable AT INVOCATION TIME

@@ -18,6 +18,7 @@ from app.domain.services.graphs.parallel_execution_subgraph import (
     _build_pre_results_from_terminal,
     _rehydrate_dispatch,
     dispatch_node,
+    reducer_node,
 )
 
 pytestmark = pytest.mark.anyio
@@ -506,6 +507,50 @@ class TestRehydrateDispatchBranches:
         assert event_queue.get_nowait() is sentinel_event
         # And the post-detection router was actually reached.
         assert routed.get("called") is True
+
+    async def test_rehydrate_reducer_never_records_run_terminal(self) -> None:
+        """[C2b rollout WS1b §3.4 double-count guard — LOCKING TEST] The
+        rehydrate path (``_rehydrate_dispatch``) never sets
+        ``dispatch_started_monotonic`` on the state. So when reducer_node runs
+        on a rehydrated run (state has NO stamp), the run-level metrics recorder
+        is NEVER called — preventing a double-count of the monotonic
+        run_cost_usd counter on crash recovery. Pins the invariant against a
+        future refactor that lets _rehydrate_dispatch set the stamp."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from app.application.services.patch_reducer_service import (
+            ReducerDiagnostics,
+            ReducerOutput,
+        )
+        from app.domain.models.patch_apply_plan import GroupOutcome
+
+        recorder = MagicMock()
+        reducer = AsyncMock()
+        reducer.reduce = AsyncMock(return_value=ReducerOutput(
+            apply_plan=None,
+            group_outcome=GroupOutcome.SUCCESS,
+            step_result_candidate="ok",
+            diagnostics=ReducerDiagnostics(),
+        ))
+        queue: asyncio.Queue = asyncio.Queue()
+        # State shaped like a rehydrate handoff: NO dispatch_started_monotonic.
+        state = {
+            "coordinator_run_id": "r1",
+            "user_id": "u1",
+            "work_units": [_make_wu("wu1")],
+            "worker_results": [],
+            "child_session_ids": {"wu1": "c1"},
+        }
+        config = {"configurable": {
+            "patch_reducer_service": reducer,
+            "event_queue": queue,
+            "coordinator_metrics_recorder": recorder,
+        }}
+
+        await reducer_node(state, config)
+
+        recorder.record_run_terminal.assert_not_called()
 
     async def test_missing_child_raises_even_when_only_terminals(self) -> None:
         """Defense-in-depth: a wu_id in work_units with NO corresponding

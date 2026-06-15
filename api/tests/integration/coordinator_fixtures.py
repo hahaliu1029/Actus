@@ -214,8 +214,17 @@ class PricedRoutingFakeChatModel(PricedFakeListChatModel):
         object.__setattr__(self, "parent_plan_calls", 0)
         object.__setattr__(self, "child_plan_calls", 0)
         object.__setattr__(self, "build_llm_call_count", 0)
+        object.__setattr__(self, "_parent_executor_response", None)
 
-    def setup_responses(self, *, planner_response, child_responses=None, **legacy):
+    def setup_responses(
+        self,
+        *,
+        planner_response,
+        child_responses=None,
+        parent_executor_response=None,
+        **legacy,
+    ):
+        object.__setattr__(self, "_parent_executor_response", parent_executor_response)
         from collections import deque
         object.__setattr__(self, "_planner_response", planner_response)
         step0 = planner_response["steps"][0]
@@ -306,9 +315,22 @@ class PricedRoutingFakeChatModel(PricedFakeListChatModel):
         )
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        from langchain_core.messages import AIMessage
         from langchain_core.outputs import ChatGeneration, ChatResult
         selector = self._match_selector(messages)
         if selector is None or selector not in self._child_decks:
+            # [C2b rollout WS0] Parent (non-child) executor call. If a parent
+            # executor response is configured, return it as a terminal AIMessage
+            # so a SANITIZED flag-off step can run to completion (dark-launch).
+            # Else preserve the original raise (existing coordinator tests rely on it).
+            if selector is None and self._parent_executor_response is not None:
+                msg = AIMessage(
+                    content=self._parent_executor_response,
+                    usage_metadata={"input_tokens": self.input_tokens,
+                                    "output_tokens": self.output_tokens,
+                                    "total_tokens": self.input_tokens + self.output_tokens},
+                )
+                return ChatResult(generations=[ChatGeneration(message=msg)])
             raise AssertionError("routing fake: no child deck for selector in messages")
         async with self._locks[selector]:
             deck = self._child_decks[selector]

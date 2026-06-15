@@ -30,6 +30,9 @@ from app.domain.services.prompts.sections.memory_user_profile import (
     memory_user_profile_section,
 )
 from app.domain.services.prompts.sections.output_format import output_format_section
+from app.domain.services.prompts.sections.parallel_work_units_teaching import (
+    parallel_work_units_teaching_section,
+)
 from app.domain.services.prompts.sections.planner_identity import (
     planner_identity_section,
 )
@@ -100,6 +103,7 @@ ZH_EXECUTOR_REGISTRY = SectionRegistry(
 ZH_PLANNER_REGISTRY = SectionRegistry(
     sections=(
         planner_identity_section,
+        parallel_work_units_teaching_section,
         planner_tool_summary_legacy_section,
         conversation_summaries_section,
     ),
@@ -118,6 +122,7 @@ ZH_PLANNER_REGISTRY = SectionRegistry(
 ZH_UPDATER_REGISTRY = SectionRegistry(
     sections=(
         planner_identity_section,
+        parallel_work_units_teaching_section,
         planner_tool_summary_legacy_section,
         conversation_summaries_section,
     ),
@@ -133,51 +138,3 @@ ZH_BUNDLE = PromptBundle(
     planner=ZH_PLANNER_REGISTRY,
     updater=ZH_UPDATER_REGISTRY,
 )
-
-
-# ---- C2 PR-1 Task 1.10 — Planner teaching for parallel_work_units ------ #
-#
-# 同 ``bundles/en.py::PARALLEL_WORK_UNITS_TEACHING_EN``：当 Step 可拆成
-# 多个互不依赖的子任务时，让 planner 在 Step 上输出
-# ``parallel_work_units``（C2 协调器并行后端会调度独立的子 agent），
-# 而不是写成单个 ReAct 任务。**schema 示例保留英文 key，避免 LLM 翻译
-# 出现 schema drift**。PR-1 阶段仅暴露常量、不接进 planner registry，
-# 实际注入留给 PR-2/PR-3，由 ``ACTUS_C2_COORDINATOR_ENABLED`` feature
-# flag 统一门控。
-PARALLEL_WORK_UNITS_TEACHING_ZH = """
-## 并行工作单元 (Parallel Work Units，高级用法，节制使用)
-
-当一个 step 可以拆解成互不依赖的多个子任务（彼此不共享可变状态、不读
-对方输出）时，在该 step 上设置 `parallel_work_units`，而不是只写一个
-单一的 ReAct 任务。每个 work_unit 会被派发到独立、受限的子 agent。
-
-适合使用的场景：
-- 多个互不依赖的文件修改（彼此无共享可变状态）
-- 多角度独立调研
-- 跨文件的 lint / 格式化修复
-
-不适合使用的场景：
-- 子任务之间需要共享状态 / 读取彼此的输出
-- 跨 step 的推理依赖
-- 单一短任务（编排开销不值）
-
-两阶段模式：
-- Phase 1 `exploration`：子 agent 只读取，返回 proposed_write_plan
-- Phase 2 `write`：子 agent 在租约内执行已声明的写操作
-
-Schema:
-{
-  "parallel_work_units": {
-    "work_units": [
-      {
-        "objective": "rewrite api/utils/foo.py",
-        "phase": "write",
-        "allowed_tools": ["file_read", "file_write"],
-        "proposed_paths": [{"path": "api/utils/foo.py", "op": "modify"}]
-      }
-    ]
-  }
-}
-
-硬上限：每个 step 最多 5 个 work_units。
-"""

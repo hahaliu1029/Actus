@@ -695,3 +695,39 @@ async def test_rollback_stop_survives_release_failure() -> None:
         await dispatch_node(state, config)
 
     assert [e for e in call_log if e[0] == "stop"] == [("stop", ("c1", "c2"))]
+
+
+# ── C2b rollout WS1b §3.3: dispatch_started_monotonic stamp ──────────────────
+
+
+@pytest.mark.anyio
+async def test_first_time_dispatch_stamps_dispatch_started_monotonic() -> None:
+    """[C2b rollout WS1b §3.3] _first_time_dispatch carries a float
+    dispatch_started_monotonic in Command(update) — the reducer derives run
+    duration from it AND gates run-level metrics on its presence."""
+    config = _base_config(peek_returns=None)
+    state = _base_state()
+    cmd = await dispatch_node(state, config)
+    assert "dispatch_started_monotonic" in cmd.update
+    assert isinstance(cmd.update["dispatch_started_monotonic"], float)
+
+
+@pytest.mark.anyio
+async def test_rehydrate_dispatch_does_not_stamp_dispatch_started_monotonic() -> None:
+    """[C2b rollout WS1b §3.4 double-count guard] _rehydrate_dispatch (crash
+    recovery, same coordinator_run_id) must NOT set dispatch_started_monotonic
+    — so the reducer records run-level metrics nothing on rehydrate (no
+    double-count of the monotonic run_cost_usd counter)."""
+    config = _base_config(peek_returns=2)
+    rehydrate = config["configurable"]["rehydrate_service"]
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=2, count=2)
+    existing = MagicMock()
+    existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2"}
+    existing.pending = wu_ids
+    existing.terminal = {}
+    existing.already_applied = None
+    rehydrate.detect_existing_run = AsyncMock(return_value=existing)
+
+    state = _base_state()
+    cmd = await dispatch_node(state, config)
+    assert "dispatch_started_monotonic" not in cmd.update

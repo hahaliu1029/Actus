@@ -190,6 +190,33 @@ async def test_built_wrapper_carries_runtime_deps() -> None:
     assert "child_permission_context" not in kw
 
 
+async def test_build_threads_coordinator_metrics_recorder_to_adapter() -> None:
+    """[C2b rollout WS1b Task 2.3] build(..., coordinator_metrics_recorder=rec)
+    passes the recorder into the adapter ctor so _drain can record tool_calls."""
+    runner_class = MagicMock(name="AgentTaskRunner")
+    runner_instance = MagicMock(name="runner-inst")
+    runner_instance.set_coordinator_cancel_event = MagicMock()
+    runner_class.return_value = runner_instance
+    factory = ChildAgentTaskRunnerFactory(
+        runner_class=runner_class, mailbox_publisher=MagicMock(),
+        task_cls=MagicMock(),
+    )
+    rec = MagicMock(name="CoordinatorMetricsRecorder")
+    built = await factory.build(
+        child_session_id="c1",
+        child_permission_context=_mk_cctx(),
+        tool_filter_preset="coordinator_step",
+        cancel_event=asyncio.Event(),
+        sandbox=MagicMock(),
+        browser=MagicMock(),
+        user_id="u1",
+        cost_callback_handler=MagicMock(),
+        coordinator_metrics_recorder=rec,
+    )
+    assert isinstance(built.runner, AgentTaskRunnerInvokeAdapter)
+    assert built.runner._coordinator_metrics_recorder is rec
+
+
 def test_factory_ctor_stores_deps() -> None:
     """Smoke: ctor stores runner_class + mailbox_publisher as private fields
     so repeated build() calls reuse the same dependencies."""

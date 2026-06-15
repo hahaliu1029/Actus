@@ -1,26 +1,21 @@
 """[PR-9b-A] Lifespan-scoped coordinator runtime deps container.
 
-Aggregates **19 fields** (singletons). ``PlannerReActFlow._build_config()``
-copies the **first 16 deps** into ``configurable``. The 17th
-(``coordinator_envelope_store``), 18th (``parent_sandbox_adapter_factory``)
-and 19th (``coordinator_metrics`` — C2b budget D10, consumed by the starter
-ctor at composition time) are NOT copied as their own cfg keys:
+Aggregates **20 fields** (singletons). ``PlannerReActFlow._build_config()``
+projects **19 coordinator cfg keys**: the first 16 deps + 2 per-run keys
+(``cancel_event`` + the wrapped ``parent_sandbox``) + ``coordinator_metrics_recorder``
+(the 20th field, [C2b rollout WS1b] — the reducer reads it duck-typed for the
+run-level run_cost_usd / duration_seconds metrics). NOT projected as cfg keys:
 
-- ``coordinator_envelope_store`` is consumed only by ``SupervisorContext`` at
-  ``_factory`` time (NOT by the coordinator graph).
-- ``parent_sandbox_adapter_factory`` is CONSUMED at ``_build_config`` time to
-  WRAP the per-run raw ``SandboxHandle`` into a ``ParentSandboxPort`` — it is
-  the transform applied to the ``parent_sandbox`` value, not a key of its own.
-  (finish-core §5.2 G2: keeps the domain flow infra-free — the flow injects a
-  factory instead of importing ``ParentSandboxAdapter`` from infrastructure.)
+- ``coordinator_envelope_store`` — consumed only by ``SupervisorContext`` at
+  ``_factory`` time.
+- ``parent_sandbox_adapter_factory`` — CONSUMED at ``_build_config`` time to wrap
+  the raw ``SandboxHandle`` into a ``ParentSandboxPort`` (transform, not a key).
+- ``coordinator_metrics`` — consumed at composition time by the starter ctor
+  (budget D10 exhaustion counter); the graph never reads it.
 
-``_build_config()`` then ADDS 2 per-run keys (``cancel_event`` +
-``parent_sandbox``) — final total: **16 + 2 = 18 coordinator cfg keys**
-(unchanged by the 18th dep; the factory is consumed, not emitted).
-
-``_NullCoordinatorRuntimeDeps`` is the legacy-test null object that yields
-``None`` for every field; ``_build_config()`` detects it as a sentinel and
-SKIPS the 18 coordinator cfg keys entirely.
+``_NullCoordinatorRuntimeDeps`` is the legacy-test null object (every field →
+None); ``_build_config()`` detects it as a sentinel and SKIPS the coordinator
+cfg keys entirely.
 """
 from __future__ import annotations
 
@@ -55,6 +50,12 @@ class _CoordinatorRuntimeDeps:
     # composition root to thread into the starter ctor; NOT projected as a
     # cfg key by _build_config (the graph never reads it).
     coordinator_metrics: object = None
+    # [C2b rollout WS1b] CoordinatorMetricsRecorder | None. Tail-defaulted so
+    # every pre-existing construction stays source-compatible. Threaded into
+    # cfg by _build_config as the 19th coordinator cfg key (the reducer reads
+    # it duck-typed) AND independently into the starter ctor at composition
+    # time (for the adapter's tool_calls path).
+    coordinator_metrics_recorder: object = None
 
 
 @dataclass(frozen=True)
@@ -99,3 +100,5 @@ class _NullCoordinatorRuntimeDeps:
     def parent_sandbox_adapter_factory(self) -> None: return None
     @property
     def coordinator_metrics(self) -> None: return None
+    @property
+    def coordinator_metrics_recorder(self) -> None: return None

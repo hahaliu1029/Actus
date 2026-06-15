@@ -225,20 +225,20 @@ new version (forward compat).
 
 **PR-6 enforcement status标签：**
 - ✅ **gated in PR-6** — dispatch / orchestrator 路径在本 PR 已读取该 env 并按其值触发拒绝/超时。
-- 🚧 **deferred to PR-9 wiring** — 本 PR 仅落地 service / callback 实现，dispatch 与 inner_runner LLM callbacks 的接入由 PR-9 完成；flag flip 前调整该 env 值无运行时效果。
+- 🚧 **deferred (out-of-scope of the rollout-readiness pipeline)** — 本 PR 仅落地 service / callback 实现，对应 dispatch / orchestrator callsite 尚未读取该 env；flag flip 前调整该 env 值无运行时效果。（per-CHILD budget/wallclock 接入已由 commit `7f2f853` 完成，见下表 ✅ rows。）
 
 | Env var | 默认值 | PR-6 状态 | Override 注意事项 |
 |---|---|---|---|
 | `ACTUS_COORDINATOR_MAX_WORK_UNITS_PER_RUN` | `5` | ✅ gated | `_first_time_dispatch` preflight（`parallel_execution_subgraph.py:297`）按 `>` 拒绝。设置 > 7 易触发 mailbox supervisor 退化（fan-out 放大 + 单 root_session 流量集中）；> 10 会撞 `MAX_DESCENDANTS_PER_ROOT=10` 静态上限并被 descendants cap 拒绝。 |
-| `ACTUS_COORDINATOR_MAX_TOTAL_TOKEN_COST_USD_PER_RUN` | `2.00` | 🚧 deferred | `BudgetEnforcementCallback` 已落地（`budget_enforcement_callback.py`），但未绑定到 inner_runner 的 LLM callbacks 链。PR-9 wiring 接入后才会按累计 USD `>= cap` 触发 `request_stop(StopReason.TOKEN_BUDGET)` → `NEEDS_AUTHORIZATION(reason="budget_exhausted")`。与 LLM provider 余额 / 速率限制协调，过大会让 budget watchdog 在 LLM 限流之后才触发，浪费 token。 |
-| `ACTUS_COORDINATOR_MAX_TOKEN_COST_USD_PER_CHILD` | `0.50` | 🚧 deferred | 同 `TOTAL_TOKEN_COST_USD_PER_RUN`：service exists, wiring 待 PR-9。建议保持 `child * max_work_units_per_run >= total_run`，避免 PR-9 接入后某些 child 提前被切但 total 未到。 |
-| `ACTUS_COORDINATOR_MAX_WALLCLOCK_SECONDS_PER_CHILD` | `300` | 🚧 deferred | `coordinator_child_wallclock_watchdog.start_wallclock_watchdog` 已落地，但 `CoordinatorChildRunner.run_work_unit` 尚未调用它（见 `coordinator_child_runner.py:235` TODO）。PR-9 wiring 接入后才会触发 `StopReason.WALLCLOCK_BUDGET`。`load_coordinator_limits_from_env()` 已经在 PR-6 强制不变式 `< SUBAGENT_RESULT_READY_TIMEOUT_SECONDS (600s)`：违反时 silent fallback 到默认（避免 wiring 落地后 child 错过内部 cap → 被 supervisor backstop 杀掉错配 `TIMED_OUT`）。 |
-| `ACTUS_COORDINATOR_MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN` | `900` | 🚧 deferred | `_run_with_observer` 当前固定使用 `timeout_seconds=600` 默认参数，**未**从 `CoordinatorLimits` 读取。PR-9 wiring 接入后该 env 才会替换该默认值。值的语义仍是 "整个 coordinator run（含所有 work_unit + reducer）的总墙钟硬上限"；调高时确认 SSE 连接 + 客户端超时配置同步放宽；调低会让长任务的 reducer 整合阶段被强制截断。 |
+| `ACTUS_COORDINATOR_MAX_TOTAL_TOKEN_COST_USD_PER_RUN` | `2.00` | 🚧 deferred（out-of-scope of the rollout-readiness pipeline） | per-RUN token cap 仍无 callsite：`parallel_execution_subgraph.py:365` 仅有 commented TODO，dispatch 从未读取该 limit（注意 per-CHILD token cap 已 wired，见下一行）。语义是 "整个 coordinator run 的累计 token 成本硬上限"。与 LLM provider 余额 / 速率限制协调，过大会让 budget watchdog 在 LLM 限流之后才触发，浪费 token。 |
+| `ACTUS_COORDINATOR_MAX_TOKEN_COST_USD_PER_CHILD` | `0.50` | ✅ wired | per-child token cap 已接入（commit `7f2f853`）：`BudgetEnforcementCallback` 经 starter 后置注入（`coordinator_child_runner_starter.py:220/308`）→ adapter → 子任务 LLM callbacks 链，累计 USD `>= cap` 触发 `request_stop(StopReason.TOKEN_BUDGET)` → `NEEDS_AUTHORIZATION(reason="budget_exhausted")`。建议保持 `child * max_work_units_per_run >= total_run`，避免某些 child 提前被切但 per-run total 未到。 |
+| `ACTUS_COORDINATOR_MAX_WALLCLOCK_SECONDS_PER_CHILD` | `300` | ✅ wired | per-child wallclock watchdog 已接入（commit `7f2f853`）：`CoordinatorChildRunner.run_work_unit` 调用 `start_wallclock_watchdog`（`coordinator_child_runner.py:334`），超时触发 `StopReason.WALLCLOCK_BUDGET`。`load_coordinator_limits_from_env()` 强制不变式 `< SUBAGENT_RESULT_READY_TIMEOUT_SECONDS (600s)`：违反时 silent fallback 到默认（避免 child 错过内部 cap → 被 supervisor backstop 杀掉错配 `TIMED_OUT`）。 |
+| `ACTUS_COORDINATOR_MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN` | `900` | 🚧 deferred（out-of-scope of the rollout-readiness pipeline） | per-RUN wallclock cap 仍无 callsite：`CoordinatorRunOrchestrator` 硬编码 `timeout_seconds=600`（`coordinator_run_orchestrator.py:235`），**从未**从 `CoordinatorLimits` 读取该 900 limit（注意 per-CHILD wallclock cap 已 wired，见上一行）。值的语义是 "整个 coordinator run（含所有 work_unit + reducer）的总墙钟硬上限"；调高时确认 SSE 连接 + 客户端超时配置同步放宽；调低会让长任务的 reducer 整合阶段被强制截断。 |
 | `ACTUS_COORDINATOR_MAX_CONCURRENT_RUNS_PER_USER` | `2` | ✅ gated | `_first_time_dispatch` 调用 `probe_quota.acquire_coordinator_concurrency`（`parallel_execution_subgraph.py:307`），基于 Redis 原子 `INCR` + `> cap` rollback。调高时确认 Redis 容量 + 用户事件配额；调低后已被 acquire 的 slot 由 `release_coordinator_quotas` 自然回落。**Pod crash recovery**：concurrency key 在每次成功 acquire 时刷 6h TTL（`CONCURRENCY_TTL_SECONDS = 21600`，codex round 3 P1-5），兜底 "dispatch INCR 后 pod crash、reducer DECR 永远不运行" 导致永久 slot 泄漏的场景；正常生命周期下 `reducer_node.finally` 的 DECR 在 TTL 触发前就已经释放槽位，TTL 只是 ceiling，不是常规清理路径。 |
 | `ACTUS_COORDINATOR_MAX_TOKEN_COST_USD_PER_USER_PER_DAY` | `50.00` | 🚧 deferred | **PR-6 仅落地 service method**（`ProbeQuotaService.acquire_coordinator_daily_cost`，基于 Redis `INCRBYFLOAT` + 负向回滚 + 25h TTL，key 为 `actus:coord:daily_cost:{user_id}:{utc-date}`）；**dispatch 调用点延后到 PR-7+ wiring**（见 `parallel_execution_subgraph.py` `_first_time_dispatch` 的 TODO），flag flip 前该 cap 并未在生产路径生效，调整本 env 值在 PR-6 阶段无运行时效果。过低会让正常用户在跨日临近时被 reject；rollback 路径会自动负向 INCRBYFLOAT 抹掉超额。 |
-| `ACTUS_COORDINATOR_MAX_TOOL_CALLS_PER_CHILD` | `25` | 🚧 deferred | 当前 dispatch 通过 `CoordinatorEnvelopeFactory.make_spawn_request` 的默认 `CoordinatorBudgetSnapshot(max_tool_calls=25, ...)` 写入 SPAWN_REQUEST envelope，child 收到但 PR-6 没有实际 enforcement（依赖 PR-9 wiring 的 BudgetEnforcementCallback / runner 内部计数）。env 当前**不会**影响 envelope 默认值（factory 默认是 hardcoded `25`）；PR-9 wiring 之前调整本 env 无运行时效果。 |
+| `ACTUS_COORDINATOR_MAX_TOOL_CALLS_PER_CHILD` | `25` | 🚧 deferred | 当前 dispatch 通过 `CoordinatorEnvelopeFactory.make_spawn_request` 的默认 `CoordinatorBudgetSnapshot(max_tool_calls=25, ...)` 写入 SPAWN_REQUEST envelope，child 收到但**累计 tool-count 上限尚未 enforce**：`ChildScopeGate._tool_call_budget_exhausted`（`child_scope_gate.py:174-176`）目前只判 static `max_tool_calls <= 0`，累计计数器尚未接入（cumulative counter 仍 out-of-scope of the rollout-readiness pipeline）。env 当前**不会**影响 envelope 默认值（factory 默认是 hardcoded `25`）；累计 enforcement 接入前调整本 env 无运行时效果。 |
 
-任何覆盖都建议在 staging 环境跑一次 dispatch preflight + budget watchdog 烟测，确认日志中无 `coordinator_limits: ... non-positive, using default` 或 `>= supervisor backstop` 警告。✅ rows 立即生效；🚧 rows 在 PR-9 wiring 落地前是惰性的（只影响 `CoordinatorLimits` 实例内字段，未被消费者读取）。
+任何覆盖都建议在 staging 环境跑一次 dispatch preflight + budget watchdog 烟测，确认日志中无 `coordinator_limits: ... non-positive, using default` 或 `>= supervisor backstop` 警告。✅ rows 立即生效；🚧 rows 在对应 callsite 接入前是惰性的（只影响 `CoordinatorLimits` 实例内字段，未被消费者读取）——这些接入 out-of-scope of the rollout-readiness pipeline。
 
 ### C2 Coordinator OTel monitoring
 
@@ -251,7 +251,15 @@ new version (forward compat).
 | `actus_coordinator_duration_seconds` | Histogram | s | `p99 > 540s` 接近 supervisor 600s backstop |
 | `actus_coordinator_budget_exhaustion_total` | Counter | 1 | `rate(... [10m]) > 0` 子任务触顶 budget |
 
-Instrument 在 PR-6 已落地；call-site wiring（counter `add`、histogram `record`）随 PR-9 与 `ACTUS_C2_COORDINATOR_ENABLED=true` flip 同步落地。
+Instrument 在 PR-6 已落地；**4 个 instrument 现已全部接入 call-site**（C2b rollout-readiness WS1b）：
+
+- `actus_coordinator_budget_exhaustion_total` — 子任务 budget 终结器直接 `add`（`coordinator_child_runner.py:653`）。
+- `actus_coordinator_tool_calls` — invoke-adapter `_drain` 每观察到一个 `CALLING` ToolEvent 经 `CoordinatorMetricsRecorder.record_tool_call` 计数（`agent_task_runner_invoke_adapter.py` `_drain`），覆盖**每个** child（含失败/取消，不止成功写盘的子任务）。
+- `actus_coordinator_run_cost_usd` + `actus_coordinator_duration_seconds` — `reducer_node` 经 `CoordinatorMetricsRecorder.record_run_terminal` 记录（run 级）。
+
+Run 级 metrics **每个 run 只在首次派发路径记录一次**：派发起点由 `_first_time_dispatch` 打 `dispatch_started_monotonic` 时间戳，崩溃后 rehydrate 走 `_rehydrate_dispatch`（不打戳）→ reducer 不重复记录，避免 monotonic `run_cost_usd` counter 双计（§3.4）。`run_cost_usd` 仅在 cost 权威时 `add`（无 `cost_unavailable` 诊断），绝不 `add(0)`（避免把 "未知" 伪装成 "零"）。
+
+Cardinality 注意：metric label 携带高基数维度 `coordinator_run_id`（+ `user_id_hash` + `function_name`），在真实 Prometheus 上每个 run 会生成一组 series。当前无生产部署（scrape 仅本地），可接受；若将来部署，应把 `coordinator_run_id` 下放到 span/log 属性、保留可聚合维度、对 `function_name` 分桶（§3.7）。
 
 ### C2 Coordinator concurrency leak recovery
 
@@ -291,19 +299,19 @@ PR-7 落地了 coordinator 的 crash-recovery 主路径（spec §12）：pod 重
 | Surface | PR-7 落地 | 当前生效状态 | 备注 |
 |---------|-----------|----------------|------|
 | `coordinator_result_envelope_store` table | ✅ migration `c2pr7_envelope_store` | upgrade head 后表已存在 | 7 columns + `(coordinator_run_id, work_unit_id)` UNIQUE；migration 在所有 `alembic upgrade head` 跑 |
-| `CoordinatorRehydrateService` 7-step | ✅ application/services | 仅 cold-code（PR-9 wiring 后激活） | `detect_existing_run` 返回 `RehydrateResult(child_session_ids, pending, terminal, already_applied)` |
+| `CoordinatorRehydrateService` 7-step | ✅ application/services | ✅ live（C2 finish-core epic `bd400ac` 激活） | `detect_existing_run` 返回 `RehydrateResult(child_session_ids, pending, terminal, already_applied)` |
 | `SessionRepository.find_children_by_coordinator_run` | ✅ ABC + DB impl | 已 ship | 按 `(coordinator_run_id, parent_session_id)` 排序 by `created_at` ASC |
-| MailboxSupervisor `persist_terminal` PROLOGUE | ✅ ResultReady + CancelAck | 🚧 deferred PR-9 wiring | gate 双 None：`coordinator_envelope_store` AND `session_repo`。当前 `service_dependencies.py` 未注入 `coordinator_envelope_store` → PROLOGUE silently no-op |
-| `_rehydrate_dispatch` 4 branches | ✅ subgraph | cold-code | already_applied 短路 + 终端 envelope pre-populate + 意外子任务 CANCEL_REQUEST + missing-child raise（v1 hard fail）|
+| MailboxSupervisor `persist_terminal` PROLOGUE | ✅ ResultReady + CancelAck | ✅ wired | gate 双 None：`coordinator_envelope_store` AND `session_repo`。C2 finish-core epic（`bd400ac`）注入了 `coordinator_envelope_store`（`service_dependencies.py:785` AND `:964`）→ PROLOGUE live path 已激活 |
+| `_rehydrate_dispatch` 4 branches | ✅ subgraph | ✅ live（C2 finish-core epic `bd400ac`；仅崩溃恢复路径触达） | already_applied 短路 + 终端 envelope pre-populate + 意外子任务 CANCEL_REQUEST + missing-child raise（v1 hard fail）|
 | `main_graph._run_parallel_backend` `ALREADY_APPLIED:` 短路 | ✅ 4 status 分支 | 已 ship | success / rollback_partial / crash_mid_apply / in_progress_recent 各自有 operator-facing summary |
 | `HealthEvent` rollback_partial + crash_mid_apply 告警 | ✅ rehydrate service | 已 ship | `HealthStatus.TERMINATING` + `metrics["code"]` = `coordinator_apply_rollback_partial` / `coordinator_apply_crash_mid_apply` |
 | Envelope store payload safety（whitelist + 64KB + PII + 非序列化）| ✅ 4 path | 已 ship | minimum rehydrate fields = `{outcome, patch_manifest, cost_summary, needs_authorization_details, final_state}`；写入前 strip + truncate + PII redact + JSON fallback |
 
-**PR-9 flip checklist (cleanup)**：
-1. 在 `service_dependencies.py:_factory` 注入 `coordinator_envelope_store=DbCoordinatorResultEnvelopeStoreRepository(pg_session_factory)` 和 PR-6 的 `cost_rollup_service=...`；
-2. 把 `parallel_execution_subgraph.py` `_first_time_dispatch` 的 PR-7+ TODO（daily cost cap + 缺失 child 幂等 spawn）逐项落地；
-3. 把 `coordinator_child_runner.py:235` 的 PR-9 wiring TODO（wallclock watchdog + budget callback）连同 `planner_react.py:_build_config` 的 14-dep DI 一起跑通；
-4. 翻 `ACTUS_C2_COORDINATOR_ENABLED=true` 前必须确认 §15.2 7 AST gate + 6 pytest marker + 3 E2E integration test 全过（PR-9 §15.2 spec）。
+**Flip checklist (cleanup)**：
+1. ✅ DONE（C2 finish-core epic `bd400ac`）：`service_dependencies.py` 已注入 `coordinator_envelope_store=DbCoordinatorResultEnvelopeStoreRepository(...)`（`:785` AND `:964`）和 `cost_rollup_service=...`；
+2. 把 `parallel_execution_subgraph.py` `_first_time_dispatch` 的 PR-7+ TODO（daily cost cap + 缺失 child 幂等 spawn）逐项落地（仍 out-of-scope of the rollout-readiness pipeline）；
+3. ✅ DONE（commit `7f2f853`）：`coordinator_child_runner.py` 的 wallclock watchdog（`start_wallclock_watchdog`，现位于 `:334`）+ budget callback 已跑通，`planner_react.py:_build_config` 的 coordinator DI 链也已接好；
+4. 翻 `ACTUS_C2_COORDINATOR_ENABLED=true` 前必须确认 §15.2 7 AST gate + 6 pytest marker + 3 E2E integration test 全过。剩余收尾 = 本 PR（C2b rollout-readiness WS1b）落地的 3 个 OTel instrument call-site wiring（见上方 OTel monitoring 段）。
 
 **PR-7 missing-child 硬失败（v1 契约）**：
 
@@ -364,18 +372,18 @@ While the flag stays `false`, the coordinator emit sites silently no-op and the 
 
 1. Update `.env` (or k8s ConfigMap): `ACTUS_C2_COORDINATOR_ENABLED=true`.
 2. Roll restart `api` pods.
-3. Monitor (PR-9b call-site wiring required for live signal):
-   - `actus_coordinator_run_cost_usd` — emitted from `CoordinatorRunOrchestrator` (call-site wiring lands in PR-9b together with the deferred `_emit_event` wirings).
+3. Monitor:
+   - `actus_coordinator_run_cost_usd` — emitted from `reducer_node` via `CoordinatorMetricsRecorder.record_run_terminal` (call-site wired by the C2b rollout-readiness WS1b PR; run-level, recorded once per run on the first-time-dispatch path — rehydrate skips, §3.4).
    - `actus_coordinator_budget_exhaustion_total` — emitted from the child runner's budget finalizer (`CoordinatorChildRunner._finalize_needs_authorization_budget`, single aggregation point for both token/wallclock reasons; wired by the C2b in-flight budget PR).
 
-   Precondition: drive a synthetic coordinator run (a planner step with 2-3 `parallel_work_units`) and verify `actus_coordinator_run_cost_usd > 0` via the metrics endpoint. If the counter is flat after a known coordinator run, the call-site wiring hasn't landed yet — DO NOT rely on flat readings to declare "no coordinator runs."
+   Precondition: drive a synthetic coordinator run (a planner step with 2-3 `parallel_work_units`) and verify `actus_coordinator_run_cost_usd > 0` via the metrics endpoint.
 4. 24h observation window after the synthetic-run smoke check passes.
 5. Rollback if anomaly: revert `ACTUS_C2_COORDINATOR_ENABLED=false`, roll restart `api` pods.
 
 ### Rollback safety
 
-- Today (PR-2/PR-3 planner teaching wiring deferred): the `PARALLEL_WORK_UNITS_TEACHING_{EN,ZH}` constants in `api/app/domain/services/prompts/bundles/{zh,en}.py` are defined but not yet injected into the planner prompt registry — so the planner LLM doesn't know the `parallel_work_units` schema and can't emit it, regardless of `ACTUS_C2_COORDINATOR_ENABLED`. Once PR-2/PR-3 inject the teaching, the flag-gating below becomes the active control.
-- Defense in depth: if any cold-code path or stale prompt ever produced `parallel_work_units` while the flag is `false`, the executor's `assert_coordinator_enabled()` at `api/app/domain/services/graphs/main_graph.py:695` raises `RuntimeError` — fail-loud rather than silent-dispatch.
+- Planner teaching is now injected (flag-gated) by the C2b rollout-readiness WS0 PR: the `PARALLEL_WORK_UNITS_TEACHING_{EN,ZH}` constants live in `api/app/domain/services/prompts/sections/parallel_work_units_teaching.py` and are registered as `parallel_work_units_teaching_section` at index 1 of BOTH the planner and updater registries in `bundles/en.py` + `bundles/zh.py`. The section's `_render` calls `is_coordinator_enabled()` per render, so flag-OFF emits nothing (planner never learns the `parallel_work_units` schema) and flag-ON teaches it — flipping `ACTUS_C2_COORDINATOR_ENABLED=true` now actually enables coordinator dispatch (the flag is no longer inert). Note the prompt teaching-gate is only a **probability reducer** — it lowers the chance the planner emits `parallel_work_units` while off, but it is NOT the hard safety control (an LLM could still emit the schema unprompted).
+- Defense in depth — the HARD flag-off safety comes from two non-prompt layers, not the teaching-gate: (1) `_build_plan_from_response` + updater **sanitation** strip any `parallel_work_units` from a plan while the flag is `false`; (2) if a cold-code path or stale prompt ever produced `parallel_work_units` and it reached the executor, the executor's `assert_coordinator_enabled()` at `api/app/domain/services/graphs/main_graph.py:767` raises `RuntimeError` — fail-loud rather than silent-dispatch.
 - Mid-run rollback caveat: flipping the flag back to `false` mid-run is NOT graceful. The supervisor continues consuming envelopes already dispatched, but any rehydrate-on-restart will hit `assert_coordinator_enabled()` and fail-fast. Drain in-flight coordinator runs (or wait for them to reach terminal) before flipping `false`.
 - No data loss across flips; `coordinator_apply_audit`, `coordinator_result_envelope_store`, `coordinator_run_state` tables persist independently of the flag.
 
@@ -389,11 +397,16 @@ rehydrate emit + orchestrator group-create hoist), and a dedicated
 unskip guard GREEN flag-on against real pg+redis+minio+sandbox with a fake LLM.
 
 **`ACTUS_C2_COORDINATOR_ENABLED=true` runs ONLY in test/CI. Production stays
-default-off.** Remaining deferrals (NOT done): production flip, live-provider
-acceptance, canary/rollout automation, dashboard/SSE-timeline UI, N≥10 perf,
+default-off.** The minimal read-only SSE coordinator timeline is now **DONE**
+(C2b rollout-readiness PR-3 / WS2: `ui/src/components/session/coordinator-timeline-item.tsx`
++ the 5 `coordinator_*` render branches in `ui/src/app/sessions/[id]/page.tsx`
++ the TS event types); only a fancy coordinator dashboard (NG4) remains out of
+scope. Remaining deferrals (NOT done): production flip, live-provider
+acceptance, canary/rollout automation, fancy dashboard UI (NG4), N≥10 perf,
 full ChildScopeGate live-wiring (child confirmation is disabled; lease safety via
 tool_filter + patch-extraction lease-check + reducer), `atomic_write_file` true
-atomicity, in-flight wallclock/token budget wiring, multi-level spawn.
+atomicity, per-RUN wallclock/token budget wiring (per-CHILD budgets ARE wired),
+multi-level spawn.
 
 ## 前端开发
 
