@@ -588,27 +588,29 @@ class PatchApplier:
                 # succeeds atomically OR raises with no observable
                 # side effect" — that's the spec'd contract.
                 #
-                # **v1 gap**: the live sandbox HTTP service backing
-                # ``SandboxHandle.upload_file`` does NOT yet fully
-                # honor this — it writes via ``open(path, "wb")`` +
-                # chunked write, so a mid-write exception can leave
-                # a truncated file. See
-                # ``ParentSandboxAdapter`` module docstring for the
-                # full limitation table; closing the gap is a PR-7 /
-                # sandbox-team follow-up (tmp+fsync+rename or
-                # sandbox rename RPC). Until then, partial-file
-                # leakage on a write that crashes mid-stream is a
-                # documented v1 behavior, surfaced via the
-                # ``failed_reason`` audit column.
+                # As of **S1** (atomic_write_file design) the live sandbox
+                # HTTP service backing ``SandboxHandle.upload_file`` writes
+                # via ``mkstemp + fsync + os.replace`` (``_atomic_write_bytes``
+                # in ``sandbox/app/services/file.py``), so per-file
+                # final-path-content atomicity now holds for regular-file
+                # targets (the content a patch entry carries in practice): a
+                # write that raised left no truncated file, so NOT adding the
+                # current entry to rollback is sound. (If a patch entry's
+                # strict-relative path happened to target an EXISTING special
+                # file, the write would be a non-atomic pass-through per S1 D12
+                # — parity with pre-S1, node not clobbered; the apply path does
+                # NOT stat-guard the target inode type, so that case is
+                # possible-but-uncovered, not unreachable. A leftover empty
+                # parent directory on a pre-replace failure is a benign side
+                # effect invisible to digest/rollback — S1 §1.
+                # Path-transparency / Gap B is a separate S1b concern and does
+                # not affect atomicity.)
                 #
-                # Including the current entry in rollback would cause
+                # Including the current entry in rollback would ALSO cause
                 # a false ROLLBACK_PARTIAL status when the rollback's
-                # restore write fails on a file the apply write
-                # never actually touched (typical case: 4xx-class
-                # RPC failure before any byte hit the sandbox). The
-                # tradeoff: post-PR-7 atomicity fixes the leak case;
-                # PR-5 prioritizes audit clarity for the common case
-                # over edge-case rollback for partial leaks.
+                # restore write fails on a file the apply write never
+                # actually touched (typical case: 4xx-class RPC failure
+                # before any byte hit the sandbox).
                 rb, rb_failed = await self._rollback(
                     applied, snapshots, parent_sandbox, plan,
                 )

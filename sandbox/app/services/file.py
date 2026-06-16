@@ -3,6 +3,8 @@ import glob
 import logging
 import os.path
 import re
+import stat
+import tempfile
 from typing import Optional
 
 from fastapi import UploadFile
@@ -24,6 +26,140 @@ from app.models.file import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _read_umask_once() -> int:
+    """Read the process umask without leaving it changed.
+
+    Snapshotted once at import (uvicorn runs ``--workers 1`` under
+    supervisord) to avoid the process-global ``os.umask()`` read-modify-read
+    race if it were done per-write.
+    """
+    old = os.umask(0)
+    os.umask(old)
+    return old
+
+
+_UMASK = _read_umask_once()
+# Parity with the old ``open(path, "wb")`` new-file mode (~0o644 under the
+# default 0o022 umask).
+_NEW_FILE_MODE = 0o666 & ~_UMASK
+
+
+def _write_all(fd: int, data: bytes) -> int:
+    """Write all of ``data`` to ``fd`` via the raw ``os.write`` loop.
+
+    Handles short writes (the kernel may write fewer bytes than requested) and
+    uses no buffered layer, so a subsequent ``os.fsync`` covers every byte.
+    Returns the number of bytes written.
+    """
+    mv = memoryview(data)
+    off = 0
+    while off < len(mv):
+        off += os.write(fd, mv[off:])
+    return len(mv)
+
+
+def _direct_write_through(target: str, source_chunks) -> int:
+    """Legacy non-atomic write-through — the old ``open(target, "wb")`` path.
+
+    Used ONLY for an EXISTING special file (FIFO / socket / device, incl.
+    ``/dev/null``) where an atomic replace would DESTROY the node (D12).
+    Atomicity is meaningless for a stream/device, so today's pass-through
+    semantics are preserved. Returns the number of bytes written.
+    """
+    n = 0
+    with open(target, "wb") as f:
+        for chunk in source_chunks:
+            f.write(chunk)
+            n += len(chunk)
+    return n
+
+
+def _apply_target_mode(fd: int, target: str) -> None:
+    """Set the temp fd's mode to match the overwrite target (D10).
+
+    - missing target -> new-file mode (parity with old ``open(path, "wb")``)
+    - existing regular file -> preserve permission bits ONLY, stripping
+      setuid/setgid/sticky (owner is not preserved and the sandbox runs as
+      root, so copying a 04xxx bit would mint a setuid-root file)
+    - symlink -> new-file mode (special files never reach here; D12 handles
+      them before this is called)
+    """
+    try:
+        st = os.lstat(target)  # lstat: do NOT follow a symlink target
+    except FileNotFoundError:
+        os.fchmod(fd, _NEW_FILE_MODE)
+        return
+    if stat.S_ISREG(st.st_mode):
+        os.fchmod(fd, stat.S_IMODE(st.st_mode) & 0o777)
+    else:
+        os.fchmod(fd, _NEW_FILE_MODE)
+
+
+def _atomic_write_bytes(target: str, source_chunks) -> int:
+    """Atomically overwrite ``target`` with the concatenation of
+    ``source_chunks`` (a bytes iterable). Returns the number of bytes written.
+
+    Recipe: same-dir ``tempfile.mkstemp`` -> ``_write_all`` -> ``os.fsync`` ->
+    ``os.replace`` (POSIX-atomic visibility — a concurrent reader sees
+    old-complete or new-complete, never truncated). On any exception BEFORE
+    ``os.replace`` the original target is left intact and the temp is
+    best-effort unlinked (a rare unlink failure logs a warning and may leave a
+    benign ``.actus-tmp-*`` orphan — visible, never the final path) without
+    masking the original error.
+
+    Final-component symlinks are REPLACED in place (D9, not followed).
+    Existing special files (FIFO/socket/device) fall back to a non-atomic
+    direct write-through (D12) so ``os.replace`` does not clobber the node
+    (single-writer assumption per the S1 spec; a concurrent swap of ``target``
+    between the ``lstat`` dispatch and ``os.replace`` is out of scope).
+    """
+    parent = os.path.dirname(target)
+    # Bare-path rejection FIRST: os.makedirs("") raises, exactly as today, so
+    # even a bare special-file target fails before the D12 fallback.
+    os.makedirs(parent, exist_ok=True)
+    try:
+        st = os.lstat(target)
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+            return _direct_write_through(target, source_chunks)
+    except FileNotFoundError:
+        pass  # missing -> atomic create below
+    fd = tmp = None
+    try:
+        # mkstemp in the TARGET's own dir -> same filesystem -> os.replace is
+        # an intra-FS swap, never EXDEV.
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".actus-tmp-")
+        _apply_target_mode(fd, target)
+        n = 0
+        for chunk in source_chunks:
+            n += _write_all(fd, chunk)
+        os.fsync(fd)
+        _fd, fd = fd, None  # null BEFORE close -> cleanup never double-closes
+        os.close(_fd)
+        os.replace(tmp, target)  # ATOMIC visibility; replaces a symlink too
+        # parent-dir fsync deliberately omitted (durability, not atomicity)
+        return n
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass  # best-effort; never mask the original
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                # best-effort cleanup; never mask the original. A rare unlink
+                # failure leaves a benign ``.actus-tmp-*`` orphan (visible,
+                # never the final path) — surface it but do not raise. The
+                # logging call itself is guarded so a misbehaving log
+                # handler/formatter can never replace the in-flight error.
+                try:
+                    logger.warning("原子写清理临时文件失败，可能残留: %s", tmp)
+                except Exception:
+                    pass
+        raise
 
 
 class FileService:
@@ -183,17 +319,26 @@ class FileService:
                 # 10.清除下临时文件
                 os.unlink(temp_file)
             else:
-                # 11.非sudo使用Python方式写入，先确保文件路径存在
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                # 11.非 sudo 写入：覆盖走原子 helper，追加保持旧的非原子语义
+                if append:
+                    # append 不可原子化（rename 无法追加）——保持最佳努力写入，
+                    # bytes_written 仍是 f.write 的字符数（追加是 non-goal）。
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-                # 12.创建一个异步写入的函数
-                def async_write_file() -> int:
-                    write_mode = "a" if append else "w"
-                    with open(filepath, write_mode, encoding="utf-8") as f:
-                        return f.write(content)
+                    def async_append_file() -> int:
+                        with open(filepath, "a", encoding="utf-8") as f:
+                            return f.write(content)
 
-                # 13.使用asyncio创建一个子线程写入内容
-                bytes_written = await asyncio.to_thread(async_write_file)
+                    bytes_written = await asyncio.to_thread(async_append_file)
+                else:
+                    # 12.覆盖写：mkstemp + fsync + os.replace 原子落盘（S1）。
+                    #    返回字节数（len(encode)），与 sudo 分支对齐——非 ASCII
+                    #    内容下与旧的 f.write 字符数不同（H4，已文档化）。
+                    bytes_written = await asyncio.to_thread(
+                        _atomic_write_bytes,
+                        filepath,
+                        [content.encode("utf-8")],
+                    )
 
             return FileWriteResult(
                 filepath=filepath,
@@ -299,26 +444,21 @@ class FileService:
     async def upload_file(cls, file: UploadFile, filepath: str) -> FileUploadResult:
         """根据传递的文件源+路径将文件上传至沙箱"""
         try:
-            # 1.定义分块上传，每次只上传8k
+            # 1.分块读取上传内容，每次最多 8K
             chunk_size = 1024 * 8
-            file_size = 0
 
-            # 2.确保上传文件所在的目录存在
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            def _source_chunks():
+                while True:
+                    chunk = file.file.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
 
-            # 3.定义一个异步函数用于上传文件避免阻塞进程
-            def async_write_file():
-                nonlocal file_size
-                with open(filepath, "wb") as f:
-                    while True:
-                        chunk = file.file.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        file_size += len(chunk)
-
-            # 4.使用asyncio子线程完成函数调用
-            await asyncio.to_thread(async_write_file)
+            # 2.通过共享的原子写 helper 落盘（mkstemp + fsync + os.replace）——
+            #   崩溃/中途异常不会留下截断文件（S1）。
+            file_size = await asyncio.to_thread(
+                _atomic_write_bytes, filepath, _source_chunks()
+            )
 
             return FileUploadResult(
                 filepath=filepath,
@@ -344,14 +484,24 @@ class FileService:
         )
 
     async def delete_file(self, filepath: str) -> FileDeleteResult:
-        """根据传递的路径+sudo删除指定文件"""
-        # 1.判断文件是否存在
-        await self.ensure_file(filepath)
+        """根据传递的路径删除指定文件（幂等）。
 
-        try:
-            # 2.调用命令删除文件
-            os.remove(filepath)
-            return FileDeleteResult(filepath=filepath, deleted=True)
-        except Exception as e:
-            logger.error(f"删除文件{filepath}失败: {str(e)}")
-            raise AppException(f"删除文件{filepath}失败: {str(e)}")
+        丢弃旧的 ensure_file check-then-act（TOCTOU + 非幂等）：删除一个
+        已不存在的文件视为成功（terminal-absent，ENOENT→success）。其它
+        OSError（EACCES/EISDIR/EROFS 等）包成 AppException 上抛——保留具体
+        诊断信息，与 write_file/upload_file 一致（delete endpoint 不再额外
+        包装，raw OSError 会退化成全局 500 泛化文案，见 Deviation D-2）。
+        RPC success=True 表示"终态：文件不存在"（S1 §3.4）。
+        """
+
+        def _rm() -> None:
+            try:
+                os.remove(filepath)
+            except FileNotFoundError:
+                pass  # 已不存在 == 成功（幂等）
+            except OSError as e:
+                # 非 ENOENT 错误包成 AppException，保留具体诊断信息
+                raise AppException(f"删除文件{filepath}失败: {e}")
+
+        await asyncio.to_thread(_rm)
+        return FileDeleteResult(filepath=filepath, deleted=True)

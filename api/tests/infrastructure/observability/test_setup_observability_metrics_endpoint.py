@@ -38,6 +38,11 @@ def _clean_default_env(monkeypatch):
     monkeypatch.delenv("OTEL_EXPORTER", raising=False)
     monkeypatch.delenv("OTLP_PROTOCOL", raising=False)
     monkeypatch.delenv("METRICS_ENDPOINT_TOKEN", raising=False)
+    # ``metrics_endpoint_token`` now also reads the ACTUS_-prefixed alias
+    # (core/config.py AliasChoices); strip it too so a runbook-set
+    # ``ACTUS_METRICS_ENDPOINT_TOKEN`` in the dev/CI shell can't taint the
+    # default-mode (token-unset) assertions.
+    monkeypatch.delenv("ACTUS_METRICS_ENDPOINT_TOKEN", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

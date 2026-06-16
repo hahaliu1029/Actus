@@ -51,6 +51,11 @@ def _clean_default_env(monkeypatch):
     monkeypatch.delenv("OTEL_EXPORTER", raising=False)
     monkeypatch.delenv("OTLP_PROTOCOL", raising=False)
     monkeypatch.delenv("METRICS_ENDPOINT_TOKEN", raising=False)
+    # ``metrics_endpoint_token`` now also reads the ACTUS_-prefixed alias
+    # (core/config.py AliasChoices). A dev/CI shell that exported
+    # ``ACTUS_METRICS_ENDPOINT_TOKEN`` per the coordinator runbook would
+    # otherwise leak into these default-disabled tests (404 → 401 / reader wired).
+    monkeypatch.delenv("ACTUS_METRICS_ENDPOINT_TOKEN", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

@@ -4,7 +4,13 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import AwareDatetime, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Source the Settings defaults from the canonical spec constants so changing
@@ -234,7 +240,20 @@ class Settings(BaseSettings):
     # OtelMeter / OtelLLMMetricsCallback 写入的 instrument 暴露成
     # Prometheus exposition format（``text/plain; version=0.0.4``）。
     # 仅供内部 Prometheus / VictoriaMetrics 拉取，不暴露给终端用户。
-    metrics_endpoint_token: str = ""
+    # Accept BOTH the canonical unprefixed name AND the ``ACTUS_``-prefixed name.
+    # ``Settings`` has no ``env_prefix``, so the field's native env var is the
+    # unprefixed ``METRICS_ENDPOINT_TOKEN`` (used by the endpoint/observability
+    # tests). The C2 coordinator runbooks + perf CLI prescribe
+    # ``ACTUS_METRICS_ENDPOINT_TOKEN`` for consistency with
+    # ``ACTUS_C2_COORDINATOR_ENABLED`` / ``ACTUS_COORDINATOR_*``. Without the
+    # alias the prefixed name was silently ignored → empty token → /api/v1/metrics
+    # 404 → silent empty scrape + perf-CLI ``raise_for_status`` crash.
+    metrics_endpoint_token: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "METRICS_ENDPOINT_TOKEN", "ACTUS_METRICS_ENDPOINT_TOKEN"
+        ),
+    )
 
     # C1a: subagent spawn caps. Nested config so the same env_prefix=ACTUS_
     # surface stays consistent regardless of how it's accessed.

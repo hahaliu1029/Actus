@@ -106,6 +106,14 @@ services:
       # PR-9 acceptance; flip per CONTRIBUTING.md "C2 CoordinatorTaskRunner
       # Deployment" rollout checklist.
       ACTUS_C2_COORDINATOR_ENABLED: ${ACTUS_C2_COORDINATOR_ENABLED:-false}
+      # Metrics endpoint auth token (B5 observability). Empty (default) →
+      # /api/v1/metrics 404s (endpoint disabled). Required for the C2 coordinator
+      # live-acceptance + perf-sampling runbooks (scrape sends Authorization:
+      # Bearer <token>). Without this passthrough the container's token is always
+      # empty, so the scrape 404s regardless of .env. App accepts this
+      # ACTUS_-prefixed name OR unprefixed METRICS_ENDPOINT_TOKEN
+      # (core/config.py AliasChoices).
+      ACTUS_METRICS_ENDPOINT_TOKEN: ${ACTUS_METRICS_ENDPOINT_TOKEN:-}
       # C2 coordinator hard caps（pass-through；默认值由代码 coordinator_limits.py 持有，
       # 这里不设 compose 级默认，未设置时变量为空 → loader 走代码默认）。
       ACTUS_COORDINATOR_MAX_WORK_UNITS_PER_RUN: ${ACTUS_COORDINATOR_MAX_WORK_UNITS_PER_RUN:-}

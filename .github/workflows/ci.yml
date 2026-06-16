@@ -184,6 +184,26 @@ jobs:
           ACTUS_REQUIRE_SANDBOX_TESTS: "1"
         run: uv run pytest tests/sandbox/ -m sandbox -v
 
+  sandbox-test:
+    name: Sandbox Unit Tests (S1 atomic write)
+    runs-on: ubuntu-latest
+    # S1: sandbox FileService atomic-write + idempotent-delete unit tests.
+    # The sandbox is a uv workspace member but ships its OWN `app` package
+    # that collides with `api/app`, so it runs as its own pytest project from
+    # the member dir against the shared workspace venv. `--locked` fails the
+    # job if the committed root uv.lock is stale (forgotten `uv lock` after
+    # adding the pytest dev-deps). Pure os/tempfile behavior — no Docker, no
+    # DB, no Redis.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Run sandbox unit tests
+        working-directory: sandbox
+        run: uv run --locked pytest -q
+
   frontend-test:
     name: Frontend Tests
     runs-on: ubuntu-latest

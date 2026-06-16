@@ -8,33 +8,32 @@ Composition root (PR-7/8) constructs one of these per coordinator run
 holding the parent session's ``SandboxHandle``. The adapter MUST NOT
 expose destroy() — see ``ParentSandboxPort`` docstring §10.5 invariant.
 
-**Known v1 limitations (PR-5 cold-code; addressed before flag flip):**
+**v1 limitations (PR-5 cold-code):**
 
-- *atomic_write_file true atomicity* [codex R8 P1]: ``ParentSandboxPort``
-  contracts ``atomic_write_file`` as raise-or-succeed with no observable
-  side effect. The live sandbox HTTP service backing
-  ``SandboxHandle.upload_file`` currently writes via ``open(path,
-  'wb')`` + chunked write (``sandbox/app/services/file.py``); a mid-
-  write exception leaves a truncated file. Closing the gap requires
-  EITHER (a) sandbox-side tmp+fsync+rename, OR (b) adapter-side
-  upload to a temp path + atomic rename via a sandbox rename RPC.
-  PR-5 ships the contract + applier logic that relies on it; the
-  sandbox-side enforcement is a PR-7 / sandbox-team follow-up.
-  Until then operators may observe partial-file leakage on an
-  apply that crashes mid-write — symptom is documented in the
-  ``failed_reason`` audit column and HealthEvent metrics.
+- *atomic_write_file true atomicity* — **CLOSED by S1.** The sandbox HTTP
+  service backing ``SandboxHandle.upload_file`` now writes via
+  ``mkstemp + fsync + os.replace`` (``_atomic_write_bytes`` in
+  ``sandbox/app/services/file.py``), so a mid-write exception no longer
+  leaves a truncated file: the contract's final-path-content
+  raise-or-succeed atomicity holds for regular-file / symlink / new-file
+  targets and the ``WRITE_IO_ERROR`` rollback skip is sound. (An EXISTING
+  special file — FIFO/socket/device — falls back to a non-atomic
+  write-through per S1 D12 so the node is not clobbered, which is parity
+  with pre-S1; atomicity is meaningless for a stream/device. A patch entry
+  carries regular-file content in practice, but the apply path does NOT
+  stat-guard the target inode type, so this atomicity guarantee is *scoped
+  to regular-file targets* — not a claim that a special-file target is
+  unreachable on the apply path.) See the S1 design spec
+  (``docs/superpowers/specs/2026-06-16-c2full-s1-atomic-write-design.md``).
 
-- *Path resolution* [codex R8 P1]: ``FilePatchEntry.path`` is strict
-  sandbox-relative (rejects absolute + non-canonical). The live
-  sandbox HTTP API currently expects absolute paths
-  (``sandbox/app/interfaces/schemas/file.py``). PR-5 cold-code does
-  NOT yet join the relative path to a parent-sandbox root prefix —
-  that join happens at the PR-7/8 composition root which owns the
-  parent sandbox's "patch root" path (typically ``/workspace`` or
-  similar). Until composition root wires it, passing a relative
-  patch path through this adapter directly to a live sandbox would
-  resolve against the sandbox's CWD; PR-5's cold-code gate
-  (``ACTUS_C2_COORDINATOR_ENABLED=false``) prevents that today.
+- *Path resolution* [codex R8 P1] — still open, **addressed by S1b (Gap B).**
+  ``FilePatchEntry.path`` is strict sandbox-relative; the live sandbox HTTP
+  API resolves a relative path against the sandbox CWD (``/sandbox``), NOT a
+  parent-workspace root. The relative->absolute join is an S1b migration
+  (it breaks the locked ``test_g2b_path_roundtrip`` invariant). The
+  ``ACTUS_C2_COORDINATOR_ENABLED=false`` flag gate prevents the coordinator
+  apply path from going live before S1b lands. (Gap B is orthogonal to
+  atomicity — S1 makes the write atomic, S1b makes the path correct.)
 """
 from __future__ import annotations
 
@@ -169,17 +168,21 @@ class ParentSandboxAdapter(ParentSandboxPort):
     async def atomic_write_file(self, path: str, content: bytes) -> None:
         """Write ``content`` to ``path``.
 
-        Atomicity at the FS level is whatever the sandbox backend
-        provides. The applier's snapshot/rollback layer (§10)
-        provides the all-or-nothing guarantee across a multi-file
-        plan *assuming* per-file atomicity holds. **Today this
-        assumption is partial** [codex R8 P1]: the live sandbox HTTP
-        service backing ``upload_file`` writes via ``open(path,
-        'wb')`` + chunked write, so a mid-write exception leaves a
-        truncated file. The applier's ``WRITE_IO_ERROR`` branch
-        relies on raise-or-succeed atomicity to skip the current
-        entry's rollback — see module docstring "Known v1
-        limitations" for the gap + PR-7 mitigation.
+        Per-file atomicity is enforced sandbox-side as of **S1**: the live
+        sandbox HTTP service backing ``upload_file`` writes via
+        ``mkstemp + fsync + os.replace`` (``_atomic_write_bytes``), so this
+        method's contract — final-path-content raise-or-succeed with no
+        observable truncated file — holds for regular-file / symlink /
+        new-file targets (an EXISTING special file falls back to a non-atomic
+        write-through per S1 D12 — parity with pre-S1, the node is not
+        clobbered; the apply path does NOT stat-guard the target inode type,
+        so the guarantee is *scoped to regular-file targets*, not asserted
+        unreachable for special files). The applier's ``WRITE_IO_ERROR``
+        branch may therefore soundly skip rollback of the current entry (a
+        regular-file write that raised left no partial final-path content). A
+        newly-created empty parent directory on a pre-replace failure is a
+        benign, pre-existing non-atomic side effect invisible to
+        digest/rollback (S1 §1).
 
         ``SandboxHandle.upload_file`` takes ``BinaryIO`` and returns
         ``ToolResult``. We raise ``OSError`` on ``success=False`` so the

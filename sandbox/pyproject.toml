@@ -11,3 +11,20 @@ dependencies = [
     "python-multipart>=0.0.21",
     "uvicorn[standard]>=0.40.0",
 ]
+
+[tool.pytest.ini_options]
+# Sandbox runs as its OWN pytest project (rootdir = sandbox/). `pythonpath`
+# puts sandbox/ on sys.path so `import app.services.file` resolves to the
+# SANDBOX app — both api/app and sandbox/app are top-level `app` packages and
+# co-importing them in one interpreter collides, which is why this cannot be
+# collected under the api venv. asyncio_mode=auto so `async def test_*` needs
+# no per-test marker.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.0.0",
+]

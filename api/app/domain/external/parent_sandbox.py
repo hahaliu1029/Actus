@@ -40,25 +40,25 @@ class ParentSandboxPort(Protocol):
       to snapshot original content for rollback.
     - ``atomic_write_file(path, content)`` writes ``content`` to ``path``
       atomically. **Contract** [codex R7 P1 + R8 P1]: this method
-      should either succeed (file at ``path`` now has the new
-      contents) OR raise with NO observable side effect on the
+      either succeeds (file at ``path`` now has the new contents) OR
+      raises with NO observable final-path-content side effect on the
       sandbox. The applier's rollback path is built around this
-      contract — if a write raises but partially applied, the applier
-      will not include that entry in rollback and the partial state
-      would persist. Backends MUST emulate via tmp + fsync + rename
-      (or equivalent) to satisfy the contract.
+      contract. Backends emulate via tmp + fsync + rename.
 
-      *v1 status*: the live ``SandboxHandle.upload_file`` HTTP RPC
-      currently writes via ``open(path, "wb")`` + chunked write
-      (see ``sandbox/app/services/file.py``); a mid-write exception
-      leaves a truncated file. PR-5 ships the contract + the
-      applier logic that relies on it; the sandbox-side
-      enforcement is a PR-7 / sandbox-team follow-up — see
-      ``ParentSandboxAdapter`` module docstring for the full
-      v1-limitation table and mitigation strategy.
-    - ``delete_file(path)`` removes the file at ``path``. Same
-      raise-or-succeed atomicity contract as ``atomic_write_file``,
-      same v1 caveat (the live RPC uses ``os.remove`` directly).
+      *v1 status*: **enforced sandbox-side as of S1** — the live
+      ``SandboxHandle.upload_file`` HTTP RPC writes via
+      ``mkstemp + fsync + os.replace`` (see
+      ``sandbox/app/services/file.py`` ``_atomic_write_bytes`` and the
+      S1 design spec); a mid-write exception no longer leaves a
+      truncated file for regular-file / symlink / new-file targets. (An
+      EXISTING special file — FIFO/socket/device — uses a non-atomic
+      write-through per S1 D12 so the node is not clobbered; atomicity is
+      meaningless for a stream/device. Path-transparency / Gap B is a
+      separate S1b follow-up and does not affect atomicity.)
+    - ``delete_file(path)`` removes the file at ``path``. **Idempotent
+      as of S1**: deleting an already-absent file is success
+      (terminal-absent) — the live RPC uses ``os.remove`` catching
+      ENOENT; other OSError still surface.
 
     Failure modes for ``read_file`` / ``atomic_write_file`` /
     ``delete_file`` are intentionally NOT specified at the Protocol level
