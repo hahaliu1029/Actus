@@ -25,6 +25,7 @@ from app.application.services.patch_applier import (
     PatchApplier,
 )
 from app.application.services.rollback_snapshot_store import FileSnapshot
+from app.domain.external.parent_sandbox import SandboxPathCheck
 from app.domain.models.event import HealthEvent, HealthStatus
 from app.domain.models.patch_apply_plan import PatchApplyPlan
 from app.domain.models.patch_manifest import FilePatchEntry
@@ -68,6 +69,9 @@ def parent_sandbox() -> MagicMock:
     """
     s = MagicMock()
     s.exists = AsyncMock(return_value=True)
+    s.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")
+    )
     s.compute_digest = AsyncMock(side_effect=[_SHA_A, _NEW_DIGEST])
     s.read_file = AsyncMock(return_value=b"original")
     s.atomic_write_file = AsyncMock()
@@ -248,7 +252,11 @@ async def test_file_missing_aborts(
     parent_sandbox: MagicMock,
     minio: MagicMock,
 ) -> None:
-    parent_sandbox.exists = AsyncMock(return_value=False)
+    # modify-branch preflight now probes via check_path() (not exists());
+    # a missing target still aborts FILE_MISSING.
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=False, kind="missing")
+    )
     plan = _modify_plan()
     out = await applier.apply(
         plan, parent_sandbox=parent_sandbox, minio_client=minio,
@@ -549,9 +557,12 @@ async def test_add_then_failure_rollback_deletes_added_file(
     previous version walked only ``snapshots`` and never undid add ops,
     leaving 'a.py' behind on rollback — a direct violation of the
     all-or-nothing apply contract."""
-    # add 'a.py' doesn't exist (preflight); modify 'b.py' exists.
-    exists_seq = [False, True]  # a.py preflight, b.py preflight
-    parent_sandbox.exists = AsyncMock(side_effect=exists_seq)
+    # add 'a.py' doesn't exist (preflight via exists()); modify 'b.py'
+    # exists (preflight now via check_path()).
+    parent_sandbox.exists = AsyncMock(return_value=False)          # a.py add
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")  # b.py modify
+    )
     # compute_digest: b.py preflight = _SHA_A; a.py post-write = _NEW_DIGEST
     parent_sandbox.compute_digest = AsyncMock(
         side_effect=[_SHA_A, _NEW_DIGEST],
@@ -604,6 +615,65 @@ async def test_add_then_failure_rollback_deletes_added_file(
         c.args for c in parent_sandbox.delete_file.await_args_list
     ]
     assert ("a.py",) in delete_calls
+
+
+async def test_toctou_refused_write_rolls_back_prior_entry(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    """2b at the applier level (spec §4 test 8): a refused write raises
+    OSError -> WRITE_IO_ERROR **+ rollback of prior entries**. Two-entry plan:
+    'a.py' add succeeds, then 'b.py' modify's write raises the special-file
+    refuse — the applier rolls back the already-applied 'a.py' (delete_file in
+    reverse) and reports WRITE_IO_ERROR with rollback 'complete'. (That the flag
+    is SET is proven separately by test_atomic_write_file_sets_refuse_special_true.)"""
+    import errno
+
+    # a.py add -> exists()=False (add branch keeps exists()); b.py modify ->
+    # check_path regular (switched branch).
+    parent_sandbox.exists = AsyncMock(return_value=False)
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")
+    )
+    # compute_digest order: b.py modify preflight (=_SHA_A, matches base_digest)
+    # then a.py post-write verify (=_NEW_DIGEST). (Same as the fixture default.)
+    parent_sandbox.compute_digest = AsyncMock(side_effect=[_SHA_A, _NEW_DIGEST])
+
+    write_count = {"n": 0}
+
+    async def _write(path: str, content: bytes) -> None:
+        write_count["n"] += 1
+        if write_count["n"] == 2:  # b.py: the refused special write
+            raise OSError(errno.EINVAL, "refusing to write special file")
+
+    parent_sandbox.atomic_write_file = AsyncMock(side_effect=_write)
+
+    plan = PatchApplyPlan(
+        coordinator_run_id="r1",
+        files=(
+            FilePatchEntry(
+                path="a.py", op="add",
+                new_digest=_NEW_DIGEST, content_ref="ref-a",
+                content_size=len(_NEW_CONTENT),
+            ),
+            FilePatchEntry(
+                path="b.py", op="modify",
+                base_digest=_SHA_A, new_digest=_NEW_DIGEST,
+                content_ref="ref-b", content_size=len(_NEW_CONTENT),
+            ),
+        ),
+        total_size_bytes=2 * len(_NEW_CONTENT),
+        file_count=2,
+        source_work_unit_ids=("wu1",),
+    )
+    out = await applier.apply(
+        plan, parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status is ApplyStatus.WRITE_IO_ERROR
+    assert out.rollback_status == "complete"
+    # rollback undid the already-applied 'a.py' add (delete_file in reverse order).
+    parent_sandbox.delete_file.assert_awaited_once_with("a.py")
 
 
 async def test_audit_insert_then_terminal(
@@ -778,3 +848,127 @@ async def test_failed_reason_truncated_and_sanitized(
     assert len(sanitized) <= 256
     # Truncation marker preserved
     assert "...[truncated]" in sanitized
+
+
+# ─── S1b 2a: special-file preflight reject ───────────────────────────────────
+
+
+@pytest.mark.parametrize("special_kind", ["fifo", "socket", "block", "char"])
+async def test_modify_over_special_target_rejected_before_read(
+    special_kind: str,
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+    snapshot_store: MagicMock,
+) -> None:
+    """2a: modify over ANY direct special inode (fifo/socket/block/char) ->
+    TARGET_SPECIAL_FILE before any read/snapshot/write. Parameterized over the
+    FULL special set so dropping socket/block/char from the applier reject tuple
+    goes RED. A reorder that reads before the kind-check also goes RED."""
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind=special_kind)
+    )
+    out = await applier.apply(
+        _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status is ApplyStatus.TARGET_SPECIAL_FILE
+    assert out.failed_at.path == "x.py"
+    assert f"kind={special_kind}" in out.failed_at.reason
+    parent_sandbox.compute_digest.assert_not_called()
+    parent_sandbox.read_file.assert_not_called()
+    snapshot_store.save.assert_not_called()
+    parent_sandbox.atomic_write_file.assert_not_called()
+
+
+async def test_add_over_special_target_is_file_exists_never_writes(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    """add over an existing target -> FILE_EXISTS via exists() (unchanged).
+    `add` never consults check_path, so special-vs-regular is identical on
+    this path — pin FILE_EXISTS + no write."""
+    parent_sandbox.exists = AsyncMock(return_value=True)
+    out = await applier.apply(
+        _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status is ApplyStatus.FILE_EXISTS
+    parent_sandbox.atomic_write_file.assert_not_called()
+
+
+async def test_symlink_to_nonregular_is_write_io_error_not_special(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    """2a keys on the DIRECT lstat inode: a symlink target is kind="symlink"
+    (not special), proceeds to compute_digest which 500s on a non-regular
+    referent -> WRITE_IO_ERROR, explicitly NOT TARGET_SPECIAL_FILE."""
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="symlink")
+    )
+    parent_sandbox.compute_digest = AsyncMock(side_effect=OSError("download 500"))
+    out = await applier.apply(
+        _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    parent_sandbox.check_path.assert_awaited_once_with("x.py")
+    parent_sandbox.exists.assert_not_called()  # modify branch switched off exists()
+    parent_sandbox.compute_digest.assert_awaited()
+    assert out.status is ApplyStatus.WRITE_IO_ERROR
+    assert out.status is not ApplyStatus.TARGET_SPECIAL_FILE
+
+
+async def test_applier_fail_open_kind_other_proceeds(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    """Mixed-version fail-OPEN at the applier: kind="other" (old sandbox /
+    soft lstat failure) is NOT TARGET_SPECIAL_FILE; compute_digest IS awaited
+    (flow proceeds to the existing digest/snapshot path)."""
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="other")
+    )
+    out = await applier.apply(
+        _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status is not ApplyStatus.TARGET_SPECIAL_FILE
+    parent_sandbox.compute_digest.assert_awaited()
+
+
+async def test_delete_no_apply_step_inode_guard_d9_off(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    """D9=off pin: a delete whose preflight saw kind=regular proceeds to
+    delete_file(path) with no refuse_special kwarg at the apply step (the
+    benign delete-TOCTOU is documented/accepted, not closed). FilePatchEntry
+    op=delete REQUIRES base_digest and FORBIDS new_digest/content_ref/
+    content_size (patch_manifest.py __post_init__)."""
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")
+    )
+    parent_sandbox.compute_digest = AsyncMock(return_value=_SHA_A)
+    delete_plan = PatchApplyPlan(
+        coordinator_run_id="r1",
+        files=(FilePatchEntry(path="x.py", op="delete", base_digest=_SHA_A),),
+        total_size_bytes=0,
+        file_count=1,
+        source_work_unit_ids=("wu1",),
+    )
+    out = await applier.apply(
+        delete_plan, parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status is ApplyStatus.SUCCESS
+    parent_sandbox.delete_file.assert_awaited_once_with("x.py")
+
+
+def test_target_special_file_status_value_and_length():
+    """Pin the exact audit/SSE wire string + that it fits
+    ``coordinator_apply_audit.status`` ``String(32)``. The other tests assert
+    enum IDENTITY (``is ApplyStatus.TARGET_SPECIAL_FILE``), which would NOT
+    catch a value typo or an over-32-char value that breaks the audit write /
+    FE string pass-through."""
+    assert ApplyStatus.TARGET_SPECIAL_FILE.value == "target_special_file"
+    assert len(ApplyStatus.TARGET_SPECIAL_FILE.value) <= 32

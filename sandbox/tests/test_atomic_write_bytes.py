@@ -340,3 +340,78 @@ def test_symlink_to_special_replaced_not_followed_to_writethrough(tmp_path, monk
     assert not os.path.islink(link)                # symlink replaced in place (D9)
     assert link.read_bytes() == b"NEW"
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode)   # referent FIFO untouched
+
+
+# --- Task 2: refuse_special strict refuse branch (2b) ---------------------
+
+def test_refuse_special_raises_einval_on_fifo_no_blocking_open(tmp_path, monkeypatch):
+    """refuse_special=True over a FIFO → OSError(EINVAL), and the blocking
+    write-through is NEVER entered (spy, non-blocking — never perform the
+    real writer-only open)."""
+    import errno
+    from app.services import file as filemod
+
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    wt_calls = []
+    monkeypatch.setattr(
+        filemod, "_direct_write_through",
+        lambda target, chunks: wt_calls.append((target, list(chunks))),
+    )
+
+    with pytest.raises(OSError) as ei:
+        filemod._atomic_write_bytes(str(fifo), [b"data"], refuse_special=True)
+    assert ei.value.errno == errno.EINVAL
+    assert "refusing to write special file" in str(ei.value)
+    assert wt_calls == []  # never fell through to the blocking write-through
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)  # node untouched
+
+
+def test_refuse_special_directory_not_special_falls_through(tmp_path, monkeypatch):
+    """A directory is NOT in the special set — refuse_special=True must NOT
+    raise EINVAL; it falls to _direct_write_through→open()→IsADirectoryError.
+    Pins _is_special = fifo/socket/block/char only."""
+    from app.services import file as filemod
+
+    d = tmp_path / "adir"
+    d.mkdir()
+    # Real _direct_write_through on a directory → open() raises IsADirectoryError,
+    # NOT the special-refuse EINVAL. Assert we reached that branch.
+    with pytest.raises(IsADirectoryError):
+        filemod._atomic_write_bytes(str(d), [b"x"], refuse_special=True)
+
+
+def test_refuse_special_true_on_regular_still_atomic(tmp_path):
+    """refuse_special only triggers on a direct special inode — a regular
+    target still atomic-writes."""
+    from app.services import file as filemod
+
+    p = tmp_path / "f.txt"
+    p.write_text("old")
+    n = filemod._atomic_write_bytes(str(p), [b"NEW"], refuse_special=True)
+    assert n == 3
+    assert p.read_bytes() == b"NEW"
+
+
+def test_refuse_special_true_on_missing_still_creates(tmp_path):
+    from app.services import file as filemod
+
+    p = tmp_path / "new.txt"
+    n = filemod._atomic_write_bytes(str(p), [b"hi"], refuse_special=True)
+    assert n == 2
+    assert p.read_bytes() == b"hi"
+
+
+def test_is_special_covers_exactly_fifo_socket_block_char():
+    """`_is_special` returns True for the FULL special set (fifo/socket/block/
+    char) and False for every non-special kind. A mutation that drops
+    socket/block/char (or adds directory/regular) goes RED. Synthetic st_mode
+    bits — no root/mknod needed."""
+    import stat
+    from app.services import file as filemod
+
+    for special in (stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFBLK, stat.S_IFCHR):
+        assert filemod._is_special(special | 0o644) is True
+    for non_special in (stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
+        assert filemod._is_special(non_special | 0o644) is False

@@ -17,23 +17,30 @@ expose destroy() — see ``ParentSandboxPort`` docstring §10.5 invariant.
   leaves a truncated file: the contract's final-path-content
   raise-or-succeed atomicity holds for regular-file / symlink / new-file
   targets and the ``WRITE_IO_ERROR`` rollback skip is sound. (An EXISTING
-  special file — FIFO/socket/device — falls back to a non-atomic
-  write-through per S1 D12 so the node is not clobbered, which is parity
-  with pre-S1; atomicity is meaningless for a stream/device. A patch entry
-  carries regular-file content in practice, but the apply path does NOT
-  stat-guard the target inode type, so this atomicity guarantee is *scoped
-  to regular-file targets* — not a claim that a special-file target is
-  unreachable on the apply path.) See the S1 design spec
+  special file — FIFO/socket/device — is REFUSED on the
+  coordinator apply/seed path as of S1b: ``atomic_write_file`` passes
+  ``refuse_special=True`` so the sandbox raises ``OSError(EINVAL)`` instead
+  of the D12 non-atomic write-through, surfacing as ``WRITE_IO_ERROR`` +
+  rollback rather than a FIFO hang. The 2a preflight additionally rejects a
+  direct special target with ``TARGET_SPECIAL_FILE`` before the read. The
+  non-atomic D12 write-through is retained ONLY for the agent ``write_file``
+  path. The apply-path atomic-or-raise contract now holds for the special
+  set too.) See the S1 design spec
   (``docs/superpowers/specs/2026-06-16-c2full-s1-atomic-write-design.md``).
 
-- *Path resolution* [codex R8 P1] — still open, **addressed by S1b (Gap B).**
-  ``FilePatchEntry.path`` is strict sandbox-relative; the live sandbox HTTP
-  API resolves a relative path against the sandbox CWD (``/sandbox``), NOT a
-  parent-workspace root. The relative->absolute join is an S1b migration
-  (it breaks the locked ``test_g2b_path_roundtrip`` invariant). The
-  ``ACTUS_C2_COORDINATOR_ENABLED=false`` flag gate prevents the coordinator
-  apply path from going live before S1b lands. (Gap B is orthogonal to
-  atomicity — S1 makes the write atomic, S1b makes the path correct.)
+- *Path resolution* — **CLOSED.** ``FilePatchEntry.path`` is strict
+  sandbox-relative and the host adapter passes it through unchanged:
+  host-side path-transparency — no ``/workspace`` / ``patch_root`` join — is
+  locked by ``INV-F2.3`` + ``test_g2b_path_roundtrip`` (C2-finish G2b/PR-F3).
+  The relative→absolute anchoring lives sandbox-side: the live sandbox HTTP
+  service anchors a relative path under ``workspace_root`` (/home/ubuntu) via
+  ``sandbox/app/core/workspace.py`` (the Sandbox Workspace Isolation epic),
+  not the process CWD (/sandbox) — the ONLY layer all three writers (agent
+  file_write, coordinator seed-install, parent apply) share — so round-trip
+  identity holds at /home/ubuntu. (Gap B was orthogonal to atomicity: S1 made
+  the write atomic, G2b/INV-F2.3 locked host path-transparency, and the
+  Workspace Isolation epic makes the sandbox-side path correct.) S1b hardens
+  the special-file target case instead (2a preflight reject + 2b write refuse).
 """
 from __future__ import annotations
 
@@ -43,7 +50,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from app.domain.external.parent_sandbox import ParentSandboxPort
+from app.domain.external.parent_sandbox import ParentSandboxPort, SandboxPathCheck
 
 if TYPE_CHECKING:
     from app.domain.external.sandbox import SandboxHandle
@@ -116,6 +123,34 @@ class ParentSandboxAdapter(ParentSandboxPort):
             return bool(exists_attr)
         return bool(data)
 
+    async def check_path(self, path: str) -> SandboxPathCheck:
+        """Inode-typed existence probe (S1b 2a).
+
+        Parses ``{exists, kind}`` from the sandbox ``check_file_exists``
+        RPC. **Mixed-version fail-OPEN**: an OLD sandbox image returns no
+        ``kind`` → default to a NON-special value (``"missing"`` when
+        absent, else ``"other"``) so 2a proceeds (pre-S1b behavior). A
+        fail-CLOSED default would treat every regular target as special
+        and break all applies. Raises ``OSError`` on RPC failure, matching
+        ``exists()``.
+        """
+        result = await self._sandbox.check_file_exists(path)
+        if not result.success:
+            raise OSError(
+                f"sandbox check_file_exists failed for {path!r}: "
+                f"{result.message!r}",
+            )
+        data = result.data
+        if isinstance(data, dict):
+            exists = bool(data.get("exists", False))
+            kind = data.get("kind")
+        else:
+            exists = bool(getattr(data, "exists", False))
+            kind = getattr(data, "kind", None)
+        if not kind:
+            kind = "missing" if not exists else "other"
+        return SandboxPathCheck(exists=exists, kind=kind)
+
     async def read_file(self, path: str) -> bytes:
         """Read raw file contents.
 
@@ -173,13 +208,20 @@ class ParentSandboxAdapter(ParentSandboxPort):
         ``mkstemp + fsync + os.replace`` (``_atomic_write_bytes``), so this
         method's contract — final-path-content raise-or-succeed with no
         observable truncated file — holds for regular-file / symlink /
-        new-file targets (an EXISTING special file falls back to a non-atomic
-        write-through per S1 D12 — parity with pre-S1, the node is not
-        clobbered; the apply path does NOT stat-guard the target inode type,
-        so the guarantee is *scoped to regular-file targets*, not asserted
-        unreachable for special files). The applier's ``WRITE_IO_ERROR``
-        branch may therefore soundly skip rollback of the current entry (a
-        regular-file write that raised left no partial final-path content). A
+        new-file targets.
+
+        **S1b 2b (coordinator-only refuse):** this adapter passes
+        ``refuse_special=True`` to ``upload_file`` so an EXISTING special
+        file (FIFO / socket / device) at the target is **refused** — the
+        sandbox raises ``EINVAL`` (surfaced here as ``OSError``) rather than
+        doing the D12 non-atomic write-through that could block on a FIFO
+        open (the TOCTOU hang the 2a preflight cannot fully close). The
+        agent ``write_file`` path keeps the default ``refuse_special=False``
+        and its D12 write-through is unchanged. The applier's
+        ``WRITE_IO_ERROR`` branch may therefore soundly skip rollback of the
+        current entry: a regular-file write that raised left no partial
+        final-path content (``os.replace`` is the only mutating step), and a
+        refused special-file write never touched the target node at all. A
         newly-created empty parent directory on a pre-replace failure is a
         benign, pre-existing non-atomic side effect invisible to
         digest/rollback (S1 §1).
@@ -189,18 +231,23 @@ class ParentSandboxAdapter(ParentSandboxPort):
         applier's per-entry try/except catches it and routes to the
         ``WRITE_IO_ERROR`` branch with rollback.
         """
-        # [finish-core §5.2 G2b (c)] A bare filename → sandbox os.makedirs("")
-        # raises. Reject loudly here so the failure is attributable, not a
-        # cryptic FileNotFoundError from the remote service. Path-transparency
-        # is preserved: any path with a directory component (relative or
-        # absolute) passes through unchanged — no ``/workspace`` join.
+        # [Sandbox Workspace Isolation §3.8] Reject a bare filename as
+        # coordinator manifest HYGIENE — manifest paths must carry a directory
+        # component (e.g. 'workspace/foo.py'). NOTE: the sandbox service itself
+        # now ANCHORS a bare name to /home/ubuntu/<name> (the old "os.makedirs('')
+        # raises" rationale is obsolete); this adapter is the final hygiene guard,
+        # and validate_relative_path_strict does NOT reject bare names. Path
+        # transparency is preserved: any path WITH a directory component passes
+        # through unchanged — no /workspace join.
         if os.path.dirname(path) == "":
             raise ValueError(
                 f"bare filename rejected (no directory component): {path!r}; "
                 f"coordinator manifest paths must include a directory "
                 f"(e.g. 'workspace/foo.py')"
             )
-        result = await self._sandbox.upload_file(io.BytesIO(content), path)
+        result = await self._sandbox.upload_file(
+            io.BytesIO(content), path, refuse_special=True
+        )
         if not result.success:
             raise OSError(
                 f"sandbox upload_file failed for {path!r}: {result.message!r}",

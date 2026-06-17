@@ -13,6 +13,7 @@ Three methods:
   docstring (``c2pr5_add_coordinator_apply_audit.py``) for the
   authoritative ``status`` taxonomy (``success`` /
   ``digest_drift`` / ``file_missing`` / ``file_exists`` /
+  ``target_special_file`` /
   ``post_write_digest_mismatch`` / ``minio_fetch_failed`` /
   ``write_io_error`` / ``apply_aborted`` / ``rollback_partial``).
 - ``find_latest_for_run`` is the rehydrate path (PR-7) + SSE replay

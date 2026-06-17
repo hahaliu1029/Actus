@@ -25,6 +25,10 @@ VARCHAR with no CHECK constraint — applier writes ``ApplyStatus.value``:
   vs. sandbox compute_digest.
 - ``file_missing`` — preflight modify/delete on a non-existent path.
 - ``file_exists`` — preflight add on an already-existing path.
+- ``target_special_file`` — preflight modify/delete found the target is a
+  direct special inode (FIFO/socket/block/char) via ``check_path`` before
+  the read; rejected without snapshot/read/write (S1b 2a). No schema change
+  (free-text String(32); 19 chars).
 - ``post_write_digest_mismatch`` — post-write verify re-read the
   sandbox file and got a digest != ``new_digest`` (sandbox-side
   truncation / corruption).

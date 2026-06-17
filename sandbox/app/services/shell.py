@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from app.core.workspace import resolve_in_workspace
 from app.interfaces.errors.exceptions import (
     AppException,
     BadRequestException,
@@ -238,7 +239,12 @@ class ShellService:
         if existing:
             await self.close_pty_session(session_id)
 
-        exec_dir = exec_dir or os.path.expanduser("~")
+        if not exec_dir:
+            exec_dir = os.path.expanduser("~")
+        else:
+            # Anchor a relative exec_dir to the workspace root (absolute passes
+            # through). No service-tree deny — cd-ing to read is harmless.
+            exec_dir = resolve_in_workspace(exec_dir)
         if not os.path.exists(exec_dir):
             raise BadRequestException(f"当前目录不存在: {exec_dir}")
 
@@ -554,6 +560,10 @@ class ShellService:
         )
         if not exec_dir or exec_dir == "":
             exec_dir = os.path.expanduser("~")
+        else:
+            # Anchor a relative exec_dir to the workspace root (absolute passes
+            # through). No service-tree deny — cd-ing to read is harmless.
+            exec_dir = resolve_in_workspace(exec_dir)
         if not os.path.exists(exec_dir):
             logger.error(f"当前目录不存在: {exec_dir}")
             raise BadRequestException(f"当前目录不存在: {exec_dir}")

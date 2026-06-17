@@ -120,8 +120,14 @@ class Sandbox(Protocol):
         file_data: BinaryIO,
         filepath: str,
         filename: Optional[str] = None,
+        *,
+        refuse_special: bool = False,
     ) -> ToolResult:
-        """根据文件源数据+路径+文件名将文件上传到沙箱中"""
+        """根据文件源数据+路径+文件名将文件上传到沙箱中。
+
+        ``refuse_special=True``（仅 coordinator apply/seed 路径）令底层原子写
+        在 special 文件目标处 raise 而非 D12 写穿透。
+        """
         ...
 
     async def download_file(self, filepath: str) -> BinaryIO:
@@ -268,7 +274,12 @@ class SandboxHandle(Protocol):
     async def find_files(self, dir_path: str, glob_pattern: str) -> ToolResult: ...
 
     async def upload_file(
-        self, file_data: BinaryIO, filepath: str, filename: Optional[str] = None
+        self,
+        file_data: BinaryIO,
+        filepath: str,
+        filename: Optional[str] = None,
+        *,
+        refuse_special: bool = False,
     ) -> ToolResult: ...
 
     async def download_file(self, filepath: str) -> BinaryIO: ...

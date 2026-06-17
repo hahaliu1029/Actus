@@ -192,6 +192,7 @@ class ApplyStatus(StrEnum):
     WRITE_IO_ERROR = "write_io_error"
     ROLLBACK_PARTIAL = "rollback_partial"
     APPLY_ABORTED = "apply_aborted"
+    TARGET_SPECIAL_FILE = "target_special_file"
 
 
 @dataclass(frozen=True)
@@ -348,11 +349,33 @@ class PatchApplier:
         try:
             for e in plan.files:
                 if e.op in ("modify", "delete"):
-                    if not await parent_sandbox.exists(e.path):
+                    # [S1b 2a] Inode-typed preflight: probe the DIRECT lstat
+                    # kind so a target that is a special file (FIFO / socket
+                    # / block / char) is rejected BEFORE any read / snapshot /
+                    # write. ``check_path`` replaces the bool-only ``exists()``
+                    # on this branch (the ``add`` branch keeps ``exists()``).
+                    check = await parent_sandbox.check_path(e.path)
+                    if not check.exists:
                         return await self._finalize(
                             audit_id, ApplyStatus.FILE_MISSING,
                             failed=AppliedFileFailure(
                                 path=e.path, reason="missing",
+                            ),
+                            applied=[],
+                            snapshots_to_discard=snapshots,
+                            started_at=started_at,
+                            plan=plan,
+                            lineage=lineage,
+                        )
+                    if check.kind in ("fifo", "socket", "block", "char"):
+                        return await self._finalize(
+                            audit_id, ApplyStatus.TARGET_SPECIAL_FILE,
+                            failed=AppliedFileFailure(
+                                path=e.path,
+                                reason=(
+                                    f"target is special file "
+                                    f"(kind={check.kind})"
+                                ),
                             ),
                             applied=[],
                             snapshots_to_discard=snapshots,
@@ -595,16 +618,18 @@ class PatchApplier:
                 # final-path-content atomicity now holds for regular-file
                 # targets (the content a patch entry carries in practice): a
                 # write that raised left no truncated file, so NOT adding the
-                # current entry to rollback is sound. (If a patch entry's
-                # strict-relative path happened to target an EXISTING special
-                # file, the write would be a non-atomic pass-through per S1 D12
-                # — parity with pre-S1, node not clobbered; the apply path does
-                # NOT stat-guard the target inode type, so that case is
-                # possible-but-uncovered, not unreachable. A leftover empty
-                # parent directory on a pre-replace failure is a benign side
-                # effect invisible to digest/rollback — S1 §1.
-                # Path-transparency / Gap B is a separate S1b concern and does
-                # not affect atomicity.)
+                # current entry to rollback is sound.
+                # (As of **S1b** the apply path DOES stat-guard the target
+                # inode type for the special set: the modify/delete preflight
+                # rejects a direct FIFO/socket/block/char target with
+                # ApplyStatus.TARGET_SPECIAL_FILE before the read (2a), and the
+                # coordinator write refuses a special target with OSError
+                # instead of the D12 write-through (2b, refuse_special=True),
+                # so a TOCTOU special swap surfaces here as WRITE_IO_ERROR +
+                # rollback rather than a FIFO hang. The agent's own write_file
+                # keeps D12 unchanged. A leftover empty parent directory on a
+                # pre-replace failure is still a benign side effect — S1 §1.
+                # Path resolution / Gap B is closed by G2b — not an S1b concern.)
                 #
                 # Including the current entry in rollback would ALSO cause
                 # a false ROLLBACK_PARTIAL status when the rollback's

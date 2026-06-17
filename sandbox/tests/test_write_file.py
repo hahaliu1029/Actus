@@ -48,12 +48,42 @@ async def test_append_does_not_use_atomic_helper(tmp_path, monkeypatch):
     assert target.read_text() == "line1\nline2\n"
 
 
-async def test_write_file_bare_path_rejected(tmp_path, monkeypatch):
-    """[spec test 9] Bare filename rejected at the PUBLIC write_file surface —
-    parity with today (`os.makedirs("")` raises, wrapped in AppException)."""
+async def test_write_file_bare_name_anchors_under_workspace(tmp_path, monkeypatch):
+    """[§3.8] The SANDBOX service now ACCEPTS a bare name — it anchors to
+    workspace_root/<name>. (The host ParentSandboxAdapter still rejects bare
+    names as coordinator manifest hygiene — that guard is unchanged.)"""
+    from app.core import config as cfg
     from app.services.file import FileService
-    from app.interfaces.errors.exceptions import AppException
 
-    monkeypatch.chdir(tmp_path)  # ensure no stray "bare.py" lands in the repo
-    with pytest.raises(AppException):
-        await FileService.write_file(filepath="bare.py", content="x")
+    ws = tmp_path / "home"
+    ws.mkdir()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(ws))
+    cfg.get_settings.cache_clear()
+    try:
+        result = await FileService.write_file(filepath="bare.py", content="x")
+        assert (ws / "bare.py").read_text() == "x"
+        assert result.filepath == "bare.py"  # echo-original
+    finally:
+        cfg.get_settings.cache_clear()
+
+
+async def test_write_file_over_fifo_keeps_d12_write_through_nonblocking(tmp_path, monkeypatch):
+    import os
+    from app.services import file as filemod
+    from app.services.file import FileService
+
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    wt_calls = []
+
+    def spy_wt(target, source_chunks):
+        chunks = list(source_chunks)
+        wt_calls.append((target, chunks))
+        return sum(len(c) for c in chunks)
+
+    monkeypatch.setattr(filemod, "_direct_write_through", spy_wt)
+
+    result = await FileService.write_file(str(fifo), "data")
+    assert wt_calls == [(str(fifo), [b"data"])]  # D12 path, never the refuse branch
+    assert result.bytes_written == 4

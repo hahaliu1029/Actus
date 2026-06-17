@@ -621,11 +621,21 @@ class DockerSandbox(Sandbox):
         file_data: BinaryIO,
         filepath: str,
         filename: str = None,
+        *,
+        refuse_special: bool = False,
     ) -> ToolResult:
-        """将文件源上传至沙箱指定位置"""
+        """将文件源上传至沙箱指定位置
+
+        ``refuse_special=True``（仅 coordinator apply/seed 路径）随多部分表单
+        透传给沙箱端, 令底层原子写在 special 文件目标处 raise 而非 D12 写穿透。
+        非 coordinator 调用方保持默认 ``False``。
+        """
         # 1.预配置上传数据
         files = {"file": (filename or "upload", file_data, "application/octet-stream")}
-        data = {"filepath": filepath}
+        data = {
+            "filepath": filepath,
+            "refuse_special": str(refuse_special).lower(),  # "true"/"false"
+        }
 
         # 2.发起请求上传数据获取响应
         response = await self.client.post(

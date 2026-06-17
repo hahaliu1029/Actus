@@ -95,6 +95,11 @@ class Settings(BaseSettings):
     sandbox_https_proxy: Optional[str] = None
     sandbox_http_proxy: Optional[str] = None
     sandbox_no_proxy: Optional[str] = None
+    # NOTE (N3 follow-up): this default (/root) drifts from the real shell
+    # default (~ = /home/ubuntu) and the file workspace root (/home/ubuntu).
+    # The Sandbox Workspace Isolation epic anchors relative FILE/SHELL paths to
+    # /home/ubuntu but deliberately does NOT touch this AST-validator default
+    # (security-sensitive component). Reconcile in a separate follow-up.
     sandbox_default_cwd: str = "/root"
     container_timezone: str = "UTC"
 

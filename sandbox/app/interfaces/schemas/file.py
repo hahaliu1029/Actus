@@ -6,7 +6,9 @@ from pydantic import BaseModel, Field
 class FileReadRequest(BaseModel):
     """读取文件请求结构体"""
 
-    filepath: str = Field(..., description="要读取文件的绝对路径")
+    filepath: str = Field(
+        ..., description="要读取文件的路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )
     start_line: Optional[int] = Field(
         default=None, description="(可选)读取的起始行, 索引从0开始"
     )
@@ -22,7 +24,9 @@ class FileReadRequest(BaseModel):
 class FileWriteRequest(BaseModel):
     """写入文件请求结构体"""
 
-    filepath: str = Field(..., description="要写入文件的绝对路径")
+    filepath: str = Field(
+        ..., description="要写入文件的路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )
     content: str = Field(..., description="要写入的文本内容")
     append: Optional[bool] = Field(default=False, description="(可选)是否使用追加模式")
     leading_newline: Optional[bool] = Field(
@@ -37,7 +41,9 @@ class FileWriteRequest(BaseModel):
 class FileReplaceRequest(BaseModel):
     """查找替换文件内容请求结构体"""
 
-    filepath: str = Field(..., description="要替换内容的文件绝对路径")
+    filepath: str = Field(
+        ..., description="要替换内容的文件路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )
     old_str: str = Field(..., description="要替换的原始字符串")
     new_str: str = Field(..., description="要替换的新字符串")
     sudo: Optional[bool] = Field(default=False, description="(可选)是否使用sudo权限")
@@ -46,7 +52,9 @@ class FileReplaceRequest(BaseModel):
 class FileSearchRequest(BaseModel):
     """文件内容查找请求结构体"""
 
-    filepath: str = Field(..., description="要查找内容的文件绝对路径")
+    filepath: str = Field(
+        ..., description="要查找内容的文件路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )
     regex: str = Field(..., description="搜索正则表达式")
     sudo: Optional[bool] = Field(default=False, description="(可选)是否使用sudo权限")
 
@@ -54,17 +62,23 @@ class FileSearchRequest(BaseModel):
 class FileFindRequest(BaseModel):
     """文件查找请求结构体"""
 
-    dir_path: str = Field(..., description="搜索的目录绝对路径")
+    dir_path: str = Field(
+        ..., description="搜索的目录路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )
     glob_pattern: str = Field(..., description="文件名模式(glob语法)")
 
 
 class FileCheckRequest(BaseModel):
     """检查文件是否存在请求结构体"""
 
-    filepath: str = Field(..., description="要检查是否存在的文件绝对路径")
+    filepath: str = Field(
+        ..., description="要检查是否存在的文件路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )
 
 
 class FileDeleteRequest(BaseModel):
     """删除文件请求结构体"""
 
-    filepath: str = Field(..., description="要删除的文件绝对路径")
+    filepath: str = Field(
+        ..., description="要删除的文件路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
+    )

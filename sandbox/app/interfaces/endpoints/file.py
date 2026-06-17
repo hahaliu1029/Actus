@@ -3,6 +3,7 @@ import os.path
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import FileResponse
 
+from app.core.workspace import resolve_in_workspace
 from app.interfaces.schemas.base import Response
 from app.interfaces.schemas.file import (
     FileCheckRequest,
@@ -127,7 +128,7 @@ async def search_in_file(
 async def find_files(
     request: FileFindRequest,
     file_service: FileService = Depends(get_file_service),
-) -> Response[FileFindRequest]:
+) -> Response[FileFindResult]:
     """根据传递的文件夹+glob文件规则查找文件列表"""
     result = await file_service.find_files(
         dir_path=request.dir_path,
@@ -147,6 +148,7 @@ async def find_files(
 async def upload_file(
     file: UploadFile = File(...),  # 上传的文件源
     filepath: str = Form(None),  # 上传的文件路径
+    refuse_special: bool = Form(False),  # coordinator 专用：special 文件拒写
     file_service: FileService = Depends(get_file_service),
 ) -> Response[FileUploadResult]:
     """根据传递的文件源+路径上传文件到沙箱"""
@@ -155,7 +157,9 @@ async def upload_file(
         filepath = f"/tmp/{file.filename}"
 
     # 2.调用服务将文件上传至沙箱
-    result = await file_service.upload_file(file=file, filepath=filepath)
+    result = await file_service.upload_file(
+        file=file, filepath=filepath, refuse_special=refuse_special
+    )
 
     return Response.success(
         msg="文件上传成功",
@@ -169,15 +173,18 @@ async def download_file(
     file_service: FileService = Depends(get_file_service),
 ) -> FileResponse:
     """根据传递的filepath下载指定的文件"""
-    # 1.确保下当前文件存在
+    # 1.确保下当前文件存在（内部已 resolve）
     await file_service.ensure_file(filepath)
 
-    # 2.提取文件名字
+    # 2.解析到工作区内的真实路径供 FileResponse 读取（与 write/upload 同源）
+    resolved = resolve_in_workspace(filepath)
+
+    # 3.提取文件名字（沿用原始入参，展示用）
     filename = os.path.basename(filepath)
 
-    # 3.返回文件下载响应
+    # 4.返回文件下载响应
     return FileResponse(
-        path=filepath,
+        path=resolved,
         filename=filename,
         media_type="application/octet-stream",
     )

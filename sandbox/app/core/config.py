@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +9,19 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"  # 日志等级
     server_timeout_minutes: int = 60  # 服务超时时间单位为分钟
+
+    # Sandbox Workspace Isolation: RELATIVE file/shell paths anchor here
+    # instead of the process CWD (/sandbox = the service install dir).
+    workspace_root: str = "/home/ubuntu"
+    # Protected service tree — writes/deletes resolving under here are denied.
+    service_install_dir: str = "/sandbox"
+
+    @field_validator("workspace_root", "service_install_dir")
+    @classmethod
+    def _must_be_absolute(cls, v: str) -> str:
+        if not v.startswith("/"):
+            raise ValueError(f"must be an absolute path (got {v!r})")
+        return v
 
     # 使用pydantic v2提供的写法完成环境变量信息的声明
     model_config = SettingsConfigDict(

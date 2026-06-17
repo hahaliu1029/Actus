@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.domain.external.parent_sandbox import SandboxPathCheck
 from app.domain.models.tool_result import ToolResult
 from app.infrastructure.external.sandbox.parent_sandbox_adapter import (
     ParentSandboxAdapter,
@@ -212,3 +213,74 @@ def test_adapter_has_no_destroy_or_suspend() -> None:
     """
     assert not hasattr(ParentSandboxAdapter, "destroy")
     assert not hasattr(ParentSandboxAdapter, "suspend")
+
+
+async def test_check_path_returns_exists_and_kind(fake_sandbox: MagicMock) -> None:
+    fake_sandbox.check_file_exists = AsyncMock(
+        return_value=_ok({"exists": True, "kind": "fifo"})
+    )
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    assert await adapter.check_path("workspace/p") == SandboxPathCheck(
+        exists=True, kind="fifo",
+    )
+
+
+async def test_check_path_old_sandbox_no_kind_fails_open(fake_sandbox: MagicMock) -> None:
+    # OLD sandbox image returns no "kind" -> fail-OPEN to a non-special value
+    # so 2a proceeds (degrades to pre-S1b). exists=True -> "other"; absent -> "missing".
+    fake_sandbox.check_file_exists = AsyncMock(return_value=_ok({"exists": True}))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    assert await adapter.check_path("p") == SandboxPathCheck(exists=True, kind="other")
+
+    fake_sandbox.check_file_exists = AsyncMock(return_value=_ok({"exists": False}))
+    assert await adapter.check_path("p") == SandboxPathCheck(exists=False, kind="missing")
+
+
+async def test_check_path_raises_on_rpc_failure(fake_sandbox: MagicMock) -> None:
+    fake_sandbox.check_file_exists = AsyncMock(return_value=_fail("boom"))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.check_path("p")
+
+
+async def test_exists_unchanged_ignores_kind_field(fake_sandbox: MagicMock) -> None:
+    # Backward-compat: exists() still reads only data["exists"].
+    fake_sandbox.check_file_exists = AsyncMock(
+        return_value=_ok({"exists": True, "kind": "fifo"})
+    )
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    assert await adapter.exists("p") is True
+
+
+async def test_atomic_write_file_sets_refuse_special_true(fake_sandbox: MagicMock) -> None:
+    """2b wiring: the coordinator adapter passes refuse_special=True to the
+    sandbox upload (the anti-vacuity wiring test — proves the flag is SET,
+    not just handled when raised). The path has a directory component so the
+    bare-filename guard passes through."""
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    await adapter.atomic_write_file("workspace/p", b"data")
+    _, kwargs = fake_sandbox.upload_file.call_args
+    assert kwargs.get("refuse_special") is True
+
+
+def test_non_coordinator_uploads_never_set_refuse_special():
+    """Spec §4 test 15: ONLY the coordinator apply/seed path (this adapter,
+    Step 5) sets refuse_special=True. The attachment caller (agent_task_runner)
+    and skill-bundle caller (skill_bundle_sync) must NEVER pass refuse_special
+    to upload_file — they keep the default False. Source-guard against a future
+    edit accidentally hardening a non-coordinator upload."""
+    import importlib.util
+    import pathlib
+
+    # `api/app` is a NAMESPACE package (no top-level __init__.py), so
+    # `app.__file__` is None — locate each module's source via find_spec().origin.
+    for mod in (
+        "app.domain.services.agent_task_runner",
+        "app.domain.services.tools.skill_bundle_sync",
+    ):
+        origin = importlib.util.find_spec(mod).origin
+        text = pathlib.Path(origin).read_text(encoding="utf-8")
+        assert "refuse_special" not in text, (
+            f"{mod} unexpectedly references refuse_special — non-coordinator "
+            f"uploads must keep the default False"
+        )

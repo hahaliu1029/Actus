@@ -10,7 +10,8 @@ class ShellExecuteRequest(BaseModel):
         default=None, description="目标 Shell 会话的唯一标识符"
     )
     exec_dir: Optional[str] = Field(
-        default=None, description="执行命令的工作目录(必须使用绝对路径)"
+        default=None,
+        description="执行命令的工作目录(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用, 留空则使用 ~)",
     )
     command: str = Field(..., description="要执行的 Shell 命令")
     wait_seconds: Optional[int] = Field(

@@ -317,3 +317,82 @@ async def test_run_work_unit_reaps_listener_when_seed_install_cancelled():
     fake_listener.shutdown.assert_awaited_once()
     # No terminal envelope on a cancel-during-seed (it propagates, not finalizes).
     inner_runner.invoke_until_done.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# [C2-full S1b Task 7] Special-file seed target → child FAILED (characterization).
+#
+# This is a CHARACTERIZATION test of behavior that ALREADY ships via Task 6:
+# the child seed-install path (``_install_seed`` → ``child_sandbox.atomic_write_file``)
+# goes through the SAME ``ParentSandboxAdapter`` that Task 6 wired to pass
+# ``refuse_special=True``. So a special-file seed target raises ``OSError`` from
+# the adapter → ``_install_seed`` wraps it as ``_SeedInstallError`` → ``run_work_unit``
+# routes to ``_finalize_failed`` → publishes RESULT_READY(FAILED). There is NO
+# production change here; this test PINS that existing consequence end-to-end.
+# Unlike the seed-failure test above (which monkeypatches ``_install_seed``), this
+# drives the REAL ``_install_seed`` and only fakes the child sandbox's
+# ``atomic_write_file`` to raise the special-file OSError — exercising the exact
+# Task-6 adapter consequence.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_work_unit_seed_install_refuses_special_target_child_failed():
+    """A seed lease whose parent base bytes would land on a special target →
+    the child adapter's ``refuse_special=True`` raises ``OSError`` → the REAL
+    ``_install_seed`` wraps it as ``_SeedInstallError`` → ``run_work_unit``
+    publishes RESULT_READY(FAILED) with a ``seed_install_failed`` summary, and
+    the inner ReAct runner is NEVER invoked (seed failure short-circuits before
+    the loop). Characterizes Task-6 behavior; no production change."""
+    import errno
+
+    # Real seed path: child_sandbox.atomic_write_file is the Task-6-wired adapter
+    # seam. Force it to raise the special-file OSError (errno.EINVAL — the same
+    # class the sandbox refuse_special branch raises for a FIFO/device target).
+    child_sandbox = MagicMock()
+    child_sandbox.atomic_write_file = AsyncMock(
+        side_effect=OSError(errno.EINVAL, "refusing to write special file")
+    )
+    # compute_digest must never be reached (write raises first) — wire it anyway
+    # so a misfire would surface as a digest mismatch rather than an AttributeError.
+    child_sandbox.compute_digest = AsyncMock(return_value="deadbeef")
+    artifact = MagicMock()
+    artifact.get_bytes = AsyncMock(return_value=b"seed-bytes")
+
+    # Inner ReAct runner: spy invoke_until_done to assert it never ran.
+    inner_runner = MagicMock()
+    inner_runner.invoke_until_done = AsyncMock()
+
+    runner, cancel_event, publisher, envf, sentinel = _wire_runner(
+        inner_runner, child_sandbox=child_sandbox, artifact=artifact,
+    )
+    # A seeded modify lease (op=modify + seed_content_ref) drives _install_seed
+    # into the atomic_write_file call that now raises.
+    wu = _wu(
+        [PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="ref-1")]
+    )
+    fake_listener = _fake_listener()
+    with patch.object(
+        runner_module, "CoordinatorChildCancelListener", return_value=fake_listener
+    ):
+        result = await runner.run_work_unit(
+            coordinator_run_id="run-1", work_unit=wu, child_session_id="child-1",
+            spawn_manifest=MagicMock(), cancel_event=cancel_event, root_session_id="root-1",
+        )
+
+    # The real atomic_write_file (Task-6 adapter seam) was actually exercised.
+    child_sandbox.atomic_write_file.assert_awaited_once_with("a.py", b"seed-bytes")
+    # Exactly one terminal envelope published; run_work_unit did NOT raise.
+    publisher.publish.assert_awaited_once_with(sentinel)
+    assert envf.make_result_ready.call_count == 1
+    payload = envf.make_result_ready.call_args.kwargs["payload"]
+    # (1) Published outcome is FAILED.
+    assert payload.outcome is ResultReadyOutcome.FAILED
+    # (2) The reason/summary carries seed_install_failed (the _install_seed wrap
+    #     message ``seed_install_failed: lease=...`` flows into _finalize_failed's
+    #     ``failed: {exc}`` summary).
+    assert "seed_install_failed" in payload.summary
+    # (3) The inner ReAct loop NEVER ran — seed failure short-circuits.
+    inner_runner.invoke_until_done.assert_not_awaited()
+    # Listener reaped on the seed-failure exit path.
+    fake_listener.shutdown.assert_awaited_once()
+    assert result is payload

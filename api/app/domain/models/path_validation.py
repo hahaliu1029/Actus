@@ -56,10 +56,10 @@ def validate_relative_path_strict(value: str) -> str:
     Used by ``FilePatchEntry.path`` where the path is a write target the
     child has authority to produce. A child publishing a manifest with
     ``/tmp/...`` or ``/etc/...`` is an attempted escape from the parent
-    sandbox; the PR-5 PatchApplier will join the path against the parent
-    sandbox root, and an absolute path passed to ``Path('/sandbox').joinpath('/etc/foo')``
-    returns ``/etc/foo`` (the second segment wins). Fail-closed here keeps
-    the manifest wire schema honest about being sandbox-relative.
+    sandbox; the relative→absolute join now lives in the sandbox file service
+    (``sandbox/app/core/workspace.py``, the Sandbox Workspace Isolation epic),
+    anchoring the path under ``workspace_root`` (/home/ubuntu). Fail-closed
+    here keeps the manifest wire schema honest about being sandbox-relative.
 
     [codex R3 P2#6 fix] Reject non-canonical relative forms (``./x.py``,
     ``x/./y.py``, ``x//y.py``) so the reducer's cross-worker conflict

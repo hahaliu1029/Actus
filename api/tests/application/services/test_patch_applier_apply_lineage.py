@@ -22,6 +22,7 @@ from app.application.services.patch_applier import (
     ApplyStatus,
     PatchApplier,
 )
+from app.domain.external.parent_sandbox import SandboxPathCheck
 from app.domain.models.event import CoordinatorApplyEvent
 from app.domain.models.patch_apply_plan import PatchApplyPlan
 from app.domain.models.patch_manifest import FilePatchEntry
@@ -51,6 +52,9 @@ def parent_sandbox() -> MagicMock:
     s = MagicMock()
     s.compute_digest = AsyncMock(side_effect=[_SHA_A, _NEW_DIGEST])
     s.exists = AsyncMock(return_value=True)
+    s.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")
+    )
     s.read_file = AsyncMock(return_value=b"old content")
     s.atomic_write_file = AsyncMock()
     return s
