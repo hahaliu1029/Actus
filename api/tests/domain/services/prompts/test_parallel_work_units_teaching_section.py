@@ -34,6 +34,29 @@ def test_flag_on_renders_en(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Parallel Work Units" in out.text  # EN marker
 
 
+def test_flag_on_teaches_directory_qualified_paths_en(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[single-path contract] The planner teaching must instruct directory-
+    qualified workspace-relative proposed_paths (no bare filename) so a real
+    provider doesn't propose ``part_a.md`` that fails the lease contract."""
+    monkeypatch.setenv(_FLAG, "true")
+    out = parallel_work_units_teaching_section.render(RenderContext(lang="en"))
+    assert out.text is not None
+    assert "directory" in out.text.lower()
+    assert "workspace/" in out.text  # the new-file convention example
+
+
+def test_flag_on_teaches_directory_qualified_paths_zh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_FLAG, "true")
+    out = parallel_work_units_teaching_section.render(RenderContext(lang="zh"))
+    assert out.text is not None
+    assert "目录" in out.text  # 带目录路径
+    assert "workspace/" in out.text
+
+
 def test_section_metadata() -> None:
     s = parallel_work_units_teaching_section
     assert s.id == "parallel_work_units_teaching"

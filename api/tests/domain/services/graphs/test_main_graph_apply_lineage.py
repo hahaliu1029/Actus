@@ -50,7 +50,7 @@ async def test_run_parallel_backend_threads_group_lineage_into_apply() -> None:
     plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="f.py", op="add", new_digest=sha,
+            path="d/f.py", op="add", new_digest=sha,
             content_ref="r", content_size=1,
         ),),
         total_size_bytes=1, file_count=1,
@@ -156,7 +156,7 @@ async def test_run_parallel_backend_lineage_root_falls_back_to_parent() -> None:
     plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="f.py", op="add", new_digest=sha,
+            path="d/f.py", op="add", new_digest=sha,
             content_ref="r", content_size=1,
         ),),
         total_size_bytes=1, file_count=1,

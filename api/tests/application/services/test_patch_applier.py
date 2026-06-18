@@ -144,7 +144,7 @@ def _modify_plan() -> PatchApplyPlan:
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="x.py", op="modify",
+                path="d/x.py", op="modify",
                 base_digest=_SHA_A,
                 new_digest=_NEW_DIGEST,
                 content_ref="ref-r1",
@@ -162,7 +162,7 @@ def _add_plan() -> PatchApplyPlan:
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="new.py", op="add",
+                path="d/new.py", op="add",
                 new_digest=_NEW_DIGEST,
                 content_ref="ref-add",
                 content_size=len(_NEW_CONTENT),
@@ -190,10 +190,10 @@ async def test_happy_path_success(
     )
     assert out.status == ApplyStatus.SUCCESS
     assert len(out.applied_files) == 1
-    assert out.applied_files[0].path == "x.py"
+    assert out.applied_files[0].path == "d/x.py"
     assert out.rollback_status is None
     parent_sandbox.atomic_write_file.assert_awaited_once_with(
-        "x.py", _NEW_CONTENT,
+        "d/x.py", _NEW_CONTENT,
     )
     audit_repo.insert_in_progress.assert_awaited_once()
     audit_repo.update_terminal.assert_awaited_once()
@@ -219,7 +219,7 @@ async def test_add_happy_path(
     )
     assert out.status == ApplyStatus.SUCCESS
     parent_sandbox.atomic_write_file.assert_awaited_once_with(
-        "new.py", _NEW_CONTENT,
+        "d/new.py", _NEW_CONTENT,
     )
 
 
@@ -241,7 +241,7 @@ async def test_digest_drift_aborts_without_rollback(
     )
     assert out.status == ApplyStatus.DIGEST_DRIFT
     assert out.failed_at is not None
-    assert out.failed_at.path == "x.py"
+    assert out.failed_at.path == "d/x.py"
     parent_sandbox.atomic_write_file.assert_not_called()
     snapshot_store.save.assert_not_called()
     assert out.rollback_status is None
@@ -263,7 +263,7 @@ async def test_file_missing_aborts(
     )
     assert out.status == ApplyStatus.FILE_MISSING
     assert out.failed_at is not None
-    assert out.failed_at.path == "x.py"
+    assert out.failed_at.path == "d/x.py"
 
 
 async def test_file_exists_aborts_add(
@@ -407,12 +407,12 @@ async def test_cancel_mid_apply_triggers_rollback(
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="a.py", op="modify",
+                path="d/a.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref-a", content_size=len(_NEW_CONTENT),
             ),
             FilePatchEntry(
-                path="b.py", op="modify",
+                path="d/b.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref-b", content_size=len(_NEW_CONTENT),
             ),
@@ -487,12 +487,12 @@ async def test_rollback_partial_emits_health_event(
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="a.py", op="modify",
+                path="d/a.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref-a", content_size=len(_NEW_CONTENT),
             ),
             FilePatchEntry(
-                path="b.py", op="modify",
+                path="d/b.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref-b", content_size=len(_NEW_CONTENT),
             ),
@@ -581,12 +581,12 @@ async def test_add_then_failure_rollback_deletes_added_file(
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="a.py", op="add",
+                path="d/a.py", op="add",
                 new_digest=_NEW_DIGEST,
                 content_ref="ref-a", content_size=len(_NEW_CONTENT),
             ),
             FilePatchEntry(
-                path="b.py", op="modify",
+                path="d/b.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref-b", content_size=len(_NEW_CONTENT),
             ),
@@ -614,7 +614,7 @@ async def test_add_then_failure_rollback_deletes_added_file(
     delete_calls = [
         c.args for c in parent_sandbox.delete_file.await_args_list
     ]
-    assert ("a.py",) in delete_calls
+    assert ("d/a.py",) in delete_calls
 
 
 async def test_toctou_refused_write_rolls_back_prior_entry(
@@ -653,12 +653,12 @@ async def test_toctou_refused_write_rolls_back_prior_entry(
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="a.py", op="add",
+                path="d/a.py", op="add",
                 new_digest=_NEW_DIGEST, content_ref="ref-a",
                 content_size=len(_NEW_CONTENT),
             ),
             FilePatchEntry(
-                path="b.py", op="modify",
+                path="d/b.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref-b", content_size=len(_NEW_CONTENT),
             ),
@@ -673,7 +673,7 @@ async def test_toctou_refused_write_rolls_back_prior_entry(
     assert out.status is ApplyStatus.WRITE_IO_ERROR
     assert out.rollback_status == "complete"
     # rollback undid the already-applied 'a.py' add (delete_file in reverse order).
-    parent_sandbox.delete_file.assert_awaited_once_with("a.py")
+    parent_sandbox.delete_file.assert_awaited_once_with("d/a.py")
 
 
 async def test_audit_insert_then_terminal(
@@ -706,7 +706,7 @@ async def test_audit_carries_parent_session_id(
         coordinator_run_id="sess_abc:hash16:a0",
         files=(
             FilePatchEntry(
-                path="x.py", op="modify",
+                path="d/x.py", op="modify",
                 base_digest=_SHA_A, new_digest=_NEW_DIGEST,
                 content_ref="ref", content_size=len(_NEW_CONTENT),
             ),
@@ -872,7 +872,7 @@ async def test_modify_over_special_target_rejected_before_read(
         _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
     )
     assert out.status is ApplyStatus.TARGET_SPECIAL_FILE
-    assert out.failed_at.path == "x.py"
+    assert out.failed_at.path == "d/x.py"
     assert f"kind={special_kind}" in out.failed_at.reason
     parent_sandbox.compute_digest.assert_not_called()
     parent_sandbox.read_file.assert_not_called()
@@ -911,7 +911,7 @@ async def test_symlink_to_nonregular_is_write_io_error_not_special(
     out = await applier.apply(
         _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
     )
-    parent_sandbox.check_path.assert_awaited_once_with("x.py")
+    parent_sandbox.check_path.assert_awaited_once_with("d/x.py")
     parent_sandbox.exists.assert_not_called()  # modify branch switched off exists()
     parent_sandbox.compute_digest.assert_awaited()
     assert out.status is ApplyStatus.WRITE_IO_ERROR
@@ -952,7 +952,7 @@ async def test_delete_no_apply_step_inode_guard_d9_off(
     parent_sandbox.compute_digest = AsyncMock(return_value=_SHA_A)
     delete_plan = PatchApplyPlan(
         coordinator_run_id="r1",
-        files=(FilePatchEntry(path="x.py", op="delete", base_digest=_SHA_A),),
+        files=(FilePatchEntry(path="d/x.py", op="delete", base_digest=_SHA_A),),
         total_size_bytes=0,
         file_count=1,
         source_work_unit_ids=("wu1",),
@@ -961,7 +961,7 @@ async def test_delete_no_apply_step_inode_guard_d9_off(
         delete_plan, parent_sandbox=parent_sandbox, minio_client=minio,
     )
     assert out.status is ApplyStatus.SUCCESS
-    parent_sandbox.delete_file.assert_awaited_once_with("x.py")
+    parent_sandbox.delete_file.assert_awaited_once_with("d/x.py")
 
 
 def test_target_special_file_status_value_and_length():

@@ -55,7 +55,7 @@ def _state() -> dict[str, Any]:
 def _plan(file_count: int = 1) -> PatchApplyPlan:
     files = tuple(
         FilePatchEntry(
-            path=f"f{i}.py", op="add",
+            path=f"d/f{i}.py", op="add",
             new_digest=_SHA_A, content_ref=f"r{i}", content_size=1,
         ) for i in range(file_count)
     )
@@ -335,6 +335,25 @@ async def test_outcome_success_true_when_applier_ports_missing() -> None:
     config = {"configurable": {"parallel_execution_subgraph": subgraph}}
     outcome = await _run_parallel_backend(_state(), config, _step())
     assert outcome.success is True
+
+
+async def test_dispatch_path_contract_error_surfaces_as_failed_outcome() -> None:
+    """[single-path contract — graceful surfacing] A planner-proposed bare /
+    workspace-root path raises ``CoordinatorPathContractError`` from
+    dispatch_node. ``_run_parallel_backend`` catches it and returns a graceful
+    failed ``ParallelBackendOutcome`` — NOT an uncaught raise that would crash
+    the whole agent run (executor_node has no try/except around the call)."""
+    from app.domain.models.path_validation import CoordinatorPathContractError
+    subgraph = MagicMock()
+    subgraph.ainvoke = AsyncMock(
+        side_effect=CoordinatorPathContractError(
+            "bare filename rejected (no directory component): 'part_a.md'"
+        )
+    )
+    config = {"configurable": {"parallel_execution_subgraph": subgraph}}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is False
+    assert "part_a.md" in outcome.summary
 
 
 async def test_outcome_success_false_on_apply_other_status() -> None:

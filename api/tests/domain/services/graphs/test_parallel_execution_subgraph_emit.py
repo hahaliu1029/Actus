@@ -177,7 +177,7 @@ async def test_dispatch_failure_mid_way_emits_no_events() -> None:
         WorkUnitRequest(
             objective="touch existing", phase="write",
             allowed_tools=["file_write"],
-            proposed_paths=[ProposedPath(path="existing.py", op="modify")],
+            proposed_paths=[ProposedPath(path="d/existing.py", op="modify")],
         ),
     ])
     config["configurable"]["session_service"].create_session_with_parent = AsyncMock(
@@ -407,7 +407,7 @@ async def test_run_parallel_backend_constructs_applier_from_deps_with_emit() -> 
     plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="f.py", op="add", new_digest=sha,
+            path="d/f.py", op="add", new_digest=sha,
             content_ref="r", content_size=1,
         ),),
         total_size_bytes=1, file_count=1,
@@ -508,7 +508,7 @@ async def test_run_parallel_backend_raises_when_event_queue_missing() -> None:
     plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="f.py", op="add", new_digest=sha,
+            path="d/f.py", op="add", new_digest=sha,
             content_ref="r", content_size=1,
         ),),
         total_size_bytes=1, file_count=1,
@@ -1015,7 +1015,7 @@ async def test_reducer_propagates_cancellation() -> None:
     apply_plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="f.py", op="add", new_digest=sha,
+            path="d/f.py", op="add", new_digest=sha,
             content_ref="ref", content_size=1,
         ),),
         total_size_bytes=1, file_count=1,
@@ -1089,7 +1089,7 @@ async def test_reducer_handoff_survives_aggregate_exception() -> None:
     apply_plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="g.py", op="add", new_digest=sha,
+            path="d/g.py", op="add", new_digest=sha,
             content_ref="ref2", content_size=2,
         ),),
         total_size_bytes=2, file_count=1,

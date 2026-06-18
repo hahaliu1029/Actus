@@ -231,14 +231,20 @@ class ParentSandboxAdapter(ParentSandboxPort):
         applier's per-entry try/except catches it and routes to the
         ``WRITE_IO_ERROR`` branch with rollback.
         """
-        # [Sandbox Workspace Isolation §3.8] Reject a bare filename as
-        # coordinator manifest HYGIENE — manifest paths must carry a directory
-        # component (e.g. 'workspace/foo.py'). NOTE: the sandbox service itself
-        # now ANCHORS a bare name to /home/ubuntu/<name> (the old "os.makedirs('')
-        # raises" rationale is obsolete); this adapter is the final hygiene guard,
-        # and validate_relative_path_strict does NOT reject bare names. Path
-        # transparency is preserved: any path WITH a directory component passes
-        # through unchanged — no /workspace join.
+        # [Sandbox Workspace Isolation §3.8 / single-path contract] Reject a bare
+        # filename as coordinator manifest HYGIENE — manifest paths must carry a
+        # directory component (e.g. 'workspace/foo.py'). As of the single-path
+        # contract this is now a should-never-fire BACKSTOP: the bare-filename
+        # rejection is enforced FORWARD at the lease boundary
+        # (``_build_work_units_from_requests`` -> ``validate_coordinator_path``)
+        # and the manifest wire schema
+        # (``FilePatchEntry`` -> ``validate_directory_qualified_relative_path``),
+        # so a bare path is rejected before children spawn / at envelope
+        # construction rather than late here as ``write_io_error``. Kept as
+        # defense-in-depth (the sandbox service anchors a bare name to
+        # /home/ubuntu/<name>, so a slipped-through bare apply would otherwise
+        # silently land at the workspace root). Path transparency is preserved:
+        # any path WITH a directory component passes through unchanged.
         if os.path.dirname(path) == "":
             raise ValueError(
                 f"bare filename rejected (no directory component): {path!r}; "

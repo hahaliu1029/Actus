@@ -62,6 +62,13 @@ Schema:
   }
 }
 
+Path contract (REQUIRED): every `proposed_paths` entry MUST be a
+directory-qualified, workspace-relative path (e.g. `api/utils/foo.py`,
+`workspace/notes.md`) — NEVER a bare filename like `notes.md` and never an
+absolute path that resolves to the workspace root. A bare path is rejected
+before any child is dispatched. For a brand-new file with no natural package,
+put it in a subdirectory such as `workspace/` (e.g. `workspace/result.md`).
+
 Hard cap: 5 work_units per step.
 """
 
@@ -101,6 +108,12 @@ Schema:
     ]
   }
 }
+
+路径合同（必须遵守）：每个 `proposed_paths` 路径必须是带目录的 workspace-relative
+路径（例如 `api/utils/foo.py`、`workspace/notes.md`），禁止使用裸文件名（如
+`notes.md`），也禁止使用解析到 workspace 根目录的绝对路径。裸路径会在派发任何
+子 agent 之前被直接拒绝。新建文件若没有天然所属目录，请放到 `workspace/` 等
+子目录下（例如 `workspace/result.md`）。
 
 硬上限：每个 step 最多 5 个 work_units。
 """

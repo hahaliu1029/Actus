@@ -236,11 +236,11 @@ class TestConflict:
         self, service: PatchReducerService,
     ) -> None:
         e1 = FilePatchEntry(
-            path="a.py", op="add",
+            path="d/a.py", op="add",
             new_digest=_SHA_A, content_ref="r1", content_size=10,
         )
         e2 = FilePatchEntry(
-            path="b.py", op="add",
+            path="d/b.py", op="add",
             new_digest=_SHA_B, content_ref="r2", content_size=10,
         )
         out = await service.reduce(
@@ -270,7 +270,7 @@ class TestPlanConstruction:
         self, service: PatchReducerService,
     ) -> None:
         e = FilePatchEntry(
-            path="x.py", op="add",
+            path="d/x.py", op="add",
             new_digest=_SHA_A, content_ref="r", content_size=10,
         )
         out = await service.reduce(
@@ -297,11 +297,11 @@ class TestPlanConstruction:
         depend on this. Two-worker out-of-order input must yield
         path-sorted output."""
         e1 = FilePatchEntry(
-            path="zzz.py", op="add",
+            path="d/zzz.py", op="add",
             new_digest=_SHA_A, content_ref="r1", content_size=1,
         )
         e2 = FilePatchEntry(
-            path="aaa.py", op="add",
+            path="d/aaa.py", op="add",
             new_digest=_SHA_B, content_ref="r2", content_size=1,
         )
         out = await service.reduce(
@@ -319,7 +319,7 @@ class TestPlanConstruction:
             ],
         )
         assert out.apply_plan is not None
-        assert [f.path for f in out.apply_plan.files] == ["aaa.py", "zzz.py"]
+        assert [f.path for f in out.apply_plan.files] == ["d/aaa.py", "d/zzz.py"]
 
     async def test_all_success_no_manifests_empty_plan(
         self, service: PatchReducerService,
@@ -350,7 +350,7 @@ class TestPlanConstruction:
         (legal in exploration phase) MUST NOT appear, else plan_hash
         semantics would change based on incidental sibling state."""
         e = FilePatchEntry(
-            path="x.py", op="add",
+            path="d/x.py", op="add",
             new_digest=_SHA_A, content_ref="r", content_size=1,
         )
         out = await service.reduce(
@@ -377,7 +377,7 @@ class TestDigestDrift:
         self, service: PatchReducerService,
     ) -> None:
         e = FilePatchEntry(
-            path="x.py", op="modify",
+            path="d/x.py", op="modify",
             base_digest=_SHA_A, new_digest=_SHA_B,
             content_ref="r", content_size=10,
         )
@@ -397,14 +397,14 @@ class TestDigestDrift:
         assert out.group_outcome == GroupOutcome.SUCCESS
         assert out.apply_plan is not None
         assert any(
-            "x.py" in w for w in out.diagnostics.digest_drift_warnings
+            "d/x.py" in w for w in out.diagnostics.digest_drift_warnings
         )
 
     async def test_no_drift_when_matching(
         self, service: PatchReducerService,
     ) -> None:
         e = FilePatchEntry(
-            path="x.py", op="modify",
+            path="d/x.py", op="modify",
             base_digest=_SHA_A, new_digest=_SHA_B,
             content_ref="r", content_size=10,
         )
@@ -431,7 +431,7 @@ class TestDigestDrift:
         would either crash (no base_digest) or surface a misleading
         warning when the file legitimately doesn't yet exist."""
         e = FilePatchEntry(
-            path="x.py", op="add",
+            path="d/x.py", op="add",
             new_digest=_SHA_A, content_ref="r", content_size=10,
         )
         parent = AsyncMock()
@@ -457,7 +457,7 @@ class TestDigestDrift:
         isolation, or composition root chose to skip), reducer skips
         drift check entirely — proceeds to build plan."""
         e = FilePatchEntry(
-            path="x.py", op="modify",
+            path="d/x.py", op="modify",
             base_digest=_SHA_A, new_digest=_SHA_B,
             content_ref="r", content_size=1,
         )
@@ -484,7 +484,7 @@ class TestStepResultCandidate:
         self, service: PatchReducerService,
     ) -> None:
         e = FilePatchEntry(
-            path="x.py", op="add",
+            path="d/x.py", op="add",
             new_digest=_SHA_A, content_ref="r", content_size=1,
         )
         out = await service.reduce(
@@ -517,7 +517,7 @@ class TestStepResultCandidate:
         downstream summarizer prompt doesn't blow context budget."""
         files = [
             FilePatchEntry(
-                path=f"f{i}.py", op="add",
+                path=f"d/f{i}.py", op="add",
                 new_digest=_SHA_A, content_ref=f"r{i}", content_size=1,
             )
             for i in range(50)

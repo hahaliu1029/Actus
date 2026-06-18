@@ -29,8 +29,11 @@ _EXPLORATION_GUIDANCE = (
 
 _WRITE_GUIDANCE = (
     "This is the WRITE phase. You are authorized to write to the paths "
-    "listed below. ChildScopeGate enforces the lease at runtime — attempts "
-    "to write outside the lease will be denied and surface as "
+    "listed below. Write to EXACTLY those paths — each is a directory-qualified "
+    "workspace-relative path (e.g. 'workspace/foo.py', 'api/bar.py'); do NOT "
+    "write a bare filename at the workspace root (e.g. 'foo.py') and do NOT "
+    "invent a different directory. ChildScopeGate enforces the lease at runtime "
+    "— attempts to write outside the lease will be denied and surface as "
     "NEEDS_AUTHORIZATION to the parent."
 )
 

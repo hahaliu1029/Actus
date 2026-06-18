@@ -56,18 +56,18 @@ async def test_extraction_builds_modify_entry_from_tool_calls_and_child_bytes():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
-    result = ChildRunResult(done_event=MagicMock(), tool_calls=(_tool_write("a.py"),))
+    result = ChildRunResult(done_event=MagicMock(), tool_calls=(_tool_write("pkg/a.py"),))
     files = await r._extract_patch_files_from_history("run-1", wu, result)
     assert len(files) == 1
     entry = files[0]
-    assert entry.path == "a.py"
+    assert entry.path == "pkg/a.py"
     assert entry.op == "modify"
     assert entry.base_digest == "b" * 64
     assert entry.new_digest == digest
     assert entry.content_ref == "patchref-1"
-    child_sandbox.read_file.assert_awaited_once_with("a.py")  # final bytes from child sandbox
+    child_sandbox.read_file.assert_awaited_once_with("pkg/a.py")  # final bytes from child sandbox
 
 
 async def test_extraction_rejects_out_of_lease_write():
@@ -79,7 +79,7 @@ async def test_extraction_rejects_out_of_lease_write():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
     result = ChildRunResult(done_event=MagicMock(), tool_calls=(_tool_write("evil.py"),))
     with pytest.raises(_OutOfLeaseWriteError):
@@ -87,11 +87,14 @@ async def test_extraction_rejects_out_of_lease_write():
 
 
 async def test_extraction_normalizes_absolute_workspace_path_to_relative():
-    """A child write to an ABSOLUTE workspace path (/home/ubuntu/part_a.md —
-    the natural sandbox path the planner/objective uses) must be canonicalized
-    to the sandbox-relative form FilePatchEntry requires. RED before the fix
-    (FilePatchEntry's strict validator rejects the absolute path → extraction
-    raises ValidationError → worker FAILED → no apply); GREEN after."""
+    """A child write to an ABSOLUTE workspace SUBDIRECTORY path
+    (/home/ubuntu/workspace/part_a.md) is canonicalized to the directory-
+    qualified workspace-relative form FilePatchEntry requires. RED before the
+    abs->rel fix (strict validator rejects the absolute path); GREEN after.
+    [single-path contract] the path is directory-qualified (``workspace/…``),
+    so the manifest carries a directory component — see
+    ``test_extraction_rejects_bare_home_root_write_as_out_of_lease`` for the
+    bare-home-root rejection."""
     final_bytes = b"ocean line"
     digest = hashlib.sha256(final_bytes).hexdigest()
     child_sandbox = MagicMock()
@@ -102,20 +105,46 @@ async def test_extraction_normalizes_absolute_workspace_path_to_relative():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="/home/ubuntu/part_a.md", op="add")],
+        write_lease=[PathLease(path="/home/ubuntu/workspace/part_a.md", op="add")],
     )
     result = ChildRunResult(
         done_event=MagicMock(),
-        tool_calls=(_tool_write("/home/ubuntu/part_a.md"),),
+        tool_calls=(_tool_write("/home/ubuntu/workspace/part_a.md"),),
     )
     files = await r._extract_patch_files_from_history("run-1", wu, result)
     assert len(files) == 1
-    # Canonicalized to workspace-relative for the manifest wire schema.
-    assert files[0].path == "part_a.md"
+    # Canonicalized to directory-qualified workspace-relative for the manifest.
+    assert files[0].path == "workspace/part_a.md"
     assert files[0].op == "add"
     assert files[0].new_digest == digest
     # The sandbox read still uses the raw path the child actually wrote.
-    child_sandbox.read_file.assert_awaited_once_with("/home/ubuntu/part_a.md")
+    child_sandbox.read_file.assert_awaited_once_with("/home/ubuntu/workspace/part_a.md")
+
+
+async def test_extraction_rejects_bare_home_root_write_as_out_of_lease():
+    """[single-path contract — §14 live-repro] A child writes to the home ROOT
+    (``/home/ubuntu/part_a.md``), which canonicalizes to the BARE ``part_a.md``.
+    Against a directory-qualified lease the write no longer matches →
+    ``_OutOfLeaseWriteError`` (caught upstream → NEEDS_AUTHORIZATION), so a bare
+    path never reaches the manifest wire schema or the apply guard. This is the
+    contract-forward replacement for the old 'home-root write produces bare
+    manifest path' behaviour that surfaced late as ``write_io_error``."""
+    child_sandbox = MagicMock()
+    child_sandbox.read_file = AsyncMock(return_value=b"x")
+    artifact = MagicMock()
+    artifact.put_content_addressed_bytes = AsyncMock(return_value="r")
+    r = _runner(child_sandbox, artifact)
+    wu = WorkUnit(
+        work_unit_id="wu-1", objective="o", phase="write",
+        allowed_tools=["file_write"],
+        write_lease=[PathLease(path="/home/ubuntu/workspace/part_a.md", op="add")],
+    )
+    result = ChildRunResult(
+        done_event=MagicMock(),
+        tool_calls=(_tool_write("/home/ubuntu/part_a.md"),),  # home ROOT → bare canon
+    )
+    with pytest.raises(_OutOfLeaseWriteError):
+        await r._extract_patch_files_from_history("run-1", wu, result)
 
 
 async def test_extraction_matches_relative_write_against_absolute_lease():
@@ -164,7 +193,7 @@ async def test_extraction_empty_tool_calls_yields_no_files():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
     result = ChildRunResult(done_event=MagicMock(), tool_calls=())
     files = await r._extract_patch_files_from_history("run-1", wu, result)
@@ -188,7 +217,7 @@ def _tool_write_args(args):
 
 async def test_extraction_empty_filepath_does_not_fall_back_to_path():
     # filepath present but empty → no-target (skip), so the ``path`` key
-    # ("a.py") must NOT produce an entry even though there's a matching lease.
+    # ("pkg/a.py") must NOT produce an entry even though there's a matching lease.
     # This is the divergence the `args.get("filepath") or args.get("path")`
     # truthy fallback would have gotten WRONG (it would build an a.py entry).
     child_sandbox = MagicMock()
@@ -199,19 +228,19 @@ async def test_extraction_empty_filepath_does_not_fall_back_to_path():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
     result = ChildRunResult(
         done_event=MagicMock(),
-        tool_calls=(_tool_write_args({"filepath": "", "path": "a.py", "content": "x"}),),
+        tool_calls=(_tool_write_args({"filepath": "", "path": "pkg/a.py", "content": "x"}),),
     )
     files = await r._extract_patch_files_from_history("run-1", wu, result)
-    assert files == []  # empty filepath skipped; NO fallback to path="a.py"
+    assert files == []  # empty filepath skipped; NO fallback to path="pkg/a.py"
     child_sandbox.read_file.assert_not_awaited()
 
 
 async def test_extraction_filepath_priority_normal_case_still_builds_entry():
-    # Sanity: a normal {"filepath": "a.py"} still produces the entry (the fix
+    # Sanity: a normal {"filepath": "pkg/a.py"} still produces the entry (the fix
     # only changes the empty-filepath edge, not the happy path).
     final_bytes = b"new content"
     child_sandbox = MagicMock()
@@ -222,16 +251,16 @@ async def test_extraction_filepath_priority_normal_case_still_builds_entry():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
     result = ChildRunResult(
         done_event=MagicMock(),
-        tool_calls=(_tool_write_args({"filepath": "a.py", "content": "x"}),),
+        tool_calls=(_tool_write_args({"filepath": "pkg/a.py", "content": "x"}),),
     )
     files = await r._extract_patch_files_from_history("run-1", wu, result)
     assert len(files) == 1
-    assert files[0].path == "a.py"
-    child_sandbox.read_file.assert_awaited_once_with("a.py")
+    assert files[0].path == "pkg/a.py"
+    child_sandbox.read_file.assert_awaited_once_with("pkg/a.py")
 
 
 async def test_extraction_falls_back_to_path_only_when_filepath_absent():
@@ -246,21 +275,21 @@ async def test_extraction_falls_back_to_path_only_when_filepath_absent():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
     result = ChildRunResult(
         done_event=MagicMock(),
-        tool_calls=(_tool_write_args({"path": "a.py", "content": "x"}),),
+        tool_calls=(_tool_write_args({"path": "pkg/a.py", "content": "x"}),),
     )
     files = await r._extract_patch_files_from_history("run-1", wu, result)
     assert len(files) == 1
-    assert files[0].path == "a.py"
+    assert files[0].path == "pkg/a.py"
 
 
 async def test_extraction_filepath_none_falls_back_to_path():
     # Matches ChildScopeGate.extract_target_path: a filepath VALUE of None
     # falls back to "path" (value-based ``if path is None``, NOT key-presence).
-    # The gate lease-checks this write against "a.py", so the manifest MUST
+    # The gate lease-checks this write against "pkg/a.py", so the manifest MUST
     # include it — a key-presence check ("filepath" in args) would WRONGLY skip
     # it (filepath key present → path=None → not a str → continue → []).
     final_bytes = b"x"
@@ -272,13 +301,13 @@ async def test_extraction_filepath_none_falls_back_to_path():
     wu = WorkUnit(
         work_unit_id="wu-1", objective="o", phase="write",
         allowed_tools=["file_write"],
-        write_lease=[PathLease(path="a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+        write_lease=[PathLease(path="pkg/a.py", op="modify", base_digest="b" * 64, seed_content_ref="s")],
     )
     result = ChildRunResult(
         done_event=MagicMock(),
-        tool_calls=(_tool_write_args({"filepath": None, "path": "a.py", "content": "x"}),),
+        tool_calls=(_tool_write_args({"filepath": None, "path": "pkg/a.py", "content": "x"}),),
     )
     files = await r._extract_patch_files_from_history("run-1", wu, result)
     assert len(files) == 1
-    assert files[0].path == "a.py"
-    child_sandbox.read_file.assert_awaited_once_with("a.py")
+    assert files[0].path == "pkg/a.py"
+    child_sandbox.read_file.assert_awaited_once_with("pkg/a.py")

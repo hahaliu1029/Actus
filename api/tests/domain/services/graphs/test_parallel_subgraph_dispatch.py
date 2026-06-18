@@ -10,8 +10,12 @@ import hashlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from app.domain.models.path_validation import CoordinatorPathContractError
 from app.domain.models.work_unit import ProposedPath, WorkUnitRequest
-from app.domain.services.graphs.parallel_execution_subgraph import dispatch_node
+from app.domain.services.graphs.parallel_execution_subgraph import (
+    _build_work_units_from_requests,
+    dispatch_node,
+)
 
 
 def _expected_wu_ids(step_id: str, attempt_ix: int, count: int) -> list[str]:
@@ -731,3 +735,58 @@ async def test_rehydrate_dispatch_does_not_stamp_dispatch_started_monotonic() ->
     state = _base_state()
     cmd = await dispatch_node(state, config)
     assert "dispatch_started_monotonic" not in cmd.update
+
+
+class TestBuildWorkUnitsPathContract:
+    """[single-path contract — lease boundary] ``_build_work_units_from_requests``
+    rejects a planner-proposed path whose workspace-relative form lacks a
+    directory component, BEFORE any child spawns. The lease keeps the proposed
+    path's ORIGINAL form (ChildScopeGate exact-match)."""
+
+    @staticmethod
+    def _req(path: str, op: str = "add") -> WorkUnitRequest:
+        return WorkUnitRequest(
+            objective="o", phase="write", allowed_tools=["file_write"],
+            proposed_paths=[ProposedPath(path=path, op=op)],
+        )
+
+    def test_bare_relative_proposed_path_rejected(self) -> None:
+        with pytest.raises(CoordinatorPathContractError, match="directory"):
+            _build_work_units_from_requests([self._req("part_a.md")], "hash16", 1)
+
+    def test_workspace_root_absolute_rejected(self) -> None:
+        """``/home/ubuntu/part_a.md`` canonicalizes to bare ``part_a.md`` — the
+        §14 live-repro path. Rejected at dispatch, never produces a bare manifest."""
+        with pytest.raises(CoordinatorPathContractError, match="directory"):
+            _build_work_units_from_requests(
+                [self._req("/home/ubuntu/part_a.md")], "hash16", 1,
+            )
+
+    def test_directory_qualified_relative_accepted(self) -> None:
+        units = _build_work_units_from_requests(
+            [self._req("workspace/part_a.md")], "hash16", 1,
+        )
+        assert units[0].write_lease[0].path == "workspace/part_a.md"
+
+    def test_directory_qualified_absolute_canonicalized_to_relative(self) -> None:
+        units = _build_work_units_from_requests(
+            [self._req("/home/ubuntu/sub/b.py")], "hash16", 1,
+        )
+        # [single-path contract] absolute lease allowed (N5) but CANONICALIZED to
+        # the one workspace-relative form the manifest + ChildScopeGate agree on,
+        # so it can't strand the run mid-flight at strict manifest validation.
+        assert units[0].write_lease[0].path == "sub/b.py"
+
+    def test_outside_workspace_rejected(self) -> None:
+        with pytest.raises(CoordinatorPathContractError):
+            _build_work_units_from_requests(
+                [self._req("/etc/passwd", op="modify")], "hash16", 1,
+            )
+
+    def test_exploration_request_with_no_paths_unaffected(self) -> None:
+        """Exploration requests carry no proposed_paths — nothing to validate."""
+        req = WorkUnitRequest(
+            objective="explore", phase="exploration", allowed_tools=["file_read"],
+        )
+        units = _build_work_units_from_requests([req], "hash16", 1)
+        assert units[0].write_lease == []

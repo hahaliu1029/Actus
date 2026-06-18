@@ -188,7 +188,7 @@ def _mk_patch_manifest() -> PatchManifest:
         work_unit_id="wu1",
         files=(
             FilePatchEntry(
-                path="x", op="add",
+                path="d/x", op="add",
                 new_digest="b" * 64, content_ref="minio://ref", content_size=10,
             ),
         ),

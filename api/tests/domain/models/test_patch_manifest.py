@@ -28,7 +28,7 @@ _SHA_C = hashlib.sha256(b"c").hexdigest()
 class TestFilePatchEntryModify:
     def test_modify_with_digests(self) -> None:
         e = FilePatchEntry(
-            path="x", op="modify",
+            path="d/x", op="modify",
             base_digest=_SHA_A, new_digest=_SHA_B,
             content_ref="minio://ref", content_size=100,
         )
@@ -43,7 +43,7 @@ class TestFilePatchEntryModify:
 class TestFilePatchEntryAdd:
     def test_add_no_base_digest(self) -> None:
         e = FilePatchEntry(
-            path="x", op="add",
+            path="d/x", op="add",
             new_digest=_SHA_B, content_ref="minio://ref", content_size=50,
         )
         assert e.base_digest is None
@@ -54,7 +54,7 @@ class TestFilePatchEntryAdd:
 
 class TestFilePatchEntryDelete:
     def test_delete_no_content(self) -> None:
-        e = FilePatchEntry(path="x", op="delete", base_digest=_SHA_A)
+        e = FilePatchEntry(path="d/x", op="delete", base_digest=_SHA_A)
         assert e.content_ref is None
         assert e.content_size is None
         assert e.new_digest is None
@@ -64,18 +64,18 @@ class TestFilePatchEntryInvariants:
     def test_extra_field_forbidden(self) -> None:
         with pytest.raises(ValidationError):
             FilePatchEntry(  # type: ignore[call-arg]
-                path="x", op="add", new_digest=_SHA_A, content_ref="r", content_size=1,
+                path="d/x", op="add", new_digest=_SHA_A, content_ref="r", content_size=1,
                 unexpected="nope",
             )
 
     def test_frozen(self) -> None:
-        e = FilePatchEntry(path="x", op="delete", base_digest=_SHA_A)
+        e = FilePatchEntry(path="d/x", op="delete", base_digest=_SHA_A)
         with pytest.raises(ValidationError):
             e.op = "modify"  # type: ignore[misc]
 
     def test_invalid_op(self) -> None:
         with pytest.raises(ValidationError):
-            FilePatchEntry(path="x", op="rename")  # type: ignore[arg-type]
+            FilePatchEntry(path="d/x", op="rename")  # type: ignore[arg-type]
 
     def test_path_required(self) -> None:
         with pytest.raises(ValidationError):
@@ -88,56 +88,56 @@ class TestFilePatchEntryPerOpValidators:
     def test_add_with_base_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=add must have base_digest=None"):
             FilePatchEntry(
-                path="x", op="add", base_digest=_SHA_A,
+                path="d/x", op="add", base_digest=_SHA_A,
                 new_digest=_SHA_A, content_ref="r", content_size=1,
             )
 
     def test_add_missing_new_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=add must have new_digest"):
             FilePatchEntry(
-                path="x", op="add", content_ref="r", content_size=1,
+                path="d/x", op="add", content_ref="r", content_size=1,
             )
 
     def test_add_missing_content_ref_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=add must have"):
             FilePatchEntry(
-                path="x", op="add", new_digest=_SHA_A, content_size=1,
+                path="d/x", op="add", new_digest=_SHA_A, content_size=1,
             )
 
     def test_modify_missing_base_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=modify requires base_digest"):
             FilePatchEntry(
-                path="x", op="modify",
+                path="d/x", op="modify",
                 new_digest=_SHA_A, content_ref="r", content_size=1,
             )
 
     def test_modify_missing_new_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=modify must have"):
             FilePatchEntry(
-                path="x", op="modify", base_digest=_SHA_B,
+                path="d/x", op="modify", base_digest=_SHA_B,
                 content_ref="r", content_size=1,
             )
 
     def test_delete_missing_base_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=delete requires base_digest"):
-            FilePatchEntry(path="x", op="delete")
+            FilePatchEntry(path="d/x", op="delete")
 
     def test_delete_with_new_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=delete must have"):
             FilePatchEntry(
-                path="x", op="delete", base_digest=_SHA_B, new_digest=_SHA_B,
+                path="d/x", op="delete", base_digest=_SHA_B, new_digest=_SHA_B,
             )
 
     def test_delete_with_content_ref_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=delete must have"):
             FilePatchEntry(
-                path="x", op="delete", base_digest=_SHA_B, content_ref="r",
+                path="d/x", op="delete", base_digest=_SHA_B, content_ref="r",
             )
 
     def test_delete_with_content_size_rejected(self) -> None:
         with pytest.raises(ValidationError, match="op=delete must have"):
             FilePatchEntry(
-                path="x", op="delete", base_digest=_SHA_B, content_size=0,
+                path="d/x", op="delete", base_digest=_SHA_B, content_size=0,
             )
 
     def test_negative_content_size_rejected(self) -> None:
@@ -145,7 +145,7 @@ class TestFilePatchEntryPerOpValidators:
         downstream consumers reading content_size for budget tracking."""
         with pytest.raises(ValidationError):
             FilePatchEntry(
-                path="x", op="add",
+                path="d/x", op="add",
                 new_digest=_SHA_A, content_ref="r", content_size=-1,
             )
 
@@ -158,7 +158,7 @@ class TestFilePatchEntryDigestFormat:
     def test_short_digest_rejected(self) -> None:
         with pytest.raises(ValidationError, match="SHA-256"):
             FilePatchEntry(
-                path="x", op="add",
+                path="d/x", op="add",
                 new_digest="abc", content_ref="r", content_size=1,
             )
 
@@ -167,32 +167,52 @@ class TestFilePatchEntryDigestFormat:
         compare is faster than case-insensitive in the reducer hot path."""
         with pytest.raises(ValidationError, match="SHA-256"):
             FilePatchEntry(
-                path="x", op="add",
+                path="d/x", op="add",
                 new_digest="A" * 64, content_ref="r", content_size=1,
             )
 
     def test_non_hex_chars_rejected(self) -> None:
         with pytest.raises(ValidationError, match="SHA-256"):
             FilePatchEntry(
-                path="x", op="add",
+                path="d/x", op="add",
                 new_digest="g" * 64, content_ref="r", content_size=1,
             )
 
     def test_base_digest_format_also_validated(self) -> None:
         with pytest.raises(ValidationError, match="SHA-256"):
             FilePatchEntry(
-                path="x", op="modify",
+                path="d/x", op="modify",
                 base_digest="not-a-digest", new_digest=_SHA_B,
                 content_ref="r", content_size=1,
             )
 
     def test_valid_hex_accepted(self) -> None:
         e = FilePatchEntry(
-            path="x", op="modify",
+            path="d/x", op="modify",
             base_digest=_SHA_A, new_digest=_SHA_B,
             content_ref="r", content_size=1,
         )
         assert len(e.new_digest) == 64
+
+
+class TestFilePatchEntryDirectoryQualified:
+    """[single-path contract] FilePatchEntry.path must be directory-qualified
+    workspace-relative — a bare filename is rejected at the wire schema (moved
+    forward from the late host ``atomic_write_file`` guard; §14 live-repro)."""
+
+    def test_bare_filename_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="directory"):
+            FilePatchEntry(
+                path="part_a.md", op="add",
+                new_digest=_SHA_A, content_ref="r", content_size=1,
+            )
+
+    def test_directory_qualified_accepted(self) -> None:
+        e = FilePatchEntry(
+            path="workspace/part_a.md", op="add",
+            new_digest=_SHA_A, content_ref="r", content_size=1,
+        )
+        assert e.path == "workspace/part_a.md"
 
 
 class TestPatchManifestStructure:
@@ -201,7 +221,7 @@ class TestPatchManifestStructure:
             patch_id="r1:wu1:p",
             coordinator_run_id="r1", work_unit_id="wu1",
             files=(FilePatchEntry(
-                path="x", op="add",
+                path="d/x", op="add",
                 new_digest=_SHA_A, content_ref="minio://r", content_size=1,
             ),),
         )
@@ -251,15 +271,15 @@ class TestPatchManifestWireRoundtrip:
             patch_id="r1:wu1:p", coordinator_run_id="r1", work_unit_id="wu1",
             files=(
                 FilePatchEntry(
-                    path="a", op="add",
+                    path="d/a", op="add",
                     new_digest=_SHA_A, content_ref="ref_a", content_size=10,
                 ),
                 FilePatchEntry(
-                    path="b", op="modify",
+                    path="d/b", op="modify",
                     base_digest=_SHA_A, new_digest=_SHA_B,
                     content_ref="ref_b", content_size=20,
                 ),
-                FilePatchEntry(path="c", op="delete", base_digest=_SHA_C),
+                FilePatchEntry(path="d/c", op="delete", base_digest=_SHA_C),
             ),
         )
         dumped = original.model_dump(mode="python")

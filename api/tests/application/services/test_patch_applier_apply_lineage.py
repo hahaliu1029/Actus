@@ -109,7 +109,7 @@ def _modify_plan(coordinator_run_id: str) -> PatchApplyPlan:
         coordinator_run_id=coordinator_run_id,
         files=(
             FilePatchEntry(
-                path="x.py",
+                path="d/x.py",
                 op="modify",
                 base_digest=_SHA_A,
                 new_digest=_NEW_DIGEST,

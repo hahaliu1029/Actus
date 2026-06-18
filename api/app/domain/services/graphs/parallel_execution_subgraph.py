@@ -76,6 +76,7 @@ from app.domain.models.mailbox_envelope import (
     MailboxEnvelopeType,
     ResultReadyOutcome,
 )
+from app.domain.models.path_validation import validate_coordinator_path
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.models.work_unit import PathLease, WorkUnit
 
@@ -180,7 +181,19 @@ def _build_work_units_from_requests(
     step_id_hash16: str,
     attempt_ix: int,
 ) -> list[WorkUnit]:
-    """Convert planner WorkUnitRequest list to runtime WorkUnit list."""
+    """Convert planner WorkUnitRequest list to runtime WorkUnit list.
+
+    [single-path contract — lease boundary] Each planner-proposed path is
+    validated AND canonicalized via ``validate_coordinator_path`` so a bare /
+    workspace-root path is rejected with a ``CoordinatorPathContractError``
+    HERE — before any child spawns — instead of producing a bare manifest path
+    that fails late at apply (§14 live-repro). The lease stores the CANONICAL
+    directory-qualified workspace-relative form (e.g. ``/home/ubuntu/sub/b.py``
+    and ``./sub/b.py`` both -> ``sub/b.py``), i.e. the ONE form the strict
+    manifest validator + ChildScopeGate exact-match + the child prompt all
+    agree on, so a lease can never be accepted in a shape that strands the run
+    mid-flight at strict manifest validation.
+    """
     units: list[WorkUnit] = []
     for i, req in enumerate(work_unit_requests):
         units.append(
@@ -190,7 +203,8 @@ def _build_work_units_from_requests(
                 phase=req.phase,
                 allowed_tools=list(req.allowed_tools),
                 write_lease=[
-                    PathLease(path=p.path, op=p.op) for p in req.proposed_paths
+                    PathLease(path=validate_coordinator_path(p.path), op=p.op)
+                    for p in req.proposed_paths
                 ],
                 expected_result_schema=req.expected_result_schema,
             )

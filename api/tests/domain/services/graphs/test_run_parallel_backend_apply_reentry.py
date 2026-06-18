@@ -148,7 +148,7 @@ async def test_non_already_applied_does_not_short_circuit() -> None:
     plan = PatchApplyPlan(
         coordinator_run_id="r1",
         files=(FilePatchEntry(
-            path="f.py", op="add", new_digest=sha,
+            path="d/f.py", op="add", new_digest=sha,
             content_ref="r", content_size=1,
         ),),
         total_size_bytes=1, file_count=1,

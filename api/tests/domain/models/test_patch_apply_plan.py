@@ -158,11 +158,11 @@ class TestPatchApplyPlan:
         (§9.3 step 6). PatchApplyPlan itself does NOT re-sort — it
         consumes whatever the reducer hands it."""
         e1 = FilePatchEntry(
-            path="a.py", op="add",
+            path="d/a.py", op="add",
             new_digest=_SHA_A, content_ref="r1", content_size=1,
         )
         e2 = FilePatchEntry(
-            path="b.py", op="add",
+            path="d/b.py", op="add",
             new_digest=_SHA_A, content_ref="r2", content_size=2,
         )
         plan = PatchApplyPlan(
@@ -170,4 +170,4 @@ class TestPatchApplyPlan:
             total_size_bytes=3, file_count=2,
             source_work_unit_ids=("wu1", "wu2"),
         )
-        assert [f.path for f in plan.files] == ["a.py", "b.py"]
+        assert [f.path for f in plan.files] == ["d/a.py", "d/b.py"]

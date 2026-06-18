@@ -27,6 +27,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
 
 from app.domain.models.app_config import AgentConfig
+from app.domain.models.path_validation import CoordinatorPathContractError
 
 from app.application.errors.exceptions import ServerRequestsError
 # PR-9b-A6 — PatchApplier construction at run time inside
@@ -130,24 +131,45 @@ async def _run_parallel_backend(
             "executor_node parallel branch: user_id required "
             "(state.user_id or configurable.user_id)"
         )
-    final_state = await subgraph.ainvoke(
-        {
-            "coordinator_run_id": None,
-            "step_id": step.id,
-            "work_unit_requests": list(step.parallel_work_units.work_units),
-            "work_units": [],
-            "parent_session_id": parent_session_id,
-            "user_id": user_id,
-            "root_session_id": root_session_id,
-            "child_session_ids": {},
-            "orchestrator_task": None,
-            "worker_results": [],
-            "apply_plan": None,
-            "group_outcome": None,
-            "step_result_candidate": None,
-        },
-        config={"configurable": cfg},
-    )
+    try:
+        final_state = await subgraph.ainvoke(
+            {
+                "coordinator_run_id": None,
+                "step_id": step.id,
+                "work_unit_requests": list(step.parallel_work_units.work_units),
+                "work_units": [],
+                "parent_session_id": parent_session_id,
+                "user_id": user_id,
+                "root_session_id": root_session_id,
+                "child_session_ids": {},
+                "orchestrator_task": None,
+                "worker_results": [],
+                "apply_plan": None,
+                "group_outcome": None,
+                "step_result_candidate": None,
+            },
+            config={"configurable": cfg},
+        )
+    except CoordinatorPathContractError as exc:
+        # [single-path contract] dispatch_node's ``_build_work_units_from_requests``
+        # rejects a planner-proposed path that isn't directory-qualified
+        # workspace-relative (bare ``part_a.md`` / workspace-root absolute) BEFORE
+        # any child spawns. Surface it as a graceful FAILED step here — this is
+        # the only try/except around the coordinator backend (executor_node calls
+        # ``_run_parallel_backend`` directly, line ~825, with no guard), so an
+        # uncaught raise would abort the whole agent run instead of letting the
+        # planner re-plan with a corrected (directory-qualified) path.
+        logger.warning(
+            "_run_parallel_backend: coordinator dispatch rejected for step %s — "
+            "invalid path contract: %s", step.id, exc,
+        )
+        return ParallelBackendOutcome(
+            success=False,
+            summary=(
+                f"并行调度被拒绝：work_unit 提议的路径不符合合同（必须是带目录的 "
+                f"workspace-relative 路径，例如 'workspace/foo.py'）。{exc}"
+            ),
+        )
     step_result_candidate = final_state.get("step_result_candidate", "") or ""
 
     # ── C2 PR-7 §12.5: apply re-entry short-circuit ─────────────────────

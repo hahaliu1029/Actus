@@ -54,6 +54,10 @@ from app.domain.models.needs_authorization_details import (
     ProposedWritePlan,
 )
 from app.domain.models.patch_manifest import PatchManifest
+from app.domain.models.path_validation import (
+    CoordinatorPathContractError,
+    to_workspace_relative as _domain_to_workspace_relative,
+)
 from typing import Protocol, runtime_checkable
 
 from app.application.services.coordinator_child_cancel_listener import (
@@ -87,41 +91,34 @@ class _OutOfLeaseWriteError(Exception):
     """[finish-core §5.1.5] A child wrote a path outside its write_lease."""
 
 
-# The sandbox workspace root (``~`` for the sandbox user); consistent across
-# the codebase (langchain_mcp ``_SANDBOX_PATH_PREFIX``, skill bundle root, the
-# Sandbox Workspace Isolation epic's ``workspace_root``). Child write/lease
-# paths arrive either absolute (``/home/ubuntu/x``) or already workspace-
-# relative (``x``); the PatchManifest wire schema (FilePatchEntry, which uses
-# ``validate_relative_path_strict``) requires the relative form because the
-# PatchApplier re-anchors it under the PARENT sandbox's workspace root.
-_WORKSPACE_ROOT = "/home/ubuntu"
-
-
 def _to_workspace_relative(path: str) -> str:
     """Canonicalize a child write/lease path to its workspace-relative form.
 
+    Delegates to the domain single source of truth
+    (``path_validation.to_workspace_relative``, anchored at ``WORKSPACE_ROOT`` =
+    ``/home/ubuntu``) so the abs->rel mapping cannot drift between the lease
+    boundary (``_build_work_units_from_requests``) and patch extraction here:
+
     - already-relative paths pass through unchanged (existing convention);
-    - absolute paths under ``_WORKSPACE_ROOT`` are stripped to the relative
-      tail (``/home/ubuntu/part_a.md`` -> ``part_a.md``);
+    - absolute paths under the workspace root are stripped to the relative tail
+      (``/home/ubuntu/sub/b.py`` -> ``sub/b.py``);
     - an absolute path OUTSIDE the workspace root (or the root itself) is a
-      sandbox-escape attempt and raises ``_OutOfLeaseWriteError`` (fail-closed
-      — ``validate_relative_path_strict`` + ChildScopeGate would reject it
-      anyway; raising here routes to NEEDS_AUTHORIZATION rather than a silent
-      ValidationError swallowed into a FAILED envelope).
+      sandbox-escape attempt; the domain helper raises
+      ``CoordinatorPathContractError``, which we translate to
+      ``_OutOfLeaseWriteError`` (fail-closed) so the child finalizer routes the
+      escape to NEEDS_AUTHORIZATION rather than a silent ValidationError
+      swallowed into a FAILED envelope.
 
     Used for BOTH the lease keys and the child's written paths so the lease
-    match is order-independent of the absolute/relative form each side used.
+    match is order-independent of the absolute/relative form each side used. The
+    directory-component requirement (single-path contract) is enforced
+    separately at the lease boundary + the ``FilePatchEntry`` wire schema — this
+    helper only strips the workspace prefix.
     """
-    if not path.startswith("/"):
-        return path  # already workspace-relative
-    prefix = _WORKSPACE_ROOT.rstrip("/") + "/"
-    if path.startswith(prefix):
-        rel = path[len(prefix):]
-        if rel:
-            return rel
-    raise _OutOfLeaseWriteError(
-        f"child wrote outside workspace root {_WORKSPACE_ROOT!r}: {path!r}"
-    )
+    try:
+        return _domain_to_workspace_relative(path)
+    except CoordinatorPathContractError as exc:
+        raise _OutOfLeaseWriteError(str(exc)) from exc
 
 
 class StopReason(StrEnum):

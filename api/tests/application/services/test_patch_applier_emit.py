@@ -101,7 +101,7 @@ def _modify_plan() -> PatchApplyPlan:
         coordinator_run_id="r1",
         files=(
             FilePatchEntry(
-                path="x.py", op="modify",
+                path="d/x.py", op="modify",
                 base_digest=_SHA_A,
                 new_digest=_NEW_DIGEST,
                 content_ref="ref-r1",
@@ -165,7 +165,7 @@ async def test_finalize_emits_failed_apply_event_with_path(
     assert len(apply_ev_calls) == 1
     ev = apply_ev_calls[0].args[0]
     assert ev.apply_status == "digest_drift"
-    assert ev.failed_at_path == "x.py"
+    assert ev.failed_at_path == "d/x.py"
     assert ev.coordinator_run_id == "r1"
 
 

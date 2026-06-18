@@ -28,7 +28,9 @@ from typing import Annotated, Literal, Optional
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-from app.domain.models.path_validation import validate_relative_path_strict
+from app.domain.models.path_validation import (
+    validate_directory_qualified_relative_path,
+)
 
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -78,7 +80,12 @@ class FilePatchEntry(BaseModel):
     path: Annotated[
         str,
         Field(max_length=2048),
-        AfterValidator(validate_relative_path_strict),
+        # [single-path contract] directory-qualified workspace-relative — strict
+        # relative PLUS a required directory component, so a bare ``part_a.md``
+        # is rejected HERE at the wire schema instead of late at the host
+        # ``atomic_write_file`` guard (§14 live-repro). The adapter guard stays
+        # as a should-never-fire backstop (spec §3.8 / D6).
+        AfterValidator(validate_directory_qualified_relative_path),
     ]
     op: Literal["add", "modify", "delete"]
     base_digest: Optional[Annotated[str, AfterValidator(_validate_sha256_hex)]] = None

@@ -49,6 +49,17 @@ class TestSectionWritePhase:
         assert "/x" in s
         assert "ChildScopeGate" in s  # enforcement reminder
 
+    def test_write_guidance_requires_directory_qualified_paths(self) -> None:
+        """[single-path contract] The write-phase guidance must steer the child
+        to write the authorized directory-qualified paths (no bare filename at
+        the workspace root), so a new file lands at e.g. ``workspace/foo.py``
+        and never produces a bare manifest path the apply guard rejects."""
+        s = build_coordinator_work_unit_section(
+            objective="x", phase="write", allowed_paths=["workspace/x.py"],
+            work_unit_id="wu-test",
+        )
+        assert "directory" in s.lower()
+
     def test_write_no_paths_still_renders(self) -> None:
         """Defensive: write phase with empty allowed_paths SHOULDN'T happen
         (WorkUnit.write phase requires non-empty lease), but the section
