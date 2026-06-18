@@ -1076,3 +1076,331 @@ async def test_updater_node_sanitizes_parallel_work_units_flag_off(monkeypatch):
     assert plan is not None
     # The updater-spliced step must have its parallel_work_units cleared flag-off.
     assert all(s.parallel_work_units is None for s in plan.steps)
+
+
+class TestCoordinatorStepCompletion:
+    """P0 — executor_node coordinator branch must complete a
+    ``parallel_work_units`` step exactly like the react branch: mark it
+    COMPLETED, write ``execution_summary``/``result``, then route to
+    updater_node. Before the fix the branch left the step PENDING, so
+    ``Plan.get_next_step()`` re-returned the same parallel step forever
+    (executor↔updater loop → ``GraphRecursionError`` under any recursion
+    limit) and the subgraph ran on every iteration."""
+
+    @staticmethod
+    def _planner_with_parallel_step(language: str = "en"):
+        from app.domain.models.work_unit import (
+            ParallelWorkUnitGroupRequest,
+            WorkUnitRequest,
+        )
+
+        pwu = ParallelWorkUnitGroupRequest(
+            work_units=[
+                WorkUnitRequest(
+                    objective="explore", phase="exploration",
+                    allowed_tools=["file_read"],
+                )
+            ]
+        )
+        create_response = PlanResponse(
+            title="Parallel", goal="do parallel work", language=language,
+            steps=[StepDef(id="s1", description="parallel step", parallel_work_units=pwu)],
+            message="ok",
+        )
+        # Updater never replans here (the single step completes → no pending
+        # step), but the mock still needs to dispatch the schema.
+        update_response = PlanUpdateResponse(steps=[])
+        create_structured = AsyncMock()
+        create_structured.ainvoke = AsyncMock(return_value=create_response)
+        update_structured = AsyncMock()
+        update_structured.ainvoke = AsyncMock(return_value=update_response)
+        planner_llm = MagicMock()
+
+        def _wso(schema, **kwargs):
+            return create_structured if schema is PlanResponse else update_structured
+
+        planner_llm.with_structured_output = MagicMock(side_effect=_wso)
+
+        async def _astream(messages, **kwargs):
+            yield AIMessageChunk(content='{"message": "done", "attachments": []}')
+
+        planner_llm.astream = _astream
+        return planner_llm
+
+    @pytest.mark.parametrize(
+        "group_outcome_name, candidate, expected_success",
+        [
+            ("FAILED", "并行执行失败：2 个 worker 中 1 个失败。", False),
+            ("SUCCESS", "并行执行完成：1 个 worker 完成，合并写入 0 个文件。", True),
+        ],
+    )
+    async def test_coordinator_step_completes_once_no_loop(
+        self, monkeypatch, group_outcome_name, candidate, expected_success,
+    ):
+        from app.domain.models.patch_apply_plan import GroupOutcome
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        monkeypatch.setenv("ACTUS_C2_COORDINATOR_ENABLED", "true")
+
+        # Fake subgraph: exploration-only group (apply_plan=None) so the
+        # PatchApplier branch is never reached — no applier ports needed.
+        subgraph = AsyncMock()
+        subgraph.ainvoke = AsyncMock(return_value={
+            "group_outcome": getattr(GroupOutcome, group_outcome_name),
+            "apply_plan": None,
+            "step_result_candidate": candidate,
+        })
+
+        planner_llm = self._planner_with_parallel_step()
+        graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
+            planner_llm=planner_llm,
+            react_graph=_make_mock_react_graph(),
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-coord",
+        )
+
+        # Uses the default recursion_limit (25), like every other test in this
+        # file. The happy path terminates in ~3-4 super-steps
+        # (planner→executor→updater→END, subgraph invoked exactly once); the
+        # pre-fix executor↔updater loop blows past 25 just as reliably as past a
+        # tighter bound, so regression coverage holds without the flake risk of
+        # a thin margin (a thin limit intermittently raised GraphRecursionError
+        # when the nested pregel subgraph consumed extra super-steps under
+        # process-sharing/scheduling pressure).
+        result = await graph.ainvoke(
+            {
+                "message": "run parallel work",
+                "language": "en",
+                "attachments": [],
+                "image_content_blocks": [],
+                "plan": None,
+                "current_step": None,
+                "messages": [],
+                "execution_summary": "",
+                "events": [],
+                "flow_status": "idle",
+                "session_id": "sess-coord",
+                "should_interrupt": False,
+                "resume_value": None,
+                "original_request": "",
+                "skill_context": "",
+                "conversation_summaries": [],
+            },
+            config={
+                "configurable": {
+                    "parallel_execution_subgraph": subgraph,
+                    "user_id": "u1",
+                },
+            },
+        )
+
+        # The coordinator backend ran exactly once — no executor↔updater loop.
+        subgraph.ainvoke.assert_awaited_once()
+
+        plan = result.get("plan")
+        assert plan is not None
+        assert plan.status == ExecutionStatus.COMPLETED
+
+        completed = [s for s in plan.steps if s.status == ExecutionStatus.COMPLETED]
+        assert len(completed) == 1
+        # success is derived from the structured GroupOutcome, not guessed
+        # from the summary string.
+        assert completed[0].success is expected_success
+        # result + execution_summary carry the reducer's operator text.
+        assert completed[0].result == candidate
+        assert result.get("execution_summary") == candidate
+
+    @pytest.mark.parametrize(
+        "group_outcome_name, expected_success",
+        [("SUCCESS", True), ("FAILED", False)],
+    )
+    async def test_coordinator_step_emits_events_and_records_metrics(
+        self, monkeypatch, group_outcome_name, expected_success,
+    ):
+        """Parity with the react branch: the coordinator step emits exactly
+        StepEvent(STARTED) then StepEvent(COMPLETED) (the COMPLETED one carrying
+        the COMPLETED+success step the frontend timeline renders), and records
+        the step in execution_metrics on the correct counter."""
+        from app.domain.models.event import StepEvent, StepEventStatus
+        from app.domain.models.patch_apply_plan import GroupOutcome
+        from app.domain.services.execution_metrics import ExecutionMetrics
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        monkeypatch.setenv("ACTUS_C2_COORDINATOR_ENABLED", "true")
+
+        subgraph = AsyncMock()
+        subgraph.ainvoke = AsyncMock(return_value={
+            "group_outcome": getattr(GroupOutcome, group_outcome_name),
+            "apply_plan": None,
+            "step_result_candidate": "candidate text",
+        })
+
+        event_queue: asyncio.Queue = asyncio.Queue()
+        metrics = ExecutionMetrics()
+
+        planner_llm = self._planner_with_parallel_step()
+        graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
+            planner_llm=planner_llm,
+            react_graph=_make_mock_react_graph(),
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-coord-evt",
+        )
+
+        await graph.ainvoke(
+            {
+                "message": "run parallel work",
+                "language": "en",
+                "attachments": [],
+                "image_content_blocks": [],
+                "plan": None,
+                "current_step": None,
+                "messages": [],
+                "execution_summary": "",
+                "events": [],
+                "flow_status": "idle",
+                "session_id": "sess-coord-evt",
+                "should_interrupt": False,
+                "resume_value": None,
+                "original_request": "",
+                "skill_context": "",
+                "conversation_summaries": [],
+            },
+            config={
+                "recursion_limit": 8,
+                "configurable": {
+                    "parallel_execution_subgraph": subgraph,
+                    "user_id": "u1",
+                    "event_queue": event_queue,
+                    "execution_metrics": metrics,
+                },
+            },
+        )
+
+        step_events = []
+        while not event_queue.empty():
+            evt = event_queue.get_nowait()
+            if isinstance(evt, StepEvent):
+                step_events.append(evt)
+
+        # Exactly STARTED then COMPLETED for the single coordinator step.
+        assert [e.status for e in step_events] == [
+            StepEventStatus.STARTED, StepEventStatus.COMPLETED,
+        ]
+        completed_evt = step_events[1]
+        assert completed_evt.step.status == ExecutionStatus.COMPLETED
+        assert completed_evt.step.success is expected_success
+
+        # Metrics recorded once on the outcome-appropriate counter.
+        if expected_success:
+            assert metrics.steps_completed == 1
+            assert metrics.steps_failed == 0
+        else:
+            assert metrics.steps_completed == 0
+            assert metrics.steps_failed == 1
+
+    async def test_coordinator_step_advances_to_next_pending_step(self, monkeypatch):
+        """A coordinator step in the MIDDLE of a plan must complete and let the
+        plan advance to the next pending step (react path) — the path most
+        directly threatened by a broken step-sync. The subgraph runs once (step
+        1 only); step 2 runs via react_graph; the plan reaches COMPLETED with no
+        executor↔updater loop."""
+        from app.domain.models.patch_apply_plan import GroupOutcome
+        from app.domain.models.work_unit import (
+            ParallelWorkUnitGroupRequest, WorkUnitRequest,
+        )
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        monkeypatch.setenv("ACTUS_C2_COORDINATOR_ENABLED", "true")
+
+        pwu = ParallelWorkUnitGroupRequest(work_units=[
+            WorkUnitRequest(objective="explore", phase="exploration", allowed_tools=["file_read"]),
+        ])
+        create_response = PlanResponse(
+            title="Two-step", goal="parallel then normal", language="en",
+            steps=[
+                StepDef(id="s1", description="parallel step", parallel_work_units=pwu),
+                StepDef(id="s2", description="normal follow-up step"),
+            ],
+            message="ok",
+        )
+        # Empty update steps → updater keeps the pre-planned pending step 2.
+        update_response = PlanUpdateResponse(steps=[])
+        create_structured = AsyncMock()
+        create_structured.ainvoke = AsyncMock(return_value=create_response)
+        update_structured = AsyncMock()
+        update_structured.ainvoke = AsyncMock(return_value=update_response)
+        planner_llm = MagicMock()
+
+        def _wso(schema, **kwargs):
+            return create_structured if schema is PlanResponse else update_structured
+
+        planner_llm.with_structured_output = MagicMock(side_effect=_wso)
+
+        async def _astream(messages, **kwargs):
+            yield AIMessageChunk(content='{"message": "done", "attachments": []}')
+
+        planner_llm.astream = _astream
+
+        subgraph = AsyncMock()
+        subgraph.ainvoke = AsyncMock(return_value={
+            "group_outcome": GroupOutcome.SUCCESS,
+            "apply_plan": None,
+            "step_result_candidate": "step1 candidate",
+        })
+
+        graph = build_main_graph(
+            _allow_default_prompt_assembler=True,
+            planner_llm=planner_llm,
+            react_graph=_make_mock_react_graph(),
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-coord-multi",
+        )
+
+        result = await graph.ainvoke(
+            {
+                "message": "do two steps",
+                "language": "en",
+                "attachments": [],
+                "image_content_blocks": [],
+                "plan": None,
+                "current_step": None,
+                "messages": [],
+                "execution_summary": "",
+                "events": [],
+                "flow_status": "idle",
+                "session_id": "sess-coord-multi",
+                "should_interrupt": False,
+                "resume_value": None,
+                "original_request": "",
+                "skill_context": "",
+                "conversation_summaries": [],
+            },
+            config={
+                "recursion_limit": 12,
+                "configurable": {
+                    "parallel_execution_subgraph": subgraph,
+                    "user_id": "u1",
+                },
+            },
+        )
+
+        # Coordinator backend ran once (only step 1 is parallel); step 2 took
+        # the react path. No loop on the coordinator step.
+        subgraph.ainvoke.assert_awaited_once()
+        # The updater consumed step 1's execution_summary to drive replanning.
+        update_structured.ainvoke.assert_awaited()
+
+        plan = result.get("plan")
+        assert plan is not None
+        assert plan.status == ExecutionStatus.COMPLETED
+        completed = [s for s in plan.steps if s.status == ExecutionStatus.COMPLETED]
+        assert len(completed) == 2
+        # Step 1 (coordinator) carries the structured success + reducer text.
+        s1 = next(s for s in plan.steps if s.id == "s1")
+        assert s1.success is True
+        assert s1.result == "step1 candidate"

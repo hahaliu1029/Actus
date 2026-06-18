@@ -87,6 +87,43 @@ class _OutOfLeaseWriteError(Exception):
     """[finish-core §5.1.5] A child wrote a path outside its write_lease."""
 
 
+# The sandbox workspace root (``~`` for the sandbox user); consistent across
+# the codebase (langchain_mcp ``_SANDBOX_PATH_PREFIX``, skill bundle root, the
+# Sandbox Workspace Isolation epic's ``workspace_root``). Child write/lease
+# paths arrive either absolute (``/home/ubuntu/x``) or already workspace-
+# relative (``x``); the PatchManifest wire schema (FilePatchEntry, which uses
+# ``validate_relative_path_strict``) requires the relative form because the
+# PatchApplier re-anchors it under the PARENT sandbox's workspace root.
+_WORKSPACE_ROOT = "/home/ubuntu"
+
+
+def _to_workspace_relative(path: str) -> str:
+    """Canonicalize a child write/lease path to its workspace-relative form.
+
+    - already-relative paths pass through unchanged (existing convention);
+    - absolute paths under ``_WORKSPACE_ROOT`` are stripped to the relative
+      tail (``/home/ubuntu/part_a.md`` -> ``part_a.md``);
+    - an absolute path OUTSIDE the workspace root (or the root itself) is a
+      sandbox-escape attempt and raises ``_OutOfLeaseWriteError`` (fail-closed
+      — ``validate_relative_path_strict`` + ChildScopeGate would reject it
+      anyway; raising here routes to NEEDS_AUTHORIZATION rather than a silent
+      ValidationError swallowed into a FAILED envelope).
+
+    Used for BOTH the lease keys and the child's written paths so the lease
+    match is order-independent of the absolute/relative form each side used.
+    """
+    if not path.startswith("/"):
+        return path  # already workspace-relative
+    prefix = _WORKSPACE_ROOT.rstrip("/") + "/"
+    if path.startswith(prefix):
+        rel = path[len(prefix):]
+        if rel:
+            return rel
+    raise _OutOfLeaseWriteError(
+        f"child wrote outside workspace root {_WORKSPACE_ROOT!r}: {path!r}"
+    )
+
+
 class StopReason(StrEnum):
     """C2 PR-3 §14.3.1 — sole authoritative stop classifier."""
 
@@ -583,6 +620,19 @@ class CoordinatorChildRunner:
     async def _finalize_failed(
         self, run_id: str, wu: "WorkUnit", child_id: str, exc: Exception,
     ) -> ResultReadyPayload:
+        # The failing exception was previously swallowed into ``summary`` only,
+        # which is NOT persisted to coordinator_result_envelope_store and is
+        # consumed off the Redis stream by the subscriber — leaving live
+        # worker failures undiagnosable. Log it loudly (with traceback) so the
+        # root cause of a FAILED worker is visible in the api logs.
+        logger.warning(
+            "coordinator child %s (wu=%s, run=%s) FAILED: %s",
+            child_id,
+            getattr(wu, "work_unit_id", "?"),
+            run_id,
+            exc,
+            exc_info=exc,
+        )
         payload = ResultReadyPayload(
             summary=f"failed: {exc}",
             outcome=ResultReadyOutcome.FAILED,
@@ -767,7 +817,16 @@ class CoordinatorChildRunner:
 
         result = done_event  # ChildRunResult (§5.1.1)
         tool_calls = getattr(result, "tool_calls", ()) or ()
-        lease_by_path = {lease.path: lease for lease in wu.write_lease}
+        # Canonicalize lease keys to workspace-relative so the match below is
+        # independent of whether the planner leased an absolute or relative
+        # path. A lease that escapes the workspace root can never be satisfied
+        # by a workspace write — drop it (the write side fails closed instead).
+        lease_by_path: dict[str, Any] = {}
+        for lease in wu.write_lease:
+            try:
+                lease_by_path[_to_workspace_relative(lease.path)] = lease
+            except _OutOfLeaseWriteError:
+                continue
 
         # Last-write-wins, preserve first-seen order.
         written_paths: list[str] = []
@@ -797,7 +856,12 @@ class CoordinatorChildRunner:
 
         files: list[FilePatchEntry] = []
         for path in written_paths:
-            lease = lease_by_path.get(path)
+            # ``path`` is the raw path the child wrote (absolute or relative);
+            # ``canon`` is its workspace-relative form for lease matching + the
+            # PatchManifest. An absolute write outside the workspace root raises
+            # _OutOfLeaseWriteError here (→ NEEDS_AUTHORIZATION, fail-closed).
+            canon = _to_workspace_relative(path)
+            lease = lease_by_path.get(canon)
             if lease is None:
                 raise _OutOfLeaseWriteError(
                     f"child wrote out-of-lease path: {path!r} "
@@ -812,6 +876,8 @@ class CoordinatorChildRunner:
                 raise _OutOfLeaseWriteError(
                     f"child wrote to a non-writable lease (op={lease.op}): {path!r}"
                 )
+            # Read the bytes back using the RAW path the child wrote (the child
+            # sandbox accepts whatever form the child used).
             content = await self._child_sandbox.read_file(path)
             new_digest = hashlib.sha256(content).hexdigest()
             content_ref = await self._artifact_storage.put_content_addressed_bytes(
@@ -819,7 +885,9 @@ class CoordinatorChildRunner:
                 content=content,
             )
             files.append(FilePatchEntry(
-                path=path,
+                # Workspace-relative — the PatchApplier re-anchors under the
+                # parent sandbox root (validate_relative_path_strict contract).
+                path=canon,
                 op=lease.op,
                 base_digest=lease.base_digest if lease.op == "modify" else None,
                 new_digest=new_digest,

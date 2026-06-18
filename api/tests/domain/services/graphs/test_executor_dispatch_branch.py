@@ -49,7 +49,7 @@ async def test_run_parallel_backend_invokes_subgraph_with_planner_units() -> Non
     }
     config = {"configurable": {"parallel_execution_subgraph": subgraph}}
 
-    result = await _run_parallel_backend(state, config, step)
+    result = (await _run_parallel_backend(state, config, step)).summary
     assert result == "subgraph-output"
     subgraph.ainvoke.assert_awaited_once()
     invoked_state = subgraph.ainvoke.await_args.args[0]
@@ -127,7 +127,7 @@ async def test_run_parallel_backend_returns_empty_string_on_missing_candidate() 
     ])
     state = {"session_id": "p", "user_id": "u", "root_session_id": "r"}
     config = {"configurable": {"parallel_execution_subgraph": subgraph}}
-    result = await _run_parallel_backend(state, config, step)
+    result = (await _run_parallel_backend(state, config, step)).summary
     assert result == ""
 
 

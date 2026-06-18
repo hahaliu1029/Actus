@@ -86,6 +86,79 @@ async def test_extraction_rejects_out_of_lease_write():
         await r._extract_patch_files_from_history("run-1", wu, result)
 
 
+async def test_extraction_normalizes_absolute_workspace_path_to_relative():
+    """A child write to an ABSOLUTE workspace path (/home/ubuntu/part_a.md —
+    the natural sandbox path the planner/objective uses) must be canonicalized
+    to the sandbox-relative form FilePatchEntry requires. RED before the fix
+    (FilePatchEntry's strict validator rejects the absolute path → extraction
+    raises ValidationError → worker FAILED → no apply); GREEN after."""
+    final_bytes = b"ocean line"
+    digest = hashlib.sha256(final_bytes).hexdigest()
+    child_sandbox = MagicMock()
+    child_sandbox.read_file = AsyncMock(return_value=final_bytes)
+    artifact = MagicMock()
+    artifact.put_content_addressed_bytes = AsyncMock(return_value="ref-abs")
+    r = _runner(child_sandbox, artifact)
+    wu = WorkUnit(
+        work_unit_id="wu-1", objective="o", phase="write",
+        allowed_tools=["file_write"],
+        write_lease=[PathLease(path="/home/ubuntu/part_a.md", op="add")],
+    )
+    result = ChildRunResult(
+        done_event=MagicMock(),
+        tool_calls=(_tool_write("/home/ubuntu/part_a.md"),),
+    )
+    files = await r._extract_patch_files_from_history("run-1", wu, result)
+    assert len(files) == 1
+    # Canonicalized to workspace-relative for the manifest wire schema.
+    assert files[0].path == "part_a.md"
+    assert files[0].op == "add"
+    assert files[0].new_digest == digest
+    # The sandbox read still uses the raw path the child actually wrote.
+    child_sandbox.read_file.assert_awaited_once_with("/home/ubuntu/part_a.md")
+
+
+async def test_extraction_matches_relative_write_against_absolute_lease():
+    """Mixed case: planner leases an absolute path, child writes the relative
+    form (or vice-versa). Canonicalization on BOTH sides makes them match."""
+    child_sandbox = MagicMock()
+    child_sandbox.read_file = AsyncMock(return_value=b"x")
+    artifact = MagicMock()
+    artifact.put_content_addressed_bytes = AsyncMock(return_value="ref")
+    r = _runner(child_sandbox, artifact)
+    wu = WorkUnit(
+        work_unit_id="wu-1", objective="o", phase="write",
+        allowed_tools=["file_write"],
+        write_lease=[PathLease(path="/home/ubuntu/sub/b.py", op="add")],
+    )
+    result = ChildRunResult(
+        done_event=MagicMock(),
+        tool_calls=(_tool_write("sub/b.py"),),  # relative write vs absolute lease
+    )
+    files = await r._extract_patch_files_from_history("run-1", wu, result)
+    assert len(files) == 1
+    assert files[0].path == "sub/b.py"
+
+
+async def test_extraction_rejects_absolute_path_outside_workspace():
+    """A child write to an absolute path OUTSIDE the workspace root is a
+    sandbox-escape attempt → _OutOfLeaseWriteError (fail-closed), never a
+    silent ValidationError or an escaping FilePatchEntry."""
+    child_sandbox = MagicMock()
+    child_sandbox.read_file = AsyncMock(return_value=b"x")
+    artifact = MagicMock()
+    artifact.put_content_addressed_bytes = AsyncMock(return_value="r")
+    r = _runner(child_sandbox, artifact)
+    wu = WorkUnit(
+        work_unit_id="wu-1", objective="o", phase="write",
+        allowed_tools=["file_write"],
+        write_lease=[PathLease(path="/etc/passwd", op="modify", base_digest="b" * 64, seed_content_ref="s")],
+    )
+    result = ChildRunResult(done_event=MagicMock(), tool_calls=(_tool_write("/etc/passwd"),))
+    with pytest.raises(_OutOfLeaseWriteError):
+        await r._extract_patch_files_from_history("run-1", wu, result)
+
+
 async def test_extraction_empty_tool_calls_yields_no_files():
     r = _runner(MagicMock(), MagicMock())
     wu = WorkUnit(

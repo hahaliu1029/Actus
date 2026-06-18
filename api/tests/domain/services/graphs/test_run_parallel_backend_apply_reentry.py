@@ -65,7 +65,7 @@ def _config_with_full_ports(subgraph: MagicMock) -> tuple[dict[str, Any], MagicM
 async def test_already_applied_success_returns_summary_no_apply() -> None:
     sub = _subgraph_already_applied("success", 42)
     config, applier = _config_with_full_ports(sub)
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "Apply already succeeded" in out
     assert "42" in out
     applier.apply.assert_not_called()
@@ -74,7 +74,7 @@ async def test_already_applied_success_returns_summary_no_apply() -> None:
 async def test_already_applied_rollback_partial_returns_no_retry_no_apply() -> None:
     sub = _subgraph_already_applied("rollback_partial", 7)
     config, applier = _config_with_full_ports(sub)
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "rollback_partial" in out
     assert "not auto-retrying" in out
     assert "7" in out
@@ -84,7 +84,7 @@ async def test_already_applied_rollback_partial_returns_no_retry_no_apply() -> N
 async def test_already_applied_crash_mid_apply_warns_manual_recovery_no_apply() -> None:
     sub = _subgraph_already_applied("crash_mid_apply", 99)
     config, applier = _config_with_full_ports(sub)
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "crash" in out.lower() or "pod crash" in out
     assert "99" in out
     applier.apply.assert_not_called()
@@ -93,7 +93,7 @@ async def test_already_applied_crash_mid_apply_warns_manual_recovery_no_apply() 
 async def test_already_applied_in_progress_recent_waits_no_apply() -> None:
     sub = _subgraph_already_applied("in_progress_recent", 11)
     config, applier = _config_with_full_ports(sub)
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "Redis lock" in out or "lock" in out
     applier.apply.assert_not_called()
 
@@ -109,7 +109,7 @@ async def test_already_applied_unknown_status_returns_verbatim() -> None:
     """
     sub = _subgraph_already_applied("mystery_status", 5)
     config, applier = _config_with_full_ports(sub)
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert out == "ALREADY_APPLIED:mystery_status:5"
     applier.apply.assert_not_called()
 
@@ -123,7 +123,7 @@ async def test_malformed_already_applied_returns_unknown_audit_id() -> None:
         "step_result_candidate": "ALREADY_APPLIED:success",
     })
     config, applier = _config_with_full_ports(sub)
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "Apply already succeeded" in out
     assert "unknown" in out
     applier.apply.assert_not_called()
@@ -172,6 +172,28 @@ async def test_non_already_applied_does_not_short_circuit() -> None:
         "parent_sandbox": AsyncMock(),
         "artifact_storage": AsyncMock(),
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     applier.apply.assert_awaited_once()
     assert "应用成功" in out
+
+
+# ── Structured success flag for the ALREADY_APPLIED short-circuit ─────────
+
+
+@pytest.mark.parametrize(
+    "status, expected_success",
+    [
+        ("success", True),
+        ("rollback_partial", False),
+        ("crash_mid_apply", False),
+        ("in_progress_recent", False),
+        ("mystery_status", False),
+    ],
+)
+async def test_already_applied_outcome_success_flag(
+    status: str, expected_success: bool,
+) -> None:
+    sub = _subgraph_already_applied(status, 1)
+    config, _applier = _config_with_full_ports(sub)
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is expected_success

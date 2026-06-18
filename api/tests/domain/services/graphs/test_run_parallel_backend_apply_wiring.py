@@ -88,7 +88,7 @@ async def test_failed_group_outcome_skips_apply() -> None:
         "parent_sandbox": AsyncMock(),
         "artifact_storage": AsyncMock(),
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "并行执行失败" in out
     applier.apply.assert_not_called()
 
@@ -108,7 +108,7 @@ async def test_success_empty_plan_skips_apply() -> None:
         "parent_sandbox": AsyncMock(),
         "artifact_storage": AsyncMock(),
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "并行执行完成" in out
     applier.apply.assert_not_called()
 
@@ -125,7 +125,7 @@ async def test_success_with_plan_but_no_applier_port_skips_apply() -> None:
     config = {"configurable": {
         "parallel_execution_subgraph": subgraph,
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "并行执行完成" in out
 
 
@@ -152,7 +152,7 @@ async def test_success_with_applier_returns_success_text() -> None:
         "parent_sandbox": AsyncMock(),
         "artifact_storage": AsyncMock(),
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     applier.apply.assert_awaited_once()
     assert "reducer-text" in out
     # [codex R4 P2] Apply outcome text is Chinese per project
@@ -181,7 +181,7 @@ async def test_apply_rollback_partial_surfaces_failed_path() -> None:
         "parent_sandbox": AsyncMock(),
         "artifact_storage": AsyncMock(),
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     # [codex R4 P2] Operator text is Chinese; PR-6/PR-8 route via
     # ApplyStatus enum, not text matching.
     assert "应用回滚不完整" in out
@@ -245,5 +245,119 @@ async def test_apply_other_failure_returns_status_text() -> None:
         "parent_sandbox": AsyncMock(),
         "artifact_storage": AsyncMock(),
     }}
-    out = await _run_parallel_backend(_state(), config, _step())
+    out = (await _run_parallel_backend(_state(), config, _step())).summary
     assert "digest_drift" in out.lower()
+
+
+# ── Structured success flag (NOT inferred from the summary string) ────────
+
+
+async def test_outcome_success_false_on_failed_group() -> None:
+    subgraph = _subgraph_with_final({
+        "group_outcome": GroupOutcome.FAILED,
+        "apply_plan": None,
+        "step_result_candidate": "并行执行失败。",
+    })
+    config = {"configurable": {"parallel_execution_subgraph": subgraph}}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is False
+
+
+async def test_outcome_success_true_on_success_exploration_only() -> None:
+    """SUCCESS with no files (exploration-only) → success, no apply needed."""
+    subgraph = _subgraph_with_final({
+        "group_outcome": GroupOutcome.SUCCESS,
+        "apply_plan": _plan(file_count=0),
+        "step_result_candidate": "并行探索完成。",
+    })
+    config = {"configurable": {"parallel_execution_subgraph": subgraph}}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is True
+
+
+async def test_outcome_success_true_on_apply_success() -> None:
+    subgraph = _subgraph_with_final({
+        "group_outcome": GroupOutcome.SUCCESS,
+        "apply_plan": _plan(),
+        "step_result_candidate": "reducer-text",
+    })
+    applier = MagicMock()
+    applier.apply = AsyncMock(return_value=ApplyOutcome(
+        status=ApplyStatus.SUCCESS,
+        applied_files=(AppliedFileRecord(path="f0.py", op="add"),),
+        failed_at=None, rollback_status=None,
+        diagnostics=ApplyDiagnostics(duration_ms=1),
+    ))
+    config = {"configurable": {
+        "parallel_execution_subgraph": subgraph,
+        "patch_applier": applier,
+        "parent_sandbox": AsyncMock(),
+        "artifact_storage": AsyncMock(),
+    }}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is True
+
+
+async def test_outcome_success_false_on_apply_rollback_partial() -> None:
+    subgraph = _subgraph_with_final({
+        "group_outcome": GroupOutcome.SUCCESS,
+        "apply_plan": _plan(),
+        "step_result_candidate": "reducer-text",
+    })
+    applier = MagicMock()
+    applier.apply = AsyncMock(return_value=ApplyOutcome(
+        status=ApplyStatus.ROLLBACK_PARTIAL,
+        applied_files=(),
+        failed_at=AppliedFileFailure(path="bad.py", reason="disk full"),
+        rollback_status="partial",
+        diagnostics=ApplyDiagnostics(duration_ms=1),
+    ))
+    config = {"configurable": {
+        "parallel_execution_subgraph": subgraph,
+        "patch_applier": applier,
+        "parent_sandbox": AsyncMock(),
+        "artifact_storage": AsyncMock(),
+    }}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is False
+
+
+async def test_outcome_success_true_when_applier_ports_missing() -> None:
+    """SUCCESS with files but the composition root hasn't wired the applier
+    ports (PR-5 cold-code / misconfig) → the reducer's SUCCESS is the
+    authoritative work signal, so success=True (the skipped apply is logged
+    as a WARNING and never happens on the flag-ON production path)."""
+    subgraph = _subgraph_with_final({
+        "group_outcome": GroupOutcome.SUCCESS,
+        "apply_plan": _plan(),
+        "step_result_candidate": "并行执行完成：1 个 worker 完成，合并写入 1 个文件。",
+    })
+    config = {"configurable": {"parallel_execution_subgraph": subgraph}}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is True
+
+
+async def test_outcome_success_false_on_apply_other_status() -> None:
+    """Apply ends in a non-SUCCESS / non-ROLLBACK_PARTIAL status (e.g.
+    DIGEST_DRIFT) → step failed."""
+    subgraph = _subgraph_with_final({
+        "group_outcome": GroupOutcome.SUCCESS,
+        "apply_plan": _plan(),
+        "step_result_candidate": "reducer-text",
+    })
+    applier = MagicMock()
+    applier.apply = AsyncMock(return_value=ApplyOutcome(
+        status=ApplyStatus.DIGEST_DRIFT,
+        applied_files=(),
+        failed_at=AppliedFileFailure(path="x.py", reason="drift"),
+        rollback_status="complete",
+        diagnostics=ApplyDiagnostics(duration_ms=1),
+    ))
+    config = {"configurable": {
+        "parallel_execution_subgraph": subgraph,
+        "patch_applier": applier,
+        "parent_sandbox": AsyncMock(),
+        "artifact_storage": AsyncMock(),
+    }}
+    outcome = await _run_parallel_backend(_state(), config, _step())
+    assert outcome.success is False

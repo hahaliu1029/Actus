@@ -116,7 +116,7 @@ async def test_run_parallel_backend_threads_group_lineage_into_apply() -> None:
             "cancel_event": cancel_event,
         }}
 
-        out = await _run_parallel_backend(state, config, step)
+        out = (await _run_parallel_backend(state, config, step)).summary
     finally:
         if orig_applier is None:
             mg.__dict__.pop("PatchApplier", None)

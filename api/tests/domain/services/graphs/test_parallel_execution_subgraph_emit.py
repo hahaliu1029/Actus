@@ -467,7 +467,7 @@ async def test_run_parallel_backend_constructs_applier_from_deps_with_emit() -> 
             "event_queue": event_queue,
         }}
 
-        out = await _run_parallel_backend(state, config, step)
+        out = (await _run_parallel_backend(state, config, step)).summary
     finally:
         if orig_applier is None:
             mg.__dict__.pop("PatchApplier", None)

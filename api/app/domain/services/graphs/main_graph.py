@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, TYPE_CHECKING
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -67,7 +68,25 @@ logger = logging.getLogger(__name__)
 _BROWSER_COMPACT_TOOLS = frozenset(["browser_view", "browser_navigate"])
 
 
-async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
+@dataclass(frozen=True)
+class ParallelBackendOutcome:
+    """Structured result of the C2 coordinator branch (``_run_parallel_backend``).
+
+    ``summary`` is the operator-facing text the orchestrator forwards into
+    ``execution_summary`` / ``Step.result``. ``success`` is the authoritative
+    pass/fail signal — derived from the reducer's ``GroupOutcome`` (and, on the
+    SUCCESS-with-apply path, the ``ApplyStatus``), NOT inferred from the summary
+    string. ``executor_node`` reads ``success`` to set ``Step.success`` exactly
+    like the react branch reads ``failure_count == 0``.
+    """
+
+    success: bool
+    summary: str
+
+
+async def _run_parallel_backend(
+    state: Any, config: Any, step: Any
+) -> ParallelBackendOutcome:
     """C2 PR-3 §7.2 — invoke parallel_execution_subgraph for a coordinator step.
 
     The subgraph's ``dispatch_node`` is responsible for ``coordinator_run_id``
@@ -150,25 +169,41 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
         status = parts[1] if len(parts) > 1 else "unknown"
         audit_id = parts[2] if len(parts) > 2 else "unknown"
         if status == "success":
-            return f"Apply already succeeded (audit {audit_id})."
+            # The apply already committed in a prior run — the step's goal
+            # was achieved, so the coordinator step is a success.
+            return ParallelBackendOutcome(
+                success=True,
+                summary=f"Apply already succeeded (audit {audit_id}).",
+            )
         if status == "rollback_partial":
             # Spec §10.4: 不 auto-retry; HealthEvent 已由 rehydrate_service emit。
-            return (
-                f"Apply rollback_partial detected (audit {audit_id}); "
-                f"not auto-retrying — manual recovery required."
+            # Needs manual recovery → NOT a success.
+            return ParallelBackendOutcome(
+                success=False,
+                summary=(
+                    f"Apply rollback_partial detected (audit {audit_id}); "
+                    f"not auto-retrying — manual recovery required."
+                ),
             )
         if status == "crash_mid_apply":
-            return (
-                f"⚠️ apply 中途 pod crash（audit {audit_id} "
-                f"in_progress > 5min）。Workspace 可能不一致，请人工检查 "
-                f"+ 清理 audit row 后重试。"
+            return ParallelBackendOutcome(
+                success=False,
+                summary=(
+                    f"⚠️ apply 中途 pod crash（audit {audit_id} "
+                    f"in_progress > 5min）。Workspace 可能不一致，请人工检查 "
+                    f"+ 清理 audit row 后重试。"
+                ),
             )
         if status == "in_progress_recent":
-            return (
-                "apply 仍在执行（另一 pod？），等 Redis lock 释放后重试。"
+            return ParallelBackendOutcome(
+                success=False,
+                summary="apply 仍在执行（另一 pod？），等 Redis lock 释放后重试。",
             )
         # Unknown status — surface verbatim so operator can diagnose.
-        return step_result_candidate
+        # Conservative: an undiagnosable apply state is NOT a success.
+        return ParallelBackendOutcome(
+            success=False, summary=step_result_candidate
+        )
 
     # ── C2 PR-5 §10.6: invoke PatchApplier on SUCCESS ────────────────────
     #
@@ -195,12 +230,18 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
     from app.domain.models.patch_apply_plan import GroupOutcome
     group_outcome = final_state.get("group_outcome")
     if group_outcome != GroupOutcome.SUCCESS:
-        return step_result_candidate
+        # Any non-SUCCESS group outcome (FAILED / CANCELLED / TIMED_OUT /
+        # NEEDS_AUTHORIZATION / CONFLICT / INCOMPLETE / MIXED) → step failed.
+        return ParallelBackendOutcome(
+            success=False, summary=step_result_candidate
+        )
 
     apply_plan = final_state.get("apply_plan")
     if apply_plan is None or apply_plan.file_count == 0:
-        # SUCCESS with no files (exploration-only step) — nothing to apply
-        return step_result_candidate
+        # SUCCESS with no files (exploration-only step) — nothing to apply.
+        return ParallelBackendOutcome(
+            success=True, summary=step_result_candidate
+        )
 
     # PR-9b-A6: prefer per-run construction from PatchApplierDeps. Falls back
     # to a singleton ``patch_applier`` only when the new key is absent.
@@ -266,7 +307,13 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
             "the composition root.",
             apply_plan.file_count, missing,
         )
-        return step_result_candidate
+        # The reducer reported SUCCESS; the skipped apply is a composition-root
+        # wiring gap (already surfaced as a WARNING above) and never happens on
+        # the flag-ON production path where the ports are always bound. Treat
+        # the reducer's SUCCESS as the authoritative work signal.
+        return ParallelBackendOutcome(
+            success=True, summary=step_result_candidate
+        )
 
     from app.application.services.patch_applier import ApplyStatus
     # [codex R2 P1] Thread the orchestrator's cancel_event into the
@@ -291,9 +338,12 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
         lineage=lineage,
     )
     if apply_outcome.status == ApplyStatus.SUCCESS:
-        return (
-            f"{step_result_candidate}\n"
-            f"应用成功（写入 {apply_plan.file_count} 个文件）。"
+        return ParallelBackendOutcome(
+            success=True,
+            summary=(
+                f"{step_result_candidate}\n"
+                f"应用成功（写入 {apply_plan.file_count} 个文件）。"
+            ),
         )
     if apply_outcome.status == ApplyStatus.ROLLBACK_PARTIAL:
         # Surface critical health signal — applier already emitted the
@@ -303,8 +353,9 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
             apply_outcome.failed_at.path
             if apply_outcome.failed_at else "未知路径"
         )
-        return (
-            f"应用回滚不完整（卡在 {failed_path}）；需要人工恢复。"
+        return ParallelBackendOutcome(
+            success=False,
+            summary=f"应用回滚不完整（卡在 {failed_path}）；需要人工恢复。",
         )
     # Other ApplyStatus (DIGEST_DRIFT / FILE_MISSING / WRITE_IO_ERROR /
     # POST_WRITE_DIGEST_MISMATCH / MINIO_FETCH_FAILED / APPLY_ABORTED).
@@ -312,7 +363,10 @@ async def _run_parallel_backend(state: Any, config: Any, step: Any) -> str:
     # is consistent — orchestrator routes via the result text. Operator
     # text in Chinese (project convention); the machine-readable status
     # value remains the canonical routing surface for PR-6/8.
-    return f"应用失败（状态 {apply_outcome.status.value}）"
+    return ParallelBackendOutcome(
+        success=False,
+        summary=f"应用失败（状态 {apply_outcome.status.value}）",
+    )
 
 
 def _assign_fallback_step_id(plan_id: str, index: int) -> str:
@@ -765,13 +819,38 @@ def build_main_graph(
                 assert_coordinator_enabled,
             )
             assert_coordinator_enabled()
-            step_result_candidate = await _run_parallel_backend(state, config, step)
+            # Parity with the react branch (below): emit STARTED, run the
+            # coordinator backend, then complete the step.
+            await _emit(StepEvent(step=step, status=StepEventStatus.STARTED))
+            outcome = await _run_parallel_backend(state, config, step)
+            # Mark the step COMPLETED with the authoritative success flag +
+            # result text — exactly like the react branch does after a step.
+            # Without this the step stays PENDING, so updater_node's
+            # Plan.get_next_step() re-returns this same parallel step forever
+            # (executor↔updater loop → GraphRecursionError). ``success`` comes
+            # from the structured ParallelBackendOutcome, not the summary text.
+            step = step.model_copy(update={
+                "status": ExecutionStatus.COMPLETED,
+                "success": outcome.success,
+                "result": outcome.summary,
+            })
+            await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
+            _metrics = config.get("configurable", {}).get("execution_metrics")
+            if _metrics is not None:
+                if outcome.success:
+                    _metrics.steps_completed += 1
+                else:
+                    _metrics.steps_failed += 1
             return Command(
                 update={
                     "current_step": step,
-                    "events": [],
+                    # ``execution_summary`` (NOT ``step_result``) is the field
+                    # updater_node reads to drive replanning + step sync.
+                    "execution_summary": outcome.summary,
+                    "resume_value": None,
+                    "flow_status": FlowStatus.UPDATING.value,
+                    "events": [],  # StepEvents already emitted via queue
                     "messages": state.get("messages", []),
-                    "step_result": step_result_candidate,
                 },
                 goto="updater_node",
             )
