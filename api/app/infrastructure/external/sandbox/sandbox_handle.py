@@ -45,6 +45,7 @@ SANDBOX_FORWARDED_METHODS: frozenset[str] = frozenset(
         "download_file",
         "ensure_sandbox",
         "get_browser",
+        "snapshot_workspace",
     }
 )
 

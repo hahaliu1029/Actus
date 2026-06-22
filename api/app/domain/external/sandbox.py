@@ -115,6 +115,22 @@ class Sandbox(Protocol):
         """根据传递的文件夹路径+匹配规则查找文件"""
         ...
 
+    async def snapshot_workspace(
+        self,
+        root: str = "/home/ubuntu",
+        *,
+        max_paths: int,
+        max_files: int,
+        max_total_bytes: int,
+        max_seconds: float,
+    ) -> ToolResult:
+        """S2 §3.1 — capped directory-excluded content snapshot of ``root``.
+
+        Returns a ToolResult whose ``data`` carries ``{entries, truncated}``;
+        the ParentSandboxAdapter decodes it into a domain WorkspaceScan.
+        """
+        ...
+
     async def upload_file(
         self,
         file_data: BinaryIO,
@@ -272,6 +288,18 @@ class SandboxHandle(Protocol):
     ) -> ToolResult: ...
 
     async def find_files(self, dir_path: str, glob_pattern: str) -> ToolResult: ...
+
+    async def snapshot_workspace(
+        self,
+        root: str = "/home/ubuntu",
+        *,
+        max_paths: int,
+        max_files: int,
+        max_total_bytes: int,
+        max_seconds: float,
+    ) -> ToolResult:
+        """S2 §3.1 forwarded RPC (see SANDBOX_FORWARDED_METHODS)."""
+        ...
 
     async def upload_file(
         self,

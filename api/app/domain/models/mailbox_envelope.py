@@ -177,6 +177,13 @@ class ResultReadyPayload(BaseModel):
     # [C2 PR-4 §6.2] coordinator child writes; tied to outcome by the
     # `_outcome_field_matrix` validator below.
     patch_manifest: Optional[PatchManifest] = None
+    # [C2-full S2 §3.2 C1] MinIO ref to a full PatchManifest JSON, used when
+    # the inline manifest would exceed the envelope-store 64KB whitelist
+    # ceiling (shell-mode children can produce large patch sets). SUCCESS-only
+    # and MUTUALLY EXCLUSIVE with inline ``patch_manifest`` — exactly one of
+    # the two carries the write set. worker_node / the rehydrate builder
+    # resolve the ref via artifact_storage.get_bytes before the reducer runs.
+    patch_manifest_ref: Optional[str] = None
     # [C2 PR-4 §6.2 + r14 P1-2] structured grievance; required when
     # outcome=NEEDS_AUTHORIZATION. Free-text rationale lives in
     # ``needs_authorization_details.proposed_write_plan.rationale_ref``
@@ -195,6 +202,9 @@ class ResultReadyPayload(BaseModel):
                                   completion envelope, confusing the reducer)
         - patch_manifest is allowed on SUCCESS only (other outcomes have no
           meaningful write set to apply)
+        - [S2 §3.2 C1] patch_manifest_ref is allowed on SUCCESS only and is
+          mutually exclusive with inline patch_manifest (exactly one carries
+          the write set; both-None is a legal exploration-phase SUCCESS).
         """
         if self.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION:
             if self.needs_authorization_details is None:
@@ -213,6 +223,16 @@ class ResultReadyPayload(BaseModel):
             raise ValueError(
                 f"outcome={self.outcome.value} forbids patch_manifest "
                 "(only SUCCESS may carry one)"
+            )
+        if self.patch_manifest_ref is not None and self.outcome != ResultReadyOutcome.SUCCESS:
+            raise ValueError(
+                f"outcome={self.outcome.value} forbids patch_manifest_ref "
+                "(only SUCCESS may carry one)"
+            )
+        if self.patch_manifest is not None and self.patch_manifest_ref is not None:
+            raise ValueError(
+                "patch_manifest and patch_manifest_ref are mutually exclusive "
+                "(exactly one may carry the write set)"
             )
         return self
 

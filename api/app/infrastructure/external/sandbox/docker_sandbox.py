@@ -596,6 +596,28 @@ class DockerSandbox(Sandbox):
         """传递目录列出沙箱指定目录下的所有文件"""
         return await self.find_files(dir_path, "*")
 
+    async def snapshot_workspace(
+        self,
+        root: str = "/home/ubuntu",
+        *,
+        max_paths: int,
+        max_files: int,
+        max_total_bytes: int,
+        max_seconds: float,
+    ) -> ToolResult:
+        """S2 §3.1 — capped directory-excluded content snapshot of ``root``."""
+        response = await self.client.post(
+            f"{self._base_url}/api/file/snapshot-workspace",
+            json={
+                "root": root,
+                "max_paths": max_paths,
+                "max_files": max_files,
+                "max_total_bytes": max_total_bytes,
+                "max_seconds": max_seconds,
+            },
+        )
+        return ToolResult.from_sandbox(**response.json())
+
     async def check_file_exists(self, filepath: str) -> ToolResult:
         """传递指定路径检查沙箱中指定文件是否存在"""
         response = await self.client.post(

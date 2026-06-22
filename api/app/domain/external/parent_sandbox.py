@@ -23,7 +23,7 @@ wraps the live ``SandboxHandle`` (which returns ``BinaryIO`` /
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Protocol
+from typing import Literal, Mapping, Optional, Protocol
 
 
 FileKind = Literal[
@@ -46,8 +46,48 @@ class SandboxPathCheck:
     kind: FileKind
 
 
+@dataclass(frozen=True)
+class WorkspaceScanEntry:
+    """One non-directory inode captured by ``snapshot_workspace`` (S2 §3.1).
+
+    ``kind`` is the ``os.lstat`` inode type and is NEVER ``"directory"`` —
+    directories are traversed, not emitted. ``sha256`` is the content digest,
+    set ONLY when ``kind == "regular"``; ``link_target`` is the ``os.readlink``
+    referent, set ONLY when ``kind == "symlink"``. The diff identity tuple the
+    differ compares is ``(kind, sha256, size, mode, link_target)``.
+    """
+
+    rel_path: str
+    kind: "FileKind"
+    sha256: Optional[str]
+    size: int
+    mode: int
+    link_target: Optional[str]
+
+
+@dataclass(frozen=True)
+class WorkspaceScan:
+    """Capped, directory-excluded snapshot of a workspace subtree (S2 §3.1).
+
+    ``entries`` is keyed by ``rel_path`` (workspace-relative,
+    directory-qualified); directories are EXCLUDED. ``truncated`` is True iff
+    any cap (paths / files / total-bytes / seconds) aborted the walk — the
+    differ treats a truncated scan as a hard fail-closed signal (group
+    zero-apply).
+    """
+
+    entries: Mapping[str, WorkspaceScanEntry]
+    truncated: bool
+
+
 class ParentSandboxPort(Protocol):
     """Narrow read/write surface over the parent session's sandbox.
+
+    This port is a **neutral, read-only file-surface used over BOTH the
+    parent and the child handle** (S2 §3.1 [B9]): the same adapter wraps the
+    parent session's ``SandboxHandle`` and a coordinator child's handle
+    (``coordinator_child_runner_starter.py:246``). ``snapshot_workspace`` is
+    read-only and (per M1) MUST NOT expose any lifecycle op.
 
     Method semantics are spec-defined (§10.5):
 
@@ -98,3 +138,22 @@ class ParentSandboxPort(Protocol):
     async def read_file(self, path: str) -> bytes: ...
     async def atomic_write_file(self, path: str, content: bytes) -> None: ...
     async def delete_file(self, path: str) -> None: ...
+    async def snapshot_workspace(
+        self,
+        root: str = "/home/ubuntu",
+        *,
+        max_paths: int,
+        max_files: int,
+        max_total_bytes: int,
+        max_seconds: float,
+    ) -> "WorkspaceScan":
+        """Capped, directory-excluded content snapshot of ``root`` (S2 §3.1).
+
+        Walks ``root`` (excluding ``/sandbox`` + ``.memory``), emitting one
+        ``WorkspaceScanEntry`` per non-directory inode keyed by
+        directory-qualified workspace-relative path. Aborts the walk and sets
+        ``truncated=True`` if any cap is exceeded. Indeterminate-kind inodes
+        fail CLOSED (treated as a scan failure / truncation), opposite of
+        ``check_path``'s fail-open. Raises ``OSError`` on RPC failure.
+        """
+        ...

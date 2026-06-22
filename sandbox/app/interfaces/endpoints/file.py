@@ -13,6 +13,7 @@ from app.interfaces.schemas.file import (
     FileReplaceRequest,
     FileSearchRequest,
     FileWriteRequest,
+    SnapshotWorkspaceRequest,
 )
 from app.interfaces.service_dependencies import get_file_service
 from app.models.file import (
@@ -24,6 +25,7 @@ from app.models.file import (
     FileSearchResult,
     FileUploadResult,
     FileWriteResult,
+    WorkspaceScan,
 )
 from app.services.file import FileService
 
@@ -137,6 +139,31 @@ async def find_files(
 
     return Response.success(
         msg=f"查找完毕, 检索到{len(result.files)}个文件",
+        data=result,
+    )
+
+
+@router.post(
+    path="/snapshot-workspace",
+    response_model=Response[WorkspaceScan],
+)
+async def snapshot_workspace(
+    request: SnapshotWorkspaceRequest,
+    file_service: FileService = Depends(get_file_service),
+) -> Response[WorkspaceScan]:
+    """S2 §3.1 — capped, directory-excluded content snapshot of the workspace."""
+    result = await file_service.snapshot_workspace(
+        root=request.root,
+        max_paths=request.max_paths,
+        max_files=request.max_files,
+        max_total_bytes=request.max_total_bytes,
+        max_seconds=request.max_seconds,
+    )
+    return Response.success(
+        msg=(
+            f"快照完毕, 共 {len(result.entries)} 个条目"
+            + ("(已截断)" if result.truncated else "")
+        ),
         data=result,
     )
 

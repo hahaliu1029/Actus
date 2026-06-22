@@ -15,8 +15,18 @@ class Settings(BaseSettings):
     workspace_root: str = "/home/ubuntu"
     # Protected service tree — writes/deletes resolving under here are denied.
     service_install_dir: str = "/sandbox"
+    # Read-only memory MOUNT target INSIDE the sandbox container — mirrors the
+    # api-side ``sandbox_memory_mount_target`` (api/core/config.py). The api
+    # mounts the host memory tree read-only at THIS path (docker_sandbox.py),
+    # which by default is ``/workspace/.memory`` — a DIFFERENT tree than the
+    # scanned workspace root (/home/ubuntu). The snapshot walker excludes THIS
+    # configured mount, NOT ``workspace_root/.memory`` (the latter is a child's
+    # own legitimate write directory and must be captured).
+    memory_mount_target: str = "/workspace/.memory"
 
-    @field_validator("workspace_root", "service_install_dir")
+    @field_validator(
+        "workspace_root", "service_install_dir", "memory_mount_target"
+    )
     @classmethod
     def _must_be_absolute(cls, v: str) -> str:
         if not v.startswith("/"):

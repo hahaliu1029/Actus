@@ -1,11 +1,13 @@
 import asyncio
 import errno
 import glob
+import hashlib
 import logging
 import os.path
 import re
 import stat
 import tempfile
+import time
 from typing import Optional
 
 from fastapi import UploadFile
@@ -15,7 +17,10 @@ from app.interfaces.errors.exceptions import (
     BadRequestException,
     NotFoundException,
 )
+from app.core.config import get_settings
 from app.core.workspace import (
+    OutsideWorkspaceError,
+    _within_or_equal,
     deny_service_tree_write,
     is_within_workspace,
     resolve_in_workspace,
@@ -30,6 +35,8 @@ from app.models.file import (
     FileSearchResult,
     FileUploadResult,
     FileWriteResult,
+    WorkspaceScan,
+    WorkspaceScanEntry,
 )
 
 logger = logging.getLogger(__name__)
@@ -529,6 +536,279 @@ class FileService:
             for f in confined
         ]
         return FileFindResult(dir_path=original_dir, files=rebased)
+
+    @classmethod
+    async def snapshot_workspace(
+        cls,
+        root: str = "/home/ubuntu",
+        *,
+        max_paths: int,
+        max_files: int,
+        max_total_bytes: int,
+        max_seconds: float,
+    ) -> WorkspaceScan:
+        """S2 §3.1 — capped, directory-excluded content snapshot.
+
+        os.walk(topdown=True, followlinks=False) over ``root``, **confined to
+        the workspace root** (scope = /home/ubuntu only — P0), pruning
+        ``/sandbox`` (service tree) and the read-only memory MOUNT at the
+        CONFIGURED ``memory_mount_target`` (default ``/workspace/.memory`` — a
+        DIFFERENT tree than the scanned workspace root, so by default nothing in
+        a /home/ubuntu scan is excluded by it). Exclusion is by realpath
+        containment, NOT basename — a nested real dir merely named ``.memory``
+        (e.g. a child's ``proj/.memory`` write) is descended/captured; R6-P1.
+        Emits ONE WorkspaceScanEntry per non-directory inode keyed by directory-qualified
+        path RELATIVE TO ``workspace_root`` (NOT the arbitrary caller ``root``).
+        Real directories are traversed-not-emitted; a symlink (even to a
+        directory) is emitted as kind="symlink" and NOT descended. A
+        CLASSIFIABLE special inode (fifo/socket/block/char) is EMITTED as a
+        kind=<special> entry (sha256=None) — NOT treated as truncation — so the
+        downstream differ can reject it (F8/F9); only an INDETERMINATE
+        ``kind == "other"`` inode fails CLOSED. Reuses ``_classify``; regular
+        files are hashed in a thread. Caps (paths/files/bytes/seconds) are
+        checked DURING the walk over BOTH ``dirnames`` and ``filenames``
+        (early-abort via ``dirnames[:] = []``); fail CLOSED — an indeterminate
+        (``other``) inode or any per-inode OSError sets ``truncated=True`` and
+        aborts.
+        """
+        # P0 scope confinement: resolve_in_workspace passes ABSOLUTE paths
+        # through unchanged (workspace.py:56-57), so a caller-supplied
+        # ``root="/etc"`` / ``"/sandbox"`` would otherwise be scanned. Require
+        # the resolved scan_root to be within-or-equal the workspace root;
+        # else fail CLOSED with a 4xx (no out-of-scope bytes ever read).
+        workspace_root = get_settings().workspace_root
+        ws_real = os.path.realpath(workspace_root)
+        # Walk the REALPATH of the resolved root so every ``full`` and the
+        # rel-path base ``ws_real`` live in the same namespace (avoids a
+        # ``../`` rel_path when tmp_path / mounts go through symlinks, e.g.
+        # macOS /var -> /private/var). os.walk uses followlinks=False, so
+        # realpath-ing only the SCAN ROOT does not follow inner symlinks.
+        scan_root = os.path.realpath(resolve_in_workspace(root, follow_final=True))
+        if not _within_or_equal(scan_root, ws_real):
+            raise OutsideWorkspaceError(
+                f"snapshot root {root!r} 超出工作区 {workspace_root!r} 范围"
+            )
+        install_real = os.path.realpath(get_settings().service_install_dir)
+        # P1-c: the read-only memory MOUNT lives at the CONFIGURED
+        # ``memory_mount_target`` (default ``/workspace/.memory``), NOT at
+        # ``workspace_root/.memory``. The api mounts the host memory tree
+        # read-only at THIS container path (docker_sandbox.py:266); with the
+        # default it sits OUTSIDE the scanned workspace root, so the containment
+        # check below never matches during a /home/ubuntu scan and a child's own
+        # ``/home/ubuntu/.memory`` write is CAPTURED (correct). Exclusion is by
+        # realpath containment, NOT basename — a nested real dir merely NAMED
+        # ``.memory`` (e.g. ``proj/.memory``) is a child's legitimate write and
+        # must be descended, not silently skipped (a basename/wrong-path prune is
+        # fail-open — the differ sees a clean no-op and the child's writes are
+        # lost).
+        memory_real = os.path.realpath(get_settings().memory_mount_target)
+        # P1-d: never scan the read-only memory mount or the service tree even if
+        # a caller passes one as ``root``. Today the caller always passes the
+        # workspace root, so this is a defensive correctness guard layered on top
+        # of the workspace confinement above.
+        if _within_or_equal(scan_root, memory_real) or _within_or_equal(
+            scan_root, install_real
+        ):
+            raise OutsideWorkspaceError(
+                f"snapshot root {root!r} 落在只读内存挂载/服务目录内，拒绝扫描"
+            )
+
+        def _walk() -> WorkspaceScan:
+            entries: dict[str, WorkspaceScanEntry] = {}
+            truncated = False
+            paths_seen = 0
+            files_emitted = 0
+            total_bytes = 0
+            started = time.monotonic()
+
+            def _emit(full: str, st) -> bool:
+                """lstat-classify ``full`` and emit a non-directory entry.
+
+                Returns True iff the walk must ABORT (cap/special/fail-closed);
+                the caller then truncates. A real directory is never emitted
+                (the caller keeps it in the pruned dirnames for traversal).
+                """
+                nonlocal files_emitted, total_bytes
+                kind = _classify(st)
+                # Fail CLOSED ONLY on an INDETERMINATE kind (``other`` /
+                # unclassifiable — S_ISDOOR/PORT/WHT, …). A CLASSIFIABLE special
+                # inode (fifo/socket/block/char) is NOT a scan failure: it is
+                # EMITTED as a kind=<special> entry (sha256=None, link_target=
+                # None) so the downstream PR-1 differ (F8: post_entry.kind !=
+                # "regular") and the PR-4 differ (F9, reason ``special_file``)
+                # can reject it. Treating it as truncate here would make the
+                # ``special_file`` reject UNREACHABLE from a real scan (only
+                # synthetic differ tests would ever exercise it). Per spec §3.1
+                # "Fail-CLOSED on indeterminate kind (other/unclassifiable)".
+                if kind == "other":
+                    return True
+                if kind == "directory":
+                    # Real dir: traversed (via dirnames), NEVER emitted.
+                    return False
+                # rel_path is relative to the WORKSPACE ROOT, not scan_root.
+                rel_path = os.path.relpath(full, ws_real)
+                sha256: str | None = None
+                link_target: str | None = None
+                if kind == "symlink":
+                    try:
+                        link_target = os.readlink(full)
+                    except OSError:
+                        return True
+                elif kind == "regular":
+                    # P2-2: spec L123 — max_files is the REGULAR-file count. The
+                    # cap is checked (and ``files_emitted`` incremented) ONLY for
+                    # a regular file; the cap-tripping regular returns True
+                    # WITHOUT emitting. Non-regular inodes (symlink/fifo/socket/
+                    # block/char) consume NO max_files slot — they stay bounded
+                    # by max_paths (counted in the walk loop).
+                    if files_emitted >= max_files:
+                        return True
+                    total_bytes += st.st_size
+                    if total_bytes > max_total_bytes:
+                        return True
+                    try:
+                        h = hashlib.sha256()
+                        with open(full, "rb") as fh:
+                            while True:
+                                # wall-clock breach mid-hash -> truncate, don't
+                                # emit. ``started``/``max_seconds`` come from the
+                                # enclosing ``_walk`` closure / snapshot_workspace
+                                # params — the read+hash of a slow/large file can
+                                # otherwise overshoot the cap with truncated=False.
+                                if time.monotonic() - started > max_seconds:
+                                    return True
+                                # chunked read: never spike memory by up to
+                                # max_total_bytes via a single fh.read().
+                                chunk = fh.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                h.update(chunk)
+                        sha256 = h.hexdigest()
+                    except OSError:
+                        return True
+                    files_emitted += 1
+                # fifo/socket/block/char fall through here: emitted with
+                # sha256=None + link_target=None (no content read, no readlink).
+                entries[rel_path] = WorkspaceScanEntry(
+                    rel_path=rel_path,
+                    kind=kind,
+                    sha256=sha256,
+                    size=st.st_size,
+                    # P2-1: spec L110 — ``mode`` is st_mode PERMISSION bits,
+                    # not the full st_mode (which carries the S_IF* type bits).
+                    mode=stat.S_IMODE(st.st_mode),
+                    link_target=link_target,
+                )
+                return False
+
+            # P1-4: os.walk swallows scandir/lstat errors by default — an
+            # incomplete listing would silently return truncated=False. Fail
+            # CLOSED: re-raise from the onerror callback and convert any
+            # walk-level OSError into a truncated scan below (spec L123).
+            def _on_err(exc: OSError) -> None:
+                raise exc
+
+            try:
+                for dirpath, dirnames, filenames in os.walk(
+                    scan_root, topdown=True, followlinks=False, onerror=_on_err
+                ):
+                    # --- dirnames pass: prune the service tree + memory mount,
+                    # count the node against max_paths/max_seconds, and os.lstat
+                    # EVERY child so a symlink-to-a-directory (which lands in
+                    # dirnames under followlinks=False) is emitted as a symlink
+                    # and NOT descended.
+                    #
+                    # P1-2 / R2-A / R6-P1 / P1-c: lstat FIRST, then apply the
+                    # memory-mount AND /sandbox prunes ONLY to a REAL directory,
+                    # by REALPATH CONTAINMENT. A symlink (even one NAMED
+                    # ``.memory`` or one whose target resolves into /sandbox)
+                    # must still be EMITTED (kind="symlink"), never pre-pruned by
+                    # a basename/commonpath drop — otherwise it vanishes from the
+                    # snapshot and the differ can't group-zero-apply it (spec
+                    # §3.1/L136). The memory exclusion gates on a real dir
+                    # CONTAINED in the CONFIGURED ``memory_mount_target`` (the
+                    # read-only mount, default ``/workspace/.memory``), NOT a bare
+                    # ``.memory`` basename and NOT ``workspace_root/.memory`` —
+                    # the latter two were fail-open (R6-P1 / P1-c): with the
+                    # default mount target the containment never matches under a
+                    # /home/ubuntu scan, so a child's own ``.memory`` write is
+                    # CAPTURED; same class as the /sandbox pre-lstat prune (P1-2).
+                    pruned: list[str] = []
+                    for d in list(dirnames):
+                        if time.monotonic() - started > max_seconds:
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+                        paths_seen += 1
+                        if paths_seen > max_paths:
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+
+                        child = os.path.join(dirpath, d)
+                        try:
+                            child_st = os.lstat(child)
+                        except OSError:
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+                        if stat.S_ISDIR(child_st.st_mode):
+                            # REAL dir: NOW apply the memory-mount + /sandbox
+                            # service-tree prunes by REALPATH CONTAINMENT — drop
+                            # if it IS (or is under) the read-only memory mount
+                            # (the CONFIGURED ``memory_mount_target``) or is
+                            # contained in /sandbox, else descend (not emitted).
+                            # P1-c/R6-P1: a NESTED real dir merely named
+                            # ``.memory`` (e.g. ``proj/.memory``), or a child's
+                            # own ``.memory`` when the mount target is the default
+                            # ``/workspace/.memory`` (outside this scan), is NOT
+                            # the mount — so it is descended/captured.
+                            # ``os.path.commonpath`` raises ``ValueError`` when
+                            # the two paths live on different roots/drives; both
+                            # are absolute realpaths so this is belt-and-suspenders
+                            # — treat a ValueError as "not contained" (do NOT
+                            # prune).
+                            child_real = os.path.realpath(child)
+                            if _within_or_equal(child_real, memory_real):
+                                continue  # drop the read-only .memory mount subtree
+                            if _within_or_equal(child_real, install_real):
+                                continue  # drop /sandbox subtree
+                            pruned.append(d)  # real dir -> descend, not emitted
+                            continue
+                        # Non-dir in the dirnames slot (symlink-to-dir, etc.):
+                        # emit it (e.g. as kind="symlink") and DO NOT descend,
+                        # REGARDLESS of where the symlink points.
+                        if _emit(child, child_st):
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+                    dirnames[:] = pruned
+
+                    # --- filenames pass: count + emit each non-directory inode.
+                    for name in filenames:
+                        if time.monotonic() - started > max_seconds:
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+                        paths_seen += 1
+                        if paths_seen > max_paths:
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+
+                        full = os.path.join(dirpath, name)
+                        try:
+                            st = os.lstat(full)
+                        except OSError:
+                            # fail CLOSED — can't determine kind.
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+                        if _emit(full, st):
+                            dirnames[:] = []
+                            return WorkspaceScan(entries=entries, truncated=True)
+            except OSError:
+                # P1-4: any scandir-level error surfaced via onerror -> the scan
+                # is incomplete -> fail CLOSED (truncated), never a silent
+                # partial scan with truncated=False.
+                return WorkspaceScan(entries=entries, truncated=True)
+
+            return WorkspaceScan(entries=entries, truncated=truncated)
+
+        return await asyncio.to_thread(_walk)
 
     @classmethod
     async def upload_file(

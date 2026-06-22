@@ -71,3 +71,25 @@ class FileDeleteResult(BaseModel):
 
     filepath: str = Field(..., description="删除文件的路径(回显调用方原始入参)")
     deleted: bool = Field(..., description="文件是否删除成功")
+
+
+class WorkspaceScanEntry(BaseModel):
+    """S2 §3.1 — one non-directory inode (never kind=directory)."""
+
+    rel_path: str = Field(..., description="工作区相对、目录限定路径")
+    kind: FileKind = Field(..., description="os.lstat inode 类型（不跟随符号链接）")
+    sha256: Optional[str] = Field(
+        default=None, description="内容摘要，仅 kind=regular 时填充"
+    )
+    size: int = Field(..., description="st_size 字节数")
+    mode: int = Field(..., description="st_mode 权限位")
+    link_target: Optional[str] = Field(
+        default=None, description="os.readlink 目标，仅 kind=symlink 时填充"
+    )
+
+
+class WorkspaceScan(BaseModel):
+    """S2 §3.1 — directory-excluded snapshot; truncated=True iff any cap aborted."""
+
+    entries: dict[str, WorkspaceScanEntry] = Field(default_factory=dict)
+    truncated: bool = Field(..., description="任一上限触发遍历中止则为 True")

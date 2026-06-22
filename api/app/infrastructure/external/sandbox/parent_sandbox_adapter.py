@@ -48,9 +48,97 @@ import hashlib
 import io
 import logging
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Optional
 
-from app.domain.external.parent_sandbox import ParentSandboxPort, SandboxPathCheck
+from app.domain.external.parent_sandbox import (
+    ParentSandboxPort,
+    SandboxPathCheck,
+    WorkspaceScan,
+    WorkspaceScanEntry,
+)
+
+# R7b P1-i: the 9 ``FileKind`` Literal members, materialized as a runtime set
+# so the decode can reject a ``kind`` outside the contract. Mirrors the
+# ``FileKind`` Literal in ``app.domain.external.parent_sandbox`` (a Literal has
+# no membership API; keep these two in lockstep).
+_VALID_FILE_KINDS = frozenset(
+    {
+        "missing",
+        "regular",
+        "directory",
+        "symlink",
+        "fifo",
+        "socket",
+        "block",
+        "char",
+        "other",
+    }
+)
+# 64-char lowercase-hex sha256 alphabet (no uppercase per the walker contract).
+_HEX_LOWER = frozenset("0123456789abcdef")
+
+
+def _validate_scan_entry(entry: WorkspaceScanEntry, root: str) -> None:
+    """R7b P1-i: enforce per-kind structural invariants on a decoded entry.
+
+    Raises ``OSError`` (fail-CLOSED, consistent with the other decode guards)
+    on any violation so a malformed/garbage entry never reaches the differ.
+    The rules mirror the sandbox walker's contract (``WorkspaceScanEntry``
+    docstring): only ``regular`` carries a sha, only ``symlink`` carries a
+    ``link_target``.
+    """
+    rel_path = entry.rel_path
+    kind = entry.kind
+    if kind not in _VALID_FILE_KINDS:
+        raise OSError(
+            f"malformed snapshot_workspace entry {rel_path!r}: "
+            f"unknown kind {kind!r} (not a FileKind) for {root!r}",
+        )
+    sha = entry.sha256
+    link_target = entry.link_target
+    if kind == "regular":
+        if not (
+            isinstance(sha, str)
+            and len(sha) == 64
+            and all(c in _HEX_LOWER for c in sha)
+        ):
+            raise OSError(
+                f"malformed snapshot_workspace entry {rel_path!r}: regular "
+                f"requires a 64-char lowercase-hex sha256, got {sha!r} "
+                f"for {root!r}",
+            )
+        if link_target is not None:
+            raise OSError(
+                f"malformed snapshot_workspace entry {rel_path!r}: regular "
+                f"must have link_target=None, got {link_target!r} for {root!r}",
+            )
+    elif kind == "symlink":
+        if sha is not None:
+            raise OSError(
+                f"malformed snapshot_workspace entry {rel_path!r}: symlink "
+                f"must have sha256=None, got {sha!r} for {root!r}",
+            )
+        if not (isinstance(link_target, str) and link_target != ""):
+            raise OSError(
+                f"malformed snapshot_workspace entry {rel_path!r}: symlink "
+                f"requires a non-empty link_target, got {link_target!r} "
+                f"for {root!r}",
+            )
+    else:
+        # Any non-regular, non-symlink kind (directory/fifo/socket/block/
+        # char/other/missing): neither a sha nor a link_target is carried.
+        if sha is not None:
+            raise OSError(
+                f"malformed snapshot_workspace entry {rel_path!r}: kind "
+                f"{kind!r} must have sha256=None, got {sha!r} for {root!r}",
+            )
+        if link_target is not None:
+            raise OSError(
+                f"malformed snapshot_workspace entry {rel_path!r}: kind "
+                f"{kind!r} must have link_target=None, got {link_target!r} "
+                f"for {root!r}",
+            )
 
 if TYPE_CHECKING:
     from app.domain.external.sandbox import SandboxHandle
@@ -271,3 +359,119 @@ class ParentSandboxAdapter(ParentSandboxPort):
             raise OSError(
                 f"sandbox delete_file failed for {path!r}: {result.message!r}",
             )
+
+    async def snapshot_workspace(
+        self,
+        root: str = "/home/ubuntu",
+        *,
+        max_paths: int,
+        max_files: int,
+        max_total_bytes: int,
+        max_seconds: float,
+    ) -> WorkspaceScan:
+        """Decode the sandbox ``snapshot_workspace`` RPC into a typed scan.
+
+        Fails CLOSED: a payload missing ``truncated`` (old image / malformed)
+        is treated as ``truncated=True`` so the differ zero-applies rather than
+        trusting an incomplete walk (opposite of ``check_path``'s fail-open).
+        Raises ``OSError`` on RPC failure, matching ``exists()``/``check_path``.
+        """
+        result = await self._sandbox.snapshot_workspace(
+            root,
+            max_paths=max_paths,
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+            max_seconds=max_seconds,
+        )
+        if not result.success:
+            raise OSError(
+                f"sandbox snapshot_workspace failed for {root!r}: "
+                f"{result.message!r}",
+            )
+        data = result.data
+        if isinstance(data, dict):
+            # R3: get the raw value AS-IS (no ``or {}``). A FALSEY non-mapping
+            # value (``[]`` / ``""`` / ``0`` / ``False``) must NOT be coerced
+            # to an empty dict — that would decode a malformed payload to a
+            # "complete empty scan" (fail-OPEN, differ skips group-zero-apply).
+            raw_entries = data.get("entries")
+            truncated = data.get("truncated")
+        else:
+            raw_entries = getattr(data, "entries", None)
+            truncated = getattr(data, "truncated", None)
+        # Fail closed: decode ``truncated`` strictly.
+        # - absent/None (old image / missing key) => treat as truncated (the
+        #   established lenient default for a MISSING flag, fail-CLOSED).
+        # - a REAL bool => use it as-is. ``isinstance(truncated, bool)`` is the
+        #   correct guard: although ``bool`` is an ``int`` subclass, isinstance
+        #   accepts ONLY ``True``/``False`` and rejects ``0``/``1`` ints.
+        # - R4: present but NON-bool (``0`` / ``""`` / ``[]`` / ``{}`` / etc.)
+        #   is a malformed payload — a falsey value must NOT be coerced via
+        #   ``bool(truncated)`` to ``False`` ("complete scan"). That is the same
+        #   fail-OPEN class the R3 ``entries`` fix closed: the differ would
+        #   trust an incomplete/garbage walk and proceed to group-zero-apply.
+        #   Fail CLOSED as OSError, consistent with the entries-not-a-mapping
+        #   branch below.
+        if truncated is None:
+            truncated_bool = True
+        elif isinstance(truncated, bool):
+            truncated_bool = truncated
+        else:
+            raise OSError(
+                f"malformed snapshot_workspace payload: truncated not a "
+                f"bool ({type(truncated).__name__}) for {root!r}",
+            )
+        # R2-B / R3: a malformed-but-plausible payload (entries not a mapping,
+        # or an entry dict/object missing required keys) must fail CLOSED as
+        # OSError per this method's documented "Raises OSError on RPC failure"
+        # contract, NOT raise a raw KeyError/AttributeError that escapes the
+        # fail-closed envelope. The strict ``Mapping`` check rejects
+        # ``[]``/``""``/``0``/``False``/``None``/absent (none are Mapping) as
+        # fail-CLOSED, while a genuine empty scan ``{}`` (a Mapping) still
+        # passes and decodes to an empty WorkspaceScan.
+        if not isinstance(raw_entries, Mapping):
+            raise OSError(
+                f"malformed snapshot_workspace payload: entries not a "
+                f"mapping ({type(raw_entries).__name__}) for {root!r}",
+            )
+        entries: dict[str, WorkspaceScanEntry] = {}
+        for rel_path, e in raw_entries.items():
+            try:
+                if isinstance(e, dict):
+                    entry = WorkspaceScanEntry(
+                        rel_path=e["rel_path"],
+                        kind=e["kind"],
+                        sha256=e.get("sha256"),
+                        size=int(e["size"]),
+                        mode=int(e["mode"]),
+                        link_target=e.get("link_target"),
+                    )
+                else:
+                    entry = WorkspaceScanEntry(
+                        rel_path=getattr(e, "rel_path"),
+                        kind=getattr(e, "kind"),
+                        sha256=getattr(e, "sha256", None),
+                        size=int(getattr(e, "size")),
+                        mode=int(getattr(e, "mode")),
+                        link_target=getattr(e, "link_target", None),
+                    )
+                # R7b P1-h: the mapping KEY is what the differ keys changes by,
+                # so it must be a ``str`` AND agree with the entry's own
+                # ``rel_path``. A non-str key (defensive — JSON keys are always
+                # strings, but an object-shaped payload need not be) or a
+                # key≠rel_path would have the differ key a change by a path that
+                # contradicts the entry it carries. Fail CLOSED.
+                if not isinstance(rel_path, str) or rel_path != entry.rel_path:
+                    raise OSError(
+                        f"malformed snapshot_workspace entry: key {rel_path!r} "
+                        f"!= rel_path {entry.rel_path!r} for {root!r}",
+                    )
+                # R7b P1-i: per-kind structural invariants (sha only on
+                # regular, link_target only on symlink, valid FileKind).
+                _validate_scan_entry(entry, root)
+                entries[rel_path] = entry
+            except (KeyError, AttributeError, TypeError, ValueError) as exc:
+                raise OSError(
+                    f"malformed snapshot_workspace entry {rel_path!r}: {exc}",
+                ) from exc
+        return WorkspaceScan(entries=entries, truncated=truncated_bool)

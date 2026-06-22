@@ -82,3 +82,16 @@ class FileDeleteRequest(BaseModel):
     filepath: str = Field(
         ..., description="要删除的文件路径(相对路径锚定到工作区 /home/ubuntu, 绝对路径原样使用)"
     )
+
+
+class SnapshotWorkspaceRequest(BaseModel):
+    """S2 §3.1 — capped content-snapshot request for the coordinator differ."""
+
+    root: str = Field(
+        default="/home/ubuntu",
+        description="工作区根（相对锚定到 /home/ubuntu, 绝对路径原样使用）",
+    )
+    max_paths: int = Field(..., gt=0, description="遍历的路径节点上限")
+    max_files: int = Field(..., gt=0, description="发出条目（文件）上限")
+    max_total_bytes: int = Field(..., gt=0, description="读取/哈希的总字节上限")
+    max_seconds: float = Field(..., gt=0, description="整个遍历的墙钟上限（秒）")

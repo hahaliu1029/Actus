@@ -263,6 +263,101 @@ async def test_atomic_write_file_sets_refuse_special_true(fake_sandbox: MagicMoc
     assert kwargs.get("refuse_special") is True
 
 
+async def test_snapshot_workspace_decodes_entries_and_truncated(
+    fake_sandbox: MagicMock,
+) -> None:
+    from app.domain.external.parent_sandbox import (
+        WorkspaceScan,
+        WorkspaceScanEntry,
+    )
+
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "workspace/a.py": {
+                "rel_path": "workspace/a.py", "kind": "regular",
+                "sha256": "a" * 64, "size": 3, "mode": 33188,
+                "link_target": None,
+            },
+            "workspace/link": {
+                "rel_path": "workspace/link", "kind": "symlink",
+                "sha256": None, "size": 7, "mode": 41471,
+                "link_target": "../t.py",
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+        max_seconds=5.0,
+    )
+    assert isinstance(scan, WorkspaceScan)
+    assert scan.truncated is False
+    assert scan.entries["workspace/a.py"] == WorkspaceScanEntry(
+        rel_path="workspace/a.py", kind="regular", sha256="a" * 64,
+        size=3, mode=33188, link_target=None,
+    )
+    assert scan.entries["workspace/link"].link_target == "../t.py"
+
+
+async def test_snapshot_workspace_truncated_true(fake_sandbox: MagicMock) -> None:
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {}, "truncated": True,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1, max_files=1, max_total_bytes=1, max_seconds=0.001,
+    )
+    assert scan.truncated is True
+    assert scan.entries == {}
+
+
+async def test_snapshot_workspace_raises_on_rpc_failure(
+    fake_sandbox: MagicMock,
+) -> None:
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_fail("boom"))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1, max_files=1, max_total_bytes=1, max_seconds=1.0,
+        )
+
+
+async def test_snapshot_workspace_fails_closed_on_missing_truncated_flag(
+    fake_sandbox: MagicMock,
+) -> None:
+    # Old image / malformed payload with no ``truncated`` key -> fail CLOSED
+    # (treat as truncated, opposite of check_path's fail-open).
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {},
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1, max_files=1, max_total_bytes=1, max_seconds=1.0,
+    )
+    assert scan.truncated is True
+
+
+async def test_snapshot_workspace_malformed_entry_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # R2-B: a malformed-but-plausible payload — entries IS a mapping but an
+    # entry dict is missing required keys (rel_path/size/mode) — must fail
+    # CLOSED as OSError per the documented "Raises OSError on RPC failure"
+    # contract, NOT raise a raw KeyError/AttributeError that escapes the
+    # adapter's fail-closed envelope.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {"x": {"kind": "regular"}},
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
 def test_non_coordinator_uploads_never_set_refuse_special():
     """Spec §4 test 15: ONLY the coordinator apply/seed path (this adapter,
     Step 5) sets refuse_special=True. The attachment caller (agent_task_runner)
@@ -284,3 +379,394 @@ def test_non_coordinator_uploads_never_set_refuse_special():
             f"{mod} unexpectedly references refuse_special — non-coordinator "
             f"uploads must keep the default False"
         )
+
+
+async def test_snapshot_workspace_falsey_non_mapping_entries_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # Round-3 fail-OPEN fix: a malformed payload whose ``entries`` is a FALSEY
+    # non-mapping (``[]``) with ``truncated=False`` previously decoded to a
+    # "complete empty scan" because ``data.get("entries", {}) or {}`` coerced
+    # ``[]`` -> ``{}``. That is a fail-OPEN: the differ sees no changes and
+    # skips group-zero-apply. It must instead fail CLOSED as OSError (entries
+    # is not a Mapping).
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": [], "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_absent_entries_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # ``entries`` absent entirely with ``truncated=False`` is also malformed —
+    # an absent key is not a Mapping, so it must fail CLOSED as OSError rather
+    # than coerce to an empty scan via the old ``or {}`` default.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_genuine_empty_scan_passes(
+    fake_sandbox: MagicMock,
+) -> None:
+    # REGRESSION GUARD (must stay GREEN before AND after the round-3 fix): a
+    # genuine empty scan ``{}`` is a Mapping, so it decodes to an empty
+    # WorkspaceScan (NOT an OSError). The strict Mapping check must not reject
+    # the legitimate empty-directory walk.
+    from app.domain.external.parent_sandbox import WorkspaceScan
+
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {}, "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+        max_seconds=5.0,
+    )
+    assert isinstance(scan, WorkspaceScan)
+    assert scan.entries == {}
+    assert scan.truncated is False
+
+
+async def test_snapshot_workspace_falsey_int_truncated_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # Round-4 fail-OPEN fix (sibling of the round-3 ``entries`` fix): a
+    # malformed ``truncated`` value that is a falsey NON-bool (``0``) must NOT
+    # be coerced via ``bool(truncated)`` to ``False`` ("complete scan"). That
+    # is a fail-OPEN: the differ trusts an incomplete/garbage walk and proceeds
+    # to group-zero-apply. It must instead fail CLOSED as OSError (truncated is
+    # present but not a real bool). ``isinstance(truncated, bool)`` correctly
+    # rejects ``0`` even though ``bool`` is an ``int`` subclass.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {}, "truncated": 0,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_falsey_list_truncated_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # Same round-4 class as the ``0`` case: a falsey non-bool ``[]`` for
+    # ``truncated`` must fail CLOSED as OSError, not coerce to a "complete
+    # scan" via truthiness.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {}, "truncated": [],
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_truncated_real_bool_true_preserved(
+    fake_sandbox: MagicMock,
+) -> None:
+    # REGRESSION GUARD (green before AND after the round-4 fix): a genuine
+    # ``truncated=True`` bool must decode to ``scan.truncated is True``.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {}, "truncated": True,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+        max_seconds=5.0,
+    )
+    assert scan.truncated is True
+
+
+async def test_snapshot_workspace_truncated_real_bool_false_preserved(
+    fake_sandbox: MagicMock,
+) -> None:
+    # REGRESSION GUARD (green before AND after the round-4 fix): a genuine
+    # ``truncated=False`` bool must decode to ``scan.truncated is False`` (a
+    # complete scan — the differ proceeds). This is the value the round-4 fix
+    # must keep working: a REAL bool ``False`` is honored, only a NON-bool
+    # falsey ``truncated`` is rejected.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {}, "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+        max_seconds=5.0,
+    )
+    assert scan.truncated is False
+
+
+# ---------------------------------------------------------------------------
+# R7b — decode hardening (P1-h key==rel_path, P1-i per-kind invariants)
+#
+# Two remaining fail-OPEN gaps let GARBAGE entry data into the differ:
+#  - P1-h: the dict KEY is trusted as the path even if it is non-``str`` or
+#    disagrees with the entry's own ``rel_path`` — the differ would then key
+#    a change by a path that contradicts the entry it carries.
+#  - P1-i: per-kind structural invariants (regular⇒64hex sha + no link;
+#    symlink⇒no sha + non-empty link; any other kind⇒no sha + no link) were
+#    not enforced, so a payload could smuggle a sha onto a fifo or a regular
+#    with a bogus/absent digest into the diff identity tuple.
+# Both must fail CLOSED as OSError, consistent with the prior decode guards.
+# ---------------------------------------------------------------------------
+
+
+def _hex64(ch: str = "a") -> str:
+    return ch * 64
+
+
+async def test_snapshot_workspace_key_mismatch_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-h: the dict KEY ("a.py") disagrees with the entry's own rel_path
+    # ("b.py"). Trusting the key would key the diff by a path that contradicts
+    # the entry — fail CLOSED as OSError.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "a.py": {
+                "rel_path": "b.py", "kind": "regular", "sha256": _hex64(),
+                "size": 1, "mode": 0o644, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_non_str_key_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-h: JSON keys are always strings, but a defensive non-``str`` key
+    # (here an int from a non-JSON / object-shaped payload) must still be
+    # rejected — fail CLOSED as OSError.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            123: {
+                "rel_path": "123", "kind": "regular", "sha256": _hex64(),
+                "size": 1, "mode": 0o644, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_regular_with_none_sha_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-i: a regular file MUST carry a 64-hex sha. ``sha256=None`` is a
+    # contract violation (only regulars carry a sha) — fail CLOSED as OSError.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "x.py": {
+                "rel_path": "x.py", "kind": "regular", "sha256": None,
+                "size": 1, "mode": 0o644, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_regular_with_bad_sha_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-i: a regular file's sha must be 64-char lowercase-hex. A short /
+    # non-hex string ("abc") is malformed — fail CLOSED as OSError.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "x.py": {
+                "rel_path": "x.py", "kind": "regular", "sha256": "abc",
+                "size": 1, "mode": 0o644, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_symlink_with_none_link_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-i: a symlink MUST carry a non-empty link_target. ``link_target=None``
+    # is a contract violation — fail CLOSED as OSError.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "link": {
+                "rel_path": "link", "kind": "symlink", "sha256": None,
+                "size": 7, "mode": 41471, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_fifo_with_sha_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-i: a non-regular, non-symlink kind (fifo) MUST have sha None AND
+    # link_target None. A fifo carrying a non-None sha smuggles a digest into
+    # the diff identity tuple — fail CLOSED as OSError.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "pipe": {
+                "rel_path": "pipe", "kind": "fifo", "sha256": _hex64(),
+                "size": 0, "mode": 4480, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_unknown_kind_fails_closed(
+    fake_sandbox: MagicMock,
+) -> None:
+    # P1-i: ``kind`` must be one of the 9 FileKind values. A bogus kind
+    # ("weird") that is not in the Literal set is malformed — fail CLOSED.
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "x": {
+                "rel_path": "x", "kind": "weird", "sha256": None,
+                "size": 0, "mode": 0o644, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    with pytest.raises(OSError):
+        await adapter.snapshot_workspace(
+            max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+            max_seconds=5.0,
+        )
+
+
+async def test_snapshot_workspace_directory_kind_decodes(
+    fake_sandbox: MagicMock,
+) -> None:
+    # DIRECTORY-KIND DECISION (chosen branch): a ``directory`` entry with
+    # sha None + link None is STRUCTURALLY VALID per the P1-i rules
+    # ("non-regular, non-symlink ⇒ sha None AND link None") and therefore
+    # DECODES — we do NOT add an extra "reject directory/missing" rule.
+    # Rationale: the four stated invariants are exhaustive; the sandbox walker
+    # never EMITS a directory entry (directories are traversed, per the
+    # WorkspaceScanEntry docstring), so an explicit reject rule would be
+    # belt-and-suspenders beyond the spec's invariant list (over-engineering).
+    # The structural decode here is the honest reflection of the rules.
+    from app.domain.external.parent_sandbox import (
+        WorkspaceScan,
+        WorkspaceScanEntry,
+    )
+
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "subdir": {
+                "rel_path": "subdir", "kind": "directory", "sha256": None,
+                "size": 0, "mode": 16877, "link_target": None,
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+        max_seconds=5.0,
+    )
+    assert isinstance(scan, WorkspaceScan)
+    assert scan.entries["subdir"] == WorkspaceScanEntry(
+        rel_path="subdir", kind="directory", sha256=None,
+        size=0, mode=16877, link_target=None,
+    )
+
+
+async def test_snapshot_workspace_valid_regular_and_symlink_decode(
+    fake_sandbox: MagicMock,
+) -> None:
+    # REGRESSION GUARD (green before AND after the R7b fix): a fully valid
+    # payload — a regular with a real 64-hex sha (key==rel_path, link None)
+    # AND a symlink with a link_target set (sha None) — decodes to the correct
+    # WorkspaceScan. Mirrors the existing happy-path test; pinned again here so
+    # the R7b invariants are proven NOT to reject legitimate entries.
+    from app.domain.external.parent_sandbox import (
+        WorkspaceScan,
+        WorkspaceScanEntry,
+    )
+
+    fake_sandbox.snapshot_workspace = AsyncMock(return_value=_ok({
+        "entries": {
+            "workspace/a.py": {
+                "rel_path": "workspace/a.py", "kind": "regular",
+                "sha256": _hex64(), "size": 3, "mode": 33188,
+                "link_target": None,
+            },
+            "workspace/link": {
+                "rel_path": "workspace/link", "kind": "symlink",
+                "sha256": None, "size": 7, "mode": 41471,
+                "link_target": "../t.py",
+            },
+        },
+        "truncated": False,
+    }))
+    adapter = ParentSandboxAdapter(fake_sandbox)
+    scan = await adapter.snapshot_workspace(
+        max_paths=1000, max_files=500, max_total_bytes=1_000_000,
+        max_seconds=5.0,
+    )
+    assert isinstance(scan, WorkspaceScan)
+    assert scan.truncated is False
+    assert scan.entries["workspace/a.py"] == WorkspaceScanEntry(
+        rel_path="workspace/a.py", kind="regular", sha256=_hex64(),
+        size=3, mode=33188, link_target=None,
+    )
+    assert scan.entries["workspace/link"] == WorkspaceScanEntry(
+        rel_path="workspace/link", kind="symlink", sha256=None,
+        size=7, mode=41471, link_target="../t.py",
+    )

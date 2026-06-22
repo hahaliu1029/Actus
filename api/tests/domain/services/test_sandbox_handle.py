@@ -164,7 +164,8 @@ def test_properties_cached_at_acquire() -> None:
 
 
 def test_forwarded_methods_count() -> None:
-    assert len(SANDBOX_FORWARDED_METHODS) == 18
+    assert len(SANDBOX_FORWARDED_METHODS) == 19
+    assert "snapshot_workspace" in SANDBOX_FORWARDED_METHODS
 
 
 def test_unknown_attribute_raises() -> None:
