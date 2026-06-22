@@ -453,6 +453,8 @@ def test_orchestrator_factory_build_accepts_consumer_kwargs():
     # ctor saw the per-run identity kwargs (parity with PR-7/§11.3 spec).
     assert captured["parent_session_id"] == "p1"
     assert captured["coordinator_run_id"] == "r1"
+    assert captured["coordinator_limits"] is coord_deps.coordinator_limits
+    assert captured["cost_rollup_service"] is coord_deps.cost_rollup_service
     # ``root_session_id`` is intentionally NOT forwarded into the ctor —
     # the orchestrator receives it via ``run(root_session_id=...)`` at
     # invocation time (coordinator_run_orchestrator.py:230).

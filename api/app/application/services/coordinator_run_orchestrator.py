@@ -114,6 +114,27 @@ def _extract_needs_auth_reason(payload: Any) -> Optional[str]:
     return reason if isinstance(reason, str) else None
 
 
+def _extract_total_usd(payload: Any) -> float:
+    """Read ``payload.cost_summary.total_usd`` from dict or model shapes."""
+    if payload is None:
+        return 0.0
+    cost_summary: Any
+    if isinstance(payload, dict):
+        cost_summary = payload.get("cost_summary")
+    else:
+        cost_summary = getattr(payload, "cost_summary", None)
+    if cost_summary is None:
+        return 0.0
+    if isinstance(cost_summary, dict):
+        raw = cost_summary.get("total_usd", 0.0)
+    else:
+        raw = getattr(cost_summary, "total_usd", 0.0)
+    try:
+        return float(raw or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def should_trigger_sibling_cancel(envelope: MailboxEnvelope) -> bool:
     """[spec §11.8 r15] Decide whether to fan out CANCEL_REQUEST to siblings.
 
@@ -191,6 +212,8 @@ class CoordinatorRunOrchestrator:
         envelope_factory: Optional[CoordinatorEnvelopeFactory] = None,
         mailbox_subscriber: Optional[MailboxSubscriber] = None,
         emit_event: Optional[EmitEvent] = None,
+        cost_rollup_service: Optional[Any] = None,
+        coordinator_limits: Optional[Any] = None,
     ) -> None:
         """r3 P1-2: ``parent_session_id`` / ``coordinator_run_id`` are required
         non-empty. Live publisher derives the Redis stream key from
@@ -223,6 +246,46 @@ class CoordinatorRunOrchestrator:
         self._coordinator_run_id = coordinator_run_id
         self._subscriber = mailbox_subscriber
         self._emit_event = emit_event
+        self._cost_rollup_service = cost_rollup_service
+        self._max_total_token_cost_usd_per_run = getattr(
+            coordinator_limits, "max_total_token_cost_usd_per_run", None
+        )
+        self._max_total_wallclock_seconds_per_run = getattr(
+            coordinator_limits, "max_total_wallclock_seconds_per_run", None
+        )
+
+    async def _get_current_run_cost_usd(
+        self,
+        *,
+        coordinator_run_id: str,
+        child_session_ids: dict[str, str],
+    ) -> float | None:
+        """Pull authoritative run cost from the ledger when wired.
+
+        Returns None on absent/failing rollup so callers can fall back to the
+        terminal envelope's inline cost summary.
+        """
+        if self._cost_rollup_service is None:
+            return None
+        try:
+            result = await self._cost_rollup_service.aggregate(
+                coordinator_run_id=coordinator_run_id,
+                child_session_ids=list(child_session_ids.values()),
+            )
+        except Exception:
+            logger.warning(
+                "CoordinatorRunOrchestrator: cost aggregate failed run=%s; "
+                "falling back to terminal envelope cost_summary",
+                coordinator_run_id,
+                exc_info=True,
+            )
+            return None
+        cost = getattr(result, "cost", None)
+        raw = getattr(cost, "total_usd", None)
+        try:
+            return float(raw or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     async def run(
         self,
@@ -413,17 +476,36 @@ class CoordinatorRunOrchestrator:
         tasks.append(watcher_task)
 
         try:
+            effective_timeout = (
+                float(self._max_total_wallclock_seconds_per_run)
+                if self._max_total_wallclock_seconds_per_run is not None
+                else timeout_seconds
+            )
             done, _pending_tasks = await asyncio.wait(
                 set(tasks),
-                timeout=timeout_seconds,
+                timeout=effective_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
-                logger.info(
-                    "CoordinatorRunOrchestrator: timeout (no terminal, no cancel)"
-                    " run=%s",
-                    coordinator_run_id,
-                )
+                if self._max_total_wallclock_seconds_per_run is not None:
+                    logger.info(
+                        "CoordinatorRunOrchestrator: run wallclock budget "
+                        "exceeded run=%s cap=%s",
+                        coordinator_run_id,
+                        self._max_total_wallclock_seconds_per_run,
+                    )
+                    await self._publish_cancel_to_pending(
+                        wu_ids=sorted(pending),
+                        child_session_ids=child_session_ids,
+                        coordinator_run_id=coordinator_run_id,
+                        reason="run_total_wallclock_budget_exceeded",
+                    )
+                else:
+                    logger.info(
+                        "CoordinatorRunOrchestrator: timeout (no terminal, no cancel)"
+                        " run=%s",
+                        coordinator_run_id,
+                    )
         finally:
             # Cancel whichever task hasn't completed + drain exceptions so
             # CancelledError doesn't escape the orchestrator.
@@ -516,6 +598,7 @@ class CoordinatorRunOrchestrator:
             wu_id = child_to_wu.get(child_id)
             return wu_id is not None and wu_id in pending
 
+        run_cost_usd = 0.0
         try:
             async for env_dict in subscriber.consume(
                 stream_key=stream_key,
@@ -549,6 +632,26 @@ class CoordinatorRunOrchestrator:
                         child_session_ids=child_session_ids,
                         coordinator_run_id=coordinator_run_id,
                         root_session_id=root_session_id,
+                    )
+
+                current_run_cost_usd = await self._get_current_run_cost_usd(
+                    coordinator_run_id=coordinator_run_id,
+                    child_session_ids=child_session_ids,
+                )
+                if current_run_cost_usd is None:
+                    run_cost_usd += _extract_total_usd(envelope.payload)
+                else:
+                    run_cost_usd = current_run_cost_usd
+                if (
+                    self._max_total_token_cost_usd_per_run is not None
+                    and run_cost_usd >= self._max_total_token_cost_usd_per_run
+                    and pending
+                ):
+                    await self._publish_cancel_to_pending(
+                        wu_ids=sorted(pending),
+                        child_session_ids=child_session_ids,
+                        coordinator_run_id=coordinator_run_id,
+                        reason="run_total_token_cost_budget_exceeded",
                     )
 
                 if not pending:

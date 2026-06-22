@@ -21,12 +21,15 @@ from unittest.mock import AsyncMock
 from app.application.services.coordinator_envelope_factory import (
     CoordinatorEnvelopeFactory,
 )
+from app.application.services.cost_rollup_service import AggregateResult
 from app.application.services.coordinator_run_orchestrator import (
     CoordinatorRunOrchestrator,
     should_trigger_sibling_cancel,
 )
+from app.domain.services.coordinator_limits import CoordinatorLimits
 from app.domain.models.mailbox_envelope import (
     CancelAckPayload,
+    CostAggregate,
     MailboxEnvelope,
     MailboxEnvelopeType,
     ResultReadyOutcome,
@@ -45,11 +48,13 @@ def _result_ready_env(
     *,
     child_session_id: str = "c1",
     needs_auth: Optional[NeedsAuthorizationDetails] = None,
+    cost_usd: float = 0.0,
 ) -> MailboxEnvelope:
     payload = ResultReadyPayload(
         summary="x",
         outcome=outcome,
         needs_authorization_details=needs_auth,
+        cost_summary=CostAggregate(total_usd=cost_usd),
     )
     return CoordinatorEnvelopeFactory().make_result_ready(
         parent_session_id="p1",
@@ -357,6 +362,88 @@ class TestObserverExitConditions:
             cancel_event=cancel_event, timeout_seconds=2.0,
         )
         publisher.publish.assert_not_called()
+
+
+class TestRunLevelBudgetCaps:
+    """C2b per-run caps: ``CoordinatorLimits`` fields must be enforced by the
+    run observer, not merely parsed from env."""
+
+    async def test_total_token_cost_cap_cancels_remaining_pending(self) -> None:
+        publisher = AsyncMock()
+        env_ok = _result_ready_env(
+            ResultReadyOutcome.SUCCESS,
+            child_session_id="c1",
+        )
+        subscriber = _FakeSubscriber([env_ok], exhaust_then_return=True)
+        cost_rollup_service = AsyncMock()
+        cost_rollup_service.aggregate = AsyncMock(
+            return_value=AggregateResult(
+                cost=CostAggregate(total_usd=1.25),
+                missing_children=(),
+            )
+        )
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1",
+            coordinator_run_id="r1",
+            cost_rollup_service=cost_rollup_service,
+            coordinator_limits=CoordinatorLimits(
+                max_total_token_cost_usd_per_run=1.0,
+            ),
+        )
+        cancel_event = asyncio.Event()
+
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1", "wu2"],
+            child_session_ids={"wu1": "c1", "wu2": "c2"},
+            cancel_event=cancel_event,
+            timeout_seconds=1.0,
+        )
+
+        assert publisher.publish.await_count == 1
+        env = publisher.publish.await_args.args[0]
+        assert env.type == MailboxEnvelopeType.CANCEL_REQUEST
+        assert env.child_session_id == "c2"
+        assert env.payload["reason"] == "run_total_token_cost_budget_exceeded"
+        cost_rollup_service.aggregate.assert_awaited_once_with(
+            coordinator_run_id="r1",
+            child_session_ids=["c1", "c2"],
+        )
+
+    async def test_total_wallclock_cap_timeout_cancels_all_pending(self) -> None:
+        publisher = AsyncMock()
+        subscriber = _FakeSubscriber([], exhaust_then_return=False)
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1",
+            coordinator_run_id="r1",
+            coordinator_limits=CoordinatorLimits(
+                max_total_wallclock_seconds_per_run=0.01,
+            ),
+        )
+        cancel_event = asyncio.Event()
+
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1", "wu2"],
+            child_session_ids={"wu1": "c1", "wu2": "c2"},
+            cancel_event=cancel_event,
+            timeout_seconds=1.0,
+        )
+
+        assert publisher.publish.await_count == 2
+        reasons = {
+            call.args[0].payload["reason"]
+            for call in publisher.publish.await_args_list
+        }
+        assert reasons == {"run_total_wallclock_budget_exceeded"}
 
     async def test_timeout_with_no_terminal_no_cancel(self) -> None:
         publisher = AsyncMock()

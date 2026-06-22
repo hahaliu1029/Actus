@@ -1058,7 +1058,10 @@ def build_coordinator_runtime_deps(
         publisher=mailbox_publisher,
     )
 
-    # ── 7. CoordinatorRunOrchestrator factory — per-run wrapper around the
+    # ── 7a. CoordinatorLimits (env-overridable singleton). ──────────────────
+    coordinator_limits = load_coordinator_limits_from_env()
+
+    # ── 7b. CoordinatorRunOrchestrator factory — per-run wrapper around the
     #      lifespan-scoped publisher + envelope_factory + subscriber.
     #      Per spec §11.3-§11.4, one orchestrator is constructed per
     #      coordinator run; the *factory* captures the lifespan deps.
@@ -1093,10 +1096,14 @@ def build_coordinator_runtime_deps(
             mailbox_publisher,
             envelope_factory,
             mailbox_subscriber,
+            coordinator_limits,
+            cost_rollup_service_provider,
         ) -> None:
             self._mailbox_publisher = mailbox_publisher
             self._envelope_factory = envelope_factory
             self._mailbox_subscriber = mailbox_subscriber
+            self._coordinator_limits = coordinator_limits
+            self._cost_rollup_service_provider = cost_rollup_service_provider
 
         def build(
             self,
@@ -1122,12 +1129,16 @@ def build_coordinator_runtime_deps(
                 envelope_factory=self._envelope_factory,
                 mailbox_subscriber=self._mailbox_subscriber,
                 emit_event=emit_event,
+                cost_rollup_service=self._cost_rollup_service_provider(),
+                coordinator_limits=self._coordinator_limits,
             )
 
     _orchestrator_factory = _OrchestratorFactory(
         mailbox_publisher=mailbox_publisher,
         envelope_factory=envelope_factory,
         mailbox_subscriber=mailbox_subscriber,
+        coordinator_limits=coordinator_limits,
+        cost_rollup_service_provider=lambda: cost_rollup_service,
     )
 
     # ── 8. SessionService (coordinator path). ───────────────────────────────
@@ -1142,9 +1153,6 @@ def build_coordinator_runtime_deps(
 
     # ── 9. ProbeQuotaService — Redis-backed per-user active-probe quota. ────
     probe_quota = ProbeQuotaService(redis_client=redis_client)
-
-    # ── 10. CoordinatorLimits (env-overridable singleton). ──────────────────
-    coordinator_limits = load_coordinator_limits_from_env()
 
     # ── 10b. CoordinatorMetrics — C2b budget D10 instrument bundle. ─────────
     #      OtelMeter() defaults to get_meter("actus"): a no-op proxy before
