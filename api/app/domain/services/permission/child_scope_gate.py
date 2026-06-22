@@ -25,8 +25,8 @@ EvaluationContext.child_permission_context and call check_in_scope (DRY):
 Known limitations (spec §6, deferred — NOT bugs introduced here):
 - Cumulative tool-count cap: budget is still the static ``max_tool_calls <= 0``
   kill-switch, not a cumulative counter.
-- Intra-batch race; symlink / non-canonical lease escape (exact-string match);
-  manifest ``allowed_tools`` has no known-name validator.
+- Intra-batch race; symlink lease escape; manifest ``allowed_tools`` has no
+  known-name validator.
 
 Resolved (C2b §6-lim2 follow-up): child session DB row termination on
 violation/event-cancel — the runner now writes ``COMPLETED`` + ``"natural"``
@@ -40,6 +40,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import TYPE_CHECKING
+
+from app.domain.models.path_validation import (
+    CoordinatorPathContractError,
+    validate_coordinator_path,
+)
 
 if TYPE_CHECKING:
     from app.domain.models.work_unit import PathLease
@@ -157,8 +162,22 @@ class ChildScopeGate:
         target_path: str,
         leases: "tuple[PathLease, ...]",
     ) -> "PathLease | None":
+        # Legacy compatibility: older fixtures / stored manifests may carry
+        # absolute non-workspace paths (e.g. "/x"). Preserve exact-match behavior
+        # for those shapes while adding the single-path canonical fallback below.
         for lease in leases:
             if lease.path == target_path:
+                return lease
+        try:
+            canonical_target = validate_coordinator_path(target_path)
+        except CoordinatorPathContractError:
+            return None
+        for lease in leases:
+            try:
+                canonical_lease = validate_coordinator_path(lease.path)
+            except CoordinatorPathContractError:
+                continue
+            if canonical_lease == canonical_target:
                 return lease
         return None
 

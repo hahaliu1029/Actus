@@ -176,6 +176,51 @@ class TestPathLease:
         )
         assert await gate.check_in_scope(_call("file_write", filepath="/y"), _ctx(c), c) == ScopeDecision.OUT_OF_PATH_LEASE
 
+    @pytest.mark.parametrize(
+        "target_path",
+        [
+            "/home/ubuntu/workspace/a.py",
+            "./workspace/a.py",
+            "workspace//a.py",
+        ],
+    )
+    async def test_write_matches_lease_after_coordinator_path_canonicalization(
+        self, gate, target_path
+    ):
+        """A child tool may send an absolute/non-canonical spelling of the same
+        workspace path the coordinator stored in the lease."""
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            leases=(
+                PathLease(path="workspace/a.py", op="modify", base_digest="abc"),
+            ),
+        )
+
+        assert (
+            await gate.check_in_scope(
+                _call("file_write", filepath=target_path), _ctx(c), c
+            )
+            == ScopeDecision.IN_SCOPE
+        )
+
+    @pytest.mark.parametrize("target_path", ["/etc/passwd", "a.py"])
+    async def test_invalid_coordinator_path_spelling_still_denied(
+        self, gate, target_path
+    ):
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            leases=(
+                PathLease(path="workspace/a.py", op="modify", base_digest="abc"),
+            ),
+        )
+
+        assert (
+            await gate.check_in_scope(
+                _call("file_write", filepath=target_path), _ctx(c), c
+            )
+            == ScopeDecision.OUT_OF_PATH_LEASE
+        )
+
     async def test_empty_filepath_does_not_fall_through_to_path(self, gate):
         """Explicit empty filepath must not silently fall back to 'path' kwarg."""
         c = _cctx(
