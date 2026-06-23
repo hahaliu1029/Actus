@@ -129,3 +129,74 @@ async def test_partial_status_propagates_into_total():
     )
     agg = await svc.get_tree_aggregate("root", user_id="u1", max_depth=1)
     assert agg.total_cost.cost_status == CostStatus.PARTIAL
+
+
+@pytest.mark.anyio
+async def test_cost_tree_clamp_and_depth_reached_honor_injected_ceiling():
+    """S3 PR-3: with max_subagent_depth=2 injected, the walk clamps to 2 and
+    depth_reached is computed from the persisted depth relative to the root."""
+    self_s = Session(id="root", user_id="u1", worker_type="root", depth=0)
+    c1 = Session(
+        id="c1", user_id="u1", worker_type="subagent",
+        parent_session_id="root", depth=1, root_session_id="root",
+    )
+    c2 = Session(
+        id="c2", user_id="u1", worker_type="subagent",
+        parent_session_id="c1", depth=2, root_session_id="root",
+    )
+    svc = SessionCostTreeService(
+        session_repo=_SessionRepo(self_session=self_s, descendants=[c1, c2]),
+        cost_repo=_CostRepo([]),
+        cost_aggregator=CostAggregationService(_CostRepo([])),
+        max_subagent_depth=2,
+    )
+    agg = await svc.get_tree_aggregate("root", user_id="u1")  # max_depth=None → ceiling
+    assert agg.max_depth_applied == 2
+    assert agg.depth_reached == 2  # max(1-0, 2-0)
+
+
+@pytest.mark.anyio
+async def test_cost_tree_default_parity_clamps_to_1():
+    """INV-E: default ceiling=1 → effective_depth 1; depth_reached == 1 when a
+    descendant exists (identical to the legacy hardcoded behavior)."""
+    self_s = Session(id="root", user_id="u1", worker_type="root", depth=0)
+    c1 = Session(
+        id="c1", user_id="u1", worker_type="subagent",
+        parent_session_id="root", depth=1, root_session_id="root",
+    )
+    svc = SessionCostTreeService(
+        session_repo=_SessionRepo(self_session=self_s, descendants=[c1]),
+        cost_repo=_CostRepo([]),
+        cost_aggregator=CostAggregationService(_CostRepo([])),
+    )  # default max_subagent_depth = MAX_SUBAGENT_DEPTH = 1
+    agg = await svc.get_tree_aggregate("root", user_id="u1")
+    assert agg.max_depth_applied == 1
+    assert agg.depth_reached == 1
+
+
+@pytest.mark.anyio
+async def test_cost_tree_depth_reached_zero_with_no_descendants():
+    """INV-E: no descendants → depth_reached 0 (unchanged)."""
+    self_s = Session(id="root", user_id="u1", worker_type="root", depth=0)
+    svc = SessionCostTreeService(
+        session_repo=_SessionRepo(self_session=self_s, descendants=[]),
+        cost_repo=_CostRepo([]),
+        cost_aggregator=CostAggregationService(_CostRepo([])),
+    )
+    agg = await svc.get_tree_aggregate("root", user_id="u1")
+    assert agg.depth_reached == 0
+
+
+def test_di_factory_threads_runtime_limit_into_cost_tree():
+    """S3 PR-3 / R2-B1: the DI factory passes limits.max_subagent_depth into
+    the service ctor (calling the factory directly bypasses FastAPI Depends)."""
+    from app.interfaces.service_dependencies import get_session_cost_tree_service
+    from core.config import SubagentLimitsConfig
+
+    svc = get_session_cost_tree_service(
+        session_repo=object(),
+        cost_repo=object(),
+        cost_aggregator=object(),
+        limits=SubagentLimitsConfig(max_subagent_depth=2),
+    )
+    assert svc._max_subagent_depth == 2

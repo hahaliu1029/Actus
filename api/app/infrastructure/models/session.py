@@ -68,6 +68,19 @@ class SessionModel(Base):
         nullable=False,
         server_default=text("'root'::character varying"),
     )  # C1a identity axis root/subagent; CHECK constraints live in c1a migration.
+    # ── C2-full S3 lineage columns (migration s3pr1_add_session_depth_lineage) ──
+    # Mirror the domain Session.depth / root_session_id. server_default mirrors
+    # the migration's NOT NULL DEFAULT 0 so create_all() and alembic
+    # --autogenerate agree (cf. sandbox_generation server_default=text("0")).
+    depth: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    root_session_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )
     # C3 PR-1 — control plane discriminator (spec §11.2). NULLABLE with NO
     # server_default; NULL ≡ 'legacy' (pre-C3 rows). Consumers must apply
     # ``coalesce(value, 'legacy')`` semantics; see migration

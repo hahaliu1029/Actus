@@ -116,11 +116,18 @@ async def test_raises_descendants_cap():
 
 @pytest.mark.anyio
 async def test_raises_depth_cap_when_parent_is_already_subagent():
+    """INV-B1: at default config=1, a valid depth-1 subagent parent → reject
+    with the byte-identical legacy tuple SpawnCapExceeded('depth', 2, 1)."""
     parent = Session(
-        id="p", user_id="u1", worker_type="subagent", parent_session_id="root"
+        id="p",
+        user_id="u1",
+        worker_type="subagent",
+        parent_session_id="root",
+        depth=1,
+        root_session_id="root",
     )
     repo = _FakeRepo(parent=parent)
-    svc = SessionService(uow_factory=_uow_factory(repo))
+    svc = SessionService(uow_factory=_uow_factory(repo))  # default config=1
     with pytest.raises(SpawnCapExceeded) as exc_info:
         await svc.create_session_with_parent(
             user_id="u1",
@@ -128,6 +135,8 @@ async def test_raises_depth_cap_when_parent_is_already_subagent():
             tool_filter_preset="subagent_research",
         )
     assert exc_info.value.kind == "depth"
+    assert exc_info.value.current == 2
+    assert exc_info.value.cap == 1
 
 
 @pytest.mark.anyio
@@ -172,8 +181,9 @@ async def test_custom_descendants_cap_is_used():
 
 
 @pytest.mark.anyio
-async def test_unsupported_max_subagent_depth_raises_not_implemented():
-    """Codex P1 regression: max_subagent_depth > 1 must fail loudly (Phase 1 only supports 1)."""
+async def test_max_subagent_depth_2_accepts_child_from_root():
+    """S3 PR-2: with the ceiling lifted to 2, a root parent still yields a
+    valid depth-1 child (the only prod-reachable shape; INV-B1/INV-0/INV-B2)."""
     from core.config import SubagentLimitsConfig
 
     parent = Session(id="p", user_id="u1", worker_type="root")
@@ -184,9 +194,144 @@ async def test_unsupported_max_subagent_depth_raises_not_implemented():
             max_subagent_depth=2, max_descendants_per_root=10
         ),
     )
-    with pytest.raises(NotImplementedError, match="max_subagent_depth > 1"):
+    child = await svc.create_session_with_parent(
+        user_id="u1",
+        parent_session_id="p",
+        tool_filter_preset="subagent_research",
+    )
+    assert child.depth == 1
+    assert child.root_session_id == "p"
+
+
+@pytest.mark.anyio
+async def test_depth_2_grandchild_accepted_at_ceiling_2():
+    """S3 PR-2: direct construction of a valid depth-1 subagent parent; at
+    config=2 a grandchild (depth 2) is accepted, chaining root to the true root.
+    Dormant in prod (INV-B2) — reachable only from this unit test."""
+    from core.config import SubagentLimitsConfig
+
+    parent = Session(
+        id="c1",
+        user_id="u1",
+        worker_type="subagent",
+        parent_session_id="root",
+        depth=1,
+        root_session_id="root",
+    )
+    repo = _FakeRepo(parent=parent)
+    svc = SessionService(
+        uow_factory=_uow_factory(repo),
+        subagent_limits=SubagentLimitsConfig(
+            max_subagent_depth=2, max_descendants_per_root=10
+        ),
+    )
+    grandchild = await svc.create_session_with_parent(
+        user_id="u1",
+        parent_session_id="c1",
+        tool_filter_preset="subagent_research",
+    )
+    assert grandchild.depth == 2
+    assert grandchild.root_session_id == "root"  # true root, not the immediate parent
+
+
+@pytest.mark.anyio
+async def test_depth_3_rejected_with_current_3_not_legacy_literal_2():
+    """S3 PR-2: a depth-2 parent → child_depth=3 > ceiling=2 → reject with
+    current=3 (the legacy gate hardcoded the literal 2 regardless of depth)."""
+    from core.config import SubagentLimitsConfig
+
+    parent = Session(
+        id="c2",
+        user_id="u1",
+        worker_type="subagent",
+        parent_session_id="c1",
+        depth=2,
+        root_session_id="root",
+    )
+    repo = _FakeRepo(parent=parent)
+    svc = SessionService(
+        uow_factory=_uow_factory(repo),
+        subagent_limits=SubagentLimitsConfig(
+            max_subagent_depth=2, max_descendants_per_root=10
+        ),
+    )
+    with pytest.raises(SpawnCapExceeded) as exc_info:
         await svc.create_session_with_parent(
             user_id="u1",
-            parent_session_id="p",
+            parent_session_id="c2",
             tool_filter_preset="subagent_research",
         )
+    assert exc_info.value.kind == "depth"
+    assert exc_info.value.current == 3
+    assert exc_info.value.cap == 2
+
+
+@pytest.mark.anyio
+async def test_corrupt_lineage_parent_set_but_depth_zero_fails_closed():
+    """S3 PR-2 §4.2: a row with parent_session_id set but depth=0 violates
+    INV-A1. The gate fails closed (kind='depth') rather than spawning from it."""
+    parent = Session(
+        id="bad",
+        user_id="u1",
+        worker_type="subagent",
+        parent_session_id="root",
+        depth=0,  # corrupt: a subagent must be depth ≥ 1
+    )
+    repo = _FakeRepo(parent=parent)
+    svc = SessionService(uow_factory=_uow_factory(repo))  # default config=1
+    with pytest.raises(SpawnCapExceeded) as exc_info:
+        await svc.create_session_with_parent(
+            user_id="u1",
+            parent_session_id="bad",
+            tool_filter_preset="subagent_research",
+        )
+    assert exc_info.value.kind == "depth"
+
+
+@pytest.mark.anyio
+async def test_corrupt_lineage_root_with_positive_depth_fails_closed():
+    """S3 PR-2 §4.2: the mirror corruption — no parent but depth>0 — also fails
+    closed before the depth math."""
+    parent = Session(
+        id="bad2",
+        user_id="u1",
+        worker_type="root",
+        parent_session_id=None,
+        depth=2,  # corrupt: a root must be depth 0
+    )
+    repo = _FakeRepo(parent=parent)
+    svc = SessionService(uow_factory=_uow_factory(repo))
+    with pytest.raises(SpawnCapExceeded) as exc_info:
+        await svc.create_session_with_parent(
+            user_id="u1",
+            parent_session_id="bad2",
+            tool_filter_preset="subagent_research",
+        )
+    assert exc_info.value.kind == "depth"
+
+
+@pytest.mark.anyio
+async def test_child_lineage_set_from_root_parent():
+    """S3 PR-1 / INV-A1: a child spawned from a root carries depth=1 and
+    root_session_id = parent.id (parent's effective root)."""
+    parent = Session(id="p", user_id="u1", worker_type="root")  # depth=0, root=None
+    repo = _FakeRepo(parent=parent)
+    svc = SessionService(uow_factory=_uow_factory(repo))
+    child = await svc.create_session_with_parent(
+        user_id="u1",
+        parent_session_id="p",
+        tool_filter_preset="subagent_research",
+    )
+    assert child.depth == 1
+    assert child.root_session_id == "p"
+
+
+@pytest.mark.anyio
+async def test_create_session_root_lineage_defaults():
+    """S3 PR-1: a root session created via create_session has depth=0 / root=None."""
+    repo = _FakeRepo(parent=None)
+    svc = SessionService(uow_factory=_uow_factory(repo))
+    s = await svc.create_session("u1")
+    assert s.depth == 0
+    assert s.root_session_id is None
+    assert repo.saved is s

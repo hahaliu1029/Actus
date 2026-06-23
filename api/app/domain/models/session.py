@@ -93,6 +93,14 @@ class Session(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # 会话id
     parent_session_id: Optional[str] = None  # C1a canonical lineage field — sole survivor after PR-4 contract drop.
     worker_type: Literal["root", "subagent"] = "root"  # C1a identity axis; CHECK ck_sessions_worker_type_parent_invariant keeps this in sync with parent_session_id.
+    # C2-full S3 (PR-1) — persisted lineage backbone. Set once at creation,
+    # never mutated (lineage is append-only). depth: root=0, child=parent.depth+1.
+    # root_session_id: NULL ⇔ self-is-root; else the true tree root id
+    # (effective_root = root_session_id or id). Pure carriers in PR-1 — no
+    # decision reads them yet; the depth-aware spawn gate (PR-2) and cost
+    # depth_reached (PR-3) consume them.
+    depth: int = 0
+    root_session_id: Optional[str] = None
     # C3 PR-1 — control plane discriminator (spec §11.2). 'legacy' = SSE-only
     # path; 'mailbox' = MailboxSupervisor manages lifecycle; None = pre-C3 rows
     # (treat as 'legacy' via consumer-side coalesce). Narrowed to a Literal

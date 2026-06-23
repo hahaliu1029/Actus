@@ -77,6 +77,7 @@ from app.interfaces.service_dependencies import (
     get_agent_service,
     get_session_repository,
     get_session_service,
+    get_subagent_limits,
     get_subagent_research_service,
     get_supervisor,
 )
@@ -85,7 +86,7 @@ from app.application.services.subagent_research_service import (
 )
 from app.interfaces.schemas.subagent import ResearchSubagentRequest
 from app.infrastructure.storage.redis import RedisClient, get_redis
-from core.config import get_settings
+from core.config import SubagentLimitsConfig, get_settings
 from fastapi import APIRouter, Body, Depends, Query, Request, Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -315,13 +316,14 @@ async def list_session_children(
     current_user: CurrentUser,
     repo: SessionRepository = Depends(get_session_repository),
     depth: int = Query(default=MAX_SUBAGENT_DEPTH, ge=1, le=10),
+    limits: SubagentLimitsConfig = Depends(get_subagent_limits),
 ) -> Response[ChildrenListResponse]:
     """C1a: GET /api/sessions/{session_id}/children — flat descendants list."""
     session = await repo.find_by_id_for_user(session_id, user_id=current_user.id)
     if session is None:
         raise NotFoundError(f"session {session_id} not found")
 
-    effective_depth = min(depth, MAX_SUBAGENT_DEPTH)
+    effective_depth = min(depth, limits.max_subagent_depth)
     depth_clamped = effective_depth < depth
     cap = MAX_DESCENDANTS_PER_ROOT
     raw = await repo.find_descendants(

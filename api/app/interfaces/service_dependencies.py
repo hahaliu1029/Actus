@@ -2015,10 +2015,11 @@ def get_session_cost_tree_service(
     session_repo=Depends(get_session_repository),
     cost_repo=Depends(get_cost_record_repository),
     cost_aggregator=Depends(get_cost_aggregation_service),
+    limits=Depends(get_subagent_limits),
 ):
-    """C1a: SessionCostTreeService composed of 3 deps. FastAPI Depends cache
+    """C1a: SessionCostTreeService composed of 4 deps. FastAPI Depends cache
     guarantees ``db_session`` is shared between session_repo and cost_repo within
-    the same request.
+    the same request. S3: ``limits`` injects the runtime spawn-depth ceiling.
     """
     from app.application.services.session_cost_tree_service import (
         SessionCostTreeService,
@@ -2028,6 +2029,7 @@ def get_session_cost_tree_service(
         session_repo=session_repo,
         cost_repo=cost_repo,
         cost_aggregator=cost_aggregator,
+        max_subagent_depth=limits.max_subagent_depth,
     )
 
 

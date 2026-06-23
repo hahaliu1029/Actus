@@ -59,10 +59,15 @@ class SessionCostTreeService:
         session_repo: "SessionRepository",
         cost_repo: "CostRecordRepository",
         cost_aggregator: CostAggregationService,
+        max_subagent_depth: int = MAX_SUBAGENT_DEPTH,
     ) -> None:
         self._sessions = session_repo
         self._costs = cost_repo
         self._aggregator = cost_aggregator
+        # C2-full S3 (PR-3) — runtime ceiling. Defaulted to the constant so the
+        # pre-existing ctor sites stay green; prod wires limits.max_subagent_depth
+        # at service_dependencies.get_session_cost_tree_service.
+        self._max_subagent_depth = max_subagent_depth
 
     async def get_tree_aggregate(
         self,
@@ -72,8 +77,8 @@ class SessionCostTreeService:
         max_depth: int | None = None,
     ) -> CostTreeAggregate:
         effective_depth = min(
-            max_depth if max_depth is not None else MAX_SUBAGENT_DEPTH,
-            MAX_SUBAGENT_DEPTH,
+            max_depth if max_depth is not None else self._max_subagent_depth,
+            self._max_subagent_depth,
         )
 
         self_session = await self._sessions.find_by_id_for_user(
@@ -116,7 +121,10 @@ class SessionCostTreeService:
             descendants_cost=self._aggregator.aggregate_rows(desc_rows),
             total_cost=self._aggregator.aggregate_rows(rows),
             descendant_ids=[d.id for d in descendants],
-            depth_reached=max((1 for _ in descendants), default=0),
+            depth_reached=max(
+                (d.depth - self_session.depth for d in descendants),
+                default=0,
+            ),
             max_depth_applied=effective_depth,
             truncated=truncated,
             cost_source=cost_source,

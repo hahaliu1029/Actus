@@ -182,20 +182,6 @@ class SessionService:
 
             limits = SubagentLimitsConfig()
 
-        # Phase 1 invariant: only ``max_subagent_depth=1`` is implemented.
-        # The env-knob is reserved for forward-compat (the field's
-        # ``ge=1, le=8`` validator allows higher values), so we fail loudly
-        # rather than silently accept >1 and behave as 1 — the latter would
-        # surprise operators tuning the config thinking they enabled deeper
-        # trees. When Phase 2 lands the walk-up-the-chain implementation,
-        # this guard is removed.
-        if limits.max_subagent_depth != 1:
-            raise NotImplementedError(
-                "max_subagent_depth > 1 not yet implemented "
-                "(Phase 1 enforces 'parent must be a root'); "
-                f"got max_subagent_depth={limits.max_subagent_depth}"
-            )
-
         async with self._uow_factory() as uow:
             # SQL pushes (id, user_id) into WHERE so a cross-tenant parent_id
             # never acquires a row lock. Foreign-user collapses to None,
@@ -206,11 +192,31 @@ class SessionService:
             if parent is None:
                 raise NotFoundError(f"parent session {parent_id} not found")
 
-            # Phase 1 max_depth=1: parent must be a root.
-            if parent.parent_session_id is not None or parent.worker_type != "root":
-                raise SpawnCapExceeded("depth", 2, limits.max_subagent_depth)
+            # C2-full S3 (PR-2) — depth-aware spawn gate (design §4.2). The
+            # config validator (SubagentLimitsConfig le=2) caps the ceiling at
+            # load time, so the old `!= 1 → NotImplementedError` guard is gone.
+            #
+            # Corrupt-lineage guard: the persisted `depth` is now the authority,
+            # but root-ness historically had two signals (parent_session_id +
+            # worker_type). Fail closed if the parent row's lineage signals
+            # disagree, rather than trusting a corrupt depth (unreachable
+            # post-backfill / INV-A1, but defends against a bad row).
+            if (parent.parent_session_id is not None) != (parent.depth > 0):
+                raise SpawnCapExceeded(
+                    "depth", parent.depth + 1, limits.max_subagent_depth
+                )
 
-            root_id = parent.parent_session_id or parent.id
+            child_depth = parent.depth + 1
+            if child_depth > limits.max_subagent_depth:
+                raise SpawnCapExceeded(
+                    "depth", child_depth, limits.max_subagent_depth
+                )
+
+            root_id = (
+                parent.root_session_id
+                if parent.root_session_id is not None
+                else parent.id
+            )
             descendant_count = await uow.session.count_descendants(
                 root_id, user_id=user_id, cap=limits.max_descendants_per_root,
             )
@@ -238,6 +244,16 @@ class SessionService:
                 # C2 PR-3 §7.5 P0-3 — atomic same-row write of coordinator lineage.
                 coordinator_run_id=coordinator_run_id,
                 work_unit_id=work_unit_id,
+                # C2-full S3 (PR-1) — persisted lineage, set once from the
+                # FOR-UPDATE-locked parent row (INV-A1). depth chains off the
+                # parent; root_session_id resolves to the true tree root
+                # (parent's root, or the parent itself when the parent is a root).
+                depth=parent.depth + 1,
+                root_session_id=(
+                    parent.root_session_id
+                    if parent.root_session_id is not None
+                    else parent.id
+                ),
             )
             await uow.session.save(child)
             logger.info(

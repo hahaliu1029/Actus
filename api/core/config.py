@@ -33,7 +33,7 @@ class SubagentLimitsConfig(BaseSettings):
         extra="ignore",
     )
 
-    max_subagent_depth: int = Field(default=1, ge=1, le=8)
+    max_subagent_depth: int = Field(default=1, ge=1, le=2)
     max_descendants_per_root: int = Field(default=10, ge=1, le=200)
 
 

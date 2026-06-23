@@ -570,3 +570,26 @@ in-flight is **NOT a graceful abort**. Wiring stays live; in-flight runs continu
 to emit events and drain to terminal state. The flag only gates the entry to
 **new** coordinator dispatches. To fully drain before rollback, wait for all
 sessions with a `parallel_work_units` step to reach terminal status, then flip.
+
+## C2-full S3 — Multi-Level Spawn Governance (dormant machinery)
+
+`max_subagent_depth` (env `ACTUS_MAX_SUBAGENT_DEPTH`, config `SubagentLimitsConfig`)
+clamps the session-tree spawn depth to `[1, 2]`. **Setting it to `2` does NOT
+enable nested agents.** It is a dormant / forward-compat governance knob:
+
+- At the default `1`, behavior is byte-identical to pre-S3 (INV-0).
+- Even at `2`, no production path can drive a subagent to
+  `create_session_with_parent` — the 4 reachability blocks (design §F0.9) stay
+  intact: `spawn_subagent` is not a wired tool, the child runner factory wires no
+  coordinator subgraph, and the only two callers spawn exclusively from a root.
+  Depth>1 is exercised only by direct unit construction.
+- Values `≥ 3` fail at config load (Pydantic `le=2`) — a fail-loud tightening
+  that replaces the old spawn-time `NotImplementedError`. The knob is absent from
+  every shipped template (`.env.example`, `config.yaml.example`,
+  `docker-compose.yml`), so no default deployment is affected.
+
+**Deferred to a later "S3-enable" epic:** the entire mailbox / supervisor / cancel
+control plane (root re-anchoring, recursive cancel, supervisor `parent==root`
+contract). The `MailboxEnvelope` wire schema is `extra="forbid"`; adding a
+`root_session_id` field would poison-skip control-plane messages for ordinary
+depth-1 children on a rolling deploy (design §F0.10). Do NOT add it as part of S3.

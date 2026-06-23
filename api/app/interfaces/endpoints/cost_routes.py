@@ -20,7 +20,9 @@ from app.interfaces.service_dependencies import (
     get_cost_aggregation_service,
     get_session_cost_tree_service,
     get_session_service,
+    get_subagent_limits,
 )
+from core.config import SubagentLimitsConfig
 
 if TYPE_CHECKING:
     from app.application.services.cost_aggregation_service import (
@@ -98,9 +100,10 @@ async def get_session_cost_tree(
     current_user: CurrentUser,
     service: "SessionCostTreeService" = Depends(get_session_cost_tree_service),
     depth: int = Query(default=MAX_SUBAGENT_DEPTH, ge=1, le=10),
+    limits: SubagentLimitsConfig = Depends(get_subagent_limits),
 ) -> Response[CostTreeResponse]:
     """C1a: GET /api/sessions/{session_id}/cost/tree — tree cost rollup."""
-    effective_depth = min(depth, MAX_SUBAGENT_DEPTH)
+    effective_depth = min(depth, limits.max_subagent_depth)
     agg = await service.get_tree_aggregate(
         session_id,
         user_id=current_user.id,
