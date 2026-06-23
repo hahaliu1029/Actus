@@ -784,9 +784,22 @@ class CoordinatorChildRunner:
             # It is INSIDE this try because the MinIO upload is a NEW failure
             # source — an upload failure must route to _finalize_failed (a terminal
             # envelope), never escape run_work_unit's finally-only wrapper.
-            payload = await self._build_manifest_payload_inline_or_ref(
-                run_id, wu, patch_manifest,
-                summary=f"completed {wu.work_unit_id}",
+            #
+            # [codex PR-4 R4 P0] BOUND the build/upload by the snapshot budget.
+            # The by-ref upload (put_content_addressed_bytes) is otherwise
+            # UNBOUNDED; a shell-diff manifest can be large, so a stalled MinIO
+            # upload would outlive the parent waiter's timeout — the parent
+            # synthesizes TIMED_OUT, and THEN this finalize would publish a
+            # contradictory LATE SUCCESS (a second, conflicting terminal). The
+            # wait_for keeps the whole shell finalize inside the §3.2 finalizer
+            # budget; a TimeoutError is an Exception → routed to _finalize_failed
+            # below → exactly one bounded FAILED terminal, no late success.
+            payload = await asyncio.wait_for(
+                self._build_manifest_payload_inline_or_ref(
+                    run_id, wu, patch_manifest,
+                    summary=f"completed {wu.work_unit_id}",
+                ),
+                timeout=self._snapshot_limits.max_snapshot_seconds,
             )
         except _OutOfLeaseWriteError as exc:
             return await self._finalize_needs_authorization_out_of_lease(

@@ -367,3 +367,30 @@ async def test_worker_node_no_kill_when_shell_replay_kill_false() -> None:
     wr = out["worker_results"][0]
     assert wr.outcome == ResultReadyOutcome.SUCCESS
     assert wr.patch_manifest is not None
+
+
+async def test_worker_node_shell_replay_kill_demotes_byref_success() -> None:
+    # [codex PR-4 R3 P2] pending-path kill-switch must fire on a BY-REF resolved
+    # manifest too (resolve-then-demote), not just inline. The ref IS resolved
+    # (get_bytes awaited) THEN the flag-off demotion discards it → FAILED/None.
+    pm = _manifest()
+    artifact = MagicMock()
+    artifact.get_bytes = AsyncMock(
+        return_value=json.dumps(pm.model_dump(mode="json")).encode("utf-8")
+    )
+    payload = ResultReadyPayload(
+        summary="captured under flag ON",
+        outcome=ResultReadyOutcome.SUCCESS,
+        patch_manifest_ref="coordinator/r1/wu1/manifest/abc",
+    )
+    config = _config(artifact_storage=artifact)
+    config["configurable"]["terminal_waiter"].await_terminal = AsyncMock(
+        return_value=_envelope(payload)
+    )
+    send = _send(manifest_required=True)
+    send["shell_replay_kill"] = True
+    out = await worker_node(send, config)
+    wr = out["worker_results"][0]
+    assert wr.outcome == ResultReadyOutcome.FAILED
+    assert wr.patch_manifest is None
+    artifact.get_bytes.assert_awaited_once()  # ref resolved, THEN demoted

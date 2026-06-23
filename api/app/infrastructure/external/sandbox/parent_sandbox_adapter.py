@@ -145,6 +145,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# [codex PR-4 R3 P2] one-shot guard so the legacy kindless-sandbox fallback
+# (check_path) logs at most once per process instead of per-apply.
+_WARNED_LEGACY_KINDLESS = False
+
 
 class ParentSandboxAdapter(ParentSandboxPort):
     """Adapter from ``SandboxHandle`` → ``ParentSandboxPort``.
@@ -245,6 +249,21 @@ class ParentSandboxAdapter(ParentSandboxPort):
         if not kind:
             # [codex PR-4 R2 P1] legacy (kindless) sandbox: existing → "regular"
             # (pre-S1b bool semantics), absent → "missing".
+            # [codex PR-4 R3 P2] warn ONCE per process so a mixed-version
+            # deployment (new api + old sandbox image) is diagnosable: the
+            # special-inode hardening (symlink/special rejection) silently
+            # degrades to pre-S1b bool semantics on a kindless image.
+            if exists:
+                global _WARNED_LEGACY_KINDLESS
+                if not _WARNED_LEGACY_KINDLESS:
+                    _WARNED_LEGACY_KINDLESS = True
+                    logger.warning(
+                        "check_path: sandbox returned no 'kind' (legacy image?) "
+                        "for an existing target — degrading to 'regular' "
+                        "(pre-S1b bool semantics); special-inode hardening is "
+                        "INACTIVE against this sandbox. Rebuild the sandbox image "
+                        "to restore kind-based hardening. (warned once)",
+                    )
             kind = "missing" if not exists else "regular"
         return SandboxPathCheck(exists=exists, kind=kind)
 

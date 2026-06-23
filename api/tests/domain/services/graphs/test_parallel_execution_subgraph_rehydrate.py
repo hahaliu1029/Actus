@@ -261,6 +261,48 @@ class TestBuildPreResults:
         assert out[0].outcome == ResultReadyOutcome.SUCCESS
         assert isinstance(out[0].patch_manifest, PatchManifest)
 
+    async def test_kill_switch_demotes_byref_resolved_shell_replay_success(
+        self,
+    ) -> None:
+        # [codex PR-4 R3 P2] The kill-switch must fire even when the manifest is
+        # resolved BY-REF (PR-2), not just inline: the builder RESOLVES the ref
+        # (artifact_storage.get_bytes) THEN the flag-off demotion discards it.
+        # Proves a large by-ref shell manifest cannot slip past the kill-switch.
+        import json as _json
+
+        from app.domain.models.patch_manifest import PatchManifest
+
+        wu = self._shell_write_unit("wu1")
+        pm = PatchManifest(
+            patch_id="r1:wu1:p", coordinator_run_id="r1", work_unit_id="wu1",
+            files=(),
+        )
+        artifact = AsyncMock()
+        artifact.get_bytes = AsyncMock(
+            return_value=_json.dumps(pm.model_dump(mode="json")).encode("utf-8")
+        )
+        terminal = {
+            "wu1": TerminalEnvelopeRecord(
+                envelope_type="RESULT_READY",
+                payload={
+                    "outcome": "success",
+                    "patch_manifest_ref": "coordinator/r1/wu1/manifest/abc",
+                    "summary": "done",
+                },
+                child_session_id="c1",
+                received_at=datetime.now(timezone.utc),
+            ),
+        }
+        out = await _build_pre_results_from_terminal(
+            terminal,
+            artifact_storage=artifact,
+            work_units_by_id={"wu1": wu},
+            shell_replay_kill_ids={"wu1"},
+        )
+        assert out[0].outcome == ResultReadyOutcome.FAILED
+        assert out[0].patch_manifest is None
+        artifact.get_bytes.assert_awaited_once()  # ref resolved, THEN demoted
+
 
 # -- _rehydrate_dispatch branches ------------------------------------------
 

@@ -422,3 +422,53 @@ async def test_shell_mode_unit_with_flag_off_takes_typed_path(monkeypatch):
     # No PRE scan was taken (flag-off short-circuits the shell_mode_active gate).
     assert runner._pre_scan is None
     runner._child_sandbox.snapshot_workspace.assert_not_awaited()
+
+
+async def test_shell_capture_byref_manifest_upload_stall_bounded_to_failed(
+    monkeypatch,
+):
+    # [codex PR-4 R4 P0] A STALLED by-ref MANIFEST upload must be BOUNDED by the
+    # snapshot budget so it cannot outlive the parent waiter (which would
+    # synthesize TIMED_OUT) and then publish a contradictory LATE SUCCESS. The
+    # build/upload wait_for trips → _finalize_failed → exactly one FAILED terminal,
+    # well within the bound. The outer asyncio.wait_for(5s) makes a MISSING bound
+    # surface as an outer timeout (RED) instead of a silent ~600s hang.
+    monkeypatch.setattr(runner_module, "_MAX_INLINE_MANIFEST_BYTES", 0)  # force by-ref
+
+    class _TinyBudgetLimits:
+        max_snapshot_paths = 20000
+        max_snapshot_files = 8000
+        max_snapshot_total_bytes = 100 * 1024 * 1024
+        max_snapshot_seconds = 0.05  # build/upload wait_for trips before the hang
+
+    post = WorkspaceScan(
+        entries={"workspace/new.py": _entry("workspace/new.py")}, truncated=False,
+    )
+    runner, ce, pub, envf = _wire_shell_runner(post_scans=[post, post])
+    runner._snapshot_limits = _TinyBudgetLimits()
+
+    # Hang ONLY the MANIFEST upload (manifest/ prefix); the capture's patch-content
+    # upload (patch/ prefix) returns fast so the stall is isolated to the manifest
+    # build step this P0 is about.
+    async def _maybe_hung_upload(*, prefix, content, **_kw):
+        if "manifest/" in prefix:
+            await asyncio.sleep(5.0)
+        return "ref"
+
+    runner._artifact_storage.put_content_addressed_bytes = AsyncMock(
+        side_effect=_maybe_hung_upload
+    )
+    fl = _fake_listener()
+    with patch.object(
+        runner_module, "CoordinatorChildCancelListener", return_value=fl
+    ):
+        await asyncio.wait_for(
+            runner.run_work_unit(
+                coordinator_run_id="run-1", work_unit=_wu(), child_session_id="c1",
+                spawn_manifest=MagicMock(), cancel_event=ce, root_session_id="r1",
+            ),
+            timeout=5.0,
+        )
+    pub.publish.assert_awaited()  # one terminal published (no escape/hang)
+    payload = envf.make_result_ready.call_args.kwargs["payload"]
+    assert payload.outcome == ResultReadyOutcome.FAILED

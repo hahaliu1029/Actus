@@ -90,5 +90,40 @@ def load_coordinator_limits_from_env() -> CoordinatorLimits:
                 SUBAGENT_RESULT_READY_TIMEOUT_SECONDS,
             )
             continue
+        # [codex PR-4 R5 P1 + R6 P1] Combined finalizer-budget invariant. The
+        # shell child's parent result-ready waiter
+        # (SUBAGENT_RESULT_READY_TIMEOUT_SECONDS = 600s) must fit the inner-invoke
+        # wallclock cap PLUS the THREE serial snapshot-budget phases (PRE scan +
+        # capture + manifest build/upload, each bounded by max_snapshot_seconds)
+        # so the child publishes its terminal BEFORE the parent gives up (§3.2). A
+        # bare ``3*snapshot`` check (R5) was incomplete — the inner invoke ALSO
+        # consumes that window (e.g. wallclock=300 + snapshot=199 → 300+597=897s >
+        # 600). Validate against the EFFECTIVE wallclock cap (an already-parsed
+        # override if present — max_wallclock is earlier in _ENV_MAP — else the
+        # default). Mirrors the max_wallclock_seconds_per_child invariant above.
+        # NOTE: this bounds the snapshot OVERRIDE; an operator who ALSO sets the
+        # wallclock cap near the 600 backstop leaves little finalize room — the
+        # wallclock invariant itself (C2b budget D3) predates this finalize budget
+        # and would need its own headroom tightening to cover that corner.
+        if field == "max_snapshot_seconds":
+            effective_wallclock = overrides.get(
+                "max_wallclock_seconds_per_child",
+                CoordinatorLimits().max_wallclock_seconds_per_child,
+            )
+            if (
+                effective_wallclock + 3 * parsed
+                >= SUBAGENT_RESULT_READY_TIMEOUT_SECONDS
+            ):
+                logger.warning(
+                    "coordinator_limits: %s=%r too large (wallclock %s + 3×%s >= "
+                    "parent waiter backstop %d) — a stalled shell finalize could "
+                    "outlive the parent and publish a late terminal; using default",
+                    key,
+                    raw,
+                    effective_wallclock,
+                    parsed,
+                    SUBAGENT_RESULT_READY_TIMEOUT_SECONDS,
+                )
+                continue
         overrides[field] = parsed
     return CoordinatorLimits(**overrides)

@@ -465,7 +465,16 @@ class ShellService:
         branch ⇒ this scoping is inert in the shipped config; it only matters
         under a non-root reconfig. The double-scan stability guard (Task 4.6) +
         the capture byte-binding (codex R1 P1) remain the complementary checks
-        that catch a survivor which actually WRITES. Own pid is skipped."""
+        that catch a survivor which actually WRITES. Own pid is skipped.
+
+        [codex PR-4 R3 P2 — SUPPORT INVARIANT] This /proc-based survivor check
+        requires the sandbox service to run as ROOT **or** a visible procfs
+        (no ``hidepid=2`` mount). Under ``hidepid=2`` + a non-root service, an
+        uninspectable survivor of our shells would be hidden from ``listdir`` and
+        thus uncheckable here — a THEORETICAL residual fail-open (the double-scan
+        + byte-binding still catch any survivor that writes). Supporting
+        ``hidepid=2`` would require cgroup/descendant tracking instead of /proc
+        walking; out of scope for v1 (the shipped config runs as root)."""
         import os
 
         killed_pgids = killed_pgids or set()
