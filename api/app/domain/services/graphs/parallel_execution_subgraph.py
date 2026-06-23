@@ -419,6 +419,20 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
             work_units = _build_work_units_from_requests(
                 state["work_unit_requests"], step_id_hash16, current_attempt_ix,
             )
+            # [S2 PR-4 flag-flip kill-switch] Capture which units were INTENDED
+            # shell/tree-capable BEFORE the flag-off coercion strips the signal.
+            # On the rehydrate REPLAY path a SUCCESS terminal for such a unit
+            # carries a shell-captured manifest; if the master flag is now OFF
+            # the operator has disabled shell-mode (kill switch), so that captured
+            # manifest MUST NOT be replayed into the apply plan — the terminal
+            # builder demotes it to FAILED. Empty when the flag is ON (coercion is
+            # identity ⇒ nothing to kill). Computed here (pre-coercion) because
+            # _coerce_units_typed_only_if_flag_off erases shell_mode/tree leases.
+            shell_replay_kill_ids: set[str] = set()
+            if not is_coordinator_shell_mode_enabled():
+                shell_replay_kill_ids = {
+                    wu.work_unit_id for wu in work_units if wu.shell_mode
+                }
             # [S2 §3.6 F27] flag-off active fail-closed: coerce shell-mode units
             # to typed-only while the master flag is OFF (PR-3 state). MUST run
             # BEFORE overlap rejection [codex PR-3 R1 P1]: under flag OFF the
@@ -433,6 +447,7 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
             _reject_cross_unit_tree_overlap(work_units)
             return await _rehydrate_dispatch(
                 state, config, existing, candidate_run_id, work_units,
+                shell_replay_kill_ids=shell_replay_kill_ids,
             )
 
     # r2 P2-1 known limitation: if a crash hits BETWEEN bump-commit and the
@@ -610,6 +625,20 @@ async def _first_time_dispatch(
             for lease in wu.write_lease:
                 base_digest = lease.base_digest
                 seed_ref = lease.seed_content_ref
+                if lease.op in ("modify", "delete") and (
+                    base_digest is None or seed_ref is None
+                ):
+                    # [S2 PR-4 §3.2 inv-4] seed enrichment kind invariant:
+                    # modify/delete seed reads must target a REGULAR parent file.
+                    # compute_digest/read_file follow symlinks, so a
+                    # symlinked/special/dir target would mirror the wrong inode
+                    # into the seed. Refuse via check_path (lstat, no follow)
+                    # BEFORE any compute_digest/read_file below.
+                    _enrich_check = await parent_sandbox.check_path(lease.path)
+                    if _enrich_check.kind != "regular":
+                        raise CoordinatorPathContractError(
+                            f"seed target not regular (kind={_enrich_check.kind}): {lease.path!r}"
+                        )
                 if lease.op in ("modify", "delete") and base_digest is None:
                     base_digest = await parent_sandbox.compute_digest(lease.path)
                     if base_digest is None:
@@ -1069,6 +1098,7 @@ async def _build_pre_results_from_terminal(
     *,
     artifact_storage: Any,
     work_units_by_id: "dict[str, WorkUnit]",
+    shell_replay_kill_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> list[WorkerResult]:
     """[C2 PR-7 §12.3 + S2 §3.2 C1] Convert persisted terminal envelopes back
     into WorkerResult.
@@ -1153,6 +1183,32 @@ async def _build_pre_results_from_terminal(
                         "no resolvable patch_manifest]"
                     ).strip()
                     patch_manifest = None
+            # [S2 PR-4 flag-flip kill-switch] If the master shell-mode flag is
+            # now OFF, a SUCCESS terminal for a unit that was INTENDED
+            # shell/tree-capable (captured under flag ON before a restart) must
+            # NOT have its captured manifest replayed into the apply plan: the
+            # operator turned shell-mode off (the kill switch), and the
+            # dispatch-time F27 coercion only guards NEW spawns, not replayed
+            # terminals. Demote to FAILED (fail-closed). ``shell_replay_kill_ids``
+            # is EMPTY when the flag is ON (coercion is identity ⇒ nothing to
+            # kill) and is the set of shell-intended wu_ids (computed PRE-coercion
+            # in dispatch_node, where the signal still survives) when OFF.
+            if (
+                outcome == ResultReadyOutcome.SUCCESS
+                and wu_id in shell_replay_kill_ids
+            ):
+                logger.warning(
+                    "rehydrate: flag-flip kill-switch demoting SUCCESS→FAILED "
+                    "for shell-intended wu=%s — master shell-mode flag is OFF; "
+                    "captured manifest discarded (not replayed into apply plan)",
+                    wu_id,
+                )
+                outcome = ResultReadyOutcome.FAILED
+                summary = (
+                    f"{summary or ''} [demoted: shell-mode flag OFF on "
+                    "rehydrate; captured manifest discarded]"
+                ).strip()
+                patch_manifest = None
             pre_results.append(WorkerResult(
                 work_unit_id=wu_id,
                 child_session_id=record.child_session_id,
@@ -1196,6 +1252,7 @@ async def _rehydrate_dispatch(
     existing: "RehydrateResult",
     coordinator_run_id: str,
     work_units: list[WorkUnit],
+    shell_replay_kill_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> Command:
     """[C2 PR-7 §12] Resume dispatch from a prior coordinator run.
 
@@ -1445,6 +1502,7 @@ async def _rehydrate_dispatch(
         existing.terminal,
         artifact_storage=cfg.get("artifact_storage"),
         work_units_by_id={wu.work_unit_id: wu for wu in work_units},
+        shell_replay_kill_ids=shell_replay_kill_ids,
     )
 
     # Step 8: pre-subscribe waiter group + Send only for truly-pending.
@@ -1468,6 +1526,11 @@ async def _rehydrate_dispatch(
             # [S2 §3.2 R3-F1] mirror the first-time payload so a replayed
             # pending worker is held to the same manifest-required contract.
             "manifest_required": _phase_by_wu_id.get(wu_id) == "write",
+            # [codex PR-4 R1 P0] flag-flip kill-switch — twin of the terminal
+            # path. A pending child that was INTENDED shell/tree-capable, whose
+            # terminal surfaces in worker_node under flag OFF, must have its
+            # captured manifest discarded (demoted to FAILED in worker_node).
+            "shell_replay_kill": wu_id in shell_replay_kill_ids,
         })
         for wu_id in existing.pending
     ]
@@ -1550,6 +1613,16 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
     # sharing the same child_session_id could cross-contaminate the
     # current apply plan.
     manifest_required = bool(state_per_send.get("manifest_required", False))
+    # [codex PR-4 R1 P0] flag-flip kill-switch on the PENDING replay path. The
+    # rehydrate dispatcher sets this True for a wu that was INTENDED shell/tree-
+    # capable while the master flag is now OFF (see dispatch_node). A pending
+    # child whose terminal still surfaces here (mailbox replay of a terminal
+    # published-but-not-DB-persisted before the crash, or a surviving child) must
+    # NOT have its shell-captured manifest applied — the operator turned the kill
+    # switch. Mirrors _build_pre_results_from_terminal's already-terminal guard so
+    # BOTH crash-recovery replay paths are covered. Default False (first-time
+    # dispatch + flag ON ⇒ no kill).
+    shell_replay_kill = bool(state_per_send.get("shell_replay_kill", False))
 
     # [codex PR-2 R4 P0] Fail-closed terminal decode. The waiter matches the
     # terminal on envelope-level fields (type/child/correlation) over a RAW
@@ -1649,6 +1722,23 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
                 summary = (
                     f"{summary or ''} [demoted: write-phase SUCCESS with no "
                     "resolvable patch_manifest]"
+                ).strip()
+                patch_manifest = None
+            # [codex PR-4 R1 P0] flag-flip kill-switch on the PENDING replay
+            # path: a still-SUCCESS shell-intended replay under flag OFF must
+            # NOT carry its captured manifest into the reducer/apply. Demote to
+            # FAILED (fail-closed) — twin of _build_pre_results_from_terminal.
+            if outcome == ResultReadyOutcome.SUCCESS and shell_replay_kill:
+                logger.warning(
+                    "worker_node: flag-flip kill-switch demoting SUCCESS→FAILED "
+                    "for shell-intended wu=%s — master shell-mode flag is OFF; "
+                    "captured manifest discarded (not replayed into apply plan)",
+                    state_per_send["work_unit_id"],
+                )
+                outcome = ResultReadyOutcome.FAILED
+                summary = (
+                    f"{summary or ''} [demoted: shell-mode flag OFF on "
+                    "rehydrate; captured manifest discarded]"
                 ).strip()
                 patch_manifest = None
         else:

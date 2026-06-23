@@ -193,6 +193,7 @@ class ApplyStatus(StrEnum):
     ROLLBACK_PARTIAL = "rollback_partial"
     APPLY_ABORTED = "apply_aborted"
     TARGET_SPECIAL_FILE = "target_special_file"
+    PARENT_NOT_REGULAR = "parent_not_regular"
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,22 @@ class PatchApplier:
                             plan=plan,
                             lineage=lineage,
                         )
+                    # [S2 PR-4 §3.4 R4-H] kind invariant: a modify/delete target
+                    # MUST be a regular file. symlink/directory/other → reject
+                    # (the symlink-following exists() backstop is replaced).
+                    if check.kind != "regular":
+                        return await self._finalize(
+                            audit_id, ApplyStatus.PARENT_NOT_REGULAR,
+                            failed=AppliedFileFailure(
+                                path=e.path,
+                                reason=f"target not regular (kind={check.kind})",
+                            ),
+                            applied=[],
+                            snapshots_to_discard=snapshots,
+                            started_at=started_at,
+                            plan=plan,
+                            lineage=lineage,
+                        )
                     cur = await parent_sandbox.compute_digest(e.path)
                     if cur != e.base_digest:
                         return await self._finalize(
@@ -408,11 +425,31 @@ class PatchApplier:
                     )
                     snapshots.append(snap)
                 elif e.op == "add":
-                    if await parent_sandbox.exists(e.path):
+                    # [S2 PR-4 §3.4 R4-H] kind invariant: an add target MUST be
+                    # missing. check_path (lstat, no symlink follow) replaces the
+                    # symlink-following exists() — a parent-side symlink at the
+                    # target path must NOT be written through. A regular file →
+                    # FILE_EXISTS (existing semantics); any other inode →
+                    # PARENT_NOT_REGULAR.
+                    add_check = await parent_sandbox.check_path(e.path)
+                    if add_check.kind == "regular":
                         return await self._finalize(
                             audit_id, ApplyStatus.FILE_EXISTS,
                             failed=AppliedFileFailure(
                                 path=e.path, reason="exists",
+                            ),
+                            applied=[],
+                            snapshots_to_discard=snapshots,
+                            started_at=started_at,
+                            plan=plan,
+                            lineage=lineage,
+                        )
+                    if add_check.kind != "missing":
+                        return await self._finalize(
+                            audit_id, ApplyStatus.PARENT_NOT_REGULAR,
+                            failed=AppliedFileFailure(
+                                path=e.path,
+                                reason=f"add target not missing (kind={add_check.kind})",
                             ),
                             applied=[],
                             snapshots_to_discard=snapshots,

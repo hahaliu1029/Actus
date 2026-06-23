@@ -67,6 +67,9 @@ from app.application.services.coordinator_child_wallclock_watchdog import (
     start_wallclock_watchdog,
 )
 from app.domain.services.graphs.react_graph import CancelledByEventError
+from app.domain.services.coordinator_shell_mode_flag import (
+    is_coordinator_shell_mode_enabled,
+)
 from app.domain.services.permission.child_scope_violation import (
     ChildScopeViolation,
 )
@@ -77,6 +80,7 @@ if TYPE_CHECKING:
     from app.domain.services.permission.child_permission_context import (
         ChildBudget,
     )
+    from app.domain.external.parent_sandbox import WorkspaceScan, WorkspaceScanEntry
 
 
 logger = logging.getLogger(__name__)
@@ -101,7 +105,95 @@ class _SeedInstallError(Exception):
 
 
 class _OutOfLeaseWriteError(Exception):
-    """[finish-core §5.1.5] A child wrote a path outside its write_lease."""
+    """[finish-core §5.1.5] A child wrote a path outside its write_lease.
+
+    [C2-full S2 §3.4] Carries a structured ``reason`` (one of the §3.4 reject
+    codes) so _finalize_needs_authorization_out_of_lease can surface the SPECIFIC
+    NEEDS_AUTHORIZATION reason on the wire instead of a hard-coded literal, plus
+    an optional ``offending_path`` that feeds the bounded ``rejection_summary``
+    on the envelope (§3.4). The defaults (``out_of_path_lease`` / ``None``)
+    preserve every legacy bare-message raise
+    (``_OutOfLeaseWriteError(str(...))``) — those keep the existing wire reason
+    unchanged and contribute no summary entry."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        reason: str = "out_of_path_lease",
+        offending_path: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.offending_path = offending_path
+
+
+# [C2-full S2 §3.4] EXHAUSTIVE NEEDS_AUTHORIZATION reason vocabulary for
+# snapshot-diff group zero-apply. Mirrored in the spec §3.4 reject table.
+_SNAPSHOT_REJECT_REASONS: frozenset[str] = frozenset(
+    {
+        "out_of_path_lease",
+        "out_of_tree_lease",
+        "special_file",
+        "symlink",
+        "mode_only_change",
+        "indeterminate_kind",
+        "scan_truncated",
+        "tree_add_target_exists",
+        "parent_not_regular",
+    }
+)
+
+# [C2-full S2 §3.4] bound the envelope's rejection_summary (first N offending
+# paths). Group zero-apply raises on the FIRST violation, so in v1 the summary
+# is at most one entry; the cap future-proofs a batch-collect variant.
+_SNAPSHOT_SUMMARY_CAP: int = 20
+
+
+def _snapshot_reject(reason: str, path: str) -> "_OutOfLeaseWriteError":
+    """Build an _OutOfLeaseWriteError tagged with a §3.4 reason code + path.
+
+    The reason is BOTH embedded in the message (so an aborted `pytest.raises(match=)`
+    still reads it) AND carried as the structured ``reason`` attribute, which
+    _finalize_needs_authorization_out_of_lease forwards to
+    NeedsAuthorizationDetails.reason — i.e. the SPECIFIC §3.4 code reaches the wire,
+    not just the exception message. The ``path`` is carried as ``offending_path``
+    so the finalizer can populate the bounded ``rejection_summary`` (§3.4)."""
+    assert reason in _SNAPSHOT_REJECT_REASONS, f"unknown reject reason {reason!r}"
+    return _OutOfLeaseWriteError(
+        f"[{reason}] {path}", reason=reason, offending_path=path,
+    )
+
+
+def _scans_semantically_equal(a: "WorkspaceScan", b: "WorkspaceScan") -> bool:
+    """[§3.2 F23] Sort entries by rel_path and compare the
+    (kind, sha256, size, mode, link_target) tuple per path — NOT a raw JSON/byte
+    compare (which false-positives on dict ordering). truncated is part of the
+    comparison so an aborted re-scan also counts as drift."""
+    if a.truncated != b.truncated:
+        return False
+    ka, kb = sorted(a.entries), sorted(b.entries)
+    if ka != kb:
+        return False
+    for k in ka:
+        ea, eb = a.entries[k], b.entries[k]
+        if (ea.kind, ea.sha256, ea.size, ea.mode, ea.link_target) != (
+            eb.kind, eb.sha256, eb.size, eb.mode, eb.link_target
+        ):
+            return False
+    return True
+
+
+def _op_lease_compatible(diff_op: str, lease_op: str) -> bool:
+    """A diff op is compatible only with an exactly-matching file-lease op."""
+    return diff_op == lease_op
+
+
+def _canon_tree_prefix(prefix: str) -> str:
+    """Canonicalize a tree-lease prefix to its workspace-relative form for
+    tree_contains (PR-3 validate_coordinator_tree_prefix already canonicalized
+    at lease-construction; this re-applies to_workspace_relative defensively)."""
+    return _to_workspace_relative(prefix)
 
 
 def _to_workspace_relative(path: str) -> str:
@@ -196,6 +288,10 @@ class ChildRunResult:
 _NeedsAuthReason = Literal[
     "out_of_tool_allowlist", "out_of_path_lease", "op_mismatch",
     "hard_blocked", "budget_exhausted", "lease_expired", "revision_drift",
+    # [C2-full S2 §3.4] snapshot-diff group zero-apply reject codes.
+    "out_of_tree_lease", "special_file", "symlink", "mode_only_change",
+    "indeterminate_kind", "scan_truncated",
+    "tree_add_target_exists", "parent_not_regular",
 ]
 _SCOPE_DECISION_TO_REASON: Mapping[str, _NeedsAuthReason] = {
     "out_of_tool_allowlist": "out_of_tool_allowlist",
@@ -232,6 +328,9 @@ class CoordinatorChildRunner:
         # [C2b budget D10] Optional CoordinatorMetrics for the budget
         # finalizer's best-effort exhaustion counter (INV-B9).
         coordinator_metrics: Any = None,
+        # [S2 PR-4 §3.6] live snapshot caps; defaults to CoordinatorLimits()
+        # for legacy/unit constructions.
+        snapshot_limits: Any = None,
     ) -> None:
         self._cancel_event = cancel_event
         self._stop_reason: Optional[StopReason] = None
@@ -252,6 +351,13 @@ class CoordinatorChildRunner:
         self._coordinator_run_id = coordinator_run_id
         self._mailbox_subscriber = mailbox_subscriber
         self._budget = budget
+        # [S2 PR-4] snapshot caps for the bounded finalizer; starter overwrites
+        # with the live CoordinatorLimits. Default mirrors CoordinatorLimits.
+        from app.domain.services.coordinator_limits import CoordinatorLimits
+        self._snapshot_limits = snapshot_limits or CoordinatorLimits()
+        # [S2 PR-4 §3.2] PRE-scan captured after seed-install; the bounded
+        # finalizer diffs it against the quiesced POST scan. None until set.
+        self._pre_scan: "Optional[WorkspaceScan]" = None
         self._coordinator_metrics = coordinator_metrics
         # [C2b budget D1/D5] Reference to the child's BudgetEnforcementCallback
         # (attach_budget_callback) so _build_budget_evidence can read
@@ -307,6 +413,14 @@ class CoordinatorChildRunner:
         # placeholder when the runner is built once and reused for replays).
         self._coordinator_run_id = coordinator_run_id
 
+        # [S2 §3.6] Two-level gate: shell-mode runs iff master flag ON AND
+        # the unit carries shell_mode. Computed once; reused for the PRE scan
+        # and the finalize routing so they can never diverge.
+        shell_mode_active = (
+            getattr(work_unit, "shell_mode", False)
+            and is_coordinator_shell_mode_enabled()
+        )
+
         listener = CoordinatorChildCancelListener(
             subscriber=self._mailbox_subscriber,
             root_session_id=root_session_id,
@@ -359,6 +473,39 @@ class CoordinatorChildRunner:
             # CancelledError-during-seed, invoke failure, and natural success.
             try:
                 await self._install_seed(work_unit)
+                # [S2 PR-4 §3.2/§3.6] PRE scan AFTER seed, BEFORE the inner
+                # invoke, only when shell-mode is ACTIVE (flag_on AND
+                # wu.shell_mode — see shell_mode_active above). A scan RPC failure
+                # here is a _SeedInstallError so it routes to _finalize_failed
+                # (terminal envelope published — never escapes run_work_unit).
+                #
+                # [S2 §3.2 finalizer-budget invariant] The PRE scan await is
+                # bounded by ``max_snapshot_seconds`` via asyncio.wait_for — EXACTLY
+                # like the POST scan in _capture_shell_snapshot_diff (Task 4.6).
+                # The sandbox-side ``max_seconds`` only bounds the WALK; a hung /
+                # stalled snapshot RPC would otherwise block on the api side until
+                # the DockerSandbox HTTP client timeout (~600s,
+                # docker_sandbox.py:51), NOT the snapshot budget — violating §3.2's
+                # "ALL finalizer snapshot awaits live inside the bounded budget"
+                # rule. With the guard, a stalled PRE RPC raises
+                # asyncio.TimeoutError, is wrapped into _SeedInstallError below, and
+                # routes to _finalize_failed (terminal FAILED published) instead of
+                # a ~600s hang.
+                if shell_mode_active:
+                    try:
+                        self._pre_scan = await asyncio.wait_for(
+                            self._child_sandbox.snapshot_workspace(
+                                max_paths=self._snapshot_limits.max_snapshot_paths,
+                                max_files=self._snapshot_limits.max_snapshot_files,
+                                max_total_bytes=self._snapshot_limits.max_snapshot_total_bytes,
+                                max_seconds=self._snapshot_limits.max_snapshot_seconds,
+                            ),
+                            timeout=self._snapshot_limits.max_snapshot_seconds,
+                        )
+                    except Exception as scan_exc:  # noqa: BLE001 — incl. asyncio.TimeoutError
+                        raise _SeedInstallError(
+                            f"pre_scan_failed: {scan_exc}"
+                        ) from scan_exc
             except _SeedInstallError as exc:
                 return await self._finalize_failed(
                     coordinator_run_id, work_unit, child_session_id, exc,
@@ -460,6 +607,12 @@ class CoordinatorChildRunner:
             # natural ReAct done — branch by phase (spec §8.3 r13).
             if work_unit.phase == "exploration":
                 return await self._finalize_exploration_proposal(
+                    coordinator_run_id, work_unit, child_session_id, done_event,
+                )
+            # [S2 §3.6] Shell-finalize only when the gate is ACTIVE (flag_on AND
+            # wu.shell_mode). Flag-off ⇒ typed path even if wu.shell_mode leaked.
+            if shell_mode_active:
+                return await self._finalize_success_shell(
                     coordinator_run_id, work_unit, child_session_id, done_event,
                 )
             return await self._finalize_success(
@@ -604,20 +757,71 @@ class CoordinatorChildRunner:
         await self._publish_result_ready(child_id, payload)
         return payload
 
+    async def _finalize_success_shell(
+        self, run_id: str, wu: "WorkUnit", child_id: str, done_event: Any,
+    ) -> ResultReadyPayload:
+        """[S2 PR-4 §3.2] Shell-mode write finalize: capture the PRE/POST
+        snapshot diff (quiesce + stability + lease revalidation), BUILD the
+        SUCCESS RESULT_READY payload (inline-or-by-ref) and publish it. Capture
+        AND build exceptions degrade to NEEDS_AUTHORIZATION
+        (_OutOfLeaseWriteError) or FAILED (scan/quiesce/MinIO-upload), exactly
+        like _finalize_success — NEVER escaping run_work_unit (the outer wrapper
+        is finally-only)."""
+        try:
+            files = await self._capture_shell_snapshot_diff(run_id, wu)
+            patch_manifest = PatchManifest(
+                patch_id=f"{run_id}:{wu.work_unit_id}:p",
+                coordinator_run_id=run_id,
+                work_unit_id=wu.work_unit_id,
+                files=tuple(files),
+            )
+            # [S2 §3.2 C1] BUILD the payload via the PR-2 build-only producer
+            # (NOT an inline ResultReadyPayload(patch_manifest=...)): a shell-diff
+            # manifest can be large, and publishing it inline would lose it to the
+            # 64KB terminal-store truncation → silent zero-apply on rehydrate. The
+            # helper returns an inline payload when small, else UPLOADS the
+            # manifest to MinIO and returns a payload carrying patch_manifest_ref.
+            # It is INSIDE this try because the MinIO upload is a NEW failure
+            # source — an upload failure must route to _finalize_failed (a terminal
+            # envelope), never escape run_work_unit's finally-only wrapper.
+            payload = await self._build_manifest_payload_inline_or_ref(
+                run_id, wu, patch_manifest,
+                summary=f"completed {wu.work_unit_id}",
+            )
+        except _OutOfLeaseWriteError as exc:
+            return await self._finalize_needs_authorization_out_of_lease(
+                run_id, wu, child_id, exc,
+            )
+        except Exception as exc:  # noqa: BLE001 — scan/quiesce/upload → FAILED
+            return await self._finalize_failed(run_id, wu, child_id, exc)
+        # [F2 P0] The single publish is the UNPROTECTED final step — OUTSIDE the
+        # try above so a publish failure is not swallowed + re-published as FAILED
+        # (exactly one publish, never double-handled). The build (incl. upload) is
+        # already done and protected; only the publish remains.
+        await self._publish_result_ready(child_id, payload)
+        return payload
+
     async def _finalize_needs_authorization_out_of_lease(
         self, run_id: str, wu: "WorkUnit", child_id: str,
         exc: "_OutOfLeaseWriteError",
     ) -> ResultReadyPayload:
         """[F2 P0] A write-phase child wrote a path outside its write_lease
         (defensive lease enforcement caught it during patch extraction).
-        Publish a terminal RESULT_READY(NEEDS_AUTHORIZATION) with reason
-        ``out_of_path_lease`` — the same reason the ChildScopeGate would emit
-        for the runtime equivalent (see _SCOPE_DECISION_TO_REASON) — so the
-        reducer/orchestrator treats it like any other out-of-lease grievance
-        instead of seeing the child crash with no envelope."""
+        Publish a terminal RESULT_READY(NEEDS_AUTHORIZATION) carrying the
+        SPECIFIC reject reason (``exc.reason``; default ``out_of_path_lease`` for
+        legacy bare raises) — the §3.4 vocabulary the ChildScopeGate would emit
+        for the runtime equivalent (see _SCOPE_DECISION_TO_REASON) — plus a
+        bounded ``rejection_summary`` (first offending path, §3.4) so the
+        zero-apply is diagnosable on the envelope. The reducer/orchestrator
+        treats it like any other out-of-lease grievance instead of seeing the
+        child crash with no envelope."""
+        summary: tuple[str, ...] = (
+            (exc.offending_path,) if exc.offending_path else ()
+        )
         details = NeedsAuthorizationDetails(
-            reason="out_of_path_lease",
+            reason=exc.reason,
             observed_evidence=str(exc),
+            rejection_summary=summary[:_SNAPSHOT_SUMMARY_CAP],
         )
         payload = ResultReadyPayload(
             summary=f"out-of-lease write: {wu.work_unit_id}",
@@ -960,6 +1164,211 @@ class CoordinatorChildRunner:
                 content_size=len(content),
             ))
         return files
+
+    async def _extract_patch_files_from_snapshot(
+        self, run_id: str, wu: "WorkUnit",
+        pre_scan: "WorkspaceScan", post_scan: "WorkspaceScan",
+    ) -> list[Any]:
+        """[C2-full S2 §3.2/§3.4] Build FilePatchEntry list from a PRE/POST
+        workspace snapshot diff (shell-mode capture). Diff identity tuple =
+        (kind, sha256, size, mode, link_target). ADD-only tree leases; exact
+        file-lease precedence; base_digest = PRE sha256 for modify/delete;
+        parent-side kind-invariant precheck via check_path. ANY violation →
+        _OutOfLeaseWriteError (group zero-apply → NEEDS_AUTHORIZATION)."""
+        from app.domain.models.patch_manifest import FilePatchEntry
+        from app.domain.models.path_validation import (
+            CoordinatorPathContractError,
+            tree_contains,
+            validate_directory_qualified_relative_path,
+        )
+
+        # scan.truncated ⇒ fail-CLOSED (cannot trust an aborted walk).
+        if pre_scan.truncated or post_scan.truncated:
+            raise _snapshot_reject("scan_truncated", "<workspace>")
+
+        # Canonicalize lease keys to workspace-relative for exact match.
+        file_lease_by_path: dict[str, Any] = {}
+        for lease in wu.write_lease:
+            try:
+                file_lease_by_path[_to_workspace_relative(lease.path)] = lease
+            except _OutOfLeaseWriteError:
+                continue
+
+        def _tuple(e: "WorkspaceScanEntry") -> tuple:
+            return (e.kind, e.sha256, e.size, e.mode, e.link_target)
+
+        # Determine diff op per rel_path (union of PRE/POST keys).
+        all_paths = set(pre_scan.entries) | set(post_scan.entries)
+        diffs: list[tuple[str, str, Any, Any]] = []  # (op, rel, pre_entry, post_entry)
+        for rel in sorted(all_paths):
+            pre_e = pre_scan.entries.get(rel)
+            post_e = post_scan.entries.get(rel)
+            if pre_e is None and post_e is not None:
+                diffs.append(("add", rel, None, post_e))
+            elif pre_e is not None and post_e is None:
+                diffs.append(("delete", rel, pre_e, None))
+            elif pre_e is not None and post_e is not None:
+                if _tuple(pre_e) == _tuple(post_e):
+                    continue  # F15 content-identical / no-op
+                # mode-only change (F11): same sha256+kind+size+link, diff mode.
+                if (
+                    pre_e.kind == post_e.kind == "regular"
+                    and pre_e.sha256 == post_e.sha256
+                    and pre_e.size == post_e.size
+                    and pre_e.link_target == post_e.link_target
+                    and pre_e.mode != post_e.mode
+                ):
+                    raise _snapshot_reject("mode_only_change", rel)
+                # kind change (F12). Distinguish symlink (spec §3.4) from the
+                # genuine special-file kinds: a regular→symlink replacement must
+                # report `symlink`, NOT `special_file` — check symlink FIRST so
+                # the symlink-specific branch is reachable before the special
+                # fall-through.
+                if pre_e.kind != post_e.kind:
+                    if "symlink" in {pre_e.kind, post_e.kind}:
+                        raise _snapshot_reject("symlink", rel)
+                    # [codex PR-4 R1 P1] An "other" (indeterminate) inode on
+                    # either side reports the §3.4 `indeterminate_kind` code, NOT
+                    # the special-file fall-through — match the build loop's
+                    # per-entry vocabulary so the wire reason is correct.
+                    if "other" in {pre_e.kind, post_e.kind}:
+                        raise _snapshot_reject("indeterminate_kind", rel)
+                    raise _snapshot_reject("special_file", rel)
+                diffs.append(("modify", rel, pre_e, post_e))
+            # both None impossible (rel came from the union).
+
+        files: list[Any] = []
+        for op, rel, pre_e, post_e in diffs:
+            # Non-regular fail-closed (F8 symlink / F9 special / F10 other).
+            for e in (pre_e, post_e):
+                if e is None:
+                    continue
+                if e.kind == "symlink":
+                    raise _snapshot_reject("symlink", rel)
+                if e.kind in ("fifo", "socket", "block", "char"):
+                    raise _snapshot_reject("special_file", rel)
+                if e.kind == "other":
+                    raise _snapshot_reject("indeterminate_kind", rel)
+                if e.kind != "regular":
+                    raise _snapshot_reject("indeterminate_kind", rel)
+
+            # Path validation (F18 bare top-level).
+            try:
+                canon = validate_directory_qualified_relative_path(
+                    _to_workspace_relative(rel)
+                )
+            except (ValueError, CoordinatorPathContractError):
+                raise _snapshot_reject("out_of_path_lease", rel)
+
+            # Lease matching with precedence: exact file lease wins.
+            exact = file_lease_by_path.get(canon)
+            if exact is not None:
+                if not _op_lease_compatible(op, exact.op):
+                    raise _snapshot_reject("out_of_path_lease", canon)
+                governing_op = exact.op
+            else:
+                # Tree lease only covers op=add.
+                covered = any(
+                    tree_contains(_canon_tree_prefix(tl.prefix), canon)
+                    and "add" in tl.ops
+                    for tl in wu.write_tree_lease
+                )
+                if op == "add" and covered:
+                    governing_op = "add"
+                elif op in ("modify", "delete") and any(
+                    tree_contains(_canon_tree_prefix(tl.prefix), canon)
+                    for tl in wu.write_tree_lease
+                ):
+                    raise _snapshot_reject("out_of_tree_lease", canon)
+                else:
+                    raise _snapshot_reject("out_of_path_lease", canon)
+
+            # Parent-side kind invariant (F22/F25/F26) via check_path (NOT exists).
+            check = await self._parent_sandbox.check_path(canon)
+            if governing_op == "add":
+                if check.kind == "regular":
+                    raise _snapshot_reject("tree_add_target_exists", canon)
+                if check.kind != "missing":
+                    raise _snapshot_reject("parent_not_regular", canon)
+            else:  # modify / delete
+                if check.kind != "regular":
+                    raise _snapshot_reject("parent_not_regular", canon)
+
+            # Build the entry.
+            if governing_op == "delete":
+                files.append(FilePatchEntry(
+                    path=canon, op="delete", base_digest=pre_e.sha256,
+                ))
+                continue
+            content = await self._child_sandbox.read_file(rel)
+            new_digest = hashlib.sha256(content).hexdigest()
+            # [codex PR-4 R1 P1] Bind the captured bytes to the proven-stable POST
+            # scan. quiesce + the double-scan stability check (Task 4.6) prove the
+            # workspace was quiescent AT SCAN TIME, but a detached writer not
+            # reaped by quiesce could rewrite a leased file in the window BETWEEN
+            # the second POST scan and this read — slipping bytes into the manifest
+            # that no stable scan ever witnessed. The scan's sha256/size is that
+            # witness; a mismatch means the workspace was NOT quiescent → raise
+            # RuntimeError (→ _finalize_failed → FAILED), never a silent capture.
+            if post_e is not None and (
+                new_digest != post_e.sha256 or len(content) != post_e.size
+            ):
+                raise RuntimeError(
+                    "workspace not quiescent: "
+                    f"{rel!r} changed between the stable POST scan and the "
+                    f"content read (scan={post_e.sha256}/{post_e.size}, "
+                    f"read={new_digest}/{len(content)})"
+                )
+            content_ref = await self._artifact_storage.put_content_addressed_bytes(
+                prefix=f"coordinator/{run_id}/{wu.work_unit_id}/patch/",
+                content=content,
+            )
+            files.append(FilePatchEntry(
+                path=canon,
+                op=governing_op,
+                base_digest=pre_e.sha256 if governing_op == "modify" else None,
+                new_digest=new_digest,
+                content_ref=content_ref,
+                content_size=len(content),
+            ))
+        return files
+
+    async def _capture_shell_snapshot_diff(
+        self, run_id: str, wu: "WorkUnit",
+    ) -> list[Any]:
+        """[C2-full S2 §3.2] Quiesce shell, take the POST scan + a stability
+        re-scan, confirm semantic equality, then diff PRE vs POST. Bounded by
+        max_snapshot_seconds. Raises _OutOfLeaseWriteError (lease/cap → NEEDS_AUTH)
+        or RuntimeError/Exception (quiesce/scan failure → FAILED). Must run inside
+        the finalize try/except so an escape still publishes a terminal envelope."""
+        limits = self._snapshot_limits
+        scan_kwargs = dict(
+            max_paths=limits.max_snapshot_paths,
+            max_files=limits.max_snapshot_files,
+            max_total_bytes=limits.max_snapshot_total_bytes,
+            max_seconds=limits.max_snapshot_seconds,
+        )
+
+        async def _bounded() -> list[Any]:
+            # (a) quiesce: kill every tracked shell process-group.
+            await self._child_sandbox.kill_all_shell_sessions()
+            # (b) POST scan + (c) stability re-scan.
+            post_a = await self._child_sandbox.snapshot_workspace(**scan_kwargs)
+            post_b = await self._child_sandbox.snapshot_workspace(**scan_kwargs)
+            if not _scans_semantically_equal(post_a, post_b):
+                raise RuntimeError(
+                    "workspace not quiescent: live writer detected on re-scan"
+                )
+            pre = self._pre_scan
+            if pre is None:
+                raise RuntimeError("PRE scan missing; cannot diff shell workspace")
+            return await self._extract_patch_files_from_snapshot(
+                run_id, wu, pre, post_a,
+            )
+
+        return await asyncio.wait_for(
+            _bounded(), timeout=limits.max_snapshot_seconds,
+        )
 
     def _extract_proposed_write_plan(self, done_event: Any) -> ProposedWritePlan:
         """[PR-4 minimal] Returns an empty proposal. PR-6 wires the real

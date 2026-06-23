@@ -628,6 +628,15 @@ class DockerSandbox(Sandbox):
         )
         return ToolResult.from_sandbox(**response.json())
 
+    async def kill_all_shell_sessions(self) -> ToolResult:
+        """杀掉所有被追踪 shell 会话的进程组并校验工作区静默（S2 quiesce）。
+        路由在存在残留写者时返回非 success，from_sandbox 透传给适配层。"""
+        response = await self.client.post(
+            f"{self._base_url}/api/shell/kill-all-sessions",
+            json={},
+        )
+        return ToolResult.from_sandbox(**response.json())
+
     async def delete_file(self, filepath: str) -> ToolResult:
         """传递路径删除指定的文件"""
         response = await self.client.post(

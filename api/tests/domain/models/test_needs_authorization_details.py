@@ -160,8 +160,26 @@ class TestNeedsAuthorizationDetailsInvariants:
             "out_of_tool_allowlist", "out_of_path_lease", "op_mismatch",
             "hard_blocked", "budget_exhausted", "lease_expired", "revision_drift",
             "exploration_proposal",
+            # [C2-full S2 §3.4] snapshot-diff group zero-apply reject codes.
+            "out_of_tree_lease", "special_file", "symlink", "mode_only_change",
+            "indeterminate_kind", "scan_truncated",
+            "tree_add_target_exists", "parent_not_regular",
         ):
             NeedsAuthorizationDetails(reason=r)  # type: ignore[arg-type]
+
+    def test_rejection_summary_defaults_empty_and_roundtrips(self) -> None:
+        # [C2-full S2 §3.4] bounded first-N offending paths on the envelope.
+        d0 = NeedsAuthorizationDetails(reason="out_of_tree_lease")
+        assert d0.rejection_summary == ()
+        d1 = NeedsAuthorizationDetails(
+            reason="out_of_tree_lease",
+            rejection_summary=("pkg/a.py", "pkg/b.py"),
+        )
+        assert d1.rejection_summary == ("pkg/a.py", "pkg/b.py")
+        rehydrated = NeedsAuthorizationDetails.model_validate(
+            d1.model_dump(mode="python")
+        )
+        assert rehydrated.rejection_summary == ("pkg/a.py", "pkg/b.py")
 
 
 class TestWireRoundtrip:

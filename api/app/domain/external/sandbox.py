@@ -131,6 +131,14 @@ class Sandbox(Protocol):
         """
         ...
 
+    async def kill_all_shell_sessions(self) -> ToolResult:
+        """[S2 PR-4 §3.2] os.killpg every tracked shell session's process group
+        so a backgrounded descendant cannot keep writing during the POST scan,
+        then run the §3.2(c) /proc survivor check. ``success == False`` (a
+        survivor still holds the workspace) ⇒ the adapter raises ⇒ finalizer
+        FAILED."""
+        ...
+
     async def upload_file(
         self,
         file_data: BinaryIO,
@@ -299,6 +307,14 @@ class SandboxHandle(Protocol):
         max_seconds: float,
     ) -> ToolResult:
         """S2 §3.1 forwarded RPC (see SANDBOX_FORWARDED_METHODS)."""
+        ...
+
+    async def kill_all_shell_sessions(self) -> ToolResult:
+        """[S2 PR-4 §3.2] os.killpg every tracked shell session's process group
+        so a backgrounded descendant cannot keep writing during the POST scan,
+        then run the §3.2(c) /proc survivor check. ``success == False`` (a
+        survivor still holds the workspace) ⇒ the adapter raises ⇒ finalizer
+        FAILED."""
         ...
 
     async def upload_file(

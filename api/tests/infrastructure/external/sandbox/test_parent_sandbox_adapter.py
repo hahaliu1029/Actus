@@ -225,15 +225,25 @@ async def test_check_path_returns_exists_and_kind(fake_sandbox: MagicMock) -> No
     )
 
 
-async def test_check_path_old_sandbox_no_kind_fails_open(fake_sandbox: MagicMock) -> None:
-    # OLD sandbox image returns no "kind" -> fail-OPEN to a non-special value
-    # so 2a proceeds (degrades to pre-S1b). exists=True -> "other"; absent -> "missing".
+async def test_check_path_old_sandbox_no_kind_maps_existing_to_regular(
+    fake_sandbox: MagicMock,
+) -> None:
+    # [codex PR-4 R2 P1] OLD sandbox image returns no "kind". An existing target
+    # maps to "regular" (pre-S1b bool semantics), NOT "other": PR-4's kind-
+    # invariant guards (dispatch seed-enrichment + PatchApplier preflight) now
+    # fail-CLOSED on any non-"regular" kind, so an "other" default would break
+    # normal typed modify/delete/add on a legacy sandbox. "other" stays reserved
+    # for a NEW sandbox that EXPLICITLY reports an indeterminate inode.
     fake_sandbox.check_file_exists = AsyncMock(return_value=_ok({"exists": True}))
     adapter = ParentSandboxAdapter(fake_sandbox)
-    assert await adapter.check_path("p") == SandboxPathCheck(exists=True, kind="other")
+    assert await adapter.check_path("p") == SandboxPathCheck(
+        exists=True, kind="regular"
+    )
 
     fake_sandbox.check_file_exists = AsyncMock(return_value=_ok({"exists": False}))
-    assert await adapter.check_path("p") == SandboxPathCheck(exists=False, kind="missing")
+    assert await adapter.check_path("p") == SandboxPathCheck(
+        exists=False, kind="missing"
+    )
 
 
 async def test_check_path_raises_on_rpc_failure(fake_sandbox: MagicMock) -> None:
@@ -770,3 +780,29 @@ async def test_snapshot_workspace_valid_regular_and_symlink_decode(
         rel_path="workspace/link", kind="symlink", sha256=None,
         size=7, mode=41471, link_target="../t.py",
     )
+
+
+# ── S2 PR-4 Task 4.11 — kill_all_shell_sessions (quiesce) ──
+# ``pytestmark`` / ``anyio_backend`` / AsyncMock+MagicMock imports already
+# declared at module top; only the two new tests are appended here.
+
+
+async def test_kill_all_shell_sessions_forwards_to_handle() -> None:
+    handle = MagicMock()
+    handle.kill_all_shell_sessions = AsyncMock(
+        return_value=MagicMock(success=True, message="ok")
+    )
+    adapter = ParentSandboxAdapter(handle)
+    result = await adapter.kill_all_shell_sessions()
+    assert result is None  # void best-effort surface
+    handle.kill_all_shell_sessions.assert_awaited_once_with()
+
+
+async def test_kill_all_shell_sessions_raises_on_rpc_failure() -> None:
+    handle = MagicMock()
+    handle.kill_all_shell_sessions = AsyncMock(
+        return_value=MagicMock(success=False, message="boom")
+    )
+    adapter = ParentSandboxAdapter(handle)
+    with pytest.raises(OSError, match="kill_all_shell_sessions"):
+        await adapter.kill_all_shell_sessions()

@@ -27,6 +27,12 @@ class CoordinatorLimits:
     max_total_wallclock_seconds_per_run: int = 900
     max_concurrent_coordinator_runs_per_user: int = 2
     max_coordinator_token_cost_usd_per_user_per_day: float = 50.00
+    # [C2-full S2 §3.6] snapshot-diff caps — bound the per-child workspace walk
+    # (PR-1 walk + PR-4 bounded finalizer). Each >0-validated like every other cap.
+    max_snapshot_paths: int = 20000
+    max_snapshot_files: int = 8000
+    max_snapshot_total_bytes: int = 100 * 1024 * 1024
+    max_snapshot_seconds: float = 30.0
 
 
 _ENV_MAP: dict[str, tuple[str, type]] = {
@@ -38,6 +44,11 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "ACTUS_COORDINATOR_MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN": ("max_total_wallclock_seconds_per_run", int),
     "ACTUS_COORDINATOR_MAX_CONCURRENT_RUNS_PER_USER": ("max_concurrent_coordinator_runs_per_user", int),
     "ACTUS_COORDINATOR_MAX_TOKEN_COST_USD_PER_USER_PER_DAY": ("max_coordinator_token_cost_usd_per_user_per_day", float),
+    # [C2-full S2 §3.6] snapshot-diff caps
+    "ACTUS_COORDINATOR_MAX_SNAPSHOT_PATHS": ("max_snapshot_paths", int),
+    "ACTUS_COORDINATOR_MAX_SNAPSHOT_FILES": ("max_snapshot_files", int),
+    "ACTUS_COORDINATOR_MAX_SNAPSHOT_TOTAL_BYTES": ("max_snapshot_total_bytes", int),
+    "ACTUS_COORDINATOR_MAX_SNAPSHOT_SECONDS": ("max_snapshot_seconds", float),
 }
 
 def load_coordinator_limits_from_env() -> CoordinatorLimits:

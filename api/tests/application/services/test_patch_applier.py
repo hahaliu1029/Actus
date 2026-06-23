@@ -25,7 +25,7 @@ from app.application.services.patch_applier import (
     PatchApplier,
 )
 from app.application.services.rollback_snapshot_store import FileSnapshot
-from app.domain.external.parent_sandbox import SandboxPathCheck
+from app.domain.external.parent_sandbox import SandboxPathCheck, WorkspaceScan
 from app.domain.models.event import HealthEvent, HealthStatus
 from app.domain.models.patch_apply_plan import PatchApplyPlan
 from app.domain.models.patch_manifest import FilePatchEntry
@@ -76,7 +76,27 @@ def parent_sandbox() -> MagicMock:
     s.read_file = AsyncMock(return_value=b"original")
     s.atomic_write_file = AsyncMock()
     s.delete_file = AsyncMock()
+    # [S2 PR-4] snapshot + quiesce surface (empty scan default; tests override)
+    s.snapshot_workspace = AsyncMock(
+        return_value=WorkspaceScan(entries={}, truncated=False)
+    )
+    s.kill_all_shell_sessions = AsyncMock(return_value=None)
     return s
+
+
+def test_parent_sandbox_fixture_has_snapshot_and_quiesce(parent_sandbox) -> None:
+    # [S2 PR-4 §9] every shared sandbox mock must EXPLICITLY wire the new surface
+    # or downstream finalize/applier tests get a silent auto-child-mock (whose
+    # return_value is NOT a WorkspaceScan) mid-run. NOTE: a bare `hasattr` is
+    # useless here — `parent_sandbox` is a `MagicMock`, so `hasattr(m, "x")`
+    # auto-creates a child mock and returns True for ANYTHING. Assert the attrs
+    # were explicitly SET on the mock (present in `__dict__`) and that
+    # snapshot_workspace is a real AsyncMock returning a real WorkspaceScan.
+    assert "snapshot_workspace" in parent_sandbox.__dict__
+    assert "kill_all_shell_sessions" in parent_sandbox.__dict__
+    assert isinstance(parent_sandbox.snapshot_workspace, AsyncMock)
+    scan = parent_sandbox.snapshot_workspace.return_value
+    assert isinstance(scan, WorkspaceScan)
 
 
 @pytest.fixture
@@ -211,7 +231,9 @@ async def test_add_happy_path(
     ``compute_digest`` is called exactly ONCE — the post-write verify.
     Override the fixture's two-item side_effect to a single
     post-write digest value that matches the manifest's new_digest."""
-    parent_sandbox.exists = AsyncMock(return_value=False)
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=False, kind="missing")
+    )
     parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)
     plan = _add_plan()
     out = await applier.apply(
@@ -557,12 +579,13 @@ async def test_add_then_failure_rollback_deletes_added_file(
     previous version walked only ``snapshots`` and never undid add ops,
     leaving 'a.py' behind on rollback — a direct violation of the
     all-or-nothing apply contract."""
-    # add 'a.py' doesn't exist (preflight via exists()); modify 'b.py'
-    # exists (preflight now via check_path()).
-    parent_sandbox.exists = AsyncMock(return_value=False)          # a.py add
-    parent_sandbox.check_path = AsyncMock(
-        return_value=SandboxPathCheck(exists=True, kind="regular")  # b.py modify
-    )
+    # add a.py ⇒ parent missing; modify b.py ⇒ parent regular. The add branch
+    # now probes check_path too, so a single return_value would FILE_EXISTS the add.
+    def _check(path: str) -> SandboxPathCheck:
+        if path == "d/a.py":
+            return SandboxPathCheck(exists=False, kind="missing")
+        return SandboxPathCheck(exists=True, kind="regular")  # d/b.py modify
+    parent_sandbox.check_path = AsyncMock(side_effect=_check)
     # compute_digest: b.py preflight = _SHA_A; a.py post-write = _NEW_DIGEST
     parent_sandbox.compute_digest = AsyncMock(
         side_effect=[_SHA_A, _NEW_DIGEST],
@@ -630,12 +653,13 @@ async def test_toctou_refused_write_rolls_back_prior_entry(
     is SET is proven separately by test_atomic_write_file_sets_refuse_special_true.)"""
     import errno
 
-    # a.py add -> exists()=False (add branch keeps exists()); b.py modify ->
-    # check_path regular (switched branch).
-    parent_sandbox.exists = AsyncMock(return_value=False)
-    parent_sandbox.check_path = AsyncMock(
-        return_value=SandboxPathCheck(exists=True, kind="regular")
-    )
+    # a.py add ⇒ parent missing; b.py modify ⇒ parent regular. The add branch
+    # now probes check_path too, so a single return_value would FILE_EXISTS the add.
+    def _check(path: str) -> SandboxPathCheck:
+        if path == "d/a.py":
+            return SandboxPathCheck(exists=False, kind="missing")  # a.py add
+        return SandboxPathCheck(exists=True, kind="regular")       # d/b.py modify
+    parent_sandbox.check_path = AsyncMock(side_effect=_check)
     # compute_digest order: b.py modify preflight (=_SHA_A, matches base_digest)
     # then a.py post-write verify (=_NEW_DIGEST). (Same as the fixture default.)
     parent_sandbox.compute_digest = AsyncMock(side_effect=[_SHA_A, _NEW_DIGEST])
@@ -880,30 +904,39 @@ async def test_modify_over_special_target_rejected_before_read(
     parent_sandbox.atomic_write_file.assert_not_called()
 
 
-async def test_add_over_special_target_is_file_exists_never_writes(
+async def test_add_over_regular_target_is_file_exists_via_check_path(
     applier: PatchApplier,
     parent_sandbox: MagicMock,
     minio: MagicMock,
 ) -> None:
-    """add over an existing target -> FILE_EXISTS via exists() (unchanged).
-    `add` never consults check_path, so special-vs-regular is identical on
-    this path — pin FILE_EXISTS + no write."""
-    parent_sandbox.exists = AsyncMock(return_value=True)
+    """[S2 PR-4 R4-H] The add branch now keys on ``check_path()`` (lstat, no
+    symlink follow), NOT the symlink-following ``exists()``. An existing REGULAR
+    target → FILE_EXISTS + no write. (An existing symlink/special/dir target →
+    PARENT_NOT_REGULAR — covered by ``test_add_target_is_symlink_in_parent_rejected``.)
+    Pin that ``check_path`` IS consulted and the dead ``exists()`` path is no
+    longer relied on."""
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")
+    )
+    parent_sandbox.exists = AsyncMock(return_value=False)  # dead path — must be ignored
     out = await applier.apply(
         _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
     )
     assert out.status is ApplyStatus.FILE_EXISTS
+    parent_sandbox.check_path.assert_awaited_once_with("d/new.py")
+    parent_sandbox.exists.assert_not_called()  # add no longer consults exists()
     parent_sandbox.atomic_write_file.assert_not_called()
 
 
-async def test_symlink_to_nonregular_is_write_io_error_not_special(
+async def test_symlink_modify_target_is_parent_not_regular(
     applier: PatchApplier,
     parent_sandbox: MagicMock,
     minio: MagicMock,
 ) -> None:
-    """2a keys on the DIRECT lstat inode: a symlink target is kind="symlink"
-    (not special), proceeds to compute_digest which 500s on a non-regular
-    referent -> WRITE_IO_ERROR, explicitly NOT TARGET_SPECIAL_FILE."""
+    """[S2 PR-4 R4-H] 2a keys on the DIRECT lstat inode: a symlink modify
+    target is kind="symlink" → rejected at the kind invariant BEFORE any
+    digest read. No fall-open to compute_digest / WRITE_IO_ERROR; status is
+    PARENT_NOT_REGULAR, explicitly NOT TARGET_SPECIAL_FILE."""
     parent_sandbox.check_path = AsyncMock(
         return_value=SandboxPathCheck(exists=True, kind="symlink")
     )
@@ -912,28 +945,35 @@ async def test_symlink_to_nonregular_is_write_io_error_not_special(
         _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
     )
     parent_sandbox.check_path.assert_awaited_once_with("d/x.py")
-    parent_sandbox.exists.assert_not_called()  # modify branch switched off exists()
-    parent_sandbox.compute_digest.assert_awaited()
-    assert out.status is ApplyStatus.WRITE_IO_ERROR
+    # [S2 PR-4 R4-H] modify target MUST be regular; a symlink is rejected at
+    # the kind invariant BEFORE any digest read — no fall-open to WRITE_IO_ERROR.
+    parent_sandbox.compute_digest.assert_not_awaited()
+    parent_sandbox.atomic_write_file.assert_not_called()
+    assert out.status is ApplyStatus.PARENT_NOT_REGULAR
     assert out.status is not ApplyStatus.TARGET_SPECIAL_FILE
 
 
-async def test_applier_fail_open_kind_other_proceeds(
+async def test_modify_kind_other_is_parent_not_regular(
     applier: PatchApplier,
     parent_sandbox: MagicMock,
     minio: MagicMock,
 ) -> None:
-    """Mixed-version fail-OPEN at the applier: kind="other" (old sandbox /
-    soft lstat failure) is NOT TARGET_SPECIAL_FILE; compute_digest IS awaited
-    (flow proceeds to the existing digest/snapshot path)."""
+    """[S2 PR-4 R4-H] the modify/delete branch no longer falls OPEN on a
+    non-regular kind: kind="other" (old sandbox / soft lstat failure) is now a
+    hard PARENT_NOT_REGULAR reject, NOT TARGET_SPECIAL_FILE, with no digest
+    read."""
     parent_sandbox.check_path = AsyncMock(
         return_value=SandboxPathCheck(exists=True, kind="other")
     )
     out = await applier.apply(
         _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
     )
+    # [S2 PR-4 R4-H] the modify/delete branch no longer falls OPEN on a
+    # non-regular kind — `other` is now a hard PARENT_NOT_REGULAR reject, no
+    # digest read.
+    assert out.status is ApplyStatus.PARENT_NOT_REGULAR
     assert out.status is not ApplyStatus.TARGET_SPECIAL_FILE
-    parent_sandbox.compute_digest.assert_awaited()
+    parent_sandbox.compute_digest.assert_not_awaited()
 
 
 async def test_delete_no_apply_step_inode_guard_d9_off(
@@ -972,3 +1012,56 @@ def test_target_special_file_status_value_and_length():
     FE string pass-through."""
     assert ApplyStatus.TARGET_SPECIAL_FILE.value == "target_special_file"
     assert len(ApplyStatus.TARGET_SPECIAL_FILE.value) <= 32
+
+
+def test_parent_not_regular_status_value_and_length():
+    assert ApplyStatus.PARENT_NOT_REGULAR.value == "parent_not_regular"
+    assert len(ApplyStatus.PARENT_NOT_REGULAR.value) <= 32
+
+
+async def test_add_target_is_symlink_in_parent_rejected(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    # add target appears as a symlink in the parent → must NOT be written
+    # through. check_path (lstat) sees kind="symlink"; the add branch now
+    # probes check_path (not the symlink-following exists()) and rejects.
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="symlink")
+    )
+    out = await applier.apply(
+        _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status == ApplyStatus.PARENT_NOT_REGULAR
+    parent_sandbox.atomic_write_file.assert_not_called()
+
+
+async def test_add_target_missing_in_parent_ok(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=False, kind="missing")
+    )
+    parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)  # post-write
+    out = await applier.apply(
+        _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status == ApplyStatus.SUCCESS
+
+
+async def test_modify_target_is_directory_in_parent_rejected(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="directory")
+    )
+    out = await applier.apply(
+        _modify_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+    assert out.status == ApplyStatus.PARENT_NOT_REGULAR
+    parent_sandbox.compute_digest.assert_not_awaited()

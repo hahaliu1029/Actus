@@ -46,6 +46,8 @@ SANDBOX_FORWARDED_METHODS: frozenset[str] = frozenset(
         "ensure_sandbox",
         "get_browser",
         "snapshot_workspace",
+        # [S2 PR-4 §3.2] shell quiesce before the POST snapshot scan.
+        "kill_all_shell_sessions",
     }
 )
 

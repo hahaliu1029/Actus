@@ -310,6 +310,7 @@ class DefaultCoordinatorChildRunnerStarter:
                 mailbox_subscriber=self._mailbox_subscriber,
                 budget=budget,                                   # [C2b budget D2/A2]
                 coordinator_metrics=self._coordinator_metrics,   # [C2b budget D10]
+                snapshot_limits=self._coordinator_limits,        # [S2 PR-4 §3.6]
             )
             # 7b. [C2b budget D1/§3-6] Late-inject the token budget callback.
             # Constructed only NOW: its ctor needs the CoordinatorChildRunner,
@@ -385,6 +386,7 @@ class DefaultCoordinatorChildRunnerStarter:
                     parent_session_id=parent_session_id,
                     coordinator_run_id=coordinator_run_id,
                     mailbox_subscriber=self._mailbox_subscriber,
+                    snapshot_limits=self._coordinator_limits,    # [S2 PR-4 §3.6]
                 )
                 await failure_publisher._finalize_failed(
                     coordinator_run_id, work_unit, child_session_id, exc,

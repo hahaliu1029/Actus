@@ -60,6 +60,11 @@ class _FakeCoordinatorLimits:
     max_tool_calls_per_child: int = 100
     max_token_cost_usd_per_child: float = 2.0
     max_wallclock_seconds_per_child: int = 600
+    # [S2 PR-4 §3.6] snapshot caps
+    max_snapshot_paths: int = 20000
+    max_snapshot_files: int = 8000
+    max_snapshot_total_bytes: int = 100 * 1024 * 1024
+    max_snapshot_seconds: float = 30.0
 
 
 def _manifest_bytes() -> bytes:
@@ -1030,3 +1035,31 @@ def test_serialize_spawn_manifest_emits_s2_keys():
     data = json.loads(_serialize_spawn_manifest(wu))
     assert data["shell_mode"] is True
     assert data["write_tree_lease"] == [{"prefix": "workspace", "ops": ["add"]}]
+
+
+async def test_starter_passes_snapshot_limits_to_runner(monkeypatch):
+    import app.application.services.coordinator_child_runner_starter as starter_mod
+
+    captured = {}
+
+    class _FakeChildRunner:
+        def __init__(self, **kwargs):
+            captured["ctor"] = kwargs
+
+        def attach_budget_callback(self, cb):  # noqa: D401
+            pass
+
+        async def run_work_unit(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(starter_mod, "CoordinatorChildRunner", _FakeChildRunner)
+    starter = _make_starter()
+    await starter.start(
+        coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1", spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(), root_session_id="root-1",
+        parent_session_id="parent-1", parent_sandbox=MagicMock(), user_id="user-1",
+    )
+    sl = captured["ctor"]["snapshot_limits"]
+    assert sl.max_snapshot_paths == 20000
+    assert sl.max_snapshot_seconds == 30.0

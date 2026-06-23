@@ -7,6 +7,7 @@ import logging
 import os.path
 import pty
 import re
+import signal
 import socket
 import struct
 import termios
@@ -32,6 +33,12 @@ from app.models.shell import (
 )
 
 logger = logging.getLogger(__name__)
+
+# [S2 PR-4 §3.2(c)] quiesce survivor-check roots — module-level so tests can
+# point them at a fake /proc tree. /home/ubuntu is the workspace root (same
+# anchor as workspace.py / the snapshot scan).
+_QUIESCE_WORKSPACE_ROOT = "/home/ubuntu"
+_QUIESCE_PROC_ROOT = "/proc"
 
 
 @dataclass
@@ -387,6 +394,159 @@ class ShellService:
         display_dir = self._get_display_path(exec_dir)
         return f"{username}@{hostname}:{display_dir} $"
 
+    async def kill_all_shell_sessions(self) -> bool:
+        """[S2 PR-4 §3.2] Quiesce. (1) os.killpg(SIGKILL) every tracked session's
+        process group so a backgrounded descendant cannot keep writing during the
+        POST snapshot scan (both active_shells + pty_shells spawn with
+        start_new_session=True ⇒ pgid == pid). (2) §3.2(c) survivor check: scan
+        /proc for any remaining process whose cwd or an open fd resolves UNDER the
+        workspace root — such a process holds the workspace even if momentarily
+        not writing (the double-scan stability guard alone can miss it). Returns
+        ``True`` if clean (no survivor), ``False`` otherwise. Best-effort on
+        /proc read errors (missing/raced entries skipped) so quiesce never raises
+        mid-finalize; the double-scan stability guard in Task 4.6 remains the
+        second, complementary check.
+
+        [codex PR-4 R2 P1] The pgids we attempt to kill are collected and handed
+        to the survivor check so an UNREADABLE survivor of OUR shell groups
+        (e.g. a sudo-spawned root-owned descendant a non-root service cannot
+        ptrace) fails CLOSED, while an unreadable UNRELATED process (a root-owned
+        system process under a non-root service) is not mistaken for a survivor
+        (which would false-fail every capture). The default sandbox service runs
+        as root (no ``USER`` in the Dockerfile) so every /proc entry is readable
+        and this scoping is inert; it only matters under a non-root reconfig."""
+        import os
+        import signal
+
+        # (1) kill the tracked groups, remembering each pgid for the scoped
+        # survivor check below.
+        killed_pgids: set[int] = set()
+        for session in list(self.active_shells.values()) + list(
+            self.pty_shells.values()
+        ):
+            proc = getattr(session, "process", None)
+            pid = getattr(proc, "pid", None)
+            if pid is None:
+                continue
+            try:
+                pgid = os.getpgid(pid)
+            except (ProcessLookupError, OSError):
+                continue
+            killed_pgids.add(pgid)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                continue
+
+        # (2) §3.2(c) bounded best-effort /proc survivor check.
+        return self._workspace_quiescent(killed_pgids)
+
+    def _workspace_quiescent(self, killed_pgids: "set[int] | None" = None) -> bool:
+        """Return False if ANY /proc descendant has a cwd or open fd resolving
+        under the workspace root, OR if a descendant THAT IS A SURVIVOR OF OUR
+        KILLED SHELL GROUPS cannot be inspected so its quiescence cannot be
+        confirmed — §3.2 fail-closed, SCOPED.
+
+        [codex PR-4 R2 P1] Error-class handling:
+        - a /proc entry that DISAPPEARED between listdir and readlink (process
+          died) raises ``FileNotFoundError`` — genuinely no survivor, skip it;
+        - an UNREADABLE entry (``PermissionError`` etc. — e.g. a sudo-spawned
+          root-owned descendant a non-root service cannot ptrace) is failed
+          CLOSED **only if its process group is one we just killed**
+          (``pgid in killed_pgids``) — i.e. a real survivor of OUR shells we
+          cannot inspect. An unreadable UNRELATED process (a root-owned system
+          process under a non-root service) is SKIPPED, not failed — otherwise
+          every capture would false-fail. The pgid is read from the
+          world-readable ``/proc/<pid>/stat`` (no ptrace needed), so the scope
+          decision works even when cwd/fd are unreadable.
+
+        The default sandbox service runs as ROOT (no ``USER`` in the Dockerfile)
+        ⇒ every /proc entry is readable ⇒ no entry ever hits the unreadable
+        branch ⇒ this scoping is inert in the shipped config; it only matters
+        under a non-root reconfig. The double-scan stability guard (Task 4.6) +
+        the capture byte-binding (codex R1 P1) remain the complementary checks
+        that catch a survivor which actually WRITES. Own pid is skipped."""
+        import os
+
+        killed_pgids = killed_pgids or set()
+        root = os.path.realpath(_QUIESCE_WORKSPACE_ROOT)
+
+        def _link_under_root(link: str) -> bool:
+            # ``os.readlink`` on a /proc magic symlink returns the kernel-resolved
+            # target. FileNotFoundError → link/pid vanished (not a survivor).
+            # PermissionError / other OSError → cannot inspect → propagate so the
+            # caller decides (scoped fail-close). We readlink (not realpath(strict))
+            # so a survivor holding a since-deleted cwd is not mistaken for "gone".
+            target = os.readlink(link)
+            real = os.path.realpath(target)
+            return real == root or real.startswith(root + os.sep)
+
+        def _pgid_of(proc_base: str) -> "int | None":
+            # /proc/<pid>/stat field 5 (pgrp) — world-readable, no ptrace. comm
+            # (field 2) may contain spaces/parens, so split AFTER the last ')'.
+            try:
+                with open(os.path.join(proc_base, "stat"), "r") as fh:
+                    stat_line = fh.read()
+            except OSError:
+                return None
+            try:
+                after_comm = stat_line.rpartition(")")[2].split()
+                # after_comm[0]=state, [1]=ppid, [2]=pgrp
+                return int(after_comm[2])
+            except (IndexError, ValueError):
+                return None
+
+        try:
+            entries = os.listdir(_QUIESCE_PROC_ROOT)
+        except OSError:
+            # No /proc → cannot verify; treat as NOT clean (fail-closed, §3.2).
+            return False
+
+        my_pid = os.getpid()
+        for name in entries:
+            if not name.isdigit():
+                continue
+            if int(name) == my_pid:
+                continue
+            base = os.path.join(_QUIESCE_PROC_ROOT, name)
+            # Is this process a survivor of one of OUR killed shell groups?
+            _ours = _pgid_of(base) in killed_pgids if killed_pgids else False
+
+            def _check(link: str) -> "bool | None":
+                # True: survivor under root. False: not under root. None: caller
+                # must decide (unreadable). FileNotFoundError → gone (False).
+                try:
+                    return _link_under_root(link)
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return None
+
+            # cwd
+            cwd_res = _check(os.path.join(base, "cwd"))
+            if cwd_res is True:
+                return False
+            if cwd_res is None and _ours:
+                return False  # OUR survivor, uninspectable → fail-closed
+
+            # open fds
+            fd_dir = os.path.join(base, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except FileNotFoundError:
+                continue  # process gone — skip
+            except OSError:
+                if _ours:
+                    return False  # OUR survivor, fd dir uninspectable → fail-closed
+                continue  # unrelated unreadable process — skip (no false-fail)
+            for fd in fds:
+                fd_res = _check(os.path.join(fd_dir, fd))
+                if fd_res is True:
+                    return False
+                if fd_res is None and _ours:
+                    return False
+        return True
+
     @classmethod
     async def _create_process(
         cls, exec_dir: str, command: str
@@ -405,6 +565,10 @@ class ShellService:
             stderr=asyncio.subprocess.STDOUT,  # 将标准错误重定向到标准输出流
             stdin=asyncio.subprocess.PIPE,  # 创建管道以允许标准输入
             limit=1024 * 1024,  # 设置缓冲区大小并限制为1MB
+            # [S2 PR-4 §3.2] own session/process group so quiesce can killpg
+            # the whole group (backgrounded descendants included) — mirrors the
+            # PTY path's start_new_session=True at :265.
+            start_new_session=True,
         )
 
     async def _start_output_reader(

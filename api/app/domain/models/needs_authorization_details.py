@@ -55,7 +55,8 @@ class NeedsAuthorizationDetails(BaseModel):
     """Structured grievance from a coordinator child that stopped before
     producing a PatchManifest.
 
-    ``reason`` is a closed Literal set; any expansion is an explicit wire-schema
+    ``reason`` is a closed Literal set (now including the §3.4 snapshot-diff
+    group zero-apply reject codes); any expansion is an explicit wire-schema
     change tracked by ``TestNeedsAuthorizationDetailsInvariants
     .test_all_reason_values_accepted``.
 
@@ -75,10 +76,27 @@ class NeedsAuthorizationDetails(BaseModel):
         "lease_expired",
         "revision_drift",
         "exploration_proposal",
+        # [C2-full S2 §3.4] snapshot-diff group zero-apply reject codes — an
+        # EXPLICIT wire-schema expansion of the closed Literal (the docstring
+        # contract). Mirrored in the runner's _SNAPSHOT_REJECT_REASONS (Task 4.3)
+        # and pinned by test_all_reason_values_accepted.
+        "out_of_tree_lease",
+        "special_file",
+        "symlink",
+        "mode_only_change",
+        "indeterminate_kind",
+        "scan_truncated",
+        "tree_add_target_exists",
+        "parent_not_regular",
     ]
     requested_tool: Optional[str] = None
     requested_paths: tuple[str, ...] = ()
     observed_evidence: Optional[str] = None
+    # [C2-full S2 §3.4] bounded first-N offending paths for a group zero-apply,
+    # so a snapshot reject is diagnosable on the envelope without an apply-audit
+    # row. Empty for non-snapshot grievances. Bounded by the populating site
+    # (differ/finalizer pass at most N — see Task 4.4/4.6 _SNAPSHOT_SUMMARY_CAP).
+    rejection_summary: tuple[str, ...] = ()
     proposed_write_plan: Optional[ProposedWritePlan] = None
     known_digests: dict[str, str] = Field(default_factory=dict)
 

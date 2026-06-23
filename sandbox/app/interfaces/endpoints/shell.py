@@ -165,6 +165,29 @@ async def resize_shell(
     )
 
 
+@router.post(path="/kill-all-sessions", response_model=Response[dict])
+async def kill_all_sessions(
+    shell_service: ShellService = Depends(get_shell_service),
+) -> Response[dict]:
+    """杀掉所有被追踪 shell 会话的进程组，并校验工作区无残留写者。"""
+    clean = await shell_service.kill_all_shell_sessions()
+    if not clean:
+        # [§3.2(c)] a survivor's cwd/open-fd is still under the workspace root —
+        # NOT quiescent. Surface as a non-success ToolResult so the api adapter
+        # raises and the bounded finalizer routes to FAILED (no manifest).
+        # NOTE: the repo's ``Response`` helper exposes ``fail(code, msg, data)``
+        # (not ``error``); a code >= 300 makes ``ToolResult.from_sandbox`` decode
+        # ``success=False`` (the only contract the api adapter relies on).
+        return Response.fail(
+            code=500,
+            msg="工作区仍有残留进程持有 cwd/fd，未达到静默",
+            data={"clean": False},
+        )
+    return Response.success(
+        msg="所有 shell 会话进程组已终止", data={"clean": True}
+    )
+
+
 @router.websocket(path="/ws")
 async def shell_websocket(
     websocket: WebSocket,

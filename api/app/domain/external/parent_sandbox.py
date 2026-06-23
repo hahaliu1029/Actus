@@ -125,6 +125,10 @@ class ParentSandboxPort(Protocol):
       as of S1**: deleting an already-absent file is success
       (terminal-absent) — the live RPC uses ``os.remove`` catching
       ENOENT; other OSError still surface.
+    - ``kill_all_shell_sessions()`` quiesces every tracked shell
+      session's process group before the POST snapshot scan —
+      best-effort sandbox-side, raises ``OSError`` on RPC failure
+      (§3.2).
 
     Failure modes for ``read_file`` / ``atomic_write_file`` /
     ``delete_file`` are intentionally NOT specified at the Protocol level
@@ -138,6 +142,7 @@ class ParentSandboxPort(Protocol):
     async def read_file(self, path: str) -> bytes: ...
     async def atomic_write_file(self, path: str, content: bytes) -> None: ...
     async def delete_file(self, path: str) -> None: ...
+    async def kill_all_shell_sessions(self) -> None: ...
     async def snapshot_workspace(
         self,
         root: str = "/home/ubuntu",

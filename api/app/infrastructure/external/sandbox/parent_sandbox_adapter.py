@@ -214,13 +214,20 @@ class ParentSandboxAdapter(ParentSandboxPort):
     async def check_path(self, path: str) -> SandboxPathCheck:
         """Inode-typed existence probe (S1b 2a).
 
-        Parses ``{exists, kind}`` from the sandbox ``check_file_exists``
-        RPC. **Mixed-version fail-OPEN**: an OLD sandbox image returns no
-        ``kind`` → default to a NON-special value (``"missing"`` when
-        absent, else ``"other"``) so 2a proceeds (pre-S1b behavior). A
-        fail-CLOSED default would treat every regular target as special
-        and break all applies. Raises ``OSError`` on RPC failure, matching
-        ``exists()``.
+        Parses ``{exists, kind}`` from the sandbox ``check_file_exists`` RPC.
+        **Mixed-version legacy fallback**: an OLD sandbox image returns no
+        ``kind``. Map a kindless EXISTING target to ``"regular"`` (NOT
+        ``"other"``): pre-S1b behavior was ``exists()``-based and treated every
+        existing target as a regular file, and PR-4's kind-invariant guards
+        (dispatch seed-enrichment + ``PatchApplier`` preflight) now fail-CLOSED
+        on any non-``"regular"`` kind — so an ``"other"`` default would break
+        normal typed modify/delete/add on an old sandbox (the very
+        "break all applies" regression this fallback exists to avoid).
+        ``"other"`` stays reserved for a NEW sandbox that EXPLICITLY reports an
+        indeterminate inode → correctly fail-closed. (Shell-mode capture needs a
+        NEW sandbox — ``snapshot_workspace`` is a new RPC — so this legacy
+        regular-fallback never weakens shell-capture protection.) Raises
+        ``OSError`` on RPC failure, matching ``exists()``.
         """
         result = await self._sandbox.check_file_exists(path)
         if not result.success:
@@ -236,7 +243,9 @@ class ParentSandboxAdapter(ParentSandboxPort):
             exists = bool(getattr(data, "exists", False))
             kind = getattr(data, "kind", None)
         if not kind:
-            kind = "missing" if not exists else "other"
+            # [codex PR-4 R2 P1] legacy (kindless) sandbox: existing → "regular"
+            # (pre-S1b bool semantics), absent → "missing".
+            kind = "missing" if not exists else "regular"
         return SandboxPathCheck(exists=exists, kind=kind)
 
     async def read_file(self, path: str) -> bytes:
@@ -358,6 +367,18 @@ class ParentSandboxAdapter(ParentSandboxPort):
         if not result.success:
             raise OSError(
                 f"sandbox delete_file failed for {path!r}: {result.message!r}",
+            )
+
+    async def kill_all_shell_sessions(self) -> None:
+        """[S2 PR-4 §3.2] Quiesce: kill every tracked shell session's process
+        group sandbox-side before the POST snapshot scan. Same failure
+        convention as ``delete_file`` — ``success=False`` from the sandbox RPC
+        raises ``OSError`` so the bounded finalizer routes the failure to
+        ``_finalize_failed`` (a non-quiescent capture must not silently SUCCESS)."""
+        result = await self._sandbox.kill_all_shell_sessions()
+        if not result.success:
+            raise OSError(
+                f"sandbox kill_all_shell_sessions failed: {result.message!r}",
             )
 
     async def snapshot_workspace(

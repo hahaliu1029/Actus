@@ -204,6 +204,63 @@ class TestBuildPreResults:
         )
         assert out[0].outcome == ResultReadyOutcome.FAILED
 
+    def _shell_write_unit(self, wu_id: str = "wu1") -> WorkUnit:
+        from app.domain.models.work_unit import TreeLease
+
+        return WorkUnit(
+            work_unit_id=wu_id, objective="o", phase="write", shell_mode=True,
+            allowed_tools=["file_write"],
+            write_tree_lease=[TreeLease(prefix="workspace", ops=frozenset({"add"}))],
+        )
+
+    def _success_manifest_terminal(self, wu_id: str = "wu1") -> dict:
+        pm_dict = {
+            "patch_id": f"r1:{wu_id}:p",
+            "coordinator_run_id": "r1",
+            "work_unit_id": wu_id,
+            "files": [],
+        }
+        return {
+            wu_id: TerminalEnvelopeRecord(
+                envelope_type="RESULT_READY",
+                payload={"outcome": "success", "patch_manifest": pm_dict,
+                         "summary": "done"},
+                child_session_id="c1",
+                received_at=datetime.now(timezone.utc),
+            ),
+        }
+
+    async def test_flag_flip_kill_switch_demotes_shell_replay_success(self) -> None:
+        # [S2 PR-4 kill-switch] flag OFF + a shell-intended wu_id in the kill set
+        # ⇒ the persisted SUCCESS terminal's captured manifest is NOT replayed;
+        # the WorkerResult is demoted to FAILED with patch_manifest None.
+        wu = self._shell_write_unit("wu1")
+        out = await _build_pre_results_from_terminal(
+            self._success_manifest_terminal("wu1"),
+            artifact_storage=_FAKE_ARTIFACT_STORAGE,
+            work_units_by_id={"wu1": wu},
+            shell_replay_kill_ids={"wu1"},
+        )
+        assert out[0].outcome == ResultReadyOutcome.FAILED
+        assert out[0].patch_manifest is None
+        assert "flag OFF" in (out[0].summary or "")
+
+    async def test_no_kill_switch_replays_success_when_id_absent(self) -> None:
+        # Empty kill set (flag ON, or a non-shell unit) ⇒ the SUCCESS terminal's
+        # manifest IS replayed (resolved to a PatchManifest), no demotion. Proves
+        # the kill-switch is gated strictly on membership, not always-on.
+        from app.domain.models.patch_manifest import PatchManifest
+
+        wu = self._shell_write_unit("wu1")
+        out = await _build_pre_results_from_terminal(
+            self._success_manifest_terminal("wu1"),
+            artifact_storage=_FAKE_ARTIFACT_STORAGE,
+            work_units_by_id={"wu1": wu},
+            shell_replay_kill_ids=set(),
+        )
+        assert out[0].outcome == ResultReadyOutcome.SUCCESS
+        assert isinstance(out[0].patch_manifest, PatchManifest)
+
 
 # -- _rehydrate_dispatch branches ------------------------------------------
 
@@ -493,7 +550,9 @@ class TestRehydrateDispatchBranches:
         # covered by the TestRehydrateDispatchBranches suite above).
         routed: dict = {}
 
-        async def _stub_rehydrate_dispatch(state, config, existing, run_id, wus):
+        async def _stub_rehydrate_dispatch(
+            state, config, existing, run_id, wus, **kwargs
+        ):
             routed["called"] = True
             from langgraph.graph import END
             from langgraph.types import Command

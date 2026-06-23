@@ -315,3 +315,55 @@ async def test_worker_node_terminal_wait_timeout_fails_closed() -> None:
     assert wr.child_session_id == "c1"
     assert wr.manifest_required is True
     assert wr.patch_manifest is None
+
+
+# ── codex PR-4 R1 P0: flag-flip kill-switch on the PENDING/worker_node path ──
+
+
+async def test_worker_node_shell_replay_kill_demotes_success_with_manifest() -> None:
+    # [codex PR-4 R1 P0] A pending shell-intended child whose SUCCESS terminal
+    # surfaces in worker_node under flag OFF (shell_replay_kill=True) must be
+    # demoted to FAILED with its captured manifest discarded — twin of the
+    # already-terminal kill-switch. Even a fully-resolvable manifest must NOT
+    # reach the reducer/apply.
+    pm = _manifest()
+    artifact = MagicMock()
+    artifact.get_bytes = AsyncMock()
+    payload = ResultReadyPayload(
+        summary="captured under flag ON",
+        outcome=ResultReadyOutcome.SUCCESS,
+        patch_manifest=pm,
+    )
+    config = _config(artifact_storage=artifact)
+    config["configurable"]["terminal_waiter"].await_terminal = AsyncMock(
+        return_value=_envelope(payload)
+    )
+    send = _send(manifest_required=True)
+    send["shell_replay_kill"] = True
+    out = await worker_node(send, config)
+    wr = out["worker_results"][0]
+    assert wr.outcome == ResultReadyOutcome.FAILED
+    assert wr.patch_manifest is None
+    assert "flag OFF" in (wr.summary or "")
+
+
+async def test_worker_node_no_kill_when_shell_replay_kill_false() -> None:
+    # Differential: same SUCCESS+manifest, but shell_replay_kill absent/False
+    # (flag ON, or a non-shell unit) ⇒ the manifest IS kept (no demotion). Proves
+    # the kill is gated strictly on the bit, not always-on.
+    pm = _manifest()
+    artifact = MagicMock()
+    artifact.get_bytes = AsyncMock()
+    payload = ResultReadyPayload(
+        summary="ok",
+        outcome=ResultReadyOutcome.SUCCESS,
+        patch_manifest=pm,
+    )
+    config = _config(artifact_storage=artifact)
+    config["configurable"]["terminal_waiter"].await_terminal = AsyncMock(
+        return_value=_envelope(payload)
+    )
+    out = await worker_node(_send(manifest_required=True), config)
+    wr = out["worker_results"][0]
+    assert wr.outcome == ResultReadyOutcome.SUCCESS
+    assert wr.patch_manifest is not None

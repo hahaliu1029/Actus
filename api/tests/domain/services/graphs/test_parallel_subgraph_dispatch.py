@@ -80,6 +80,23 @@ def _base_config(*, peek_returns: int | None = None) -> dict:
     parent_sandbox = AsyncMock()
     parent_sandbox.compute_digest = AsyncMock(return_value="sha256_abc")
     parent_sandbox.read_file = AsyncMock(return_value=b"content")
+    from app.domain.external.parent_sandbox import SandboxPathCheck, WorkspaceScan
+    parent_sandbox.snapshot_workspace = AsyncMock(
+        return_value=WorkspaceScan(entries={}, truncated=False)
+    )
+    parent_sandbox.kill_all_shell_sessions = AsyncMock(return_value=None)
+    # [S2 PR-4 §3.2 inv-4] Default the seed-enrichment kind precheck to a REGULAR
+    # target. `parent_sandbox` is an AsyncMock, so a bare `AsyncMock()` here would
+    # make `(await check_path(...)).kind` a child mock (NOT the string "regular")
+    # — which the Task 4.10 `_enrich_check.kind != "regular"` guard would REJECT,
+    # turning existing modify-seed dispatch tests (e.g.
+    # test_dispatch_seeds_modify_lease_with_digest_and_content) RED. Return a real
+    # regular SandboxPathCheck so those tests stay green; Task 4.10's
+    # symlink-rejection test overrides this with a symlink-kind SandboxPathCheck
+    # ONLY in that test.
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="regular")
+    )
     orchestrator = AsyncMock()
     orchestrator.run = AsyncMock()
     orchestrator_factory = MagicMock()
@@ -1438,3 +1455,31 @@ class TestDispatchNodeFlagOffFailClosed:
         ])
         with pytest.raises(CoordinatorPathContractError, match="fail-closed"):
             await _peg.dispatch_node(state, config)
+
+
+# This file marks async tests per-test with @pytest.mark.anyio (no module-level
+# pytestmark); without the marker an async test is collected but never awaited and
+# passes vacuously, defeating RED. Match the convention.
+@pytest.mark.anyio
+async def test_seed_enrichment_rejects_symlink_modify_target():
+    # [S2 PR-4 §3.2 inv-4] A modify lease whose parent target is a symlink must
+    # NOT be seed-read (symlink-following compute_digest/read_file would mirror
+    # the link target into the seed). Enrichment must refuse via check_path.
+    from app.domain.external.parent_sandbox import SandboxPathCheck
+
+    state = _base_state(work_unit_requests=[
+        WorkUnitRequest(
+            objective="o", phase="write", allowed_tools=["file_write"],
+            proposed_paths=[ProposedPath(path="pkg/a.py", op="modify")],
+        ),
+    ])
+    config = _base_config(peek_returns=None)
+    config["configurable"]["parent_sandbox"].check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=True, kind="symlink")
+    )
+    with pytest.raises(Exception) as ei:
+        await dispatch_node(state, config)
+    assert (
+        "not regular" in str(ei.value).lower()
+        or "symlink" in str(ei.value).lower()
+    )
