@@ -1061,6 +1061,154 @@ class TestBuildWorkUnitsTreeLease:
         # the exact file lease survives so the built unit is a valid write unit.
         assert [l.path for l in units[0].write_lease] == ["d/a.py"]
 
+    # [S2 §3.3/§3.5] PR-5 Task 5.6 regression locks. Plan placed these in
+    # TestBuildWorkUnitsPathContract, but PR-3 created this dedicated tree-lease
+    # build class — the correct home (deviation noted, no semantic change). The
+    # sibling PR-3 tests above lock the build derivation at the WorkUnit level;
+    # these add the two cases they do NOT cover: a MIXED unit (file + tree lease
+    # coexisting) and the end-to-end factory-bind chain for a no-tree shell unit.
+    def test_shell_mode_and_tree_lease_survive_to_work_unit(self):
+        from app.domain.models.work_unit import (
+            ProposedPath, ProposedTree, WorkUnitRequest,
+        )
+        from app.domain.services.graphs.parallel_execution_subgraph import (
+            _build_work_units_from_requests,
+        )
+        req = WorkUnitRequest(
+            objective="codegen under workspace/gen",
+            phase="write",
+            allowed_tools=["file_read", "shell_execute"],
+            shell_mode=True,
+            proposed_paths=[ProposedPath(path="api/config.py", op="modify")],
+            proposed_trees=[ProposedTree(prefix="workspace/gen", ops=["add"])],
+        )
+        units = _build_work_units_from_requests([req], "hash16", 1)
+        assert len(units) == 1
+        wu = units[0]
+        assert wu.shell_mode is True
+        assert len(wu.write_tree_lease) == 1
+        assert wu.write_tree_lease[0].prefix == "workspace/gen"
+        assert "add" in wu.write_tree_lease[0].ops
+        # exact file lease still built from proposed_paths.
+        assert any(l.path == "api/config.py" and l.op == "modify"
+                   for l in wu.write_lease)
+
+    def test_shell_mode_without_tree_lease_survives_and_binds_shell(
+        self, monkeypatch,
+    ):
+        # REGRESSION LOCK (no RED-first phase; per Task 5.6 convention) —
+        # guards the `shell_mode = bool(tree_leases)` footgun. PR-3 made
+        # shell_mode an INDEPENDENTLY-requestable field (WorkUnitRequest.
+        # shell_mode), so a shell-mode unit may carry ONLY exact file leases
+        # (no proposed_trees). The sibling test above only exercises
+        # shell_mode=True + proposed_trees, so if an implementer regressed the
+        # build derivation back to `shell_mode = bool(tree_leases)`, this
+        # no-tree unit would be SILENTLY downgraded to typed-only and the 5
+        # shell tools would NOT bind — a regression no other PR-5 test catches.
+        # This locks the build derivation (a) AND chains the DERIVED flag into
+        # the real factory bind chain (b), so a downgrade fails end-to-end.
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from app.application.services import (
+            child_agent_runner_factory as factory_mod,
+        )
+        from app.application.services.child_agent_runner_factory import (
+            ChildAgentTaskRunnerFactory,
+        )
+        from app.domain.models.tool_filter_presets import (
+            COORDINATOR_STEP_PRESET,
+        )
+        from app.domain.models.work_unit import ProposedPath, WorkUnitRequest
+        from app.domain.services.graphs.parallel_execution_subgraph import (
+            _build_work_units_from_requests,
+        )
+        from app.domain.services.permission.child_permission_context import (
+            ChildBudget, ChildPermissionContext, SpawnManifest,
+        )
+
+        _SHELL_FIVE = frozenset({
+            "shell_execute", "shell_wait_process", "shell_kill_process",
+            "shell_write_input", "shell_read_output",
+        })
+
+        # (a) Build derivation: shell_mode=True with ONLY proposed_paths and
+        #     NO proposed_trees must still derive WorkUnit.shell_mode is True.
+        req = WorkUnitRequest(
+            objective="sed across an enumerated file set (no new dirs)",
+            phase="write",
+            allowed_tools=[
+                "file_read", "shell_execute", "shell_wait_process",
+                "shell_read_output", "shell_write_input", "shell_kill_process",
+            ],
+            shell_mode=True,
+            proposed_paths=[ProposedPath(path="api/config.py", op="modify")],
+            proposed_trees=[],  # NO tree lease — the footgun's blind spot.
+        )
+        units = _build_work_units_from_requests([req], "hash16", 1)
+        assert len(units) == 1
+        wu = units[0]
+        # The load-bearing assertion: a no-tree shell unit is NOT downgraded.
+        assert wu.shell_mode is True, (
+            "shell_mode must survive the build WITHOUT a tree lease "
+            "(regression: shell_mode = bool(tree_leases) footgun)"
+        )
+        assert wu.write_tree_lease == []  # no tree lease requested.
+
+        # (b) With the master flag ON, feeding the DERIVED flag through the
+        #     real factory binds the 5 shell tools. If the build had downgraded
+        #     shell_mode to False, the union is skipped and this fails.
+        class _CaptureRunner:
+            last_kwargs: dict = {}
+
+            def __init__(self, **kwargs):
+                type(self).last_kwargs = kwargs
+
+        class _FakeTask:
+            def __init__(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(
+            factory_mod, "is_coordinator_shell_mode_enabled", lambda: True
+        )
+        cpc = ChildPermissionContext(
+            parent_session_id="p1", child_session_id="c1",
+            coordinator_run_id="r1", work_unit_id=wu.work_unit_id,
+            spawn_manifest=SpawnManifest(
+                allowed_tools=frozenset(wu.allowed_tools), path_leases=(),
+                runtime_caps=frozenset(), tree_leases=(),
+                shell_mode=wu.shell_mode,  # the DERIVED flag, not a literal.
+            ),
+            session_mode_revision=1,
+            budget=ChildBudget(max_tool_calls=10, max_token_cost_usd=1.0,
+                               max_wallclock_seconds=600),
+            shell_mode=wu.shell_mode,  # the DERIVED flag, not a literal.
+        )
+        factory = ChildAgentTaskRunnerFactory(
+            runner_class=_CaptureRunner,
+            mailbox_publisher=MagicMock(),
+            task_cls=_FakeTask,
+        )
+
+        async def _build():
+            return await factory.build(
+                child_session_id="c1",
+                child_permission_context=cpc,
+                tool_filter_preset=COORDINATOR_STEP_PRESET,
+                cancel_event=asyncio.Event(),
+                sandbox=MagicMock(),
+                browser=MagicMock(),
+                user_id="u1",
+                cost_callback_handler=MagicMock(),
+            )
+
+        asyncio.run(_build())
+        bound = _CaptureRunner.last_kwargs["tool_filter"]
+        assert _SHELL_FIVE <= bound, (
+            "a no-tree shell_mode unit must still bind the 5 shell tools "
+            "with the flag ON (regression: silent typed-only downgrade)"
+        )
+
 
 class TestEnrichmentPreservesShellSignals:
     """[S2 §3.3/§3.5 — P0-1] The Step-4 enrichment loop in dispatch rebuilds

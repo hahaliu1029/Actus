@@ -45,9 +45,12 @@ from app.domain.models.path_validation import (
     CoordinatorPathContractError,
     validate_coordinator_path,
 )
+from app.domain.services.coordinator_shell_mode_flag import (
+    is_coordinator_shell_mode_enabled,
+)
 
 if TYPE_CHECKING:
-    from app.domain.models.work_unit import PathLease
+    from app.domain.models.work_unit import PathLease, TreeLease
     from app.domain.services.permission.child_permission_context import (
         ChildPermissionContext,
     )
@@ -91,6 +94,16 @@ TYPED_WRITE_TOOL_NAMES: frozenset[str] = frozenset({
 # TYPED_WRITE_TOOL_NAMES is kept for _op_compatible's add/modify branch.
 PATH_LEASED_TOOL_NAMES: frozenset[str] = TYPED_WRITE_TOOL_NAMES | frozenset({"file_delete"})
 
+# [S2 §3.5] The 5 raw-shell entries inside HARD_BLOCKED_FOR_CHILDREN that the
+# shell-mode dual-loosening conditionally un-blocks. Must be the EXACT live
+# canonical shell set (tool_source_resolver.py:132-137). Non-shell hard-blocks
+# (message_*/memory_save/spawn_subagent/install_skill/set_tool_approval/
+# publish_mailbox_envelope) stay unconditional.
+SHELL_HARD_BLOCKED_NAMES: frozenset[str] = frozenset({
+    "shell_execute", "shell_wait_process", "shell_kill_process",
+    "shell_write_input", "shell_read_output",
+})
+
 
 def extract_target_path(call) -> str | None:
     """Extract target file path from tool_args (filepath canonical, path fallback).
@@ -124,19 +137,49 @@ class ChildScopeGate:
         # 1. tool name in manifest allowlist?
         if call.tool_name not in child_ctx.spawn_manifest.allowed_tools:
             return ScopeDecision.OUT_OF_TOOL_ALLOWLIST
-        # 2. hardcoded HARD_BLOCKED (overrides allowlist)
+        # 2. hardcoded HARD_BLOCKED (overrides allowlist).
+        # [S2 §3.5] Dual-loosening: the 5 raw-shell entries skip HARD_BLOCK
+        # iff master flag ON AND this child's shell_mode is True; non-shell
+        # hard-blocks stay unconditional. An un-blocked shell tool then falls
+        # through steps 3-6 with NO path-lease check (shell has no path arg) —
+        # capture happens via the snapshot differ (§3.2), not the typed gate.
         if call.tool_name in HARD_BLOCKED_FOR_CHILDREN:
-            return ScopeDecision.HARD_BLOCKED
+            _shell_allowed = (
+                call.tool_name in SHELL_HARD_BLOCKED_NAMES
+                and child_ctx.shell_mode
+                and is_coordinator_shell_mode_enabled()
+            )
+            if not _shell_allowed:
+                return ScopeDecision.HARD_BLOCKED
         # 3. path lease check for typed write/delete (PATH_LEASED_TOOL_NAMES)
         if call.tool_name in PATH_LEASED_TOOL_NAMES:
             target_path = self._extract_target_path(call)
             if target_path is None:
                 return ScopeDecision.OUT_OF_PATH_LEASE
             lease = self._lookup_lease(target_path, child_ctx.spawn_manifest.path_leases)
-            if lease is None:
-                return ScopeDecision.OUT_OF_PATH_LEASE
-            if not self._op_compatible(call, lease.op):
-                return ScopeDecision.OP_MISMATCH
+            if lease is not None:
+                # [S2 §3.4] Exact file lease GOVERNS — op must match, NO tree
+                # fallback (a tree lease can never widen a file lease's op, F21).
+                if not self._op_compatible(call, lease.op):
+                    return ScopeDecision.OP_MISMATCH
+            else:
+                # [S2 §3.5] No exact file lease: a covering TreeLease authorizes
+                # a typed op=add write ONLY (tree leases are ADD-only). Such a
+                # write is captured by the snapshot differ, not the typed
+                # extractor, so gate-allows / capture-sees stay consistent.
+                # GATED ON BOTH the master flag AND this child's shell_mode —
+                # identical fail-safe to the step-2 shell un-block. With the flag
+                # OFF (default), a stale/hand-crafted manifest carrying a
+                # tree_lease can NEVER widen the gate → OUT_OF_PATH_LEASE.
+                _tree_allowed = (
+                    child_ctx.shell_mode
+                    and is_coordinator_shell_mode_enabled()
+                    and self._tree_covers_add(
+                        call, target_path, child_ctx.spawn_manifest.tree_leases
+                    )
+                )
+                if not _tree_allowed:
+                    return ScopeDecision.OUT_OF_PATH_LEASE
         # 4. budget — tool call count only (spec §5.4 r11)
         if self._tool_call_budget_exhausted(child_ctx):
             return ScopeDecision.BUDGET_EXHAUSTED
@@ -187,6 +230,39 @@ class ChildScopeGate:
             return call.tool_name in TYPED_WRITE_TOOL_NAMES
         if lease_op == "delete":
             return call.tool_name == "file_delete"
+        return False
+
+    @staticmethod
+    def _tree_covers_add(
+        call,
+        target_path: str,
+        tree_leases: "tuple[TreeLease, ...]",
+    ) -> bool:
+        """[S2 §3.5] True iff a typed op=add write to ``target_path`` is covered
+        by an ADD-only TreeLease. Only file_write / file_str_replace (the
+        TYPED_WRITE_TOOL_NAMES = add/modify shapes) can be tree-covered; a
+        file_delete is never covered (tree=ADD-only). Coverage is POSIX
+        component-aware via ``tree_contains``.
+
+        [codex PR-5 R2 P2] Canonicalize ``target_path`` first, mirroring
+        ``_lookup_lease``. ``tree_contains`` requires BOTH sides canonical
+        workspace-relative (``lease.prefix`` is canonicalized at build via
+        ``validate_coordinator_tree_prefix``); a raw absolute target (e.g.
+        ``/home/ubuntu/workspace/gen/x.py``) would otherwise be wrongly rejected.
+        A non-canonicalizable target stays fail-closed → False."""
+        from app.domain.models.path_validation import tree_contains
+
+        if call.tool_name not in TYPED_WRITE_TOOL_NAMES:
+            return False  # file_delete shape — tree is ADD-only
+        try:
+            canonical_target = validate_coordinator_path(target_path)
+        except CoordinatorPathContractError:
+            return False  # fail-closed: a non-canonicalizable path is uncovered
+        for lease in tree_leases:
+            if "add" not in lease.ops:
+                continue
+            if tree_contains(lease.prefix, canonical_target):
+                return True
         return False
 
     @staticmethod

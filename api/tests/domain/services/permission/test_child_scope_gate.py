@@ -7,6 +7,7 @@ import pytest
 
 from app.domain.models.session import SessionStatus
 from app.domain.models.work_unit import PathLease, TreeLease
+from app.domain.services.permission import child_scope_gate as gate_mod
 from app.domain.services.permission.child_permission_context import (
     ChildBudget,
     ChildPermissionContext,
@@ -22,6 +23,12 @@ from app.domain.services.permission.context import EvaluationContext
 
 pytestmark = pytest.mark.anyio
 
+_SHELL_FIVE = frozenset({
+    "shell_execute", "shell_wait_process", "shell_kill_process",
+    "shell_write_input", "shell_read_output",
+})
+_NON_SHELL_HARD_BLOCKED = HARD_BLOCKED_FOR_CHILDREN - _SHELL_FIVE
+
 
 def _call(tool_name, **args):
     m = MagicMock()
@@ -34,7 +41,9 @@ def _cctx(
     *,
     allowed=frozenset({"file_read"}),
     leases=(),
+    tree_leases=(),
     caps=frozenset(),
+    shell_mode=False,
     max_tool_calls=100,
     session_mode_revision=1,
 ) -> ChildPermissionContext:
@@ -47,6 +56,8 @@ def _cctx(
             allowed_tools=allowed,
             path_leases=leases,
             runtime_caps=caps,
+            tree_leases=tree_leases,
+            shell_mode=shell_mode,
         ),
         session_mode_revision=session_mode_revision,
         budget=ChildBudget(
@@ -54,6 +65,7 @@ def _cctx(
             max_token_cost_usd=1.0,
             max_wallclock_seconds=600,
         ),
+        shell_mode=shell_mode,
     )
 
 
@@ -81,26 +93,37 @@ class TestAllowlist:
 
 
 class TestHardBlocked:
-    @pytest.mark.parametrize(
-        "tool",
-        [
-            # Shell live canonical names (full set from tool_source_resolver.py:132-137)
-            "shell_execute", "shell_wait_process", "shell_kill_process",
-            "shell_write_input", "shell_read_output",
-            # User-interaction
-            "message_ask_user", "message_notify_user",
-            # Memory mutation
-            "memory_save",
-            # Subagent / runtime mutation forward-include
-            "spawn_subagent",
-            "install_skill",
-            "set_tool_approval",
-            "publish_mailbox_envelope",
-        ],
-    )
-    async def test_overrides_allowlist(self, gate, tool):
-        c = _cctx(allowed=frozenset({tool}))
-        assert await gate.check_in_scope(_call(tool), _ctx(c), c) == ScopeDecision.HARD_BLOCKED
+    """Shell entries are conditional; non-shell entries unconditional."""
+
+    @pytest.mark.parametrize("tool", sorted(_NON_SHELL_HARD_BLOCKED))
+    async def test_non_shell_overrides_allowlist_unconditionally(
+        self, gate, tool, monkeypatch,
+    ):
+        # Even flag-on + shell_mode=True must NOT un-block non-shell hard-blocks.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(allowed=frozenset({tool}), shell_mode=True)
+        assert await gate.check_in_scope(
+            _call(tool), _ctx(c), c
+        ) == ScopeDecision.HARD_BLOCKED
+
+    @pytest.mark.parametrize("tool", sorted(_SHELL_FIVE))
+    async def test_shell_blocked_when_flag_off(self, gate, tool, monkeypatch):
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: False)
+        c = _cctx(allowed=frozenset({tool}), shell_mode=True)
+        assert await gate.check_in_scope(
+            _call(tool), _ctx(c), c
+        ) == ScopeDecision.HARD_BLOCKED
+
+    @pytest.mark.parametrize("tool", sorted(_SHELL_FIVE))
+    async def test_shell_blocked_when_shell_mode_off(self, gate, tool, monkeypatch):
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(allowed=frozenset({tool}), shell_mode=False)
+        assert await gate.check_in_scope(
+            _call(tool), _ctx(c), c
+        ) == ScopeDecision.HARD_BLOCKED
 
     def test_full_live_blocked_set(self):
         """Lock the full HARD_BLOCKED_FOR_CHILDREN canonical membership.
@@ -121,6 +144,45 @@ class TestHardBlocked:
             f"HARD_BLOCKED_FOR_CHILDREN drifted: missing {expected - HARD_BLOCKED_FOR_CHILDREN}, "
             f"extra {HARD_BLOCKED_FOR_CHILDREN - expected}"
         )
+
+
+class TestShellModeConditional:
+    @pytest.mark.parametrize("tool", sorted(_SHELL_FIVE))
+    async def test_shell_unblocked_when_flag_on_and_shell_mode(
+        self, gate, tool, monkeypatch,
+    ):
+        # flag_on AND shell_mode → the 5 shell entries fall through steps 3-6
+        # (no path-lease check, no path arg) → IN_SCOPE.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(allowed=frozenset({tool}), shell_mode=True)
+        assert await gate.check_in_scope(
+            _call(tool), _ctx(c), c
+        ) == ScopeDecision.IN_SCOPE
+
+    async def test_shell_not_in_allowlist_still_out_of_allowlist(
+        self, gate, monkeypatch,
+    ):
+        # Un-block does NOT bypass step-1 allowlist: a shell tool absent from
+        # allowed_tools is still OUT_OF_TOOL_ALLOWLIST even flag-on+shell_mode.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(allowed=frozenset({"file_read"}), shell_mode=True)
+        assert await gate.check_in_scope(
+            _call("shell_execute"), _ctx(c), c
+        ) == ScopeDecision.OUT_OF_TOOL_ALLOWLIST
+
+    async def test_shell_unblock_respects_budget_exhaustion(
+        self, gate, monkeypatch,
+    ):
+        # Falling through steps 3-6 means an exhausted budget still trips.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(allowed=frozenset({"shell_execute"}), shell_mode=True,
+                  max_tool_calls=0)
+        assert await gate.check_in_scope(
+            _call("shell_execute"), _ctx(c), c
+        ) == ScopeDecision.BUDGET_EXHAUSTED
 
 
 class TestPathLease:
@@ -426,3 +488,121 @@ class TestSpawnManifestShellModeCarrier:
             ),
         )
         assert ctx.shell_mode is False
+
+
+class TestTreeLeaseAdd:
+    async def test_tree_add_typed_write_honored(self, gate, monkeypatch):
+        # flag-on + shell_mode: file_write to a path under a tree-lease prefix,
+        # no exact file lease → IN_SCOPE (op=add inferred from absence of exact
+        # lease; tree is ADD-only).
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=True,
+        )
+        assert await gate.check_in_scope(
+            _call("file_write", filepath="workspace/new.py"), _ctx(c), c
+        ) == ScopeDecision.IN_SCOPE
+
+    async def test_tree_add_out_of_lease_when_flag_off(self, gate, monkeypatch):
+        # FAIL-SAFE: flag OFF + a covering tree lease (shell_mode True on a
+        # stale/hand-crafted manifest) → the tree branch is gated on the master
+        # flag, so it NEVER widens the gate → OUT_OF_PATH_LEASE. This locks the
+        # default-OFF invariant for the tree-add path (mirror of the step-2
+        # shell un-block flag gate).
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: False)
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=True,
+        )
+        assert await gate.check_in_scope(
+            _call("file_write", filepath="workspace/new.py"), _ctx(c), c
+        ) == ScopeDecision.OUT_OF_PATH_LEASE
+
+    async def test_tree_add_no_coverage_out_of_lease(self, gate, monkeypatch):
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=True,
+        )
+        assert await gate.check_in_scope(
+            _call("file_write", filepath="api/other.py"), _ctx(c), c
+        ) == ScopeDecision.OUT_OF_PATH_LEASE
+
+    async def test_exact_file_lease_wins_over_tree_op_mismatch(
+        self, gate, monkeypatch,
+    ):
+        # F21: exact file lease (op=add) + a covering tree lease on same prefix;
+        # a file_delete (op=delete shape) → exact wins → OP_MISMATCH, NO tree
+        # fallback widening the op.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(
+            allowed=frozenset({"file_delete"}),
+            leases=(PathLease(path="workspace/x.py", op="add"),),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=True,
+        )
+        assert await gate.check_in_scope(
+            _call("file_delete", filepath="workspace/x.py"), _ctx(c), c
+        ) == ScopeDecision.OP_MISMATCH
+
+    async def test_tree_lease_does_not_cover_delete(self, gate, monkeypatch):
+        # A file_delete under a tree prefix with NO exact lease → tree is
+        # ADD-only, so a delete shape is never covered → OUT_OF_PATH_LEASE.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(
+            allowed=frozenset({"file_delete"}),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=True,
+        )
+        assert await gate.check_in_scope(
+            _call("file_delete", filepath="workspace/gone.py"), _ctx(c), c
+        ) == ScopeDecision.OUT_OF_PATH_LEASE
+
+    async def test_tree_add_out_of_lease_when_shell_mode_off(
+        self, gate, monkeypatch,
+    ):
+        # [codex PR-5 R2 P2] FAIL-SAFE truth-table cell: master flag ON but the
+        # child's shell_mode is False + a covering tree lease (stale/hand-crafted
+        # manifest) → the tree branch requires BOTH the flag AND
+        # child_ctx.shell_mode, so it NEVER widens the gate → OUT_OF_PATH_LEASE.
+        # Completes the {flag, shell_mode} truth table for the tree-add path.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=False,
+        )
+        assert await gate.check_in_scope(
+            _call("file_write", filepath="workspace/new.py"), _ctx(c), c
+        ) == ScopeDecision.OUT_OF_PATH_LEASE
+
+    async def test_tree_add_canonicalizes_absolute_target(
+        self, gate, monkeypatch,
+    ):
+        # [codex PR-5 R2 P2] The tree branch canonicalizes the target before
+        # tree_contains (mirror of _lookup_lease). An ABSOLUTE workspace target
+        # (/home/ubuntu/workspace/new.py) canonicalizes to "workspace/new.py" and
+        # is covered → IN_SCOPE. Before the fix the raw absolute path was handed
+        # to tree_contains (which needs canonical workspace-relative) → wrongly
+        # rejected. NON-VACUOUS: this returns OUT_OF_PATH_LEASE without the fix.
+        monkeypatch.setattr(gate_mod, "is_coordinator_shell_mode_enabled",
+                            lambda: True)
+        c = _cctx(
+            allowed=frozenset({"file_write"}),
+            tree_leases=(TreeLease(prefix="workspace", ops=frozenset({"add"})),),
+            shell_mode=True,
+        )
+        assert await gate.check_in_scope(
+            _call("file_write", filepath="/home/ubuntu/workspace/new.py"),
+            _ctx(c), c,
+        ) == ScopeDecision.IN_SCOPE

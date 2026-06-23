@@ -217,6 +217,7 @@ class PromptAssembler:
         phase: "Literal['exploration', 'write']",
         allowed_paths: list[str],
         work_unit_id: str,
+        allowed_trees: list[str] = (),
         expected_result_schema: str | None = None,
     ) -> str:
         """Static helper — composes the restricted prompt for a coordinator
@@ -232,6 +233,11 @@ class PromptAssembler:
           behavior against the spec'd allowlist, so prompt minimality is
           a security invariant, not just a UX choice.
 
+        ``allowed_trees`` (C2-full S2 PR-5) are the unit's ADD-only
+        ``write_tree_lease`` prefixes; forwarded verbatim to the section so a
+        shell-mode child knows which directory trees it may CREATE new files
+        under. Empty (default) ⇒ section output is byte-for-byte unchanged.
+
         Returns the assembled prompt text. Caller (CoordinatorChildRunner)
         feeds the string directly to the inner runner."""
         from app.domain.services.prompts.sections.coordinator_work_unit import (
@@ -242,6 +248,7 @@ class PromptAssembler:
             phase=phase,
             allowed_paths=allowed_paths,
             work_unit_id=work_unit_id,
+            allowed_trees=allowed_trees,
             expected_result_schema=expected_result_schema,
         )
         # Identity + restricted-behavior preamble. Kept inline (not pulled

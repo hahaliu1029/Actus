@@ -1079,12 +1079,21 @@ class CoordinatorChildRunner:
     def _build_child_prompt(self, wu: "WorkUnit", manifest: Any) -> str:
         """[spec §8.7] Compose the restricted child prompt. The PromptAssembler
         static helper (Task 4.8) handles section composition; here we only
-        forward the work_unit's planner-visible fields."""
+        forward the work_unit's planner-visible fields.
+
+        [C2-full S2 PR-5] Forward ``write_tree_lease`` prefixes as
+        ``allowed_trees`` so a shell-mode tree-add unit tells the child which
+        ADD-only directory trees it may create NEW files under — without this the
+        section drops the lease and renders the contradictory
+        '(none — read-only exploration)' placeholder for an authorized write
+        unit. A non-shell unit has ``write_tree_lease == []`` ⇒ empty
+        ``allowed_trees`` ⇒ byte-for-byte-identical prompt (flag-OFF guarantee)."""
         return PromptAssembler.build_minimal_for_coordinator_child(
             objective=wu.objective,
             phase=wu.phase,
             allowed_paths=[lease.path for lease in wu.write_lease],
             work_unit_id=wu.work_unit_id,
+            allowed_trees=[tl.prefix for tl in wu.write_tree_lease],
             expected_result_schema=wu.expected_result_schema,
         )
 

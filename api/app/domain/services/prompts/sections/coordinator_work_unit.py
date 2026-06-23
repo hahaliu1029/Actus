@@ -38,12 +38,25 @@ _WRITE_GUIDANCE = (
 )
 
 
+_TREE_GUIDANCE = (
+    "**Authorized directory trees (ADD-ONLY)**:\n"
+    "{trees}\n\n"
+    "These are ADD-ONLY directory trees: you MAY create NEW files anywhere "
+    "under each prefix above, but you may NOT modify or delete EXISTING files "
+    "there (to modify/delete a file you need an exact path lease above). "
+    "ChildScopeGate / snapshot capture enforces this at runtime — creating a "
+    "file outside these trees, or modifying/deleting an existing file inside "
+    "them, will be rejected and surface as NEEDS_AUTHORIZATION to the parent."
+)
+
+
 def build_coordinator_work_unit_section(
     *,
     objective: str,
     phase: Literal["exploration", "write"],
     allowed_paths: list[str],
     work_unit_id: str,
+    allowed_trees: list[str] = (),
     expected_result_schema: str | None = None,
 ) -> str:
     """Build the markdown body for the coordinator child's work-unit block.
@@ -53,19 +66,49 @@ def build_coordinator_work_unit_section(
     ``WorkUnit.phase`` which is itself the same Literal — but a non-conforming
     string would otherwise silently fall through to WRITE guidance and emit
     an authorization-tone prompt for a non-write phase. Fail closed instead.
+
+    ``allowed_trees`` (C2-full S2 PR-5) are workspace-relative ADD-only directory
+    prefixes from the unit's ``write_tree_lease`` (shell-mode write units). When
+    non-empty, an ADD-only tree block is appended so the child knows which trees
+    it may CREATE new files under. EMPTY ``allowed_trees`` (the non-shell /
+    flag-OFF case) renders BYTE-FOR-BYTE identically to the legacy no-trees call:
+    no tree block, and the ``_(none — read-only exploration)_`` placeholder still
+    applies — but ONLY when BOTH ``allowed_paths`` AND ``allowed_trees`` are
+    empty, so a tree-only write unit is never mislabeled as read-only.
     """
     if phase not in ("exploration", "write"):
         raise ValueError(
             f"phase must be 'exploration' or 'write', got {phase!r}"
         )
-    paths_block = (
-        "\n".join(f"- {p}" for p in allowed_paths)
-        if allowed_paths
-        else "_(none — read-only exploration)_"
-    )
+    # [codex PR-5 R3 P2] Fail-closed: an exploration unit is read-only and
+    # carries NO leases (WorkUnit enforces exploration ⇒ no write/tree lease
+    # upstream). Reject a direct-helper misuse that would otherwise emit
+    # contradictory exploration guidance alongside an ADD-only tree block.
+    if phase == "exploration" and allowed_trees:
+        raise ValueError(
+            "exploration phase must not carry allowed_trees (read-only)"
+        )
+    if allowed_paths:
+        paths_block = "\n".join(f"- {p}" for p in allowed_paths)
+    elif allowed_trees:
+        # [codex PR-5 R4 P2] tree-only write unit: there are no exact paths, the
+        # real authorization is the ADD-only tree block below. Redirect to it
+        # rather than leave an empty list under "write to EXACTLY those paths".
+        paths_block = (
+            "_(none — create NEW files under the authorized directory "
+            "trees below)_"
+        )
+    else:
+        paths_block = "_(none — read-only exploration)_"
     guidance = (
         _EXPLORATION_GUIDANCE if phase == "exploration" else _WRITE_GUIDANCE
     )
+    # [PR-5] ADD-only tree block, only when tree leases are present. Empty
+    # allowed_trees ⇒ no block ⇒ byte-for-byte identical to the legacy output.
+    tree_block = ""
+    if allowed_trees:
+        trees = "\n".join(f"- {t}" for t in allowed_trees)
+        tree_block = "\n\n" + _TREE_GUIDANCE.format(trees=trees)
     schema_block = ""
     if expected_result_schema:
         schema_block = f"\n\n**Expected result schema:**\n{expected_result_schema}"
@@ -76,5 +119,5 @@ def build_coordinator_work_unit_section(
         f"**Objective**: {objective}\n\n"
         f"**Phase**: {phase}\n\n"
         f"**Authorized paths**:\n{paths_block}\n\n"
-        f"{guidance}{schema_block}"
+        f"{guidance}{tree_block}{schema_block}"
     )

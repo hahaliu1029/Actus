@@ -37,7 +37,18 @@ from dataclasses import dataclass
 from typing import Any, FrozenSet, Optional, Protocol
 
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
+from app.domain.services.coordinator_shell_mode_flag import (
+    is_coordinator_shell_mode_enabled,
+)
 from app.domain.services.tool_filter_presets import resolve_preset
+
+# [S2 §3.5] The 5 raw-shell tools the bind-time widen unions into the
+# coordinator_step allowlist when shell-mode. Must match
+# child_scope_gate.SHELL_HARD_BLOCKED_NAMES (lockstep gate un-block).
+_SHELL_MODE_UNION_TOOLS: frozenset[str] = frozenset({
+    "shell_execute", "shell_wait_process", "shell_kill_process",
+    "shell_write_input", "shell_read_output",
+})
 
 
 class ChildRunnerBuilder(Protocol):
@@ -157,6 +168,30 @@ class ChildAgentTaskRunnerFactory:
             AgentTaskRunnerInvokeAdapter,
         )
         tool_filter = resolve_preset(tool_filter_preset)
+        # [S2 §3.5] Bind-time dual-loosening: when this child runs shell-mode
+        # (master flag ON AND its spawn_manifest.shell_mode True), union the 5
+        # raw-shell tools into the resolved allowlist so llm.bind_tools exposes
+        # them. Keep the PERSISTED preset string (coordinator_step) — runtime
+        # union only, NO DB migration (§10-B). Lockstep with the runtime gate
+        # un-block (child_scope_gate.py): preset-widen WITHOUT gate-unblock
+        # would bind a tool the gate then HARD_BLOCKs, and vice-versa.
+        # [codex PR-5 R1 P1] Scope the widen to the coordinator-step preset.
+        # shell-mode is a coordinator feature; the live caller always passes
+        # COORDINATOR_STEP_PRESET, and a non-coordinator child never carries
+        # shell_mode=True. Gating on the preset self-defends this reusable
+        # factory boundary so a future non-coordinator reuse with a hand-built
+        # shell_mode context can NEVER bind raw exec shell.
+        _shell_mode = bool(
+            getattr(child_permission_context, "shell_mode", False)
+        )
+        _shell_widen = (
+            tool_filter is not None
+            and _shell_mode
+            and tool_filter_preset == COORDINATOR_STEP_PRESET
+            and is_coordinator_shell_mode_enabled()
+        )
+        if _shell_widen:
+            tool_filter = tool_filter | _SHELL_MODE_UNION_TOOLS
         terminal_disabled = tool_filter_preset == COORDINATOR_STEP_PRESET
         raw_runner = self._runner_class(
             session_id=child_session_id,

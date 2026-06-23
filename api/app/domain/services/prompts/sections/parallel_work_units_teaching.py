@@ -18,6 +18,9 @@ fixture render fires at import. (R2 P1#2.)
 from __future__ import annotations
 
 from app.domain.services.coordinator_feature_flag import is_coordinator_enabled
+from app.domain.services.coordinator_shell_mode_flag import (
+    is_coordinator_shell_mode_enabled,
+)
 from app.domain.services.prompts.section import (
     RenderContext,
     Section,
@@ -119,15 +122,125 @@ Schema:
 """
 
 
+# [S2 §3.5] Flag-gated shell/tree extension — appended ONLY when BOTH the
+# master coordinator flag AND the shell-mode flag are on. Schema keys kept in
+# English (schema-drift guard).
+PARALLEL_WORK_UNITS_SHELL_TEACHING_EN = """
+## Shell-capable Work Units (advanced — opt-in per work_unit)
+
+A `write`-phase work_unit may set `"shell_mode": true` to run with raw shell
+tools (shell_execute, shell_wait_process, shell_kill_process,
+shell_write_input, shell_read_output) IN ADDITION to typed file tools. Use this
+only when the change genuinely needs shell (build/codegen/sed across many
+files); prefer typed `proposed_paths` otherwise.
+
+REQUIRED when `shell_mode` is true: `allowed_tools` MUST list ALL FIVE shell
+tools — `shell_execute`, `shell_wait_process`, `shell_read_output`,
+`shell_write_input`, `shell_kill_process` — alongside any file tools you need.
+The gate rejects any called tool that is NOT in `allowed_tools` (it bounces with
+OUT_OF_TOOL_ALLOWLIST), so omitting one of the five means the child can bind it
+but never call it. List all five.
+
+When `shell_mode` is true you MUST also declare what the child may CREATE, via
+either (or both):
+- `proposed_paths` — exact files, as usual (add/modify/delete).
+- `proposed_trees` — directory prefixes the child may ADD NEW files under.
+  Tree leases are ADD-ONLY: a tree lease never authorizes modifying or
+  deleting an existing file. To modify/delete, declare an exact
+  `proposed_paths` entry.
+
+Every shell write is captured by a filesystem snapshot diff and revalidated
+against these leases; any write outside the declared paths/trees discards the
+WHOLE work_unit's changes (group zero-apply).
+
+Schema:
+{
+  "parallel_work_units": {
+    "work_units": [
+      {
+        "objective": "run codegen, write generated files under workspace/gen",
+        "phase": "write",
+        "shell_mode": true,
+        "allowed_tools": [
+          "file_read", "shell_execute", "shell_wait_process",
+          "shell_read_output", "shell_write_input", "shell_kill_process"
+        ],
+        "proposed_paths": [{"path": "api/config.py", "op": "modify"}],
+        "proposed_trees": [{"prefix": "workspace/gen", "ops": ["add"]}]
+      }
+    ]
+  }
+}
+"""
+
+
+PARALLEL_WORK_UNITS_SHELL_TEACHING_ZH = """
+## 支持 Shell 的工作单元 (Shell-capable，高级，按 work_unit 选择开启)
+
+`write` 阶段的 work_unit 可设置 `"shell_mode": true`，在受限的类型化文件工具
+之外额外获得原始 shell 工具（shell_execute、shell_wait_process、
+shell_kill_process、shell_write_input、shell_read_output）。仅当改动确实需要
+shell（构建 / 代码生成 / 跨多文件 sed）时使用；否则优先用类型化的
+`proposed_paths`。
+
+`shell_mode` 为 true 时必须：`allowed_tools` 必须列出全部 5 个 shell 工具 ——
+`shell_execute`、`shell_wait_process`、`shell_read_output`、
+`shell_write_input`、`shell_kill_process` —— 以及你需要的文件工具。门会拒绝
+任何不在 `allowed_tools` 中的被调用工具（返回 OUT_OF_TOOL_ALLOWLIST），漏写
+其中任一个会导致子 agent 虽被绑定该工具却永远无法调用。请列全 5 个。
+
+开启 `shell_mode` 时，还必须声明子 agent 可以创建的内容，二者可同时使用：
+- `proposed_paths`：精确文件（add/modify/delete），同前。
+- `proposed_trees`：允许子 agent 在其下新建文件的目录前缀。树租约是
+  仅 ADD：树租约永远不授权修改或删除已存在文件；要修改/删除请声明精确的
+  `proposed_paths` 条目。
+
+每次 shell 写入都会被文件系统快照 diff 捕获并对照这些租约重新校验；任何
+超出已声明 paths/trees 的写入会丢弃整个 work_unit 的全部改动（组级零应用）。
+
+Schema:
+{
+  "parallel_work_units": {
+    "work_units": [
+      {
+        "objective": "run codegen, write generated files under workspace/gen",
+        "phase": "write",
+        "shell_mode": true,
+        "allowed_tools": [
+          "file_read", "shell_execute", "shell_wait_process",
+          "shell_read_output", "shell_write_input", "shell_kill_process"
+        ],
+        "proposed_paths": [{"path": "api/config.py", "op": "modify"}],
+        "proposed_trees": [{"prefix": "workspace/gen", "ops": ["add"]}]
+      }
+    ]
+  }
+}
+"""
+
+
 def _render(ctx: RenderContext) -> SectionOutput:
-    """Flag-gated: emit the bilingual teaching only when the coordinator is on."""
+    """Flag-gated: emit the bilingual teaching only when the coordinator is on.
+
+    [S2 §3.5] When the shell-mode master flag is ALSO on, append the
+    shell/tree schema extension so a flag-on real provider learns to emit
+    ``shell_mode`` / ``proposed_trees``. Coordinator-on + shell-off ⇒
+    byte-for-byte the existing typed-only teaching (regression-safe)."""
     if not is_coordinator_enabled():
         return SectionOutput(text=None)
+    is_en = ctx.lang == "en"
     text = (
         PARALLEL_WORK_UNITS_TEACHING_EN
-        if ctx.lang == "en"
+        if is_en
         else PARALLEL_WORK_UNITS_TEACHING_ZH
     ).strip()
+    if is_coordinator_shell_mode_enabled():
+        shell_text = (
+            PARALLEL_WORK_UNITS_SHELL_TEACHING_EN
+            if is_en
+            else PARALLEL_WORK_UNITS_SHELL_TEACHING_ZH
+        ).strip()
+        text = f"{text}\n\n{shell_text}"
     return SectionOutput(text=text, metadata={"coordinator_teaching": True})
 
 

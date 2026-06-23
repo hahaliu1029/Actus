@@ -107,6 +107,55 @@ async def test_oversized_manifest_built_by_ref() -> None:
     runner._publish_result_ready.assert_not_awaited()
 
 
+def test_build_child_prompt_forwards_tree_lease_prefix() -> None:
+    """[C2-full S2 PR-5] A shell-mode write unit carrying ``write_tree_lease``
+    must have its ADD-only tree prefixes reach the child prompt — the codex-found
+    gap was ``_build_child_prompt`` dropping ``wu.write_tree_lease`` so a tree-add
+    unit was mislabeled '(none — read-only exploration)'."""
+    from app.application.services.coordinator_child_runner import (
+        CoordinatorChildRunner,
+    )
+    from app.domain.models.work_unit import TreeLease, WorkUnit
+
+    wu = WorkUnit(
+        work_unit_id="wu-tree",
+        objective="generate code under the tree",
+        phase="write",
+        write_tree_lease=[TreeLease(prefix="workspace/gen", ops=frozenset({"add"}))],
+        shell_mode=True,
+    )
+    runner = CoordinatorChildRunner.__new__(CoordinatorChildRunner)
+    prompt = runner._build_child_prompt(wu, manifest=MagicMock())
+
+    # The leased tree prefix reaches the prompt.
+    assert "workspace/gen" in prompt
+    # And the tree-only write unit is NOT mislabeled read-only.
+    assert "_(none — read-only exploration)_" not in prompt
+
+
+def test_build_child_prompt_no_tree_lease_unchanged_no_tree_block() -> None:
+    """[flag-OFF safety] A non-shell-mode unit (``write_tree_lease == []``) ⇒
+    empty ``allowed_trees`` ⇒ no ADD-only tree block in the rendered prompt."""
+    from app.application.services.coordinator_child_runner import (
+        CoordinatorChildRunner,
+    )
+    from app.domain.models.work_unit import PathLease, WorkUnit
+
+    wu = WorkUnit(
+        work_unit_id="wu-paths",
+        objective="patch a file",
+        phase="write",
+        write_lease=[
+            PathLease(path="workspace/a.py", op="add"),
+        ],
+    )
+    runner = CoordinatorChildRunner.__new__(CoordinatorChildRunner)
+    prompt = runner._build_child_prompt(wu, manifest=MagicMock())
+
+    assert "workspace/a.py" in prompt
+    assert "directory tree" not in prompt.lower()
+
+
 @pytest.mark.anyio
 async def test_finalize_success_upload_failure_publishes_failed_terminal() -> None:
     """[defect-fix R2 P1] The by-ref MinIO upload is a NEW failure source. It is
