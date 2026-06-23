@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from app.domain.models.work_unit import PathLease
+    from app.domain.models.work_unit import PathLease, TreeLease
 
 
 class ChildRuntimeCap(StrEnum):
@@ -33,6 +33,12 @@ class SpawnManifest:
     allowed_tools: frozenset[str]
     path_leases: "tuple[PathLease, ...]"
     runtime_caps: frozenset[ChildRuntimeCap]
+    # [S2 §3.3] ADD-only directory-tree leases. Default () keeps every existing
+    # construction (3-field) valid + inert.
+    tree_leases: "tuple[TreeLease, ...]" = ()
+    # [S2 §3.5] positive shell-capable signal. Default False = typed-only (the
+    # pre-S2 behavior). NO reuse of ChildRuntimeCap.NO_RAW_SHELL_WRITE.
+    shell_mode: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,3 +51,7 @@ class ChildPermissionContext:
     session_mode_revision: int
     budget: ChildBudget
     lease_expiry: Optional[datetime] = None
+    # [S2 §3.5] mirror of spawn_manifest.shell_mode hoisted to the top-level
+    # carrier so the two gate callers can read cpc.shell_mode without reaching
+    # into the manifest. Dormant in PR-3 (no caller reads it yet).
+    shell_mode: bool = False

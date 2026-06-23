@@ -43,12 +43,22 @@ class TestFilterMinimumRehydrate:
         payload = {
             "outcome": "success",
             "patch_manifest": {"file_count": 2},
+            "patch_manifest_ref": "coordinator/r1/wu1/manifest/abc",
             "cost_summary": {"total_cost_usd": 0.5},
             "needs_authorization_details": {"reason": "denied"},
             "final_state": "cancelled",
         }
         out = _filter_minimum_rehydrate(payload)
+        # [S2 §3.2 C1] Pin the new key explicitly. The bare
+        # ``set(out.keys()) == _MIN_REHYDRATE_KEYS`` equality is symmetric and
+        # would stay GREEN pre-impl (the key is dropped from BOTH sides); these
+        # two asserts go RED until the frozenset is extended.
+        assert "patch_manifest_ref" in out
+        assert "patch_manifest_ref" in _MIN_REHYDRATE_KEYS
         assert set(out.keys()) == _MIN_REHYDRATE_KEYS
+
+    def test_manifest_ref_in_whitelist(self) -> None:
+        assert "patch_manifest_ref" in _MIN_REHYDRATE_KEYS
 
     def test_strips_free_text_keys(self) -> None:
         payload = {
@@ -230,3 +240,39 @@ class TestPersistTerminalSafety:
 class TestMaxPayloadBytesContract:
     def test_64kb_constant(self) -> None:
         assert _MAX_PAYLOAD_BYTES == 64 * 1024
+
+
+# ── PII scan excludes the structured manifest ref ───────────────────────
+
+
+import hashlib
+
+from app.infrastructure.repositories.db_coordinator_result_envelope_store_repository import (  # noqa: E501
+    _pii_scan_target,
+)
+
+
+class TestPiiExcludesManifestRef:
+    def test_digest_like_manifest_ref_not_treated_as_pii(self) -> None:
+        # A content-addressed MinIO ref ends in a 64-char sha256 hex digest,
+        # which contains runs of 8+ digits → would trip the phone regex.
+        digest = hashlib.sha256(b"x").hexdigest()
+        ref = f"coordinator/r1/wu1/manifest/{digest}"
+        filtered = {"outcome": "success", "patch_manifest_ref": ref}
+        # The PII scan target must EXCLUDE the structured ref field, so the
+        # digit-run inside the digest does not cause redaction.
+        scan_target = _pii_scan_target(filtered)
+        assert ref not in scan_target
+
+    def test_email_in_non_excluded_field_still_caught(self) -> None:
+        # Regression: real PII in a non-excluded field is still scanned.
+        # The email here lives in ``needs_authorization_details.observed_evidence``
+        # (a whitelisted free-text-bearing field); assert the PII excluder only
+        # drops ``patch_manifest_ref``, nothing else.
+        filtered = {
+            "outcome": "success",
+            "patch_manifest_ref": "coordinator/r1/wu1/manifest/abc",
+            "needs_authorization_details": {"observed_evidence": "a@b.co"},
+        }
+        scan_target = _pii_scan_target(filtered)
+        assert "a@b.co" in scan_target

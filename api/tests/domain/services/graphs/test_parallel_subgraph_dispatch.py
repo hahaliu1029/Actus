@@ -11,9 +11,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from app.domain.models.path_validation import CoordinatorPathContractError
-from app.domain.models.work_unit import ProposedPath, WorkUnitRequest
+from app.domain.models.work_unit import ProposedPath, ProposedTree, WorkUnitRequest
 from app.domain.services.graphs.parallel_execution_subgraph import (
     _build_work_units_from_requests,
+    _coerce_units_typed_only_if_flag_off,
+    _reject_cross_unit_tree_overlap,
     dispatch_node,
 )
 
@@ -790,3 +792,649 @@ class TestBuildWorkUnitsPathContract:
         )
         units = _build_work_units_from_requests([req], "hash16", 1)
         assert units[0].write_lease == []
+
+
+@pytest.mark.anyio  # this file marks each async test individually (no module-level pytestmark)
+async def test_first_time_send_payload_carries_manifest_required() -> None:
+    write_req = WorkUnitRequest(
+        objective="write X",
+        phase="write",
+        allowed_tools=["file_write"],
+        proposed_paths=[ProposedPath(path="workspace/a.py", op="add")],
+    )
+    explore_req = WorkUnitRequest(
+        objective="explore Y",
+        phase="exploration",
+        allowed_tools=["file_read"],
+    )
+    state = _base_state(work_unit_requests=[write_req, explore_req])
+    config = _base_config(peek_returns=None)
+    cmd = await dispatch_node(state, config)
+    # cmd.goto is a list of Send; each .arg dict must carry manifest_required.
+    by_required = {
+        send.arg["work_unit_id"]: send.arg["manifest_required"]
+        for send in cmd.goto
+    }
+    # exactly one write-phase wu (manifest_required=True) + one exploration (False)
+    assert sorted(by_required.values()) == [False, True]
+
+
+@pytest.mark.anyio
+async def test_rehydrate_send_payload_carries_manifest_required() -> None:
+    """[S2 §3.2 R3-F1] The rehydrate dispatch builds its own Send payload
+    (parallel_execution_subgraph.py:1236) — assert it ALSO carries
+    manifest_required, keyed off the rehydrated WorkUnit's phase. Drives the
+    rehydrate branch via detect_existing_run returning a pending run (mirrors
+    the file's existing rehydrate tests, e.g.
+    test_peek_then_rehydrate_found_skips_bump_and_spawn)."""
+    # Two requests: index 0 = write-phase, index 1 = exploration. wu_ids are
+    # derived positionally as f"{hash16}.a{attempt}.{i}" (research:
+    # _build_work_units_from_requests :206), so wu_ids[0] is the write unit.
+    write_req = WorkUnitRequest(
+        objective="write X",
+        phase="write",
+        allowed_tools=["file_write"],
+        proposed_paths=[ProposedPath(path="workspace/a.py", op="add")],
+    )
+    explore_req = WorkUnitRequest(
+        objective="explore Y",
+        phase="exploration",
+        allowed_tools=["file_read"],
+    )
+    config = _base_config(peek_returns=3)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=3, count=2)
+    existing = MagicMock()
+    existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2"}
+    existing.pending = wu_ids
+    existing.terminal = {}  # no terminal envelopes ⇒ all pending fan out as Sends
+    existing.already_applied = None
+    config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
+        return_value=existing,
+    )
+    state = _base_state(work_unit_requests=[write_req, explore_req])
+    cmd = await dispatch_node(state, config)
+    # Rehydrate fan-out returns the pending Sends as cmd.goto.
+    by_required = {
+        send.arg["work_unit_id"]: send.arg["manifest_required"]
+        for send in cmd.goto
+    }
+    assert by_required[wu_ids[0]] is True   # write-phase wu ⇒ manifest required
+    assert by_required[wu_ids[1]] is False  # exploration wu ⇒ not required
+
+
+@pytest.mark.anyio
+async def test_rehydrate_unexpected_terminal_wu_id_fails_closed() -> None:
+    """[codex PR-2 R1 P1] A persisted terminal envelope keyed by a wu_id NOT in
+    the current attempt's work_units must fail-closed at the dispatcher BEFORE
+    the builder — never flowing a stale SUCCESS into the reducer.
+
+    ``CoordinatorRehydrateService.detect_existing_run`` builds ``terminal`` from
+    EVERY persisted envelope for the (attempt-scoped) ``coordinator_run_id``
+    with no filtering against the rebuilt ``work_units``. A wu_id in
+    ``terminal`` but outside ``expected_wu_ids`` means the persisted run shape
+    no longer matches the current plan (state ``work_unit_requests`` changed /
+    unit count shrank between dispatch and rehydrate). Left unguarded,
+    ``_build_pre_results_from_terminal`` computes ``manifest_required`` from
+    ``work_units_by_id.get(wu_id)`` → ``None`` for the unknown id → NO
+    demotion, and a self-consistent SUCCESS manifest would pass the reducer's
+    lineage cross-check (matched against the worker_result's own wu_id, not the
+    expected set) and inject out-of-plan writes into the apply plan. Mirror the
+    Step 6 (missing) / limbo guards: raise so the orchestrator surfaces an
+    operator-actionable error instead of a silent fail-open.
+    """
+    config = _base_config(peek_returns=3)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=3, count=2)
+    existing = MagicMock()
+    # Both expected children present & pending ⇒ no missing-child, no limbo.
+    existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2"}
+    existing.pending = wu_ids
+    # ... plus ONE stale terminal keyed by a wu_id NOT in the current plan.
+    stale = MagicMock()
+    stale.envelope_type = "RESULT_READY"
+    stale.payload = {"outcome": "success"}
+    stale.child_session_id = "c-stale"
+    existing.terminal = {"deadbeefdeadbeef.a3.9": stale}
+    existing.already_applied = None
+    config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
+        return_value=existing,
+    )
+    state = _base_state()
+    with pytest.raises(RuntimeError, match="unexpected terminal"):
+        await dispatch_node(state, config)
+
+
+@pytest.mark.anyio
+async def test_rehydrate_unexpected_pending_wu_id_fails_closed() -> None:
+    """[codex PR-2 R1 P1 — opus-review follow-up] Symmetric to the terminal
+    guard: an out-of-plan wu_id that is still PENDING (a child row exists for a
+    wu_id NOT in the current attempt's work_units) must ALSO fail-closed.
+
+    Without the union guard, Step 8 (``pending_sends``) would ``Send`` the
+    out-of-plan id to ``worker_node`` with
+    ``manifest_required = _phase_by_wu_id.get(wu_id) == "write"`` → ``None ==
+    "write"`` → ``False`` ⇒ no write-phase demotion, and the child's
+    self-consistent SUCCESS manifest would then fold into the apply plan via the
+    reducer's wu_id-self-referential lineage check — the identical out-of-plan
+    write injection the terminal guard closes. The guard rejects
+    ``(terminal ∪ pending) - expected_wu_ids`` so BOTH routes fail loudly.
+    """
+    config = _base_config(peek_returns=3)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=3, count=2)
+    oob = "cafebabecafebabe.a3.7"  # out-of-plan: not produced by this attempt
+    existing = MagicMock()
+    # Realistic shape: pending ⊆ children. Expected children present ⇒ no
+    # missing-child; nothing in terminal & all in pending ⇒ no limbo.
+    existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2", oob: "c3"}
+    existing.pending = [wu_ids[0], wu_ids[1], oob]
+    existing.terminal = {}
+    existing.already_applied = None
+    config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
+        return_value=existing,
+    )
+    state = _base_state()
+    with pytest.raises(RuntimeError, match="unexpected terminal/pending"):
+        await dispatch_node(state, config)
+
+
+@pytest.mark.anyio
+async def test_rehydrate_terminal_child_session_mismatch_fails_closed() -> None:
+    """[codex PR-2 R2 P1] A terminal envelope for an EXPECTED wu_id whose
+    child_session_id differs from the current child must fail-closed.
+
+    Terminal records are keyed by work_unit_id only, and (coordinator_run_id,
+    work_unit_id) is NOT yet unique on the sessions table (partial-unique
+    deferred to PR-7 — see the missing-child guard). A stale/duplicate child row
+    can therefore surface a terminal envelope produced by a DIFFERENT child than
+    the current ``child_session_ids[wu_id]`` (the newest child by created_at).
+    Left unguarded, ``_build_pre_results_from_terminal`` would turn that stale
+    envelope into the WorkerResult for the expected wu_id (and ``pending`` skips
+    the REAL current child), so a stale-child SUCCESS manifest folds into the
+    apply plan while the live child's work is dropped — the reducer's lineage
+    check validates run_id + wu_id but NOT child_session_id. Fail closed.
+    """
+    config = _base_config(peek_returns=3)
+    wu_ids = _expected_wu_ids("step-abc", attempt_ix=3, count=2)
+    existing = MagicMock()
+    # Current children for both expected wu_ids ⇒ no missing-child.
+    existing.child_session_ids = {wu_ids[0]: "c1-current", wu_ids[1]: "c2"}
+    existing.pending = [wu_ids[1]]  # wu1 still pending; wu0 has a terminal
+    # wu0's terminal was produced by a STALE child (≠ "c1-current").
+    stale = MagicMock()
+    stale.envelope_type = "RESULT_READY"
+    stale.payload = {"outcome": "success"}
+    stale.child_session_id = "c1-STALE"
+    existing.terminal = {wu_ids[0]: stale}  # in-plan id, wrong child
+    existing.already_applied = None
+    config["configurable"]["rehydrate_service"].detect_existing_run = AsyncMock(
+        return_value=existing,
+    )
+    state = _base_state()
+    with pytest.raises(RuntimeError, match="produced by child"):
+        await dispatch_node(state, config)
+
+
+
+
+# ── S2 PR-3 Task 3.6: tree-lease build/enrich + overlap + flag-off coercion ──
+
+
+def _tree_req(prefix: str) -> WorkUnitRequest:
+    return WorkUnitRequest(
+        objective="o", phase="write", allowed_tools=["file_write"],
+        proposed_paths=[],
+        proposed_trees=[ProposedTree(prefix=prefix, ops=frozenset({"add"}))],
+    )
+
+
+def _path_req(path: str, op: str = "add") -> WorkUnitRequest:
+    return WorkUnitRequest(
+        objective="o", phase="write", allowed_tools=["file_write"],
+        proposed_paths=[ProposedPath(path=path, op=op)],
+    )
+
+
+class TestBuildWorkUnitsTreeLease:
+    def test_build_sets_tree_lease_and_shell_mode(self):
+        units = _build_work_units_from_requests([_tree_req("workspace")], "h16", 1)
+        assert units[0].write_tree_lease[0].prefix == "workspace"
+        assert units[0].shell_mode is True
+
+    def test_build_canonicalizes_tree_prefix(self):
+        units = _build_work_units_from_requests([_tree_req("./workspace/")], "h16", 1)
+        assert units[0].write_tree_lease[0].prefix == "workspace"
+
+    def test_build_path_only_keeps_shell_mode_false(self):
+        units = _build_work_units_from_requests([_path_req("d/a.py")], "h16", 1)
+        assert units[0].shell_mode is False
+        assert units[0].write_tree_lease == []
+
+    def test_build_bad_tree_prefix_rejected(self):
+        # [deviation from plan-verbatim, justified by Task 3.2 design]
+        # Task 3.2 places ``validate_coordinator_tree_prefix`` on the
+        # ``ProposedTree.prefix`` field as a Pydantic ``AfterValidator`` (it
+        # mirrors ``ProposedPath``). So a bad prefix like "/etc" is rejected at
+        # ``ProposedTree`` CONSTRUCTION (inside ``_tree_req``) — BEFORE
+        # ``_build_work_units_from_requests`` ever runs. Pydantic re-wraps the
+        # ``CoordinatorPathContractError`` raised by the validator into a
+        # ``pydantic.ValidationError`` (both are ``ValueError`` subclasses). The
+        # test's intent — a bad tree prefix is rejected before any child spawns
+        # — holds; it is just rejected one layer earlier than the plan's test
+        # body assumed (raw ``CoordinatorPathContractError`` out of the build).
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            _build_work_units_from_requests([_tree_req("/etc")], "h16", 1)
+
+    def test_build_shell_mode_request_with_paths_only_no_tree_lease(self):
+        # P0: a legit shell-mode unit with ONLY exact file leases (shell_mode
+        # requested positively, NO proposed_trees) must build shell_mode=True
+        # with an EMPTY write_tree_lease. Before the fix the build derived
+        # shell_mode=bool(tree_leases), so this unit could NEVER activate shell
+        # mode (shell_mode stuck False). Tree leases are SUFFICIENT, not
+        # NECESSARY, for shell mode.
+        req = WorkUnitRequest(
+            objective="o", phase="write", allowed_tools=["file_write"],
+            proposed_paths=[ProposedPath(path="d/a.py", op="add")],
+            proposed_trees=[],
+            shell_mode=True,
+        )
+        units = _build_work_units_from_requests([req], "h16", 1)
+        assert units[0].shell_mode is True
+        assert units[0].write_tree_lease == []
+        # the exact file lease survives so the built unit is a valid write unit.
+        assert [l.path for l in units[0].write_lease] == ["d/a.py"]
+
+
+class TestEnrichmentPreservesShellSignals:
+    """[S2 §3.3/§3.5 — P0-1] The Step-4 enrichment loop in dispatch rebuilds
+    every WorkUnit. It MUST carry shell_mode + write_tree_lease through the
+    rebuild, otherwise the signals are stripped before _serialize_spawn_manifest
+    and never reach the child (PR-4/PR-5 stay dead even flag-on). We observe the
+    rebuilt unit indirectly through the serialized manifest bytes uploaded for
+    that unit (the enriched unit is what _serialize_spawn_manifest sees).
+    """
+
+    @pytest.mark.anyio
+    async def test_dispatch_enriched_manifest_preserves_shell_mode_and_tree_lease(
+        self, monkeypatch,
+    ) -> None:
+        import json as _json
+
+        from app.domain.services.graphs import (
+            parallel_execution_subgraph as _peg,
+        )
+
+        # Flag ON so the flag-off coercion (F27) does NOT strip the signals —
+        # we are isolating the enrichment rebuild, not the coercion.
+        monkeypatch.setenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", "true")
+
+        config = _base_config(peek_returns=None)
+        config["configurable"]["session_service"].create_session_with_parent = (
+            AsyncMock(side_effect=[_mk_session("c1")])
+        )
+        # Capture every manifest upload (filename="manifest.json") so we can
+        # decode the bytes the serializer produced for the enriched unit.
+        manifests: list[bytes] = []
+
+        async def _capture_put(*, prefix, content, filename=None):
+            if filename == "manifest.json":
+                manifests.append(content)
+            return "minio://manifest-ref"
+
+        config["configurable"]["artifact_storage"].put_content_addressed_bytes = (
+            AsyncMock(side_effect=_capture_put)
+        )
+
+        state = _base_state(work_unit_requests=[
+            WorkUnitRequest(
+                objective="shell-write", phase="write",
+                allowed_tools=["file_write"],
+                proposed_paths=[],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+        ])
+        await _peg.dispatch_node(state, config)
+
+        assert manifests, "no manifest.json uploaded"
+        data = _json.loads(manifests[0])
+        # With the P0-1 bug present (enrichment omits the fields), these would be
+        # shell_mode False / write_tree_lease [] -> this test FAILS.
+        assert data["shell_mode"] is True
+        assert data["write_tree_lease"] == [{"prefix": "workspace", "ops": ["add"]}]
+
+
+class TestCrossUnitTreeOverlap:
+    def test_file_lease_under_other_units_tree_rejected(self):
+        # F24: unit A leases tree "workspace"; unit B leases file
+        # "workspace/x.py" -> overlap -> reject.
+        units = _build_work_units_from_requests(
+            [_tree_req("workspace"), _path_req("workspace/x.py")], "h16", 1,
+        )
+        with pytest.raises(CoordinatorPathContractError, match="overlap"):
+            _reject_cross_unit_tree_overlap(units)
+
+    def test_tree_under_other_units_tree_rejected(self):
+        units = _build_work_units_from_requests(
+            [_tree_req("api"), _tree_req("api/gen")], "h16", 1,
+        )
+        with pytest.raises(CoordinatorPathContractError, match="overlap"):
+            _reject_cross_unit_tree_overlap(units)
+
+    def test_identical_tree_prefix_rejected(self):
+        # F24 + §3.3/§159: two units leasing the SAME prefix is a double-grant.
+        # tree_contains returns False for equal paths, so a bare
+        # tree_contains(a, b) check would WRONGLY accept this — the overlap
+        # helper must special-case equality.
+        units = _build_work_units_from_requests(
+            [_tree_req("workspace"), _tree_req("workspace")], "h16", 1,
+        )
+        with pytest.raises(CoordinatorPathContractError, match="overlap"):
+            _reject_cross_unit_tree_overlap(units)
+
+    def test_disjoint_trees_ok(self):
+        units = _build_work_units_from_requests(
+            [_tree_req("workspace"), _tree_req("api")], "h16", 1,
+        )
+        _reject_cross_unit_tree_overlap(units)  # no raise
+
+    def test_same_unit_file_under_own_tree_ok(self):
+        # A unit's own file lease under its own tree is not cross-unit overlap.
+        unit_req = WorkUnitRequest(
+            objective="o", phase="write", allowed_tools=["file_write"],
+            proposed_paths=[ProposedPath(path="workspace/x.py", op="add")],
+            proposed_trees=[ProposedTree(prefix="workspace", ops=frozenset({"add"}))],
+        )
+        units = _build_work_units_from_requests([unit_req], "h16", 1)
+        _reject_cross_unit_tree_overlap(units)  # no raise
+
+
+class TestFlagOffFailClosedCoercion:
+    def test_flag_off_coerces_shell_mode_unit_to_typed_only(self, monkeypatch):
+        # F27: master flag OFF -> any unit with shell_mode/tree lease is coerced
+        # back to typed-only (shell_mode False, write_tree_lease []).
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+        units = _build_work_units_from_requests(
+            [WorkUnitRequest(
+                objective="o", phase="write", allowed_tools=["file_write"],
+                proposed_paths=[ProposedPath(path="workspace/x.py", op="add")],
+                proposed_trees=[ProposedTree(prefix="workspace", ops=frozenset({"add"}))],
+            )],
+            "h16", 1,
+        )
+        assert units[0].shell_mode is True  # built with the signal
+        coerced = _coerce_units_typed_only_if_flag_off(units)
+        assert coerced[0].shell_mode is False
+        assert coerced[0].write_tree_lease == []
+        # the path lease survives so the unit is still a valid write unit.
+        assert [l.path for l in coerced[0].write_lease] == ["workspace/x.py"]
+
+    def test_flag_off_tree_only_unit_hard_rejected(self, monkeypatch):
+        # A tree-ONLY unit (no file lease) has no typed write to fall back to —
+        # "coercing" it would still spawn a child for a flag-off shell payload.
+        # Per spec §3.6/F27 ("hard-reject (or coerce typed-only)") it is HARD
+        # REJECTED, NOT demoted to exploration.
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+        units = _build_work_units_from_requests([_tree_req("workspace")], "h16", 1)
+        with pytest.raises(CoordinatorPathContractError, match="fail-closed"):
+            _coerce_units_typed_only_if_flag_off(units)
+
+    def test_flag_on_leaves_units_unchanged(self, monkeypatch):
+        monkeypatch.setenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", "true")
+        units = _build_work_units_from_requests([_tree_req("workspace")], "h16", 1)
+        coerced = _coerce_units_typed_only_if_flag_off(units)
+        assert coerced[0].shell_mode is True
+        assert coerced[0].write_tree_lease[0].prefix == "workspace"
+
+
+class TestDispatchNodeFlagOffFailClosed:
+    """[S2 §3.6 F27 — wiring guard] The helper tests above prove the COERCION
+    LOGIC. These prove the guard is actually WIRED INTO ``dispatch_node`` (both
+    build branches), not merely defined: an implementer who builds the helpers
+    but forgets to CALL them in ``dispatch_node`` would pass every helper test
+    but fail here. We drive the real ``dispatch_node`` with the master flag OFF
+    and a ``proposed_trees``-carrying request, then observe the units that
+    ENTERED dispatch via the serialized manifest bytes (MIXED → coerced
+    typed-only) and via the raised contract error (TREE-ONLY → hard-reject).
+    Covers BOTH the first-time build branch (``:313`` → ``_first_time_dispatch``)
+    and the rehydrate build branch (``:290`` → ``_rehydrate_dispatch``).
+    """
+
+    @pytest.mark.anyio
+    async def test_first_time_dispatch_mixed_unit_coerced_typed_only(
+        self, monkeypatch,
+    ) -> None:
+        import json as _json
+
+        from app.domain.services.graphs import (
+            parallel_execution_subgraph as _peg,
+        )
+
+        # Master flag OFF — the dispatch guard must coerce before enrichment.
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+
+        config = _base_config(peek_returns=None)
+        config["configurable"]["session_service"].create_session_with_parent = (
+            AsyncMock(side_effect=[_mk_session("c1")])
+        )
+        manifests: list[bytes] = []
+
+        async def _capture_put(*, prefix, content, filename=None):
+            if filename == "manifest.json":
+                manifests.append(content)
+            return "minio://manifest-ref"
+
+        config["configurable"]["artifact_storage"].put_content_addressed_bytes = (
+            AsyncMock(side_effect=_capture_put)
+        )
+
+        # MIXED unit: a real file lease + a tree lease / shell_mode. Flag OFF ⇒
+        # the tree lease + shell_mode are stripped but the typed write survives.
+        state = _base_state(work_unit_requests=[
+            WorkUnitRequest(
+                objective="mixed-write", phase="write",
+                allowed_tools=["file_write"],
+                proposed_paths=[ProposedPath(path="api/new.py", op="add")],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+        ])
+        await _peg.dispatch_node(state, config)
+
+        assert manifests, "no manifest.json uploaded"
+        data = _json.loads(manifests[0])
+        # The unit that ENTERED dispatch was coerced typed-only BEFORE serialize.
+        assert data["shell_mode"] is False
+        assert data["write_tree_lease"] == []
+        # The typed write survives so the unit is still a valid write unit.
+        assert data["write_lease"] == [
+            {"path": "api/new.py", "op": "add",
+             "base_digest": None, "seed_content_ref": None},
+        ]
+
+    @pytest.mark.anyio
+    async def test_flag_off_overlapping_trees_disjoint_paths_coerced_not_rejected(
+        self, monkeypatch,
+    ) -> None:
+        """[codex PR-3 R1 P1 — ordering] With the master flag OFF, two MIXED
+        units whose typed file leases are DISJOINT but whose tree leases OVERLAP
+        must be COERCED to typed-only (trees discarded) and dispatch — NOT
+        rejected by the overlap guard. Coercion MUST run BEFORE overlap: under
+        flag OFF the trees are stripped, so the (moot) tree overlap is irrelevant
+        and only the disjoint typed leases remain. Overlap-first spuriously
+        rejected this — an F27 dormancy violation that bites flag-OFF rollout
+        once the planner emits trees.
+        """
+        import json as _json
+
+        from app.domain.services.graphs import (
+            parallel_execution_subgraph as _peg,
+        )
+
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+
+        config = _base_config(peek_returns=None)  # default side_effect c1, c2
+        manifests: list[bytes] = []
+
+        async def _capture_put(*, prefix, content, filename=None):
+            if filename == "manifest.json":
+                manifests.append(content)
+            return "minio://manifest-ref"
+
+        config["configurable"]["artifact_storage"].put_content_addressed_bytes = (
+            AsyncMock(side_effect=_capture_put)
+        )
+
+        # Two MIXED units: DISJOINT typed paths, OVERLAPPING tree prefixes.
+        state = _base_state(work_unit_requests=[
+            WorkUnitRequest(
+                objective="mixed-a", phase="write", allowed_tools=["file_write"],
+                proposed_paths=[ProposedPath(path="api/a.py", op="add")],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+            WorkUnitRequest(
+                objective="mixed-b", phase="write", allowed_tools=["file_write"],
+                proposed_paths=[ProposedPath(path="api/b.py", op="add")],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+        ])
+
+        cmd = await _peg.dispatch_node(state, config)  # must NOT raise
+
+        # Both children spawned — no spurious overlap rejection.
+        assert config["configurable"][
+            "session_service"
+        ].create_session_with_parent.await_count == 2
+        assert len(cmd.goto) == 2
+        # Both units coerced typed-only (tree leases discarded under flag OFF).
+        assert manifests, "no manifest.json uploaded"
+        for raw in manifests:
+            data = _json.loads(raw)
+            assert data["shell_mode"] is False
+            assert data["write_tree_lease"] == []
+
+    @pytest.mark.anyio
+    async def test_first_time_dispatch_tree_only_unit_hard_rejected(
+        self, monkeypatch,
+    ) -> None:
+        from app.domain.models.path_validation import CoordinatorPathContractError
+        from app.domain.services.graphs import (
+            parallel_execution_subgraph as _peg,
+        )
+
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+
+        config = _base_config(peek_returns=None)
+        config["configurable"]["session_service"].create_session_with_parent = (
+            AsyncMock(side_effect=[_mk_session("c1")])
+        )
+
+        # TREE-ONLY unit (no file lease) + flag OFF ⇒ dispatch_node must raise,
+        # proving the guard is wired into the first-time build branch.
+        state = _base_state(work_unit_requests=[
+            WorkUnitRequest(
+                objective="shell-only", phase="write",
+                allowed_tools=["file_write"], proposed_paths=[],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+        ])
+        with pytest.raises(CoordinatorPathContractError, match="fail-closed"):
+            await _peg.dispatch_node(state, config)
+        # No child was spawned (hard-reject happens before dispatch).
+        config["configurable"][
+            "session_service"
+        ].create_session_with_parent.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_rehydrate_flag_off_overlapping_trees_disjoint_paths_coerced(
+        self, monkeypatch,
+    ) -> None:
+        """[codex PR-3 R2 P2] Ordering regression LOCK on the REHYDRATE branch.
+        The first-time branch is covered by
+        ``test_flag_off_overlapping_trees_disjoint_paths_coerced_not_rejected``;
+        the existing rehydrate test is tree-only-reject, which passes under
+        EITHER order. Two MIXED units with disjoint typed paths + overlapping
+        trees, flag OFF: coercion must strip the trees BEFORE overlap so the
+        rehydrate dispatch proceeds (both pending children re-dispatched), NOT
+        raise. Reverting the rehydrate branch to overlap-before-coerce makes
+        this raise."""
+        from app.domain.services.graphs import (
+            parallel_execution_subgraph as _peg,
+        )
+
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+
+        config = _base_config(peek_returns=2)
+        wu_ids = _expected_wu_ids("step-abc", attempt_ix=2, count=2)
+        existing = MagicMock()
+        existing.child_session_ids = {wu_ids[0]: "c1", wu_ids[1]: "c2"}
+        existing.pending = wu_ids
+        existing.terminal = {}
+        existing.already_applied = None
+        config["configurable"]["rehydrate_service"].detect_existing_run = (
+            AsyncMock(return_value=existing)
+        )
+
+        state = _base_state(work_unit_requests=[
+            WorkUnitRequest(
+                objective="mixed-a", phase="write", allowed_tools=["file_write"],
+                proposed_paths=[ProposedPath(path="api/a.py", op="add")],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+            WorkUnitRequest(
+                objective="mixed-b", phase="write", allowed_tools=["file_write"],
+                proposed_paths=[ProposedPath(path="api/b.py", op="add")],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+        ])
+        cmd = await _peg.dispatch_node(state, config)  # must NOT raise
+        # Both pending children re-dispatched — no spurious overlap rejection.
+        assert len(cmd.goto) == 2
+
+    @pytest.mark.anyio
+    async def test_rehydrate_dispatch_tree_only_unit_hard_rejected(
+        self, monkeypatch,
+    ) -> None:
+        from app.domain.models.path_validation import CoordinatorPathContractError
+        from app.domain.services.graphs import (
+            parallel_execution_subgraph as _peg,
+        )
+
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED", raising=False)
+
+        # Route the rehydrate build branch (:290): peek hits + detect returns an
+        # existing run. The guard must run on the units built there too.
+        config = _base_config(peek_returns=2)
+        wu_ids = _expected_wu_ids("step-abc", attempt_ix=2, count=1)
+        existing = MagicMock()
+        existing.child_session_ids = {wu_ids[0]: "c1"}
+        existing.pending = wu_ids
+        existing.terminal = {}
+        existing.already_applied = None
+        config["configurable"]["rehydrate_service"].detect_existing_run = (
+            AsyncMock(return_value=existing)
+        )
+
+        state = _base_state(work_unit_requests=[
+            WorkUnitRequest(
+                objective="shell-only", phase="write",
+                allowed_tools=["file_write"], proposed_paths=[],
+                proposed_trees=[
+                    ProposedTree(prefix="workspace", ops=frozenset({"add"})),
+                ],
+            ),
+        ])
+        with pytest.raises(CoordinatorPathContractError, match="fail-closed"):
+            await _peg.dispatch_node(state, config)

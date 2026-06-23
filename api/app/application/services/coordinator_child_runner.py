@@ -82,6 +82,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# [S2 §3.2 C1] Inline-vs-ref ceiling for the SUCCESS PatchManifest. The
+# terminal envelope store collapses a persisted payload >64KB to a
+# {outcome,_truncated} marker (DbCoordinatorResultEnvelopeStoreRepository
+# .persist_terminal, guarding _MAX_PAYLOAD_BYTES), silently dropping a large
+# inline manifest → zero-apply. Below this
+# ceiling we keep the manifest inline (cheap, no extra MinIO round-trip on
+# resolve); above it (strictly > ceiling; exactly == ceiling stays inline, per
+# the ``<=`` test below) we upload the manifest to MinIO and carry a tiny
+# patch_manifest_ref instead. Margin under 64KB leaves room for the rest of the
+# envelope (summary, cost_summary, etc.) that also counts toward the cap.
+_MAX_INLINE_MANIFEST_BYTES = 48 * 1024
+
+
 class _SeedInstallError(Exception):
     """[finish-core §5.1.4] Raised when child seed-install fails (fetch /
     write / digest mismatch). Routed to _finalize_failed (reason seed_*)."""
@@ -494,6 +507,55 @@ class CoordinatorChildRunner:
             )
         return await self._finalize_cancelled(run_id, wu, child_id)
 
+    async def _build_manifest_payload_inline_or_ref(
+        self,
+        run_id: str,
+        wu: "WorkUnit",
+        patch_manifest: PatchManifest,
+        *,
+        summary: str,
+    ) -> ResultReadyPayload:
+        """[S2 §3.2 C1] BUILD (do NOT publish) a SUCCESS RESULT_READY payload
+        carrying the manifest either INLINE (small) or BY MinIO REF (large), and
+        RETURN it. The terminal store truncates a persisted payload >64KB to a
+        marker (dropping a large inline manifest → silent zero-apply); uploading
+        the manifest and carrying a tiny ``patch_manifest_ref`` instead lets a
+        large write set survive persist + rehydrate. Inline and ref are mutually
+        exclusive (ResultReadyPayload validator, Task 2.1).
+
+        [defect-fix R2 P1] BUILD-ONLY by design: the ``put_content_addressed_bytes``
+        upload is a NEW failure source, so the caller invokes this INSIDE its
+        protected (extraction) region — an upload failure then degrades to a
+        terminal FAILED/NEEDS_AUTHORIZATION envelope rather than escaping with no
+        terminal envelope and stranding the parent waiter. The caller does the
+        single unprotected publish OUTSIDE that region (F2 P0). Reused by the
+        PR-4 snapshot-capture finalizer (same name/signature; it builds inside
+        its own protected region and publishes outside)."""
+        manifest_json = patch_manifest.model_dump_json()
+        if len(manifest_json.encode("utf-8")) <= _MAX_INLINE_MANIFEST_BYTES:
+            return ResultReadyPayload(
+                summary=summary,
+                outcome=ResultReadyOutcome.SUCCESS,
+                patch_manifest=patch_manifest,
+            )
+        ref = await self._artifact_storage.put_content_addressed_bytes(
+            prefix=f"coordinator/{run_id}/{wu.work_unit_id}/manifest/",
+            content=manifest_json.encode("utf-8"),
+        )
+        logger.info(
+            "CoordinatorChildRunner: manifest for wu=%s exceeds inline ceiling "
+            "(%d bytes > %d); carrying by ref=%s",
+            wu.work_unit_id,
+            len(manifest_json.encode("utf-8")),
+            _MAX_INLINE_MANIFEST_BYTES,
+            ref,
+        )
+        return ResultReadyPayload(
+            summary=summary,
+            outcome=ResultReadyOutcome.SUCCESS,
+            patch_manifest_ref=ref,
+        )
+
     async def _finalize_success(
         self, run_id: str, wu: "WorkUnit", child_id: str, done_event: Any,
     ) -> ResultReadyPayload:
@@ -520,19 +582,25 @@ class CoordinatorChildRunner:
                 work_unit_id=wu.work_unit_id,
                 files=tuple(files),
             )
+            # [S2 §3.2 C1 + defect-fix R2 P1] BUILD the payload (inline or, for
+            # an oversized manifest, by MinIO ref) INSIDE this try. The by-ref
+            # upload is a NEW failure source: keeping it here means an upload
+            # failure degrades to a terminal FAILED envelope via the generic
+            # ``except`` below — exactly like an extraction failure — instead of
+            # escaping run_work_unit's finally-only outer wrapper with NO
+            # terminal envelope (which would strand the parent waiter).
+            payload = await self._build_manifest_payload_inline_or_ref(
+                run_id, wu, patch_manifest,
+                summary=f"completed {wu.work_unit_id}",
+            )
         except _OutOfLeaseWriteError as exc:
             return await self._finalize_needs_authorization_out_of_lease(
                 run_id, wu, child_id, exc,
             )
-        except Exception as exc:  # noqa: BLE001 — ValidationError + sandbox/artifact errors
+        except Exception as exc:  # noqa: BLE001 — ValidationError + sandbox/artifact/upload errors
             return await self._finalize_failed(run_id, wu, child_id, exc)
-        # [F2 P0] _publish_result_ready intentionally OUTSIDE the try above so a
-        # publish failure is not swallowed + re-published as FAILED.
-        payload = ResultReadyPayload(
-            summary=f"completed {wu.work_unit_id}",
-            outcome=ResultReadyOutcome.SUCCESS,
-            patch_manifest=patch_manifest,
-        )
+        # [F2 P0] The single _publish_result_ready intentionally OUTSIDE the try
+        # above so a publish failure is not swallowed + re-published as FAILED.
         await self._publish_result_ready(child_id, payload)
         return payload
 

@@ -32,6 +32,7 @@ from app.infrastructure.external.sandbox.parent_sandbox_adapter import (
     ParentSandboxAdapter,
 )
 from app.domain.models.work_unit import PathLease  # PathLease lives on work_unit, NOT child_permission_context
+from app.domain.models.work_unit import TreeLease
 from app.domain.services.permission.child_permission_context import (
     ChildBudget,
     ChildPermissionContext,
@@ -107,6 +108,18 @@ def _decode_path_lease(pl: dict[str, Any]) -> PathLease:
         base_digest=pl.get("base_digest"),
         seed_content_ref=pl.get("seed_content_ref"),
     )
+
+
+def _decode_tree_lease(tl: dict[str, Any]) -> TreeLease:
+    """[S2 §3.3] TreeLease wire-payload decoder, mirroring _decode_path_lease.
+
+    The canonical wire format emitted by _serialize_spawn_manifest is
+    ``{"prefix": <str>, "ops": [<"add">...]}``. ``ops`` is rebuilt into the
+    frozenset the model requires; ``prefix`` is required (KeyError on absence so
+    a malformed manifest fails loudly with a clear pointer to the wire-schema
+    bug, same fail-loud convention as _decode_path_lease's missing ``op``).
+    """
+    return TreeLease(prefix=tl["prefix"], ops=frozenset(tl["ops"]))
 
 
 class _PreBoundPricing:
@@ -204,12 +217,31 @@ class DefaultCoordinatorChildRunnerStarter:
         # 1. Fetch + decode SpawnManifest.
         raw = await self._artifact_storage.get_bytes(spawn_manifest_ref)
         data = json.loads(raw)
+        # [S2 §3.3/§3.5] decode write_tree_lease + shell_mode symmetrically with
+        # _serialize_spawn_manifest. A LEGACY manifest missing these keys decodes
+        # to tree_leases=() / shell_mode=False -> typed-only (the inert default).
+        # [codex PR-3 R2 P1] shell_mode is a STRICT bool — do NOT bool()-coerce:
+        # bool("false") is True, so a malformed/tampered string value would
+        # fail-OPEN to shell-mode. A present non-bool is a corrupt manifest;
+        # propagate loudly (consistent with the malformed-manifest contract
+        # below). Legacy-missing returns the bool default False, unaffected.
+        _raw_shell_mode = data.get("shell_mode", False)
+        if not isinstance(_raw_shell_mode, bool):
+            raise ValueError(
+                f"SpawnManifest shell_mode must be a bool, got "
+                f"{type(_raw_shell_mode).__name__}={_raw_shell_mode!r}"
+            )
+        shell_mode = _raw_shell_mode
         spawn_manifest = SpawnManifest(
             allowed_tools=frozenset(data["allowed_tools"]),
             path_leases=tuple(_decode_path_lease(pl) for pl in data["write_lease"]),
             runtime_caps=frozenset(
                 ChildRuntimeCap(c) for c in data.get("runtime_caps", [])
             ),
+            tree_leases=tuple(
+                _decode_tree_lease(tl) for tl in data.get("write_tree_lease", [])
+            ),
+            shell_mode=shell_mode,
         )
         # 2. session_mode_revision.
         session_mode_revision = await self._session_repository.read_mode_revision(
@@ -232,6 +264,7 @@ class DefaultCoordinatorChildRunnerStarter:
             session_mode_revision=session_mode_revision,
             budget=budget,
             lease_expiry=None,
+            shell_mode=shell_mode,  # [S2 §3.5] mirror manifest signal onto carrier
         )
         # 5-11. Provision + spawn under an M1-safe leak-guard. Steps 1-4
         # (manifest decode / revision / budget / ChildPermissionContext)

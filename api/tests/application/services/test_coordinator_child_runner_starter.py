@@ -884,3 +884,149 @@ async def test_active_runners_reaped_on_task_done(monkeypatch):
         await asyncio.sleep(0.01)
     assert "child-r" not in starter._active_runners
     assert "child-r" not in starter._active_tasks
+
+
+def _manifest_bytes_with_shell() -> bytes:
+    """S2 manifest carrying the new write_tree_lease + shell_mode keys."""
+    return json.dumps({
+        "allowed_tools": ["file_read", "file_write"],
+        "write_lease": [{"path": "a/b.py", "op": "modify", "base_digest": "b" * 64}],
+        "write_tree_lease": [{"prefix": "workspace", "ops": ["add"]}],
+        "shell_mode": True,
+        "runtime_caps": [],
+    }).encode("utf-8")
+
+
+async def test_legacy_manifest_missing_shell_mode_decodes_typed_only(monkeypatch):
+    """A 3-field legacy manifest ⇒ shell_mode False, tree_leases empty.
+
+    The starter decodes the manifest into a SpawnManifest, builds a
+    ChildPermissionContext from it, and hands that cpc to
+    ``runner_factory.build(child_permission_context=..., ...)`` — so we read it
+    back off the fake factory's recorded ``call_args`` (NOT a runner-ctor kwarg:
+    CoordinatorChildRunner.__init__ takes no child_permission_context).
+    """
+    captured: dict = {}
+
+    class _NoopChildRunner:
+        def __init__(self, **kwargs):
+            captured["ctor"] = kwargs
+
+        def attach_budget_callback(self, cb):
+            pass
+
+        async def run_work_unit(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter."
+        "CoordinatorChildRunner",
+        _NoopChildRunner,
+    )
+
+    runner_factory = _FakeRunnerFactory()
+    # legacy 3-field payload from the existing _manifest_bytes() builder.
+    starter = _make_starter(runner_factory=runner_factory)
+
+    await starter.start(
+        coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1", spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(), root_session_id="root-1",
+        parent_session_id="parent-1", parent_sandbox=MagicMock(), user_id="user-1",
+    )
+
+    cpc = runner_factory.call_args["child_permission_context"]
+    assert cpc.spawn_manifest.shell_mode is False
+    assert cpc.spawn_manifest.tree_leases == ()
+    assert cpc.shell_mode is False
+
+
+async def test_s2_manifest_round_trips_tree_lease_and_shell_mode(monkeypatch):
+    from app.domain.models.work_unit import TreeLease
+
+    captured: dict = {}
+
+    class _NoopChildRunner:
+        def __init__(self, **kwargs):
+            captured["ctor"] = kwargs
+
+        def attach_budget_callback(self, cb):
+            pass
+
+        async def run_work_unit(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter."
+        "CoordinatorChildRunner",
+        _NoopChildRunner,
+    )
+
+    runner_factory = _FakeRunnerFactory()
+    starter = _make_starter(runner_factory=runner_factory)
+    # Swap the artifact payload to the S2 manifest carrying the new keys
+    # (_make_starter wires a default _FakeArtifactStorage(_manifest_bytes());
+    # the field is the public-by-convention `_artifact_storage` decode source).
+    starter._artifact_storage = _FakeArtifactStorage(_manifest_bytes_with_shell())
+
+    await starter.start(
+        coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1", spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(), root_session_id="root-1",
+        parent_session_id="parent-1", parent_sandbox=MagicMock(), user_id="user-1",
+    )
+
+    cpc = runner_factory.call_args["child_permission_context"]
+    assert cpc.spawn_manifest.shell_mode is True
+    assert cpc.shell_mode is True
+    assert cpc.spawn_manifest.tree_leases == (
+        TreeLease(prefix="workspace", ops=frozenset({"add"})),
+    )
+
+
+async def test_malformed_string_shell_mode_rejected(monkeypatch):
+    """[codex PR-3 R2 P1] A non-bool ``shell_mode`` (e.g. the string "false")
+    must be REJECTED, not ``bool()``-coerced. ``bool("false")`` is True, so a
+    malformed/tampered manifest would fail-OPEN to shell-mode. The decode
+    requires a strict bool; a present non-bool propagates loudly (consistent
+    with the malformed-manifest contract). Legacy-missing still defaults to the
+    bool False, so it is unaffected (covered by the legacy test above)."""
+    import json as _json
+
+    runner_factory = _FakeRunnerFactory()
+    starter = _make_starter(runner_factory=runner_factory)
+    bad = _json.dumps({
+        "allowed_tools": ["file_read"],
+        "write_lease": [
+            {"path": "a/b.py", "op": "modify", "base_digest": "b" * 64},
+        ],
+        "shell_mode": "false",  # string, not bool — bool("false") is True
+        "runtime_caps": [],
+    }).encode("utf-8")
+    starter._artifact_storage = _FakeArtifactStorage(bad)
+
+    with pytest.raises(ValueError, match="shell_mode"):
+        await starter.start(
+            coordinator_run_id="run-1", work_unit=_FakeWorkUnit("wu-1"),
+            child_session_id="child-1", spawn_manifest_ref="ref-1",
+            cancel_event=asyncio.Event(), root_session_id="root-1",
+            parent_session_id="parent-1", parent_sandbox=MagicMock(),
+            user_id="user-1",
+        )
+
+
+def test_serialize_spawn_manifest_emits_s2_keys():
+    from app.domain.models.work_unit import TreeLease, WorkUnit
+    from app.domain.services.graphs.parallel_execution_subgraph import (
+        _serialize_spawn_manifest,
+    )
+
+    wu = WorkUnit(
+        work_unit_id="wu-1", objective="o", phase="write",
+        allowed_tools=["file_write"], write_lease=[],
+        write_tree_lease=[TreeLease(prefix="workspace", ops=frozenset({"add"}))],
+        shell_mode=True,
+    )
+    data = json.loads(_serialize_spawn_manifest(wu))
+    assert data["shell_mode"] is True
+    assert data["write_tree_lease"] == [{"prefix": "workspace", "ops": ["add"]}]

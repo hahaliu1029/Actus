@@ -223,3 +223,62 @@ def validate_coordinator_path(value: str) -> str:
             f"subdirectory such as 'workspace/'."
         )
     return canonical
+
+
+def validate_coordinator_tree_prefix(value: str) -> str:
+    """[S2 §3.3 tree-lease boundary] Validate AND canonicalize a planner-proposed
+    tree-lease prefix to the ONE canonical workspace-relative DIRECTORY form.
+
+    Sibling of ``validate_coordinator_path`` but for a DIRECTORY prefix (a
+    ``TreeLease.prefix``), NOT a file path — so unlike that helper it ACCEPTS a
+    single-segment dir (``workspace``, ``api``): a tree prefix names a directory
+    under which ADD-only writes are authorized, and a top-level directory is a
+    legitimate (indeed the common) prefix. It still rejects the workspace root
+    itself, absolute-outside-root, NUL/newline/``..`` traversal, and the empty /
+    ``.`` (root) shapes.
+
+    Returns the canonical relative form (``./workspace`` and ``workspace/`` and
+    ``/home/ubuntu/workspace`` all -> ``workspace``) so the prefix the planner
+    leases is the SAME shape the dispatch overlap check + child manifest +
+    capture-side ``tree_contains`` all agree on.
+    """
+    try:
+        validate_relative_path(value)
+    except CoordinatorPathContractError:
+        raise
+    except ValueError as exc:
+        raise CoordinatorPathContractError(str(exc)) from exc
+    canonical = to_workspace_relative(posixpath.normpath(value))
+    # posixpath.normpath("") == ".", normpath(".") == "."; to_workspace_relative
+    # passes "." through unchanged (it is relative). Reject the root / empty
+    # shapes: a tree prefix must name a real directory under the root.
+    if canonical in ("", ".", "/"):
+        raise CoordinatorPathContractError(
+            f"tree prefix cannot be the workspace root or empty: {value!r}; "
+            f"a tree lease must name a directory under the root "
+            f"(e.g. 'workspace', 'api/gen')."
+        )
+    return canonical
+
+
+def tree_contains(prefix: str, path: str) -> bool:
+    """[S2 §3.3] True iff ``path`` is STRICTLY inside the directory ``prefix`` —
+    by POSIX path-component containment (``posixpath.commonpath``), NOT string
+    prefix (so ``workspace-foo`` is NOT under ``workspace``). The prefix itself
+    is NOT "contained" (a tree lease authorizes files under the dir, not the dir
+    inode). Both args are workspace-relative canonical forms (the shape
+    ``validate_coordinator_tree_prefix`` / ``to_workspace_relative`` produce).
+
+    Used by (a) the dispatch overlap check (one unit's file/tree lease must not
+    fall inside another unit's tree prefix) and (b) the capture-side membership
+    test in PR-2. Single source of truth so all three agree.
+    """
+    norm_prefix = posixpath.normpath(prefix)
+    norm_path = posixpath.normpath(path)
+    if norm_prefix == norm_path:
+        return False
+    try:
+        return posixpath.commonpath([norm_prefix, norm_path]) == norm_prefix
+    except ValueError:
+        # mixed abs/rel or empty -> not contained (fail-closed).
+        return False

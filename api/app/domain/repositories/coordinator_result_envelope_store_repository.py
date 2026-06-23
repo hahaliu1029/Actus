@@ -47,9 +47,9 @@ class CoordinatorResultEnvelopeStoreRepository(ABC):
         cheap future widening).
 
         ``payload`` is filtered by the impl to the minimum rehydrate
-        subset (``outcome``, ``patch_manifest``, ``cost_summary``,
-        ``needs_authorization_details``, ``final_state``); free-text
-        fields are stripped, oversized payloads truncated, and PII
+        subset (``outcome``, ``patch_manifest``, ``patch_manifest_ref``,
+        ``cost_summary``, ``needs_authorization_details``, ``final_state``);
+        free-text fields are stripped, oversized payloads truncated, and PII
         regex hits redacted before insert.
         """
 

@@ -37,8 +37,8 @@ during rare windows where rows are being moved around for backfill
 maintenance.
 
 **Payload is JSONB minimum rehydrate fields only.** The repo layer
-filters incoming dicts to ``{outcome, patch_manifest, cost_summary,
-needs_authorization_details, final_state}`` before insert — free-text
+filters incoming dicts to ``{outcome, patch_manifest, patch_manifest_ref,
+cost_summary, needs_authorization_details, final_state}`` before insert — free-text
 fields (assistant message, raw tool transcripts) are stripped to keep
 the row narrow (target ≤ 64KB) and to avoid persisting model-generated
 text into a long-term recovery table. PII regex guards (email / phone)

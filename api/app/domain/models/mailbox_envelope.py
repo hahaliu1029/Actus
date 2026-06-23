@@ -180,9 +180,12 @@ class ResultReadyPayload(BaseModel):
     # [C2-full S2 §3.2 C1] MinIO ref to a full PatchManifest JSON, used when
     # the inline manifest would exceed the envelope-store 64KB whitelist
     # ceiling (shell-mode children can produce large patch sets). SUCCESS-only
-    # and MUTUALLY EXCLUSIVE with inline ``patch_manifest`` — exactly one of
-    # the two carries the write set. worker_node / the rehydrate builder
-    # resolve the ref via artifact_storage.get_bytes before the reducer runs.
+    # and MUTUALLY EXCLUSIVE with inline ``patch_manifest`` — AT MOST one of
+    # the two carries the write set (the model layer permits a both-None
+    # SUCCESS; the write-phase "a manifest MUST be present/resolvable"
+    # invariant is enforced at the graph layer — see ``_outcome_field_matrix``
+    # below). worker_node / the rehydrate builder resolve the ref via
+    # artifact_storage.get_bytes before the reducer runs.
     patch_manifest_ref: Optional[str] = None
     # [C2 PR-4 §6.2 + r14 P1-2] structured grievance; required when
     # outcome=NEEDS_AUTHORIZATION. Free-text rationale lives in
@@ -203,8 +206,11 @@ class ResultReadyPayload(BaseModel):
         - patch_manifest is allowed on SUCCESS only (other outcomes have no
           meaningful write set to apply)
         - [S2 §3.2 C1] patch_manifest_ref is allowed on SUCCESS only and is
-          mutually exclusive with inline patch_manifest (exactly one carries
-          the write set; both-None is a legal exploration-phase SUCCESS).
+          mutually exclusive with inline patch_manifest (at most one carries
+          the write set). This model layer is phase-agnostic, so it permits a
+          both-None SUCCESS; the write-phase "a resolvable manifest MUST be
+          present" invariant is enforced downstream at the graph layer
+          (``worker_node`` / rehydrate demotion to FAILED), not here.
         """
         if self.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION:
             if self.needs_authorization_details is None:
@@ -232,7 +238,7 @@ class ResultReadyPayload(BaseModel):
         if self.patch_manifest is not None and self.patch_manifest_ref is not None:
             raise ValueError(
                 "patch_manifest and patch_manifest_ref are mutually exclusive "
-                "(exactly one may carry the write set)"
+                "(at most one may carry the write set)"
             )
         return self
 

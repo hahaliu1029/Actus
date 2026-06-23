@@ -52,6 +52,7 @@ import json
 import logging
 import operator
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any, Optional, TypedDict
 
 if TYPE_CHECKING:
@@ -76,9 +77,17 @@ from app.domain.models.mailbox_envelope import (
     MailboxEnvelopeType,
     ResultReadyOutcome,
 )
-from app.domain.models.path_validation import validate_coordinator_path
+from app.domain.models.path_validation import (
+    CoordinatorPathContractError,
+    tree_contains,
+    validate_coordinator_path,
+    validate_coordinator_tree_prefix,
+)
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
-from app.domain.models.work_unit import PathLease, WorkUnit
+from app.domain.models.work_unit import PathLease, TreeLease, WorkUnit
+from app.domain.services.coordinator_shell_mode_flag import (
+    is_coordinator_shell_mode_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +117,12 @@ class WorkerResult:
         summary: Optional[str] = None,
         patch_manifest: Optional[Any] = None,
         needs_authorization_details: Optional[Any] = None,
+        # [C2-full S2 §3.2 R3-F1] When True, a SUCCESS worker with no resolved
+        # patch_manifest is demoted to FAILED before the reducer (write-phase
+        # SUCCESS must carry a manifest; a dropped/truncated/unresolvable one
+        # must never silently zero-apply). Threaded onto the Send payload so
+        # worker_node's demotion decision is local (no per-worker phase lookup).
+        manifest_required: bool = False,
     ) -> None:
         self.work_unit_id = work_unit_id
         self.child_session_id = child_session_id
@@ -117,6 +132,7 @@ class WorkerResult:
         self.summary = summary
         self.patch_manifest = patch_manifest
         self.needs_authorization_details = needs_authorization_details
+        self.manifest_required = manifest_required
 
 
 class ParallelSubgraphState(TypedDict, total=False):
@@ -196,6 +212,23 @@ def _build_work_units_from_requests(
     """
     units: list[WorkUnit] = []
     for i, req in enumerate(work_unit_requests):
+        tree_leases = [
+            TreeLease(
+                prefix=validate_coordinator_tree_prefix(t.prefix),
+                ops=frozenset(t.ops),
+            )
+            for t in getattr(req, "proposed_trees", []) or []
+        ]
+        # [S2 §3.3/§3.5] shell_mode is the OR of TWO sufficient signals:
+        #   (1) the request's OWN positive shell_mode (§3.5 — a unit may request
+        #       shell mode with ONLY exact file leases, NO tree leases), AND
+        #   (2) the "tree lease IMPLIES shell_mode" rule (§3.3 — a non-empty tree
+        #       lease is sufficient on its own).
+        # Reading ONLY bool(tree_leases) would (a) strand a legit shell-mode unit
+        # that has only exact file leases (shell_mode stays False forever) and
+        # (b) silently drop the request's positive shell_mode signal. A
+        # path-only / exploration unit with shell_mode unset stays typed-only.
+        shell_mode = bool(getattr(req, "shell_mode", False)) or bool(tree_leases)
         units.append(
             WorkUnit(
                 work_unit_id=f"{step_id_hash16}.a{attempt_ix}.{i}",
@@ -206,10 +239,93 @@ def _build_work_units_from_requests(
                     PathLease(path=validate_coordinator_path(p.path), op=p.op)
                     for p in req.proposed_paths
                 ],
+                write_tree_lease=tree_leases,
+                shell_mode=shell_mode,
                 expected_result_schema=req.expected_result_schema,
             )
         )
     return units
+
+
+def _reject_cross_unit_tree_overlap(units: list[WorkUnit]) -> None:
+    """[S2 §3.3 F24] Reject any cross-unit lease overlap: one unit's tree prefix
+    must not contain another unit's file lease or tree prefix (component-aware
+    via ``tree_contains``). Same-unit nesting (a unit's own file under its own
+    tree) is fine — only CROSS-unit overlap strands the parallel apply plan
+    (two children both authorized to create under the same dir). Raises
+    ``CoordinatorPathContractError`` BEFORE any child spawns."""
+    for i, unit_a in enumerate(units):
+        for tl in unit_a.write_tree_lease:
+            for j, unit_b in enumerate(units):
+                if i == j:
+                    continue
+                for pl in unit_b.write_lease:
+                    if tree_contains(tl.prefix, pl.path):
+                        raise CoordinatorPathContractError(
+                            f"tree/file lease overlap: unit {unit_a.work_unit_id} "
+                            f"leases tree {tl.prefix!r} which contains unit "
+                            f"{unit_b.work_unit_id}'s file lease {pl.path!r}"
+                        )
+                for tl_b in unit_b.write_tree_lease:
+                    # [S2 §3.3 F24] tree/tree overlap is symmetric AND includes
+                    # the IDENTICAL-prefix case. ``tree_contains`` returns False
+                    # for EQUAL paths (a prefix is not "inside" itself), so two
+                    # units each leasing ``workspace`` would BOTH pass a bare
+                    # ``tree_contains`` check — the exact double-grant §3.3/§159
+                    # dispatch-time rejection must catch. Compare both directions
+                    # plus equality.
+                    if (
+                        tl.prefix == tl_b.prefix
+                        or tree_contains(tl.prefix, tl_b.prefix)
+                        or tree_contains(tl_b.prefix, tl.prefix)
+                    ):
+                        raise CoordinatorPathContractError(
+                            f"tree/tree lease overlap: unit {unit_a.work_unit_id} "
+                            f"leases tree {tl.prefix!r} which overlaps unit "
+                            f"{unit_b.work_unit_id}'s tree {tl_b.prefix!r}"
+                        )
+
+
+def _coerce_units_typed_only_if_flag_off(units: list[WorkUnit]) -> list[WorkUnit]:
+    """[S2 §3.6 F27] FLAG-OFF ACTIVE FAIL-CLOSED. While the master shell-mode
+    flag is OFF, the spec wants any unit carrying ``shell_mode=True`` / a
+    non-empty ``write_tree_lease`` "hard-rejected (or coerced typed-only)". The
+    distinction turns on whether a TYPED write survives the strip:
+
+    - **MIXED unit** (has a ``write_lease`` AND a tree lease / shell_mode): the
+      typed write is still authorized, so the tree lease + ``shell_mode`` are
+      stripped and the unit runs typed-only (``shell_mode=False`` +
+      ``write_tree_lease=[]``). The path lease survives unchanged.
+    - **TREE-ONLY unit** (no ``write_lease``, only a tree lease / shell_mode):
+      there is NO typed write to fall back to. "Coercing" it to exploration
+      would still SPAWN a child for a stale / hand-crafted shell payload, which
+      is precisely the attack F27 closes. So it is **HARD REJECTED** —
+      ``CoordinatorPathContractError`` raised BEFORE any child spawns.
+
+    Flag ON -> identity (no coercion).
+    """
+    if is_coordinator_shell_mode_enabled():
+        return units
+    coerced: list[WorkUnit] = []
+    for u in units:
+        if not u.shell_mode and not u.write_tree_lease:
+            coerced.append(u)
+            continue
+        if u.write_lease:
+            # MIXED: the typed write survives; strip the dormant shell signals.
+            coerced.append(
+                u.model_copy(update={"shell_mode": False, "write_tree_lease": []})
+            )
+        else:
+            # TREE-ONLY: nothing typed survives the strip -> hard-reject, do NOT
+            # spawn a child for a flag-off shell payload (F27 active fail-closed).
+            raise CoordinatorPathContractError(
+                f"shell-mode unit {u.work_unit_id} carries a tree lease / "
+                f"shell_mode but no file lease while "
+                f"ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED is OFF; refusing to "
+                f"dispatch a shell-capable child (F27 active fail-closed)."
+            )
+    return coerced
 
 
 def _log_orchestrator_task_done(task: asyncio.Task) -> None:
@@ -230,13 +346,26 @@ def _log_orchestrator_task_done(task: asyncio.Task) -> None:
 
 
 def _serialize_spawn_manifest(wu: WorkUnit) -> bytes:
-    """Minimal JSON serialization of WorkUnit for MinIO manifest."""
+    """Minimal JSON serialization of WorkUnit for MinIO manifest.
+
+    [S2 §3.3/§3.5 round-trip B5] write_tree_lease + shell_mode are serialized
+    here and decoded symmetrically in the starter. TreeLease.ops is a frozenset
+    -> sorted list for stable JSON. ``wu.shell_mode`` is the value built in
+    ``_build_work_units_from_requests`` as ``req.shell_mode or
+    bool(write_tree_lease)`` (and preserved through the Step-4 enrichment
+    rebuild), so the request's positive shell_mode reaches the child manifest.
+    """
     return json.dumps({
         "work_unit_id": wu.work_unit_id,
         "objective": wu.objective,
         "phase": wu.phase,
         "allowed_tools": list(wu.allowed_tools),
         "write_lease": [lease.model_dump() for lease in wu.write_lease],
+        "write_tree_lease": [
+            {"prefix": tl.prefix, "ops": sorted(tl.ops)}
+            for tl in wu.write_tree_lease
+        ],
+        "shell_mode": wu.shell_mode,
         "expected_result_schema": wu.expected_result_schema,
     }, sort_keys=True).encode("utf-8")
 
@@ -290,6 +419,18 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
             work_units = _build_work_units_from_requests(
                 state["work_unit_requests"], step_id_hash16, current_attempt_ix,
             )
+            # [S2 §3.6 F27] flag-off active fail-closed: coerce shell-mode units
+            # to typed-only while the master flag is OFF (PR-3 state). MUST run
+            # BEFORE overlap rejection [codex PR-3 R1 P1]: under flag OFF the
+            # tree leases are stripped, so two units that coerce to DISJOINT
+            # typed-only leases must not be spuriously rejected for a (moot)
+            # tree overlap that no longer exists post-coercion.
+            work_units = _coerce_units_typed_only_if_flag_off(work_units)
+            # [S2 §3.3 F24] reject cross-unit lease overlap BEFORE spawning, on
+            # the POST-coercion units: flag ON ⇒ coercion is identity ⇒ tree
+            # overlaps still fail loud; flag OFF ⇒ only surviving typed leases
+            # are overlap-checked.
+            _reject_cross_unit_tree_overlap(work_units)
             return await _rehydrate_dispatch(
                 state, config, existing, candidate_run_id, work_units,
             )
@@ -313,6 +454,17 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
     work_units = _build_work_units_from_requests(
         state["work_unit_requests"], step_id_hash16, attempt_ix,
     )
+    # [S2 §3.6 F27] flag-off active fail-closed: coerce shell-mode units to
+    # typed-only while the master flag is OFF (PR-3 state). MUST run BEFORE
+    # overlap rejection [codex PR-3 R1 P1]: under flag OFF the tree leases are
+    # stripped, so two units that coerce to DISJOINT typed-only leases must not
+    # be spuriously rejected for a (moot) tree overlap that no longer exists
+    # post-coercion.
+    work_units = _coerce_units_typed_only_if_flag_off(work_units)
+    # [S2 §3.3 F24] reject cross-unit lease overlap BEFORE spawning, on the
+    # POST-coercion units: flag ON ⇒ coercion is identity ⇒ tree overlaps still
+    # fail loud; flag OFF ⇒ only surviving typed leases are overlap-checked.
+    _reject_cross_unit_tree_overlap(work_units)
     return await _first_time_dispatch(state, config, coordinator_run_id, work_units)
 
 
@@ -480,6 +632,16 @@ async def _first_time_dispatch(
                 phase=wu.phase,
                 allowed_tools=wu.allowed_tools,
                 write_lease=new_leases,
+                # [S2 §3.3/§3.5 — P0-1] preserve the shell-mode signals through
+                # enrichment; enrichment only fills write_lease digests, it must
+                # not strip the tree lease / shell_mode (else they never reach
+                # _serialize_spawn_manifest -> the child -> PR-4/PR-5). ``wu``
+                # here is the pre-enrichment unit produced by
+                # ``_build_work_units_from_requests``, so ``wu.shell_mode``
+                # already carries ``req.shell_mode or bool(write_tree_lease)`` —
+                # the request's positive shell_mode flows through unchanged.
+                write_tree_lease=wu.write_tree_lease,
+                shell_mode=wu.shell_mode,
                 expected_result_schema=wu.expected_result_schema,
             ))
 
@@ -893,16 +1055,23 @@ async def _first_time_dispatch(
                 "child_session_id": child_session_ids[wu.work_unit_id],
                 "coordinator_run_id": coordinator_run_id,
                 "root_session_id": root_session_id,
+                # [S2 §3.2 R3-F1] write-phase ⇒ a resolvable manifest is
+                # required; worker_node demotes SUCCESS-no-manifest to FAILED.
+                "manifest_required": wu.phase == "write",
             })
             for wu in enriched_units
         ],
     )
 
 
-def _build_pre_results_from_terminal(
+async def _build_pre_results_from_terminal(
     terminal: "dict[str, TerminalEnvelopeRecord]",
+    *,
+    artifact_storage: Any,
+    work_units_by_id: "dict[str, WorkUnit]",
 ) -> list[WorkerResult]:
-    """[C2 PR-7 §12.3] Convert persisted terminal envelopes back into WorkerResult.
+    """[C2 PR-7 §12.3 + S2 §3.2 C1] Convert persisted terminal envelopes back
+    into WorkerResult.
 
     The reducer consumes ``state["worker_results"]`` -- a list[WorkerResult]
     accumulated by ``worker_node`` Send fan-in. After a crash, we restore
@@ -912,8 +1081,15 @@ def _build_pre_results_from_terminal(
 
     Per [r3 P1-3] the TerminalEnvelopeRecord carries ``envelope_type`` so
     we can correctly map RESULT_READY -> outcome from the payload and
-    CANCEL_ACK -> outcome from final_state, mirroring worker_node's live
-    decode (lines 736-770).
+    CANCEL_ACK -> outcome from final_state, mirroring ``worker_node``'s live
+    decode.
+
+    [S2 §3.2 C1] Now async: resolves ``patch_manifest_ref`` from the persisted
+    payload via ``artifact_storage`` (shared ``_resolve_manifest`` helper), and
+    demotes a write-phase (``work_units_by_id[wu_id].phase == "write"``) SUCCESS
+    with no resolvable manifest to FAILED — the same fail-close worker_node
+    applies live, so a crash-recovery replay can never silently zero-apply a
+    dropped/truncated manifest.
     """
     pre_results: list[WorkerResult] = []
     for wu_id, record in terminal.items():
@@ -931,36 +1107,63 @@ def _build_pre_results_from_terminal(
                     cost_summary = CostAggregate.model_validate(cost_raw)
                 except Exception:  # noqa: BLE001 -- degrade to default
                     cost_summary = None
-            # [codex R2 P1] JSONB round-trip lands ``patch_manifest`` as a
-            # plain ``dict`` after psycopg decode. Downstream consumers
-            # (``patch_reducer_service.py``) do attribute access like
-            # ``pm.coordinator_run_id`` on the manifest, which fails on
-            # ``dict``. Coerce back to the pydantic ``PatchManifest`` here
-            # so the rehydrate path produces the same shape as
-            # ``worker_node`` did originally (worker_node validates via
-            # ``ResultReadyPayload.patch_manifest`` -- subgraph
-            # parallel_execution_subgraph.py:914 region).
-            pm_raw = payload.get("patch_manifest")
+            summary = payload.get("summary")
+            wu = work_units_by_id.get(wu_id)
+            manifest_required = wu is not None and wu.phase == "write"
             patch_manifest: Optional[Any] = None
-            if isinstance(pm_raw, dict):
-                from app.domain.models.patch_manifest import PatchManifest
-                try:
-                    patch_manifest = PatchManifest.model_validate(pm_raw)
-                except Exception:  # noqa: BLE001 -- degrade to None
+            if outcome == ResultReadyOutcome.SUCCESS:
+                # [codex R2 P1] JSONB round-trip lands ``patch_manifest`` as a
+                # plain ``dict`` after psycopg decode. Downstream consumers
+                # (``patch_reducer_service.py``) do attribute access like
+                # ``pm.coordinator_run_id`` on the manifest, which fails on
+                # ``dict``. Build a thin shim exposing the two fields
+                # ``_resolve_manifest`` reads. The persisted payload is the
+                # minimum-rehydrate dict (it may carry an inline
+                # ``patch_manifest`` dict OR a ``patch_manifest_ref`` string).
+                # Coerce an inline dict to a typed PatchManifest first so
+                # ``_resolve_manifest``'s inline branch returns the model, not a
+                # dict.
+                pm_raw = payload.get("patch_manifest")
+                inline: Optional[Any] = None
+                if isinstance(pm_raw, dict):
+                    from app.domain.models.patch_manifest import PatchManifest
+                    try:
+                        inline = PatchManifest.model_validate(pm_raw)
+                    except Exception:  # noqa: BLE001 -- degrade to None
+                        inline = None
+                elif pm_raw is not None:
+                    inline = pm_raw  # typed model (mid-process replay)
+                shim = _ManifestShim(
+                    patch_manifest=inline,
+                    patch_manifest_ref=payload.get("patch_manifest_ref"),
+                )
+                patch_manifest = await _resolve_manifest(
+                    shim, artifact_storage=artifact_storage,
+                )
+                if manifest_required and patch_manifest is None:
+                    logger.warning(
+                        "rehydrate: demoting SUCCESS→FAILED for wu=%s — "
+                        "write-phase manifest required but None/unresolvable "
+                        "(ref=%r)",
+                        wu_id, payload.get("patch_manifest_ref"),
+                    )
+                    outcome = ResultReadyOutcome.FAILED
+                    summary = (
+                        f"{summary or ''} [demoted: write-phase SUCCESS with "
+                        "no resolvable patch_manifest]"
+                    ).strip()
                     patch_manifest = None
-            elif pm_raw is not None:
-                # Already a typed model (e.g. mid-process replay) -- pass through.
-                patch_manifest = pm_raw
             pre_results.append(WorkerResult(
                 work_unit_id=wu_id,
                 child_session_id=record.child_session_id,
                 outcome=outcome,
                 cost_summary=cost_summary,
-                summary=payload.get("summary"),
+                summary=summary,
                 patch_manifest=patch_manifest,
                 needs_authorization_details=payload.get(
                     "needs_authorization_details"
                 ),
+                manifest_required=manifest_required,
             ))
         elif record.envelope_type == "CANCEL_ACK":
             final_state = payload.get("final_state")
@@ -1014,11 +1217,12 @@ async def _rehydrate_dispatch(
         also catches it).
 
       * Step 6 (MISSING CHILD): if a wu_id is in ``work_units`` but
-        has NO corresponding child row, leave it pending. TODO(PR-7+
-        partial-INSERT-unique idempotent spawn) -- the M1 v1 contract
-        treats this as "counter inflation, BUMP-AGAIN" (handled
-        upstream in dispatch_node via the bump fall-through), but
-        cleaner is a partial-unique INSERT here.
+        has NO corresponding child row, RAISE a RuntimeError ([codex R1
+        P1] fail loudly) so the orchestrator surfaces an
+        operator-actionable error rather than routing an incomplete
+        worker_results set to the reducer. TODO(PR-7+ partial-INSERT-
+        unique idempotent spawn) will instead re-spawn the missing
+        child idempotently.
 
       * Step 7 (TERMINAL -> pre-populate): inject the terminal-envelope-
         derived WorkerResult objects into ``state["worker_results"]``
@@ -1165,8 +1369,83 @@ async def _rehydrate_dispatch(
             f"or backfill the envelope row before retrying."
         )
 
+    # [codex PR-2 R1 P1 + opus-review follow-up] Out-of-plan guard (terminal AND
+    # pending). ``existing.terminal`` / ``existing.pending`` are built by
+    # ``CoordinatorRehydrateService.detect_existing_run`` (Steps 4-5) from EVERY
+    # persisted envelope / child row for this ``coordinator_run_id`` with no
+    # filtering against the rebuilt ``work_units``. Because ``coordinator_run_id``
+    # embeds the attempt (``…:a{attempt_ix}``), prior-attempt rows never return —
+    # so a wu_id in ``terminal`` OR ``pending`` but NOT in ``expected_wu_ids``
+    # means the persisted run shape no longer matches the current plan (state
+    # ``work_unit_requests`` changed, or the unit count shrank, between the
+    # original dispatch and this rehydrate). That is the same drift class the
+    # missing / limbo guards reject in the other direction. Left unguarded BOTH
+    # routes inject out-of-plan writes into the apply plan:
+    #   • terminal → ``_build_pre_results_from_terminal`` computes
+    #     ``manifest_required = work_units_by_id.get(wu_id) is not None and …`` →
+    #     ``False`` for the unknown id → NO demotion;
+    #   • pending  → Step 8 ``Send``s it to ``worker_node`` with the same
+    #     ``_phase_by_wu_id.get(wu_id) == "write"`` → ``False`` → NO demotion.
+    # In either case a self-consistent SUCCESS manifest passes the reducer's
+    # lineage cross-check (matched against the worker_result's OWN wu_id, not the
+    # expected set) and folds into the apply plan. Fail loudly — symmetric with
+    # the missing / limbo guards — so the orchestrator surfaces an
+    # operator-actionable error instead of a silent fail-open. (Step 5 still
+    # best-effort CANCELs any out-of-plan child first; this guard then refuses
+    # the inconsistent resume.)
+    unexpected_wu_ids = sorted(
+        (set(existing.terminal.keys()) | set(existing.pending)) - expected_wu_ids
+    )
+    if unexpected_wu_ids:
+        raise RuntimeError(
+            f"rehydrate: cannot resume run {coordinator_run_id!r} -- "
+            f"unexpected terminal/pending work units exist for "
+            f"{unexpected_wu_ids!r} which are NOT in the current attempt's "
+            f"work_units. The persisted run shape no longer matches the rebuilt "
+            f"plan (work_unit_requests changed or the unit count shrank between "
+            f"dispatch and rehydrate). v1 fails closed so a stale child SUCCESS "
+            f"can never inject out-of-plan writes into the apply plan; operator "
+            f"must replan or reset coordinator_attempt."
+        )
+
+    # [codex PR-2 R2 P1] Stale-child guard. Terminal records are keyed by
+    # work_unit_id only (CoordinatorRehydrateService Step 4), and
+    # (coordinator_run_id, work_unit_id) is NOT yet unique on the sessions table
+    # (the partial-unique is deferred to PR-7 — see the missing-child guard
+    # above). A duplicate / stale child row for an EXPECTED wu_id can therefore
+    # surface a terminal envelope whose child_session_id differs from the
+    # current child (``existing.child_session_ids[wu_id]`` = the newest child by
+    # created_at). Left unguarded, the terminal-record path turns that stale
+    # envelope into the WorkerResult for the expected wu_id (and ``pending``
+    # skips the REAL current child), so a stale-child SUCCESS manifest folds
+    # into the apply plan while the live child's work is dropped — the reducer's
+    # lineage cross-check validates run_id + work_unit_id but NOT
+    # child_session_id. Fail closed. (Runs after the union guard, so every
+    # terminal wu_id here is in-plan and — after the missing-child guard — has a
+    # current child entry.)
+    for _wu_id, _rec in existing.terminal.items():
+        _current_child = existing.child_session_ids.get(_wu_id)
+        if _rec.child_session_id != _current_child:
+            raise RuntimeError(
+                f"rehydrate: cannot resume run {coordinator_run_id!r} -- "
+                f"terminal envelope for wu_id={_wu_id!r} was produced by child "
+                f"{_rec.child_session_id!r} but the current child for that work "
+                f"unit is {_current_child!r} (stale / duplicate child row; "
+                f"(coordinator_run_id, work_unit_id) is not yet unique pre-PR-7). "
+                f"v1 fails closed so a stale child's result cannot masquerade as "
+                f"the current child's; operator must reconcile the child rows or "
+                f"reset coordinator_attempt."
+            )
+
     # Step 7: pre-populate worker_results from persisted terminal envelopes.
-    pre_results = _build_pre_results_from_terminal(existing.terminal)
+    # [S2 §3.2 C1] async now: resolve manifest-by-ref + demote write-phase
+    # SUCCESS-no-manifest. ``cfg`` is config["configurable"] (bound at the top
+    # of _rehydrate_dispatch); ``work_units`` is the function parameter.
+    pre_results = await _build_pre_results_from_terminal(
+        existing.terminal,
+        artifact_storage=cfg.get("artifact_storage"),
+        work_units_by_id={wu.work_unit_id: wu for wu in work_units},
+    )
 
     # Step 8: pre-subscribe waiter group + Send only for truly-pending.
     subscriber = cfg["mailbox_subscriber"]  # fail-fast on missing DI [r2 P1-2]
@@ -1179,12 +1458,16 @@ async def _rehydrate_dispatch(
             start_id="0",
         )
 
+    _phase_by_wu_id = {wu.work_unit_id: wu.phase for wu in work_units}
     pending_sends = [
         Send("worker_node", {
             "work_unit_id": wu_id,
             "child_session_id": existing.child_session_ids[wu_id],
             "coordinator_run_id": coordinator_run_id,
             "root_session_id": root_session_id,
+            # [S2 §3.2 R3-F1] mirror the first-time payload so a replayed
+            # pending worker is held to the same manifest-required contract.
+            "manifest_required": _phase_by_wu_id.get(wu_id) == "write",
         })
         for wu_id in existing.pending
     ]
@@ -1205,6 +1488,55 @@ async def _rehydrate_dispatch(
 # ── worker_node ──────────────────────────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class _ManifestShim:
+    """[S2 §3.2 C1] Minimal attribute carrier so the shared _resolve_manifest
+    helper can read inline-or-ref from a rehydrate payload dict the same way it
+    reads from a live ResultReadyPayload."""
+
+    patch_manifest: Optional[Any]
+    patch_manifest_ref: Optional[str]
+
+
+async def _resolve_manifest(
+    rr_payload: Any,
+    *,
+    artifact_storage: Any,
+) -> Optional[Any]:
+    """[C2-full S2 §3.2 C1] Shared inline/ref manifest resolver.
+
+    Returns the inline ``patch_manifest`` if present; else resolves
+    ``patch_manifest_ref`` via ``artifact_storage.get_bytes`` +
+    ``PatchManifest.model_validate``. Returns ``None`` on absent ref OR on any
+    resolution failure (missing key / corrupt JSON / validation error) — the
+    caller decides whether None is fatal (write-phase) or legal (exploration).
+    The two fields are mutually exclusive by the ResultReadyPayload validator,
+    so at most one branch fires.
+    """
+    inline = getattr(rr_payload, "patch_manifest", None)
+    if inline is not None:
+        return inline
+    ref = getattr(rr_payload, "patch_manifest_ref", None)
+    if ref is None:
+        return None
+    if artifact_storage is None:
+        logger.warning(
+            "manifest-by-ref present (%r) but no artifact_storage in config; "
+            "treating as unresolved",
+            ref,
+        )
+        return None
+    try:
+        raw = await artifact_storage.get_bytes(ref)
+        from app.domain.models.patch_manifest import PatchManifest
+        return PatchManifest.model_validate(json.loads(raw))
+    except Exception as exc:  # noqa: BLE001 — get_bytes / json / validation
+        logger.warning(
+            "manifest-by-ref resolution failed for ref=%r: %s", ref, exc
+        )
+        return None
+
+
 async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
     """Thin await of the terminal envelope; normalize CANCEL_ACK final_state."""
     cfg = config["configurable"]
@@ -1217,12 +1549,64 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
     # this filter a stale RESULT_READY from a different attempt
     # sharing the same child_session_id could cross-contaminate the
     # current apply plan.
-    envelope = await waiter.await_terminal(
-        child_session_id=state_per_send["child_session_id"],
-        root_session_id=state_per_send["root_session_id"],
-        cancel_event=cancel_event,
-        coordinator_run_id=state_per_send.get("coordinator_run_id"),
-    )
+    manifest_required = bool(state_per_send.get("manifest_required", False))
+
+    # [codex PR-2 R4 P0] Fail-closed terminal decode. The waiter matches the
+    # terminal on envelope-level fields (type/child/correlation) over a RAW
+    # dict, and ``RedisMailboxSubscriber.consume`` XACKs the matched entry
+    # BEFORE the waiter deep-validates it via ``MailboxEnvelope.model_validate``
+    # (which runs the typed ``ResultReadyPayload`` schema). A malformed child
+    # payload therefore surfaces here as a pydantic ``ValidationError`` AFTER
+    # the entry is already acked/lost. Catch it and synthesize a FAILED
+    # WorkerResult: the reducer's completeness invariant (every Send yields a
+    # worker_result) must hold, and a single malformed child envelope must not
+    # crash the whole parallel superstep or strand the run. (Only ValidationError
+    # is caught — transient infra errors from the subscriber stay retryable.)
+    from pydantic import ValidationError
+    try:
+        envelope = await waiter.await_terminal(
+            child_session_id=state_per_send["child_session_id"],
+            root_session_id=state_per_send["root_session_id"],
+            cancel_event=cancel_event,
+            coordinator_run_id=state_per_send.get("coordinator_run_id"),
+        )
+    except ValidationError as exc:
+        logger.warning(
+            "worker_node: malformed terminal envelope for wu=%s child=%s — "
+            "failing closed (FAILED): %s",
+            state_per_send["work_unit_id"],
+            state_per_send["child_session_id"],
+            exc,
+        )
+        return {"worker_results": [WorkerResult(
+            work_unit_id=state_per_send["work_unit_id"],
+            child_session_id=state_per_send["child_session_id"],
+            outcome=ResultReadyOutcome.FAILED,
+            summary="malformed terminal envelope (undecodable payload)",
+            manifest_required=manifest_required,
+        )]}
+    except asyncio.TimeoutError:
+        # [codex PR-2 R5 P0] The child never emitted a terminal within the
+        # waiter's window. A raise here would crash the whole ``Send`` fan-out
+        # superstep (only CoordinatorPathContractError is caught upstream in
+        # ``_run_parallel_backend``; executor_node has no retry policy), losing
+        # every sibling worker's result and stranding the run. Fail closed to a
+        # TIMED_OUT WorkerResult so the reducer's completeness invariant holds
+        # and one slow child (more likely for S2 shell-mode children) cannot
+        # kill the batch. (TIMED_OUT → reducer non-SUCCESS → no apply.)
+        logger.warning(
+            "worker_node: terminal wait timed out for wu=%s child=%s — "
+            "failing closed (TIMED_OUT)",
+            state_per_send["work_unit_id"],
+            state_per_send["child_session_id"],
+        )
+        return {"worker_results": [WorkerResult(
+            work_unit_id=state_per_send["work_unit_id"],
+            child_session_id=state_per_send["child_session_id"],
+            outcome=ResultReadyOutcome.TIMED_OUT,
+            summary="terminal envelope wait timed out",
+            manifest_required=manifest_required,
+        )]}
 
     # [r4 P1 fix] Propagate PR-4 wire-schema fields (patch_manifest /
     # needs_authorization_details / cost_summary / summary) into the
@@ -1245,8 +1629,30 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
         outcome = rr_payload.outcome
         summary = rr_payload.summary
         cost_summary = rr_payload.cost_summary
-        patch_manifest = rr_payload.patch_manifest
         needs_authorization_details = rr_payload.needs_authorization_details
+        # [C2-full S2 §3.2 C1] Resolve inline-or-ref manifest, then fail-close:
+        # a write-phase SUCCESS (manifest_required) with no resolved manifest
+        # MUST NOT reach the reducer as SUCCESS (it would zero-apply silently).
+        if outcome == ResultReadyOutcome.SUCCESS:
+            patch_manifest = await _resolve_manifest(
+                rr_payload, artifact_storage=cfg.get("artifact_storage"),
+            )
+            if manifest_required and patch_manifest is None:
+                logger.warning(
+                    "worker_node: demoting SUCCESS→FAILED for wu=%s — "
+                    "write-phase manifest required but None/unresolvable "
+                    "(ref=%r)",
+                    state_per_send["work_unit_id"],
+                    getattr(rr_payload, "patch_manifest_ref", None),
+                )
+                outcome = ResultReadyOutcome.FAILED
+                summary = (
+                    f"{summary or ''} [demoted: write-phase SUCCESS with no "
+                    "resolvable patch_manifest]"
+                ).strip()
+                patch_manifest = None
+        else:
+            patch_manifest = None
     elif envelope.type == MailboxEnvelopeType.CANCEL_ACK:
         final_state = (
             envelope.payload.get("final_state")
@@ -1278,6 +1684,7 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
         summary=summary,
         patch_manifest=patch_manifest,
         needs_authorization_details=needs_authorization_details,
+        manifest_required=manifest_required,
     )
     return {"worker_results": [result]}
 

@@ -76,9 +76,15 @@ def anyio_backend() -> str:
 
 # -- _build_pre_results_from_terminal --------------------------------------
 
+# [S2 §3.2 C1] _build_pre_results_from_terminal is now async and requires an
+# artifact_storage + work_units_by_id. These TestBuildPreResults cases carry no
+# patch_manifest_ref, so the resolver never touches storage; an AsyncMock keeps
+# an accidental call observable instead of crashing with TypeError.
+_FAKE_ARTIFACT_STORAGE = AsyncMock()
+
 
 class TestBuildPreResults:
-    def test_result_ready_constructs_worker_result(self) -> None:
+    async def test_result_ready_constructs_worker_result(self) -> None:
         terminal = {
             "wu1": TerminalEnvelopeRecord(
                 envelope_type="RESULT_READY",
@@ -87,14 +93,16 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert len(out) == 1
         assert isinstance(out[0], WorkerResult)
         assert out[0].work_unit_id == "wu1"
         assert out[0].outcome == ResultReadyOutcome.SUCCESS
         assert out[0].summary == "done"
 
-    def test_jsonb_patch_manifest_dict_coerced_to_model(self) -> None:
+    async def test_jsonb_patch_manifest_dict_coerced_to_model(self) -> None:
         """[codex R2 P1] JSONB round-trip lands patch_manifest as dict;
         downstream reducer does attribute access (pm.coordinator_run_id)
         which fails on dict. Builder must coerce dict -> PatchManifest.
@@ -114,12 +122,14 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert isinstance(out[0].patch_manifest, PatchManifest)
         assert out[0].patch_manifest.coordinator_run_id == "r1"
         assert out[0].patch_manifest.work_unit_id == "wu1"
 
-    def test_invalid_patch_manifest_dict_degrades_to_none(self) -> None:
+    async def test_invalid_patch_manifest_dict_degrades_to_none(self) -> None:
         """Defensive: a malformed manifest dict (missing required fields)
         does not raise -- WorkerResult ends up with patch_manifest=None.
         """
@@ -131,12 +141,14 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert out[0].patch_manifest is None
         # ... but the rest of WorkerResult still populated
         assert out[0].outcome == ResultReadyOutcome.SUCCESS
 
-    def test_cancel_ack_cancelled_maps_correctly(self) -> None:
+    async def test_cancel_ack_cancelled_maps_correctly(self) -> None:
         terminal = {
             "wu1": TerminalEnvelopeRecord(
                 envelope_type="CANCEL_ACK",
@@ -145,10 +157,12 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert out[0].outcome == ResultReadyOutcome.CANCELLED
 
-    def test_cancel_ack_force_terminated_maps_to_timed_out(self) -> None:
+    async def test_cancel_ack_force_terminated_maps_to_timed_out(self) -> None:
         terminal = {
             "wu1": TerminalEnvelopeRecord(
                 envelope_type="CANCEL_ACK",
@@ -157,10 +171,12 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert out[0].outcome == ResultReadyOutcome.TIMED_OUT
 
-    def test_unknown_envelope_type_logged_and_skipped(self) -> None:
+    async def test_unknown_envelope_type_logged_and_skipped(self) -> None:
         terminal = {
             "wu1": TerminalEnvelopeRecord(
                 envelope_type="MYSTERY",
@@ -169,10 +185,12 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert out == []
 
-    def test_invalid_outcome_string_degrades_to_failed(self) -> None:
+    async def test_invalid_outcome_string_degrades_to_failed(self) -> None:
         terminal = {
             "wu1": TerminalEnvelopeRecord(
                 envelope_type="RESULT_READY",
@@ -181,7 +199,9 @@ class TestBuildPreResults:
                 received_at=datetime.now(timezone.utc),
             ),
         }
-        out = _build_pre_results_from_terminal(terminal)
+        out = await _build_pre_results_from_terminal(
+            terminal, artifact_storage=_FAKE_ARTIFACT_STORAGE, work_units_by_id={}
+        )
         assert out[0].outcome == ResultReadyOutcome.FAILED
 
 

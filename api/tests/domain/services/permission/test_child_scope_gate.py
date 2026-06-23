@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.domain.models.session import SessionStatus
-from app.domain.models.work_unit import PathLease
+from app.domain.models.work_unit import PathLease, TreeLease
 from app.domain.services.permission.child_permission_context import (
     ChildBudget,
     ChildPermissionContext,
@@ -376,3 +376,53 @@ class TestNoneChildRaises:
         )
         with pytest.raises(ValueError, match="child_ctx=None"):
             await gate.check_in_scope(_call("file_read"), ctx, None)  # type: ignore[arg-type]
+
+
+class TestSpawnManifestShellModeCarrier:
+    def test_spawn_manifest_defaults_inert(self):
+        from app.domain.services.permission.child_permission_context import (
+            SpawnManifest,
+        )
+        m = SpawnManifest(
+            allowed_tools=frozenset({"file_read"}),
+            path_leases=(),
+            runtime_caps=frozenset(),
+        )
+        # §3.5/§3.3: both new fields default to the inert state.
+        assert m.shell_mode is False
+        assert m.tree_leases == ()
+
+    def test_spawn_manifest_carries_tree_lease_and_shell_mode(self):
+        from app.domain.services.permission.child_permission_context import (
+            SpawnManifest,
+        )
+        tl = TreeLease(prefix="workspace", ops=frozenset({"add"}))
+        m = SpawnManifest(
+            allowed_tools=frozenset({"file_write"}),
+            path_leases=(),
+            runtime_caps=frozenset(),
+            tree_leases=(tl,),
+            shell_mode=True,
+        )
+        assert m.shell_mode is True
+        assert m.tree_leases == (tl,)
+
+    def test_child_permission_context_shell_mode_default(self):
+        from app.domain.services.permission.child_permission_context import (
+            ChildBudget,
+            ChildPermissionContext,
+            SpawnManifest,
+        )
+        ctx = ChildPermissionContext(
+            parent_session_id="p1", child_session_id="c1",
+            coordinator_run_id="r1", work_unit_id="wu1",
+            spawn_manifest=SpawnManifest(
+                allowed_tools=frozenset({"file_read"}),
+                path_leases=(), runtime_caps=frozenset(),
+            ),
+            session_mode_revision=1,
+            budget=ChildBudget(
+                max_tool_calls=10, max_token_cost_usd=1.0, max_wallclock_seconds=600,
+            ),
+        )
+        assert ctx.shell_mode is False

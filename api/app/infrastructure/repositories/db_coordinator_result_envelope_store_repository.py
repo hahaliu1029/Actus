@@ -42,11 +42,17 @@ logger = logging.getLogger(__name__)
 # Whitelist of payload keys preserved into the persisted JSONB. Anything
 # else (assistant message, raw tool transcripts, debug metadata) gets
 # stripped at ``_filter_minimum_rehydrate``. PR-7 rehydrate only
-# consumes these five fields when rebuilding completed_work_units.
+# consumes these six fields when rebuilding completed_work_units
+# ([C2-full S2 §3.2 C1] added ``patch_manifest_ref`` to the set).
 _MIN_REHYDRATE_KEYS = frozenset(
     {
         "outcome",
         "patch_manifest",
+        # [C2-full S2 §3.2 C1] manifest-by-ref survives the whitelist. A bare
+        # MinIO ref is tiny (well under _MAX_PAYLOAD_BYTES) so it is NOT
+        # collapsed by the 64KB truncation marker the way a large inline
+        # patch_manifest would be — the rehydrate builder resolves it later.
+        "patch_manifest_ref",
         "cost_summary",
         "needs_authorization_details",
         "final_state",
@@ -86,6 +92,31 @@ def _pii_guard(payload_json: str) -> bool:
     to know which one fired.
     """
     return bool(_EMAIL_RE.search(payload_json) or _PHONE_RE.search(payload_json))
+
+
+# Structured machine-generated fields excluded from the best-effort PII scan.
+# ``patch_manifest_ref`` is a content-addressed MinIO key ending in a 64-char
+# sha256 hex digest (minio_file_storage.put_content_addressed_bytes), whose
+# digit runs would otherwise trip the phone regex and collapse the whole row to
+# a {outcome,_pii_redacted} marker — silently dropping the ref the rehydrate
+# path needs to resolve the manifest. The application layer remains the
+# canonical PII surface for free-text fields.
+_PII_EXCLUDED_FIELDS = frozenset({"patch_manifest_ref"})
+
+
+def _pii_scan_target(filtered: dict[str, Any]) -> str:
+    """Serialise ``filtered`` for the PII guard, excluding structured
+    machine-generated fields (``_PII_EXCLUDED_FIELDS``). Pure; does not mutate.
+    Falls back to the full dict if the trimmed dict is not serialisable (it
+    always is here, but keep the guard defensive)."""
+    scannable = {k: v for k, v in filtered.items() if k not in _PII_EXCLUDED_FIELDS}
+    try:
+        return json.dumps(scannable, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return json.dumps(
+            {"outcome": str(scannable.get("outcome", "unknown"))},
+            separators=(",", ":"),
+        )
 
 
 class DbCoordinatorResultEnvelopeStoreRepository(
@@ -151,8 +182,10 @@ class DbCoordinatorResultEnvelopeStoreRepository(
             }
             serialised = json.dumps(filtered, separators=(",", ":"))
 
-        # PII check — runs on the (possibly truncated) serialised form.
-        if _pii_guard(serialised):
+        # PII check — runs on the (possibly truncated) serialised form, MINUS
+        # the structured ``patch_manifest_ref`` field (a content-addressed
+        # digest that would false-positive the phone regex). [S2 §3.2 C1]
+        if _pii_guard(_pii_scan_target(filtered)):
             logger.warning(
                 "persist_terminal: PII regex matched payload for "
                 "run_id=%s wu_id=%s; redacting to marker.",
