@@ -408,6 +408,28 @@ tool_filter + patch-extraction lease-check + reducer), `atomic_write_file` true
 atomicity, per-RUN wallclock/token budget wiring (per-CHILD budgets ARE wired),
 multi-level spawn.
 
+## C2 shell-mode (S2)
+
+Coordinator children may opt into **shell-mode** (raw shell inside an isolated
+ephemeral sandbox) while still producing only a lease-validated `PatchManifest`.
+See [`docs/shell-mode/c2-shell-mode.md`](./docs/shell-mode/c2-shell-mode.md) for the full design.
+
+Hard invariants when touching this path:
+- **Fail-safe default**: shell-mode requires `flag_on AND wu.shell_mode` (both
+  affirmative). Flag OFF (`ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED` default
+  OFF) ⇒ byte-for-byte pre-S2 behavior; `dispatch_node` actively coerces a
+  stale `shell_mode`/`write_tree_lease` payload to typed-only (mixed units that
+  keep a typed lease) or hard-rejects it (tree-only / shell-only units). Pinned by
+  `tests/integration/test_coordinator_shell_mode_dark_launch.py` (which also
+  asserts ZERO shell tools are bound while the flag is OFF).
+- **Tree leases are ADD-only**: modify/delete need a seeded file lease;
+  tree-only modify/delete zero-applies the whole group.
+- **Group zero-apply is the integrity boundary**: any out-of-lease / special /
+  symlink / mode-only / scan-truncated diff discards the WHOLE manifest.
+- The live shell-mode E2E (`tests/integration/test_coordinator_e2e_shell_mode.py`)
+  runs only in the `coordinator-e2e` CI job and must never be silently skipped —
+  `tests/structure/test_shell_mode_e2e_unskip_guard.py` enforces this.
+
 ## 前端开发
 
 ```bash

@@ -248,6 +248,10 @@ class PricedRoutingFakeChatModel(PricedFakeListChatModel):
         object.__setattr__(self, "_child_decks", decks)
         object.__setattr__(self, "_locks", locks)
         object.__setattr__(self, "_selectors", selectors)
+        # [S2 PR-6] record the tool-name set of every bind_tools call so
+        # flag-state guards (dark-launch) can assert which tools were (or were
+        # NOT) bound — `return self` alone hides this.
+        object.__setattr__(self, "bound_tool_name_sets", [])
 
     def _build_child_turns(self, turns):
         from langchain_core.messages import AIMessage
@@ -306,6 +310,23 @@ class PricedRoutingFakeChatModel(PricedFakeListChatModel):
         return RunnableLambda(_route)
 
     def bind_tools(self, tools, **kwargs):  # type: ignore[override]
+        # Record the bound tool names so flag-state guards can assert which tools
+        # were (or were NOT) bound — `return self` alone hides this. Tolerate both
+        # LangChain tool objects (.name) and raw dicts/callables.
+        names = set()
+        for t in (tools or []):
+            name = getattr(t, "name", None)
+            if name is None and isinstance(t, dict):
+                name = t.get("name") or (t.get("function") or {}).get("name")
+            if name is None:
+                name = getattr(t, "__name__", None)
+            if name:
+                names.add(name)
+        # bound_tool_name_sets may not exist on a model built before this PR's
+        # setup_responses ran; guard for safety.
+        if not hasattr(self, "bound_tool_name_sets"):
+            object.__setattr__(self, "bound_tool_name_sets", [])
+        self.bound_tool_name_sets.append(names)
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):

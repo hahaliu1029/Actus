@@ -140,6 +140,10 @@ jobs:
           MINIO_BUCKET_NAME: a2a-mcp        # matches settings default; bucket created above
           SANDBOX_IMAGE: actus-sandbox:latest  # default None -> DockerSandbox.create fails
           ACTUS_C2_COORDINATOR_ENABLED: "true"
+          # [S2 PR-6] shell-mode master flag ON for the live shell-mode E2E
+          # (test_coordinator_e2e_shell_mode.py). Default OFF elsewhere; this
+          # job is the only flag-ON-shell-mode run.
+          ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED: "true"
         # NOTE: no --strict-markers here. Collection imports the WHOLE test tree
         # before -m deselection, and pre-existing unrelated files use unregistered
         # markers (`asyncio`, `network`); --strict-markers would promote those to

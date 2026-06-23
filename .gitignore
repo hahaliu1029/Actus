@@ -68,7 +68,12 @@ api/config.yaml
 api/config.yaml
 
 
-docs/
+# [S2 PR-6] docs/ is local-only by default, BUT the checked-in shell-mode
+# contributor doc must be tracked. Re-include just docs/shell-mode/.
+docs/*
+!docs/shell-mode/
+docs/shell-mode/*
+!docs/shell-mode/c2-shell-mode.md
 
 # Git worktrees
 .worktrees/
