@@ -196,6 +196,12 @@ class DockerSandbox(Sandbox):
                     "HTTP_PROXY": settings.sandbox_http_proxy,
                     "NO_PROXY": settings.sandbox_no_proxy,
                     "TZ": settings.container_timezone,
+                    # R10-2 / codex-R4-F2: propagate the (possibly customized)
+                    # skill bundle root so the SANDBOX snapshot walker prunes the
+                    # SAME ``.skills`` path the api writes — else api writes one
+                    # path while the sandbox excludes its default and the
+                    # bundle-sync diff pollution returns.
+                    "SKILL_SANDBOX_BUNDLE_ROOT": settings.skill_sandbox_bundle_root,
                 },
                 # 容器级资源上限，防止 Chromium 失控导致宿主机 OOM
                 "mem_limit": settings.sandbox_mem_limit,

@@ -23,9 +23,23 @@ class Settings(BaseSettings):
     # configured mount, NOT ``workspace_root/.memory`` (the latter is a child's
     # own legitimate write directory and must be captured).
     memory_mount_target: str = "/workspace/.memory"
+    # Native MEMBER skill bundle root INSIDE the sandbox container — mirrors the
+    # api-side ``skill_sandbox_bundle_root`` (api/core/config.py:108). A fresh
+    # native member skill's foreground bundle sync writes its files here AFTER the
+    # S2 PRE snapshot is taken; without exclusion they surface as spurious
+    # ADD/MODIFY in the S2 patch manifest (R10-2). The snapshot walker excludes
+    # THIS configured tree by realpath containment — exactly like the read-only
+    # memory mount and the service-install tree — because ``.skills`` is never a
+    # legitimate work-unit output. The api propagates its (possibly customized)
+    # value into the container env (docker_sandbox.py) so this default stays in
+    # sync; a basename/wrong-path prune would be fail-open.
+    skill_sandbox_bundle_root: str = "/home/ubuntu/workspace/.skills"
 
     @field_validator(
-        "workspace_root", "service_install_dir", "memory_mount_target"
+        "workspace_root",
+        "service_install_dir",
+        "memory_mount_target",
+        "skill_sandbox_bundle_root",
     )
     @classmethod
     def _must_be_absolute(cls, v: str) -> str:

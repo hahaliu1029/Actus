@@ -37,12 +37,17 @@ def test_empty_member_fields_omitted_byte_identical():
     assert "member_skill_slugs" not in data
 
 
-def test_non_empty_member_fields_sorted_deterministic():
+def test_non_empty_member_fields_deterministic():
     wu = _wu(
         member_skill_tools=frozenset({"skill_b_y", "skill_a_x"}),
         member_skill_slugs=("repo-map", "grep-pro"),
     )
     data = json.loads(_serialize_spawn_manifest(wu))
+    # member_skill_tools is a SET (order-irrelevant) → sorted() for determinism.
     assert data["member_skill_tools"] == ["skill_a_x", "skill_b_y"]   # sorted
-    assert data["member_skill_slugs"] == ["grep-pro", "repo-map"]     # sorted
+    # member_skill_slugs is ORDER-SIGNIFICANT (the expander's canonical
+    # tuple(dict.fromkeys(member.skills)) order = the child's prepend order,
+    # EPIC-FIX-2) → serialized order-PRESERVING (list, NOT sorted). Sorting here
+    # silently broke Fix #2's expander↔child ordering-equivalence.
+    assert data["member_skill_slugs"] == ["repo-map", "grep-pro"]     # order preserved
     assert _serialize_spawn_manifest(wu) == _serialize_spawn_manifest(wu)  # determinism

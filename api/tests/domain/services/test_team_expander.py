@@ -39,7 +39,7 @@ async def test_mcp_member_skill_with_c2_child_safe_resolves():
     assert isinstance(cap, MemberCapability)
     assert cap.member_skill_tools == frozenset({"skill_safe_mcp_go"})
     assert cap.member_skill_slugs == ("safe-mcp",)
-    assert cap.native_skill_slugs == ()  # PR-3: native always empty
+    assert cap.native_skill_slugs == ()  # mcp skill ⇒ not native
 
 
 @pytest.mark.asyncio
@@ -51,11 +51,20 @@ async def test_mcp_member_skill_without_c2_child_safe_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_native_member_skill_rejected_in_pr3():
+async def test_native_member_skill_resolves_and_is_tracked_pr5():
+    # [S4 §13 PR-5] native member skills RESOLVE (no longer rejected at resolve);
+    # their slug is collected into native_skill_slugs and their generated tool
+    # name is included in member_skill_tools. The per-unit capability gate
+    # (shell+write) is enforced later in the dispatch path (5.2), NOT here.
     repo = _FakeSkillRepo([_skill("nat", runtime=SkillRuntimeType.NATIVE)])
-    m = TeamMember(role="r", description="d", system_prompt="p", skills=("nat",))
-    with pytest.raises(TeamCapabilityError):
-        await resolve_team_member_map(team=_team(m), skill_repository=repo)
+    m = TeamMember(role="r", description="d", system_prompt="p", skills=("nat",),
+                   shell_mode=True)
+    out = await resolve_team_member_map(team=_team(m), skill_repository=repo)
+    cap = out["r"]
+    assert cap.native_skill_slugs == ("nat",)
+    # _skill("nat") manifest tools default to [{"name": "go"}] →
+    # generated name is skill_{slug}_{tool} = skill_nat_go.
+    assert "skill_nat_go" in cap.member_skill_tools  # native tool name included
 
 
 @pytest.mark.asyncio

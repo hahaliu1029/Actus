@@ -212,20 +212,36 @@ def _force_include_member_skills(filtered_pool, enabled_skills, member_slugs):
 
 
 def _apply_member_skill_floor(selected, pool, member_slugs):
-    """[S4 §12/codex-R8] Member skills are a SELECTION FLOOR: union them into EVERY
-    per-message/per-step selection so a query-driven selector can never drop them
-    (which would leave member_skill_tools allowlisted+bound but the dynamic
-    StructuredTool unbuilt → silent absence). Identity when no member slugs."""
+    """[S4 §12/codex-R8 + EPIC-FIX-2] Member skills are a SELECTION FLOOR placed
+    FIRST (canonical ``member_slugs`` order) so a query-driven selector can never
+    drop them (which would leave member_skill_tools allowlisted+bound but the
+    dynamic StructuredTool unbuilt → silent absence), AND so the child's
+    ``SkillTool.initialize`` indexes them BEFORE any non-member skill.
+
+    Why FIRST (not appended last): ``SkillTool.initialize`` seeds its
+    ``_tool_name_index`` in list order — the first (slug, tool) pair that
+    normalizes to a given ``skill_{slug}_{tool}`` base claims the bare name; later
+    collisions get ``_N``. The expander predicts a member's ``member_skill_tools``
+    via ``SkillTool.generate_tool_names(resolved)`` over ONLY that member's skills
+    from an EMPTY index, so it always predicts the BARE name. Each child work unit
+    carries exactly ONE member (``cpc.member_skill_slugs``), and that same de-duped
+    slug order (``tuple(dict.fromkeys(member.skills))`` in the expander) is carried
+    here as ``member_slugs``. Indexing the member's skills FIRST, in that order,
+    from the child's own empty index reproduces the expander's prediction EXACTLY —
+    any non-member base collision now absorbs the ``_N`` suffix instead of the
+    member tool. Without this, an appended-last member tool collided on base would
+    get ``_N`` while the expander predicted the bare name → the built-vs-bound
+    assertion mis-fires / silent absence (the §12 #1 risk, §13/R7-2 violation).
+
+    Identity when no member slugs (INV-0) ⇒ flag-OFF / non-team children
+    byte-identical (no reorder)."""
     if not member_slugs:
         return selected
-    have = {s.slug for s in selected}
     by_slug = {s.slug: s for s in pool}
-    out = list(selected)
-    for slug in member_slugs:
-        if slug not in have and slug in by_slug:
-            out.append(by_slug[slug])
-            have.add(slug)
-    return out
+    front = [by_slug[slug] for slug in member_slugs if slug in by_slug]
+    front_slugs = {s.slug for s in front}
+    rest = [s for s in selected if s.slug not in front_slugs]
+    return front + rest
 
 
 def _enabled_provider_names(mcp_config, a2a_config):

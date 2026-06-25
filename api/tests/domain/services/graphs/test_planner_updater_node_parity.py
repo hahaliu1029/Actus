@@ -223,6 +223,53 @@ def test_updater_node_calls_section_bundle_updater() -> None:
     assert "section_bundle.updater" in src
 
 
+def test_updater_node_passes_team_members_into_render_context() -> None:
+    """EPIC-FIX-1: updater_node is the re-plan loop that RE-EMITS
+    role-bearing ``parallel_work_units``. The agent-team teaching section
+    is registered in BOTH the planner AND updater registries
+    (bundles/{en,zh}.py), so updater_node must mirror planner_node's
+    best-effort STRUCTURAL-ONLY team-teaching load and pass
+    ``team_members=`` into its ``build_render_context`` call — otherwise
+    the section renders inert (text=None) on every replan round and
+    role-tagging degrades exactly where the planner had taught it.
+
+    This is an AST-level assertion: walk updater_node, find the
+    ``build_render_context(...)`` call, and require a ``team_members``
+    keyword argument.
+    """
+    source = MAIN_GRAPH_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = _find_function(tree, "updater_node")
+    assert fn is not None
+
+    found_render_ctx_call = False
+    found_team_members_kw = False
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_brc = (
+            isinstance(func, ast.Name) and func.id == "build_render_context"
+        ) or (
+            isinstance(func, ast.Attribute)
+            and func.attr == "build_render_context"
+        )
+        if not is_brc:
+            continue
+        found_render_ctx_call = True
+        if any(kw.arg == "team_members" for kw in node.keywords):
+            found_team_members_kw = True
+
+    assert found_render_ctx_call, (
+        "updater_node must call build_render_context"
+    )
+    assert found_team_members_kw, (
+        "updater_node must pass team_members= into build_render_context "
+        "(mirror planner_node's STRUCTURAL-ONLY team-teaching load) so the "
+        "agent-team teaching section reaches the assembled updater prompt"
+    )
+
+
 def test_planner_node_does_not_write_skill_context() -> None:
     """Two-clock invariant: planner_node must not write skill_context to
     state. Only updater_node is allowed (via skill_context_refresher) —

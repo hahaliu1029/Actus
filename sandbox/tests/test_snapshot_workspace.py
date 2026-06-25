@@ -551,6 +551,140 @@ async def test_nested_dot_memory_real_dir_is_descended_not_pruned(
         cfg.get_settings.cache_clear()
 
 
+async def test_configured_skills_bundle_subtree_excluded(tmp_path, monkeypatch):
+    # R10-2 (S4 PR-5): the foreground bundle sync of a fresh native MEMBER skill
+    # writes its files under the CONFIGURED ``skill_sandbox_bundle_root`` (default
+    # ``/home/ubuntu/workspace/.skills``) AFTER the S2 PRE snapshot is taken.
+    # Without exclusion those ``.skills`` files surface as spurious ADD/MODIFY in
+    # the S2 patch manifest. Exactly mirrors the read-only memory mount + service
+    # tree prune: a REAL ``.skills`` directory CONTAINED in the configured bundle
+    # root is dropped by realpath containment (``.skills`` is never a legitimate
+    # work-unit output). To exercise the prune in a tmp_path harness we point the
+    # bundle root UNDER the test workspace (``ws/.skills``); only THEN is that
+    # subtree dropped.
+    from app.core import config as cfg
+    from app.services.file import FileService
+
+    ws = _ws(tmp_path, monkeypatch)
+    # Point the bundle root at ``ws/.skills`` so the realpath-containment prune
+    # actually matches inside this scan; re-clear the settings cache.
+    monkeypatch.setenv("SKILL_SANDBOX_BUNDLE_ROOT", str(ws / ".skills"))
+    cfg.get_settings.cache_clear()
+    try:
+        (ws / ".skills" / "my-skill").mkdir(parents=True)
+        (ws / ".skills" / "my-skill" / "bundle.py").write_bytes(b"s")
+        (ws / "workspace").mkdir()
+        (ws / "workspace" / "ok.py").write_bytes(b"k")
+        scan = await FileService.snapshot_workspace(
+            root=str(ws), max_paths=1000, max_files=1000,
+            max_total_bytes=1_000_000, max_seconds=10.0,
+        )
+        assert "workspace/ok.py" in scan.entries
+        # bundle root == ws/.skills -> THAT subtree is dropped.
+        assert ".skills/my-skill/bundle.py" not in scan.entries
+        assert scan.truncated is False
+    finally:
+        cfg.get_settings.cache_clear()
+
+
+async def test_skills_symlink_emitted_not_pruned(tmp_path, monkeypatch):
+    # Security mirror of ``test_memory_symlink_emitted_not_pruned`` /
+    # ``test_symlink_to_sandbox_is_emitted_not_pruned``: a symlink NAMED
+    # ``.skills`` (or one resolving INTO the bundle root) that points at a REAL
+    # directory lands in os.walk's ``dirnames`` (followlinks=False). The
+    # ``.skills`` prune must run ONLY for a REAL directory CONTAINED in the bundle
+    # root — a ``.skills`` SYMLINK must still surface as kind="symlink" (spec
+    # §3.1/L136: ANY symlink must surface so the differ group-zero-applies), NEVER
+    # be silently dropped. Same class as the /sandbox + .memory pre-lstat prunes.
+    from app.core import config as cfg
+    from app.services.file import FileService
+
+    ws = _ws(tmp_path, monkeypatch)
+    # Default SKILL_SANDBOX_BUNDLE_ROOT (/home/ubuntu/workspace/.skills, outside
+    # this ws) — the symlink basename is ``.skills`` but it is NOT contained in
+    # the bundle root, so it must be emitted regardless.
+    try:
+        realtarget = ws / "realtarget"
+        realtarget.mkdir()
+        (realtarget / "inside.py").write_bytes(b"i")
+        (ws / "workspace").mkdir()
+        # symlink NAMED .skills -> a real dir, so it lands in dirnames.
+        os.symlink(str(realtarget), ws / "workspace" / ".skills")
+        scan = await FileService.snapshot_workspace(
+            root=str(ws), max_paths=1000, max_files=1000,
+            max_total_bytes=1_000_000, max_seconds=10.0,
+        )
+        sk = scan.entries["workspace/.skills"]
+        assert sk.kind == "symlink"
+        assert sk.link_target == str(realtarget)
+        assert sk.sha256 is None
+        # NOT descended through the symlink.
+        assert "workspace/.skills/inside.py" not in scan.entries
+        assert scan.truncated is False
+    finally:
+        cfg.get_settings.cache_clear()
+
+
+async def test_nested_dot_skills_real_dir_is_descended_not_pruned(
+    tmp_path, monkeypatch
+):
+    # R10-2 security mirror of ``test_nested_dot_memory_real_dir_is_descended_not_pruned``:
+    # ``.skills`` must be excluded by BUNDLE-ROOT REALPATH CONTAINMENT, not by
+    # basename. Only the CONFIGURED ``skill_sandbox_bundle_root`` subtree is
+    # dropped. A NESTED real directory merely NAMED ``.skills`` (e.g.
+    # ``proj/.skills``) is a child's legitimate write — it must be DESCENDED and
+    # its files emitted, NOT silently skipped. A basename prune
+    # (``if d == ".skills": continue``) would be fail-open: the differ sees a
+    # clean no-op and the child's writes vanish with truncated=False.
+    from app.core import config as cfg
+    from app.services.file import FileService
+
+    # Default SKILL_SANDBOX_BUNDLE_ROOT (/home/ubuntu/workspace/.skills) sits
+    # OUTSIDE this tmp workspace, so a nested ws/proj/.skills is NOT contained in
+    # the bundle root and must be descended (no setenv — exercise the default).
+    ws = _ws(tmp_path, monkeypatch)
+    try:
+        (ws / "proj" / ".skills").mkdir(parents=True)
+        (ws / "proj" / ".skills" / "keep.py").write_bytes(b"k")
+        (ws / "proj" / "ok.py").write_bytes(b"k")
+        scan = await FileService.snapshot_workspace(
+            root=str(ws), max_paths=1000, max_files=1000,
+            max_total_bytes=1_000_000, max_seconds=10.0,
+        )
+        # The NESTED .skills (NOT the configured bundle root) is descended + emitted.
+        assert "proj/.skills/keep.py" in scan.entries
+        assert "proj/ok.py" in scan.entries
+        assert scan.truncated is False
+    finally:
+        cfg.get_settings.cache_clear()
+
+
+async def test_scan_root_inside_skills_bundle_root_rejected(tmp_path, monkeypatch):
+    # P1-d fail-closed (R10-2): a scan ``root`` that resolves INSIDE the
+    # CONFIGURED skill bundle root must be rejected — mirrors the memory-mount /
+    # service-tree root-guard. The bundle root is never a legitimate scan target;
+    # scanning it would surface every native skill bundle as spurious output.
+    from app.core import config as cfg
+    from app.core.workspace import OutsideWorkspaceError
+    from app.services.file import FileService
+
+    ws = _ws(tmp_path, monkeypatch)
+    bundle = ws / "bundle-root"
+    bundle.mkdir()
+    # Point the bundle root at a real dir INSIDE the workspace so the P0
+    # workspace-confinement passes and the P1-d skills-root guard is what fires.
+    monkeypatch.setenv("SKILL_SANDBOX_BUNDLE_ROOT", str(bundle))
+    cfg.get_settings.cache_clear()
+    try:
+        with pytest.raises(OutsideWorkspaceError):
+            await FileService.snapshot_workspace(
+                root=str(bundle), max_paths=1000, max_files=1000,
+                max_total_bytes=1_000_000, max_seconds=10.0,
+            )
+    finally:
+        cfg.get_settings.cache_clear()
+
+
 async def test_outside_workspace_root_rejected(tmp_path, monkeypatch):
     # P0 fail-closed: an absolute ``root`` OUTSIDE the workspace must NOT be
     # scanned (spec §3.1 "Scope = /home/ubuntu only"). resolve_in_workspace

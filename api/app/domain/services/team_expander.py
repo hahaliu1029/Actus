@@ -33,6 +33,7 @@ async def resolve_team_member_map(
     for member in team.members:
         slugs = tuple(dict.fromkeys(member.skills))  # dedupe a member's slug list
         resolved = []
+        native_slugs: list[str] = []
         for slug in slugs:
             skill = await skill_repository.get_by_slug(slug)
             if skill is None or not skill.enabled:
@@ -42,12 +43,10 @@ async def resolve_team_member_map(
                 )
             # ---- member-skill capability policy (§13, fail-closed) ----------
             if skill.runtime_type == SkillRuntimeType.NATIVE:
-                # PR-3: native member skills are NOT yet supported (PR-5 adds the
-                # capability-gated native path). Reject fail-closed.
-                raise TeamCapabilityError(
-                    f"team {team.slug!r} member {member.role!r}: native member "
-                    f"skill {slug!r} is not supported yet (PR-5)"
-                )
+                # [S4 §13 PR-5] native is allowed but capability-gated PER-UNIT
+                # (post-coercion shell_mode + write) in the dispatch path, NOT
+                # here. Resolve tracks the slug; the gate enforces shell+write.
+                native_slugs.append(slug)
             else:  # mcp / a2a → require the unverified author attestation
                 policy = (skill.manifest or {}).get("policy", {})
                 if not (isinstance(policy, dict) and policy.get("c2_child_safe") is True):
@@ -66,7 +65,7 @@ async def resolve_team_member_map(
             system_prompt=member.system_prompt,
             member_skill_tools=frozenset(tool_names),
             member_skill_slugs=slugs,
-            native_skill_slugs=(),  # PR-3: always empty (native rejected); PR-5 populates
+            native_skill_slugs=tuple(native_slugs),  # ⊆ member_skill_slugs; the native ones (PR-5 gate)
             shell_mode=member.shell_mode,
         )
     return out

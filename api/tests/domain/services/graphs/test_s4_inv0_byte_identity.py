@@ -16,6 +16,12 @@ role. The four surfaces:
       planner prompt, so its ``_render`` returning ``text=None`` when off IS
       the planner-prompt-identity proof.
 
+A FIFTH S4 surface — the sandbox snapshot walker's ``.skills`` exclusion (PR-5,
+R10-2) — lives in the SANDBOX service and so is guarded in that package, not
+here: see ``sandbox/tests/test_snapshot_workspace.py`` (subtree-exclusion,
+symlink-emitted, nested-not-over-pruned, scan-root-rejected). Its prune is
+realpath-containment-scoped, a behavioral no-op for pre-S4 coordinator children.
+
 Plus an AST guard that BOTH ``input_for_graph`` dict literals in
 ``planner_react.py`` thread the ``team_slug`` key.
 """

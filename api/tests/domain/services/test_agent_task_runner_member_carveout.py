@@ -72,6 +72,27 @@ def test_selection_floor_no_duplicate_when_already_selected():
     assert [s.slug for s in out] == ["repo-map"]       # no duplicate
 
 
+def test_selection_floor_places_member_skills_first():
+    # [EPIC-FIX-2] The floor PREPENDS member skills in canonical member_slugs
+    # order so the child's SkillTool.initialize indexes them BEFORE non-member
+    # skills (claiming the bare generated name the expander predicted).
+    member = _skill("repo-map")
+    other = _skill("other")
+    out = _apply_member_skill_floor([other, member], [other, member], ("repo-map",))
+    assert [s.slug for s in out] == ["repo-map", "other"]   # member first, no dup
+
+
+def test_selection_floor_preserves_member_slug_order_when_multiple():
+    # [EPIC-FIX-2] Multiple member skills land in member_slugs order at the front;
+    # this MUST match the expander's generate_tool_names iteration order (which
+    # iterates the same de-duped member.skills tuple).
+    a = _skill("aaa")
+    b = _skill("bbb")
+    other = _skill("other")
+    out = _apply_member_skill_floor([other], [a, b, other], ("aaa", "bbb"))
+    assert [s.slug for s in out] == ["aaa", "bbb", "other"]
+
+
 # ---- per-step REFRESH path floor (codex-R8: the hottest reselection site) -- #
 #
 # These drive the REAL ``AgentTaskRunner._compute_refreshed_skills`` (not just

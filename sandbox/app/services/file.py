@@ -602,15 +602,28 @@ class FileService:
         # fail-open — the differ sees a clean no-op and the child's writes are
         # lost).
         memory_real = os.path.realpath(get_settings().memory_mount_target)
-        # P1-d: never scan the read-only memory mount or the service tree even if
-        # a caller passes one as ``root``. Today the caller always passes the
-        # workspace root, so this is a defensive correctness guard layered on top
-        # of the workspace confinement above.
-        if _within_or_equal(scan_root, memory_real) or _within_or_equal(
-            scan_root, install_real
+        # R10-2 (S4 PR-5): the native MEMBER skill bundle root (CONFIGURED
+        # ``skill_sandbox_bundle_root``, default ``/home/ubuntu/workspace/.skills``)
+        # is excluded by the SAME realpath containment as the memory mount / service
+        # tree. A fresh native member skill's foreground bundle sync writes here
+        # AFTER the S2 PRE snapshot, so without this prune those ``.skills`` files
+        # show up as spurious ADD/MODIFY in the patch manifest. ``.skills`` is never
+        # a legitimate work-unit output. Exclusion is by realpath containment, NOT
+        # basename — and (mirroring memory/sandbox) only REAL dirs are pruned; a
+        # symlink named/pointing-at ``.skills`` is still EMITTED kind="symlink"
+        # (never silently dropped).
+        skills_real = os.path.realpath(get_settings().skill_sandbox_bundle_root)
+        # P1-d: never scan the read-only memory mount, the service tree, or the
+        # skill bundle root even if a caller passes one as ``root``. Today the
+        # caller always passes the workspace root, so this is a defensive
+        # correctness guard layered on top of the workspace confinement above.
+        if (
+            _within_or_equal(scan_root, memory_real)
+            or _within_or_equal(scan_root, install_real)
+            or _within_or_equal(scan_root, skills_real)
         ):
             raise OutsideWorkspaceError(
-                f"snapshot root {root!r} 落在只读内存挂载/服务目录内，拒绝扫描"
+                f"snapshot root {root!r} 落在只读内存挂载/服务目录/技能包目录内，拒绝扫描"
             )
 
         def _walk() -> WorkspaceScan:
@@ -770,6 +783,8 @@ class FileService:
                                 continue  # drop the read-only .memory mount subtree
                             if _within_or_equal(child_real, install_real):
                                 continue  # drop /sandbox subtree
+                            if _within_or_equal(child_real, skills_real):
+                                continue  # drop the .skills bundle root subtree (R10-2)
                             pruned.append(d)  # real dir -> descend, not emitted
                             continue
                         # Non-dir in the dirnames slot (symlink-to-dir, etc.):

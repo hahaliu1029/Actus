@@ -46,6 +46,10 @@ def test_create_task_sets_tz_for_spawned_sandbox_container(monkeypatch) -> None:
         sandbox_no_proxy=None,
         sandbox_network="actus-net",
         container_timezone="Asia/Shanghai",
+        # NON-default value: proves the env carries the CONFIGURED value (the
+        # codex-R4-F2 sync purpose), not a hardcoded default. If the production
+        # code emitted a literal default instead of reading settings, this fails.
+        skill_sandbox_bundle_root="/opt/custom/skills-bundle",
     )
     fake_container = _FakeContainer()
     fake_docker_client = _FakeDockerClient(fake_container)
@@ -69,6 +73,16 @@ def test_create_task_sets_tz_for_spawned_sandbox_container(monkeypatch) -> None:
 
     assert sandbox.id.startswith("actus-sb-")
     assert fake_docker_client.containers.run_kwargs["environment"]["TZ"] == "Asia/Shanghai"
+    # R10-2 / codex-R4-F2: a customized api ``skill_sandbox_bundle_root`` must be
+    # propagated into the spawned container env so the SANDBOX snapshot walker
+    # prunes the SAME ``.skills`` path the api writes — else the bundle-sync diff
+    # pollution returns (api writes one path, sandbox excludes its default).
+    assert (
+        fake_docker_client.containers.run_kwargs["environment"][
+            "SKILL_SANDBOX_BUNDLE_ROOT"
+        ]
+        == "/opt/custom/skills-bundle"
+    )
     assert fake_docker_client.containers.run_kwargs["network"] == "actus-net"
     assert fake_docker_client.containers.run_kwargs["mem_limit"] == "4g"
     assert fake_docker_client.closed is True

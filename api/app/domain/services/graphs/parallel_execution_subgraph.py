@@ -89,7 +89,7 @@ from app.domain.services.coordinator_shell_mode_flag import (
     is_coordinator_shell_mode_enabled,
 )
 from app.domain.services.permission.child_scope_gate import SHELL_HARD_BLOCKED_NAMES
-from app.domain.services.team_expander import TeamCapabilityError
+from app.domain.services.team_expander import MemberCapability, TeamCapabilityError
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +392,36 @@ def _coerce_units_typed_only_if_flag_off(units: list[WorkUnit]) -> list[WorkUnit
     return coerced
 
 
+def _enforce_native_member_gate(
+    units: list[WorkUnit], team_member_map: dict[str, MemberCapability] | None
+) -> list[WorkUnit]:
+    """[S4 §13/R12-1] POST-coercion native capability gate. A native member skill
+    runs raw shell (skill.py:412) → its parent-workspace writes are only captured
+    by the S2 snapshot-diff/lease apply when the unit is effective shell_mode AND
+    phase==write. Evaluate AFTER _coerce_units_typed_only_if_flag_off so a
+    flag-OFF demotion can't leave native bound in a now-typed-only unit. Raise
+    TeamCapabilityError (→ graceful FAILED, fail-closed: no child spawns →
+    nothing native binds) otherwise."""
+    if not team_member_map:
+        return units
+    for u in units:
+        role = u.role
+        if role is None:
+            continue
+        cap = team_member_map.get(role)
+        if cap is None or not cap.native_skill_slugs:
+            continue
+        if not (u.shell_mode and u.phase == "write"):
+            raise TeamCapabilityError(
+                f"work unit role {role!r}: native member skill(s) "
+                f"{cap.native_skill_slugs} require an effective shell_mode WRITE "
+                f"unit (post-coercion); got shell_mode={u.shell_mode}, "
+                f"phase={u.phase!r}. Enable ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED "
+                f"and give the member a write task, or remove native skills."
+            )
+    return units
+
+
 def _log_orchestrator_task_done(task: asyncio.Task) -> None:
     """r6 P1-1 — done-callback for the orchestrator background task.
 
@@ -456,11 +486,20 @@ def _serialize_spawn_manifest(wu: WorkUnit) -> bytes:
         "expected_result_schema": wu.expected_result_schema,
     }
     # [S4 §9/§14/R3-F4] omit-when-empty (byte-identical manifest when off) +
-    # sorted (content-addressed manifest must be reproducible across pods).
+    # reproducible bytes (content-addressed manifest must be stable across pods).
+    # member_skill_tools is an unordered frozenset consumed as a SET (bind-floor
+    # union + membership assertion) → sorted() for determinism. member_skill_slugs
+    # is an ORDER-SIGNIFICANT canonical tuple (the expander's
+    # ``tuple(dict.fromkeys(member.skills))`` order) consumed as the child's
+    # prepend order [EPIC-FIX-2]: the child's SkillTool.initialize must index
+    # member skills in this EXACT order to reproduce the expander's per-member
+    # generate_tool_names prediction, so it is serialized order-preserving via
+    # list() (NOT sorted — sorting here silently broke the ordering-equivalence).
+    # list() of a fixed canonical tuple is still reproducible across pods.
     if wu.member_skill_tools:
         payload["member_skill_tools"] = sorted(wu.member_skill_tools)
     if wu.member_skill_slugs:
-        payload["member_skill_slugs"] = sorted(wu.member_skill_slugs)
+        payload["member_skill_slugs"] = list(wu.member_skill_slugs)
     return json.dumps(payload, sort_keys=True).encode("utf-8")
 
 
@@ -535,6 +574,10 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
             # typed-only leases must not be spuriously rejected for a (moot)
             # tree overlap that no longer exists post-coercion.
             work_units = _coerce_units_typed_only_if_flag_off(work_units)
+            # [S4 §13/R12-1] POST-coercion native capability gate: a flag-OFF
+            # demotion above can't leave a native member bound in a now-typed-only
+            # unit (the "allow-then-demote" escape). Runs AFTER coercion.
+            work_units = _enforce_native_member_gate(work_units, state.get("team_member_map"))
             # [S2 §3.3 F24] reject cross-unit lease overlap BEFORE spawning, on
             # the POST-coercion units: flag ON ⇒ coercion is identity ⇒ tree
             # overlaps still fail loud; flag OFF ⇒ only surviving typed leases
@@ -572,6 +615,10 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
     # be spuriously rejected for a (moot) tree overlap that no longer exists
     # post-coercion.
     work_units = _coerce_units_typed_only_if_flag_off(work_units)
+    # [S4 §13/R12-1] POST-coercion native capability gate: a flag-OFF demotion
+    # above can't leave a native member bound in a now-typed-only unit (the
+    # "allow-then-demote" escape). Runs AFTER coercion.
+    work_units = _enforce_native_member_gate(work_units, state.get("team_member_map"))
     # [S2 §3.3 F24] reject cross-unit lease overlap BEFORE spawning, on the
     # POST-coercion units: flag ON ⇒ coercion is identity ⇒ tree overlaps still
     # fail loud; flag OFF ⇒ only surviving typed leases are overlap-checked.

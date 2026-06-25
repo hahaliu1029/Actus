@@ -1361,10 +1361,64 @@ def build_main_graph(
                     state.get("language", "zh")
                 )
                 updater_config = {"configurable": {}}
+
+                # S4 EPIC-FIX-1: best-effort + STRUCTURAL-ONLY agent-team
+                # teaching load — mirror planner_node (see lines ~742-769).
+                # updater_node is the re-plan loop: when the coordinator flag
+                # is ON it RE-EMITS role-bearing ``parallel_work_units`` via
+                # the structured LLM call below, and ``WorkUnitRequest.role``
+                # lives in those units. The teaching section is registered in
+                # BOTH the planner AND updater registries (bundles/{en,zh}.py),
+                # so without this load the section renders inert (text=None)
+                # here and role-tagging degrades on every replan round.
+                #
+                # updater_node receives the REAL LangGraph ``config`` (same as
+                # planner_node — it already reads ``event_queue`` from it
+                # above), so ``team_repository`` is sourced from the real
+                # ``configurable``, NOT a fresh empty dict.
+                #
+                # STRUCTURAL only — NO §13 capability validation (that lives
+                # exclusively in ``_run_parallel_backend``). NEVER raises
+                # uncaught: a load failure degrades to ``team_members=None``,
+                # keeping flag-OFF / no-team paths byte-identical (INV-0).
+                team_members = None
+                try:
+                    from app.domain.services.agent_teams_flag import (
+                        is_agent_teams_enabled,
+                    )
+                    from app.domain.services.coordinator_feature_flag import (
+                        is_coordinator_enabled,
+                    )
+
+                    _configurable = (
+                        config.get("configurable") if config else {}
+                    ) or {}
+                    _team_slug = state.get("team_slug")
+                    _team_repo = _configurable.get("team_repository")
+                    if (
+                        is_coordinator_enabled()
+                        and is_agent_teams_enabled()
+                        and _team_slug
+                        and _team_repo
+                    ):
+                        _team = await _team_repo.get_by_slug(_team_slug)
+                        if _team is not None:
+                            team_members = tuple(
+                                (m.role, m.description) for m in _team.members
+                            )
+                except Exception:
+                    logger.warning(
+                        "updater_node: team teaching load failed; omitting",
+                        exc_info=True,
+                    )
+                    team_members = None
+
                 # M2 PR-4: updater registry does NOT include memory sections —
                 # skip the snapshot fetch. See ``memory_snapshot_provider``
                 # docstring.
-                ctx = build_render_context(state, updater_config, agent_config)
+                ctx = build_render_context(
+                    state, updater_config, agent_config, team_members=team_members
+                )
                 result = prompt_assembler.assemble(
                     section_bundle.updater,
                     ctx,
