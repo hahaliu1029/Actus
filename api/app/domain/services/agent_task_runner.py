@@ -744,6 +744,19 @@ class AgentTaskRunner(TaskRunner):
             ),
         )
 
+    @property
+    def session_id(self) -> str:
+        """Public read accessor for the session id this runner drives.
+
+        B5.5 T1: the task layer (``RedisStreamTask._execute_task`` /
+        ``_execute_resume``) reads this to bind the observability session
+        context via ``bind_session_context`` so prompt-assembly and
+        LLM-invocation telemetry records carry a non-null ``session_id``
+        (the per-session grouping key for cache-viability analysis). Exposed
+        as a property rather than touching ``_session_id`` from another layer.
+        """
+        return self._session_id
+
     def _require_state_machine(self) -> SessionStateMachine:
         # A4-1 §6: production write paths always inject an SSM. The ctor param
         # stays Optional (non-write-path fixtures legitimately pass None), so

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import uuid
 from typing import Any, Dict, Optional
@@ -8,6 +9,7 @@ from app.domain.external.task import Task, TaskRunner
 from app.infrastructure.external.message_queue.redis_stream_message_queue import (
     RedisStreamMessageQueue,
 )
+from app.infrastructure.observability.context import bind_session_context
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +57,50 @@ class RedisStreamTask(Task):
         # 2.清除当前任务对应的资源
         self._cleanup_registry()
 
+    async def _bind_session_context_if_available(
+        self, stack: contextlib.AsyncExitStack
+    ) -> None:
+        """B5.5 T1: best-effort entry of the observability session-context
+        binding so prompt-assembly / LLM-invocation telemetry records emitted
+        during ``runner.invoke`` / ``resume`` carry a non-null ``session_id``
+        (the per-session grouping key for cache-viability analysis).
+
+        Covers BOTH the root path (this task created by the SSE / chat entry)
+        AND the coordinator child path: ``AgentTaskRunnerInvokeAdapter`` also
+        drives the child ``AgentTaskRunner`` through ``RedisStreamTask`` (the
+        factory injects this class as its ``task_cls`` —
+        ``child_agent_runner_factory``), so the child rebinds its OWN
+        session_id here, overriding any value inherited from the parent task's
+        contextvar snapshot.
+
+        Never raises an ordinary exception: a runner that does not expose a
+        ``str`` session_id (test doubles, future runner types) — or whose
+        ``session_id`` accessor itself raises — simply skips applying a binding
+        here; execution proceeds with whatever context was inherited from the
+        task-creation scope left untouched (normally none for the root path).
+        Telemetry must never break task execution
+        (mirrors the swallow-all philosophy of the observability subsystem), so
+        the setup is wrapped: a failure here must not skip ``runner.invoke`` /
+        ``resume``. ``asyncio.CancelledError`` (a ``BaseException`` in py3.12)
+        is deliberately NOT caught — cooperative cancellation must propagate to
+        the outer handlers; the ``AsyncExitStack`` still resets the binding on
+        the way out.
+        """
+        try:
+            session_id = getattr(self._task_runner, "session_id", None)
+            if isinstance(session_id, str) and session_id:
+                await stack.enter_async_context(bind_session_context(session_id))
+        except Exception as exc:
+            logger.warning(
+                "任务[%s] session 上下文绑定跳过（best-effort）: %s", self._id, exc
+            )
+
     async def _execute_task(self) -> None:
         """使用TaskRunner执行任务"""
         try:
-            await self._task_runner.invoke(self)
+            async with contextlib.AsyncExitStack() as stack:
+                await self._bind_session_context_if_available(stack)
+                await self._task_runner.invoke(self)
         except asyncio.CancelledError:
             logger.info(f"任务[{self._id}]执行被取消")
             raise
@@ -76,7 +118,9 @@ class RedisStreamTask(Task):
     async def _execute_resume(self, command: Any) -> None:
         """Execute resume in background task (mirrors _execute_task for invoke)."""
         try:
-            await self._task_runner.resume(self, command)
+            async with contextlib.AsyncExitStack() as stack:
+                await self._bind_session_context_if_available(stack)
+                await self._task_runner.resume(self, command)
         except asyncio.CancelledError:
             logger.info(f"任务[{self._id}] resume 被取消")
             raise

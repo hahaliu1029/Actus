@@ -1325,10 +1325,12 @@ def build_coordinator_runtime_deps(
         parent_sandbox_adapter_factory=_parent_sandbox_adapter_factory,
         coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
         coordinator_metrics_recorder=coordinator_metrics_recorder,  # [C2b rollout WS1b]
-        # [S4 §5] Dormant DI plumbing — fresh FileTeamRepository (teams/ sibling
+        # [S4 §5] Coordinator team DI — fresh FileTeamRepository (teams/ sibling
         # of skills_root_dir; no dedicated settings field exists) + a FRESH
-        # FileSkillRepository (no shared singleton — [codex-R2-F3]). Consumed by
-        # the team expander (3.3) + planner_node (PR-4); nothing reads them yet.
+        # FileSkillRepository (no shared singleton — [codex-R2-F3]). Threaded via
+        # _build_config into cfg and read by the team expander
+        # (_run_parallel_backend) + planner/updater teaching load; active only when
+        # ACTUS_C2_AGENT_TEAMS_ENABLED + a team_slug are set (flag-gated, INV-0).
         team_repository=FileTeamRepository(Path(settings.skills_root_dir).parent / "teams"),
         skill_repository=FileSkillRepository(settings.skills_root_dir),
     )

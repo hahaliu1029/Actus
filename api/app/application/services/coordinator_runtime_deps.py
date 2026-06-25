@@ -5,8 +5,9 @@ projects **21 coordinator cfg keys**: the first 16 deps + 2 per-run keys
 (``cancel_event`` + the wrapped ``parent_sandbox``) + ``coordinator_metrics_recorder``
 (the 20th field, [C2b rollout WS1b] — the reducer reads it duck-typed for the
 run-level run_cost_usd / duration_seconds metrics) + ``team_repository`` +
-``skill_repository`` ([S4 §5] dormant DI plumbing — projected for the team
-expander (3.3) + planner_node (PR-4); no consumer in 3.1). NOT projected as cfg keys:
+``skill_repository`` ([S4 §5] — read by the team expander (``_run_parallel_backend``)
++ planner/updater teaching load; active only when ``ACTUS_C2_AGENT_TEAMS_ENABLED``
++ a ``team_slug`` are set). NOT projected as cfg keys:
 
 - ``coordinator_envelope_store`` — consumed only by ``SupervisorContext`` at
   ``_factory`` time.
