@@ -102,6 +102,14 @@ class RenderContext:
     (legacy executor path, tests without memory fixtures) therefore
     remain unaffected.
     """
+    team_members: tuple[tuple[str, str], ...] | None = None
+    """S4 PR-4: agent-team ``(role, description)`` pairs for the planner
+    teaching section. Loaded best-effort + STRUCTURAL-ONLY in
+    ``planner_node`` (no §13 capability validation — that lives in
+    ``_run_parallel_backend``). When ``None`` (flag-OFF / no team / load
+    failure), the teaching section emits nothing, keeping all non-team
+    call sites byte-identical (INV-0).
+    """
 
 
 # ---- SectionOutput ------------------------------------------------------ #

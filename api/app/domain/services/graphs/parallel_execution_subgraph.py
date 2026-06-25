@@ -53,7 +53,7 @@ import logging
 import operator
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, NotRequired, Optional, TypedDict
 
 if TYPE_CHECKING:
     # [codex R5 P2] Narrow the loose ``Any`` annotation on
@@ -88,6 +88,8 @@ from app.domain.models.work_unit import PathLease, TreeLease, WorkUnit
 from app.domain.services.coordinator_shell_mode_flag import (
     is_coordinator_shell_mode_enabled,
 )
+from app.domain.services.permission.child_scope_gate import SHELL_HARD_BLOCKED_NAMES
+from app.domain.services.team_expander import TeamCapabilityError
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +145,10 @@ class ParallelSubgraphState(TypedDict, total=False):
     step_id: str
     work_unit_requests: list[Any]  # list[WorkUnitRequest]
     work_units: list[WorkUnit]
+    # [S4 §10] role → MemberCapability map (plain data, NOT a service). Resolved
+    # ONCE parent-side in _run_parallel_backend; None ⇒ no team (INV-0). Re-resolved
+    # fresh on crash-replay (NOT a persisted snapshot, §15).
+    team_member_map: NotRequired[dict | None]
     parent_session_id: str
     user_id: str
     root_session_id: str
@@ -196,6 +202,7 @@ def _build_work_units_from_requests(
     work_unit_requests: list[Any],
     step_id_hash16: str,
     attempt_ix: int,
+    team_member_map: "dict | None" = None,  # [S4 §10] role → MemberCapability
 ) -> list[WorkUnit]:
     """Convert planner WorkUnitRequest list to runtime WorkUnit list.
 
@@ -219,7 +226,7 @@ def _build_work_units_from_requests(
             )
             for t in getattr(req, "proposed_trees", []) or []
         ]
-        # [S2 §3.3/§3.5] shell_mode is the OR of TWO sufficient signals:
+        # [S2 §3.3/§3.5] task_shell_signal is the OR of TWO sufficient signals:
         #   (1) the request's OWN positive shell_mode (§3.5 — a unit may request
         #       shell mode with ONLY exact file leases, NO tree leases), AND
         #   (2) the "tree lease IMPLIES shell_mode" rule (§3.3 — a non-empty tree
@@ -228,13 +235,66 @@ def _build_work_units_from_requests(
         # that has only exact file leases (shell_mode stays False forever) and
         # (b) silently drop the request's positive shell_mode signal. A
         # path-only / exploration unit with shell_mode unset stays typed-only.
-        shell_mode = bool(getattr(req, "shell_mode", False)) or bool(tree_leases)
+        task_shell_signal = bool(getattr(req, "shell_mode", False)) or bool(tree_leases)
+        role = getattr(req, "role", None)
+
+        # ── resolve the member ──
+        # [codex-R7 — INV-0 critical] role is interpreted ONLY when a team is
+        # selected (team_member_map is not None). `role` is in the planner's
+        # with_structured_output schema UNCONDITIONALLY, so under flag-OFF / no
+        # team_slug (⇒ map is None) the LLM CAN still emit a role — it must be a
+        # DEAD no-op (INV-0 passthrough), NOT a raise. A team IS selected ⇒ a role
+        # not in the roster is fail-closed (R1-F3 / §13 matrix).
+        member = None
+        if team_member_map is not None and role is not None:
+            if role not in team_member_map:
+                raise TeamCapabilityError(
+                    f"work unit role {role!r} is not a member of the selected team"
+                )
+            member = team_member_map[role]
+
+        if member is None:
+            # ── no-merge / INV-0 branch (verbatim, NO dict.fromkeys) ──
+            allowed_tools = list(req.allowed_tools)
+            shell_mode = task_shell_signal
+            system_prompt = None
+            member_skill_tools: frozenset[str] = frozenset()
+            member_skill_slugs: tuple[str, ...] = ()
+        else:
+            # ── merge branch ──
+            system_prompt = member.system_prompt
+            member_skill_tools = member.member_skill_tools
+            member_skill_slugs = member.member_skill_slugs
+            # shell_mode: member-authoritative + conflict reject (§11/R4-#4)
+            if req.phase == "exploration":
+                shell_mode = False  # req validator guarantees task_shell_signal is False here
+            else:  # write
+                if member.shell_mode is False and task_shell_signal:
+                    raise TeamCapabilityError(
+                        f"work unit role {role!r}: task requires shell (tree lease / "
+                        f"shell_mode) but member is not shell-capable"
+                    )
+                shell_mode = member.shell_mode
+            # gate union (member skill tool names). [codex-R1-F5] member_skill_tools
+            # + SHELL_HARD_BLOCKED_NAMES are FROZENSETS → iteration order is
+            # process-dependent; the manifest is content-addressed (serialized via
+            # list(wu.allowed_tools) verbatim, _serialize_spawn_manifest), so the
+            # set parts MUST be sorted() for reproducible bytes across pods.
+            # req.allowed_tools stays verbatim (planner order preserved); dedupe via
+            # dict.fromkeys.
+            allowed_tools = list(dict.fromkeys([*req.allowed_tools, *sorted(member_skill_tools)]))
+            # F4 shell gate-union: gate step-1 (allowlist) precedes shell-release
+            # (HARD_BLOCKED un-block), so an effective-shell unit must carry the 5
+            # shell names in allowed_tools.
+            if shell_mode:
+                allowed_tools = list(dict.fromkeys([*allowed_tools, *sorted(SHELL_HARD_BLOCKED_NAMES)]))
+
         units.append(
             WorkUnit(
                 work_unit_id=f"{step_id_hash16}.a{attempt_ix}.{i}",
                 objective=req.objective,
                 phase=req.phase,
-                allowed_tools=list(req.allowed_tools),
+                allowed_tools=allowed_tools,
                 write_lease=[
                     PathLease(path=validate_coordinator_path(p.path), op=p.op)
                     for p in req.proposed_paths
@@ -242,6 +302,10 @@ def _build_work_units_from_requests(
                 write_tree_lease=tree_leases,
                 shell_mode=shell_mode,
                 expected_result_schema=req.expected_result_schema,
+                role=role,
+                system_prompt=system_prompt,
+                member_skill_tools=member_skill_tools,
+                member_skill_slugs=member_skill_slugs,
             )
         )
     return units
@@ -345,6 +409,29 @@ def _log_orchestrator_task_done(task: asyncio.Task) -> None:
         )
 
 
+def _rebuild_enriched_unit(wu: WorkUnit, new_leases: list[PathLease]) -> WorkUnit:
+    """[S2 §3.3 + S4 R2-F1] Rebuild a unit after seed enrichment, re-threading
+    EVERY field. enriched_units (not work_units) flows downstream to
+    _serialize_spawn_manifest + the child, so any field dropped here never
+    reaches the manifest/child. The 4 S4 fields (role/system_prompt/
+    member_skill_tools/member_skill_slugs) MUST be carried — preserving
+    allowed_tools does NOT save member_skill_tools/slugs (distinct fields)."""
+    return WorkUnit(
+        work_unit_id=wu.work_unit_id,
+        objective=wu.objective,
+        phase=wu.phase,
+        allowed_tools=wu.allowed_tools,
+        write_lease=new_leases,
+        write_tree_lease=wu.write_tree_lease,
+        shell_mode=wu.shell_mode,
+        expected_result_schema=wu.expected_result_schema,
+        role=wu.role,
+        system_prompt=wu.system_prompt,
+        member_skill_tools=wu.member_skill_tools,
+        member_skill_slugs=wu.member_skill_slugs,
+    )
+
+
 def _serialize_spawn_manifest(wu: WorkUnit) -> bytes:
     """Minimal JSON serialization of WorkUnit for MinIO manifest.
 
@@ -355,7 +442,7 @@ def _serialize_spawn_manifest(wu: WorkUnit) -> bytes:
     bool(write_tree_lease)`` (and preserved through the Step-4 enrichment
     rebuild), so the request's positive shell_mode reaches the child manifest.
     """
-    return json.dumps({
+    payload = {
         "work_unit_id": wu.work_unit_id,
         "objective": wu.objective,
         "phase": wu.phase,
@@ -367,7 +454,14 @@ def _serialize_spawn_manifest(wu: WorkUnit) -> bytes:
         ],
         "shell_mode": wu.shell_mode,
         "expected_result_schema": wu.expected_result_schema,
-    }, sort_keys=True).encode("utf-8")
+    }
+    # [S4 §9/§14/R3-F4] omit-when-empty (byte-identical manifest when off) +
+    # sorted (content-addressed manifest must be reproducible across pods).
+    if wu.member_skill_tools:
+        payload["member_skill_tools"] = sorted(wu.member_skill_tools)
+    if wu.member_skill_slugs:
+        payload["member_skill_slugs"] = sorted(wu.member_skill_slugs)
+    return json.dumps(payload, sort_keys=True).encode("utf-8")
 
 
 # ── dispatch_node ────────────────────────────────────────────────────────────
@@ -418,6 +512,7 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
         if existing is not None:
             work_units = _build_work_units_from_requests(
                 state["work_unit_requests"], step_id_hash16, current_attempt_ix,
+                team_member_map=state.get("team_member_map"),
             )
             # [S2 PR-4 flag-flip kill-switch] Capture which units were INTENDED
             # shell/tree-capable BEFORE the flag-off coercion strips the signal.
@@ -468,6 +563,7 @@ async def dispatch_node(state: ParallelSubgraphState, config: RunnableConfig) ->
     )
     work_units = _build_work_units_from_requests(
         state["work_unit_requests"], step_id_hash16, attempt_ix,
+        team_member_map=state.get("team_member_map"),
     )
     # [S2 §3.6 F27] flag-off active fail-closed: coerce shell-mode units to
     # typed-only while the master flag is OFF (PR-3 state). MUST run BEFORE
@@ -655,24 +751,16 @@ async def _first_time_dispatch(
                     path=lease.path, op=lease.op,
                     base_digest=base_digest, seed_content_ref=seed_ref,
                 ))
-            enriched_units.append(WorkUnit(
-                work_unit_id=wu.work_unit_id,
-                objective=wu.objective,
-                phase=wu.phase,
-                allowed_tools=wu.allowed_tools,
-                write_lease=new_leases,
-                # [S2 §3.3/§3.5 — P0-1] preserve the shell-mode signals through
-                # enrichment; enrichment only fills write_lease digests, it must
-                # not strip the tree lease / shell_mode (else they never reach
-                # _serialize_spawn_manifest -> the child -> PR-4/PR-5). ``wu``
-                # here is the pre-enrichment unit produced by
-                # ``_build_work_units_from_requests``, so ``wu.shell_mode``
-                # already carries ``req.shell_mode or bool(write_tree_lease)`` —
-                # the request's positive shell_mode flows through unchanged.
-                write_tree_lease=wu.write_tree_lease,
-                shell_mode=wu.shell_mode,
-                expected_result_schema=wu.expected_result_schema,
-            ))
+            # [S2 §3.3/§3.5 — P0-1 / S4 R2-F1] Rebuild via the pure helper so
+            # EVERY field is re-threaded through enrichment. enrichment only
+            # fills write_lease digests, but it must not strip the tree lease /
+            # shell_mode / S4 member fields (else they never reach
+            # _serialize_spawn_manifest -> the child -> PR-4/PR-5). ``wu`` here
+            # is the pre-enrichment unit produced by
+            # ``_build_work_units_from_requests``, so ``wu.shell_mode`` already
+            # carries ``req.shell_mode or bool(write_tree_lease)`` — the
+            # request's positive shell_mode flows through unchanged.
+            enriched_units.append(_rebuild_enriched_unit(wu, new_leases))
 
         # Step 5 -- create N child sessions (live returns Session domain object).
         #

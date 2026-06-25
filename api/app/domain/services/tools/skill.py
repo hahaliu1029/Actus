@@ -32,6 +32,40 @@ logger = logging.getLogger(__name__)
 TOOL_NAME_MAX_LENGTH = 64
 
 
+def _skill_tool_function_name(
+    skill_slug: str, tool_name: str, name_index: dict[str, int]
+) -> str:
+    """Single source of truth for the generated ``skill_{slug}_{tool}`` name
+    (+ ``_N`` dedup + sha1 cap).
+
+    Extracted verbatim from the original ``SkillTool._build_function_name``
+    body, adapting the one ``self.`` reference: ``self._normalize_function_part``
+    → ``SkillTool._normalize_function_part`` (a ``@classmethod``, callable on the
+    class). Shared by the preserved bound method (monkeypatch contract) and the
+    sandbox-free ``SkillTool.generate_tool_names`` (S4 §13/R7-2). [codex-R4-F1]
+    """
+    slug_part = SkillTool._normalize_function_part(skill_slug)
+    tool_part = SkillTool._normalize_function_part(tool_name)
+    base = f"skill_{slug_part}_{tool_part}"
+    suffix_num = name_index.get(base, 0)
+    name_index[base] = suffix_num + 1
+
+    candidate = base if suffix_num == 0 else f"{base}_{suffix_num}"
+    if len(candidate) <= TOOL_NAME_MAX_LENGTH:
+        return candidate
+
+    digest = hashlib.sha1(candidate.encode("utf-8")).hexdigest()[:8]
+    prefix = candidate[: TOOL_NAME_MAX_LENGTH - 9].rstrip("_")
+    return f"{prefix}_{digest}"
+
+
+def _skill_tool_is_model_invocable(skill: "Skill", manifest_tool: dict) -> bool:
+    """Module-level mirror of ``SkillTool._is_model_invocable``; shared by the
+    preserved bound method and ``generate_tool_names`` (sandbox-free)."""
+    policy = SkillTool._get_tool_policy(skill, manifest_tool)  # already @staticmethod
+    return bool(policy.get("model_invocable", True))
+
+
 class SkillTool(BaseTool):
     """统一 Skill 工具层，支持 native/mcp/a2a 三类运行时"""
 
@@ -471,19 +505,35 @@ class SkillTool(BaseTool):
     def _build_function_name(
         self, skill_slug: str, tool_name: str, name_index: dict[str, int]
     ) -> str:
-        slug_part = self._normalize_function_part(skill_slug)
-        tool_part = self._normalize_function_part(tool_name)
-        base = f"skill_{slug_part}_{tool_part}"
-        suffix_num = name_index.get(base, 0)
-        name_index[base] = suffix_num + 1
+        # Thin wrapper over the module-level helper. Signature UNCHANGED so the
+        # initialize() call site + the monkeypatch atomicity tests keep working.
+        return _skill_tool_function_name(skill_slug, tool_name, name_index)
 
-        candidate = base if suffix_num == 0 else f"{base}_{suffix_num}"
-        if len(candidate) <= TOOL_NAME_MAX_LENGTH:
-            return candidate
-
-        digest = hashlib.sha1(candidate.encode("utf-8")).hexdigest()[:8]
-        prefix = candidate[: TOOL_NAME_MAX_LENGTH - 9].rstrip("_")
-        return f"{prefix}_{digest}"
+    @staticmethod
+    def generate_tool_names(skills: "list[Skill]") -> list[str]:
+        """[S4 §13/R7-2] The generated ``skill_{slug}_{tool}`` names a SkillTool
+        would build — same filter (enabled / list / dict / non-empty name /
+        model_invocable) + naming (SHARED name_index + sha1 cap) as
+        ``initialize()``, WITHOUT constructing a SkillTool (no sandbox). The
+        anti-drift test locks it to real ``get_tools()``."""
+        name_index: dict[str, int] = {}
+        names: list[str] = []
+        for skill in skills:
+            if not skill.enabled:
+                continue
+            manifest_tools = (skill.manifest or {}).get("tools", [])
+            if not isinstance(manifest_tools, list):
+                continue
+            for manifest_tool in manifest_tools:
+                if not isinstance(manifest_tool, dict):
+                    continue
+                raw = str(manifest_tool.get("name") or "").strip()
+                if not raw:
+                    continue
+                if not _skill_tool_is_model_invocable(skill, manifest_tool):
+                    continue
+                names.append(_skill_tool_function_name(skill.slug, raw, name_index))
+        return names
 
     @classmethod
     def _extract_skill_md_summary(cls, skill_md: str) -> str:
@@ -536,8 +586,9 @@ class SkillTool(BaseTool):
         return policy
 
     def _is_model_invocable(self, skill: Skill, manifest_tool: dict[str, Any]) -> bool:
-        policy = self._get_tool_policy(skill, manifest_tool)
-        return bool(policy.get("model_invocable", True))
+        # Thin wrapper over the module-level helper. Signature UNCHANGED so the
+        # initialize() call site + the monkeypatch atomicity tests keep working.
+        return _skill_tool_is_model_invocable(skill, manifest_tool)
 
     def _contains_blocked_command(self, command: str) -> bool:
         """DEPRECATED (N1): retained as belt-and-suspenders secondary layer.

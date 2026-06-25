@@ -1168,8 +1168,41 @@ class PlannerReActFlow(BaseFlow):
             "conversation_summaries": list(summary_texts),
         }
         detection_config = {"configurable": {}}
+
+        # S4 PR-4 (codex R2 F1): the detection-path plan is REUSED by
+        # ``invoke()`` with ``flow_status=EXECUTING``, which SKIPS
+        # ``planner_node`` — so the planner-side agent-team teaching load
+        # that lives ONLY in ``planner_node`` (main_graph.py) would never
+        # run on this branch, silently producing un-taught (no-roster /
+        # no-role) plans for team-selected normal tasks. Mirror the
+        # ``planner_node`` best-effort + STRUCTURAL-ONLY load here, but
+        # source the team repository from the FLOW's coord deps (this
+        # method builds its own empty ``detection_config``, so there is no
+        # graph ``config`` to read). Gated identically to ``planner_node``;
+        # never validates capabilities (§13 lives in
+        # ``_run_parallel_backend``); never raises uncaught — a failure
+        # degrades to ``team_members=None``, keeping flag-OFF / no-team
+        # paths byte-identical (INV-0).
+        team_members = None
+        try:
+            from app.domain.services.agent_teams_flag import is_agent_teams_enabled
+            from app.domain.services.coordinator_feature_flag import is_coordinator_enabled
+            _team_slug = getattr(message, "team_slug", None)
+            _team_repo = getattr(self._coord_deps, "team_repository", None)  # PR-3 DI on the flow
+            if is_coordinator_enabled() and is_agent_teams_enabled() and _team_slug and _team_repo:
+                _team = await _team_repo.get_by_slug(_team_slug)   # STRUCTURAL only (no §13 here)
+                if _team is not None:
+                    team_members = tuple((m.role, m.description) for m in _team.members)
+        except Exception:
+            logger.warning(
+                "_run_planner_for_detection: team teaching load failed; omitting",
+                exc_info=True,
+            )
+            team_members = None
+
         ctx = build_render_context(
-            detection_state, detection_config, self._agent_config
+            detection_state, detection_config, self._agent_config,
+            team_members=team_members,
         )
         result = self._prompt_assembler.assemble(
             section_bundle.planner,
@@ -1498,6 +1531,8 @@ class PlannerReActFlow(BaseFlow):
                 "artifact_storage": cd.artifact_storage,
                 "cost_rollup_service": cd.cost_rollup_service,
                 "coordinator_metrics_recorder": cd.coordinator_metrics_recorder,
+                "team_repository": cd.team_repository,      # [S4 §5] expander + teaching
+                "skill_repository": cd.skill_repository,    # [S4 §5/R7-1] slug→manifest resolve
             })
             # event_queue is intentionally NOT here — GraphEventBridge merges
             # {"event_queue": q} into configurable AT INVOCATION TIME
@@ -1632,6 +1667,7 @@ class PlannerReActFlow(BaseFlow):
                 input_for_graph = {
                     "message": message.message,
                     "language": message.language,
+                    "team_slug": getattr(message, "team_slug", None),  # [S4 §7]
                     "attachments": getattr(message, "attachments", []),
                     "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": plan,
@@ -1655,6 +1691,7 @@ class PlannerReActFlow(BaseFlow):
                 input_for_graph = {
                     "message": message.message,
                     "language": message.language,
+                    "team_slug": getattr(message, "team_slug", None),  # [S4 §7]
                     "attachments": getattr(message, "attachments", []),
                     "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": self.plan,

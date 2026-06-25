@@ -133,6 +133,7 @@ def test_planner_and_updater_registries_populated_in_c6() -> None:
     expected_ids = [
         "planner_identity",
         "parallel_work_units_teaching",
+        "agent_team_teaching",          # [S4] new — inserted after the S2 teaching section
         "planner_tool_summary_legacy",
         "conversation_summaries",
     ]

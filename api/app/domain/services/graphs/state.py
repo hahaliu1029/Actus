@@ -23,6 +23,10 @@ class MainGraphState(TypedDict):
     # Input
     message: str
     language: str
+    # [S4 §7] per-run team selection. NotRequired ⇒ older checkpoints lack it
+    # ⇒ state.get("team_slug") is None ⇒ INV-0 (coordinator backend only acts
+    # when is_coordinator_enabled() and is_agent_teams_enabled() and team_slug).
+    team_slug: NotRequired[str | None]
     attachments: list[str]
     image_content_blocks: list[dict]  # 图片附件的多模态内容块 (OpenAI image_url format)
 

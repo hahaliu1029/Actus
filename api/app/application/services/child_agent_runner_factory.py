@@ -51,6 +51,20 @@ _SHELL_MODE_UNION_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _apply_member_skill_bind(tool_filter, child_permission_context, tool_filter_preset):
+    """[S4 §11] Union the member skill GENERATED tool names into the bind floor,
+    gated on the coordinator-step preset (self-defends a future non-coordinator
+    reuse, same as the shell widen). Bind floor = preset ∪ member_skill_tools —
+    NEVER WorkUnit.allowed_tools (the planner is an LLM; it must not widen its own
+    bind surface)."""
+    member_tools = frozenset(
+        getattr(child_permission_context, "member_skill_tools", frozenset()) or frozenset()
+    )
+    if tool_filter is not None and member_tools and tool_filter_preset == COORDINATOR_STEP_PRESET:
+        return tool_filter | member_tools
+    return tool_filter
+
+
 class ChildRunnerBuilder(Protocol):
     """[C2 PR-4 r7 P1] Protocol the factory expects from its ``runner_class``
     injection point.
@@ -192,6 +206,14 @@ class ChildAgentTaskRunnerFactory:
         )
         if _shell_widen:
             tool_filter = tool_filter | _SHELL_MODE_UNION_TOOLS
+        # [S4 §11] Union the member's GENERATED skill tool names into the bind
+        # floor (preset ∪ member_skill_tools), gated on the coordinator-step
+        # preset — same self-defense as the shell widen above. Empty member
+        # tools / non-coordinator preset / tool_filter=None ⇒ identity, so
+        # flag-OFF / no-team children keep byte-identical bind behavior.
+        tool_filter = _apply_member_skill_bind(
+            tool_filter, child_permission_context, tool_filter_preset
+        )
         terminal_disabled = tool_filter_preset == COORDINATOR_STEP_PRESET
         raw_runner = self._runner_class(
             session_id=child_session_id,

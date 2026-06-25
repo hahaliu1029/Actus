@@ -2834,6 +2834,7 @@ class AgentService:
         latest_event_id: Optional[str] = None,
         timestamp: Optional[datetime] = None,
         tool_filter: Optional[FrozenSet[str]] = None,
+        team_slug: Optional[str] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的信息调用Agent服务发起对话请求
 
@@ -2966,6 +2967,7 @@ class AgentService:
                         else []
                     ),
                     skill_confirmation_action=skill_confirmation_action,
+                    team_slug=team_slug,  # [S4 §7] carrier — survives enqueue/dequeue
                 )
 
                 # 8.将事件添加到任务的输入流中，好让Agent获取到数据

@@ -1,10 +1,12 @@
 """[PR-9b-A] Lifespan-scoped coordinator runtime deps container.
 
-Aggregates **20 fields** (singletons). ``PlannerReActFlow._build_config()``
-projects **19 coordinator cfg keys**: the first 16 deps + 2 per-run keys
+Aggregates **22 fields** (singletons). ``PlannerReActFlow._build_config()``
+projects **21 coordinator cfg keys**: the first 16 deps + 2 per-run keys
 (``cancel_event`` + the wrapped ``parent_sandbox``) + ``coordinator_metrics_recorder``
 (the 20th field, [C2b rollout WS1b] — the reducer reads it duck-typed for the
-run-level run_cost_usd / duration_seconds metrics). NOT projected as cfg keys:
+run-level run_cost_usd / duration_seconds metrics) + ``team_repository`` +
+``skill_repository`` ([S4 §5] dormant DI plumbing — projected for the team
+expander (3.3) + planner_node (PR-4); no consumer in 3.1). NOT projected as cfg keys:
 
 - ``coordinator_envelope_store`` — consumed only by ``SupervisorContext`` at
   ``_factory`` time.
@@ -56,6 +58,15 @@ class _CoordinatorRuntimeDeps:
     # it duck-typed) AND independently into the starter ctor at composition
     # time (for the adapter's tool_calls path).
     coordinator_metrics_recorder: object = None
+    # [S4 §5] AgentTeamRepository | None. Tail-defaulted so every pre-existing
+    # construction stays source-compatible. Read from cfg by _run_parallel_backend
+    # (expander) AND planner_node (teaching load). The graph reads it from cfg —
+    # it NEVER `new`s a FileTeamRepository (Clean Architecture).
+    team_repository: object = None
+    # [S4 §5/R7-1] SkillRepository | None. Needed by the expander to resolve
+    # member skill slugs → Skill manifests for generated-name resolution (§13).
+    # Ordered LAST.
+    skill_repository: object = None
 
 
 @dataclass(frozen=True)
@@ -102,3 +113,7 @@ class _NullCoordinatorRuntimeDeps:
     def coordinator_metrics(self) -> None: return None
     @property
     def coordinator_metrics_recorder(self) -> None: return None
+    @property
+    def team_repository(self) -> None: return None
+    @property
+    def skill_repository(self) -> None: return None

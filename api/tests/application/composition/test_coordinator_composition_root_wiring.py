@@ -321,6 +321,8 @@ def test_lifespan_threads_coord_deps_through_agent_service():
         "artifact_storage",
         "cost_rollup_service",
         "coordinator_envelope_store",
+        "team_repository",      # [S4 §5] dormant DI — constructed by comp root
+        "skill_repository",     # [S4 §5/R7-1] dormant DI — constructed by comp root
     )
     for name in field_names:
         assert getattr(coord_deps, name) is not None, (

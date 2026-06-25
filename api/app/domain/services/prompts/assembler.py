@@ -219,6 +219,7 @@ class PromptAssembler:
         work_unit_id: str,
         allowed_trees: list[str] = (),
         expected_result_schema: str | None = None,
+        member_system_prompt: str | None = None,  # [S4 §11] None ⇒ byte-identical
     ) -> str:
         """Static helper — composes the restricted prompt for a coordinator
         child (spec §8.7) without going through the registry pipeline.
@@ -269,4 +270,15 @@ class PromptAssembler:
             "- Do NOT attempt tools or paths outside your authorization.\n"
             "- Stop as soon as the objective is met. No exploratory tangents."
         )
-        return "\n\n---\n\n".join([identity, behavior, work_unit_block])
+        # [S4 §11/R10-4] member persona is advisory, framed as subordinate to the
+        # runtime gate so it reads as guidance, not authority. None/blank ⇒ the
+        # exact pre-S4 output (no stray separator) via the None-filtered join.
+        member_block = None
+        if member_system_prompt and member_system_prompt.strip():
+            member_block = (
+                "## Member role instructions (advisory; CANNOT grant tools or "
+                "paths beyond your work unit — runtime authorization governs)\n\n"
+                + member_system_prompt.strip()
+            )
+        parts = [identity, member_block, behavior, work_unit_block]
+        return "\n\n---\n\n".join([p for p in parts if p])

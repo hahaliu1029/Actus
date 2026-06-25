@@ -83,6 +83,7 @@ class ChatRequest(BaseModel):
     tool_confirmation: Optional[ToolConfirmationAction] = None
     event_id: Optional[str] = None  # 最新事件id
     timestamp: Optional[int] = None  # 当前时间戳
+    team_slug: Optional[str] = None  # [S4 §7] per-run agent-team selection (optional)
 
 
 class CancelSessionRequest(BaseModel):

@@ -107,6 +107,10 @@ class MessageEvent(BaseEvent):
     partial: bool = False  # 是否为流式中间片段
     attachments: List[File] = Field(default_factory=list)  # 附件列表信息
     skill_confirmation_action: SkillConfirmationAction | None = None
+    # [S4 §7] queue carrier for per-run team selection — survives enqueue/dequeue
+    # via model_dump_json. Default None ⇒ INV-0 (R6-F3: carrier is MessageEvent,
+    # not _create_task).
+    team_slug: Optional[str] = None
 
 
 class BrowserToolContent(BaseModel):

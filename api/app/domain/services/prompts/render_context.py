@@ -101,6 +101,7 @@ def build_render_context(
     agent_config: Any,
     *,
     memory_snapshot: "MemorySnapshot | None" = None,
+    team_members: "tuple[tuple[str, str], ...] | None" = None,
 ) -> RenderContext:
     """Build a ``RenderContext`` from LangGraph state + config + AgentConfig.
 
@@ -157,4 +158,5 @@ def build_render_context(
         mcp_active=_has_category(bound_tool_names, "mcp"),
         a2a_active=_has_category(bound_tool_names, "a2a"),
         memory_snapshot=memory_snapshot,
+        team_members=team_members,
     )

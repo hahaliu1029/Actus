@@ -122,6 +122,26 @@ def _decode_tree_lease(tl: dict[str, Any]) -> TreeLease:
     return TreeLease(prefix=tl["prefix"], ops=frozenset(tl["ops"]))
 
 
+def _decode_member_skill_field(data: dict, key: str) -> list[str]:
+    """[S4 §9/R1-F2] missing-tolerant, present-value STRICT-typed (mirrors the
+    shell_mode strict decode). A bare string would frozenset()-iterate into
+    single characters → silent corrupt set; reject it loudly."""
+    raw = data.get(key, [])
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(
+            f"SpawnManifest {key} must be a list[str], got {type(raw).__name__}={raw!r}"
+        )
+    return raw
+
+
+def _decode_member_skill_tools(data: dict) -> frozenset[str]:
+    return frozenset(_decode_member_skill_field(data, "member_skill_tools"))
+
+
+def _decode_member_skill_slugs(data: dict) -> tuple[str, ...]:
+    return tuple(_decode_member_skill_field(data, "member_skill_slugs"))
+
+
 class _PreBoundPricing:
     """[C2b budget §3-6] PricingFn impl with the price resolved ONCE at
     construction. The callback then computes per-call cost via the shared
@@ -232,6 +252,8 @@ class DefaultCoordinatorChildRunnerStarter:
                 f"{type(_raw_shell_mode).__name__}={_raw_shell_mode!r}"
             )
         shell_mode = _raw_shell_mode
+        member_skill_tools = _decode_member_skill_tools(data)
+        member_skill_slugs = _decode_member_skill_slugs(data)
         spawn_manifest = SpawnManifest(
             allowed_tools=frozenset(data["allowed_tools"]),
             path_leases=tuple(_decode_path_lease(pl) for pl in data["write_lease"]),
@@ -242,6 +264,8 @@ class DefaultCoordinatorChildRunnerStarter:
                 _decode_tree_lease(tl) for tl in data.get("write_tree_lease", [])
             ),
             shell_mode=shell_mode,
+            member_skill_tools=member_skill_tools,
+            member_skill_slugs=member_skill_slugs,
         )
         # 2. session_mode_revision.
         session_mode_revision = await self._session_repository.read_mode_revision(
@@ -265,6 +289,8 @@ class DefaultCoordinatorChildRunnerStarter:
             budget=budget,
             lease_expiry=None,
             shell_mode=shell_mode,  # [S2 §3.5] mirror manifest signal onto carrier
+            member_skill_tools=member_skill_tools,  # [S4 §11] bind-floor mirror
+            member_skill_slugs=member_skill_slugs,  # [S4 §12] carve-out mirror
         )
         # 5-11. Provision + spawn under an M1-safe leak-guard. Steps 1-4
         # (manifest decode / revision / budget / ChildPermissionContext)

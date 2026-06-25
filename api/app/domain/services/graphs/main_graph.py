@@ -131,13 +131,47 @@ async def _run_parallel_backend(
             "executor_node parallel branch: user_id required "
             "(state.user_id or configurable.user_id)"
         )
+    # C2-full S4 §10 — agent-team named bundles. Resolve the planner-selected
+    # team INSIDE the ``try`` (before ``subgraph.ainvoke``) so that a missing /
+    # malformed TEAM.md (TeamArtifactError) or an uninstalled / capability-
+    # rejected member skill (TeamCapabilityError, raised either here at resolve
+    # time OR later at merge time inside ainvoke) becomes a graceful FAILED
+    # outcome via the widened ``except`` below — never an uncaught abort.
+    #
+    # INV-0: when ``team_slug`` is absent OR either flag is OFF, ``team_member_map``
+    # stays None and the only payload delta vs. pre-S4 is the new key carrying
+    # None (LangGraph drops/ignores a None-valued unknown key pre-3.4).
+    from app.domain.repositories.agent_team_repository import TeamArtifactError
+    from app.domain.services.agent_teams_flag import is_agent_teams_enabled
+    from app.domain.services.coordinator_feature_flag import is_coordinator_enabled
+    from app.domain.services.team_expander import (
+        TeamCapabilityError,
+        resolve_team_member_map,
+    )
+
     try:
+        team_member_map = None
+        team_slug = state.get("team_slug")
+        if is_coordinator_enabled() and is_agent_teams_enabled() and team_slug:
+            team_repo = cfg.get("team_repository")
+            skill_repo = cfg.get("skill_repository")
+            if team_repo is None or skill_repo is None:
+                raise TeamCapabilityError(
+                    "team selected but team_repository/skill_repository not wired"
+                )
+            team = await team_repo.get_by_slug(team_slug)
+            if team is None:
+                raise TeamCapabilityError(f"team {team_slug!r} not found")
+            team_member_map = await resolve_team_member_map(
+                team=team, skill_repository=skill_repo,
+            )
         final_state = await subgraph.ainvoke(
             {
                 "coordinator_run_id": None,
                 "step_id": step.id,
                 "work_unit_requests": list(step.parallel_work_units.work_units),
                 "work_units": [],
+                "team_member_map": team_member_map,  # [S4 §10] None ⇒ INV-0
                 "parent_session_id": parent_session_id,
                 "user_id": user_id,
                 "root_session_id": root_session_id,
@@ -150,26 +184,43 @@ async def _run_parallel_backend(
             },
             config={"configurable": cfg},
         )
-    except CoordinatorPathContractError as exc:
-        # [single-path contract] dispatch_node's ``_build_work_units_from_requests``
-        # rejects a planner-proposed path that isn't directory-qualified
-        # workspace-relative (bare ``part_a.md`` / workspace-root absolute) BEFORE
-        # any child spawns. Surface it as a graceful FAILED step here — this is
-        # the only try/except around the coordinator backend (executor_node calls
+    except (CoordinatorPathContractError, TeamCapabilityError, TeamArtifactError) as exc:
+        # Graceful FAILED for a rejected coordinator dispatch. This is the only
+        # try/except around the coordinator backend (executor_node calls
         # ``_run_parallel_backend`` directly, line ~825, with no guard), so an
         # uncaught raise would abort the whole agent run instead of letting the
-        # planner re-plan with a corrected (directory-qualified) path.
-        logger.warning(
-            "_run_parallel_backend: coordinator dispatch rejected for step %s — "
-            "invalid path contract: %s", step.id, exc,
-        )
-        return ParallelBackendOutcome(
-            success=False,
-            summary=(
+        # planner re-plan after the operator corrects the offending input.
+        #
+        # Two error families land here:
+        #   • CoordinatorPathContractError [single-path contract] —
+        #     dispatch_node's ``_build_work_units_from_requests`` rejects a
+        #     planner-proposed path that isn't directory-qualified workspace-
+        #     relative (bare ``part_a.md`` / workspace-root absolute) BEFORE any
+        #     child spawns. Fix: re-plan with a directory-qualified path.
+        #   • TeamCapabilityError / TeamArtifactError [S4 §10] — a malformed
+        #     TEAM.md (TeamArtifactError from ``get_by_slug``) or an uninstalled /
+        #     capability-rejected member skill (TeamCapabilityError, at resolve
+        #     time here OR merge time inside ainvoke). Fix: repair the team
+        #     bundle / install + enable the member skills, then retry.
+        if isinstance(exc, CoordinatorPathContractError):
+            logger.warning(
+                "_run_parallel_backend: coordinator dispatch rejected for step %s — "
+                "invalid path contract: %s", step.id, exc,
+            )
+            summary = (
                 f"并行调度被拒绝：work_unit 提议的路径不符合合同（必须是带目录的 "
                 f"workspace-relative 路径，例如 'workspace/foo.py'）。{exc}"
-            ),
-        )
+            )
+        else:
+            logger.warning(
+                "_run_parallel_backend: coordinator dispatch rejected for step %s — "
+                "team capability/artifact error: %s", step.id, exc,
+            )
+            summary = (
+                f"并行调度被拒绝：team 校验失败（team-capability 或 TEAM.md "
+                f"artifact 不合法，请修正后重试）。{exc}"
+            )
+        return ParallelBackendOutcome(success=False, summary=summary)
     step_result_candidate = final_state.get("step_result_candidate", "") or ""
 
     # ── C2 PR-7 §12.5: apply re-entry short-circuit ─────────────────────
@@ -672,16 +723,56 @@ def build_main_graph(
             ),
         )
 
-        # B5 C7.5: PromptAssembler is the single code path. planner_node
-        # does not receive the LangGraph ``config`` (only ``state``), so
-        # we build a dummy config with an empty ``configurable`` —
-        # ``bound_tool_names`` will be empty, which is correct: the planner
-        # runs BEFORE react_graph_provider and has no per-step tool binding.
+        # B5 C7.5: PromptAssembler is the single code path. We build the
+        # render context with a dummy config carrying an empty
+        # ``configurable`` — ``bound_tool_names`` will be empty, which is
+        # correct: the planner runs BEFORE react_graph_provider and has no
+        # per-step tool binding. (planner_node DOES receive the LangGraph
+        # ``config``; the team-repo read below uses the REAL ``config``,
+        # not this dummy.)
         section_bundle = get_prompt_section_bundle(state.get("language", "zh"))
         planner_config = {"configurable": {}}
+
+        # S4 PR-4: best-effort + STRUCTURAL-ONLY agent-team teaching load.
+        # Gated on both feature flags + a team_slug + an injected
+        # team_repository (PR-3 DI). This NEVER validates capabilities
+        # (§13 validation lives in ``_run_parallel_backend``) and NEVER
+        # raises uncaught — a load failure degrades to no teaching section
+        # (None), keeping flag-OFF / no-team paths byte-identical (INV-0).
+        team_members = None
+        try:
+            from app.domain.services.agent_teams_flag import (
+                is_agent_teams_enabled,
+            )
+            from app.domain.services.coordinator_feature_flag import (
+                is_coordinator_enabled,
+            )
+
+            _configurable = (config.get("configurable") if config else {}) or {}
+            _team_slug = state.get("team_slug")
+            _team_repo = _configurable.get("team_repository")  # from the REAL config
+            if (
+                is_coordinator_enabled()
+                and is_agent_teams_enabled()
+                and _team_slug
+                and _team_repo
+            ):
+                _team = await _team_repo.get_by_slug(_team_slug)  # STRUCTURAL only
+                if _team is not None:
+                    team_members = tuple(
+                        (m.role, m.description) for m in _team.members
+                    )
+        except Exception:
+            logger.warning(
+                "planner_node: team teaching load failed; omitting", exc_info=True
+            )
+            team_members = None
+
         # M2 PR-4: planner registry does NOT include memory sections —
         # skip the snapshot fetch. See ``memory_snapshot_provider`` docstring.
-        ctx = build_render_context(state, planner_config, agent_config)
+        ctx = build_render_context(
+            state, planner_config, agent_config, team_members=team_members
+        )
         result = prompt_assembler.assemble(
             section_bundle.planner,
             ctx,

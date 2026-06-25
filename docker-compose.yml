@@ -106,6 +106,10 @@ services:
       # PR-9 acceptance; flip per CONTRIBUTING.md "C2 CoordinatorTaskRunner
       # Deployment" rollout checklist.
       ACTUS_C2_COORDINATOR_ENABLED: ${ACTUS_C2_COORDINATOR_ENABLED:-false}
+      # C2-full S4 agent-team named bundles (spec §6/R6-F6). Default off; the flag
+      # is read from os.environ directly, so without this passthrough a Docker
+      # deployment can never enable it.
+      ACTUS_C2_AGENT_TEAMS_ENABLED: ${ACTUS_C2_AGENT_TEAMS_ENABLED:-false}
       # Metrics endpoint auth token (B5 observability). Empty (default) →
       # /api/v1/metrics 404s (endpoint disabled). Required for the C2 coordinator
       # live-acceptance + perf-sampling runbooks (scrape sends Authorization:

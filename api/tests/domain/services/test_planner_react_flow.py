@@ -606,3 +606,128 @@ class TestRunPlannerForDetectionLanguageDispatch:
             "no-skill-tools path should pass en to input_for_graph; "
             f"got {captured_inputs[0].get('language')!r}"
         )
+
+
+class TestRunPlannerForDetectionTeamTeaching:
+    """[S4 PR-4 codex R2 F1] The detection-path planner (whose plan is REUSED
+    with ``flow_status=EXECUTING``, skipping ``planner_node``) MUST also teach
+    the agent-team roster. The teaching lived only in ``planner_node``, so
+    team-selected normal tasks silently produced un-taught plans on this
+    branch. These tests drive ``_run_planner_for_detection`` end-to-end with a
+    REAL ``PromptAssembler`` and a fake ``team_repository`` injected via the
+    flow's coord deps, then assert the assembled planner prompt contains (ON)
+    or omits (OFF, INV-0) the member roster.
+    """
+
+    @staticmethod
+    def _real_assembler():
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from app.domain.services.prompts.assembler import PromptAssembler
+        from app.domain.services.prompts.budget import SystemPromptBudget
+
+        return PromptAssembler(
+            budget=SystemPromptBudget(max_tokens=10_000),
+            token_estimator=TokenEstimator(strategy="hybrid"),
+            telemetry=None,
+        )
+
+    @staticmethod
+    def _fake_team_repo(members):
+        from app.domain.models.agent_team import TeamBundle, TeamMember
+
+        team = TeamBundle(
+            slug="research-team",
+            name="Research Team",
+            description="A team",
+            members=tuple(
+                TeamMember(
+                    role=role,
+                    description=desc,
+                    system_prompt=f"You are the {role}.",
+                )
+                for role, desc in members
+            ),
+        )
+        repo = MagicMock()
+        repo.get_by_slug = AsyncMock(return_value=team)
+        return repo
+
+    def _flow_with_team(self, mock_llm, mock_uow, members):
+        """Construct a flow whose coord deps expose a fake team_repository and
+        a REAL assembler, spying on ``assemble`` to capture the planner prompt.
+        """
+        assembler = self._real_assembler()
+        captured: list[str] = []
+        real_assemble = assembler.assemble
+
+        def _spy_assemble(*args, **kwargs):
+            result = real_assemble(*args, **kwargs)
+            captured.append(result.text)
+            return result
+
+        assembler.assemble = _spy_assemble  # type: ignore[method-assign]
+
+        coord_deps = MagicMock()
+        coord_deps.team_repository = self._fake_team_repo(members)
+
+        flow = _make_flow(
+            mock_llm,
+            mock_uow,
+            prompt_assembler=assembler,
+            _coord_deps=coord_deps,
+        )
+        flow._supports_vision = False
+        # Force the planner LLM into the fallback path so the test never needs
+        # a real structured plan — the prompt is still assembled first.
+        mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
+            side_effect=Exception("force fallback; prompt already assembled")
+        )
+        return flow, captured
+
+    async def test_detection_path_teaches_team_roster_when_flags_on(
+        self, mock_llm, mock_uow, monkeypatch
+    ) -> None:
+        """Both flags ON + a selected team ⇒ the assembled detection planner
+        prompt CONTAINS the member roster (role + description)."""
+        monkeypatch.setenv("ACTUS_C2_COORDINATOR_ENABLED", "true")
+        monkeypatch.setenv("ACTUS_C2_AGENT_TEAMS_ENABLED", "true")
+
+        members = [("mapper", "maps the codebase")]
+        flow, captured = self._flow_with_team(mock_llm, mock_uow, members)
+
+        msg = Message(message="help", language="en", team_slug="research-team")
+        await flow._run_planner_for_detection(msg, [])
+
+        assert captured, "expected the assembler to be invoked"
+        prompt = captured[0]
+        # The teaching section renders ``- `<role>`: <description>``.
+        assert "mapper" in prompt and "maps the codebase" in prompt, (
+            "detection planner prompt must teach the team roster when flags on; "
+            f"roster text absent in assembled prompt:\n{prompt}"
+        )
+        flow._coord_deps.team_repository.get_by_slug.assert_awaited_once_with(
+            "research-team"
+        )
+
+    async def test_detection_path_no_roster_when_flags_off(
+        self, mock_llm, mock_uow, monkeypatch
+    ) -> None:
+        """INV-0 companion: flags OFF ⇒ roster ABSENT (byte-identical to
+        pre-S4 detection prompt). team_repository is never consulted."""
+        monkeypatch.delenv("ACTUS_C2_COORDINATOR_ENABLED", raising=False)
+        monkeypatch.delenv("ACTUS_C2_AGENT_TEAMS_ENABLED", raising=False)
+
+        members = [("mapper", "maps the codebase")]
+        flow, captured = self._flow_with_team(mock_llm, mock_uow, members)
+
+        msg = Message(message="help", language="en", team_slug="research-team")
+        await flow._run_planner_for_detection(msg, [])
+
+        assert captured, "expected the assembler to be invoked"
+        prompt = captured[0]
+        assert "maps the codebase" not in prompt, (
+            "flags-OFF detection prompt must NOT contain the team roster (INV-0); "
+            f"roster leaked into assembled prompt:\n{prompt}"
+        )
+        # Flags off ⇒ the team load is gated out before any repo read.
+        flow._coord_deps.team_repository.get_by_slug.assert_not_awaited()

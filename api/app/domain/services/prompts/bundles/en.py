@@ -16,6 +16,9 @@ planner/updater placeholders.
 from __future__ import annotations
 
 from app.domain.services.prompts.section import PromptBundle, SectionRegistry
+from app.domain.services.prompts.sections.agent_team_teaching import (
+    agent_team_teaching_section,
+)
 from app.domain.services.prompts.sections.behavior_core import behavior_core_section
 from app.domain.services.prompts.sections.conversation_summaries import (
     conversation_summaries_section,
@@ -78,6 +81,7 @@ EN_PLANNER_REGISTRY = SectionRegistry(
     sections=(
         planner_identity_section,
         parallel_work_units_teaching_section,
+        agent_team_teaching_section,
         planner_tool_summary_legacy_section,
         conversation_summaries_section,
     ),
@@ -92,6 +96,7 @@ EN_UPDATER_REGISTRY = SectionRegistry(
     sections=(
         planner_identity_section,
         parallel_work_units_teaching_section,
+        agent_team_teaching_section,
         planner_tool_summary_legacy_section,
         conversation_summaries_section,
     ),

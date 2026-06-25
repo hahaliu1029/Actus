@@ -99,6 +99,10 @@ class WorkUnitRequest(BaseModel):
     # shell-mode unit with only exact leases can never activate shell mode.
     shell_mode: bool = False
     expected_result_schema: Optional[str] = None
+    # [S4 §9] planner-authored member role tag. None ⇒ no specialization
+    # (INV-0 passthrough). Optional default keeps extra="forbid" accepting
+    # pre-S4 payloads.
+    role: Optional[str] = None
 
     @model_validator(mode="after")
     def _write_must_have_paths(self) -> "WorkUnitRequest":
@@ -158,6 +162,19 @@ class WorkUnit(BaseModel):
     write_tree_lease: list[TreeLease] = Field(default_factory=list)
     shell_mode: bool = False
     expected_result_schema: Optional[str] = None
+    # [S4 §9] carried verbatim from WorkUnitRequest in
+    # _build_work_units_from_requests; re-threaded through the :658 enrichment.
+    role: Optional[str] = None
+    # [S4 §9] member persona, expander-set, rides the IN-MEMORY WorkUnit only.
+    # NEVER serialized to the content-addressed manifest (avoids perturbing
+    # spawn_manifest_sha256 + keeps large prompts out of MinIO).
+    system_prompt: Optional[str] = None
+    # [S4 §9/§11] the BIND floor carrier (preset ∪ member_skill_tools) — the
+    # GENERATED skill_{slug}_{tool} names. Serialized omit-when-empty + sorted.
+    member_skill_tools: frozenset[str] = Field(default_factory=frozenset)
+    # [S4 §9/§12 hop-3] the child-side carve-out carrier — source Skill slugs,
+    # so the child can force-include them past _filter_skills_by_user_preferences.
+    member_skill_slugs: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _phase_lease_consistency(self) -> "WorkUnit":

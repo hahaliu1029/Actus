@@ -31,6 +31,8 @@ EXPECTED_KEYS = {
     "artifact_storage",
     "cost_rollup_service",
     "coordinator_metrics_recorder",
+    "team_repository",      # [S4 §5] dormant DI — expander + teaching
+    "skill_repository",     # [S4 §5/R7-1] dormant DI — slug→manifest resolve
 }
 
 
@@ -49,6 +51,7 @@ def _build_flow_with_real_coord_deps():
         "patch_reducer_service", "patch_applier_deps", "artifact_storage",
         "cost_rollup_service", "coordinator_envelope_store",
         "coordinator_metrics_recorder",  # [C2b rollout WS1b] 19th cfg key
+        "team_repository", "skill_repository",  # [S4 §5] dormant DI keys
     )}
     # [finish-core §5.2 G2] The factory dep must be CALLABLE — _build_config
     # invokes it as parent_sandbox_adapter_factory(self._sandbox) to wrap the

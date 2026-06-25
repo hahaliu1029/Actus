@@ -62,6 +62,7 @@ from app.infrastructure.repositories.db_user_tool_approval_policy_repository imp
     DBUserToolApprovalPolicyRepository,
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
+from app.infrastructure.repositories.file_team_repository import FileTeamRepository
 from app.infrastructure.storage.minio import MinioStore, get_minio
 from app.infrastructure.storage.postgres import get_db_session, get_postgres, get_uow
 from app.infrastructure.storage.redis import RedisClient, get_redis
@@ -1324,6 +1325,12 @@ def build_coordinator_runtime_deps(
         parent_sandbox_adapter_factory=_parent_sandbox_adapter_factory,
         coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
         coordinator_metrics_recorder=coordinator_metrics_recorder,  # [C2b rollout WS1b]
+        # [S4 §5] Dormant DI plumbing — fresh FileTeamRepository (teams/ sibling
+        # of skills_root_dir; no dedicated settings field exists) + a FRESH
+        # FileSkillRepository (no shared singleton — [codex-R2-F3]). Consumed by
+        # the team expander (3.3) + planner_node (PR-4); nothing reads them yet.
+        team_repository=FileTeamRepository(Path(settings.skills_root_dir).parent / "teams"),
+        skill_repository=FileSkillRepository(settings.skills_root_dir),
     )
     app_state.coord_deps = coord_deps
     return coord_deps

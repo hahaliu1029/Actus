@@ -1095,6 +1095,7 @@ class CoordinatorChildRunner:
             work_unit_id=wu.work_unit_id,
             allowed_trees=[tl.prefix for tl in wu.write_tree_lease],
             expected_result_schema=wu.expected_result_schema,
+            member_system_prompt=wu.system_prompt,  # [S4 §11/COH-3] None ⇒ byte-identical
         )
 
     async def _extract_patch_files_from_history(

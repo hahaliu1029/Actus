@@ -181,6 +181,126 @@ def _compute_has_positive_match(scores: list[float]) -> bool:
     return gap > 0.05 or scores[0] > 0.4
 
 
+# --------------------------------------------------------------------------- #
+# [C2-full S4 §12 / Task 3.8] Child-side team-member skill carve-out helpers.
+#
+# A coordinator child whose work unit carries team-member skills must FORCE the
+# member skills past the user's global skill/provider preference filters (the
+# team selection supersedes the user's per-tool preferences for the duration of
+# that child), make them a SELECTION FLOOR so a query-driven selector can never
+# silently drop them at runtime, and assert (loudly) that the demanded member
+# tools were actually built — a failed carve-out is a clear terminal error, NOT
+# silent absence (the spec's #1 risk, §12). All four helpers are pure and
+# IDENTITY when there are no member slugs/tools (INV-0 / flag-OFF safety): the
+# non-coordinator path never raises or changes behavior.
+# --------------------------------------------------------------------------- #
+
+
+def _force_include_member_skills(filtered_pool, enabled_skills, member_slugs):
+    """[S4 §12 hop-3] Team selection supersedes the user's global skill prefs for
+    member-injected skills. Append any enabled member skill the pref filter
+    dropped. Identity when there are no member slugs (INV-0)."""
+    if not member_slugs:
+        return filtered_pool
+    have = {s.slug for s in filtered_pool}
+    member_set = set(member_slugs)
+    for skill in enabled_skills:
+        if skill.slug in member_set and skill.slug not in have:
+            filtered_pool.append(skill)
+            have.add(skill.slug)
+    return filtered_pool
+
+
+def _apply_member_skill_floor(selected, pool, member_slugs):
+    """[S4 §12/codex-R8] Member skills are a SELECTION FLOOR: union them into EVERY
+    per-message/per-step selection so a query-driven selector can never drop them
+    (which would leave member_skill_tools allowlisted+bound but the dynamic
+    StructuredTool unbuilt → silent absence). Identity when no member slugs."""
+    if not member_slugs:
+        return selected
+    have = {s.slug for s in selected}
+    by_slug = {s.slug: s for s in pool}
+    out = list(selected)
+    for slug in member_slugs:
+        if slug not in have and slug in by_slug:
+            out.append(by_slug[slug])
+            have.add(slug)
+    return out
+
+
+def _enabled_provider_names(mcp_config, a2a_config):
+    """[S4 §12/R10-3] The provider sets the carve-out treats as CONFIGURED =
+    deployment-ENABLED only. A deployment-disabled provider (server_config.enabled
+    is False) is NOT user-disabled (that's the separate preference map) — it is an
+    operator decision the team carve-out must NOT override; a member skill that
+    references it fails closed (unavailable/unconfigured), never silently degrades.
+    Returns (mcp_server_names: set[str], a2a_agent_ids: set[str])."""
+    mcp_names = (
+        {sn for sn, cfg in mcp_config.mcpServers.items() if cfg.enabled}
+        if mcp_config is not None else set()
+    )
+    a2a_ids = (
+        {s.id for s in a2a_config.a2a_servers if s.enabled}
+        if a2a_config is not None else set()
+    )
+    return mcp_names, a2a_ids
+
+
+def _member_referenced_providers(member_skills, mcp_server_names, a2a_agent_ids):
+    """[S4 §12/R10-3] Derive (referenced_mcp_servers, referenced_a2a_agents,
+    unconfigured) from member skill manifests. A referenced provider not in the
+    configured sets is 'unconfigured' → caller fails closed (NOT a resolve-time
+    error: the expander has no provider config channel, R11-2)."""
+    from app.domain.models.skill import SkillRuntimeType
+    from app.domain.services.tools.mcp import _mcp_tool_namespace
+    referenced_mcp: set[str] = set()
+    referenced_a2a: set[str] = set()
+    unconfigured: set[str] = set()
+    for skill in member_skills:
+        for mt in (skill.manifest or {}).get("tools", []):
+            if not isinstance(mt, dict):
+                continue
+            entry = mt.get("entry")
+            if not isinstance(entry, dict):
+                continue
+            if skill.runtime_type == SkillRuntimeType.MCP:
+                # [codex-R2-F4] mirror live _invoke_mcp (skill.py): it falls back
+                # to manifest_tool.name when entry.tool_name is absent, so the
+                # provider inference MUST too — else an executable member MCP
+                # skill is wrongly flagged unconfigured.
+                tool_name = str(entry.get("tool_name") or mt.get("name") or "").strip()
+                # [codex-R10-3] Deterministic LONGEST-prefix match: among enabled
+                # servers the namespace-collision guard already makes the match
+                # unique, but set iteration order is non-deterministic — pick the
+                # longest matching namespace so the result is stable regardless.
+                matched = max(
+                    (sn for sn in mcp_server_names
+                     if tool_name.startswith(_mcp_tool_namespace(sn) + "_")),
+                    key=lambda sn: len(_mcp_tool_namespace(sn)),
+                    default=None,
+                )
+                (referenced_mcp.add(matched) if matched
+                 else unconfigured.add(f"mcp:{skill.slug}:{tool_name}"))
+            elif skill.runtime_type == SkillRuntimeType.A2A:
+                agent_id = str(entry.get("agent_id") or "").strip()
+                (referenced_a2a.add(agent_id) if agent_id in a2a_agent_ids
+                 else unconfigured.add(f"a2a:{skill.slug}:{agent_id}"))
+    return referenced_mcp, referenced_a2a, unconfigured
+
+
+def _assert_member_tools_built(*, required: set[str], built_names: set[str]) -> None:
+    """[S4 §12] Child-side loud assertion: every member skill tool name MUST be
+    present in the actually-built tools — else the carve-out silently no-op'd
+    (the #1 risk). Fail closed with a clear message, NOT silent absence."""
+    missing = required - built_names
+    if missing:
+        raise RuntimeError(
+            f"team member skill tools were not built in the child (carve-out "
+            f"failed): {sorted(missing)}. The referenced skills may be missing, "
+            f"or a provider is unconfigured."
+        )
+
+
 @dataclass(slots=True)
 class SelectionDebugMeta:
     selection_source: str
@@ -1891,6 +2011,13 @@ class AgentTaskRunner(TaskRunner):
             skills = self._skill_selector.select(self._session_skill_pool, query)
             scores = None
 
+        # [S4 §12/codex-R8] member skills are a SELECTION FLOOR on the per-step
+        # refresh too (the hottest reselection path) — union them back so a
+        # query-driven refresh can never drop a member skill and crash the
+        # per-step built-vs-bound assertion. Identity when no member slugs (INV-0).
+        skills = _apply_member_skill_floor(
+            skills, self._session_skill_pool, getattr(self, "_member_skill_slugs", ()),
+        )
         context = self._build_runtime_system_context(skills, scores=scores)
         return RefreshedSkillsResult(
             skills=tuple(skills),
@@ -2145,6 +2272,23 @@ class AgentTaskRunner(TaskRunner):
         _tool_filter = getattr(self, "_tool_filter", None)
         if _tool_filter is not None:
             lc_tools = [t for t in lc_tools if t.name in _tool_filter]
+
+        # [C2-full S4 §12 / Task 3.8 / codex-R8] Built-vs-bound assertion AT THE
+        # PER-STEP BUILD (not startup — a startup-only check is stale after the
+        # first reselect). After ``_tool_filter`` has trimmed the set, assert
+        # every member skill tool the parent/manifest demanded is actually built.
+        # [codex-R2-F2] ``_required`` is the AUTHORITATIVE cpc.member_skill_tools
+        # (what was demanded), NOT re-derived from the pool. [codex-R9] read the
+        # cpc from SELF — the startup-local ``_cpc`` is not in this method's scope.
+        # No cpc / empty member tools ⇒ the ``if`` is False ⇒ NO assertion ⇒ the
+        # flag-OFF / non-coordinator path never NameErrors or reddens (INV-0).
+        _cpc = getattr(self, "_coordinator_child_permission_context", None)
+        _member_required = set(
+            getattr(_cpc, "member_skill_tools", frozenset()) or frozenset()
+        )
+        if _member_required:
+            _built = {t.name for t in lc_tools}
+            _assert_member_tools_built(required=_member_required, built_names=_built)
 
         return wrap_tool_list_for_supervisor(lc_tools, self._execution_supervisor)
 
@@ -2495,6 +2639,14 @@ class AgentTaskRunner(TaskRunner):
                 user_message,
             )
 
+        # [§12/codex-R8] per-step selection FLOOR — keep member skills bound on
+        # every step activation (incl. the caller-supplied selected_skills path,
+        # belt-and-suspenders). Read the cached slugs; identity when empty.
+        target_skills = _apply_member_skill_floor(
+            target_skills,
+            self._session_skill_pool,
+            getattr(self, "_member_skill_slugs", ()),
+        )
         await self._apply_preselected_skills(target_skills)
         self._step_skill_state = StepSkillActivationState(
             step_id=step_id,
@@ -2551,6 +2703,14 @@ class AgentTaskRunner(TaskRunner):
         selected_skills, _ = await self._select_skills_for_message(
             self._session_skill_pool,
             user_message,
+        )
+        # [§12/codex-R8] unknown-tool reselect FLOOR — a query-driven reselection
+        # must not drop member skills mid-step. Read the cached slugs; identity
+        # when empty.
+        selected_skills = _apply_member_skill_floor(
+            selected_skills,
+            self._session_skill_pool,
+            getattr(self, "_member_skill_slugs", ()),
         )
         # Field split (TODO #30 spec §3.2 Site 4):
         # - Attempt counters (reselect_count, consecutive_unknown_tool_calls)
@@ -4077,6 +4237,53 @@ class AgentTaskRunner(TaskRunner):
             mcp_preference_map = await self._load_user_preferences_map(ToolType.MCP)
             a2a_preference_map = await self._load_user_preferences_map(ToolType.A2A)
             skill_preference_map = await self._load_user_preferences_map(ToolType.SKILL)
+            # [C2-full S4 §12 / Task 3.8] Child-side team-member skill carve-out.
+            # HOIST the enabled-skills load above the mcp/a2a preference apply so
+            # the member-provider 4th-hop carve-out can force-enable the underlying
+            # MCP server / A2A agent BEFORE the preference filters drop them.
+            # ``_load_enabled_skills`` has no mcp/a2a dependency, so the move is safe.
+            # No-op / byte-identical for non-coordinator runners (no cpc → empty
+            # member slugs → every step below short-circuits, INV-0).
+            enabled_skills = await self._load_enabled_skills()
+            _cpc = getattr(self, "_coordinator_child_permission_context", None)
+            _member_slugs = tuple(getattr(_cpc, "member_skill_slugs", ()) or ())
+            # Cache for the per-message / per-step selection FLOOR (those run in
+            # DIFFERENT methods that cannot see this local — codex-R9 scope trap).
+            self._member_skill_slugs = _member_slugs
+            if _member_slugs:
+                # Fail closed: a member slug not installed/enabled in the child
+                # cannot be force-included (the carve-out can't conjure a skill).
+                _missing_slugs = set(_member_slugs) - {s.slug for s in enabled_skills}
+                if _missing_slugs:
+                    raise RuntimeError(
+                        f"team member skill slug(s) not installed/enabled in child: "
+                        f"{sorted(_missing_slugs)} (carve-out cannot force-include a "
+                        f"non-existent skill)"
+                    )
+                # [§12/R10-3 hop-4] Derive the underlying MCP server / A2A agent
+                # each member skill references and force-enable it past the SEPARATE
+                # provider-preference filter. An unconfigured provider → fail closed.
+                _member_skills_for_providers = [
+                    s for s in enabled_skills if s.slug in set(_member_slugs)
+                ]
+                _mcp_names, _a2a_ids = _enabled_provider_names(
+                    getattr(self, "_mcp_config", None),
+                    getattr(self, "_a2a_config", None),
+                )
+                _ref_mcp, _ref_a2a, _unconfigured = _member_referenced_providers(
+                    _member_skills_for_providers, _mcp_names, _a2a_ids,
+                )
+                if _unconfigured:
+                    raise RuntimeError(
+                        f"team member skill references unconfigured provider(s) "
+                        f"(provider absent or deployment-disabled): "
+                        f"{sorted(_unconfigured)} — install/configure them or "
+                        f"remove the member skill"
+                    )
+                for _sn in _ref_mcp:
+                    mcp_preference_map[_sn] = True   # override user-disable (team carve-out)
+                for _aid in _ref_a2a:
+                    a2a_preference_map[_aid] = True
             filtered_mcp_config = self._apply_user_preferences_to_mcp_config(
                 self._mcp_config,
                 mcp_preference_map,
@@ -4087,10 +4294,15 @@ class AgentTaskRunner(TaskRunner):
             )
             await self._mcp_tool.initialize(filtered_mcp_config)
             await self._a2a_tool.initialize(filtered_a2a_config)
-            enabled_skills = await self._load_enabled_skills()
             self._session_skill_pool = self._filter_skills_by_user_preferences(
                 enabled_skills,
                 skill_preference_map,
+            )
+            # [§12 hop-3] team carve-out: force-include member skills past the
+            # user's global skill prefs (reuses the hoisted enabled_skills /
+            # _member_slugs above; identity when there are no member slugs).
+            self._session_skill_pool = _force_include_member_skills(
+                self._session_skill_pool, enabled_skills, _member_slugs,
             )
             # Phase 1: Embedding 索引构建
             embedding_config = getattr(self._agent_config, 'skill_embedding', None)
@@ -4121,9 +4333,13 @@ class AgentTaskRunner(TaskRunner):
                 except Exception:
                     logger.warning("Embedding 不可用，将使用 token-overlap", exc_info=True)
                     self._embedding_available = False
-            initial_skills = self._select_skills_from_pool(
+            # [§12/codex-R8] startup selection FLOOR — union member skills back in
+            # so the initial SkillTool init binds them even if the empty-query
+            # selector dropped them (same scope as _member_slugs).
+            initial_skills = _apply_member_skill_floor(
+                self._select_skills_from_pool(self._session_skill_pool, ""),
                 self._session_skill_pool,
-                "",
+                _member_slugs,
             )
             await self._skill_bundle_sync.prepare_startup_sync(
                 skill_pool=self._session_skill_pool,
@@ -4207,11 +4423,20 @@ class AgentTaskRunner(TaskRunner):
                                 else None
                             ),
                             language=self._current_language,  # B5 #29: bootstrap hint
+                            team_slug=getattr(event, "team_slug", None),  # [S4 §7]
                         )
 
                         selected_skills, _ = await self._select_skills_for_message(
                             self._session_skill_pool,
                             message_obj.message,
+                        )
+                        # [§12/codex-R8] message-boundary selection FLOOR — read the
+                        # CACHED slugs (different method ⇒ _member_slugs local is out
+                        # of scope; identity when empty).
+                        selected_skills = _apply_member_skill_floor(
+                            selected_skills,
+                            self._session_skill_pool,
+                            getattr(self, "_member_skill_slugs", ()),
                         )
                         self._current_message_text = message_obj.message
                         self._current_message_selected_skills = list(selected_skills)

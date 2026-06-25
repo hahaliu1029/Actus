@@ -23,3 +23,7 @@ class Message(BaseModel):
     image_content_blocks: List[dict] = Field(default_factory=list)  # 图片附件的多模态内容块
     skill_confirmation_action: SkillConfirmationAction | None = None
     language: str = "zh"  # B5 #29: bootstrap hint (see docstring)
+    # [S4 §7] per-run team selection (transient; no Session column). Default None
+    # ⇒ INV-0. Message has no explicit model_config (inherits extra="ignore"),
+    # so this additive field is regression-safe.
+    team_slug: str | None = None

@@ -39,6 +39,12 @@ class SpawnManifest:
     # [S2 §3.5] positive shell-capable signal. Default False = typed-only (the
     # pre-S2 behavior). NO reuse of ChildRuntimeCap.NO_RAW_SHELL_WRITE.
     shell_mode: bool = False
+    # [S4 §9/§11] member-skill GENERATED tool names = the bind floor carrier.
+    # Default empty ⇒ omitted from the manifest JSON ⇒ byte-identical manifest.
+    member_skill_tools: frozenset[str] = frozenset()
+    # [S4 §9/§12] member-skill source slugs = the child-side preference carve-out
+    # carrier. Default empty ⇒ omitted ⇒ byte-identical.
+    member_skill_slugs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -55,3 +61,9 @@ class ChildPermissionContext:
     # carrier so the two gate callers can read cpc.shell_mode without reaching
     # into the manifest. Dormant in PR-3 (no caller reads it yet).
     shell_mode: bool = False
+    # [S4 §11/§12] mirrors of the manifest fields hoisted onto the carrier so the
+    # factory bind (member_skill_tools) and the child startup carve-out
+    # (member_skill_slugs) read them without reaching into the manifest. Dormant
+    # until PR-3 wires the readers.
+    member_skill_tools: frozenset[str] = frozenset()
+    member_skill_slugs: tuple[str, ...] = ()

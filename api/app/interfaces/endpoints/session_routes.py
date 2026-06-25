@@ -527,6 +527,7 @@ async def chat(
                         if request.timestamp
                         else None
                     ),
+                    team_slug=request.team_slug,  # [S4 §7]
                 )
             async for event in event_stream:
                 # 2.将Agent事件转换为sse数据(因为普通的event没法通过流式事件传输)
