@@ -163,9 +163,37 @@ def test_properties_cached_at_acquire() -> None:
 # ── Forwarded methods ──
 
 
-def test_forwarded_methods_count() -> None:
-    assert len(SANDBOX_FORWARDED_METHODS) == 19
-    assert "snapshot_workspace" in SANDBOX_FORWARDED_METHODS
+def test_forwarded_methods_exact_set() -> None:
+    """Pin the exact forwarded method set, not a bare count.
+
+    Asserting the full set documents WHICH Sandbox Protocol methods are
+    generation-checked forwarded and fails with a meaningful diff when a
+    method is added to / removed from ``SANDBOX_FORWARDED_METHODS``. Keep
+    this list in sync with the source definition in ``sandbox_handle.py``.
+    """
+    expected = {
+        "exec_command",
+        "read_shell_output",
+        "wait_process",
+        "write_shell_input",
+        "resize_shell_session",
+        "kill_process",
+        "write_file",
+        "read_file",
+        "check_file_exists",
+        "delete_file",
+        "list_files",
+        "replace_in_file",
+        "search_in_file",
+        "find_files",
+        "upload_file",
+        "download_file",
+        "ensure_sandbox",
+        "get_browser",
+        "snapshot_workspace",
+        "kill_all_shell_sessions",
+    }
+    assert SANDBOX_FORWARDED_METHODS == expected
 
 
 def test_unknown_attribute_raises() -> None:
