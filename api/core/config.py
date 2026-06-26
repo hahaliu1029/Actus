@@ -125,6 +125,20 @@ class Settings(BaseSettings):
     tool_confirmation_timeout_seconds: int = 300
     smart_approve_enabled: bool = False
 
+    # C5a Sandbox Policy Compiler — observe-only dark-launch. Default OFF:
+    # when OFF the two enforcement seams skip compiler + sink entirely
+    # (byte-identical, INV-0). The field name itself MUST be an alias
+    # (validation_alias replaces the field name as a source), else
+    # Settings(sandbox_policy_compiler_enabled=True) is ignored (R5#5).
+    sandbox_policy_compiler_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_policy_compiler_enabled",
+            "SANDBOX_POLICY_COMPILER_ENABLED",
+            "ACTUS_C5_SANDBOX_POLICY_COMPILER_ENABLED",
+        ),
+    )
+
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 

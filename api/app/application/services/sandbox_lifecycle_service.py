@@ -28,6 +28,10 @@ from app.domain.errors.sandbox_lifecycle import (
     SessionSuspendedError,
     SessionUnboundError,
 )
+from app.domain.external.policy_snapshot_sink import (
+    NoopPolicySnapshotSink,
+    PolicySnapshotSink,
+)
 from app.domain.external.sandbox import Sandbox, SandboxHandle
 from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.models.event import SandboxStateChangedEvent
@@ -72,6 +76,8 @@ class SandboxLifecycleService:
         uow_factory: Callable[[], IUnitOfWork],
         quiesce_timeout_seconds: float = 10.0,
         supervisor_registry: Optional[SupervisorRegistryPort] = None,
+        sink: "PolicySnapshotSink | None" = None,        # C5a observe-only sink
+        policy_snapshot_enabled: bool = False,           # C5a flag, captured ONCE (INV-0)
     ) -> None:
         self._sandbox_cls = sandbox_cls
         self._uow_factory = uow_factory
@@ -86,6 +92,17 @@ class SandboxLifecycleService:
         self._supervisor_registry: Optional[SupervisorRegistryPort] = (
             supervisor_registry
         )
+
+        # C5a: observe-only policy-snapshot sink (default = no-op).
+        self._policy_sink: PolicySnapshotSink = (
+            sink if sink is not None else NoopPolicySnapshotSink()
+        )
+        # C5a flag captured at construction → bind_new's OFF path does ZERO work
+        # (one bool check; NO get_settings call/import, NO helper, NO await) —
+        # strict INV-0 byte-identical [codex planR4 P1]. Seam B reads the flag off
+        # the already-present `_settings` so it pays nothing; Seam A (bind_new)
+        # had NO get_settings call pre-C5a, so it must NOT add one on the OFF path.
+        self._policy_snapshot_enabled = policy_snapshot_enabled
 
         # Single-worker runtime check (§8.6 layer 2)
         web_concurrency = os.environ.get("WEB_CONCURRENCY", "1")
@@ -315,7 +332,57 @@ class SandboxLifecycleService:
             self._registry.register(
                 session_id, sandbox, generation=new_binding.generation
             )
+
+            # C5a Seam A: observe-only container-create policy snapshot. INV-0 —
+            # the flag was captured at construction, so the OFF path is a single
+            # bool check: NO get_settings, NO import, NO coroutine, NO await.
+            if self._policy_snapshot_enabled:
+                await self._observe_container_policy(
+                    session_id=session_id,
+                    user_id=effective_user_id,
+                    new_binding=new_binding,
+                    session=session,
+                )
+
             return cast(SandboxHandle, self._registry.acquire_handle(session_id))
+
+    async def _observe_container_policy(
+        self, *, session_id: str, user_id: str | None, new_binding, session
+    ) -> None:
+        """C5a observe-only emission (additive, best-effort).
+
+        Only ever called when the flag is ON (gated by the caller). Reads
+        get_settings() LAZILY here (ON path only) for the view values — the OFF
+        path never touches config (INV-0). Swallows ALL errors so an observe
+        failure can never fail a sandbox bind. The sink is non-suspending
+        (Task 3), so this awaits without yielding.
+        """
+        try:
+            from app.domain.models.sandbox_policy import (
+                ContainerCreateInput,
+                build_settings_view,
+            )
+            from app.domain.services.safety.sandbox_policy_compiler import (
+                SandboxPolicyCompiler,
+            )
+            from core.config import get_settings  # lazy — reached only on the ON path (INV-0)
+
+            inp = ContainerCreateInput(
+                session_id=session_id,
+                user_id=user_id,
+                sandbox_id=new_binding.id,  # SandboxBinding.id == sandbox.id
+                sandbox_generation=new_binding.generation,
+                worker_type=session.worker_type,
+                depth=session.depth,
+                settings=build_settings_view(get_settings()),
+            )
+            snapshot = SandboxPolicyCompiler().compile_container_create(inp)
+            await self._policy_sink.record(snapshot)
+        except Exception as exc:  # noqa: BLE001 — observe must never fail a bind
+            logger.warning(
+                "sandbox.policy observe failed surface=container_create exc=%s",
+                type(exc).__name__,
+            )
 
     async def suspend(self, session_id: str) -> None:
         """ACTIVE → SUSPENDED. Container stays alive, can resume later.

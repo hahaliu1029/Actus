@@ -312,6 +312,7 @@ async def lifespan(app: FastAPI):
         from app.interfaces.service_dependencies import (
             build_coordinator_runtime_deps,
             build_supervisor_registry,
+            get_policy_snapshot_sink,
         )
 
         mailbox_publisher = RedisMailboxPublisher(redis_client.client)
@@ -437,6 +438,8 @@ async def lifespan(app: FastAPI):
             sandbox_cls=DockerSandbox,
             uow_factory=get_uow,
             supervisor_registry=supervisor_registry,
+            sink=get_policy_snapshot_sink(),  # C5a: Logging sink when flag ON, else Noop
+            policy_snapshot_enabled=get_settings().sandbox_policy_compiler_enabled,  # C5a Seam A gate (read once)
         )
         app.state.sandbox_lifecycle_service = sandbox_lifecycle_service
         # Fill the forward reference now that lifecycle service is live.

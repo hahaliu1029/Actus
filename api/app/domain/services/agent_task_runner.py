@@ -430,6 +430,7 @@ class AgentTaskRunner(TaskRunner):
         was_background: bool = False,
         permission_engine: Any = None,  # PE-0 Phase 7: PermissionEngine | None
         session_state_machine: Any = None,  # PE-0 Phase 7: SessionStateMachine | None
+        policy_snapshot_sink: Any = None,  # C5a Seam B sink (forwarded into PlannerReActFlow)
         tool_filter: Optional[FrozenSet[str]] = None,  # Phase 1 minimal subagent: tool-name allowlist (None = no filter)
         supervisor_registry: Optional[SupervisorRegistryPort] = None,  # C3 PR-3c: per-pod MailboxSupervisor registry (None when mailbox plane disabled)
         mailbox_supervisor_enabled: bool = False,  # C3 PR-3c: deployment-time flag mirror (false unless wired by application layer)
@@ -519,6 +520,7 @@ class AgentTaskRunner(TaskRunner):
         self._confirmation_manager = confirmation_manager
         self._permission_engine = permission_engine
         self._session_state_machine = session_state_machine
+        self._policy_snapshot_sink = policy_snapshot_sink
         self._memory_flusher = memory_flusher
         self._memory_embedding_provider = memory_embedding_provider
         self._memory_session_factory = memory_session_factory
@@ -734,6 +736,7 @@ class AgentTaskRunner(TaskRunner):
             execution_supervisor=self._execution_supervisor,
             permission_engine=self._permission_engine,
             session_state_machine=self._session_state_machine,
+            policy_snapshot_sink=self._policy_snapshot_sink,
             # PR-9b-A Task A8 — forward the lifespan-scoped coord deps to
             # PlannerReActFlow. When None, the planner's default
             # ``_NullCoordinatorRuntimeDeps`` kicks in (legacy/test path).

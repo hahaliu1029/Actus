@@ -1638,6 +1638,50 @@ def build_react_graph(
                 if _metrics is not None:
                     _metrics.record_ast_validation(_ast_result.code)
 
+                # C5a Seam B (PE path): observe-only tool_call policy snapshot.
+                # INV-0 — read the flag FIRST; the entire block is swallowed so
+                # it can never alter control flow. The validator decision below
+                # (`if not _ast_result.allowed`) is UNCHANGED.
+                if _settings.sandbox_policy_compiler_enabled and (
+                    _policy_sink := configurable.get("policy_snapshot_sink")
+                ) is not None:
+                    try:
+                        from app.domain.models.sandbox_policy import (
+                            ToolCallInput,
+                            ValidationResultView,
+                            build_settings_view,
+                        )
+                        from app.domain.services.safety.sandbox_policy_compiler import (
+                            SandboxPolicyCompiler,
+                        )
+
+                        _pol_inp = ToolCallInput(
+                            session_id=str(configurable.get("session_id") or ""),
+                            sandbox_id=None,
+                            sandbox_generation=0,
+                            worker_type="unknown",
+                            depth=0,
+                            tool_call_id=str(call_id),
+                            tool_name=tool_name,
+                            tool_source=tool_source.source,
+                            command=args.get("command", ""),
+                            validation=ValidationResultView(
+                                allowed=_ast_result.allowed,
+                                code=_ast_result.code,
+                                effective_cwd=_ast_result.effective_cwd,
+                            ),
+                            is_default_cwd=not bool(args.get("exec_dir")),
+                            settings=build_settings_view(_settings),
+                        )
+                        await _policy_sink.record(
+                            SandboxPolicyCompiler().compile_tool_call(_pol_inp)
+                        )
+                    except Exception as _pol_exc:  # noqa: BLE001 — observe must never alter flow
+                        logger.warning(
+                            "sandbox.policy observe failed surface=tool_call exc=%s",
+                            type(_pol_exc).__name__,
+                        )
+
                 if not _ast_result.allowed:
                     _ast_denied = to_typed_denied(
                         _ast_result, original_command=args.get("command", "")
@@ -2406,6 +2450,47 @@ def build_react_graph(
 
                 if _metrics is not None:
                     _metrics.record_ast_validation(ast_result.code)
+
+                # C5a Seam B (legacy tool_node path): observe-only tool_call snapshot.
+                if _settings.sandbox_policy_compiler_enabled and (
+                    _policy_sink := configurable.get("policy_snapshot_sink")
+                ) is not None:
+                    try:
+                        from app.domain.models.sandbox_policy import (
+                            ToolCallInput,
+                            ValidationResultView,
+                            build_settings_view,
+                        )
+                        from app.domain.services.safety.sandbox_policy_compiler import (
+                            SandboxPolicyCompiler,
+                        )
+
+                        _pol_inp = ToolCallInput(
+                            session_id=str(configurable.get("session_id") or ""),
+                            sandbox_id=None,
+                            sandbox_generation=0,
+                            worker_type="unknown",
+                            depth=0,
+                            tool_call_id=str(call_id),
+                            tool_name=tool_name,
+                            tool_source=tool_source.source,
+                            command=args.get("command", ""),
+                            validation=ValidationResultView(
+                                allowed=ast_result.allowed,
+                                code=ast_result.code,
+                                effective_cwd=ast_result.effective_cwd,
+                            ),
+                            is_default_cwd=not bool(args.get("exec_dir")),
+                            settings=build_settings_view(_settings),
+                        )
+                        await _policy_sink.record(
+                            SandboxPolicyCompiler().compile_tool_call(_pol_inp)
+                        )
+                    except Exception as _pol_exc:  # noqa: BLE001 — observe must never alter flow
+                        logger.warning(
+                            "sandbox.policy observe failed surface=tool_call exc=%s",
+                            type(_pol_exc).__name__,
+                        )
 
                 if not ast_result.allowed:
                     denied = to_typed_denied(ast_result, original_command=args.get("command", ""))

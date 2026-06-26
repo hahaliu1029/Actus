@@ -14,7 +14,7 @@ import posixpath
 import re as _re
 import unicodedata as _unicodedata
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 import bashlex
 
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MAX_COMMAND_BYTES",
     "ValidationCode",
+    "DENY_VALIDATION_CODES",
     "ValidationResult",
     "validate",
     "format_denied_content",
@@ -40,6 +41,14 @@ ValidationCode = Literal[
     "parse_failed",
     "oversized_command",
 ]
+
+# C5a: single source of truth for the deny-class validation codes. The Sandbox
+# Policy Compiler imports this so CommandPolicy.blocked_validation_codes can
+# never drift from the validator's real deny set. Every non-"ok" code is a
+# denial (allowed=False), incl. parse_failed / oversized_command.
+DENY_VALIDATION_CODES: tuple[str, ...] = tuple(
+    c for c in get_args(ValidationCode) if c != "ok"
+)
 
 MAX_COMMAND_BYTES = 8192
 _MAX_AST_DEPTH = 32

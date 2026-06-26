@@ -178,6 +178,7 @@ class PlannerReActFlow(BaseFlow):
         execution_supervisor: Any = None,
         permission_engine: "PermissionEngine | None" = None,
         session_state_machine: "SessionStateMachine | None" = None,
+        policy_snapshot_sink: Any = None,  # C5a observe-only sink (Seam B carrier)
         # PR-9b-A A5: lifespan-scoped coordinator runtime deps. Default is the
         # frozen NullCoordinatorRuntimeDeps sentinel so legacy callers (tests
         # + non-coordinator paths) inject zero coord cfg keys; production
@@ -188,6 +189,7 @@ class PlannerReActFlow(BaseFlow):
         self._execution_supervisor = execution_supervisor
         self._permission_engine = permission_engine
         self._session_state_machine = session_state_machine
+        self._policy_snapshot_sink = policy_snapshot_sink
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_processor_lookup = file_processor_lookup
@@ -1424,6 +1426,7 @@ class PlannerReActFlow(BaseFlow):
                 "execution_control": control,
                 "tool_failure_tracker": self._tool_failure_tracker,
                 "execution_metrics": self._execution_metrics,
+                "policy_snapshot_sink": self._policy_snapshot_sink,  # C5a Seam B carrier
                 # B5 C5a: make the LLM adapter and AgentConfig available to
                 # executor_node so PromptAssembler consumers (C5b) can read
                 # provider name / model details without re-injecting via state.

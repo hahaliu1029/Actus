@@ -243,6 +243,7 @@ class AgentService:
         # user-stop. None -> legacy/test path (stop_session skips). Built in
         # ``_build_agent_service`` from ``coord_deps``; NOT threaded into
         # ``AgentTaskRunner`` and NOT added to ``_CoordinatorRuntimeDeps``.
+        policy_snapshot_sink: object | None = None,  # C5a Seam B sink (DI-provided)
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -274,6 +275,7 @@ class AgentService:
         self._coord_deps = coord_deps
         # C2 coordinator-cancel — consumed only by stop_session (INV-C4 null-safe).
         self._coordinator_parent_cancel_fanout = coordinator_parent_cancel_fanout
+        self._policy_snapshot_sink = policy_snapshot_sink
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -833,6 +835,7 @@ class AgentService:
             # back to ``_NullCoordinatorRuntimeDeps`` so _build_config()
             # SKIPS the 18 coordinator cfg keys.
             coord_deps=getattr(self, "_coord_deps", None),
+            policy_snapshot_sink=getattr(self, "_policy_snapshot_sink", None),
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);

@@ -34,6 +34,7 @@ from app.infrastructure.external.health_checker.redis_health_checker import (
     RedisHealthChecker,
 )
 from app.domain.external.mailbox_publisher import MailboxPublisher
+from app.domain.external.policy_snapshot_sink import PolicySnapshotSink
 from app.domain.models.app_config import LLMConfig, SkillRiskPolicy
 from app.domain.repositories.coordinator_result_envelope_store_repository import (
     CoordinatorResultEnvelopeStoreRepository,
@@ -1776,6 +1777,7 @@ def _build_agent_service(
         coord_deps=coord_deps,
         # C2 coordinator-cancel — consumed only by stop_session.
         coordinator_parent_cancel_fanout=coordinator_parent_cancel_fanout,
+        policy_snapshot_sink=get_policy_snapshot_sink(),  # C5a: Logging sink when flag ON, else Noop
     )
     agent_svc._supervisor = supervisor
     # C3 PR-4.5 — bind AgentService into the supervisor callback bridge
@@ -2087,6 +2089,22 @@ def get_mailbox_publisher(
     )
 
     return RedisMailboxPublisher(redis_client.client)
+
+
+def get_policy_snapshot_sink() -> PolicySnapshotSink:
+    """C5a: log-only sink when the flag is ON, else a no-op.
+
+    Belt-and-suspenders: the two seams ALSO read the flag and skip snapshot
+    construction entirely when OFF (INV-0), so the no-op is only a default.
+    Reads the module-level ``settings`` singleton (service_dependencies.py:81).
+    """
+    if settings.sandbox_policy_compiler_enabled:
+        from app.infrastructure.external.safety.logging_policy_snapshot_sink import (
+            LoggingPolicySnapshotSink,
+        )
+        return LoggingPolicySnapshotSink()
+    from app.domain.external.policy_snapshot_sink import NoopPolicySnapshotSink
+    return NoopPolicySnapshotSink()
 
 
 def build_cost_callback_handler(session_id: str, user_id: str):
