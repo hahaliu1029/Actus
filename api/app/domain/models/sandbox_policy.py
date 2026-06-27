@@ -1,6 +1,7 @@
 """C5a Sandbox Policy Compiler — frozen policy-snapshot model + fingerprint helpers.
 
-Observe-only (flag default-OFF). PURE DOMAIN: imports no FastAPI/SQLAlchemy/
+C5b: tool_call snapshots report enforcement_mode="enforce", container_create stays
+observe_only (the C5a flag now gates only snapshot EMISSION). PURE DOMAIN: imports no FastAPI/SQLAlchemy/
 infrastructure and never calls get_settings(). See
 docs/superpowers/specs/2026-06-26-c5a-sandbox-policy-compiler-design.md (§4).
 """

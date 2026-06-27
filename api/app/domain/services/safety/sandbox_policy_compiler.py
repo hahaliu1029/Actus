@@ -1,4 +1,5 @@
-"""C5a Sandbox Policy Compiler — pure two-surface compiler. Observe-only.
+"""C5a/C5b Sandbox Policy Compiler — pure two-surface compiler. tool_call snapshots
+report enforcement_mode="enforce" (C5b); container_create stays observe_only.
 
 PURE DOMAIN: imports only app.domain siblings + stdlib. Never calls
 get_settings(); the caller passes a pre-built SandboxSettingsView (§3/§5).
@@ -8,7 +9,6 @@ from __future__ import annotations
 from app.domain.models.sandbox_policy import (
     COMPILER_VERSION,
     SCHEMA_VERSION,
-    CommandPolicy,
     ContainerCreateInput,
     ContainerRuntimePolicy,
     DecisionSummary,
@@ -24,9 +24,9 @@ from app.domain.models.sandbox_policy import (
     compute_settings_hash,
     sha256_hexdigest,
 )
-from app.domain.services.safety.shell_ast_validator import (
-    DENY_VALIDATION_CODES,
-    MAX_COMMAND_BYTES,
+from app.domain.services.safety.command_policy_evaluator import (
+    build_command_policy,
+    evaluate_command,
 )
 
 
@@ -66,7 +66,9 @@ def _network(s: SandboxSettingsView) -> NetworkPolicy:
 
 class SandboxPolicyCompiler:
     """Pure, stateless. Renders the CURRENT effective sandbox posture into a
-    versioned SandboxPolicySnapshot. observe-only: never mutates anything."""
+    versioned SandboxPolicySnapshot. The compiler never mutates anything; the
+    snapshot's enforcement_mode is "enforce" for tool_call (C5b), "observe_only"
+    for container_create."""
 
     def compile_container_create(self, inp: ContainerCreateInput) -> SandboxPolicySnapshot:
         s = inp.settings
@@ -112,16 +114,14 @@ class SandboxPolicyCompiler:
     def compile_tool_call(self, inp: ToolCallInput) -> SandboxPolicySnapshot:
         s = inp.settings
         v = inp.validation
-        command = CommandPolicy(
-            validator="shell_ast_validator",
-            max_command_bytes=MAX_COMMAND_BYTES,
-            blocked_validation_codes=list(DENY_VALIDATION_CODES),
-            effective_cwd_digest=sha256_hexdigest(v.effective_cwd),
+        command = build_command_policy(
+            effective_cwd=v.effective_cwd,
             is_default_cwd=inp.is_default_cwd,
         )
+        _decision = evaluate_command(validation_code=v.code, policy=command)
         decision = DecisionSummary(
             decision_source="shell_ast_validator",
-            verdict="ok" if v.allowed else "denied",
+            verdict="ok" if _decision.allowed else "denied",
             reason_code=v.code,
         )
         subject = PolicySubject(
@@ -139,7 +139,7 @@ class SandboxPolicyCompiler:
         )
         snap = SandboxPolicySnapshot(
             schema_version=SCHEMA_VERSION, policy_hash="",
-            enforcement_mode="observe_only", surface="tool_call",
+            enforcement_mode="enforce", surface="tool_call",
             subject=subject, provenance=provenance, decision=decision,
             filesystem=_filesystem(s), command=command, network=_network(s),
             container=None,

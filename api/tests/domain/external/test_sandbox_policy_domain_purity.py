@@ -13,6 +13,7 @@ _TARGETS = [
     ("app", "domain", "models", "sandbox_policy.py"),
     ("app", "domain", "services", "safety", "sandbox_policy_compiler.py"),
     ("app", "domain", "external", "policy_snapshot_sink.py"),
+    ("app", "domain", "services", "safety", "command_policy_evaluator.py"),
 ]
 _FORBIDDEN_IMPORT_PREFIXES = ("fastapi", "sqlalchemy", "app.infrastructure")
 

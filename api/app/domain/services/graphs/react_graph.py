@@ -1607,6 +1607,10 @@ def build_react_graph(
                     to_typed_denied,
                     validate,
                 )
+                from app.domain.services.safety.command_policy_evaluator import (
+                    build_command_policy,
+                    evaluate_command,
+                )
                 try:
                     _ast_result = validate(
                         command=args.get("command", ""),
@@ -1638,10 +1642,10 @@ def build_react_graph(
                 if _metrics is not None:
                     _metrics.record_ast_validation(_ast_result.code)
 
-                # C5a Seam B (PE path): observe-only tool_call policy snapshot.
-                # INV-0 — read the flag FIRST; the entire block is swallowed so
-                # it can never alter control flow. The validator decision below
-                # (`if not _ast_result.allowed`) is UNCHANGED.
+                # C5a Seam B (PE path): best-effort tool_call policy snapshot emission
+                # (still flag-gated + swallowed; the flag gates ONLY this emission, never
+                # control flow). C5b: the snapshot reports enforcement_mode="enforce" and
+                # the decision below is policy-driven (evaluate_command), not `_ast_result.allowed`.
                 if _settings.sandbox_policy_compiler_enabled and (
                     _policy_sink := configurable.get("policy_snapshot_sink")
                 ) is not None:
@@ -1682,7 +1686,14 @@ def build_react_graph(
                             type(_pol_exc).__name__,
                         )
 
-                if not _ast_result.allowed:
+                _cmd_decision = evaluate_command(
+                    validation_code=_ast_result.code,
+                    policy=build_command_policy(
+                        effective_cwd=_ast_result.effective_cwd,
+                        is_default_cwd=not bool(args.get("exec_dir")),
+                    ),
+                )
+                if not _cmd_decision.allowed:
                     _ast_denied = to_typed_denied(
                         _ast_result, original_command=args.get("command", "")
                     )
@@ -2418,6 +2429,10 @@ def build_react_graph(
                     to_typed_denied,
                     validate,
                 )
+                from app.domain.services.safety.command_policy_evaluator import (
+                    build_command_policy,
+                    evaluate_command,
+                )
                 try:
                     ast_result = validate(
                         command=args.get("command", ""),
@@ -2451,7 +2466,10 @@ def build_react_graph(
                 if _metrics is not None:
                     _metrics.record_ast_validation(ast_result.code)
 
-                # C5a Seam B (legacy tool_node path): observe-only tool_call snapshot.
+                # C5a Seam B (legacy tool_node path): best-effort tool_call snapshot
+                # emission (flag-gated + swallowed). C5b: the snapshot reports
+                # enforcement_mode="enforce"; the decision below is policy-driven
+                # (evaluate_command), not `ast_result.allowed`.
                 if _settings.sandbox_policy_compiler_enabled and (
                     _policy_sink := configurable.get("policy_snapshot_sink")
                 ) is not None:
@@ -2492,7 +2510,14 @@ def build_react_graph(
                             type(_pol_exc).__name__,
                         )
 
-                if not ast_result.allowed:
+                _cmd_decision = evaluate_command(
+                    validation_code=ast_result.code,
+                    policy=build_command_policy(
+                        effective_cwd=ast_result.effective_cwd,
+                        is_default_cwd=not bool(args.get("exec_dir")),
+                    ),
+                )
+                if not _cmd_decision.allowed:
                     denied = to_typed_denied(ast_result, original_command=args.get("command", ""))
                     await _finalize_outcome(tc, args, tool_source, denied, _tool_start)
                     continue

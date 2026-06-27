@@ -404,6 +404,10 @@ class SkillTool(BaseTool):
             to_legacy_tool_result,
             validate,
         )
+        from app.domain.services.safety.command_policy_evaluator import (
+            build_command_policy,
+            evaluate_command,
+        )
         try:
             ast_result = validate(command, effective_cwd=exec_dir)
         except Exception as _ast_exc:  # defensive — validate() should never raise
@@ -417,7 +421,11 @@ class SkillTool(BaseTool):
                     f"{type(_ast_exc).__name__}"
                 ),
             )
-        if not ast_result.allowed:
+        _cmd_decision = evaluate_command(
+            validation_code=ast_result.code,
+            policy=build_command_policy(effective_cwd=ast_result.effective_cwd, is_default_cwd=False),
+        )
+        if not _cmd_decision.allowed:
             # Interim telemetry for ast_block_rate_skill (spec §8.6);
             # session_id not yet created here (runs before line ~349),
             # so use skill.id + manifest_tool name. INFO level (not WARN) —

@@ -111,7 +111,7 @@ def test_container_create_full_golden():
 def _expected_tool_call(*, command, verdict, reason_code):
     return {
         "schema_version": SCHEMA_VERSION,
-        "enforcement_mode": "observe_only",
+        "enforcement_mode": "enforce",   # was "observe_only" (C5b §6 step 3)
         "surface": "tool_call",
         "subject": {
             "session_id": "s1", "sandbox_id": None, "sandbox_generation": 0,
@@ -172,3 +172,83 @@ def test_egress_disabled_when_network_none_string():
 def test_egress_proxy_env_when_proxy_present():
     snap = C.compile_container_create(_cc_input(settings=_view(has_https_proxy=True)))
     assert snap.network.egress_mode == "proxy_env"
+
+
+# ---- §8.6 C5b compiler honesty (shared builder + verdict + enforce flip) ---- #
+def test_tool_call_command_uses_shared_builder_surrogate():
+    # A surrogate-containing effective_cwd diverges iff the compiler kept the
+    # strict inline sha256_hexdigest (which raises on a lone surrogate). Equality
+    # locks SEMANTIC equivalence with the shared builder. [§8.6, R2#P3-1]
+    from app.domain.services.safety.command_policy_evaluator import build_command_policy
+
+    inp = _tc_input(
+        validation=ValidationResultView(allowed=True, code="ok", effective_cwd="/tmp/\ud800x"),
+    )
+    snap = C.compile_tool_call(inp)
+    assert snap.command == build_command_policy(
+        effective_cwd=inp.validation.effective_cwd,
+        is_default_cwd=inp.is_default_cwd,
+    )
+
+
+def test_tool_call_verdict_derived_from_evaluator():
+    # verdict comes from evaluate_command(code, policy), not from v.allowed. [§8.6, codex Q6]
+    from app.domain.services.safety.command_policy_evaluator import (
+        build_command_policy,
+        evaluate_command,
+    )
+
+    for code, expected in (("ok", "ok"), ("fs_destructive", "denied")):
+        inp = _tc_input(
+            command="x",
+            validation=ValidationResultView(
+                allowed=(code == "ok"), code=code, effective_cwd="/root"
+            ),
+        )
+        snap = C.compile_tool_call(inp)
+        pol = build_command_policy(effective_cwd="/root", is_default_cwd=inp.is_default_cwd)
+        derived = "ok" if evaluate_command(validation_code=code, policy=pol).allowed else "denied"
+        assert snap.decision.verdict == derived == expected
+
+
+def test_tool_call_verdict_off_contract_follows_evaluator():
+    # OFF-CONTRACT discriminator (codex planR1 P2): allowed=True but code is a deny code.
+    # Old `"ok" if v.allowed else "denied"` logic would say "ok"; the evaluator (code-driven)
+    # says "denied". Asserting "denied" PROVES the verdict is derived from evaluate_command,
+    # not from v.allowed. (Tests may build off-contract ValidationResultViews; spec §0.2.)
+    inp = _tc_input(
+        command="x",
+        validation=ValidationResultView(allowed=True, code="fs_destructive", effective_cwd="/root"),
+    )
+    snap = C.compile_tool_call(inp)
+    assert snap.decision.verdict == "denied"
+
+
+def test_tool_call_verdict_reads_evaluator_output(monkeypatch):
+    # Verdict must read the EVALUATOR's output, not re-derive from v.code/v.allowed. Force the
+    # compiler-module evaluate_command to DENY an `ok` input; the verdict must then be "denied".
+    # A `v.code == "ok"` (or v.allowed) derivation would yield "ok" → fail. [codex planR7 P2]
+    import app.domain.services.safety.sandbox_policy_compiler as compiler_mod
+    from app.domain.services.safety.command_policy_evaluator import CommandGateDecision
+
+    monkeypatch.setattr(
+        compiler_mod,
+        "evaluate_command",
+        lambda *, validation_code, policy: CommandGateDecision(
+            allowed=False, code=validation_code, blocked_by_policy=True
+        ),
+        raising=False,
+    )
+    snap = C.compile_tool_call(_tc_input(
+        validation=ValidationResultView(allowed=True, code="ok", effective_cwd="/root"),
+    ))
+    assert snap.decision.verdict == "denied"  # from the (patched) evaluator, not v.code=="ok"
+
+
+def test_enforce_flip_is_in_fingerprint():
+    # compute_policy_hash includes enforcement_mode (sandbox_policy.py:231), so the
+    # enforce snapshot's fingerprint must differ from its observe_only twin. [§8.6]
+    snap = C.compile_tool_call(_tc_input())
+    assert snap.enforcement_mode == "enforce"
+    observe_twin = snap.model_copy(update={"enforcement_mode": "observe_only"})
+    assert compute_policy_hash(observe_twin) != compute_policy_hash(snap)
