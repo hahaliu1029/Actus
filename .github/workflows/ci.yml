@@ -177,16 +177,58 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Pre-pull alpine:3.20
+      - name: Pre-pull probe images
         # CI runner 一般有 docker daemon，但镜像不预载；_docker_or_skip 禁止
-        # 在线拉取（减少测试 flakiness），所以这里显式 pull 一次。
-        run: docker pull alpine:3.20
+        # 在线拉取（减少测试 flakiness），所以这里显式 pull。Retry each pull
+        # (transient Docker Hub blips); FAIL if an image never pulls (plan-R2 P3).
+        run: |
+          for img in alpine:3.20 python:3.12-alpine; do
+            for i in 1 2 3; do docker pull "$img" && break; [ "$i" = 3 ] && exit 1; sleep 5; done
+          done
 
-      - name: Run sandbox adversarial tests
+      - name: Run sandbox adversarial + cap-enforcement tests
         working-directory: api
         env:
           ACTUS_REQUIRE_SANDBOX_TESTS: "1"
-        run: uv run pytest tests/sandbox/ -m sandbox -v
+        run: uv run pytest tests/sandbox/ -m "sandbox and not sandbox_real_image" -v
+
+  sandbox-hardening-smoke:
+    name: Sandbox Hardening Smoke (real image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # C5d-1 surface ②③: boot the REAL actus-sandbox image with the C5c hardening
+    # profile ON and prove the workload survives + the container has the caps
+    # dropped. Standalone — the sandbox app needs no pg/redis/minio.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build sandbox image
+        # Retry the build (transient apt/NodeSource/PPA pulls); FAIL the step if all
+        # attempts fail — a bare `|| sleep` loop would exit 0 on the final sleep
+        # (plan-R2 P3 silent-failure fix).
+        run: |
+          for i in 1 2 3; do
+            docker build -t actus-sandbox:latest sandbox/ && exit 0
+            echo "build attempt $i failed"; sleep 10
+          done
+          exit 1
+
+      - name: Run hardening smoke (flag-on, real image)
+        working-directory: api
+        env:
+          ACTUS_REQUIRE_SANDBOX_TESTS: "1"
+        run: uv run pytest tests/sandbox/ -m "sandbox and sandbox_real_image" -v
 
   sandbox-test:
     name: Sandbox Unit Tests (S1 atomic write)

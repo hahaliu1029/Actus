@@ -39,11 +39,16 @@ from pathlib import Path
 
 import pytest
 
+from tests.sandbox._docker_helpers import (
+    ALPINE_IMAGE,
+    _docker_client_or_skip,
+    _require_image,
+)
+
 pytestmark = [pytest.mark.sandbox, pytest.mark.anyio]
 
 # 容器内挂载点——与 ``settings.sandbox_memory_mount_target`` 默认值保持一致。
 _MOUNT_TARGET = "/workspace/.memory"
-_ALPINE_IMAGE = "alpine:3.20"
 
 
 @pytest.fixture
@@ -52,56 +57,11 @@ def anyio_backend() -> str:
 
 
 def _docker_or_skip():
-    """返回 docker client；daemon 不可达或镜像不在时按 require 策略 skip 或 fail。
-
-    - macOS + Docker Desktop 默认 socket 是 ``~/.docker/run/docker.sock``，不是
-      Linux 的 ``/var/run/docker.sock``。``docker.from_env()`` 读不到
-      ``DOCKER_HOST`` 时会直接找 Linux 默认路径 → 找不到。依次尝试候选 socket，
-      保证 macOS / Linux / CI 都能就绪。
-    - CI 必须跑到这些对抗测试（M3 验收项）。开 ``ACTUS_REQUIRE_SANDBOX_TESTS=1``
-      的环境下，docker / image 缺失会 ``pytest.fail`` 硬失败而非 skip——防止
-      "CI 静默 skip = 安全测试形同虚设" 的隐蔽退化（codex review P1）。
-    """
-    require = os.environ.get("ACTUS_REQUIRE_SANDBOX_TESTS") == "1"
-
-    def _miss(msg: str) -> None:
-        if require:
-            pytest.fail(f"ACTUS_REQUIRE_SANDBOX_TESTS=1 但 {msg}")
-        pytest.skip(msg)
-
-    try:
-        import docker
-    except ImportError:
-        _miss("docker SDK 不可用")
-
-    candidates: list[str] = []
-    env_host = os.environ.get("DOCKER_HOST")
-    if env_host:
-        candidates.append(env_host)
-    home_sock = Path.home() / ".docker" / "run" / "docker.sock"
-    if home_sock.exists():
-        candidates.append(f"unix://{home_sock}")
-    if Path("/var/run/docker.sock").exists():
-        candidates.append("unix:///var/run/docker.sock")
-
-    client = None
-    last_err: Exception | None = None
-    for url in candidates or [None]:
-        try:
-            client = docker.DockerClient(base_url=url) if url else docker.from_env()
-            client.ping()
-            break
-        except Exception as exc:
-            last_err = exc
-            client = None
-    if client is None:
-        _miss(f"docker daemon 不可达（尝试 {candidates or 'env'}): {last_err}")
-        return None  # pragma: no cover — _miss 必然 fail/skip
-
-    try:
-        client.images.get(_ALPINE_IMAGE)
-    except Exception:
-        _miss(f"本地缺少 {_ALPINE_IMAGE}；CI 需要 pre-pull 或开启在线拉取")
+    """Thin wrapper preserving the original behavior (client + alpine:3.20 require)
+    on top of the shared helpers (C5d-1 refactor). Behavior-identical: same
+    multi-socket client discovery, same REQUIRE=1 fail-not-skip, same image gate."""
+    client = _docker_client_or_skip()
+    _require_image(client, ALPINE_IMAGE)
     return client
 
 
@@ -118,7 +78,7 @@ def _run_alpine_with_ro_mount(
     from docker.types import Mount
 
     container = client.containers.run(
-        _ALPINE_IMAGE,
+        ALPINE_IMAGE,
         command=["sh", "-c", cmd],
         mounts=[
             Mount(
