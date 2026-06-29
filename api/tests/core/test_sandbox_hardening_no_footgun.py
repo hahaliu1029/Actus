@@ -7,11 +7,59 @@ from core.config import Settings
 
 def test_no_free_form_hardening_settings():
     # INV-4: hardening is a vetted profile behind booleans, NOT raw docker knobs.
+    # C5d-2 extends this to cap_add — the allowlist is a compiler constant, never a knob.
     s = Settings(env="test")
-    for forbidden in ("sandbox_security_opt", "sandbox_cap_drop", "sandbox_pids_limit"):
+    for forbidden in (
+        "sandbox_security_opt", "sandbox_cap_drop", "sandbox_cap_add", "sandbox_pids_limit",
+    ):
         assert not hasattr(s, forbidden), (
             f"INV-4 footgun: free-form {forbidden} must not exist on Settings"
         )
+
+
+def test_strict_cap_add_is_subset_of_vetted_ceiling():
+    # INV-4: the two two-place literals must stay consistent. _STRICT_CAP_ADD (what the
+    # compiler emits) ⊆ _VETTED_CAP_CEILING (what the validator permits); and never "ALL".
+    from app.domain.services.safety.sandbox_policy_compiler import _STRICT_CAP_ADD
+    from app.infrastructure.external.sandbox.container_hardening import _VETTED_CAP_CEILING
+
+    assert set(_STRICT_CAP_ADD) <= _VETTED_CAP_CEILING
+    assert "ALL" not in _STRICT_CAP_ADD
+    assert len(_STRICT_CAP_ADD) == 9  # the documented allowlist size (parity-10 adds SYS_CHROOT)
+
+
+def test_sandbox_policy_compiler_stays_pure_domain():
+    # INV-5: the compiler is PURE DOMAIN — stdlib + app.domain siblings only. A future edit
+    # importing app.infrastructure / core / docker / fastapi / sqlalchemy would pass every
+    # behavioral test yet break Clean Architecture; this AST gate fails fast.
+    import ast
+    from pathlib import Path
+
+    compiler = (
+        Path(__file__).resolve().parents[2]   # api/tests/core/<file> → api/
+        / "app" / "domain" / "services" / "safety" / "sandbox_policy_compiler.py"
+    )
+    tree = ast.parse(compiler.read_text(encoding="utf-8"))
+    forbidden = ("app.infrastructure", "core", "docker", "fastapi", "sqlalchemy")
+    bad: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            mods = [node.module or ""]
+        elif isinstance(node, ast.Import):
+            mods = [alias.name for alias in node.names]
+        else:
+            continue
+        bad += [m for m in mods if any(m == p or m.startswith(p + ".") for p in forbidden)]
+    assert not bad, f"INV-5: sandbox_policy_compiler.py must stay pure domain; forbidden imports: {bad}"
+
+
+def test_validator_lives_in_infrastructure_not_domain():
+    # INV-5 other half: the fail-closed validator knows docker-py kwargs → it is INFRA, not
+    # domain. It must be importable from the infra module (where the plan places it).
+    from app.infrastructure.external.sandbox.container_hardening import (  # noqa: F401
+        SandboxHardeningConfigError,
+        validate_hardening_config,
+    )
 
 
 class _S:

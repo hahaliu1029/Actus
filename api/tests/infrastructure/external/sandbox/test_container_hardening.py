@@ -11,7 +11,7 @@ def _policy(**over) -> ContainerRuntimePolicy:
     base = dict(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=(), security_opt=(), pids_limit=None,
+        read_only_rootfs=False, cap_drop=(), cap_add=(), security_opt=(), pids_limit=None,
         mounts=(),
     )
     base.update(over)
@@ -64,3 +64,18 @@ def test_applied_policy_no_mount_when_skipped():
         container_config={"image": "actus/sandbox:latest", "mem_limit": "4g"},
         memory_mount=None, memory_mount_target="/workspace/.memory")
     assert applied.mounts == ()
+
+
+def test_strict_policy_emits_cap_add_and_drop_all():
+    kw = container_hardening_kwargs(_policy(
+        cap_drop=("ALL",), cap_add=("CHOWN", "SETUID"), pids_limit=512))
+    assert kw == {
+        "cap_drop": ["ALL"],
+        "cap_add": ["CHOWN", "SETUID"],   # tuple → list (SDK-native)
+        "pids_limit": 512,
+    }
+
+
+def test_empty_cap_add_is_omitted():
+    kw = container_hardening_kwargs(_policy(cap_drop=("NET_RAW",), pids_limit=512))
+    assert "cap_add" not in kw

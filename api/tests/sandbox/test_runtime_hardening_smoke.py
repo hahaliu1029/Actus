@@ -30,6 +30,10 @@ pytestmark = [pytest.mark.sandbox, pytest.mark.sandbox_real_image]
 
 _READY_TIMEOUT = 180  # chrome under Xvfb in CI can be slow (codex R3#3)
 
+# C5d-2 strict mask (bits) — independent in-test literal (parity with the negative
+# test's _EXPECTED_STRICT_CAP_BITS). Parity-10 fallback → add bit 18 (SYS_CHROOT).
+_STRICT_MASK_BITS = frozenset({0, 1, 3, 4, 5, 6, 7, 8, 31})
+
 # Retained-cap probe: prove CHOWN + FOWNER (the caps we do NOT drop) still work
 # — create as root, chown to ubuntu (CHOWN), chmod the now-ubuntu file as root
 # (FOWNER). Exits 0 on success (codex R4).
@@ -167,6 +171,84 @@ def test_no_new_privileges_opt_in_sets_nonewprivs_and_breaks_sudo():
         # setuid sudo cannot escalate under no-new-privileges (run as non-root ubuntu).
         code, _ = _exec(container, ["sudo", "-n", "true"], user="ubuntu")
         assert code != 0, "sudo unexpectedly succeeded under no-new-privileges"
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.fixture
+def strict_sandbox():
+    """Boot the REAL actus-sandbox image with the STRICT profile (cap_drop=ALL +
+    the 9-cap allowlist, NNP off)."""
+    client = _docker_client_or_skip()
+    _require_image(client, SANDBOX_IMAGE)
+    container = client.containers.run(
+        SANDBOX_IMAGE, detach=True, **hardening_kwargs(hardening=True, strict=True, nnp=False)
+    )
+    try:
+        _wait_ready(container)
+        yield container
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_workload_survives_strict_profile(strict_sandbox):
+    # C5d-2 surface ②: the 9-cap strict profile supports the CORE per-session workload
+    # (startup + shell + offline pip + chown/chmod + sudo + Chromium CDP). SETFCAP/KILL
+    # ride along un-exercised (safe over-grant; spec §9/§11).
+    c = strict_sandbox
+
+    code, out = _exec(c, ["sh", "-lc", "echo ok"])
+    assert code == 0 and out.strip() == b"ok", out
+
+    setup = "from setuptools import setup; setup(name='c5d2probe', version='0.0.0', packages=['c5d2mod'])"
+    mk = (
+        "mkdir -p /tmp/pkg/c5d2mod && "
+        f"printf '%s' \"{setup}\" > /tmp/pkg/setup.py && "
+        "touch /tmp/pkg/c5d2mod/__init__.py"
+    )
+    assert _exec(c, ["sh", "-c", mk])[0] == 0
+    code, out = _exec(c, ["sh", "-c", "python3 -m pip install --no-index --no-build-isolation --no-deps /tmp/pkg"])
+    assert code == 0, f"offline pip failed under strict: {out!r}"
+
+    # retained caps: CHOWN + FOWNER still work
+    code, out = _exec(c, ["python3", "-c", _RETAINED_CAP_PROBE])
+    assert code == 0, f"retained-cap probe failed under strict: {out!r}"
+
+    # sudo intact (NNP off → setuid sudo works) — SETUID/SETGID/SETPCAP in the allowlist
+    code, out = _exec(c, ["sudo", "-n", "true"], user="ubuntu")
+    assert code == 0, f"sudo -n true failed under strict profile: {out!r}"
+
+    # real-image hardening: PID 1 + a fresh root exec carry EXACTLY the strict mask,
+    # NoNewPrivs:0 (default), pids.max==512.
+    for pid_path in ("/proc/1/status", "/proc/self/status"):
+        sets = _caps_from_proc(c, pid_path)
+        for name in ("CapEff", "CapPrm", "CapBnd"):
+            assert sets[name] == _STRICT_MASK_BITS, f"{pid_path} {name} != strict mask: {sorted(sets[name])}"
+    assert _nonewprivs(c, "/proc/1/status") == "0", "strict default profile must NOT set NoNewPrivs"
+    assert read_pids_max(c) == "512", "real-image pids.max != 512"
+
+
+def test_strict_with_no_new_privileges_breaks_sudo():
+    # C5d-2 surface ③: strict + NNP → NoNewPrivs:1 + setuid sudo FAILS (INV-6). SETUID
+    # in the allowlist is NOT enough — NNP is exactly the knob that forbids setuid escalation.
+    client = _docker_client_or_skip()
+    _require_image(client, SANDBOX_IMAGE)
+    container = client.containers.run(
+        SANDBOX_IMAGE, detach=True,
+        **hardening_kwargs(hardening=True, strict=True, nnp=True),
+    )
+    try:
+        _wait_ready(container)
+        assert _nonewprivs(container, "/proc/1/status") == "1", "strict+NNP must set NoNewPrivs on PID 1"
+        assert _nonewprivs(container, "/proc/self/status") == "1", "strict+NNP must set NoNewPrivs on exec"
+        code, _ = _exec(container, ["sudo", "-n", "true"], user="ubuntu")
+        assert code != 0, "sudo unexpectedly succeeded under strict + no-new-privileges"
     finally:
         try:
             container.remove(force=True)

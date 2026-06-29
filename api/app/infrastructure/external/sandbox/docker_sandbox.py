@@ -35,6 +35,8 @@ from app.infrastructure.external.browser.playwright_browser import PlaywrightBro
 from app.infrastructure.external.sandbox.container_hardening import (
     build_applied_runtime_policy,
     container_hardening_kwargs,
+    SandboxHardeningConfigError,
+    validate_hardening_config,
 )
 from async_lru import alru_cache
 from core.config import get_settings
@@ -242,6 +244,10 @@ class DockerSandbox(Sandbox):
             applied_runtime_policy = None
             if runtime_policy is not None:
                 container_config.update(container_hardening_kwargs(runtime_policy))
+                # C5d-2: fail-closed pre-run guard over the REAL merged kwargs. Raises
+                # SandboxHardeningConfigError (→ no container) on escape-enabling config.
+                # Only runs on the hardened path → OFF path byte-identical (INV-0).
+                validate_hardening_config(container_config)
                 applied_runtime_policy = build_applied_runtime_policy(
                     container_config=container_config,
                     memory_mount=memory_mount,
@@ -266,6 +272,12 @@ class DockerSandbox(Sandbox):
                 ip=ip, container_name=container_name,
                 applied_runtime_policy=applied_runtime_policy,
             )
+        except SandboxHardeningConfigError:
+            # C5d-2: preserve the typed fail-closed error — the broad handler below
+            # would re-wrap it as a generic Exception and lose the type. Fail-closed
+            # holds either way (this precedes containers.run → no container is created).
+            # INV-0-safe: only the hardened path can raise it.
+            raise
         except Exception as e:
             logger.error(f"创建Docker沙箱容器失败: {str(e)}")
             raise Exception(f"创建Docker沙箱容器失败: {str(e)}")

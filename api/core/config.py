@@ -161,6 +161,20 @@ class Settings(BaseSettings):
             "ACTUS_C5_SANDBOX_NO_NEW_PRIVILEGES_ENABLED",
         ),
     )
+    # C5d-2 Sandbox Strict Caps — cap_drop=ALL + a vetted 9-cap cap_add allowlist.
+    # A SEPARATE opt-in tier LAYERED UNDER sandbox_runtime_hardening_enabled: strict
+    # only takes effect when hardening is ALSO on (see _strict_requires_hardening).
+    # Default OFF dark-launch: when OFF the compiler emits the C5c conservative
+    # profile unchanged (INV-0). The field name itself MUST be an alias (else
+    # Settings(sandbox_strict_caps_enabled=True) is ignored).
+    sandbox_strict_caps_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_strict_caps_enabled",
+            "SANDBOX_STRICT_CAPS_ENABLED",
+            "ACTUS_C5_SANDBOX_STRICT_CAPS_ENABLED",
+        ),
+    )
 
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
@@ -362,6 +376,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "JWT_SECRET_KEY 仍为默认值 'change-me-in-env'，"
                 "请在 .env 或环境变量中设置一个安全的随机密钥"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _strict_requires_hardening(self) -> "Settings":
+        # C5d-2 INV-7 (fail-closed): strict caps are a TIER of runtime hardening.
+        # compile_runtime_policy returns None when hardening is OFF, so strict-alone
+        # would silently apply NO hardening → a false sense of strictness. Fail fast
+        # at construction. Fires ONLY on the two strict-without-hardening combos
+        # (H=0,S=1,N=any); never on the six valid combos (INV-0-safe). NO env=="test"
+        # escape — this is a config-consistency invariant, not a secret check.
+        if self.sandbox_strict_caps_enabled and not self.sandbox_runtime_hardening_enabled:
+            raise ValueError(
+                "sandbox_strict_caps_enabled requires sandbox_runtime_hardening_enabled "
+                "(strict caps are a tier of runtime hardening; enabling strict alone "
+                "would silently apply NO hardening)."
             )
         return self
 

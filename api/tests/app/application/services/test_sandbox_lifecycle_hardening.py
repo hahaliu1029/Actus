@@ -23,7 +23,7 @@ def anyio_backend():
 _APPLIED = ContainerRuntimePolicy(
     capture_kind="applied", creation_mode="docker_run",
     image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-    read_only_rootfs=False, cap_drop=("NET_RAW",), security_opt=(),
+    read_only_rootfs=False, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
     pids_limit=512, mounts=(),
 )
 

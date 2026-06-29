@@ -58,6 +58,7 @@ def _container() -> ContainerRuntimePolicy:
         run_as_user=None,
         read_only_rootfs=False,
         cap_drop=[],
+        cap_add=[],
         security_opt=[],
         pids_limit=None,
         mounts=[MountView(target="/workspace/.memory", source_kind="memory_bind", read_only=True)],
@@ -319,7 +320,7 @@ def _container_hardened(**over) -> ContainerRuntimePolicy:
     base = dict(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=[], security_opt=[], pids_limit=None,
+        read_only_rootfs=False, cap_drop=[], cap_add=[], security_opt=[], pids_limit=None,
         mounts=[MountView(target="/workspace/.memory", source_kind="memory_bind", read_only=True)],
     )
     base.update(over)
@@ -339,6 +340,38 @@ def test_container_hash_differs_when_cap_drop_changes():
     assert compute_policy_hash(a) != compute_policy_hash(b)
 
 
+def test_container_hash_differs_when_cap_add_changes():
+    # cap_add is a STATIC rule-set field (INV-2) → it MUST be in the fingerprint.
+    a = _container_snapshot(container=_container_hardened(cap_add=[]))
+    b = _container_snapshot(container=_container_hardened(cap_add=["CHOWN"]))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
+def test_container_hash_same_when_cap_add_equal():
+    a = _container_snapshot(container=_container_hardened(cap_add=["CHOWN", "SETUID"]))
+    b = _container_snapshot(container=_container_hardened(cap_add=["CHOWN", "SETUID"]))
+    assert compute_policy_hash(a) == compute_policy_hash(b)
+
+
+def test_cap_add_include_addition_is_invisible_to_tool_call_hash():
+    # §6.2 / spec §13 "tool_call-hash-unchanged": cap_add joins the container hash-include,
+    # but tool_call snapshots carry container=None, so the include change cannot alter their
+    # fingerprint. Prove the container contribution is IDENTICAL under the OLD (no cap_add) and
+    # NEW (cap_add) include sets — both serialize to {"container": None} — hence the public
+    # compute_policy_hash is unchanged for tool_call.
+    snap = _tool_call_snapshot()
+    old_set = {"capture_kind", "creation_mode", "image", "mem_limit", "run_as_user",
+               "read_only_rootfs", "cap_drop", "security_opt", "pids_limit"}
+    new_set = old_set | {"cap_add"}
+    # The OLD include-set (no cap_add) and the NEW set (with cap_add) yield the SAME tool_call
+    # payload — both {"container": None} — so the container hash-include addition cannot move the
+    # tool_call fingerprint. (This payload-level equality IS the hash-invariance, since
+    # compute_policy_hash derives the digest from exactly this model_dump payload.)
+    assert (snap.model_dump(mode="json", include={"container": old_set})
+            == snap.model_dump(mode="json", include={"container": new_set})
+            == {"container": None})
+
+
 def test_container_hash_differs_when_pids_limit_changes():
     a = _container_snapshot(container=_container_hardened(pids_limit=None))
     b = _container_snapshot(container=_container_hardened(pids_limit=512))
@@ -356,7 +389,7 @@ def test_tool_call_none_container_serializes_as_null_under_nested_include():
     nested_dump = snap.model_dump(mode="json", include={
         "container": {
             "capture_kind", "creation_mode", "image", "mem_limit", "run_as_user",
-            "read_only_rootfs", "cap_drop", "security_opt", "pids_limit",
+            "read_only_rootfs", "cap_drop", "cap_add", "security_opt", "pids_limit",
         },
     })
     assert true_dump == nested_dump == {"container": None}

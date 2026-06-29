@@ -40,6 +40,21 @@ _BASELINE_PIDS_LIMIT: int = 512
 _NO_NEW_PRIVILEGES_OPT: str = "no-new-privileges:true"
 
 
+# ── C5d-2 strict hardening tier (cap_drop=ALL + vetted minimal add-back) ───── #
+# Each cap is justified by the all-root + runtime-apt/pip/sudo workload (spec
+# §0.5/§0.6); SYS_CHROOT is the one extra drop vs the C5c conservative profile.
+# SETFCAP + KILL are conservative-rationale-NOT-smoke-validated (safe over-grant
+# of a non-escape cap; prime tightening candidates — spec §9/§12). Emitted only
+# when BOTH runtime_hardening_enabled AND strict_caps_enabled are on.
+_STRICT_CAP_DROP: tuple[str, ...] = ("ALL",)
+_STRICT_CAP_ADD: tuple[str, ...] = (
+    "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",   # apt/pip ownership / mode / setuid-bit
+    "SETUID", "SETGID", "SETPCAP",                  # sudo NOPASSWD privilege transition
+    "SETFCAP",                                      # apt file-caps (conservative, not smoke-validated)
+    "KILL",                                         # cross-uid signal (conservative, not smoke-validated)
+)  # 9 caps. CI-gated; parity-10 fallback = append "SYS_CHROOT" (spec §9 / §4.2).
+
+
 def _egress_mode(s: SandboxSettingsView) -> str:
     # R3#3: only the exact string "none" disables egress; None/unset omits the
     # kwarg → Docker default bridge ≠ disabled.
@@ -90,7 +105,7 @@ class SandboxPolicyCompiler:
             return ContainerRuntimePolicy(
                 capture_kind="configured", creation_mode="external_address",
                 image=None, mem_limit=None, run_as_user=None,
-                read_only_rootfs=False, cap_drop=(), security_opt=(),
+                read_only_rootfs=False, cap_drop=(), cap_add=(), security_opt=(),
                 pids_limit=None, mounts=(),
             )
         mounts = (
@@ -99,20 +114,26 @@ class SandboxPolicyCompiler:
             if s.memory_mount_enabled else ()
         )
         if s.runtime_hardening_enabled:
-            cap_drop = _BASELINE_CAP_DROP
+            if s.strict_caps_enabled:
+                cap_drop = _STRICT_CAP_DROP
+                cap_add = _STRICT_CAP_ADD
+            else:
+                cap_drop = _BASELINE_CAP_DROP
+                cap_add = ()
             security_opt = (
                 (_NO_NEW_PRIVILEGES_OPT,) if s.no_new_privileges_enabled else ()
             )
             pids_limit = _BASELINE_PIDS_LIMIT
         else:
             cap_drop = ()
+            cap_add = ()
             security_opt = ()
             pids_limit = None
         return ContainerRuntimePolicy(
             capture_kind="configured", creation_mode="docker_run",
             image=s.image, mem_limit=s.mem_limit, run_as_user=None,
-            read_only_rootfs=False, cap_drop=cap_drop, security_opt=security_opt,
-            pids_limit=pids_limit, mounts=mounts,
+            read_only_rootfs=False, cap_drop=cap_drop, cap_add=cap_add,
+            security_opt=security_opt, pids_limit=pids_limit, mounts=mounts,
         )
 
     def _container_create_snapshot(

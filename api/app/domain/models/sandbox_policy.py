@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 SCHEMA_VERSION = "c5.sandbox_policy.v1"
-COMPILER_VERSION = "c5c.1"  # bump on any mapping change (C5c: container hash + capture_kind)
+COMPILER_VERSION = "c5d2.1"  # bump on any mapping change (C5d-2: cap_add in container hash)
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
@@ -99,6 +99,7 @@ class ContainerRuntimePolicy(BaseModel):  # container_create only
     run_as_user: str | None
     read_only_rootfs: bool
     cap_drop: tuple[str, ...]
+    cap_add: tuple[str, ...]  # C5d-2: strict drop-ALL add-back allowlist; () for conservative/unhardened/external
     security_opt: tuple[str, ...]
     pids_limit: int | None
     mounts: tuple[MountView, ...]
@@ -125,6 +126,10 @@ class SandboxSettingsView(BaseModel):
     # container iff runtime_hardening_enabled is set.
     runtime_hardening_enabled: bool = False
     no_new_privileges_enabled: bool = False
+    # C5d-2: strict-caps tier bit (default False → conservative/unhardened). Layered
+    # under runtime_hardening_enabled; the compiler consults it only on the hardened
+    # docker_run branch.
+    strict_caps_enabled: bool = False
 
 
 class ValidationResultView(BaseModel):  # 3-field projection of the real ValidationResult
@@ -249,6 +254,7 @@ def compute_policy_hash(snapshot: SandboxPolicySnapshot) -> str:
                 "run_as_user",
                 "read_only_rootfs",
                 "cap_drop",
+                "cap_add",
                 "security_opt",
                 "pids_limit",
             },
@@ -286,4 +292,5 @@ def build_settings_view(settings) -> SandboxSettingsView:
         # Settings namespaces lacking the flags fall back to the unhardened default.
         runtime_hardening_enabled=getattr(settings, "sandbox_runtime_hardening_enabled", False),
         no_new_privileges_enabled=getattr(settings, "sandbox_no_new_privileges_enabled", False),
+        strict_caps_enabled=getattr(settings, "sandbox_strict_caps_enabled", False),
     )

@@ -181,3 +181,46 @@ def test_dropped_caps_and_pids_are_kernel_enforced(hardening: bool):
         assert data["mknod_errno"] == 0, data
         assert data["pids_max"] != "512", data
         assert data["fork_eagain_at"] is None, "small fork sanity unexpectedly hit a cap"
+
+
+# C5d-2 surface ①: INDEPENDENT in-test literals (NOT imported from the impl — else the
+# test mirrors the implementation and misses in-ceiling drift like an accidental
+# +SYS_CHROOT). Parity-10 fallback → update BOTH to the 10-set ({…,18} / +"SYS_CHROOT").
+_EXPECTED_STRICT_CAP_NAMES = frozenset({
+    "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
+    "SETUID", "SETGID", "SETPCAP", "SETFCAP", "KILL",
+})
+_EXPECTED_STRICT_CAP_BITS = frozenset({0, 1, 3, 4, 5, 6, 7, 8, 31})
+
+
+def test_strict_caps_are_kernel_enforced_exact_mask():
+    client = _docker_client_or_skip()
+    _require_image(client, PYTHON_ALPINE_IMAGE)
+
+    kwargs = hardening_kwargs(hardening=True, strict=True)
+    # (a) the production allowlist matches the independent NAME literal (catches drift).
+    assert set(kwargs["cap_add"]) == _EXPECTED_STRICT_CAP_NAMES, kwargs
+    assert kwargs["cap_drop"] == ["ALL"], kwargs
+
+    exit_code, stdout, stderr = run_container_probe(
+        client,
+        PYTHON_ALPINE_IMAGE,
+        ["python3", "-c", _PROBE],
+        environment={"PROBE_FORK_LIMIT": "700"},
+        timeout=120,
+        container_kwargs=kwargs,
+    )
+    assert exit_code == 0, f"probe crashed (exit={exit_code}); stdout={stdout!r}; stderr={stderr!r}"
+    data = json.loads(stdout.decode())
+
+    eff = decode_caps(data["caps"]["CapEff"])
+    prm = decode_caps(data["caps"]["CapPrm"])
+    bnd = decode_caps(data["caps"]["CapBnd"])
+    # (b) EXACTLY the allowlist in all three sets — every other bit cleared, incl. the
+    # 4 C5c drops AND SYS_CHROOT(18). Root under cap_drop=ALL+cap_add → Eff==Prm==Bnd.
+    for name, s in (("CapEff", eff), ("CapPrm", prm), ("CapBnd", bnd)):
+        assert s == _EXPECTED_STRICT_CAP_BITS, f"{name} != strict mask: {sorted(s)} (caps={data['caps']})"
+    # corroborate: raw socket + mknod still EPERM; pids capped at 512.
+    assert data["net_raw_errno"] == EPERM, data
+    assert data["mknod_errno"] == EPERM, data
+    assert data["pids_max"] == "512", data

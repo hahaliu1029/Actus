@@ -102,7 +102,7 @@ def test_container_create_full_golden():
         "container": {
             "capture_kind": "configured", "creation_mode": "docker_run",
             "image": "actus/sandbox:latest", "mem_limit": "4g", "run_as_user": None,
-            "read_only_rootfs": False, "cap_drop": [], "security_opt": [],
+            "read_only_rootfs": False, "cap_drop": [], "cap_add": [], "security_opt": [],
             "pids_limit": None,
             "mounts": [{"target": "/workspace/.memory", "source_kind": "memory_bind", "read_only": True}],
         },
@@ -294,7 +294,7 @@ def test_compile_applied_container_create_is_enforce_and_recomputes_hash():
     applied = ContainerRuntimePolicy(
         capture_kind="applied", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=("NET_RAW",), security_opt=(),
+        read_only_rootfs=False, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
         pids_limit=512, mounts=(),
     )
     snap = C.compile_applied_container_create(applied, _cc_input())
@@ -304,3 +304,51 @@ def test_compile_applied_container_create_is_enforce_and_recomputes_hash():
     assert snap.container.capture_kind == "applied"
     assert snap.command is None and snap.decision is None  # partition still satisfied
     assert snap.policy_hash == compute_policy_hash(snap)  # recomputed (not "")
+
+
+# ---- §4 C5d-2: strict cap_drop=ALL hardening tier --------------------------- #
+_EXPECTED_STRICT_CAP_ADD = (
+    "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
+    "SETUID", "SETGID", "SETPCAP", "SETFCAP", "KILL",
+)
+
+
+def test_runtime_policy_strict_when_both_flags_set():
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=True, strict_caps_enabled=True))
+    assert pol.cap_drop == ("ALL",)
+    assert pol.cap_add == _EXPECTED_STRICT_CAP_ADD
+    assert pol.pids_limit == 512
+
+
+def test_runtime_policy_strict_off_is_conservative_unchanged():
+    # INV-0 tier-2: hardening ON + strict OFF == C5c conservative, byte-for-byte.
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=True, strict_caps_enabled=False))
+    assert pol.cap_drop == ("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE")
+    assert pol.cap_add == ()
+    assert pol.pids_limit == 512
+
+
+def test_runtime_policy_strict_ignored_without_hardening():
+    # The view bit alone (no hardening) → unhardened. The Settings guard normally
+    # prevents this combo, but the compiler must be safe in isolation.
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=False, strict_caps_enabled=True))
+    assert pol.cap_drop == () and pol.cap_add == () and pol.pids_limit is None
+
+
+def test_runtime_policy_strict_with_nnp_adds_security_opt():
+    pol = C.compile_container_runtime_policy(_view(
+        runtime_hardening_enabled=True, strict_caps_enabled=True,
+        no_new_privileges_enabled=True))
+    assert pol.cap_drop == ("ALL",)
+    assert pol.cap_add == _EXPECTED_STRICT_CAP_ADD
+    assert pol.security_opt == ("no-new-privileges:true",)
+
+
+def test_runtime_policy_strict_external_address_still_unhardened():
+    pol = C.compile_container_runtime_policy(_view(
+        external_address=True, runtime_hardening_enabled=True, strict_caps_enabled=True))
+    assert pol.creation_mode == "external_address"
+    assert pol.cap_drop == () and pol.cap_add == ()

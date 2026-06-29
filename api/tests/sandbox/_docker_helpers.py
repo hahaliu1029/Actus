@@ -108,7 +108,7 @@ class _StubSettings(SimpleNamespace):
     AttributeError) plus the two hardening flags. Defaults mirror config.yaml.
     """
 
-    def __init__(self, *, hardening: bool, nnp: bool = False) -> None:
+    def __init__(self, *, hardening: bool, nnp: bool = False, strict: bool = False) -> None:
         super().__init__(
             sandbox_image=SANDBOX_IMAGE,
             sandbox_network="",
@@ -122,17 +122,19 @@ class _StubSettings(SimpleNamespace):
             sandbox_address="",
             sandbox_runtime_hardening_enabled=hardening,
             sandbox_no_new_privileges_enabled=nnp,
+            sandbox_strict_caps_enabled=strict,
         )
 
 
-def hardening_kwargs(*, hardening: bool, nnp: bool = False) -> dict:
+def hardening_kwargs(*, hardening: bool, nnp: bool = False, strict: bool = False) -> dict:
     """The EXACT docker-py kwargs production emits (INV-2), or {} when off.
 
     Mirrors production: `create(runtime_policy=None)` (flag off) → no hardening
     kwargs merged; `compile_runtime_policy` returns None when the flag is off,
     so we must NOT pass None to container_hardening_kwargs (codex R1#2).
     """
-    policy = compile_runtime_policy(_StubSettings(hardening=hardening, nnp=nnp))
+    policy = compile_runtime_policy(
+        _StubSettings(hardening=hardening, nnp=nnp, strict=strict))
     return container_hardening_kwargs(policy) if policy is not None else {}
 
 
