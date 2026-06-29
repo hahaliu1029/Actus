@@ -1,7 +1,10 @@
-from typing import BinaryIO, Optional, Protocol, Self
+from typing import TYPE_CHECKING, BinaryIO, Optional, Protocol, Self
 
 from app.domain.external.browser import Browser
 from app.domain.models.tool_result import ToolResult
+
+if TYPE_CHECKING:
+    from app.domain.models.sandbox_policy import ContainerRuntimePolicy
 
 
 class Sandbox(Protocol):
@@ -190,13 +193,29 @@ class Sandbox(Protocol):
         """只读属性，获取沙箱的vnc链接(远程桌面链接)"""
         ...
 
+    @property
+    def applied_runtime_policy(self) -> "ContainerRuntimePolicy | None":
+        """C5c: the applied ContainerRuntimePolicy assembled inside ``_create_task``
+        from the real docker kwargs (capture_kind='applied'). ``None`` on the
+        hardening-OFF path, the external_address path, and fakes that do not set it.
+        Callers MUST read it via ``getattr(sandbox, "applied_runtime_policy", None)``.
+        """
+        ...
+
     @classmethod
-    async def create(cls, user_id: Optional[str] = None) -> Self:
+    async def create(
+        cls, user_id: Optional[str] = None, *,
+        runtime_policy: "ContainerRuntimePolicy | None" = None,
+    ) -> Self:
         """类方法，用于快速创建一个沙箱。
 
         ``user_id`` 在 M1 引入：不传时容器只挂载基础目录（向后兼容），
         传入时实现方应同时 bind mount 该用户的 memory 目录
         （``${MEMORY_ROOT_HOST}/{user_id}`` → ``${MEMORY_ROOT_CONTAINER}/{user_id}``）。
+
+        ``runtime_policy`` 为 C5c 引入：传入（仅 hardening 开启时）令实现方把
+        compiled hardening kwargs 合并进 container_config 并构建 applied 快照；
+        不传时按旧行为创建（INV-0 byte-identical）。
         """
         ...
 

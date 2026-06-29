@@ -503,7 +503,17 @@ class SkillCreatorService:
 
             yield SkillCreationProgress(step="validating", message="正在执行沙箱验证...")
             if sandbox is None:
-                temp_sandbox = await DockerSandbox.create()
+                # C5c: harden the generated-code validation sandbox too (the more
+                # security-sensitive path — it runs LLM-generated scripts). Flag OFF
+                # → compile_runtime_policy returns None → create() byte-identical.
+                from app.application.services.sandbox_runtime_policy import (
+                    compile_runtime_policy,
+                )
+                from core.config import get_settings
+
+                temp_sandbox = await DockerSandbox.create(
+                    runtime_policy=compile_runtime_policy(get_settings()),
+                )
                 sandbox = temp_sandbox
 
             errors = await self._validate_in_sandbox(files, sandbox)

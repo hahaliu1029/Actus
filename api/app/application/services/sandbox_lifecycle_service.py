@@ -78,6 +78,7 @@ class SandboxLifecycleService:
         supervisor_registry: Optional[SupervisorRegistryPort] = None,
         sink: "PolicySnapshotSink | None" = None,        # C5a observe-only sink
         policy_snapshot_enabled: bool = False,           # C5a flag, captured ONCE (INV-0)
+        runtime_hardening_enabled: bool = False,         # C5c flag, captured ONCE (INV-0)
     ) -> None:
         self._sandbox_cls = sandbox_cls
         self._uow_factory = uow_factory
@@ -103,6 +104,9 @@ class SandboxLifecycleService:
         # the already-present `_settings` so it pays nothing; Seam A (bind_new)
         # had NO get_settings call pre-C5a, so it must NOT add one on the OFF path.
         self._policy_snapshot_enabled = policy_snapshot_enabled
+        # C5c flag captured at construction → bind_new's OFF path does ZERO extra
+        # work (one bool check; NO get_settings/compile on the OFF path → INV-0).
+        self._runtime_hardening_enabled = runtime_hardening_enabled
 
         # Single-worker runtime check (§8.6 layer 2)
         web_concurrency = os.environ.get("WEB_CONCURRENCY", "1")
@@ -307,7 +311,23 @@ class SandboxLifecycleService:
 
             # Step 2: Actually create the sandbox container
             try:
-                sandbox = await self._sandbox_cls.create(user_id=effective_user_id)
+                # C5c: ON path compiles a hardened ContainerRuntimePolicy and passes
+                # it into create(); OFF path calls create(user_id=…) EXACTLY as today
+                # (no kwarg, no get_settings) → INV-0 + fakes lacking the kwarg keep
+                # working. Compile is INSIDE this try so a (pure) compile failure rolls
+                # the binding back to UNBOUND, never strands it in CREATING.
+                if self._runtime_hardening_enabled:
+                    from app.application.services.sandbox_runtime_policy import (
+                        compile_runtime_policy,
+                    )
+                    from core.config import get_settings
+
+                    sandbox = await self._sandbox_cls.create(
+                        user_id=effective_user_id,
+                        runtime_policy=compile_runtime_policy(get_settings()),
+                    )
+                else:
+                    sandbox = await self._sandbox_cls.create(user_id=effective_user_id)
                 await sandbox.ensure_sandbox()
             except Exception:
                 # Create failed — roll back to UNBOUND
@@ -342,20 +362,25 @@ class SandboxLifecycleService:
                     user_id=effective_user_id,
                     new_binding=new_binding,
                     session=session,
+                    sandbox=sandbox,
                 )
 
             return cast(SandboxHandle, self._registry.acquire_handle(session_id))
 
     async def _observe_container_policy(
-        self, *, session_id: str, user_id: str | None, new_binding, session
+        self, *, session_id: str, user_id: str | None, new_binding, session, sandbox
     ) -> None:
-        """C5a observe-only emission (additive, best-effort).
+        """C5a/C5c container-create policy emission (additive, best-effort).
 
-        Only ever called when the flag is ON (gated by the caller). Reads
-        get_settings() LAZILY here (ON path only) for the view values — the OFF
-        path never touches config (INV-0). Swallows ALL errors so an observe
-        failure can never fail a sandbox bind. The sink is non-suspending
-        (Task 3), so this awaits without yielding.
+        Only ever called when the C5a snapshot flag is ON (gated by the caller).
+        C5c: when the hardening flag is on AND the sandbox carries an applied
+        runtime policy (a real _create_task ran), emit the honest applied/enforce
+        snapshot; otherwise (hardening off, external_address, or a fake lacking the
+        property) fall back to the C5a configured/observe_only snapshot. The
+        ``applied_runtime_policy`` read is GUARDED via getattr so the C5a observe
+        tests (FakeSandbox has no such property) keep passing. Swallows ALL errors
+        so an observe failure can never fail a sandbox bind (INV-0). Reads
+        get_settings() LAZILY (ON path only).
         """
         try:
             from app.domain.models.sandbox_policy import (
@@ -365,7 +390,7 @@ class SandboxLifecycleService:
             from app.domain.services.safety.sandbox_policy_compiler import (
                 SandboxPolicyCompiler,
             )
-            from core.config import get_settings  # lazy — reached only on the ON path (INV-0)
+            from core.config import get_settings  # lazy — reached only on the ON path
 
             inp = ContainerCreateInput(
                 session_id=session_id,
@@ -376,7 +401,16 @@ class SandboxLifecycleService:
                 depth=session.depth,
                 settings=build_settings_view(get_settings()),
             )
-            snapshot = SandboxPolicyCompiler().compile_container_create(inp)
+            compiler = SandboxPolicyCompiler()
+            applied = (
+                getattr(sandbox, "applied_runtime_policy", None)
+                if self._runtime_hardening_enabled
+                else None
+            )
+            if applied is not None:
+                snapshot = compiler.compile_applied_container_create(applied, inp)
+            else:
+                snapshot = compiler.compile_container_create(inp)
             await self._policy_sink.record(snapshot)
         except Exception as exc:  # noqa: BLE001 — observe must never fail a bind
             logger.warning(

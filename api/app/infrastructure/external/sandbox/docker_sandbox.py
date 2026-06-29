@@ -6,7 +6,7 @@ import socket
 import time
 import uuid
 from pathlib import Path
-from typing import BinaryIO, Optional, Self
+from typing import TYPE_CHECKING, BinaryIO, Optional, Self
 
 # UUID v4 / 结构化 id 白名单。user_id 会被直接拼进 bind mount 路径，
 # 必须限定为安全字符以防止 ``../`` / 绝对路径注入。
@@ -32,11 +32,18 @@ from app.domain.external.browser import Browser
 from app.domain.external.sandbox import Sandbox
 from app.domain.models.tool_result import ToolResult
 from app.infrastructure.external.browser.playwright_browser import PlaywrightBrowser
+from app.infrastructure.external.sandbox.container_hardening import (
+    build_applied_runtime_policy,
+    container_hardening_kwargs,
+)
 from async_lru import alru_cache
 from core.config import get_settings
 from docker.errors import APIError, NotFound
 from docker.models.resource import Model
 from docker.types import Mount
+
+if TYPE_CHECKING:
+    from app.domain.models.sandbox_policy import ContainerRuntimePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +52,14 @@ class DockerSandbox(Sandbox):
     """基于Docker的沙箱服务"""
 
     def __init__(
-        self, ip: Optional[str] = None, container_name: Optional[str] = None
+        self, ip: Optional[str] = None, container_name: Optional[str] = None,
+        *, applied_runtime_policy: "ContainerRuntimePolicy | None" = None,
     ) -> None:
         """构造函数，完成Docker沙箱扩展创建"""
         self.client = httpx.AsyncClient(timeout=600)
         self._ip = ip
         self._container_name = container_name
+        self._applied_runtime_policy = applied_runtime_policy  # C5c
         self._base_url = f"http://{ip}:8080"
         self._shell_ws_url = f"ws://{ip}:8080/api/shell/ws"
         self._vnc_url = f"ws://{ip}:5901"
@@ -74,6 +83,11 @@ class DockerSandbox(Sandbox):
     @property
     def shell_ws_url(self) -> str:
         return self._shell_ws_url
+
+    @property
+    def applied_runtime_policy(self) -> "ContainerRuntimePolicy | None":
+        """C5c: applied policy built in _create_task (None on OFF / external paths)."""
+        return self._applied_runtime_policy
 
     @classmethod
     @alru_cache(maxsize=128, typed=True)
@@ -164,7 +178,10 @@ class DockerSandbox(Sandbox):
             raise first_error
 
     @classmethod
-    def _create_task(cls, user_id: Optional[str] = None) -> Self:
+    def _create_task(
+        cls, user_id: Optional[str] = None, *,
+        runtime_policy: "ContainerRuntimePolicy | None" = None,
+    ) -> Self:
         """创建沙箱容器的异步任务。
 
         ``user_id`` 为 M1 引入：传入时为 sandbox 注入 read-only bind mount，
@@ -218,6 +235,19 @@ class DockerSandbox(Sandbox):
             if memory_mount is not None:
                 container_config["mounts"] = [memory_mount]
 
+            # 5c.C5c: merge the compiled hardening kwargs (ON path only). On the OFF
+            # path runtime_policy is None → container_config is untouched (INV-0
+            # byte-identical). Build the honest applied snapshot from the REAL,
+            # fully-assembled container_config BEFORE run (fail-fast → no orphan).
+            applied_runtime_policy = None
+            if runtime_policy is not None:
+                container_config.update(container_hardening_kwargs(runtime_policy))
+                applied_runtime_policy = build_applied_runtime_policy(
+                    container_config=container_config,
+                    memory_mount=memory_mount,
+                    memory_mount_target=str(settings.sandbox_memory_mount_target),
+                )
+
             # 6.调用docker客户端容器运行参数创建沙箱
             container = docker_client.containers.run(**container_config)
 
@@ -232,7 +262,10 @@ class DockerSandbox(Sandbox):
                     f"容器已创建但未获取到IP地址，容器网络: {list(networks.keys())}"
                 )
 
-            return DockerSandbox(ip=ip, container_name=container_name)
+            return DockerSandbox(
+                ip=ip, container_name=container_name,
+                applied_runtime_policy=applied_runtime_policy,
+            )
         except Exception as e:
             logger.error(f"创建Docker沙箱容器失败: {str(e)}")
             raise Exception(f"创建Docker沙箱容器失败: {str(e)}")
@@ -241,23 +274,29 @@ class DockerSandbox(Sandbox):
                 docker_client.close()
 
     @classmethod
-    async def create(cls, user_id: Optional[str] = None) -> Self:
+    async def create(
+        cls, user_id: Optional[str] = None, *,
+        runtime_policy: "ContainerRuntimePolicy | None" = None,
+    ) -> Self:
         """类方法，创建沙箱容器。
 
-        ``user_id`` 为 M1 memory 系统引入。不传时容器按旧行为启动，
-        传入时通过 bind mount 挂载该用户的 memory 目录（只读）。
+        ``user_id`` 为 M1 memory 系统引入。``runtime_policy`` 为 C5c 引入：
+        hardening 开启时由调用方编译后传入；不传时 byte-identical 旧行为 (INV-0)。
         """
         # 1.获取系统配置信息
         settings = get_settings()
 
         # 2.判断是否使用现成的沙箱
         if settings.sandbox_address:
-            # 3.将沙箱主机/地址解析成ip
+            # 3.将沙箱主机/地址解析成ip（external 模式：runtime_policy inert，
+            #   _create_task 不运行 → applied_runtime_policy 保持 None）
             ip = await cls._resolve_hostname_to_ip(settings.sandbox_address)
             return DockerSandbox(ip=ip)
 
         # 4.使用子线程创建一个容器后返回
-        return await asyncio.to_thread(cls._create_task, user_id)
+        return await asyncio.to_thread(
+            cls._create_task, user_id, runtime_policy=runtime_policy
+        )
 
     @staticmethod
     def _build_memory_mount(settings, user_id: Optional[str]) -> Optional[Mount]:

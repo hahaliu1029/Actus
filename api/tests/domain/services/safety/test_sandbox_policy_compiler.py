@@ -4,6 +4,7 @@ from app.domain.models.sandbox_policy import (
     COMPILER_VERSION,
     SCHEMA_VERSION,
     ContainerCreateInput,
+    ContainerRuntimePolicy,
     SandboxSettingsView,
     ToolCallInput,
     ValidationResultView,
@@ -252,3 +253,54 @@ def test_enforce_flip_is_in_fingerprint():
     assert snap.enforcement_mode == "enforce"
     observe_twin = snap.model_copy(update={"enforcement_mode": "observe_only"})
     assert compute_policy_hash(observe_twin) != compute_policy_hash(snap)
+
+
+# ---- §4.3 C5c: hardened runtime policy + applied enforce snapshot ---------- #
+def test_runtime_policy_unhardened_by_default():
+    pol = C.compile_container_runtime_policy(_view())  # runtime_hardening_enabled defaults False
+    assert pol.capture_kind == "configured"
+    assert pol.creation_mode == "docker_run"
+    assert pol.cap_drop == () and pol.security_opt == () and pol.pids_limit is None
+
+
+def test_runtime_policy_hardened_when_flag_set():
+    pol = C.compile_container_runtime_policy(_view(runtime_hardening_enabled=True))
+    assert pol.cap_drop == ("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE")
+    assert pol.pids_limit == 512
+    assert pol.security_opt == ()  # no_new_privileges off → empty
+
+
+def test_runtime_policy_no_new_privileges_opt_in():
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=True, no_new_privileges_enabled=True))
+    assert pol.security_opt == ("no-new-privileges:true",)
+
+
+def test_runtime_policy_external_address_is_unhardened():
+    pol = C.compile_container_runtime_policy(
+        _view(external_address=True, runtime_hardening_enabled=True))
+    assert pol.creation_mode == "external_address"
+    assert pol.cap_drop == () and pol.pids_limit is None and pol.security_opt == ()
+
+
+def test_compile_container_create_reflects_hardening_in_container():
+    snap = C.compile_container_create(_cc_input(settings=_view(runtime_hardening_enabled=True)))
+    assert snap.enforcement_mode == "observe_only"  # compile_container_create stays observe
+    assert snap.container.cap_drop == ("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE")
+    assert snap.container.pids_limit == 512
+
+
+def test_compile_applied_container_create_is_enforce_and_recomputes_hash():
+    applied = ContainerRuntimePolicy(
+        capture_kind="applied", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
+        read_only_rootfs=False, cap_drop=("NET_RAW",), security_opt=(),
+        pids_limit=512, mounts=(),
+    )
+    snap = C.compile_applied_container_create(applied, _cc_input())
+    assert snap.surface == "container_create"
+    assert snap.enforcement_mode == "enforce"
+    assert snap.container is applied
+    assert snap.container.capture_kind == "applied"
+    assert snap.command is None and snap.decision is None  # partition still satisfied
+    assert snap.policy_hash == compute_policy_hash(snap)  # recomputed (not "")

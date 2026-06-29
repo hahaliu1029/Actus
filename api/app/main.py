@@ -440,6 +440,7 @@ async def lifespan(app: FastAPI):
             supervisor_registry=supervisor_registry,
             sink=get_policy_snapshot_sink(),  # C5a: Logging sink when flag ON, else Noop
             policy_snapshot_enabled=get_settings().sandbox_policy_compiler_enabled,  # C5a Seam A gate (read once)
+            runtime_hardening_enabled=get_settings().sandbox_runtime_hardening_enabled,  # C5c gate (read once)
         )
         app.state.sandbox_lifecycle_service = sandbox_lifecycle_service
         # Fill the forward reference now that lifecycle service is live.

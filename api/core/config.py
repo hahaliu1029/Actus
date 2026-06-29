@@ -139,6 +139,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    # C5c Sandbox Runtime Hardening — policy-driven container_config + applied
+    # snapshot. Default OFF: when OFF, both production create() paths call
+    # create(runtime_policy=None) → byte-identical container_config (INV-0). The
+    # field name itself MUST be an alias (else Settings(...=True) is ignored).
+    sandbox_runtime_hardening_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_runtime_hardening_enabled",
+            "SANDBOX_RUNTIME_HARDENING_ENABLED",
+            "ACTUS_C5_SANDBOX_RUNTIME_HARDENING_ENABLED",
+        ),
+    )
+    # C5c: SEPARATE opt-in for no-new-privileges. OFF even when hardening is on
+    # because it breaks the sandbox's by-design sudo / runtime installs (INV-6).
+    sandbox_no_new_privileges_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_no_new_privileges_enabled",
+            "SANDBOX_NO_NEW_PRIVILEGES_ENABLED",
+            "ACTUS_C5_SANDBOX_NO_NEW_PRIVILEGES_ENABLED",
+        ),
+    )
+
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 

@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 SCHEMA_VERSION = "c5.sandbox_policy.v1"
-COMPILER_VERSION = "c5a.1"  # bump on any mapping change
+COMPILER_VERSION = "c5c.1"  # bump on any mapping change (C5c: container hash + capture_kind)
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
@@ -92,7 +92,7 @@ class MountView(BaseModel):  # sanitized mount descriptor (no host source path)
 
 class ContainerRuntimePolicy(BaseModel):  # container_create only
     model_config = _FROZEN
-    capture_kind: Literal["configured"]  # "applied" reserved for C5c
+    capture_kind: Literal["configured", "applied"]  # "applied" = real _create_task kwargs (C5c)
     creation_mode: Literal["docker_run", "external_address"]
     image: str | None
     mem_limit: str | None
@@ -120,6 +120,11 @@ class SandboxSettingsView(BaseModel):
     memory_mount_enabled: bool
     relative_path_anchor: str = "/home/ubuntu"
     service_install_dir: str = "/sandbox"
+    # C5c: hardening posture bits (default False → INV-0 unhardened). build_settings_view
+    # fills these from the two new Settings flags; the compiler hardens the docker_run
+    # container iff runtime_hardening_enabled is set.
+    runtime_hardening_enabled: bool = False
+    no_new_privileges_enabled: bool = False
 
 
 class ValidationResultView(BaseModel):  # 3-field projection of the real ValidationResult
@@ -233,7 +238,20 @@ def compute_policy_hash(snapshot: SandboxPolicySnapshot) -> str:
             "surface": True,
             "filesystem": True,
             "network": True,
-            "container": True,
+            # C5c: nested include EXCLUDING mounts (per-bind-volatile → INV-2). A
+            # tool_call snapshot's container is None → still serializes as null, so
+            # tool_call fingerprints are unchanged.
+            "container": {
+                "capture_kind",
+                "creation_mode",
+                "image",
+                "mem_limit",
+                "run_as_user",
+                "read_only_rootfs",
+                "cap_drop",
+                "security_opt",
+                "pids_limit",
+            },
             "command": {"validator", "max_command_bytes", "blocked_validation_codes"},
         },
     )
@@ -264,4 +282,8 @@ def build_settings_view(settings) -> SandboxSettingsView:
         no_proxy_digest=sha256_hexdigest(no_proxy) if no_proxy else None,
         memory_mount_target=settings.sandbox_memory_mount_target,
         memory_mount_enabled=settings.sandbox_memory_mount_enabled,
+        # C5c: defensive getattr (mirrors sandbox_no_proxy above) so legacy/test
+        # Settings namespaces lacking the flags fall back to the unhardened default.
+        runtime_hardening_enabled=getattr(settings, "sandbox_runtime_hardening_enabled", False),
+        no_new_privileges_enabled=getattr(settings, "sandbox_no_new_privileges_enabled", False),
     )

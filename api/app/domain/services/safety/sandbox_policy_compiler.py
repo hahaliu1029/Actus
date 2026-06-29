@@ -29,6 +29,16 @@ from app.domain.services.safety.command_policy_evaluator import (
     evaluate_command,
 )
 
+# ── C5c conservative hardening baseline (spec §4.2; each cap justified §0.6) ── #
+# cap_drop: raw sockets / device-node creation / audit writes / privileged-port
+# bind — none used by the workload (Chrome runs --no-sandbox; ports all > 1024).
+# NOT cap_drop=["ALL"] (that needs add-back → C5d). pids_limit: fork/thread guard
+# above steady-state (Chrome + supervisord minprocs=200). no-new-privileges is a
+# SEPARATE opt-in (breaks sudo) → only added when its own flag is on.
+_BASELINE_CAP_DROP: tuple[str, ...] = ("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE")
+_BASELINE_PIDS_LIMIT: int = 512
+_NO_NEW_PRIVILEGES_OPT: str = "no-new-privileges:true"
+
 
 def _egress_mode(s: SandboxSettingsView) -> str:
     # R3#3: only the exact string "none" disables egress; None/unset omits the
@@ -70,29 +80,49 @@ class SandboxPolicyCompiler:
     snapshot's enforcement_mode is "enforce" for tool_call (C5b), "observe_only"
     for container_create."""
 
-    def compile_container_create(self, inp: ContainerCreateInput) -> SandboxPolicySnapshot:
-        s = inp.settings
+    def compile_container_runtime_policy(
+        self, s: SandboxSettingsView
+    ) -> ContainerRuntimePolicy:
+        """C5c: the INTENDED ContainerRuntimePolicy (capture_kind='configured').
+        Pure. docker_run is hardened iff s.runtime_hardening_enabled;
+        external_address is always unhardened (no container to harden)."""
         if s.external_address:
-            # R4#1: external/pre-existing sandbox — orchestrator never built a
-            # container_config, so image/mem/cap/mounts are UNKNOWN → None/[].
-            container = ContainerRuntimePolicy(
+            return ContainerRuntimePolicy(
                 capture_kind="configured", creation_mode="external_address",
                 image=None, mem_limit=None, run_as_user=None,
-                read_only_rootfs=False, cap_drop=[], security_opt=[],
-                pids_limit=None, mounts=[],
+                read_only_rootfs=False, cap_drop=(), security_opt=(),
+                pids_limit=None, mounts=(),
             )
+        mounts = (
+            (MountView(target=s.memory_mount_target, source_kind="memory_bind",
+                       read_only=True),)
+            if s.memory_mount_enabled else ()
+        )
+        if s.runtime_hardening_enabled:
+            cap_drop = _BASELINE_CAP_DROP
+            security_opt = (
+                (_NO_NEW_PRIVILEGES_OPT,) if s.no_new_privileges_enabled else ()
+            )
+            pids_limit = _BASELINE_PIDS_LIMIT
         else:
-            mounts = (
-                [MountView(target=s.memory_mount_target, source_kind="memory_bind",
-                           read_only=True)]
-                if s.memory_mount_enabled else []
-            )
-            container = ContainerRuntimePolicy(
-                capture_kind="configured", creation_mode="docker_run",
-                image=s.image, mem_limit=s.mem_limit, run_as_user=None,
-                read_only_rootfs=False, cap_drop=[], security_opt=[],
-                pids_limit=None, mounts=mounts,
-            )
+            cap_drop = ()
+            security_opt = ()
+            pids_limit = None
+        return ContainerRuntimePolicy(
+            capture_kind="configured", creation_mode="docker_run",
+            image=s.image, mem_limit=s.mem_limit, run_as_user=None,
+            read_only_rootfs=False, cap_drop=cap_drop, security_opt=security_opt,
+            pids_limit=pids_limit, mounts=mounts,
+        )
+
+    def _container_create_snapshot(
+        self, *, inp: ContainerCreateInput, container: ContainerRuntimePolicy,
+        enforcement_mode: str,
+    ) -> SandboxPolicySnapshot:
+        """Shared assembly for the configured (observe_only) and applied (enforce)
+        container_create snapshots — identical subject/provenance/filesystem/network,
+        differing only in container + enforcement_mode. Recomputes policy_hash."""
+        s = inp.settings
         subject = PolicySubject(
             session_id=inp.session_id, sandbox_id=inp.sandbox_id,
             sandbox_generation=inp.sandbox_generation,
@@ -104,12 +134,29 @@ class SandboxPolicyCompiler:
         )
         snap = SandboxPolicySnapshot(
             schema_version=SCHEMA_VERSION, policy_hash="",
-            enforcement_mode="observe_only", surface="container_create",
+            enforcement_mode=enforcement_mode, surface="container_create",
             subject=subject, provenance=provenance, decision=None,
             filesystem=_filesystem(s), command=None, network=_network(s),
             container=container,
         )
         return snap.model_copy(update={"policy_hash": compute_policy_hash(snap)})
+
+    def compile_container_create(self, inp: ContainerCreateInput) -> SandboxPolicySnapshot:
+        return self._container_create_snapshot(
+            inp=inp,
+            container=self.compile_container_runtime_policy(inp.settings),
+            enforcement_mode="observe_only",
+        )
+
+    def compile_applied_container_create(
+        self, applied: ContainerRuntimePolicy, inp: ContainerCreateInput
+    ) -> SandboxPolicySnapshot:
+        """C5c: assemble the enforce snapshot from the APPLIED policy (real kwargs,
+        capture_kind='applied' set by _create_task). Reuses subject/provenance/
+        filesystem/network from inp; container = the applied policy verbatim."""
+        return self._container_create_snapshot(
+            inp=inp, container=applied, enforcement_mode="enforce",
+        )
 
     def compile_tool_call(self, inp: ToolCallInput) -> SandboxPolicySnapshot:
         s = inp.settings

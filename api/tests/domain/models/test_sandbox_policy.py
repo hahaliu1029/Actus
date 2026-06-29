@@ -312,3 +312,74 @@ def test_settings_hash_is_deterministic_hex():
     v = build_settings_view(_FakeSettings())
     assert compute_settings_hash(v) == compute_settings_hash(v)
     assert len(compute_settings_hash(v)) == 64
+
+
+# ---- C5c: container hash excludes per-bind mounts (INV-2) ------------------ #
+def _container_hardened(**over) -> ContainerRuntimePolicy:
+    base = dict(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
+        read_only_rootfs=False, cap_drop=[], security_opt=[], pids_limit=None,
+        mounts=[MountView(target="/workspace/.memory", source_kind="memory_bind", read_only=True)],
+    )
+    base.update(over)
+    return ContainerRuntimePolicy(**base)
+
+
+def test_container_hash_same_when_only_mounts_differ():
+    # Same static rule-set, different per-bind mount → SAME hash (mounts excluded).
+    a = _container_snapshot(container=_container_hardened())          # has a mount
+    b = _container_snapshot(container=_container_hardened(mounts=[]))  # no mount
+    assert compute_policy_hash(a) == compute_policy_hash(b)
+
+
+def test_container_hash_differs_when_cap_drop_changes():
+    a = _container_snapshot(container=_container_hardened(cap_drop=[]))
+    b = _container_snapshot(container=_container_hardened(cap_drop=["NET_RAW"]))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
+def test_container_hash_differs_when_pids_limit_changes():
+    a = _container_snapshot(container=_container_hardened(pids_limit=None))
+    b = _container_snapshot(container=_container_hardened(pids_limit=512))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
+def test_tool_call_none_container_serializes_as_null_under_nested_include():
+    # CHARACTERIZATION / PIN test (not a RED driver): pure Pydantic behavior, GREEN
+    # before AND after the source change. It locks the venv claim that C5c's container
+    # include switch (True → nested-set) leaves tool_call (container None) fingerprints
+    # unchanged — Pydantic model_dump(include=) on a None nested-include field emits
+    # "container": null, not omitted.
+    snap = _tool_call_snapshot()  # container is None
+    true_dump = snap.model_dump(mode="json", include={"container": True})
+    nested_dump = snap.model_dump(mode="json", include={
+        "container": {
+            "capture_kind", "creation_mode", "image", "mem_limit", "run_as_user",
+            "read_only_rootfs", "cap_drop", "security_opt", "pids_limit",
+        },
+    })
+    assert true_dump == nested_dump == {"container": None}
+
+
+def test_capture_kind_applied_accepted():
+    snap = _container_snapshot(container=_container_hardened(capture_kind="applied"))
+    assert snap.container.capture_kind == "applied"
+
+
+# ---- C5c: build_settings_view reads the two hardening flags ---------------- #
+def test_build_settings_view_hardening_flags_default_false():
+    # _FakeSettings (defined above) lacks the new attrs → getattr defaults to False.
+    view = build_settings_view(_FakeSettings())
+    assert view.runtime_hardening_enabled is False
+    assert view.no_new_privileges_enabled is False
+
+
+def test_build_settings_view_reads_hardening_flags_when_present():
+    class _S(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = True
+
+    view = build_settings_view(_S())
+    assert view.runtime_hardening_enabled is True
+    assert view.no_new_privileges_enabled is True
