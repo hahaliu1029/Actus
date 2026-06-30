@@ -355,6 +355,14 @@ def test_container_hash_differs_when_run_as_user_changes():
     assert compute_policy_hash(a) != compute_policy_hash(b)
 
 
+def test_container_hash_differs_when_read_only_rootfs_changes():
+    # read_only_rootfs IS a static rule-set field (already in the container hash-include, line 259)
+    # → writable-rootfs vs read-only profiles fingerprint differently (INV-2).
+    a = _container_snapshot(container=_container_hardened(read_only_rootfs=False))
+    b = _container_snapshot(container=_container_hardened(read_only_rootfs=True))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
 def test_container_hash_same_when_cap_add_equal():
     a = _container_snapshot(container=_container_hardened(cap_add=["CHOWN", "SETUID"]))
     b = _container_snapshot(container=_container_hardened(cap_add=["CHOWN", "SETUID"]))
@@ -434,6 +442,26 @@ def test_build_settings_view_reads_run_as_user_flag_and_shifts_hash():
     off = build_settings_view(_HardenedRunAsUserOff())
     on = build_settings_view(_HardenedRunAsUserOn())
     assert off.run_as_user_enabled is False and on.run_as_user_enabled is True
+    assert compute_settings_hash(on) != compute_settings_hash(off)
+
+
+def test_build_settings_view_reads_read_only_rootfs_flag_and_shifts_hash():
+    # _FakeSettings lacks the attr → getattr defaults False.
+    assert build_settings_view(_FakeSettings()).read_only_rootfs_enabled is False
+
+    # Isolate the hash shift to read_only_rootfs ONLY: hold hardening ON in BOTH views so the sole
+    # difference is read_only_rootfs_enabled.
+    class _HardenedReadOnlyOff(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_read_only_rootfs_enabled = False
+
+    class _HardenedReadOnlyOn(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_read_only_rootfs_enabled = True
+
+    off = build_settings_view(_HardenedReadOnlyOff())
+    on = build_settings_view(_HardenedReadOnlyOn())
+    assert off.read_only_rootfs_enabled is False and on.read_only_rootfs_enabled is True
     assert compute_settings_hash(on) != compute_settings_hash(off)
 
 

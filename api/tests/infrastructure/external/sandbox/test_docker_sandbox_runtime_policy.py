@@ -424,3 +424,105 @@ def test_strict_plus_run_as_user_through_create_path(captured_kwargs, monkeypatc
     ]
     assert sandbox.applied_runtime_policy.run_as_user == "1000:1000"
     assert sandbox.applied_runtime_policy.cap_drop == ("ALL",)
+
+
+# ---- C5d-4: read-only rootfs → /home/ubuntu anon-volume append -------------- #
+def _readonly_conservative() -> ContainerRuntimePolicy:
+    # read_only tier ON, run_as_user OFF (isolates the volume-append concern; the full
+    # read_only × non-root compose is the §9① smoke). user=None → validator's root-default boot.
+    return ContainerRuntimePolicy(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
+        read_only_rootfs=True,
+        cap_drop=("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"),
+        cap_add=(), security_opt=(), pids_limit=512, mounts=(),
+    )
+
+
+def test_read_only_policy_appends_anon_volume_memory_absent(captured_kwargs, monkeypatch):
+    # skill_creator path (no user_id → no memory mount): mounts == [the /home/ubuntu anon volume].
+    from app.infrastructure.external.sandbox.container_hardening import _READONLY_WORKSPACE_TARGET
+    _patch_settings(monkeypatch)  # memory_mount_enabled=False → deterministic
+    DockerSandbox._create_task(user_id=None, runtime_policy=_readonly_conservative())
+    assert captured_kwargs["read_only"] is True
+    assert captured_kwargs["tmpfs"] == {"/tmp": "rw,exec,nosuid,nodev,size=512m"}
+    mounts = captured_kwargs["mounts"]
+    assert len(mounts) == 1
+    vol = mounts[0]  # docker-py Mount IS a dict
+    assert vol["Target"] == _READONLY_WORKSPACE_TARGET == "/home/ubuntu"
+    assert vol["Type"] == "volume"
+    assert vol["Source"] is None
+    assert vol["ReadOnly"] is False
+
+
+def test_read_only_policy_appends_anon_volume_after_memory_mount(captured_kwargs, monkeypatch, tmp_path):
+    # agent path (mountable user_id → memory :ro bind present): mounts == [memory_bind,
+    # /home/ubuntu volume] — setdefault APPENDS, never clobbers the memory mount.
+    host_root = tmp_path / "host"
+    cont_root = tmp_path / "cont"
+    host_root.mkdir()
+    cont_root.mkdir()
+    _patch_settings(
+        monkeypatch, sandbox_memory_mount_enabled=True,
+        memory_root_host=str(host_root), memory_root_container=str(cont_root),
+    )
+    DockerSandbox._create_task(user_id="u1", runtime_policy=_readonly_conservative())
+    mounts = captured_kwargs["mounts"]
+    assert [m["Target"] for m in mounts] == ["/workspace/.memory", "/home/ubuntu"]
+    mem, vol = mounts
+    assert mem["Type"] == "bind" and mem["ReadOnly"] is True
+    assert vol["Type"] == "volume" and vol["Source"] is None and vol["ReadOnly"] is False
+
+
+def test_read_only_off_appends_no_volume_and_no_read_only_keys(captured_kwargs, monkeypatch):
+    # INV-0: a conservative (read_only OFF) policy adds NO read_only / tmpfs / volume.
+    _patch_settings(monkeypatch)
+    DockerSandbox._create_task(user_id=None, runtime_policy=_hardened())
+    assert "read_only" not in captured_kwargs
+    assert "tmpfs" not in captured_kwargs
+    assert "mounts" not in captured_kwargs
+
+
+def test_create_task_rejects_forged_system_tmpfs_with_typed_error(captured_kwargs, monkeypatch):
+    # A forged config carrying a system-path tmpfs → the validator rejects it with the typed
+    # SandboxHardeningConfigError BEFORE containers.run (not re-wrapped by the broad except). The
+    # model field read_only_rootfs is a bool (cannot encode a bad tmpfs), so forge by monkeypatching
+    # the translator to emit a /usr tmpfs — this proves INV-8 fail-closes the create path.
+    from app.infrastructure.external.sandbox.container_hardening import (
+        SandboxHardeningConfigError,
+    )
+    from app.infrastructure.external.sandbox import docker_sandbox as ds_mod
+    _patch_settings(monkeypatch)
+    monkeypatch.setattr(
+        ds_mod, "container_hardening_kwargs",
+        lambda policy: {"read_only": True, "tmpfs": {"/usr": "rw"}},
+    )
+    with pytest.raises(SandboxHardeningConfigError):
+        DockerSandbox._create_task(user_id=None, runtime_policy=_readonly_conservative())
+
+
+def test_read_only_rootfs_off_helper_emits_no_read_only_or_tmpfs():
+    # Surface ②(a) / INV-0: hardening ON + read_only OFF → the production helper emits the C5d-3
+    # conservative kwargs and NOTHING read-only (pins INV-0; a stray unconditional emission breaks it).
+    from tests.sandbox._docker_helpers import hardening_kwargs
+    kw = hardening_kwargs(hardening=True, read_only_rootfs=False)
+    assert "read_only" not in kw and "tmpfs" not in kw
+    assert set(kw) == {"cap_drop", "pids_limit"}
+
+
+def test_read_only_rootfs_on_helper_emits_read_only_and_tmpfs():
+    # Surface ②(b): hardening ON + read_only ON → read_only=True + the vetted /tmp tmpfs, with the
+    # conservative caps unchanged. This pins the EXACT kwargs the §9① smoke boots the real image with.
+    from tests.sandbox._docker_helpers import hardening_kwargs
+    kw = hardening_kwargs(hardening=True, read_only_rootfs=True)
+    assert kw["read_only"] is True
+    assert kw["tmpfs"] == {"/tmp": "rw,exec,nosuid,nodev,size=512m"}
+    assert kw["cap_drop"] == ["NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"]
+    assert kw["pids_limit"] == 512
+    # and the validator accepts that vetted tmpfs but rejects a forged system-path one.
+    from app.infrastructure.external.sandbox.container_hardening import (
+        SandboxHardeningConfigError, validate_hardening_config,
+    )
+    validate_hardening_config({**kw})  # vetted → no raise
+    with pytest.raises(SandboxHardeningConfigError):
+        validate_hardening_config({"read_only": True, "tmpfs": {"/usr": "rw"}})

@@ -17,6 +17,12 @@ RUN groupadd -g 1000 ubuntu && \
     useradd -u 1000 -g 1000 -m -d /home/ubuntu -s /bin/bash ubuntu && \
     echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
 
+# 5a.C5d-4: pre-create the memory :ro bind mountpoint so it composes under a read-only rootfs
+# (runc cannot create a missing bind-mount target dir on a read-only rootfs). Flag-independent +
+# inert when read_only is OFF (the dir simply pre-exists; the writable-rootfs path is unaffected).
+# No chown — a :ro bind needs no ownership change; the dir is a mountpoint, not written.
+RUN mkdir -p /workspace/.memory
+
 # 6.安装Python 3.10版本(非uv)
 RUN apt-get update && \
     apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip && \

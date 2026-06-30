@@ -111,3 +111,38 @@ def test_run_as_user_constant_is_in_vetted_set():
     # spec §5: EXACTLY one vetted identity (R5 P3) — pin the WHOLE set, not just membership, so a
     # future over-broadening of _VETTED_RUN_AS_USER (e.g. adding "1000:0") fails this gate.
     assert _VETTED_RUN_AS_USER == frozenset({_RUN_AS_USER})
+
+
+def test_no_free_form_read_only_rootfs_settings():
+    # INV-4 (C5d-4): read-only is a vetted BOOLEAN tier, NOT a raw operator knob; the carve-out
+    # paths are vetted infra constants, never Settings.
+    s = Settings(env="test")
+    for forbidden in (
+        "sandbox_read_only_rootfs",      # the bool flag is sandbox_read_only_rootfs_ENABLED only
+        "sandbox_tmpfs",
+        "sandbox_tmpfs_size",
+        "sandbox_read_only_carve_out",
+        "sandbox_writable_paths",
+    ):
+        assert not hasattr(s, forbidden), (
+            f"INV-4 footgun: free-form {forbidden} must not exist on Settings"
+        )
+
+
+def test_read_only_carve_out_literals_are_consistent():
+    # INV-4: the translator emit constants and the validator permit literals must stay consistent
+    # (a SEPARATE-literal two-place edit, mirroring _RUN_AS_USER ∈ _VETTED_RUN_AS_USER). Pin the
+    # WHOLE vetted set so a future over-broadening (e.g. adding "/usr") fails this gate.
+    from app.infrastructure.external.sandbox.container_hardening import (
+        _READONLY_TMPFS,
+        _READONLY_WORKSPACE_TARGET,
+        _VETTED_READONLY_TMPFS_OPTIONS,
+        _VETTED_READONLY_TMPFS_TARGETS,
+        _VETTED_READONLY_WORKSPACE_TARGET,
+    )
+
+    assert set(_READONLY_TMPFS) == {"/tmp"}
+    assert _VETTED_READONLY_TMPFS_TARGETS == frozenset(_READONLY_TMPFS)
+    assert _VETTED_READONLY_TMPFS_TARGETS == frozenset({"/tmp"})
+    assert _READONLY_WORKSPACE_TARGET == _VETTED_READONLY_WORKSPACE_TARGET == "/home/ubuntu"
+    assert _VETTED_READONLY_TMPFS_OPTIONS == _READONLY_TMPFS["/tmp"]

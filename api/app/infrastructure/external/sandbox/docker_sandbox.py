@@ -33,6 +33,7 @@ from app.domain.external.sandbox import Sandbox
 from app.domain.models.tool_result import ToolResult
 from app.infrastructure.external.browser.playwright_browser import PlaywrightBrowser
 from app.infrastructure.external.sandbox.container_hardening import (
+    _READONLY_WORKSPACE_TARGET,
     build_applied_runtime_policy,
     container_hardening_kwargs,
     SandboxHardeningConfigError,
@@ -244,6 +245,23 @@ class DockerSandbox(Sandbox):
             applied_runtime_policy = None
             if runtime_policy is not None:
                 container_config.update(container_hardening_kwargs(runtime_policy))
+                if runtime_policy.read_only_rootfs:
+                    # C5d-4: the /home/ubuntu writable workspace = an ANONYMOUS Docker volume
+                    # (source=None, type=volume). Appended here (not in the translator) because a
+                    # volume must go through the docker-py `mounts` list, not the flat kwarg dict.
+                    # setdefault handles BOTH paths: memory-present (agent → [memory_mount] →
+                    # [memory_mount, vol]) and memory-absent (skill_creator → [] → [vol]). The
+                    # volume inherits the image 1000:1000 ownership so the C5d-3 non-root uid
+                    # writes it with no uid= option; --rm auto-removes it. Runs BEFORE validate so
+                    # the validator (C5d-4) sees the full read_only+tmpfs+mounts config.
+                    container_config.setdefault("mounts", []).append(
+                        Mount(
+                            target=_READONLY_WORKSPACE_TARGET,
+                            source=None,
+                            type="volume",
+                            read_only=False,
+                        )
+                    )
                 # C5d-2: fail-closed pre-run guard over the REAL merged kwargs. Raises
                 # SandboxHardeningConfigError (→ no container) on escape-enabling config.
                 # Only runs on the hardened path → OFF path byte-identical (INV-0).

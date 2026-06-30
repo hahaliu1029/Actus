@@ -10,13 +10,29 @@ from __future__ import annotations
 from app.domain.models.sandbox_policy import ContainerRuntimePolicy, MountView
 
 
+# ── C5d-4 read-only-rootfs writable carve-out (spec §4.2) ──────────────────── #
+# The ONLY paths made writable under read_only=True. `exec` because chrome/build steps exec
+# from /tmp; nosuid+nodev defense-in-depth (NNP also blocks suid escalation); bounded size
+# caps RAM. A writable SYSTEM path here would be an escape vector (binary replacement under a
+# read-only rootfs) → the validator (validate_hardening_config) confines the tmpfs keys to
+# _VETTED_READONLY_TMPFS_TARGETS (a SEPARATE literal).
+_READONLY_TMPFS: dict[str, str] = {"/tmp": "rw,exec,nosuid,nodev,size=512m"}
+# The agent workspace + chrome profile + caches. An ANONYMOUS Docker volume (source=None), NOT a
+# tmpfs: disk-backed (no mem_limit cost) + inherits the image's 1000:1000 ownership (Dockerfile
+# useradd -u 1000) so the C5d-3 non-root uid writes it with no uid= option; --rm auto-removes it.
+# Added in _create_task (docker_sandbox.py) because a volume must go through the `mounts` list,
+# not the translator's flat kwarg dict.
+_READONLY_WORKSPACE_TARGET: str = "/home/ubuntu"
+
+
 def container_hardening_kwargs(policy: ContainerRuntimePolicy) -> dict:
     """Render ONLY the hardening kwargs docker-py consumes (cap_drop/cap_add/
     security_opt as list[str], pids_limit as int). Empty/None fields are OMITTED → an
     unhardened policy → {} (INV-0); an empty cap_add (conservative profile) is omitted so
     the ON-conservative container_config stays byte-identical to C5c (INV-0 tier-2).
     run_as_user is emitted as docker-py `user=` when set (C5d-3, omit-when-None → INV-0);
-    read_only_rootfs is still intentionally NOT emitted (hardcoded False → C5d-4)."""
+    read_only_rootfs is emitted as docker-py read_only=True + the /tmp tmpfs when set (C5d-4,
+    omit-both-when-False → INV-0); the /home/ubuntu writable volume is added in _create_task."""
     kwargs: dict = {}
     if policy.cap_drop:
         kwargs["cap_drop"] = list(policy.cap_drop)
@@ -32,6 +48,13 @@ def container_hardening_kwargs(policy: ContainerRuntimePolicy) -> dict:
         # non-root downgrade). `is not None` emits user="" so the validator rejects it
         # fail-closed. The compiler only ever produces None or "1000:1000" — defense-in-depth.
         kwargs["user"] = policy.run_as_user
+    if policy.read_only_rootfs:
+        # `bool` field, so a plain truthy check is correct (no empty-string footgun like
+        # run_as_user). docker-py maps read_only=True → HostConfig.ReadonlyRootfs and
+        # tmpfs={path: opts} → HostConfig.Tmpfs. Fresh dict copy — never share the module
+        # constant (a caller mutation of container_config["tmpfs"] must not corrupt it).
+        kwargs["read_only"] = True
+        kwargs["tmpfs"] = dict(_READONLY_TMPFS)
     return kwargs
 
 
@@ -59,6 +82,19 @@ _VETTED_SECURITY_OPTS: frozenset[str] = frozenset({"no-new-privileges:true"})
 # No numeric parser (a parser is easier to over-broaden); add parsing only if multiple vetted
 # identities ever exist.
 _VETTED_RUN_AS_USER: frozenset[str] = frozenset({"1000:1000"})
+# ── C5d-4 read-only-rootfs carve-out confinement (spec §5) ─────────────────── #
+# The ONLY paths the read-only-rootfs carve-out may make writable. SEPARATE literals (NOT imported
+# from the translator's _READONLY_TMPFS / _READONLY_WORKSPACE_TARGET) so widening needs a reviewed
+# two-place edit. A writable SYSTEM path (e.g. /usr) under read_only=True = binary-replacement
+# escape → deny-by-default.
+_VETTED_READONLY_TMPFS_TARGETS: frozenset[str] = frozenset({"/tmp"})
+_VETTED_READONLY_WORKSPACE_TARGET: str = "/home/ubuntu"   # the one writable volume target
+# R2 P2-1/P2-2 (final audit): validate the carve-out by EXACT match, not necessary-conditions.
+# A forged tmpfs keeping the /tmp key but stripping nosuid/nodev (suid/dev escalation) or unbounding
+# size, or a forged anonymous-volume Mount carrying extra docker-py keys (VolumeOptions.DriverConfig
+# → host bind-mount escape; NoCopy → breaks uid-1000 ownership), must fail closed.
+_VETTED_READONLY_TMPFS_OPTIONS: str = "rw,exec,nosuid,nodev,size=512m"
+_VETTED_READONLY_MOUNT_KEYS: frozenset[str] = frozenset({"Target", "Source", "Type", "ReadOnly"})
 
 
 class SandboxHardeningConfigError(ValueError):
@@ -115,6 +151,68 @@ def validate_hardening_config(container_config: dict) -> None:
         raise SandboxHardeningConfigError(
             f"user outside vetted non-root identity (must be one of "
             f"{sorted(_VETTED_RUN_AS_USER)}): {user!r}")
+    if container_config.get("read_only"):
+        # C5d-4 (spec §5 / INV-8): under a read-only rootfs the writable carve-out is the only
+        # escape surface — a writable tmpfs OR volume over a SYSTEM path lets an attacker replace a
+        # binary the root services exec. Confine ALL THREE surfaces deny-by-default (tmpfs + mounts
+        # + volumes/volumes_from). Gated on read_only (without it the rootfs is writable anyway → a
+        # carve-out adds no new escape → INV-0-safe).
+        tmpfs = container_config.get("tmpfs")
+        if tmpfs is not None:
+            if not isinstance(tmpfs, dict):
+                # a scalar would iterate as characters and bypass the membership loop → fail closed.
+                raise SandboxHardeningConfigError(
+                    f"tmpfs must be a dict, got {type(tmpfs).__name__}")
+            bad = [t for t in tmpfs if t not in _VETTED_READONLY_TMPFS_TARGETS]
+            if bad:
+                raise SandboxHardeningConfigError(
+                    f"tmpfs outside vetted read-only carve-out "
+                    f"(must be one of {sorted(_VETTED_READONLY_TMPFS_TARGETS)}): {bad}")
+            bad_opts = {t: tmpfs[t] for t in tmpfs if tmpfs[t] != _VETTED_READONLY_TMPFS_OPTIONS}
+            if bad_opts:
+                raise SandboxHardeningConfigError(
+                    f"tmpfs options outside vetted read-only carve-out "
+                    f"(must be {_VETTED_READONLY_TMPFS_OPTIONS!r}): {bad_opts}")
+        for m in container_config.get("mounts", []) or []:  # docker-py Mount = dict: Target/Type/ReadOnly/Source
+            read_only = m.get("ReadOnly", False)
+            if read_only is True:  # a genuine read-only bind (the memory :ro mount) — not a write surface
+                continue
+            if read_only not in (False, None):
+                # R3 P3 defense-in-depth: a plain `if m.get("ReadOnly")` would treat a truthy NON-bool
+                # (e.g. the string "false") as read-only/exempt → a writable mount could slip the
+                # confinement. Fail closed on a malformed ReadOnly shape (mirrors this file's
+                # _str_list / isinstance(user) shape-checks). Prod always sets a real bool.
+                raise SandboxHardeningConfigError(
+                    f"mount ReadOnly must be a bool, got {read_only!r} (target={m.get('Target')!r})")
+            extra = set(m) - _VETTED_READONLY_MOUNT_KEYS
+            if extra:
+                # R2 P2-2: the vetted anonymous volume is EXACTLY {Target,Source,Type,ReadOnly};
+                # extra docker-py Mount keys (VolumeOptions.DriverConfig → host bind-mount escape,
+                # NoCopy → breaks uid-1000 ownership) must not ride through the carve-out. Fail closed.
+                raise SandboxHardeningConfigError(
+                    f"writable mount carries non-vetted keys {sorted(extra)} (the carve-out volume "
+                    f"must be EXACTLY {sorted(_VETTED_READONLY_MOUNT_KEYS)}): target={m.get('Target')!r}")
+            if not (
+                m.get("Type") == "volume"
+                and m.get("Target") == _VETTED_READONLY_WORKSPACE_TARGET
+                and m.get("Source") is None  # ANONYMOUS only (R2 P2-1): a NAMED volume = persistent/shared
+            ):
+                raise SandboxHardeningConfigError(
+                    f"writable mount outside vetted read-only carve-out (only an ANONYMOUS volume "
+                    f"at {_VETTED_READONLY_WORKSPACE_TARGET!r}): target={m.get('Target')!r} "
+                    f"type={m.get('Type')!r} source={m.get('Source')!r}")
+        for _vkey in ("volumes", "volumes_from"):
+            # C5d-4 (final-audit R1 P2): docker-py exposes writable-mount channels BEYOND
+            # `mounts`/`tmpfs` — `volumes` (host-path / named-volume binds) and `volumes_from`
+            # (inherit another container's mounts). The vetted carve-out uses ONLY the `mounts`
+            # Mount-list + the `/tmp` tmpfs; production sets neither of these. Under a read-only
+            # rootfs they are an un-vetted writable-mount channel (e.g.
+            # {"volumes": {"/host/usr": {"bind": "/usr", "mode": "rw"}}} → writable /usr →
+            # binary-replacement escape) → deny-by-default (fail closed).
+            if container_config.get(_vkey):
+                raise SandboxHardeningConfigError(
+                    f"{_vkey} is not permitted under a read-only rootfs (the vetted carve-out uses "
+                    f"only the mounts Mount-list + the /tmp tmpfs): {container_config.get(_vkey)!r}")
 
 
 def build_applied_runtime_policy(
@@ -136,7 +234,7 @@ def build_applied_runtime_policy(
         image=container_config.get("image"),
         mem_limit=container_config.get("mem_limit"),
         run_as_user=container_config.get("user"),  # C5d-3: the real --user (None when OFF)
-        read_only_rootfs=bool(container_config.get("read_only", False)),  # False in C5c
+        read_only_rootfs=bool(container_config.get("read_only", False)),  # C5d-4 populates it
         cap_drop=tuple(container_config.get("cap_drop", ())),
         cap_add=tuple(container_config.get("cap_add", ())),
         security_opt=tuple(container_config.get("security_opt", ())),

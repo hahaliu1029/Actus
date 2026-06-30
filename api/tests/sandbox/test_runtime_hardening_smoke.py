@@ -12,6 +12,7 @@ INV-7: ALL docker access inside test functions / the fixture.
 """
 from __future__ import annotations
 
+import errno
 import time
 
 import pytest
@@ -359,3 +360,90 @@ def test_root_default_boot_survives_image_edits(rootdefault_sandbox):
     # if /home/ubuntu were root-owned 0700, so it would not prove chrome (uid 1000 under --user)
     # can write its profile/cache.
     assert _exec(c, ["sh", "-c", "sudo -u ubuntu test -w /home/ubuntu"])[0] == 0
+
+
+def _assert_erofs_as_root(container, path: str) -> None:
+    # Probe AS ROOT (user="0") — NOT sudo (codex R1 P2-3 / R2 P2-2): sudo writes its own timestamp
+    # under the read-only /run,/var and would EROFS BEFORE the target write, confounding the source.
+    # A uid-1000 write to /usr is EACCES even on a WRITABLE rootfs, so we MUST probe as root to
+    # isolate EROFS (errno 30) for THIS path as the read-only proof.
+    probe = (
+        "import os,sys\n"
+        f"try:\n"
+        f"    open({path!r}, 'w').close()\n"
+        f"    sys.exit(0)\n"
+        f"except OSError as e:\n"
+        f"    sys.exit(e.errno)\n"
+    )
+    code, out = _exec(container, ["python3", "-c", probe], user="0")
+    assert code == errno.EROFS, (
+        f"expected EROFS ({errno.EROFS}) writing {path} as root, got exit={code}: {out!r}")
+
+
+@pytest.fixture
+def readonly_sandbox(tmp_path):
+    """Boot the REAL actus-sandbox with the FULL production-faithful read-only config (spec §9①):
+    the translator's read_only+tmpfs+caps+user flat kwargs (run_as_user ON — the realistic
+    non-root × read-only flip target) PLUS the /home/ubuntu anon volume PLUS a memory :ro bind from
+    a temp host dir — exactly what _create_task assembles. A smoke passing only the flat kwargs
+    (no anon volume) would put /home/ubuntu on the read-only rootfs → chrome dies → green-for-the-
+    wrong-reason."""
+    from docker.types import Mount
+    client = _docker_client_or_skip()
+    _require_image(client, SANDBOX_IMAGE)
+    host_mem = tmp_path / "mem"
+    host_mem.mkdir()
+    (host_mem / "seed.md").write_text("seed", encoding="utf-8")  # prove the :ro bind is readable
+    # mirror _create_task's assembly order EXACTLY (R1 P3): the memory :ro bind is built first
+    # (docker_sandbox.py:236-238), then Task 4 appends the /home/ubuntu volume after the hardening
+    # merge → [memory_bind, anon_volume] (the Task 4 test pins this same order). Targets are
+    # disjoint so order is behaviourally irrelevant, but matching it keeps the smoke faithful.
+    mounts = [
+        Mount(target="/workspace/.memory", source=str(host_mem), type="bind", read_only=True),
+        Mount(target="/home/ubuntu", source=None, type="volume", read_only=False),
+    ]
+    container = client.containers.run(
+        SANDBOX_IMAGE, detach=True,
+        **hardening_kwargs(hardening=True, run_as_user=True, read_only_rootfs=True),
+        mounts=mounts,
+    )
+    try:
+        _wait_ready(container)
+        yield container
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_read_only_rootfs_profile(readonly_sandbox):
+    # Surface ①: rootfs read-only (EROFS as root on a non-carve-out path) + /tmp & /home/ubuntu
+    # writable + the memory :ro bind composes + all six services + sockets — every leg asserted to
+    # defeat a half-boot-green (e.g. /tmp writable but /home/ubuntu not → chrome silently dies).
+    c = readonly_sandbox
+    # (1) core security claim: a ROOT write to a NON-carve-out system path → EROFS (errno 30).
+    _assert_erofs_as_root(c, "/usr/_ro_proof")
+    # (2) the /etc DIRECTORY is read-only (a NEW file on the image-backed /etc → EROFS as root). The
+    # OCI default pseudo-fs & per-container mounts (/dev, /proc, the 3 /etc/* network files) stay
+    # writable/standard by design and are NOT claimed confined (spec §10 INV-8 / §11).
+    _assert_erofs_as_root(c, "/etc/_ro_proof")
+    # (3) /tmp carve-out writable (tmpfs, 1777).
+    assert _exec(c, ["sh", "-c", "touch /tmp/_rw_proof"])[0] == 0, "/tmp not writable"
+    # (4) /home/ubuntu carve-out writable AS the non-root uid-1000 PID1 (anon volume + 1000:1000).
+    # First pin that an exec runs as uid/gid 1000 (the container booted `--user 1000:1000`), so the
+    # write below genuinely proves "writable AS the non-root uid" (spec §9①), not merely "writable"
+    # (R2 P3 — mirrors the C5d-3 non-root smoke's id -u / id -g assertions).
+    assert _exec(c, ["id", "-u"])[1].strip() == b"1000", "exec id -u != 1000 (run_as_user not enforced)"
+    assert _exec(c, ["id", "-g"])[1].strip() == b"1000", "exec id -g != 1000"
+    assert _exec(c, ["sh", "-c", "touch /home/ubuntu/_rw_proof"])[0] == 0, (
+        "/home/ubuntu not writable by uid 1000 (anon volume ownership / mount)")
+    # (5) memory :ro bind composes (the Task 7 mkdir proof): mounted + readable + EROFS even for root.
+    assert _exec(c, ["sh", "-c", "cat /workspace/.memory/seed.md"])[1].strip() == b"seed", (
+        "memory :ro bind not mounted/readable")
+    _assert_erofs_as_root(c, "/workspace/.memory/_ro_proof")
+    # (6) all SIX services RUNNING + sockets live + CDP up (RUNNING alone is not a health oracle).
+    assert _all_six_running(c), "not all 6 services RUNNING under read-only rootfs"
+    for port in (8080, 5900, 5901):
+        _assert_port_accepts(c, port)
+    assert _exec(c, ["sh", "-c", "curl -fsS http://127.0.0.1:9222/json/version >/dev/null"])[0] == 0

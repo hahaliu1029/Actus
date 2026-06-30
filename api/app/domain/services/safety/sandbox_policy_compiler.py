@@ -133,16 +133,18 @@ class SandboxPolicyCompiler:
             )
             pids_limit = _BASELINE_PIDS_LIMIT
             run_as_user = _RUN_AS_USER if s.run_as_user_enabled else None
+            read_only_rootfs = True if s.read_only_rootfs_enabled else False
         else:
             cap_drop = ()
             cap_add = ()
             security_opt = ()
             pids_limit = None
             run_as_user = None
+            read_only_rootfs = False
         return ContainerRuntimePolicy(
             capture_kind="configured", creation_mode="docker_run",
             image=s.image, mem_limit=s.mem_limit, run_as_user=run_as_user,
-            read_only_rootfs=False, cap_drop=cap_drop, cap_add=cap_add,
+            read_only_rootfs=read_only_rootfs, cap_drop=cap_drop, cap_add=cap_add,
             security_opt=security_opt, pids_limit=pids_limit, mounts=mounts,
         )
 

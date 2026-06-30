@@ -109,7 +109,7 @@ class _StubSettings(SimpleNamespace):
     """
 
     def __init__(self, *, hardening: bool, nnp: bool = False, strict: bool = False,
-                 run_as_user: bool = False) -> None:
+                 run_as_user: bool = False, read_only_rootfs: bool = False) -> None:
         super().__init__(
             sandbox_image=SANDBOX_IMAGE,
             sandbox_network="",
@@ -125,11 +125,12 @@ class _StubSettings(SimpleNamespace):
             sandbox_no_new_privileges_enabled=nnp,
             sandbox_strict_caps_enabled=strict,
             sandbox_run_as_user_enabled=run_as_user,
+            sandbox_read_only_rootfs_enabled=read_only_rootfs,
         )
 
 
 def hardening_kwargs(*, hardening: bool, nnp: bool = False, strict: bool = False,
-                     run_as_user: bool = False) -> dict:
+                     run_as_user: bool = False, read_only_rootfs: bool = False) -> dict:
     """The EXACT docker-py kwargs production emits (INV-2), or {} when off.
 
     Mirrors production: `create(runtime_policy=None)` (flag off) → no hardening
@@ -137,7 +138,8 @@ def hardening_kwargs(*, hardening: bool, nnp: bool = False, strict: bool = False
     so we must NOT pass None to container_hardening_kwargs (codex R1#2).
     """
     policy = compile_runtime_policy(
-        _StubSettings(hardening=hardening, nnp=nnp, strict=strict, run_as_user=run_as_user))
+        _StubSettings(hardening=hardening, nnp=nnp, strict=strict,
+                      run_as_user=run_as_user, read_only_rootfs=read_only_rootfs))
     return container_hardening_kwargs(policy) if policy is not None else {}
 
 

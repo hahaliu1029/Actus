@@ -1,4 +1,5 @@
 import logging
+import posixpath
 import socket
 from datetime import datetime
 from functools import lru_cache
@@ -187,6 +188,21 @@ class Settings(BaseSettings):
             "sandbox_run_as_user_enabled",
             "SANDBOX_RUN_AS_USER_ENABLED",
             "ACTUS_C5_SANDBOX_RUN_AS_USER_ENABLED",
+        ),
+    )
+    # C5d-4 Sandbox read-only rootfs — runtime `docker run --read-only` + writable carve-out
+    # (tmpfs /tmp + anonymous volume /home/ubuntu). A SEPARATE opt-in tier LAYERED UNDER
+    # sandbox_runtime_hardening_enabled: read-only only takes effect when hardening is ALSO on
+    # (see _read_only_rootfs_requires_hardening). Default OFF dark-launch: when OFF the compiler
+    # emits read_only_rootfs=False → the translator omits read_only/tmpfs and _create_task adds
+    # no volume → byte-identical container_config (INV-0). The field name itself MUST be an alias
+    # (else Settings(sandbox_read_only_rootfs_enabled=True) is ignored).
+    sandbox_read_only_rootfs_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_read_only_rootfs_enabled",
+            "SANDBOX_READ_ONLY_ROOTFS_ENABLED",
+            "ACTUS_C5_SANDBOX_READ_ONLY_ROOTFS_ENABLED",
         ),
     )
 
@@ -428,22 +444,68 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _warn_run_as_user_default_cwd(self) -> "Settings":
-        # C5d-3 non-fatal pre-flip nudge (codex Q5): a WARNING, not a raise — dark-launch +
-        # the Docker proof never drive the react_graph cwd path, so flipping is a deliberate
-        # ops act that must first move sandbox_default_cwd off /root. docker-run mode ONLY
-        # (codex R2 P3): in external mode (sandbox_address set) the flag is inert (no
-        # container, no --user), so a /root-cwd warning would be spurious.
+    def _read_only_rootfs_requires_hardening(self) -> "Settings":
+        # C5d-4 INV-7 (fail-closed): read-only rootfs is a TIER of runtime hardening.
+        # compile_runtime_policy returns None when hardening is OFF, so read-only-alone would
+        # emit no --read-only AND apply NO hardening → a false sense of read-only. Fail fast at
+        # construction. Mode-INDEPENDENT (NOT gated on sandbox_address): a contradictory security
+        # config must never be silently accepted, even in external mode. Fires ONLY on the two
+        # read-only-without-hardening combos (H=0,R=1,*); never on the valid combos (INV-0-safe).
+        # NO env=="test" escape — config-consistency, not a secret check.
+        if self.sandbox_read_only_rootfs_enabled and not self.sandbox_runtime_hardening_enabled:
+            raise ValueError(
+                "sandbox_read_only_rootfs_enabled requires sandbox_runtime_hardening_enabled "
+                "(read-only rootfs is a tier of runtime hardening; enabling it alone would emit "
+                "no --read-only and apply NO hardening)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _read_only_rootfs_memory_target_must_be_prebuilt(self) -> "Settings":
+        # C5d-4 (codex R1 P2-2): the Dockerfile mkdir (Task 7) pre-creates ONLY the default
+        # /workspace/.memory mountpoint, but sandbox_memory_mount_target is operator-configurable;
+        # a custom target's mountpoint would not exist in the image, so under a read-only rootfs
+        # runc cannot create it → boot fails. Fail fast at construction. Mode-INDEPENDENT.
+        # normalize . // trailing-slash AND reject any `..` component (fail-closed — a custom
+        # target with `..` is unsupported even if it lexically normalizes) before the equality
+        # check. memory_mount_enabled=False ⇒ no bind ⇒ no concern; the skill_creator path passes
+        # no user_id so it builds no memory mount regardless — this guard only bites the agent
+        # path with a non-default target.
         if (
-            self.sandbox_run_as_user_enabled
+            self.sandbox_read_only_rootfs_enabled
+            and getattr(self, "sandbox_memory_mount_enabled", False)
+            and (".." in str(self.sandbox_memory_mount_target).split("/")
+                 or posixpath.normpath(str(self.sandbox_memory_mount_target)) != "/workspace/.memory")
+        ):
+            raise ValueError(
+                "sandbox_read_only_rootfs_enabled requires sandbox_memory_mount_target=="
+                "'/workspace/.memory' (the only mountpoint the image pre-creates; a custom target "
+                "would fail to mount under a read-only rootfs — add it to the Dockerfile mkdir and "
+                "this allowlist to support it)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_run_as_user_default_cwd(self) -> "Settings":
+        # C5d-3 non-fatal pre-flip nudge (codex Q5); trigger BROADENED by C5d-4 (R1 P2-4) to fire
+        # on read-only too. A WARNING, not a raise — dark-launch + the Docker proof never drive the
+        # react_graph cwd path, so flipping is a deliberate ops act that must first move
+        # sandbox_default_cwd off /root: under run_as_user uid 1000 cannot access /root, and under
+        # read_only_rootfs /root sits on the read-only rootfs (a host-side blank-exec_dir shell
+        # write there EROFSes). docker-run mode ONLY: in external mode (sandbox_address set) both
+        # flags are inert (no container), so a /root-cwd warning would be spurious.
+        if (
+            (self.sandbox_run_as_user_enabled or self.sandbox_read_only_rootfs_enabled)
             and not self.sandbox_address
             and self.sandbox_default_cwd == "/root"
         ):
             _logger.warning(  # config.py:25 `_logger = logging.getLogger(__name__)` in scope
-                "sandbox_run_as_user_enabled is ON but sandbox_default_cwd='/root' is "
-                "inaccessible to the non-root uid; shell tools without an explicit exec_dir "
-                "will fail. Set sandbox_default_cwd to a uid-1000-writable dir (e.g. "
-                "/home/ubuntu) before relying on the flag. See the C5d-3 pre-flip checklist."
+                "sandbox_run_as_user_enabled/sandbox_read_only_rootfs_enabled is ON but "
+                "sandbox_default_cwd='/root' is inaccessible/unwritable to the hardened sandbox "
+                "(uid 1000 cannot access it under run_as_user; /root sits on the read-only rootfs "
+                "under read_only_rootfs); shell tools without an explicit exec_dir will fail. Set "
+                "sandbox_default_cwd to a writable dir (e.g. /home/ubuntu) before relying on the "
+                "flag. See the C5d pre-flip checklist."
             )
         return self
 

@@ -108,3 +108,50 @@ def test_applied_reads_user_back():
     applied = build_applied_runtime_policy(
         container_config=cfg, memory_mount=None, memory_mount_target="/workspace/.memory")
     assert applied.run_as_user == "1000:1000"
+
+
+# ---- C5d-4: read_only + tmpfs emission + applied read-back ------------------ #
+def test_read_only_rootfs_emitted_when_set():
+    kw = container_hardening_kwargs(_policy(
+        read_only_rootfs=True, cap_drop=("NET_RAW",), pids_limit=512))
+    assert kw["read_only"] is True
+    assert kw["tmpfs"] == {"/tmp": "rw,exec,nosuid,nodev,size=512m"}
+
+
+def test_read_only_rootfs_omitted_when_false():
+    # INV-0: a writable-rootfs (read_only_rootfs=False) policy adds NO read_only/tmpfs key.
+    kw = container_hardening_kwargs(_policy(
+        read_only_rootfs=False, cap_drop=("NET_RAW",), pids_limit=512))
+    assert "read_only" not in kw
+    assert "tmpfs" not in kw
+
+
+def test_read_only_rootfs_tmpfs_is_a_fresh_copy():
+    # The emitted tmpfs must be a fresh dict, never the shared module constant (a caller mutation
+    # of container_config["tmpfs"] must not corrupt _READONLY_TMPFS for the next container).
+    from app.infrastructure.external.sandbox.container_hardening import _READONLY_TMPFS
+    kw = container_hardening_kwargs(_policy(read_only_rootfs=True))
+    assert kw["tmpfs"] == _READONLY_TMPFS
+    assert kw["tmpfs"] is not _READONLY_TMPFS
+
+
+def test_applied_reads_read_only_back():
+    cfg = {"image": "actus/sandbox:latest", "mem_limit": "4g", "read_only": True,
+           "tmpfs": {"/tmp": "rw,exec,nosuid,nodev,size=512m"},
+           "cap_drop": ["NET_RAW"], "pids_limit": 512}
+    applied = build_applied_runtime_policy(
+        container_config=cfg, memory_mount=None, memory_mount_target="/workspace/.memory")
+    assert applied.read_only_rootfs is True
+
+
+def test_read_only_round_trip_translator_to_applied():
+    # End-to-end: read-only policy → translator emits read_only+tmpfs into container_config →
+    # build_applied carries read_only_rootfs=True back (the honest applied snapshot).
+    policy = _policy(read_only_rootfs=True, cap_drop=("NET_RAW",), pids_limit=512)
+    cfg = {"image": "actus/sandbox:latest", "mem_limit": "4g"}
+    cfg.update(container_hardening_kwargs(policy))
+    assert cfg["read_only"] is True
+    assert cfg["tmpfs"] == {"/tmp": "rw,exec,nosuid,nodev,size=512m"}
+    applied = build_applied_runtime_policy(
+        container_config=cfg, memory_mount=None, memory_mount_target="/workspace/.memory")
+    assert applied.read_only_rootfs is True
