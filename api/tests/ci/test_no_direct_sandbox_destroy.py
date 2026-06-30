@@ -29,6 +29,18 @@ contract):
 **Whitelisted functions**:
 
 - ``reconcile_orphans`` — explicitly whitelisted per spec §13.3.
+- ``sweep_terminal_coordinator_active_sandboxes`` — startup leak-sweep
+  (C2 coordinator-cancel Part B) for the orphaned ACTIVE sandbox of
+  *terminal* (COMPLETED/TIMED_OUT) mailbox-plane coordinator children
+  whose root ``MailboxSupervisor`` was already killed on user-stop
+  (before consuming ``CANCEL_ACK``). M1 protects *in-flight* bindings;
+  these children are terminal with no live supervisor to race, so the
+  restart-bounded destroy is safe (``destroy()``'s per-session lock
+  serializes any pathological respawn race idempotently). Consulting the
+  helper would be wrong here: the sweep's query selects only ``subagent``
+  + ``mailbox``-plane rows — exactly what ``_should_skip_mailbox_lifecycle``
+  returns ``True`` for — so it would skip every row and re-leak the
+  containers it exists to reap.
 - ``delete_session`` — user-initiated permanent session deletion: the row
   is going away, so M1 (which protects in-flight bindings) does not
   apply; the supervisor for a deleted root is stopped upstream of this
@@ -52,6 +64,7 @@ _WHITELIST_FILES = {
 
 _WHITELIST_FUNCTION_NAMES = {
     "reconcile_orphans",
+    "sweep_terminal_coordinator_active_sandboxes",
     "delete_session",
     # ``AgentService.shutdown`` calls ``self._task_cls.destroy()`` — the
     # Task class-level teardown, NOT the SandboxLifecycleService destroy.
