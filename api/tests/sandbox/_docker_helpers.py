@@ -108,7 +108,8 @@ class _StubSettings(SimpleNamespace):
     AttributeError) plus the two hardening flags. Defaults mirror config.yaml.
     """
 
-    def __init__(self, *, hardening: bool, nnp: bool = False, strict: bool = False) -> None:
+    def __init__(self, *, hardening: bool, nnp: bool = False, strict: bool = False,
+                 run_as_user: bool = False) -> None:
         super().__init__(
             sandbox_image=SANDBOX_IMAGE,
             sandbox_network="",
@@ -123,10 +124,12 @@ class _StubSettings(SimpleNamespace):
             sandbox_runtime_hardening_enabled=hardening,
             sandbox_no_new_privileges_enabled=nnp,
             sandbox_strict_caps_enabled=strict,
+            sandbox_run_as_user_enabled=run_as_user,
         )
 
 
-def hardening_kwargs(*, hardening: bool, nnp: bool = False, strict: bool = False) -> dict:
+def hardening_kwargs(*, hardening: bool, nnp: bool = False, strict: bool = False,
+                     run_as_user: bool = False) -> dict:
     """The EXACT docker-py kwargs production emits (INV-2), or {} when off.
 
     Mirrors production: `create(runtime_policy=None)` (flag off) → no hardening
@@ -134,7 +137,7 @@ def hardening_kwargs(*, hardening: bool, nnp: bool = False, strict: bool = False
     so we must NOT pass None to container_hardening_kwargs (codex R1#2).
     """
     policy = compile_runtime_policy(
-        _StubSettings(hardening=hardening, nnp=nnp, strict=strict))
+        _StubSettings(hardening=hardening, nnp=nnp, strict=strict, run_as_user=run_as_user))
     return container_hardening_kwargs(policy) if policy is not None else {}
 
 

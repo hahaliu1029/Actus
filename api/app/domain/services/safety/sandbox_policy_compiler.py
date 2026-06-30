@@ -55,6 +55,14 @@ _STRICT_CAP_ADD: tuple[str, ...] = (
 )  # 9 caps. CI-gated; parity-10 fallback = append "SYS_CHROOT" (spec §9 / §4.2).
 
 
+# ── C5d-3 non-root tier (runtime --user) ──────────────────────────────────── #
+# The ONE vetted non-root identity. uid:gid 1000:1000 = the `ubuntu` user the image
+# pins (Dockerfile useradd -u 1000 -g 1000). Numeric (not "ubuntu") so the kernel
+# enforces it without a passwd lookup; gid pinned (not bare "1000") so the process is in
+# a non-root primary group. Emitted only when hardening AND run_as_user_enabled.
+_RUN_AS_USER: str = "1000:1000"
+
+
 def _egress_mode(s: SandboxSettingsView) -> str:
     # R3#3: only the exact string "none" disables egress; None/unset omits the
     # kwarg → Docker default bridge ≠ disabled.
@@ -124,14 +132,16 @@ class SandboxPolicyCompiler:
                 (_NO_NEW_PRIVILEGES_OPT,) if s.no_new_privileges_enabled else ()
             )
             pids_limit = _BASELINE_PIDS_LIMIT
+            run_as_user = _RUN_AS_USER if s.run_as_user_enabled else None
         else:
             cap_drop = ()
             cap_add = ()
             security_opt = ()
             pids_limit = None
+            run_as_user = None
         return ContainerRuntimePolicy(
             capture_kind="configured", creation_mode="docker_run",
-            image=s.image, mem_limit=s.mem_limit, run_as_user=None,
+            image=s.image, mem_limit=s.mem_limit, run_as_user=run_as_user,
             read_only_rootfs=False, cap_drop=cap_drop, cap_add=cap_add,
             security_opt=security_opt, pids_limit=pids_limit, mounts=mounts,
         )

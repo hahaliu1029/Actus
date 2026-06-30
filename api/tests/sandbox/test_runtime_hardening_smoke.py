@@ -254,3 +254,108 @@ def test_strict_with_no_new_privileges_breaks_sudo():
             container.remove(force=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+_ALL_SERVICE_PROCS = ("xvfb", "chrome", "socat", "x11vnc", "websockify", "app")
+
+
+def _all_six_running(container) -> bool:
+    # The full [group:services] set — NOT the 4-proc `_wait_ready` filter, which would leave
+    # x11vnc/websockify untested while green (codex R2 P2).
+    _, out = _exec(container, ["sh", "-c", "supervisorctl -c /sandbox/supervisord.conf status"])
+    lines = {ln.split()[0].rsplit(":", 1)[-1]: ln
+             for ln in out.decode(errors="replace").splitlines() if ln.split()}
+    return all(p in lines and "RUNNING" in lines[p] for p in _ALL_SERVICE_PROCS)
+
+
+def _assert_port_accepts(container, port: int) -> None:
+    # A crash-looping x11vnc/websockify can flash RUNNING transiently → a socket-accept is the
+    # real liveness oracle (codex R2 P2/P3).
+    code, out = _exec(container, ["python3", "-c",
+        f"import socket; socket.create_connection(('127.0.0.1', {port}), 5).close()"])
+    assert code == 0, f"port {port} not accepting connections: {out!r}"
+
+
+def _uid_gid(container, pid_path: str) -> dict[str, list[str]]:
+    # Return ALL FOUR columns of Uid:/Gid: (real, effective, saved, fs) — codex R2 P2:
+    # asserting only the real-uid column would miss an effective/saved/fs uid drift the
+    # spec §9① pins as `1000 1000 1000 1000`.
+    code, out = _exec(container, ["sh", "-c", f"grep -E '^(Uid|Gid):' {pid_path}"])
+    assert code == 0, f"reading {pid_path} failed: {out!r}"
+    vals: dict[str, list[str]] = {}
+    for line in out.decode().splitlines():
+        key, _, val = line.partition(":")
+        vals[key.strip()] = val.split()  # ["real", "effective", "saved", "fs"]
+    return vals
+
+
+@pytest.fixture
+def nonroot_sandbox():
+    """Boot the REAL actus-sandbox under `--user 1000:1000` (hardening ON + run_as_user ON,
+    conservative caps, NNP off)."""
+    client = _docker_client_or_skip()
+    _require_image(client, SANDBOX_IMAGE)
+    container = client.containers.run(
+        SANDBOX_IMAGE, detach=True,
+        **hardening_kwargs(hardening=True, run_as_user=True, nnp=False),
+    )
+    try:
+        _wait_ready(container)
+        yield container
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_nonroot_profile_runs_as_uid_1000(nonroot_sandbox):
+    # Surface ①: uid kernel-enforced on PID1 AND on an exec; all six services + sockets live;
+    # sudo still reaches root (semi-rootless).
+    c = nonroot_sandbox
+    pid1 = _uid_gid(c, "/proc/1/status")
+    # spec §9①: ALL FOUR uid/gid columns kernel-enforced to 1000 (real/effective/saved/fs).
+    assert pid1["Uid"] == ["1000"] * 4 and pid1["Gid"] == ["1000"] * 4, (
+        f"PID1 uid/gid not all-1000 (real/effective/saved/fs): {pid1}")
+    assert _exec(c, ["id", "-u"])[1].strip() == b"1000", "exec id -u != 1000"
+    assert _exec(c, ["id", "-g"])[1].strip() == b"1000", "exec id -g != 1000"
+    assert _all_six_running(c), "not all 6 services RUNNING under non-root"
+    for port in (8080, 5900, 5901):
+        _assert_port_accepts(c, port)
+    assert _exec(c, ["sh", "-c", "curl -fsS http://127.0.0.1:9222/json/version >/dev/null"])[0] == 0
+    code, out = _exec(c, ["sudo", "-n", "id", "-u"])
+    assert code == 0 and out.strip() == b"0", f"sudo -n id -u != 0 (semi-rootless broken): {out!r}"
+
+
+@pytest.fixture
+def rootdefault_sandbox():
+    """Boot the SAME rebuilt image with NO `--user` (default) — the INV-0-for-image proof:
+    the §4.4 image edits do NOT break the default root boot."""
+    client = _docker_client_or_skip()
+    _require_image(client, SANDBOX_IMAGE)
+    container = client.containers.run(SANDBOX_IMAGE, detach=True)  # no kwargs, no --user
+    try:
+        _wait_ready(container)
+        yield container
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_root_default_boot_survives_image_edits(rootdefault_sandbox):
+    # Surface ②: default boot is still ROOT (no USER directive) and the same six-service +
+    # VNC-socket + CDP liveness holds (codex R2 P3 — RUNNING alone is not a health oracle).
+    c = rootdefault_sandbox
+    assert _uid_gid(c, "/proc/1/status")["Uid"] == ["0"] * 4, (
+        "default boot must be root (all-0 uid: real/effective/saved/fs)")
+    assert _all_six_running(c), "not all 6 services RUNNING under root default"
+    for port in (8080, 5900, 5901):
+        _assert_port_accepts(c, port)
+    assert _exec(c, ["sh", "-c", "curl -fsS http://127.0.0.1:9222/json/version >/dev/null"])[0] == 0
+    # chrome's new HOME=/home/ubuntu exists + is writable BY uid 1000 (the §4.4 edit). Probe AS
+    # uid 1000 via `sudo -u ubuntu` (codex final-audit P3): a bare root `test -w` would pass even
+    # if /home/ubuntu were root-owned 0700, so it would not prove chrome (uid 1000 under --user)
+    # can write its profile/cache.
+    assert _exec(c, ["sh", "-c", "sudo -u ubuntu test -w /home/ubuntu"])[0] == 0

@@ -347,6 +347,14 @@ def test_container_hash_differs_when_cap_add_changes():
     assert compute_policy_hash(a) != compute_policy_hash(b)
 
 
+def test_container_hash_differs_when_run_as_user_changes():
+    # run_as_user IS a static rule-set field (already in the container hash-include) → root
+    # vs non-root profiles fingerprint differently (INV-2).
+    a = _container_snapshot(container=_container_hardened(run_as_user=None))
+    b = _container_snapshot(container=_container_hardened(run_as_user="1000:1000"))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
 def test_container_hash_same_when_cap_add_equal():
     a = _container_snapshot(container=_container_hardened(cap_add=["CHOWN", "SETUID"]))
     b = _container_snapshot(container=_container_hardened(cap_add=["CHOWN", "SETUID"]))
@@ -406,6 +414,27 @@ def test_build_settings_view_hardening_flags_default_false():
     view = build_settings_view(_FakeSettings())
     assert view.runtime_hardening_enabled is False
     assert view.no_new_privileges_enabled is False
+
+
+def test_build_settings_view_reads_run_as_user_flag_and_shifts_hash():
+    # _FakeSettings lacks the attr → getattr defaults False.
+    assert build_settings_view(_FakeSettings()).run_as_user_enabled is False
+
+    # Isolate the hash shift to run_as_user ONLY: hold hardening ON in BOTH views so the sole
+    # difference is run_as_user_enabled (R5 P3 — the prior fixture flipped hardening too, so the
+    # inequality was not attributable to run_as_user).
+    class _HardenedRunAsUserOff(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_run_as_user_enabled = False
+
+    class _HardenedRunAsUserOn(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_run_as_user_enabled = True
+
+    off = build_settings_view(_HardenedRunAsUserOff())
+    on = build_settings_view(_HardenedRunAsUserOn())
+    assert off.run_as_user_enabled is False and on.run_as_user_enabled is True
+    assert compute_settings_hash(on) != compute_settings_hash(off)
 
 
 def test_build_settings_view_reads_hardening_flags_when_present():

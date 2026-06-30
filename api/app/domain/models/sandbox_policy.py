@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 SCHEMA_VERSION = "c5.sandbox_policy.v1"
-COMPILER_VERSION = "c5d2.1"  # bump on any mapping change (C5d-2: cap_add in container hash)
+COMPILER_VERSION = "c5d3.1"  # bump on any mapping change (C5d-3: run_as_user emitted in container_config)
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
@@ -130,6 +130,10 @@ class SandboxSettingsView(BaseModel):
     # under runtime_hardening_enabled; the compiler consults it only on the hardened
     # docker_run branch.
     strict_caps_enabled: bool = False
+    # C5d-3: non-root run_as_user tier bit (default False → root, as today). Layered under
+    # runtime_hardening_enabled; the compiler consults it only on the hardened docker_run
+    # branch (run_as_user="1000:1000" iff hardening AND this).
+    run_as_user_enabled: bool = False
 
 
 class ValidationResultView(BaseModel):  # 3-field projection of the real ValidationResult
@@ -293,4 +297,5 @@ def build_settings_view(settings) -> SandboxSettingsView:
         runtime_hardening_enabled=getattr(settings, "sandbox_runtime_hardening_enabled", False),
         no_new_privileges_enabled=getattr(settings, "sandbox_no_new_privileges_enabled", False),
         strict_caps_enabled=getattr(settings, "sandbox_strict_caps_enabled", False),
+        run_as_user_enabled=getattr(settings, "sandbox_run_as_user_enabled", False),
     )

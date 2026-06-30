@@ -12,8 +12,9 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 5.创建用户ubuntu并赋予sudo权限
-RUN useradd -m -d /home/ubuntu -s /bin/bash ubuntu && \
+# 5.创建用户ubuntu并赋予sudo权限（C5d-3: pin uid:gid 1000:1000 so run_as_user is repo-owned）
+RUN groupadd -g 1000 ubuntu && \
+    useradd -u 1000 -g 1000 -m -d /home/ubuntu -s /bin/bash ubuntu && \
     echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
 
 # 6.安装Python 3.10版本(非uv)

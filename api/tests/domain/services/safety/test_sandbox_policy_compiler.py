@@ -352,3 +352,47 @@ def test_runtime_policy_strict_external_address_still_unhardened():
         external_address=True, runtime_hardening_enabled=True, strict_caps_enabled=True))
     assert pol.creation_mode == "external_address"
     assert pol.cap_drop == () and pol.cap_add == ()
+
+
+# ---- §4 C5d-3: non-root run_as_user tier ----------------------------------- #
+def test_runtime_policy_run_as_user_when_both_flags_set():
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=True, run_as_user_enabled=True))
+    assert pol.run_as_user == "1000:1000"
+    # orthogonal: conservative caps + pids unchanged by run_as_user
+    assert pol.cap_drop == ("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE")
+    assert pol.cap_add == ()
+    assert pol.pids_limit == 512
+
+
+def test_runtime_policy_run_as_user_none_when_hardened_but_flag_off():
+    # INV-0: hardening ON + run_as_user OFF → run_as_user stays None (translator omits user).
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=True, run_as_user_enabled=False))
+    assert pol.run_as_user is None
+    assert pol.cap_drop == ("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE")
+
+
+def test_runtime_policy_run_as_user_ignored_without_hardening():
+    # The view bit alone (no hardening) → None. The Settings guard normally prevents this
+    # combo, but the compiler must be safe in isolation (mirrors the strict precedent).
+    pol = C.compile_container_runtime_policy(
+        _view(runtime_hardening_enabled=False, run_as_user_enabled=True))
+    assert pol.run_as_user is None
+    assert pol.cap_drop == () and pol.pids_limit is None
+
+
+def test_runtime_policy_run_as_user_external_address_still_root():
+    pol = C.compile_container_runtime_policy(_view(
+        external_address=True, runtime_hardening_enabled=True, run_as_user_enabled=True))
+    assert pol.creation_mode == "external_address"
+    assert pol.run_as_user is None
+
+
+def test_runtime_policy_run_as_user_orthogonal_to_strict():
+    # strict + run_as_user compose: cap_drop=ALL + 9-cap add + uid 1000.
+    pol = C.compile_container_runtime_policy(_view(
+        runtime_hardening_enabled=True, strict_caps_enabled=True, run_as_user_enabled=True))
+    assert pol.run_as_user == "1000:1000"
+    assert pol.cap_drop == ("ALL",)
+    assert pol.cap_add == _EXPECTED_STRICT_CAP_ADD

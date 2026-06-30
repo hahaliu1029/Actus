@@ -268,6 +268,9 @@ def test_create_task_rejects_out_of_ceiling_cap_add_with_typed_error(captured_kw
     )
     with pytest.raises(SandboxHardeningConfigError):
         DockerSandbox._create_task(user_id=None, runtime_policy=bad)
+    # codex final-audit P3: pin fail-closed-BEFORE-run — sink stays empty because the fake
+    # containers.run is never reached (the out-of-ceiling cap_add is rejected first).
+    assert captured_kwargs == {}, "validation must reject BEFORE containers.run (fail-closed)"
 
 
 def test_create_task_strict_config_passes_validator(captured_kwargs, monkeypatch):
@@ -276,3 +279,148 @@ def test_create_task_strict_config_passes_validator(captured_kwargs, monkeypatch
     sandbox = DockerSandbox._create_task(user_id=None, runtime_policy=_strict())
     assert sandbox.applied_runtime_policy.cap_drop == ("ALL",)
     assert "SYS_ADMIN" not in captured_kwargs.get("cap_add", [])
+
+
+# ---- C5d-3: non-root run_as_user through _create_task ----------------------- #
+def _nonroot_conservative() -> ContainerRuntimePolicy:
+    return ContainerRuntimePolicy(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user="1000:1000",
+        read_only_rootfs=False,
+        cap_drop=("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"),
+        cap_add=(), security_opt=(), pids_limit=512, mounts=(),
+    )
+
+
+def test_nonroot_policy_threads_user_into_kwargs_and_applied(captured_kwargs, monkeypatch):
+    # End-to-end: non-root policy → translator emits user="1000:1000" → _create_task merges
+    # → build_applied carries run_as_user into the applied snapshot.
+    _patch_settings(monkeypatch)
+    sandbox = DockerSandbox._create_task(user_id=None, runtime_policy=_nonroot_conservative())
+    assert captured_kwargs["user"] == "1000:1000"
+    applied = sandbox.applied_runtime_policy
+    assert applied is not None and applied.capture_kind == "applied"
+    assert applied.run_as_user == "1000:1000"
+
+
+def test_create_task_rejects_forged_root_user_with_typed_error(captured_kwargs, monkeypatch):
+    # A policy carrying a forged ROOT user → the validator rejects it with the typed
+    # SandboxHardeningConfigError BEFORE containers.run (not re-wrapped by the broad except).
+    from app.infrastructure.external.sandbox.container_hardening import (
+        SandboxHardeningConfigError,
+    )
+    _patch_settings(monkeypatch)
+    bad = ContainerRuntimePolicy(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user="0:0",
+        read_only_rootfs=False, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
+        pids_limit=512, mounts=(),
+    )
+    with pytest.raises(SandboxHardeningConfigError):
+        DockerSandbox._create_task(user_id=None, runtime_policy=bad)
+    # codex final-audit P3: pin fail-closed-BEFORE-run — the fake containers.run never
+    # populated the sink, so validation rejected the forged root user before any container was
+    # created (the typed raise alone would still pass if validate moved after containers.run).
+    assert captured_kwargs == {}, "validation must reject BEFORE containers.run (fail-closed)"
+
+
+def test_inv0_run_as_user_off_create_has_no_user_key(captured_kwargs, monkeypatch):
+    # INV-0 (Surface ③): hardening ON + run_as_user OFF → NO `user` kwarg; the FULL
+    # container_config == the OFF baseline + EXACTLY the C5c conservative kwargs, nothing
+    # more. A stray unconditional `user` emission breaks it. Mirrors the C5d-2 tier-2 golden.
+    from app.application.services.sandbox_runtime_policy import compile_runtime_policy
+
+    class _ConservativeNoNonroot:
+        sandbox_address = None
+        sandbox_image = "actus/sandbox:latest"
+        sandbox_network = None
+        sandbox_mem_limit = "4g"
+        sandbox_default_cwd = "/root"
+        sandbox_https_proxy = None
+        sandbox_http_proxy = None
+        sandbox_no_proxy = None
+        sandbox_memory_mount_target = "/workspace/.memory"
+        sandbox_memory_mount_enabled = False
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = False
+        sandbox_strict_caps_enabled = False
+        sandbox_run_as_user_enabled = False   # the bit under test
+
+    _patch_settings(monkeypatch)
+    DockerSandbox._create_task(user_id=None, runtime_policy=None)
+    off = {k: v for k, v in captured_kwargs.items() if k != "name"}
+    DockerSandbox._create_task(
+        user_id=None, runtime_policy=compile_runtime_policy(_ConservativeNoNonroot()))
+    conservative = {k: v for k, v in captured_kwargs.items() if k != "name"}
+    assert "user" not in conservative
+    assert conservative == off | {
+        "cap_drop": ["NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"],
+        "pids_limit": 512,
+    }
+
+
+def test_run_as_user_on_create_emits_user_via_compile_chain(captured_kwargs, monkeypatch):
+    # Full compile chain ON: settings(run_as_user on) → compile_runtime_policy → _create_task
+    # → user="1000:1000" kwarg + the applied snapshot carries it. Exercises the SHARED compile
+    # chain (compile_runtime_policy → _create_task) that BOTH production create() paths route
+    # through (sandbox_lifecycle_service.py:327 + skill_creator_service.py:514); it calls
+    # _create_task directly, so it proves the shared chain, not the outer wrappers (R5 P3 — §8
+    # "no new call sites" rests on both wrappers already calling compile_runtime_policy).
+    from app.application.services.sandbox_runtime_policy import compile_runtime_policy
+
+    class _NonRoot:
+        sandbox_address = None
+        sandbox_image = "actus/sandbox:latest"
+        sandbox_network = None
+        sandbox_mem_limit = "4g"
+        sandbox_default_cwd = "/home/ubuntu"
+        sandbox_https_proxy = None
+        sandbox_http_proxy = None
+        sandbox_no_proxy = None
+        sandbox_memory_mount_target = "/workspace/.memory"
+        sandbox_memory_mount_enabled = False
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = False
+        sandbox_strict_caps_enabled = False
+        sandbox_run_as_user_enabled = True
+
+    _patch_settings(monkeypatch)
+    sandbox = DockerSandbox._create_task(
+        user_id=None, runtime_policy=compile_runtime_policy(_NonRoot()))
+    assert captured_kwargs["user"] == "1000:1000"
+    assert sandbox.applied_runtime_policy.run_as_user == "1000:1000"
+
+
+def test_strict_plus_run_as_user_through_create_path(captured_kwargs, monkeypatch):
+    # spec §3 (R5 P3): all cap×nonroot hardened combos are valid — exercise strict + non-root
+    # TOGETHER through _create_task so cap_drop=ALL + the 9-cap cap_add + user="1000:1000" all
+    # reach containers.run AND pass the validator (vetted user + vetted caps) in one compose.
+    from app.application.services.sandbox_runtime_policy import compile_runtime_policy
+
+    class _StrictNonRoot:
+        sandbox_address = None
+        sandbox_image = "actus/sandbox:latest"
+        sandbox_network = None
+        sandbox_mem_limit = "4g"
+        sandbox_default_cwd = "/home/ubuntu"
+        sandbox_https_proxy = None
+        sandbox_http_proxy = None
+        sandbox_no_proxy = None
+        sandbox_memory_mount_target = "/workspace/.memory"
+        sandbox_memory_mount_enabled = False
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = False
+        sandbox_strict_caps_enabled = True
+        sandbox_run_as_user_enabled = True
+
+    _patch_settings(monkeypatch)
+    sandbox = DockerSandbox._create_task(
+        user_id=None, runtime_policy=compile_runtime_policy(_StrictNonRoot()))
+    assert captured_kwargs["user"] == "1000:1000"
+    assert captured_kwargs["cap_drop"] == ["ALL"]
+    assert captured_kwargs["cap_add"] == [
+        "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
+        "SETUID", "SETGID", "SETPCAP", "SETFCAP", "KILL",
+    ]
+    assert sandbox.applied_runtime_policy.run_as_user == "1000:1000"
+    assert sandbox.applied_runtime_policy.cap_drop == ("ALL",)

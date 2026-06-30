@@ -175,6 +175,20 @@ class Settings(BaseSettings):
             "ACTUS_C5_SANDBOX_STRICT_CAPS_ENABLED",
         ),
     )
+    # C5d-3 Sandbox Non-root run_as_user — runtime `docker run --user 1000:1000`.
+    # A SEPARATE opt-in tier LAYERED UNDER sandbox_runtime_hardening_enabled: non-root
+    # only takes effect when hardening is ALSO on (see _run_as_user_requires_hardening).
+    # Default OFF dark-launch: when OFF the compiler emits run_as_user=None → the translator
+    # omits the `user` kwarg → byte-identical container_config (INV-0). The field name
+    # itself MUST be an alias (else Settings(sandbox_run_as_user_enabled=True) is ignored).
+    sandbox_run_as_user_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_run_as_user_enabled",
+            "SANDBOX_RUN_AS_USER_ENABLED",
+            "ACTUS_C5_SANDBOX_RUN_AS_USER_ENABLED",
+        ),
+    )
 
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
@@ -392,6 +406,44 @@ class Settings(BaseSettings):
                 "sandbox_strict_caps_enabled requires sandbox_runtime_hardening_enabled "
                 "(strict caps are a tier of runtime hardening; enabling strict alone "
                 "would silently apply NO hardening)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _run_as_user_requires_hardening(self) -> "Settings":
+        # C5d-3 INV-7 (fail-closed): non-root is a TIER of runtime hardening.
+        # compile_runtime_policy returns None when hardening is OFF, so run_as_user-alone
+        # would emit no --user AND apply NO hardening → a false sense of non-root. Fail fast
+        # at construction. Mode-INDEPENDENT (NOT gated on sandbox_address): a contradictory
+        # security config must never be silently accepted, even in external mode (codex R3
+        # P2). Fires ONLY on the two run_as_user-without-hardening combos (H=0,R=1,*); never
+        # on the valid combos (INV-0-safe). NO env=="test" escape — config-consistency, not
+        # a secret check.
+        if self.sandbox_run_as_user_enabled and not self.sandbox_runtime_hardening_enabled:
+            raise ValueError(
+                "sandbox_run_as_user_enabled requires sandbox_runtime_hardening_enabled "
+                "(non-root is a tier of runtime hardening; enabling it alone would emit no "
+                "--user and apply NO hardening)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_run_as_user_default_cwd(self) -> "Settings":
+        # C5d-3 non-fatal pre-flip nudge (codex Q5): a WARNING, not a raise — dark-launch +
+        # the Docker proof never drive the react_graph cwd path, so flipping is a deliberate
+        # ops act that must first move sandbox_default_cwd off /root. docker-run mode ONLY
+        # (codex R2 P3): in external mode (sandbox_address set) the flag is inert (no
+        # container, no --user), so a /root-cwd warning would be spurious.
+        if (
+            self.sandbox_run_as_user_enabled
+            and not self.sandbox_address
+            and self.sandbox_default_cwd == "/root"
+        ):
+            _logger.warning(  # config.py:25 `_logger = logging.getLogger(__name__)` in scope
+                "sandbox_run_as_user_enabled is ON but sandbox_default_cwd='/root' is "
+                "inaccessible to the non-root uid; shell tools without an explicit exec_dir "
+                "will fail. Set sandbox_default_cwd to a uid-1000-writable dir (e.g. "
+                "/home/ubuntu) before relying on the flag. See the C5d-3 pre-flip checklist."
             )
         return self
 

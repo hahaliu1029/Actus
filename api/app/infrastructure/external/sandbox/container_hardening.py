@@ -15,8 +15,8 @@ def container_hardening_kwargs(policy: ContainerRuntimePolicy) -> dict:
     security_opt as list[str], pids_limit as int). Empty/None fields are OMITTED → an
     unhardened policy → {} (INV-0); an empty cap_add (conservative profile) is omitted so
     the ON-conservative container_config stays byte-identical to C5c (INV-0 tier-2).
-    run_as_user/read_only_rootfs are intentionally NOT emitted (C5c hardcodes them
-    None/False → C5d)."""
+    run_as_user is emitted as docker-py `user=` when set (C5d-3, omit-when-None → INV-0);
+    read_only_rootfs is still intentionally NOT emitted (hardcoded False → C5d-4)."""
     kwargs: dict = {}
     if policy.cap_drop:
         kwargs["cap_drop"] = list(policy.cap_drop)
@@ -26,6 +26,12 @@ def container_hardening_kwargs(policy: ContainerRuntimePolicy) -> dict:
         kwargs["security_opt"] = list(policy.security_opt)
     if policy.pids_limit is not None:
         kwargs["pids_limit"] = policy.pids_limit
+    if policy.run_as_user is not None:
+        # `is not None`, NOT truthy (codex R1 P2): a truthy check would suppress an empty
+        # run_as_user="" → no `user` kwarg → Docker silently defaults to ROOT (a silent
+        # non-root downgrade). `is not None` emits user="" so the validator rejects it
+        # fail-closed. The compiler only ever produces None or "1000:1000" — defense-in-depth.
+        kwargs["user"] = policy.run_as_user
     return kwargs
 
 
@@ -46,6 +52,13 @@ _VETTED_CAP_CEILING: frozenset[str] = frozenset({
 # allowlist auto-rejects seccomp=unconfined / apparmor=unconfined / systempaths=
 # unconfined AND any unknown opt — stronger than blocklisting "*=unconfined".
 _VETTED_SECURITY_OPTS: frozenset[str] = frozenset({"no-new-privileges:true"})
+# C5d-3: the ONE vetted non-root identity the strict path may EVER emit. A SEPARATE literal,
+# NOT imported from the compiler's _RUN_AS_USER, so defeating the guard needs a reviewed
+# two-place edit. EXACT match (codex Q4): rejects "0"/"root" (root), "1000:0" (root gid),
+# "0:1000", bare "1000"/names (passwd-dependent), "" and any non-str object — deny-by-default.
+# No numeric parser (a parser is easier to over-broaden); add parsing only if multiple vetted
+# identities ever exist.
+_VETTED_RUN_AS_USER: frozenset[str] = frozenset({"1000:1000"})
 
 
 class SandboxHardeningConfigError(ValueError):
@@ -93,6 +106,15 @@ def validate_hardening_config(container_config: dict) -> None:
         raise SandboxHardeningConfigError(
             "security_opt outside vetted set (rejects seccomp/apparmor/systempaths="
             f"unconfined + any unvetted opt): {bad_opts}")
+    user = container_config.get("user")
+    if user is not None and (not isinstance(user, str) or user not in _VETTED_RUN_AS_USER):
+        # `not isinstance(user, str)` PRECEDES the membership test (codex R1 P2): `user not in
+        # <frozenset>` raises TypeError for an unhashable value (e.g. a list) instead of the
+        # typed error; the isinstance guard converts any non-str — and the empty string "" —
+        # into a clean fail-closed raise. Absent `user` (None) is the default root boot, fine.
+        raise SandboxHardeningConfigError(
+            f"user outside vetted non-root identity (must be one of "
+            f"{sorted(_VETTED_RUN_AS_USER)}): {user!r}")
 
 
 def build_applied_runtime_policy(
@@ -113,7 +135,7 @@ def build_applied_runtime_policy(
         creation_mode="docker_run",
         image=container_config.get("image"),
         mem_limit=container_config.get("mem_limit"),
-        run_as_user=container_config.get("user"),                # None in C5c
+        run_as_user=container_config.get("user"),  # C5d-3: the real --user (None when OFF)
         read_only_rootfs=bool(container_config.get("read_only", False)),  # False in C5c
         cap_drop=tuple(container_config.get("cap_drop", ())),
         cap_add=tuple(container_config.get("cap_add", ())),

@@ -88,3 +88,26 @@ def test_security_opt_only_source_is_no_new_privileges_flag():
 
     pol2 = c.compile_container_runtime_policy(build_settings_view(_On()))
     assert pol2.security_opt == ("no-new-privileges:true",)
+
+
+def test_no_free_form_run_as_user_settings():
+    # INV-4 (C5d-3): the uid is a vetted constant, NOT a raw operator knob.
+    s = Settings(env="test")
+    for forbidden in ("sandbox_run_as_user", "sandbox_uid", "sandbox_gid"):
+        assert not hasattr(s, forbidden), (
+            f"INV-4 footgun: free-form {forbidden} must not exist on Settings"
+        )
+
+
+def test_run_as_user_constant_is_in_vetted_set():
+    # INV-4: the two two-place literals must stay consistent — _RUN_AS_USER (what the compiler
+    # emits) ∈ _VETTED_RUN_AS_USER (what the validator permits). Mirrors
+    # test_strict_cap_add_is_subset_of_vetted_ceiling.
+    from app.domain.services.safety.sandbox_policy_compiler import _RUN_AS_USER
+    from app.infrastructure.external.sandbox.container_hardening import _VETTED_RUN_AS_USER
+
+    assert _RUN_AS_USER == "1000:1000"
+    assert _RUN_AS_USER in _VETTED_RUN_AS_USER
+    # spec §5: EXACTLY one vetted identity (R5 P3) — pin the WHOLE set, not just membership, so a
+    # future over-broadening of _VETTED_RUN_AS_USER (e.g. adding "1000:0") fails this gate.
+    assert _VETTED_RUN_AS_USER == frozenset({_RUN_AS_USER})

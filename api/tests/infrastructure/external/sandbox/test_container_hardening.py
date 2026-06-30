@@ -79,3 +79,32 @@ def test_strict_policy_emits_cap_add_and_drop_all():
 def test_empty_cap_add_is_omitted():
     kw = container_hardening_kwargs(_policy(cap_drop=("NET_RAW",), pids_limit=512))
     assert "cap_add" not in kw
+
+
+# ---- C5d-3: run_as_user emission + applied read-back ------------------------ #
+def test_run_as_user_emitted_when_set():
+    kw = container_hardening_kwargs(_policy(
+        run_as_user="1000:1000", cap_drop=("NET_RAW",), pids_limit=512))
+    assert kw["user"] == "1000:1000"
+
+
+def test_run_as_user_omitted_when_none():
+    # INV-0: a root (run_as_user=None) policy adds NO `user` key.
+    kw = container_hardening_kwargs(_policy(
+        run_as_user=None, cap_drop=("NET_RAW",), pids_limit=512))
+    assert "user" not in kw
+
+
+def test_run_as_user_empty_string_is_emitted_not_omitted():
+    # codex R1 P2: `is not None` (not truthy) — "" must REACH the validator (which rejects
+    # it), never silently downgrade to root by omission.
+    kw = container_hardening_kwargs(_policy(run_as_user="", cap_drop=("NET_RAW",)))
+    assert kw["user"] == ""
+
+
+def test_applied_reads_user_back():
+    cfg = {"image": "actus/sandbox:latest", "mem_limit": "4g", "user": "1000:1000",
+           "cap_drop": ["NET_RAW"], "pids_limit": 512}
+    applied = build_applied_runtime_policy(
+        container_config=cfg, memory_mount=None, memory_mount_target="/workspace/.memory")
+    assert applied.run_as_user == "1000:1000"
