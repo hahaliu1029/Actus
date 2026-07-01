@@ -324,7 +324,9 @@ class SandboxLifecycleService:
 
                     sandbox = await self._sandbox_cls.create(
                         user_id=effective_user_id,
-                        runtime_policy=compile_runtime_policy(get_settings()),
+                        runtime_policy=compile_runtime_policy(
+                            get_settings(), worker_type=session.worker_type
+                        ),
                     )
                 else:
                     sandbox = await self._sandbox_cls.create(user_id=effective_user_id)

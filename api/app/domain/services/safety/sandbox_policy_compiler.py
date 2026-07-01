@@ -63,7 +63,26 @@ _STRICT_CAP_ADD: tuple[str, ...] = (
 _RUN_AS_USER: str = "1000:1000"
 
 
-def _egress_mode(s: SandboxSettingsView) -> str:
+def _egress_isolated(s: SandboxSettingsView, worker_type: str) -> bool:
+    # C5d-5/6 single selection rule (anti-drift): consumed by BOTH the policy field (§5.1) and the
+    # honesty fields (§5.2/§5.3). `not s.external_address` is load-bearing (R1 P1): the compiler's
+    # external branch pins no container, so without this term _network() would report
+    # egress_mode="internal_network" for an external sandbox — a snapshot claiming a boundary that
+    # was never applied. runtime_hardening_enabled makes an OFF view yield False before the
+    # compiler's own branch guard.
+    return (
+        bool(s.runtime_hardening_enabled)
+        and not s.external_address
+        and (
+            s.egress_isolation_enabled
+            or (worker_type == "subagent" and s.child_egress_isolation_enabled)
+        )
+    )
+
+
+def _egress_mode(s: SandboxSettingsView, worker_type: str = "root") -> str:
+    if _egress_isolated(s, worker_type):
+        return "internal_network"
     # R3#3: only the exact string "none" disables egress; None/unset omits the
     # kwarg → Docker default bridge ≠ disabled.
     if s.network == "none":
@@ -86,14 +105,16 @@ def _filesystem(s: SandboxSettingsView) -> FilesystemPolicy:
     )
 
 
-def _network(s: SandboxSettingsView) -> NetworkPolicy:
+def _network(s: SandboxSettingsView, worker_type: str = "root") -> NetworkPolicy:
+    mode = _egress_mode(s, worker_type)
     return NetworkPolicy(
         docker_network=s.network,
-        egress_mode=_egress_mode(s),
+        egress_mode=mode,
         has_https_proxy=s.has_https_proxy,
         has_http_proxy=s.has_http_proxy,
         has_no_proxy=s.has_no_proxy,
         no_proxy_digest=s.no_proxy_digest,
+        effective_egress_network=s.egress_internal_network if mode == "internal_network" else None,
     )
 
 
@@ -104,7 +125,7 @@ class SandboxPolicyCompiler:
     for container_create."""
 
     def compile_container_runtime_policy(
-        self, s: SandboxSettingsView
+        self, s: SandboxSettingsView, *, worker_type: str = "root"
     ) -> ContainerRuntimePolicy:
         """C5c: the INTENDED ContainerRuntimePolicy (capture_kind='configured').
         Pure. docker_run is hardened iff s.runtime_hardening_enabled;
@@ -113,8 +134,8 @@ class SandboxPolicyCompiler:
             return ContainerRuntimePolicy(
                 capture_kind="configured", creation_mode="external_address",
                 image=None, mem_limit=None, run_as_user=None,
-                read_only_rootfs=False, cap_drop=(), cap_add=(), security_opt=(),
-                pids_limit=None, mounts=(),
+                read_only_rootfs=False, egress_network=None, cap_drop=(), cap_add=(),
+                security_opt=(), pids_limit=None, mounts=(),
             )
         mounts = (
             (MountView(target=s.memory_mount_target, source_kind="memory_bind",
@@ -141,10 +162,14 @@ class SandboxPolicyCompiler:
             pids_limit = None
             run_as_user = None
             read_only_rootfs = False
+        egress_network = (
+            s.egress_internal_network if _egress_isolated(s, worker_type) else None
+        )
         return ContainerRuntimePolicy(
             capture_kind="configured", creation_mode="docker_run",
             image=s.image, mem_limit=s.mem_limit, run_as_user=run_as_user,
-            read_only_rootfs=read_only_rootfs, cap_drop=cap_drop, cap_add=cap_add,
+            read_only_rootfs=read_only_rootfs, egress_network=egress_network,
+            cap_drop=cap_drop, cap_add=cap_add,
             security_opt=security_opt, pids_limit=pids_limit, mounts=mounts,
         )
 
@@ -162,14 +187,14 @@ class SandboxPolicyCompiler:
             worker_type=inp.worker_type, depth=inp.depth,
         )
         provenance = PolicyProvenance(
-            compiler_version=COMPILER_VERSION, input_sources=["settings"],
+            compiler_version=COMPILER_VERSION, input_sources=["settings", "worker_type"],
             settings_hash=compute_settings_hash(s), tool_call_digest=None,
         )
         snap = SandboxPolicySnapshot(
             schema_version=SCHEMA_VERSION, policy_hash="",
             enforcement_mode=enforcement_mode, surface="container_create",
             subject=subject, provenance=provenance, decision=None,
-            filesystem=_filesystem(s), command=None, network=_network(s),
+            filesystem=_filesystem(s), command=None, network=_network(s, inp.worker_type),
             container=container,
         )
         return snap.model_copy(update={"policy_hash": compute_policy_hash(snap)})
@@ -177,7 +202,9 @@ class SandboxPolicyCompiler:
     def compile_container_create(self, inp: ContainerCreateInput) -> SandboxPolicySnapshot:
         return self._container_create_snapshot(
             inp=inp,
-            container=self.compile_container_runtime_policy(inp.settings),
+            container=self.compile_container_runtime_policy(
+                inp.settings, worker_type=inp.worker_type
+            ),
             enforcement_mode="observe_only",
         )
 

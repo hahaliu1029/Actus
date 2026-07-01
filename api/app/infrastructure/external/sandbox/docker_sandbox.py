@@ -38,6 +38,7 @@ from app.infrastructure.external.sandbox.container_hardening import (
     container_hardening_kwargs,
     SandboxHardeningConfigError,
     validate_hardening_config,
+    verify_egress_network_internal,
 )
 from async_lru import alru_cache
 from core.config import get_settings
@@ -265,11 +266,24 @@ class DockerSandbox(Sandbox):
                 # C5d-2: fail-closed pre-run guard over the REAL merged kwargs. Raises
                 # SandboxHardeningConfigError (→ no container) on escape-enabling config.
                 # Only runs on the hardened path → OFF path byte-identical (INV-0).
-                validate_hardening_config(container_config)
+                # C5d-5/6 §7.2: pass the expected egress network so the validator confines
+                # container_config["network"] to it EXACTLY (expected None → name check skipped → INV-0).
+                validate_hardening_config(
+                    container_config,
+                    expected_egress_network=runtime_policy.egress_network,
+                )
+                if runtime_policy.egress_network is not None:
+                    # C5d-5/6 §8 preflight: the network must be Internal=True. Runs BEFORE
+                    # containers.run → fail-fast, no orphan. SandboxHardeningConfigError re-raised
+                    # intact by the existing handler. Only when egress is ON (None → not called → INV-0).
+                    verify_egress_network_internal(
+                        docker_client, runtime_policy.egress_network
+                    )
                 applied_runtime_policy = build_applied_runtime_policy(
                     container_config=container_config,
                     memory_mount=memory_mount,
                     memory_mount_target=str(settings.sandbox_memory_mount_target),
+                    egress_network=runtime_policy.egress_network,
                 )
 
             # 6.调用docker客户端容器运行参数创建沙箱

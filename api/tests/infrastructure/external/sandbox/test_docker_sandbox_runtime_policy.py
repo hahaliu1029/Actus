@@ -24,9 +24,27 @@ class _FakeContainers:
         return _FakeContainer()
 
 
+class _FakeNetwork:
+    def __init__(self, internal):
+        self.attrs = {"Internal": internal}
+
+
+class _FakeNetworks:
+    def __init__(self, *, internal=True, raise_not_found=False):
+        self._internal = internal
+        self._raise = raise_not_found
+
+    def get(self, name):
+        import docker
+        if self._raise:
+            raise docker.errors.NotFound(f"no such network {name}")
+        return _FakeNetwork(self._internal)
+
+
 class _FakeClient:
-    def __init__(self, sink: dict):
+    def __init__(self, sink: dict, *, internal=True, raise_not_found=False):
         self.containers = _FakeContainers(sink)
+        self.networks = _FakeNetworks(internal=internal, raise_not_found=raise_not_found)
 
     def close(self):
         ...
@@ -40,6 +58,16 @@ def captured_kwargs(monkeypatch):
     monkeypatch.setattr(DockerSandbox, "_wait_for_container_ip",
                         classmethod(lambda cls, container, **kw: "1.2.3.4"))
     return sink
+
+
+def _patch_client(monkeypatch, sink, *, internal=True, raise_not_found=False):
+    # Egress create-path tests need a client whose network reports a chosen Internal value.
+    monkeypatch.setattr(
+        DockerSandbox, "_create_docker_client",
+        classmethod(lambda cls: _FakeClient(sink, internal=internal, raise_not_found=raise_not_found)),
+    )
+    monkeypatch.setattr(DockerSandbox, "_wait_for_container_ip",
+                        classmethod(lambda cls, container, **kw: "1.2.3.4"))
 
 
 def _patch_settings(monkeypatch, **over):
@@ -70,7 +98,8 @@ def _unhardened() -> ContainerRuntimePolicy:
     return ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=(), cap_add=(), security_opt=(), pids_limit=None,
+        read_only_rootfs=False, egress_network=None,
+        cap_drop=(), cap_add=(), security_opt=(), pids_limit=None,
         mounts=(),
     )
 
@@ -79,7 +108,7 @@ def _hardened() -> ContainerRuntimePolicy:
     return ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False,
+        read_only_rootfs=False, egress_network=None,
         cap_drop=("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"),
         cap_add=(),
         security_opt=(), pids_limit=512, mounts=(),
@@ -226,7 +255,7 @@ def _strict() -> ContainerRuntimePolicy:
     return ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=("ALL",),
+        read_only_rootfs=False, egress_network=None, cap_drop=("ALL",),
         cap_add=("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
                  "SETUID", "SETGID", "SETPCAP", "SETFCAP", "KILL"),
         security_opt=(), pids_limit=512, mounts=(),
@@ -263,7 +292,7 @@ def test_create_task_rejects_out_of_ceiling_cap_add_with_typed_error(captured_kw
     bad = ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=("ALL",), cap_add=("SYS_ADMIN",),
+        read_only_rootfs=False, egress_network=None, cap_drop=("ALL",), cap_add=("SYS_ADMIN",),
         security_opt=(), pids_limit=512, mounts=(),
     )
     with pytest.raises(SandboxHardeningConfigError):
@@ -286,7 +315,7 @@ def _nonroot_conservative() -> ContainerRuntimePolicy:
     return ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user="1000:1000",
-        read_only_rootfs=False,
+        read_only_rootfs=False, egress_network=None,
         cap_drop=("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"),
         cap_add=(), security_opt=(), pids_limit=512, mounts=(),
     )
@@ -313,7 +342,7 @@ def test_create_task_rejects_forged_root_user_with_typed_error(captured_kwargs, 
     bad = ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user="0:0",
-        read_only_rootfs=False, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
+        read_only_rootfs=False, egress_network=None, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
         pids_limit=512, mounts=(),
     )
     with pytest.raises(SandboxHardeningConfigError):
@@ -433,7 +462,7 @@ def _readonly_conservative() -> ContainerRuntimePolicy:
     return ContainerRuntimePolicy(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=True,
+        read_only_rootfs=True, egress_network=None,
         cap_drop=("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"),
         cap_add=(), security_opt=(), pids_limit=512, mounts=(),
     )
@@ -526,3 +555,138 @@ def test_read_only_rootfs_on_helper_emits_read_only_and_tmpfs():
     validate_hardening_config({**kw})  # vetted → no raise
     with pytest.raises(SandboxHardeningConfigError):
         validate_hardening_config({"read_only": True, "tmpfs": {"/usr": "rw"}})
+
+
+# ---- C5d-5/6: egress through _create_task ---------------------------------- #
+def _egress_policy() -> ContainerRuntimePolicy:
+    return ContainerRuntimePolicy(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
+        read_only_rootfs=False, egress_network="actus-sandbox-internal",
+        cap_drop=("NET_RAW", "MKNOD", "AUDIT_WRITE", "NET_BIND_SERVICE"),
+        cap_add=(), security_opt=(), pids_limit=512, mounts=(),
+    )
+
+
+def test_egress_on_emits_network_and_builds_applied(captured_kwargs, monkeypatch):
+    sink: dict = {}
+    _patch_client(monkeypatch, sink, internal=True)
+    _patch_settings(monkeypatch)
+    sandbox = DockerSandbox._create_task(user_id=None, runtime_policy=_egress_policy())
+    assert sink["network"] == "actus-sandbox-internal"  # translator override of the base network
+    applied = sandbox.applied_runtime_policy
+    assert applied is not None and applied.egress_network == "actus-sandbox-internal"
+
+
+def test_egress_off_create_has_no_network_from_hardening(captured_kwargs, monkeypatch):
+    # INV-0: a conservative (egress_network=None) policy adds NO `network` key from hardening; the
+    # base line-231 network (None in _patch_settings) stands → no `network` in the final config.
+    _patch_settings(monkeypatch)
+    DockerSandbox._create_task(user_id=None, runtime_policy=_hardened())
+    assert "network" not in captured_kwargs
+
+
+def test_egress_on_non_internal_network_rejected_before_run(monkeypatch):
+    # Fail-closed: the preflight sees Internal=False → SandboxHardeningConfigError BEFORE run.
+    from app.infrastructure.external.sandbox.container_hardening import SandboxHardeningConfigError
+    sink: dict = {}
+    _patch_client(monkeypatch, sink, internal=False)
+    _patch_settings(monkeypatch)
+    with pytest.raises(SandboxHardeningConfigError):
+        DockerSandbox._create_task(user_id=None, runtime_policy=_egress_policy())
+    assert sink == {}, "preflight must reject BEFORE containers.run (fail-closed)"
+
+
+def test_egress_on_missing_network_rejected_before_run(monkeypatch):
+    from app.infrastructure.external.sandbox.container_hardening import SandboxHardeningConfigError
+    sink: dict = {}
+    _patch_client(monkeypatch, sink, raise_not_found=True)
+    _patch_settings(monkeypatch)
+    with pytest.raises(SandboxHardeningConfigError):
+        DockerSandbox._create_task(user_id=None, runtime_policy=_egress_policy())
+    assert sink == {}
+
+
+def test_egress_on_name_mismatch_rejected_before_run(monkeypatch):
+    # The validator name-confinement fires when the emitted network != expected. Forge by
+    # monkeypatching the translator to emit a DIFFERENT network than runtime_policy.egress_network.
+    from app.infrastructure.external.sandbox.container_hardening import SandboxHardeningConfigError
+    from app.infrastructure.external.sandbox import docker_sandbox as ds_mod
+    sink: dict = {}
+    _patch_client(monkeypatch, sink, internal=True)
+    _patch_settings(monkeypatch)
+    monkeypatch.setattr(
+        ds_mod, "container_hardening_kwargs",
+        lambda policy: {"cap_drop": ["NET_RAW"], "pids_limit": 512, "network": "actus-net"},
+    )
+    with pytest.raises(SandboxHardeningConfigError):
+        DockerSandbox._create_task(user_id=None, runtime_policy=_egress_policy())
+    assert sink == {}
+
+
+# ---- C5d-5/6: compile_runtime_policy threads worker_type ------------------- #
+def test_compile_runtime_policy_threads_worker_type_for_child_egress():
+    from app.application.services.sandbox_runtime_policy import compile_runtime_policy
+
+    class _ChildEgress:
+        sandbox_address = None
+        sandbox_image = "actus/sandbox:latest"
+        sandbox_network = None
+        sandbox_mem_limit = "4g"
+        sandbox_default_cwd = "/home/ubuntu"
+        sandbox_https_proxy = None
+        sandbox_http_proxy = None
+        sandbox_no_proxy = None
+        sandbox_memory_mount_target = "/workspace/.memory"
+        sandbox_memory_mount_enabled = False
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = False
+        sandbox_strict_caps_enabled = False
+        sandbox_run_as_user_enabled = False
+        sandbox_read_only_rootfs_enabled = False
+        sandbox_egress_isolation_enabled = False
+        sandbox_child_egress_isolation_enabled = True
+        sandbox_egress_internal_network = "actus-sandbox-internal"
+
+    # subagent → isolated; root → not (child flag only)
+    sub = compile_runtime_policy(_ChildEgress(), worker_type="subagent")
+    root = compile_runtime_policy(_ChildEgress(), worker_type="root")
+    assert sub.egress_network == "actus-sandbox-internal"
+    assert root.egress_network is None
+
+
+def test_compile_runtime_policy_default_worker_type_is_root():
+    from app.application.services.sandbox_runtime_policy import compile_runtime_policy
+
+    class _ChildEgress:
+        sandbox_address = None
+        sandbox_image = "actus/sandbox:latest"
+        sandbox_network = None
+        sandbox_mem_limit = "4g"
+        sandbox_default_cwd = "/home/ubuntu"
+        sandbox_https_proxy = None
+        sandbox_http_proxy = None
+        sandbox_no_proxy = None
+        sandbox_memory_mount_target = "/workspace/.memory"
+        sandbox_memory_mount_enabled = False
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = False
+        sandbox_strict_caps_enabled = False
+        sandbox_run_as_user_enabled = False
+        sandbox_read_only_rootfs_enabled = False
+        sandbox_egress_isolation_enabled = False
+        sandbox_child_egress_isolation_enabled = True
+        sandbox_egress_internal_network = "actus-sandbox-internal"
+
+    # No worker_type arg → defaults to "root" → not isolated under the child flag.
+    assert compile_runtime_policy(_ChildEgress()).egress_network is None
+
+
+def test_compile_runtime_policy_off_returns_none_regardless_of_worker_type():
+    # INV-0: hardening OFF → None whatever the worker_type.
+    from app.application.services.sandbox_runtime_policy import compile_runtime_policy
+
+    class _Off:
+        sandbox_runtime_hardening_enabled = False
+
+    assert compile_runtime_policy(_Off(), worker_type="subagent") is None

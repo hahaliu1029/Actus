@@ -11,7 +11,8 @@ def _policy(**over) -> ContainerRuntimePolicy:
     base = dict(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=(), cap_add=(), security_opt=(), pids_limit=None,
+        read_only_rootfs=False, egress_network=None,
+        cap_drop=(), cap_add=(), security_opt=(), pids_limit=None,
         mounts=(),
     )
     base.update(over)
@@ -155,3 +156,151 @@ def test_read_only_round_trip_translator_to_applied():
     applied = build_applied_runtime_policy(
         container_config=cfg, memory_mount=None, memory_mount_target="/workspace/.memory")
     assert applied.read_only_rootfs is True
+
+
+# ---- C5d-5/6: validator network rejections (always-on, hardened path) ------ #
+import pytest
+
+from app.infrastructure.external.sandbox.container_hardening import (
+    SandboxHardeningConfigError,
+    validate_hardening_config,
+    verify_egress_network_internal,
+)
+
+
+@pytest.mark.parametrize("bad", [
+    {"network_mode": "host"},
+    {"network_mode": "none"},
+    {"network_mode": "container:abc"},
+    {"network_disabled": True},
+    {"networking_config": {"EndpointsConfig": {}}},
+    {"ports": {"8080/tcp": 8080}},
+    {"publish_all_ports": True},
+])
+def test_validator_rejects_host_exposure_and_network_mode_kwargs(bad):
+    # §7.1: Actus never sets these on a hardened sandbox → reject deny-by-default. A conservative
+    # config (cap_drop+pids) plus the bad kwarg must fail closed.
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512, **bad}
+    with pytest.raises(SandboxHardeningConfigError):
+        validate_hardening_config(cfg)
+
+
+def test_validator_conservative_config_without_network_still_passes():
+    # No false positive: a vetted conservative config with NO network kwarg passes (expected None).
+    validate_hardening_config({"cap_drop": ["NET_RAW"], "pids_limit": 512})
+
+
+# ---- §7.2: expected_egress_network name confinement ------------------------ #
+def test_validator_accepts_matching_egress_network():
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512, "network": "actus-sandbox-internal"}
+    validate_hardening_config(cfg, expected_egress_network="actus-sandbox-internal")  # no raise
+
+
+def test_validator_rejects_egress_network_mismatch():
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512, "network": "actus-net"}
+    with pytest.raises(SandboxHardeningConfigError):
+        validate_hardening_config(cfg, expected_egress_network="actus-sandbox-internal")
+
+
+def test_validator_rejects_missing_network_when_egress_expected():
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512}  # no network at all
+    with pytest.raises(SandboxHardeningConfigError):
+        validate_hardening_config(cfg, expected_egress_network="actus-sandbox-internal")
+
+
+def test_validator_rejects_empty_expected_egress_network():
+    # R5 P2: a forged/buggy empty expected network must fail closed BEFORE the `==` check
+    # (else "" == "" would accept an empty network).
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512, "network": ""}
+    with pytest.raises(SandboxHardeningConfigError):
+        validate_hardening_config(cfg, expected_egress_network="")
+
+
+def test_validator_expected_none_skips_network_name_check():
+    # expected_egress_network=None (egress OFF) → the name-confinement branch is skipped even if a
+    # `network` kwarg is present (the base line-231 network on the OFF path is legitimate).
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512, "network": "actus-net"}
+    validate_hardening_config(cfg, expected_egress_network=None)  # no raise
+
+
+# ---- §8 preflight: verify_egress_network_internal -------------------------- #
+class _FakeNet:
+    def __init__(self, attrs):
+        self.attrs = attrs
+
+
+class _FakeNetworks:
+    def __init__(self, *, net=None, raise_not_found=False):
+        self._net = net
+        self._raise = raise_not_found
+
+    def get(self, name):
+        import docker
+        if self._raise:
+            raise docker.errors.NotFound(f"no such network {name}")
+        return self._net
+
+
+class _FakeDockerClient:
+    def __init__(self, *, net=None, raise_not_found=False):
+        self.networks = _FakeNetworks(net=net, raise_not_found=raise_not_found)
+
+
+def test_preflight_accepts_internal_true_network():
+    client = _FakeDockerClient(net=_FakeNet({"Internal": True}))
+    verify_egress_network_internal(client, "actus-sandbox-internal")  # no raise
+
+
+@pytest.mark.parametrize("attrs", [
+    {"Internal": False},
+    {"Internal": None},
+    {},               # missing key
+    {"Internal": "true"},  # truthy non-bool → strict `is not True` rejects
+])
+def test_preflight_rejects_non_internal_network(attrs):
+    client = _FakeDockerClient(net=_FakeNet(attrs))
+    with pytest.raises(SandboxHardeningConfigError):
+        verify_egress_network_internal(client, "actus-sandbox-internal")
+
+
+def test_preflight_rejects_missing_network():
+    client = _FakeDockerClient(raise_not_found=True)
+    with pytest.raises(SandboxHardeningConfigError):
+        verify_egress_network_internal(client, "actus-sandbox-internal")
+
+
+# ---- C5d-5/6: translator emits network + applied echoes egress_network ----- #
+def test_translator_emits_network_when_egress_network_set():
+    kw = container_hardening_kwargs(_policy(
+        egress_network="actus-sandbox-internal", cap_drop=("NET_RAW",), pids_limit=512))
+    assert kw["network"] == "actus-sandbox-internal"
+
+
+def test_translator_omits_network_when_egress_none():
+    # INV-0: egress_network=None → NO `network` key (the base line-231 network stands).
+    kw = container_hardening_kwargs(_policy(
+        egress_network=None, cap_drop=("NET_RAW",), pids_limit=512))
+    assert "network" not in kw
+
+
+def test_translator_emits_empty_network_not_silently_dropped():
+    # `is not None` (not truthy): an empty "" must REACH the validator (which rejects it), never
+    # silently leave the container on the routable base network.
+    kw = container_hardening_kwargs(_policy(egress_network="", cap_drop=("NET_RAW",)))
+    assert kw["network"] == ""
+
+
+def test_applied_echoes_egress_network():
+    applied = build_applied_runtime_policy(
+        container_config={"image": "actus/sandbox:latest", "mem_limit": "4g",
+                          "network": "actus-sandbox-internal"},
+        memory_mount=None, memory_mount_target="/workspace/.memory",
+        egress_network="actus-sandbox-internal")
+    assert applied.egress_network == "actus-sandbox-internal"
+
+
+def test_applied_egress_network_none_when_off():
+    applied = build_applied_runtime_policy(
+        container_config={"image": "actus/sandbox:latest", "mem_limit": "4g"},
+        memory_mount=None, memory_mount_target="/workspace/.memory", egress_network=None)
+    assert applied.egress_network is None

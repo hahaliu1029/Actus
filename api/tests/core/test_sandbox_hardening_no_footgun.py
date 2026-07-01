@@ -146,3 +146,71 @@ def test_read_only_carve_out_literals_are_consistent():
     assert _VETTED_READONLY_TMPFS_TARGETS == frozenset({"/tmp"})
     assert _READONLY_WORKSPACE_TARGET == _VETTED_READONLY_WORKSPACE_TARGET == "/home/ubuntu"
     assert _VETTED_READONLY_TMPFS_OPTIONS == _READONLY_TMPFS["/tmp"]
+
+
+def test_no_free_form_egress_settings():
+    # INV-4 (C5d-5/6): egress is a vetted BOOLEAN tier + ONE vetted network NAME, NOT raw docker
+    # network knobs. The only egress Settings are the two *_enabled flags + sandbox_egress_internal_network.
+    s = Settings(env="test")
+    for forbidden in (
+        "sandbox_network_mode",
+        "sandbox_egress_mode",
+        "sandbox_network_disabled",
+        "sandbox_networking_config",
+        "sandbox_egress_allowlist",
+        "sandbox_egress_proxy",
+    ):
+        assert not hasattr(s, forbidden), (
+            f"INV-4 footgun: free-form {forbidden} must not exist on Settings"
+        )
+
+
+def test_egress_settings_are_exactly_the_two_flags_plus_network_name():
+    # Positive pin: the three egress Settings DO exist (so the gate above can't pass vacuously by a
+    # rename), and nothing else egress-shaped does.
+    s = Settings(env="test")
+    assert hasattr(s, "sandbox_egress_isolation_enabled")
+    assert hasattr(s, "sandbox_child_egress_isolation_enabled")
+    assert hasattr(s, "sandbox_egress_internal_network")
+
+
+def test_validator_network_rejection_literals_present():
+    # INV-4: the validator's network confinement is a deny-by-default literal set. Pin that the
+    # validator REJECTS each forbidden kwarg (behavioral, not source-grep) so a future weakening
+    # (dropping one rejection) fails this gate.
+    from app.infrastructure.external.sandbox.container_hardening import (
+        SandboxHardeningConfigError, validate_hardening_config,
+    )
+    import pytest
+    for bad in (
+        {"network_mode": "host"},
+        {"network_disabled": True},
+        {"networking_config": {}},
+        {"ports": {"8080/tcp": 8080}},
+        {"publish_all_ports": True},
+    ):
+        with pytest.raises(SandboxHardeningConfigError):
+            validate_hardening_config({"cap_drop": ["NET_RAW"], "pids_limit": 512, **bad})
+
+
+def test_egress_network_two_place_handling_is_consistent():
+    # INV-4 two-place handling (mirrors test_run_as_user_constant_is_in_vetted_set): the translator
+    # EMITS `network` from policy.egress_network and the validator CONFINES it via
+    # expected_egress_network. Prove the round-trip: a policy's egress_network → translator kwarg →
+    # validator accepts iff expected matches.
+    from app.domain.models.sandbox_policy import ContainerRuntimePolicy
+    from app.infrastructure.external.sandbox.container_hardening import (
+        SandboxHardeningConfigError, container_hardening_kwargs, validate_hardening_config,
+    )
+    import pytest
+    pol = ContainerRuntimePolicy(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
+        read_only_rootfs=False, egress_network="actus-sandbox-internal",
+        cap_drop=("NET_RAW",), cap_add=(), security_opt=(), pids_limit=512, mounts=(),
+    )
+    kw = container_hardening_kwargs(pol)
+    cfg = {"cap_drop": ["NET_RAW"], "pids_limit": 512, **kw}
+    validate_hardening_config(cfg, expected_egress_network="actus-sandbox-internal")  # match → ok
+    with pytest.raises(SandboxHardeningConfigError):
+        validate_hardening_config(cfg, expected_egress_network="other-net")  # mismatch → reject

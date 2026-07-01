@@ -67,6 +67,7 @@ _NET_EXPECTED = {
     "has_http_proxy": False,
     "has_no_proxy": False,
     "no_proxy_digest": None,
+    "effective_egress_network": None,
 }
 
 
@@ -92,7 +93,7 @@ def test_container_create_full_golden():
             "tool_call_id": None, "tool_name": None, "tool_source": None,
         },
         "provenance": {
-            "compiler_version": COMPILER_VERSION, "input_sources": ["settings"],
+            "compiler_version": COMPILER_VERSION, "input_sources": ["settings", "worker_type"],
             "settings_hash": _settings_hash(), "tool_call_digest": None,
         },
         "decision": None,
@@ -102,7 +103,8 @@ def test_container_create_full_golden():
         "container": {
             "capture_kind": "configured", "creation_mode": "docker_run",
             "image": "actus/sandbox:latest", "mem_limit": "4g", "run_as_user": None,
-            "read_only_rootfs": False, "cap_drop": [], "cap_add": [], "security_opt": [],
+            "read_only_rootfs": False, "egress_network": None,
+            "cap_drop": [], "cap_add": [], "security_opt": [],
             "pids_limit": None,
             "mounts": [{"target": "/workspace/.memory", "source_kind": "memory_bind", "read_only": True}],
         },
@@ -294,7 +296,7 @@ def test_compile_applied_container_create_is_enforce_and_recomputes_hash():
     applied = ContainerRuntimePolicy(
         capture_kind="applied", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
+        read_only_rootfs=False, egress_network=None, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
         pids_limit=512, mounts=(),
     )
     snap = C.compile_applied_container_create(applied, _cc_input())
@@ -443,3 +445,138 @@ def test_runtime_policy_read_only_rootfs_orthogonal_to_strict_and_run_as_user():
     assert pol.run_as_user == "1000:1000"
     assert pol.cap_drop == ("ALL",)
     assert pol.cap_add == _EXPECTED_STRICT_CAP_ADD
+
+
+# ---- §5 C5d-5/6: worker-type egress selection + honesty -------------------- #
+_EGRESS_NET = "actus-sandbox-internal"
+
+
+def _egress_view(**over):
+    base = dict(runtime_hardening_enabled=True, egress_internal_network=_EGRESS_NET)
+    base.update(over)
+    return _view(**base)
+
+
+def test_runtime_policy_egress_network_none_when_both_flags_off():
+    # hardening on, neither egress flag → egress_network None (INV-0 inert).
+    pol = C.compile_container_runtime_policy(_egress_view(), worker_type="root")
+    assert pol.egress_network is None
+
+
+def test_runtime_policy_global_egress_pins_network_for_root():
+    pol = C.compile_container_runtime_policy(
+        _egress_view(egress_isolation_enabled=True), worker_type="root")
+    assert pol.egress_network == _EGRESS_NET
+
+
+def test_runtime_policy_global_egress_pins_network_for_subagent():
+    pol = C.compile_container_runtime_policy(
+        _egress_view(egress_isolation_enabled=True), worker_type="subagent")
+    assert pol.egress_network == _EGRESS_NET
+
+
+def test_runtime_policy_child_egress_pins_network_for_subagent_only():
+    # Child flag → subagent isolated, root NOT (the C5d-6 trust-tiering).
+    on_child = _egress_view(child_egress_isolation_enabled=True)
+    assert C.compile_container_runtime_policy(on_child, worker_type="subagent").egress_network == _EGRESS_NET
+    assert C.compile_container_runtime_policy(on_child, worker_type="root").egress_network is None
+
+
+def test_runtime_policy_child_egress_unknown_worker_not_isolated():
+    # worker_type="unknown" is NOT "subagent" → child flag does not isolate it.
+    pol = C.compile_container_runtime_policy(
+        _egress_view(child_egress_isolation_enabled=True), worker_type="unknown")
+    assert pol.egress_network is None
+
+
+def test_runtime_policy_egress_default_worker_type_is_root():
+    # The *-keyword default is "root": the child flag alone does NOT isolate the default call.
+    pol = C.compile_container_runtime_policy(_egress_view(child_egress_isolation_enabled=True))
+    assert pol.egress_network is None
+
+
+def test_runtime_policy_egress_ignored_without_hardening():
+    # The view bit alone (no hardening) → no network. Settings guard normally prevents this combo.
+    pol = C.compile_container_runtime_policy(
+        _view(egress_isolation_enabled=True, egress_internal_network=_EGRESS_NET),
+        worker_type="subagent")
+    assert pol.egress_network is None
+
+
+def test_runtime_policy_egress_external_address_not_isolated():
+    # R1 P1: external mode pins NO container → never isolated, even with the global flag on.
+    pol = C.compile_container_runtime_policy(
+        _egress_view(external_address=True, egress_isolation_enabled=True), worker_type="subagent")
+    assert pol.creation_mode == "external_address"
+    assert pol.egress_network is None
+
+
+def test_runtime_policy_egress_orthogonal_to_other_tiers():
+    # egress composes with strict + non-root + read-only: all set together.
+    pol = C.compile_container_runtime_policy(
+        _egress_view(egress_isolation_enabled=True, strict_caps_enabled=True,
+                     run_as_user_enabled=True, read_only_rootfs_enabled=True),
+        worker_type="root")
+    assert pol.egress_network == _EGRESS_NET
+    assert pol.cap_drop == ("ALL",)
+    assert pol.run_as_user == "1000:1000"
+    assert pol.read_only_rootfs is True
+
+
+# ---- §5.2/§5.3 honesty: _network egress_mode + effective field ------------- #
+def test_network_egress_mode_internal_when_isolated():
+    snap = C.compile_container_create(_cc_input(
+        worker_type="subagent",
+        settings=_egress_view(child_egress_isolation_enabled=True)))
+    assert snap.network.egress_mode == "internal_network"
+    assert snap.network.effective_egress_network == _EGRESS_NET
+
+
+def test_network_egress_mode_unrestricted_when_not_isolated():
+    snap = C.compile_container_create(_cc_input(
+        worker_type="root",
+        settings=_egress_view(child_egress_isolation_enabled=True)))  # root + child flag → not isolated
+    assert snap.network.egress_mode == "unrestricted"
+    assert snap.network.effective_egress_network is None
+
+
+def test_network_egress_external_address_reports_non_internal_mode():
+    # R1 P1 honesty: external + egress flag → NOT internal_network (no boundary was applied).
+    snap = C.compile_container_create(_cc_input(
+        worker_type="subagent",
+        settings=_egress_view(external_address=True, egress_isolation_enabled=True)))
+    assert snap.network.egress_mode != "internal_network"
+    assert snap.network.effective_egress_network is None
+
+
+# ---- §5.4 create==observe parity + provenance ------------------------------ #
+def test_container_create_snapshot_input_sources_adds_worker_type():
+    snap = C.compile_container_create(_cc_input())
+    assert list(snap.provenance.input_sources) == ["settings", "worker_type"]
+
+
+def test_container_create_reflects_worker_type_selected_egress_in_container():
+    # The container_create snapshot's container carries the worker-type-selected egress_network
+    # (create==observe: the same value the applied path would carry).
+    snap = C.compile_container_create(_cc_input(
+        worker_type="subagent",
+        settings=_egress_view(child_egress_isolation_enabled=True)))
+    assert snap.container.egress_network == _EGRESS_NET
+
+
+def test_tool_call_egress_mode_stays_root_baseline_under_child_flag():
+    # R2 P1: tool_call _network is worker-type-INDEPENDENT (pinned root). Under child-only egress,
+    # a subagent's tool_call snapshot reports the root baseline (unrestricted), NOT internal_network.
+    snap = C.compile_tool_call(_tc_input(
+        worker_type="subagent",
+        settings=_egress_view(child_egress_isolation_enabled=True)))
+    assert snap.network.egress_mode == "unrestricted"
+    assert list(snap.provenance.input_sources) == ["settings", "tool_source", "ast_validation_result"]
+
+
+def test_tool_call_egress_mode_internal_under_global_flag():
+    # Under the GLOBAL flag, the root baseline IS internal_network → tool_call reports it too.
+    snap = C.compile_tool_call(_tc_input(
+        worker_type="subagent",
+        settings=_egress_view(egress_isolation_enabled=True)))
+    assert snap.network.egress_mode == "internal_network"

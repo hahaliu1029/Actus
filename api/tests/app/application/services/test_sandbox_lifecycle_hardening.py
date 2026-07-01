@@ -23,7 +23,7 @@ def anyio_backend():
 _APPLIED = ContainerRuntimePolicy(
     capture_kind="applied", creation_mode="docker_run",
     image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-    read_only_rootfs=False, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
+    read_only_rootfs=False, egress_network=None, cap_drop=("NET_RAW",), cap_add=(), security_opt=(),
     pids_limit=512, mounts=(),
 )
 
@@ -227,3 +227,59 @@ async def test_hardening_on_snapshot_off_passes_policy_without_snapshot(monkeypa
     await svc.bind_new("sess-1")
     assert HardenedFakeSandbox.last_runtime_policy not in (None, "UNSET")  # hardened
     assert sink.calls == []  # no snapshot (C5a audit gate off)
+
+
+# ---- C5d-6: bind_new threads session.worker_type into compile_runtime_policy --- #
+def _patch_get_settings_child_egress(monkeypatch):
+    class _S:
+        sandbox_address = None
+        sandbox_image = "actus/sandbox:latest"
+        sandbox_network = None
+        sandbox_mem_limit = "4g"
+        sandbox_default_cwd = "/home/ubuntu"
+        sandbox_https_proxy = None
+        sandbox_http_proxy = None
+        sandbox_no_proxy = None
+        sandbox_memory_mount_target = "/workspace/.memory"
+        sandbox_memory_mount_enabled = False
+        sandbox_runtime_hardening_enabled = True
+        sandbox_no_new_privileges_enabled = False
+        sandbox_strict_caps_enabled = False
+        sandbox_run_as_user_enabled = False
+        sandbox_read_only_rootfs_enabled = False
+        sandbox_egress_isolation_enabled = False
+        sandbox_child_egress_isolation_enabled = True
+        sandbox_egress_internal_network = "actus-sandbox-internal"
+    monkeypatch.setattr(cfg, "get_settings", lambda: _S())
+
+
+def _subagent_session(sid="sess-1", user_id=None):
+    return Session(
+        id=sid, user_id=user_id, status=SessionStatus.PENDING, worker_type="subagent",
+        sandbox_binding=SandboxBinding(state=SandboxBindingState.UNBOUND),
+    )
+
+
+async def test_bind_new_passes_subagent_worker_type_into_runtime_policy(monkeypatch):
+    # C5d-6: a subagent session under the child egress flag → the compiled runtime_policy carries
+    # the internal egress network (worker_type threaded from session.worker_type).
+    _patch_get_settings_child_egress(monkeypatch)
+    HardenedFakeSandbox.last_runtime_policy = "UNSET"
+    sink = _SpySink()
+    svc = _svc(HardenedFakeSandbox, {"sess-1": _subagent_session()}, sink,
+               snapshot_enabled=False, hardening_enabled=True)
+    await svc.bind_new("sess-1")
+    pol = HardenedFakeSandbox.last_runtime_policy
+    assert pol is not None and pol.egress_network == "actus-sandbox-internal"
+
+
+async def test_bind_new_root_session_not_isolated_under_child_flag(monkeypatch):
+    # A ROOT session under the child-only flag → egress_network None (the trust-tiering).
+    _patch_get_settings_child_egress(monkeypatch)
+    HardenedFakeSandbox.last_runtime_policy = "UNSET"
+    sink = _SpySink()
+    svc = _svc(HardenedFakeSandbox, {"sess-1": _unbound_session()}, sink,  # root worker_type (default)
+               snapshot_enabled=False, hardening_enabled=True)
+    await svc.bind_new("sess-1")
+    pol = HardenedFakeSandbox.last_runtime_policy
+    assert pol is not None and pol.egress_network is None

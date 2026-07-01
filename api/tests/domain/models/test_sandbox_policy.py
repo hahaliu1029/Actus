@@ -57,6 +57,7 @@ def _container() -> ContainerRuntimePolicy:
         mem_limit="4g",
         run_as_user=None,
         read_only_rootfs=False,
+        egress_network=None,
         cap_drop=[],
         cap_add=[],
         security_opt=[],
@@ -320,7 +321,8 @@ def _container_hardened(**over) -> ContainerRuntimePolicy:
     base = dict(
         capture_kind="configured", creation_mode="docker_run",
         image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
-        read_only_rootfs=False, cap_drop=[], cap_add=[], security_opt=[], pids_limit=None,
+        read_only_rootfs=False, egress_network=None,
+        cap_drop=[], cap_add=[], security_opt=[], pids_limit=None,
         mounts=[MountView(target="/workspace/.memory", source_kind="memory_bind", read_only=True)],
     )
     base.update(over)
@@ -473,3 +475,90 @@ def test_build_settings_view_reads_hardening_flags_when_present():
     view = build_settings_view(_S())
     assert view.runtime_hardening_enabled is True
     assert view.no_new_privileges_enabled is True
+
+
+# ---- C5d-5/6: egress_network field + NetworkPolicy honesty + view fields --- #
+def test_container_runtime_policy_egress_network_round_trips():
+    pol = _container_hardened(egress_network="actus-sandbox-internal")
+    assert pol.egress_network == "actus-sandbox-internal"
+    none_pol = _container_hardened(egress_network=None)
+    assert none_pol.egress_network is None
+
+
+def test_container_runtime_policy_egress_network_is_required():
+    # No default (mirrors read_only_rootfs/cap_add/run_as_user) → omitting it raises.
+    import pytest
+    from pydantic import ValidationError
+    base = dict(
+        capture_kind="configured", creation_mode="docker_run",
+        image="actus/sandbox:latest", mem_limit="4g", run_as_user=None,
+        read_only_rootfs=False, cap_drop=(), cap_add=(), security_opt=(), pids_limit=None,
+        mounts=(),
+    )  # deliberately omit egress_network
+    with pytest.raises(ValidationError):
+        ContainerRuntimePolicy(**base)
+
+
+def test_network_policy_internal_network_mode_and_effective_field():
+    net = NetworkPolicy(
+        docker_network="actus-sandbox-internal",
+        egress_mode="internal_network",
+        has_https_proxy=False, has_http_proxy=False, has_no_proxy=False,
+        effective_egress_network="actus-sandbox-internal",
+    )
+    assert net.egress_mode == "internal_network"
+    assert net.effective_egress_network == "actus-sandbox-internal"
+
+
+def test_network_policy_effective_egress_network_defaults_none():
+    # Additive default → existing builders need no change; OFF snapshots carry None.
+    assert _net().effective_egress_network is None
+
+
+def test_compiler_version_bumped_to_c5d56():
+    assert COMPILER_VERSION == "c5d56.1"
+
+
+# ---- hash: egress_network is a static rule-set field (must be in fingerprint) #
+def test_container_hash_differs_when_egress_network_changes():
+    a = _container_snapshot(container=_container_hardened(egress_network=None))
+    b = _container_snapshot(container=_container_hardened(egress_network="actus-sandbox-internal"))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
+def test_network_hash_differs_when_egress_mode_changes():
+    # egress_mode flows into the hash via the whole-network include ("network": True).
+    a = _container_snapshot(network=_net())  # unrestricted
+    b = _container_snapshot(network=NetworkPolicy(
+        docker_network="actus-sandbox-internal", egress_mode="internal_network",
+        has_https_proxy=False, has_http_proxy=False, has_no_proxy=False,
+        effective_egress_network="actus-sandbox-internal",
+    ))
+    assert compute_policy_hash(a) != compute_policy_hash(b)
+
+
+# ---- build_settings_view reads the 3 new egress attrs (getattr-defaulted) -- #
+def test_build_settings_view_egress_fields_default_false_and_none():
+    # _FakeSettings lacks the new attrs → getattr defaults.
+    view = build_settings_view(_FakeSettings())
+    assert view.egress_isolation_enabled is False
+    assert view.child_egress_isolation_enabled is False
+    assert view.egress_internal_network is None
+
+
+def test_build_settings_view_reads_egress_fields_and_shifts_hash():
+    class _EgressOff(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_egress_isolation_enabled = False
+        sandbox_egress_internal_network = None
+
+    class _EgressOn(_FakeSettings):
+        sandbox_runtime_hardening_enabled = True
+        sandbox_egress_isolation_enabled = True
+        sandbox_egress_internal_network = "actus-sandbox-internal"
+
+    off = build_settings_view(_EgressOff())
+    on = build_settings_view(_EgressOn())
+    assert off.egress_isolation_enabled is False and on.egress_isolation_enabled is True
+    assert on.egress_internal_network == "actus-sandbox-internal"
+    assert compute_settings_hash(on) != compute_settings_hash(off)

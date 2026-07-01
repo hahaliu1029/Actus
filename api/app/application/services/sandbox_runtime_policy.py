@@ -15,8 +15,15 @@ from app.domain.models.sandbox_policy import (
 from app.domain.services.safety.sandbox_policy_compiler import SandboxPolicyCompiler
 
 
-def compile_runtime_policy(settings) -> ContainerRuntimePolicy | None:
+def compile_runtime_policy(
+    settings, *, worker_type: str = "root"
+) -> ContainerRuntimePolicy | None:
+    # C5d-6: ``worker_type`` (keyword-only) drives per-child egress selection in the
+    # compiler. Default "root" keeps every existing caller (e.g. SkillCreatorService,
+    # F6 root-only) at the unchanged root baseline.
     if not getattr(settings, "sandbox_runtime_hardening_enabled", False):
         return None
     view = build_settings_view(settings)
-    return SandboxPolicyCompiler().compile_container_runtime_policy(view)
+    return SandboxPolicyCompiler().compile_container_runtime_policy(
+        view, worker_type=worker_type
+    )

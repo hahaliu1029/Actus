@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 SCHEMA_VERSION = "c5.sandbox_policy.v1"
-COMPILER_VERSION = "c5d4.1"  # bump on any mapping change (C5d-4: read_only_rootfs emitted in container_config)
+COMPILER_VERSION = "c5d56.1"  # bump on any mapping change (C5d-5/6: egress_network + internal_network egress mode)
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
@@ -76,11 +76,13 @@ class CommandPolicy(BaseModel):  # tool_call only
 class NetworkPolicy(BaseModel):
     model_config = _FROZEN
     docker_network: str | None
-    egress_mode: Literal["unrestricted", "proxy_env", "disabled"]
+    egress_mode: Literal["unrestricted", "proxy_env", "disabled", "internal_network"]
     has_https_proxy: bool
     has_http_proxy: bool
     has_no_proxy: bool
     no_proxy_digest: str | None = None  # sha256(no_proxy) or None — NO raw value
+    # C5d-5/6: the internal network name when egress_mode=="internal_network", else None (honesty).
+    effective_egress_network: str | None = None
 
 
 class MountView(BaseModel):  # sanitized mount descriptor (no host source path)
@@ -98,6 +100,7 @@ class ContainerRuntimePolicy(BaseModel):  # container_create only
     mem_limit: str | None
     run_as_user: str | None
     read_only_rootfs: bool
+    egress_network: str | None  # C5d-5/6: internal egress network (worker-type-selected); None when off
     cap_drop: tuple[str, ...]
     cap_add: tuple[str, ...]  # C5d-2: strict drop-ALL add-back allowlist; () for conservative/unhardened/external
     security_opt: tuple[str, ...]
@@ -138,6 +141,12 @@ class SandboxSettingsView(BaseModel):
     # runtime_hardening_enabled; the compiler consults it only on the hardened docker_run branch
     # (read_only_rootfs=True iff hardening AND this).
     read_only_rootfs_enabled: bool = False
+    # C5d-5/6: egress-isolation tier bits (default False/None → INV-0 unhardened). build_settings_view
+    # fills these from the two egress flags + the internal network name; the compiler pins the network
+    # iff hardening AND (global flag OR (subagent AND child flag)).
+    egress_isolation_enabled: bool = False
+    child_egress_isolation_enabled: bool = False
+    egress_internal_network: str | None = None
 
 
 class ValidationResultView(BaseModel):  # 3-field projection of the real ValidationResult
@@ -261,6 +270,7 @@ def compute_policy_hash(snapshot: SandboxPolicySnapshot) -> str:
                 "mem_limit",
                 "run_as_user",
                 "read_only_rootfs",
+                "egress_network",
                 "cap_drop",
                 "cap_add",
                 "security_opt",
@@ -303,4 +313,9 @@ def build_settings_view(settings) -> SandboxSettingsView:
         strict_caps_enabled=getattr(settings, "sandbox_strict_caps_enabled", False),
         run_as_user_enabled=getattr(settings, "sandbox_run_as_user_enabled", False),
         read_only_rootfs_enabled=getattr(settings, "sandbox_read_only_rootfs_enabled", False),
+        egress_isolation_enabled=getattr(settings, "sandbox_egress_isolation_enabled", False),
+        child_egress_isolation_enabled=getattr(
+            settings, "sandbox_child_egress_isolation_enabled", False
+        ),
+        egress_internal_network=getattr(settings, "sandbox_egress_internal_network", None),
     )

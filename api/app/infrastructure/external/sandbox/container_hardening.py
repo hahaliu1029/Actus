@@ -55,6 +55,13 @@ def container_hardening_kwargs(policy: ContainerRuntimePolicy) -> dict:
         # constant (a caller mutation of container_config["tmpfs"] must not corrupt it).
         kwargs["read_only"] = True
         kwargs["tmpfs"] = dict(_READONLY_TMPFS)
+    if policy.egress_network is not None:
+        # `is not None`, NOT truthy (mirrors run_as_user, codex §6): an empty "" must REACH the
+        # validator (§7.2 rejects it) rather than silently leave the container on the routable base
+        # network (a silent egress leak). Omit-when-None ⇒ OFF byte-identical (INV-0). This
+        # `.update()`s into container_config, overriding the base bridge network (docker_sandbox.py
+        # :232) so the hardened sandbox attaches to the vetted internal egress network instead.
+        kwargs["network"] = policy.egress_network
     return kwargs
 
 
@@ -117,18 +124,38 @@ def _str_list(value, field: str) -> list[str]:
     return list(value)
 
 
-def validate_hardening_config(container_config: dict) -> None:
+def validate_hardening_config(
+    container_config: dict, *, expected_egress_network: str | None = None
+) -> None:
     """Fail-closed guard over the REAL pre-run kwargs (sees privileged/security_opt/
     cap_add as actually assembled). Raises SandboxHardeningConfigError on any escape-
     enabling / malformed config. Scope = the HARDENED path only (the caller invokes it
     ONLY when runtime_policy is not None → INV-0: the OFF path is untouched).
 
-    Bounded (spec §5/§11): guards privileged + the cap kwargs + security_opt; does NOT
-    validate devices / userns_mode / pid_mode / ipc_mode / network_mode=host / cgroupns
-    (the base container_config sets none today; a future slice adding any owns extending
-    this guard and its tests)."""
+    C5d-5/6: ALSO confines the network surface on the hardened path — rejects network_mode (any
+    value, incl. host/none/container:), network_disabled, networking_config, ports,
+    publish_all_ports (Actus never sets these on a hardened sandbox → deny-by-default), and when
+    expected_egress_network is not None requires container_config["network"] to equal it exactly
+    (non-empty). This SUPERSEDES the former 'does not validate network_mode=host' caveat. Still does
+    NOT validate devices / userns_mode / pid_mode / ipc_mode / cgroupns (the base config sets none).
+    """
     if container_config.get("privileged"):
         raise SandboxHardeningConfigError("privileged=True is never allowed for the sandbox")
+    # C5d-5/6 §7.1: network/host-exposure kwargs Actus never sets on a hardened sandbox.
+    if "network_mode" in container_config:
+        raise SandboxHardeningConfigError(
+            f"network_mode is not permitted on a hardened sandbox (egress confinement uses the "
+            f"flat `network` kwarg): {container_config.get('network_mode')!r}")
+    if container_config.get("network_disabled"):
+        raise SandboxHardeningConfigError("network_disabled is not permitted on a hardened sandbox")
+    if "networking_config" in container_config:
+        raise SandboxHardeningConfigError(
+            "networking_config is not permitted on a hardened sandbox (a custom EndpointConfig "
+            "could bypass the internal-network egress confinement)")
+    if "ports" in container_config or container_config.get("publish_all_ports"):
+        raise SandboxHardeningConfigError(
+            "ports / publish_all_ports are not permitted on a hardened sandbox (a hardened sandbox "
+            "must not expose its internal services to the host)")
     cap_add = _str_list(container_config.get("cap_add"), "cap_add")
     cap_drop = _str_list(container_config.get("cap_drop"), "cap_drop")
     security_opt = _str_list(container_config.get("security_opt"), "security_opt")
@@ -213,10 +240,45 @@ def validate_hardening_config(container_config: dict) -> None:
                 raise SandboxHardeningConfigError(
                     f"{_vkey} is not permitted under a read-only rootfs (the vetted carve-out uses "
                     f"only the mounts Mount-list + the /tmp tmpfs): {container_config.get(_vkey)!r}")
+    if expected_egress_network is not None:
+        # C5d-5/6 §7.2: egress mode on → the `network` kwarg must equal the vetted internal network
+        # EXACTLY and be non-empty. Reject an empty expected first (R5 P2): the translator emits
+        # network="" via `is not None`, and without this guard a forged expected=="" would match
+        # container_config["network"]=="" ("" == "") and ACCEPT an empty network.
+        if not expected_egress_network:
+            raise SandboxHardeningConfigError(
+                "expected_egress_network is empty — refusing to confine to an empty network "
+                "(egress mode requires a non-empty vetted internal network name)")
+        actual = container_config.get("network")
+        if actual != expected_egress_network:
+            raise SandboxHardeningConfigError(
+                f"network kwarg {actual!r} does not match the vetted egress network "
+                f"{expected_egress_network!r} (egress confinement, fail-closed)")
+
+
+def verify_egress_network_internal(docker_client, network_name: str) -> None:
+    """C5d-5/6 §8 preflight: the egress network must exist AND be internal=True (Docker did not
+    provision a default external gateway/NAT). `is not True` (strict) so a missing/None/truthy-non-
+    bool Internal fails closed. NECESSARY but not fully SUFFICIENT (does not prove the absence of an
+    egress-proxy peer on the net / host NAT / post-create network.connect — operator
+    responsibilities, spec §13.3). Imports docker locally (infra module; allowed)."""
+    import docker
+
+    try:
+        net = docker_client.networks.get(network_name)
+    except docker.errors.NotFound:
+        raise SandboxHardeningConfigError(
+            f"egress network {network_name!r} does not exist — create it with "
+            f"`docker network create --internal --driver bridge {network_name}` before flipping")
+    if net.attrs.get("Internal") is not True:
+        raise SandboxHardeningConfigError(
+            f"egress network {network_name!r} is not internal=True (external egress would leak); "
+            f"recreate it with --internal")
 
 
 def build_applied_runtime_policy(
     *, container_config: dict, memory_mount, memory_mount_target: str,
+    egress_network: str | None = None,
 ) -> ContainerRuntimePolicy:
     """Build the honest applied ContainerRuntimePolicy from the REAL, fully-assembled
     container_config (read back the merged kwargs) + the real per-bind mount decision.
@@ -235,6 +297,7 @@ def build_applied_runtime_policy(
         mem_limit=container_config.get("mem_limit"),
         run_as_user=container_config.get("user"),  # C5d-3: the real --user (None when OFF)
         read_only_rootfs=bool(container_config.get("read_only", False)),  # C5d-4 populates it
+        egress_network=egress_network,  # C5d-5/6: validator §7.2 already guaranteed cfg["network"]==this
         cap_drop=tuple(container_config.get("cap_drop", ())),
         cap_add=tuple(container_config.get("cap_add", ())),
         security_opt=tuple(container_config.get("security_opt", ())),

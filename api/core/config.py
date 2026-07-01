@@ -206,6 +206,45 @@ class Settings(BaseSettings):
         ),
     )
 
+    # C5d-5 Sandbox egress isolation — pin a hardened sandbox onto an operator-provisioned
+    # internal=True Docker network (no external gateway → no internet egress) while api↔sandbox
+    # L3 connectivity is preserved. A SEPARATE opt-in tier LAYERED UNDER
+    # sandbox_runtime_hardening_enabled (see _egress_isolation_requires_hardening). Default OFF
+    # dark-launch: when OFF the compiler emits egress_network=None → the translator omits the
+    # `network` kwarg → byte-identical container_config (INV-0). The field name itself MUST be an
+    # alias (else Settings(sandbox_egress_isolation_enabled=True) is ignored).
+    sandbox_egress_isolation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_egress_isolation_enabled",
+            "SANDBOX_EGRESS_ISOLATION_ENABLED",
+            "ACTUS_C5_SANDBOX_EGRESS_ISOLATION_ENABLED",
+        ),
+    )
+    # C5d-6 per-child egress selector — isolates ONLY subagent (worker_type=="subagent")
+    # sandboxes (the trust-tiering: untrusted child code runs network-isolated even when root is
+    # unrestricted). Independent of the global flag but still a TIER of hardening (see
+    # _child_egress_requires_hardening). Default OFF dark-launch.
+    sandbox_child_egress_isolation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "sandbox_child_egress_isolation_enabled",
+            "SANDBOX_CHILD_EGRESS_ISOLATION_ENABLED",
+            "ACTUS_C5_SANDBOX_CHILD_EGRESS_ISOLATION_ENABLED",
+        ),
+    )
+    # C5d-5/6 the operator-provisioned internal=True Docker network name. Required (validated) when
+    # EITHER egress flag is on (see _egress_isolation_requires_internal_network) so egress-on never
+    # silently falls back to the routable actus-net. None when egress is off.
+    sandbox_egress_internal_network: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "sandbox_egress_internal_network",
+            "SANDBOX_EGRESS_INTERNAL_NETWORK",
+            "ACTUS_C5_SANDBOX_EGRESS_INTERNAL_NETWORK",
+        ),
+    )
+
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 
@@ -457,6 +496,54 @@ class Settings(BaseSettings):
                 "sandbox_read_only_rootfs_enabled requires sandbox_runtime_hardening_enabled "
                 "(read-only rootfs is a tier of runtime hardening; enabling it alone would emit "
                 "no --read-only and apply NO hardening)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _egress_isolation_requires_hardening(self) -> "Settings":
+        # C5d-5 INV-7 (fail-closed): egress isolation is a TIER of runtime hardening.
+        # compile_runtime_policy returns None when hardening is OFF, so egress-alone would apply NO
+        # hardening AND no network pin → a false sense of isolation. Fail fast at construction.
+        # Mode-INDEPENDENT (NOT gated on sandbox_address): a contradictory security config must
+        # never be silently accepted, even in external mode. NO env=="test" escape —
+        # config-consistency, not a secret check.
+        if self.sandbox_egress_isolation_enabled and not self.sandbox_runtime_hardening_enabled:
+            raise ValueError(
+                "sandbox_egress_isolation_enabled requires sandbox_runtime_hardening_enabled "
+                "(egress isolation is a tier of runtime hardening; enabling it alone would apply "
+                "NO hardening and pin no network)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _child_egress_requires_hardening(self) -> "Settings":
+        # C5d-6 INV-7 (fail-closed): the per-child selector is independent of the global flag but
+        # still a tier of hardening (same rationale as _egress_isolation_requires_hardening).
+        if (
+            self.sandbox_child_egress_isolation_enabled
+            and not self.sandbox_runtime_hardening_enabled
+        ):
+            raise ValueError(
+                "sandbox_child_egress_isolation_enabled requires "
+                "sandbox_runtime_hardening_enabled (the per-child egress selector is a tier of "
+                "runtime hardening; enabling it alone would apply NO hardening and pin no network)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _egress_isolation_requires_internal_network(self) -> "Settings":
+        # C5d-5/6 INV-EG2 (fail-closed, codex Q3): egress-on without an internal network name must
+        # NOT silently fall back to the routable actus-net (F3). Fires when EITHER egress flag is on
+        # and the network name is empty/None. Mode-INDEPENDENT. NO env=="test" escape.
+        if (
+            self.sandbox_egress_isolation_enabled
+            or self.sandbox_child_egress_isolation_enabled
+        ) and not self.sandbox_egress_internal_network:
+            raise ValueError(
+                "sandbox_egress_isolation_enabled / sandbox_child_egress_isolation_enabled "
+                "requires sandbox_egress_internal_network to be set (egress-on must NOT silently "
+                "fall back to the routable actus-net; provide the operator-provisioned "
+                "internal=True network name)."
             )
         return self
 
