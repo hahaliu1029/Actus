@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import docker
 import pytest
 
 from app.domain.models.sandbox_policy import ContainerRuntimePolicy, MountView
@@ -35,7 +36,6 @@ class _FakeNetworks:
         self._raise = raise_not_found
 
     def get(self, name):
-        import docker
         if self._raise:
             raise docker.errors.NotFound(f"no such network {name}")
         return _FakeNetwork(self._internal)
@@ -568,7 +568,7 @@ def _egress_policy() -> ContainerRuntimePolicy:
     )
 
 
-def test_egress_on_emits_network_and_builds_applied(captured_kwargs, monkeypatch):
+def test_egress_on_emits_network_and_builds_applied(monkeypatch):
     sink: dict = {}
     _patch_client(monkeypatch, sink, internal=True)
     _patch_settings(monkeypatch)

@@ -68,11 +68,23 @@ def test_child_egress_flag_parses_via_screaming_alias():
     assert s.sandbox_child_egress_isolation_enabled is True
 
 
+def test_child_egress_flag_parses_via_actus_alias():
+    # Mirror of test_global_egress_flag_parses_via_actus_alias: a typo in the child flag's
+    # ACTUS_C5_ alias (config.py AliasChoices) would otherwise go uncaught.
+    s = Settings(
+        env="test",
+        ACTUS_C5_SANDBOX_RUNTIME_HARDENING_ENABLED=True,
+        ACTUS_C5_SANDBOX_CHILD_EGRESS_ISOLATION_ENABLED=True,
+        ACTUS_C5_SANDBOX_EGRESS_INTERNAL_NETWORK="actus-sandbox-internal",
+    )
+    assert s.sandbox_child_egress_isolation_enabled is True
+
+
 # ---- _egress_isolation_requires_hardening (global) ------------------------ #
 def test_global_egress_without_hardening_raises():
     # INV-7 fail-closed: egress-alone would apply NO hardening (compile_runtime_policy
     # returns None when hardening off) → false sense of isolation.
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="sandbox_egress_isolation_enabled requires"):
         Settings(
             env="test",
             sandbox_egress_isolation_enabled=True,
@@ -82,7 +94,7 @@ def test_global_egress_without_hardening_raises():
 
 def test_global_egress_without_hardening_raises_even_in_external_mode():
     # Mode-INDEPENDENT: a contradictory security config is never silently accepted.
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="sandbox_egress_isolation_enabled requires"):
         Settings(
             env="test",
             sandbox_egress_isolation_enabled=True,
@@ -93,7 +105,7 @@ def test_global_egress_without_hardening_raises_even_in_external_mode():
 
 # ---- _child_egress_requires_hardening ------------------------------------- #
 def test_child_egress_without_hardening_raises():
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="sandbox_child_egress_isolation_enabled requires"):
         Settings(
             env="test",
             sandbox_child_egress_isolation_enabled=True,
@@ -105,7 +117,7 @@ def test_child_egress_without_hardening_raises():
 def test_global_egress_on_without_network_name_raises():
     # INV-EG2: egress-on with no network name must NOT silently fall back to the
     # routable actus-net — fail fast at construction.
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="requires sandbox_egress_internal_network to be set"):
         Settings(
             env="test",
             sandbox_runtime_hardening_enabled=True,
@@ -114,7 +126,7 @@ def test_global_egress_on_without_network_name_raises():
 
 
 def test_child_egress_on_without_network_name_raises():
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="requires sandbox_egress_internal_network to be set"):
         Settings(
             env="test",
             sandbox_runtime_hardening_enabled=True,

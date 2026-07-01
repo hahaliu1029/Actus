@@ -48,7 +48,7 @@ def test_internal_network_blocks_direct_ip_egress():
     try:
         # internal=True → external egress blocked (bounded-fail, NOT "OK"). PYTHON_ALPINE_IMAGE
         # ("python:3.12-alpine") ships python3 so the `python3 -c` probe runs.
-        code, out, _ = run_container_probe(
+        _code, out, _ = run_container_probe(
             client, PYTHON_ALPINE_IMAGE, ["python3", "-c", _EGRESS_PROBE],
             container_kwargs={"network": net.name}, timeout=30,
         )
@@ -65,7 +65,7 @@ def test_non_internal_network_allows_direct_ip_egress_teeth():
     _require_image(client, PYTHON_ALPINE_IMAGE)
     net = _new_network(client, internal=False)
     try:
-        code, out, _ = run_container_probe(
+        _code, out, _ = run_container_probe(
             client, PYTHON_ALPINE_IMAGE, ["python3", "-c", _EGRESS_PROBE],
             container_kwargs={"network": net.name}, timeout=30,
         )
@@ -103,7 +103,7 @@ def test_internal_network_intra_peer_reachable():
             f"except OSError as e:\n"
             f"    print('PEER_FAIL:'+str(getattr(e,'errno','?')))\n"
         )
-        code, out, _ = run_container_probe(
+        _code, out, _ = run_container_probe(
             client, PYTHON_ALPINE_IMAGE, ["python3", "-c", probe],
             container_kwargs={"network": net.name}, timeout=30,
         )

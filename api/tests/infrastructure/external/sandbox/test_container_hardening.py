@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import docker
+import pytest
+
 from app.domain.models.sandbox_policy import ContainerRuntimePolicy, MountView
 from app.infrastructure.external.sandbox.container_hardening import (
+    SandboxHardeningConfigError,
     build_applied_runtime_policy,
     container_hardening_kwargs,
+    validate_hardening_config,
+    verify_egress_network_internal,
 )
 
 
@@ -159,15 +165,6 @@ def test_read_only_round_trip_translator_to_applied():
 
 
 # ---- C5d-5/6: validator network rejections (always-on, hardened path) ------ #
-import pytest
-
-from app.infrastructure.external.sandbox.container_hardening import (
-    SandboxHardeningConfigError,
-    validate_hardening_config,
-    verify_egress_network_internal,
-)
-
-
 @pytest.mark.parametrize("bad", [
     {"network_mode": "host"},
     {"network_mode": "none"},
@@ -235,7 +232,6 @@ class _FakeNetworks:
         self._raise = raise_not_found
 
     def get(self, name):
-        import docker
         if self._raise:
             raise docker.errors.NotFound(f"no such network {name}")
         return self._net
