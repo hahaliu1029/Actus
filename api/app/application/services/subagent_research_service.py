@@ -39,6 +39,7 @@ from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.external.supervisor_registry import SupervisorRegistryPort
 from app.domain.models.event import BaseEvent
 from app.domain.models.session import Session
+from app.domain.repositories.subagent_run_repository import SubagentRunRepository
 from app.domain.services.execution_supervisor import ExecutionSupervisor
 from app.domain.services.graphs.token_estimator import TokenEstimator
 from app.domain.services.prompts.subagent_summary_join import (
@@ -100,6 +101,7 @@ class SubagentResearchService:
         *,
         supervisor_registry: Optional[SupervisorRegistryPort] = None,
         mailbox_publisher: Optional[MailboxPublisher] = None,
+        subagent_run_repo: Optional[SubagentRunRepository] = None,
     ) -> None:
         self._session_service = session_service
         self._agent_service = agent_service
@@ -109,6 +111,9 @@ class SubagentResearchService:
         self._classifier = classifier
         self._sandbox_lifecycle_service = sandbox_lifecycle_service
         self._quota_service = quota_service
+        # [C4.1a §5.2] Optional subagent-run observation sink. None on flag-OFF
+        # (repo-or-None at the composition root) → _record_child_run no-ops.
+        self._subagent_run_repo = subagent_run_repo
         # codex r3 [R3-3, HIGH ARCH] — set of child IDs whose
         # SPAWN_REQUEST publish actually succeeded during the most
         # recent ``_ensure_supervisor_and_publish_spawns`` invocation.
@@ -140,6 +145,40 @@ class SubagentResearchService:
         # ``mailbox_publisher`` to actually XADD the envelopes.
         self._supervisor_registry = supervisor_registry
         self._mailbox_publisher = mailbox_publisher
+
+    async def _record_child_run(self, result: ChildResult, parent_id: str) -> None:
+        """[C4.1a §5.2] best-effort 投影 + 持久化一条 research child run。
+
+        MUST 在每个 ``yield ChildDoneEvent`` **之前**调用（R1#P2：generator 的
+        post-yield 代码在 client 断开时不执行 → 会丢记录）。record 失败 swallow，
+        不影响 ChildDoneEvent 流 / summary join / metric（INV-C4.1-2）。
+        """
+        if self._subagent_run_repo is None:
+            return
+        try:
+            # lazy import（INV-C4.1-1：projector 仅 flag-ON 路径 import；镜像 Task 7）。
+            # 放在 try 内 —— import 失败也 swallow，best-effort 不破坏 ChildDoneEvent
+            # 流（codex R1 P2：与 coordinator seat 的 try-内 lazy import 对齐）。
+            from app.application.services.subagent_worker_projection import (
+                project_research_result,
+            )
+            run = project_research_result(
+                child_id=result.child_id,
+                outcome=result.outcome,
+                final_answer=result.final_answer,
+                transcript_tokens=result.transcript_tokens,
+                error_summary=result.error_summary,
+                parent_session_id=parent_id,
+                child_session_id=result.child_id,
+            )
+            await self._subagent_run_repo.record(run)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort subagent-run record
+            logger.exception(
+                "subagent_run record failed child=%s — probe continues",
+                result.child_id,
+            )
 
     async def _consume_child(
         self, child_session_id: str, user_id: str, prompt: str,
@@ -765,22 +804,22 @@ class SubagentResearchService:
                         "(orphan window until reconcile / pod restart)",
                         child.id,
                     )
-                    completed_results.append(
-                        ChildResult(
-                            child_id=child.id,
-                            prompt=prompt,
-                            outcome=ChildOutcome.FAILED,
-                            final_answer=None,
-                            transcript_tokens=0,
-                            error_summary=(
-                                "internal: mailbox→legacy rollback failed; "
-                                "child runner skipped to avoid publishing "
-                                "terminal envelopes against a non-existent "
-                                "supervisor handoff (orphan window until "
-                                "reconcile)"
-                            ),
-                        )
+                    rr = ChildResult(
+                        child_id=child.id,
+                        prompt=prompt,
+                        outcome=ChildOutcome.FAILED,
+                        final_answer=None,
+                        transcript_tokens=0,
+                        error_summary=(
+                            "internal: mailbox→legacy rollback failed; "
+                            "child runner skipped to avoid publishing "
+                            "terminal envelopes against a non-existent "
+                            "supervisor handoff (orphan window until "
+                            "reconcile)"
+                        ),
                     )
+                    completed_results.append(rr)
+                    await self._record_child_run(rr, parent_id)  # [C4.1a §5.2] BEFORE yield
                     yield ChildDoneEvent(
                         id=f"done-{child.id}",
                         probe_run_id=probe_run_id,
@@ -834,6 +873,7 @@ class SubagentResearchService:
                 for done_task in asyncio.as_completed(tasks):
                     result = await done_task
                     completed_results.append(result)
+                    await self._record_child_run(result, parent_id)  # [C4.1a §5.2] BEFORE yield
                     yield ChildDoneEvent(
                         id=f"done-{result.child_id}",
                         probe_run_id=probe_run_id,

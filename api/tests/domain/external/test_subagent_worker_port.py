@@ -10,6 +10,8 @@ import pytest
 
 import app.domain.external.subagent_worker as _c4_port_mod
 import app.domain.models.subagent_worker as _c4_models_mod
+import app.domain.models.subagent_run_record as _c41a_record_mod
+import app.domain.repositories.subagent_run_repository as _c41a_repo_mod
 from app.domain.external.subagent_worker import SubagentWorker
 from app.domain.models.subagent_worker import (
     SubagentRunResult,
@@ -64,7 +66,10 @@ def _import_allowed(module: str) -> bool:
     return module.startswith("app.domain.")
 
 
-@pytest.mark.parametrize("module", [_c4_models_mod, _c4_port_mod])
+@pytest.mark.parametrize(
+    "module",
+    [_c4_models_mod, _c4_port_mod, _c41a_record_mod, _c41a_repo_mod],
+)
 def test_c4_domain_file_is_pure(module) -> None:
     """C4 domain 文件顶层 import 仅许 stdlib + pydantic + langchain/langgraph +
     同层 app.domain.*；且全文件无 fastapi/sqlalchemy（含 lazy import）。

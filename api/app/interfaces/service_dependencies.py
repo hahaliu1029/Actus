@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from app.application.services.agent_service import AgentService
 from app.application.services.app_config_service import AppConfigService
@@ -39,6 +39,7 @@ from app.domain.models.app_config import LLMConfig, SkillRiskPolicy
 from app.domain.repositories.coordinator_result_envelope_store_repository import (
     CoordinatorResultEnvelopeStoreRepository,
 )
+from app.domain.repositories.subagent_run_repository import SubagentRunRepository
 from app.application.services.agent_service import _ConfigSnapshot
 from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
 from app.infrastructure.external.llm.actus_responses_model import ActusResponsesModel
@@ -727,6 +728,10 @@ def build_supervisor_registry(
         session_factory=pg_session_factory,
     )
 
+    # [C4.1a §5.1] repo-or-None：flag OFF → None（不构造 → 两 seat 门跳过 → INV-0）。
+    # repo stateless → 建一次复用（match supervisor_session_repo）。
+    subagent_run_repo = get_subagent_run_repository(settings_local)
+
     def _factory(root_session_id: str) -> MailboxSupervisor:
         # [C2 deferred wiring -- PR-9 composition root]
         # The following SupervisorContext-adjacent emit hooks remain
@@ -786,6 +791,10 @@ def build_supervisor_registry(
             # tests that construct contexts without DI still work.
             coordinator_envelope_store=coordinator_envelope_store,
             cost_rollup_service=cost_rollup_service,
+            # [C4.1a §5.1] subagent-run observation sink (repo-or-None built once
+            # in the outer scope; None on flag-OFF → ResultReadyHandler's third
+            # PROLOGUE gate skips → byte-identical, INV-C4.1-1).
+            subagent_run_repo=subagent_run_repo,
         )
         return MailboxSupervisor(
             ctx,
@@ -1992,6 +2001,21 @@ def get_cost_record_repository(
     return DbCostRecordRepository(db_session)
 
 
+def get_subagent_run_repository(settings_obj) -> Optional[SubagentRunRepository]:
+    """C4.1a repo-or-None（spec §5.0）。
+
+    flag OFF → None（不 import infra 实现、不 touch DB）；ON → DbSubagentRunRepository
+    持 get_postgres().session_factory。**不是** FastAPI Depends（会在查 flag 前
+    eager resolve）——由 coordinator _factory / research DI 显式调用。
+    """
+    if not settings_obj.subagent_run_record_enabled:
+        return None
+    from app.infrastructure.repositories.db_subagent_run_repository import (
+        DbSubagentRunRepository,
+    )
+    return DbSubagentRunRepository(session_factory=get_postgres().session_factory)
+
+
 def get_cost_aggregation_service(
     db_session: AsyncSession = Depends(get_db_session),
 ):
@@ -2219,4 +2243,6 @@ def get_subagent_research_service(
         # thin Redis wrapper).
         supervisor_registry=supervisor_registry,
         mailbox_publisher=mailbox_publisher,
+        # C4.1a PR-4 — research subagent-run observation sink. flag OFF → None.
+        subagent_run_repo=get_subagent_run_repository(settings),
     )

@@ -245,6 +245,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    # C4.1a subagent-run 持久化观测面 — 灰度开关（default OFF dark-launch）。
+    # 在装配根读：ON → 注入 DbSubagentRunRepository；OFF → 注入 None（repo-or-None，
+    # 见 spec §5.0）。OFF 时两个 application seat 的 `is not None` 门跳过 → 无投影 /
+    # 无 DB I/O → 行为字节等价（INV-C4.1-1 / INV-0）。字段名本身必须是 alias
+    # （否则 Settings(subagent_run_record_enabled=True) 被忽略）。
+    subagent_run_record_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "subagent_run_record_enabled",
+            "SUBAGENT_RUN_RECORD_ENABLED",
+            "ACTUS_C4_SUBAGENT_RUN_RECORD_ENABLED",
+        ),
+    )
+
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 

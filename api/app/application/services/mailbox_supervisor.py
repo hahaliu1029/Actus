@@ -64,6 +64,7 @@ from app.domain.models.mailbox_envelope import (
     MailboxEnvelope,
     MailboxEnvelopeType,
     ProducerRole,
+    ResultReadyPayload,
 )
 from app.domain.models.session import DestroyReason
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
@@ -71,6 +72,7 @@ from app.domain.repositories.mailbox_envelope_audit_repository import (
     MailboxEnvelopeAuditRepository,
 )
 from app.domain.repositories.session_repository import SessionRepository
+from app.domain.repositories.subagent_run_repository import SubagentRunRepository
 from app.infrastructure.external.mailbox.redis_mailbox_consumer import (
     RedisMailboxConsumer,
 )
@@ -271,6 +273,13 @@ class SupervisorContext:
     coordinator_envelope_store: Optional[
         "CoordinatorResultEnvelopeStoreRepository"
     ] = None
+    # [C4.1a §5.1] Optional subagent-run observation sink. ``None`` on legacy /
+    # flag-OFF contexts (repo-or-None at the composition root). ``ResultReadyHandler``
+    # fires a THIRD independent best-effort PROLOGUE for ``coordinator_step``
+    # children (own gate / own get_by_id fetch / own try-except — does NOT reuse
+    # the cost-rollup or persist-terminal fetch, mirroring their independence).
+    # A record failure MUST NOT abort destroy + audit; the handler swallows.
+    subagent_run_repo: Optional[SubagentRunRepository] = None
 
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -619,6 +628,51 @@ class ResultReadyHandler:
                     logger.exception(
                         "result_ready persist_terminal failed envelope=%s "
                         "child_session=%s — destroy continues",
+                        envelope.envelope_id,
+                        envelope.child_session_id,
+                    )
+
+            # [C4.1a §5.1] subagent_run record PROLOGUE — THIRD independent,
+            # best-effort. Own gate + own get_by_id fetch + own try/except
+            # (does NOT reuse the cost-rollup / persist-terminal child_session —
+            # independence keeps one prologue's failure from poisoning the next).
+            # Gate: subagent_run_repo AND session_repo wired (repo-or-None means
+            # None on flag-OFF → silent skip → byte-identical, INV-C4.1-1). Only
+            # coordinator_step children with full lineage are recorded; research
+            # children are recorded by the research seat (§5.0.1 preset-disjoint).
+            if ctx.subagent_run_repo is not None and ctx.session_repo is not None:
+                try:
+                    child_session = await ctx.session_repo.get_by_id(
+                        envelope.child_session_id
+                    )
+                    if (
+                        child_session is not None
+                        and child_session.tool_filter_preset == COORDINATOR_STEP_PRESET
+                        and child_session.coordinator_run_id is not None
+                        and child_session.work_unit_id is not None
+                        and child_session.parent_session_id is not None
+                    ):
+                        from app.application.services.subagent_worker_projection import (
+                            project_local_result,
+                        )
+                        payload = (
+                            envelope.payload
+                            if isinstance(envelope.payload, dict)
+                            else {}
+                        )
+                        run = project_local_result(
+                            ResultReadyPayload.model_validate(payload),
+                            parent_session_id=child_session.parent_session_id,
+                            child_session_id=envelope.child_session_id,
+                            work_unit_id=child_session.work_unit_id,
+                        )
+                        await ctx.subagent_run_repo.record(run)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — best-effort subagent-run record
+                    logger.exception(
+                        "subagent_run record failed envelope=%s child_session=%s "
+                        "— destroy continues",
                         envelope.envelope_id,
                         envelope.child_session_id,
                     )
