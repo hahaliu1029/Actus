@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 
 import { ChatInput } from "@/components/chat-input";
+import { AgentTreePanel } from "@/components/session/agent-tree-panel";
+import { MergedTimelinePanel } from "@/components/session/merged-timeline-panel";
 import { CompactionFoldIndicator } from "@/components/session/compaction-fold-indicator";
 import { CoordinatorTimelineItem } from "@/components/session/coordinator-timeline-item";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
@@ -55,6 +57,7 @@ import {
   normalizeMessageAttachments,
 } from "@/lib/session-ui";
 import { getSessionStatusMeta } from "@/lib/status-copy";
+import { t } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
 import { useSessionStore } from "@/lib/store/session-store";
@@ -788,6 +791,24 @@ export default function SessionPage() {
   const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
   const isChatting = useSessionStore((state) => state.isChatting);
   const chatSessionId = useSessionStore((state) => state.chatSessionId);
+  const loadAgentTree = useSessionStore((state) => state.loadAgentTree);
+  const refreshAgentTree = useSessionStore((state) => state.refreshAgentTree);
+  const resetAgentTree = useSessionStore((state) => state.resetAgentTree);
+  const loadMergedTimeline = useSessionStore((state) => state.loadMergedTimeline);
+  const pollActiveAgents = useSessionStore((state) => state.pollActiveAgents);
+  const hasSubagents = useSessionStore(
+    (state) => (state.agentTree.root?.children.length ?? 0) > 0,
+  );
+  // Stable signature of the descendant set — changes when a child is added/removed OR changes
+  // status, so the merged-view effect re-fetches new children AND captures a child's final events
+  // when it reaches a terminal status (a terminal child is skipped by the incremental poll, so the
+  // status flip must trigger a fresh loadMergedTimeline rebuild) while the view is open (R2 P2).
+  const descendantKey = useSessionStore((state) =>
+    Object.values(state.agentTree.byId)
+      .map((n) => `${n.sessionId}:${n.status}`)
+      .sort()
+      .join(","),
+  );
   const setMessage = useUIStore((state) => state.setMessage);
   const addTransferTask = useTransferStore((s) => s.addTask);
   const updateTransferProgress = useTransferStore((s) => s.updateProgress);
@@ -812,6 +833,7 @@ export default function SessionPage() {
   } | null>(null);
   const [desktopWorkbenchVisible, setDesktopWorkbenchVisible] = useState(true);
   const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
+  const [showMerged, setShowMerged] = useState(false);
 
   const eventScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -852,6 +874,46 @@ export default function SessionPage() {
     }
     return currentSession;
   }, [currentSession, sessionId]);
+
+  // C6a: reset the agent tree when leaving/switching this session.
+  useEffect(() => {
+    return () => resetAgentTree();
+  }, [visibleSession?.session_id, resetAgentTree]);
+
+  useEffect(() => {
+    const id = visibleSession?.session_id;
+    if (!id) {
+      return;
+    }
+    // Load for the CURRENT status — this is ALSO the final load when terminal, capturing the
+    // children's terminal statuses instead of freezing them at their last polled value (R3 P2).
+    void loadAgentTree(id);
+    const terminal =
+      visibleSession?.status === "completed" || visibleSession?.status === "timed_out";
+    if (terminal) {
+      return;
+    }
+    const timer = setInterval(() => {
+      void refreshAgentTree(id);
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [visibleSession?.session_id, visibleSession?.status, loadAgentTree, refreshAgentTree]);
+
+  // C6c: when the merged view is open, fetch descendant events once and poll the
+  // non-terminal ones on a bounded interval (§4.3). Keyed on the stable id + showMerged.
+  useEffect(() => {
+    const readyId = visibleSession?.session_id;
+    if (!showMerged || !readyId) {
+      return;
+    }
+    // `descendantKey` in the deps re-runs this when a child is added while the merged
+    // view is open, so loadMergedTimeline (fresh rebuild) fetches the new child (R2 P2).
+    void loadMergedTimeline(readyId);
+    const timer = setInterval(() => {
+      void pollActiveAgents(readyId);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [showMerged, visibleSession?.session_id, descendantKey, loadMergedTimeline, pollActiveAgents]);
 
   const eventList = useMemo(() => {
     return (visibleSession?.events || []) as SessionEvent[];
@@ -1451,6 +1513,19 @@ export default function SessionPage() {
             </div>
           ) : null}
 
+          <AgentTreePanel />
+          {hasSubagents ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowMerged((v) => !v)}
+                className="self-start rounded-md border border-border px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-accent"
+              >
+                {showMerged ? t("mergedTimeline.hide") : t("mergedTimeline.show")}
+              </button>
+              {showMerged ? <MergedTimelinePanel /> : null}
+            </>
+          ) : null}
           <div ref={eventScrollRef} className="flex-1 space-y-0 overflow-y-auto pb-4">
             {eventList.length === 0 ? (
               <div className="rounded-2xl border border-border bg-card p-3 text-sm text-muted-foreground">

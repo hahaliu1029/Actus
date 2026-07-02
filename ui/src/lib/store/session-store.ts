@@ -22,6 +22,26 @@ import type { CompactionListItem } from "@/types/session-compaction";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
 import { normalizeSessionStatus } from "@/lib/utils/session-status";
+import {
+  assignAgentColors,
+  buildTree,
+  countToolCalls,
+  flattenTree,
+  mergeAgentTimelines,
+  type AgentEventBundle,
+  type AgentTreeNode,
+  type MergedTimelineItem,
+} from "@/lib/agent-tree";
+import {
+  asRecord,
+  eventIdOf,
+  eventSemanticKey,
+  normalizeSessionEvents,
+  pruneRecoveredLLMErrors,
+  syncPlanStepsByStepEvent,
+  upsertSessionEvent,
+  type SessionEventRecord,
+} from "@/lib/event-normalize";
 
 // ---------------------------------------------------------------------------
 // Phase 1 minimal subagent research — probe state slice
@@ -62,11 +82,18 @@ type SessionState = {
   sessionsAbort: (() => void) | null;
   _isRecovering: boolean;
   probeState: ProbeState;
+  agentTree: AgentTreeState;
 };
 
 type SessionActions = {
   reset: () => void;
   setActiveSession: (sessionId: string | null) => void;
+  loadAgentTree: (sessionId: string) => Promise<void>;
+  refreshAgentTree: (sessionId: string) => Promise<void>;
+  resetAgentTree: () => void;
+  loadNodeCost: (childId: string) => Promise<void>;
+  loadMergedTimeline: (sessionId: string) => Promise<void>;
+  pollActiveAgents: (sessionId: string) => Promise<void>;
   isSessionStreaming: (sessionId: string) => boolean;
   getSessionStatus: (sessionId: string) => Session["status"] | null;
   fetchSessions: () => Promise<void>;
@@ -116,10 +143,69 @@ type SessionActions = {
 
 type SessionStore = SessionState & SessionActions;
 
-export type SessionEventRecord = {
-  event: string;
-  data: Record<string, unknown>;
+// Re-export so existing importers (session-recovery.test.ts, session-mode-changed.test.ts) keep working.
+export type { SessionEventRecord };
+
+export type AgentTreeState = {
+  rootId: string | null;
+  root: AgentTreeNode | null;
+  byId: Record<string, AgentTreeNode>;
+  treeSignature: string | null; // structural signature → loadAgentTree skips no-op updates (R3 P3)
+  loadSeq: number;              // monotonic load token → an older in-flight load can't clobber a newer one (R4 P2)
+  mergeSeq: number;             // monotonic token for eventsByAgent writes (loadMergedTimeline/pollActiveAgents) (R5 P2)
+  truncated: boolean;
+  loading: boolean;
+  error: string | null;
+  lastFetchedAt: number | null;
+  // C6b: per-node fetched cost snapshot (decimal string), keyed by session id.
+  costById: Record<string, { totalUsd: string; status: string } | null>;
+  // C6c: descendant event bundles (root events come from currentSession, INV-10).
+  eventsByAgent: Record<
+    string,
+    { events: SessionEventRecord[]; lastSeq: number | null; lastEventId: string | null }
+  >;
+  agentColors: Record<string, string>;
+  mergeLoading: boolean;
 };
+
+const initialAgentTree: AgentTreeState = {
+  rootId: null,
+  root: null,
+  byId: {},
+  treeSignature: null,
+  loadSeq: 0,
+  mergeSeq: 0,
+  truncated: false,
+  loading: false,
+  error: null,
+  lastFetchedAt: null,
+  costById: {},
+  eventsByAgent: {},
+  agentColors: {},
+  mergeLoading: false,
+};
+
+// Structural signature of the tree (per node: id + lineage + status + title + timestamps +
+// role). loadAgentTree compares it so a 4s refresh with no real change keeps root/byId object
+// identities stable — preventing the derived selectors (useMergedTimeline) and the cost effect
+// from churning every poll (R3 P3). JSON.stringify each node so null / "" / undefined are
+// DISTINCT (a plain join collapses null and "" to the same segment — R4 P3).
+function agentTreeSignature(byId: Record<string, AgentTreeNode>): string {
+  return Object.values(byId)
+    .map((n) =>
+      JSON.stringify([
+        n.sessionId,
+        n.parentSessionId,
+        n.status,
+        n.title,
+        n.createdAt,
+        n.updatedAt,
+        n.role,
+      ]),
+    )
+    .sort()
+    .join("\n");
+}
 
 const initialProbeState: ProbeState = {
   running: false,
@@ -143,13 +229,8 @@ const initialState: SessionState = {
   sessionsAbort: null,
   _isRecovering: false,
   probeState: initialProbeState,
+  agentTree: initialAgentTree,
 };
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)
-    : {};
-}
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -484,96 +565,6 @@ function applySSEToSession(session: Session, event: SSEEventData): Session {
 // production code — the `__test_` prefix marks this as a test-time API.
 export const __test_applySSEToSession = applySSEToSession;
 
-function eventSemanticKey(event: SessionEventRecord): string | null {
-  if (event.event === "message") {
-    const streamId = event.data?.stream_id;
-    if (typeof streamId === "string" && streamId.trim()) {
-      return `message:${streamId}`;
-    }
-  }
-
-  if (event.event === "plan") {
-    return "plan:latest";
-  }
-
-  if (event.event === "tool") {
-    const toolCallId = event.data?.tool_call_id;
-    if (typeof toolCallId === "string" && toolCallId.trim()) {
-      return `tool:${toolCallId}`;
-    }
-  }
-
-  if (event.event === "step") {
-    const stepId = event.data?.id;
-    if (typeof stepId === "string" && stepId.trim()) {
-      return `step:${stepId}`;
-    }
-  }
-
-  if (event.event === "tool_confirmation") {
-    const toolCallId = event.data?.tool_call_id;
-    if (typeof toolCallId === "string" && toolCallId.trim()) {
-      return `tool_confirmation:${toolCallId}`;
-    }
-    const eventId = event.data?.event_id;
-    if (typeof eventId === "string" && eventId.trim()) {
-      return `tool_confirmation:${eventId}`;
-    }
-  }
-
-  if (event.event === "compaction") {
-    const compactionId = event.data?.compaction_id;
-    if (typeof compactionId === "string" && compactionId.trim()) {
-      return `compaction:${compactionId}`;
-    }
-    // Legacy pre-B6 event with no compaction_id — fall through to event_id
-  }
-
-  const eventId = eventIdOf(event);
-  if (eventId) {
-    return `event:${eventId}`;
-  }
-
-  return null;
-}
-
-function upsertSessionEvent(
-  events: SessionEventRecord[],
-  nextEvent: SessionEventRecord
-): SessionEventRecord[] {
-  const nextKey = eventSemanticKey(nextEvent);
-  if (!nextKey) {
-    return [...events, nextEvent];
-  }
-
-  const existingIndex = events.findIndex(
-    (item) => eventSemanticKey(item) === nextKey
-  );
-  if (existingIndex < 0) {
-    return [...events, nextEvent];
-  }
-
-  const updated = [...events];
-  updated[existingIndex] = nextEvent;
-  return updated;
-}
-
-function normalizeSessionEvents(
-  events: SessionEventRecord[]
-): SessionEventRecord[] {
-  let normalized: SessionEventRecord[] = [];
-  events.forEach((event) => {
-    if (event.event === "title") {
-      return;
-    }
-    normalized = upsertSessionEvent(normalized, event);
-    if (event.event === "step") {
-      normalized = syncPlanStepsByStepEvent(normalized, event);
-    }
-  });
-  return pruneRecoveredLLMErrors(normalized);
-}
-
 function pickTitle(session: Session): string | null {
   if (session.title) {
     return session.title;
@@ -583,61 +574,6 @@ function pickTitle(session: Session): string | null {
     .find((item) => item.event === "title");
   const title = titleEvent?.data?.title;
   return typeof title === "string" ? title : null;
-}
-
-function syncPlanStepsByStepEvent(
-  events: SessionEventRecord[],
-  stepEvent: SessionEventRecord
-): SessionEventRecord[] {
-  const stepId = stepEvent.data?.id;
-  if (typeof stepId !== "string" || !stepId) {
-    return events;
-  }
-
-  const planIndex = [...events]
-    .map((item, index) => ({ item, index }))
-    .reverse()
-    .find(({ item }) => item.event === "plan")?.index;
-
-  if (planIndex === undefined) {
-    return events;
-  }
-
-  const planEvent = events[planIndex];
-  const rawSteps = planEvent.data?.steps;
-  if (!Array.isArray(rawSteps)) {
-    return events;
-  }
-
-  const nextSteps = rawSteps.map((rawStep) => {
-    const step = asRecord(rawStep);
-    if (String(step.id || "") !== stepId) {
-      return step;
-    }
-    return {
-      ...step,
-      status: stepEvent.data.status || step.status,
-      description: stepEvent.data.description || step.description,
-    };
-  });
-
-  const nextEvents = [...events];
-  nextEvents[planIndex] = {
-    ...planEvent,
-    data: {
-      ...planEvent.data,
-      steps: nextSteps,
-    },
-  };
-  return nextEvents;
-}
-
-function eventIdOf(event: SessionEventRecord): string | null {
-  const eventId = event.data?.event_id;
-  if (typeof eventId === "string" && eventId.trim()) {
-    return eventId;
-  }
-  return null;
 }
 
 function eventSeqOf(event: SessionEventRecord): number | null {
@@ -971,54 +907,6 @@ function updateSessionListStatus(
   return changed ? next : sessions;
 }
 
-function isRecoverableLLMErrorEvent(event: SessionEventRecord): boolean {
-  if (event.event !== "error") {
-    return false;
-  }
-  const text = String(event.data?.error || "");
-  if (!text) {
-    return false;
-  }
-  return (
-    text.includes("调用语言模型失败") ||
-    text.includes("调用OpenAI客户端向LLM发起请求出错")
-  );
-}
-
-function hasFollowingRecoveryEvent(
-  events: SessionEventRecord[],
-  fromIndex: number
-): boolean {
-  for (let index = fromIndex + 1; index < events.length; index += 1) {
-    const event = events[index];
-    if (!event) {
-      continue;
-    }
-    if (event.event === "error" || event.event === "done" || event.event === "wait") {
-      continue;
-    }
-    if (event.event === "message") {
-      const role = String(event.data?.role || "assistant");
-      if (role !== "assistant") {
-        continue;
-      }
-    }
-    return true;
-  }
-  return false;
-}
-
-function pruneRecoveredLLMErrors(
-  events: SessionEventRecord[]
-): SessionEventRecord[] {
-  return events.filter((event, index) => {
-    if (!isRecoverableLLMErrorEvent(event)) {
-      return true;
-    }
-    return !hasFollowingRecoveryEvent(events, index);
-  });
-}
-
 export const useSessionStore = create<SessionStore>()(
   subscribeWithSelector((set, get) => ({
     ...initialState,
@@ -1036,6 +924,294 @@ export const useSessionStore = create<SessionStore>()(
         }
         return { activeSessionId: sessionId };
       });
+    },
+
+    loadAgentTree: async (sessionId: string) => {
+      const state = get();
+      // Readiness gate (R6-P2): only build once currentSession is the ready root.
+      if (!state.currentSession || state.currentSession.session_id !== sessionId) {
+        return;
+      }
+      if (state.activeSessionId && state.activeSessionId !== sessionId) {
+        return;
+      }
+      // Capture a monotonic load token so an OLDER in-flight load can't overwrite a newer one
+      // out of order (R4 P2 — e.g. a stale "running" poll landing after the terminal-final load).
+      let loadSeq = 0;
+      set((s) => {
+        loadSeq = s.agentTree.loadSeq + 1;
+        return {
+          agentTree: { ...s.agentTree, loading: true, error: null, rootId: sessionId, loadSeq },
+        };
+      });
+      try {
+        const res = await sessionApi.getSessionChildren(sessionId, 1);
+        // Re-check the guard after the await (user may have navigated; a newer load may have started).
+        const after = get();
+        if (
+          after.agentTree.loadSeq !== loadSeq ||
+          !after.currentSession ||
+          after.currentSession.session_id !== sessionId ||
+          (after.activeSessionId && after.activeSessionId !== sessionId)
+        ) {
+          return;
+        }
+        const root = buildTree(
+          {
+            sessionId,
+            status: after.currentSession.status,
+            title: after.currentSession.title,
+            createdAt: null, // Session carries no timestamps (F0.3)
+            updatedAt: null,
+          },
+          res.descendants,
+        );
+        const byId = flattenTree(root);
+        const signature = agentTreeSignature(byId);
+        set((s) => {
+          // Structurally unchanged (e.g. a 4s poll with nothing new): keep the existing
+          // root/byId object identities so derived selectors don't churn (R3 P3).
+          if (s.agentTree.treeSignature === signature && s.agentTree.root) {
+            return {
+              agentTree: {
+                ...s.agentTree,
+                truncated: res.truncated,
+                loading: false,
+                error: null,
+                lastFetchedAt: Date.now(),
+              },
+            };
+          }
+          return {
+            agentTree: {
+              ...s.agentTree,
+              root,
+              byId,
+              treeSignature: signature,
+              truncated: res.truncated,
+              loading: false,
+              error: null,
+              lastFetchedAt: Date.now(),
+            },
+          };
+        });
+      } catch (err) {
+        // Guard the error write too (R3 P2): a stale rejection after navigation must not
+        // write an error into another (now-current) session's tree.
+        const at = get();
+        if (
+          at.agentTree.loadSeq !== loadSeq ||
+          !at.currentSession ||
+          at.currentSession.session_id !== sessionId ||
+          (at.activeSessionId && at.activeSessionId !== sessionId)
+        ) {
+          return;
+        }
+        set((s) => ({
+          agentTree: {
+            ...s.agentTree,
+            loading: false,
+            error: err instanceof Error ? err.message : "加载 Agent 树失败",
+          },
+        }));
+      }
+    },
+
+    refreshAgentTree: async (sessionId: string) => {
+      // Re-fetch is identical to load; the readiness gate + post-await guard make
+      // it safe to call on SSE-invalidation or a bounded poll without clobbering.
+      await get().loadAgentTree(sessionId);
+    },
+
+    resetAgentTree: () =>
+      set((s) => ({
+        agentTree: {
+          ...initialAgentTree,
+          // Keep the tokens MONOTONIC across reset (do NOT zero them) so an in-flight
+          // load/fetch that predates the reset can't ABA-collide with a post-reset one (R5 P2).
+          loadSeq: s.agentTree.loadSeq + 1,
+          mergeSeq: s.agentTree.mergeSeq + 1,
+        },
+      })),
+
+    loadNodeCost: async (childId: string) => {
+      try {
+        const res = await sessionApi.getSessionCost(childId);
+        set((s) => ({
+          agentTree: {
+            ...s.agentTree,
+            costById: {
+              ...s.agentTree.costById,
+              [childId]: { totalUsd: res.total_usd, status: res.cost_status },
+            },
+          },
+        }));
+      } catch {
+        set((s) => ({
+          agentTree: {
+            ...s.agentTree,
+            costById: { ...s.agentTree.costById, [childId]: null },
+          },
+        }));
+      }
+    },
+
+    loadMergedTimeline: async (sessionId: string) => {
+      const state = get();
+      if (
+        !state.currentSession ||
+        state.currentSession.session_id !== sessionId ||
+        (state.activeSessionId && state.activeSessionId !== sessionId)
+      ) {
+        return;
+      }
+      const descendantIds = Object.keys(state.agentTree.byId).filter((id) => id !== sessionId);
+      // Tokenize this eventsByAgent write so an older full rebuild can't clobber a newer poll (R5 P2).
+      let mergeSeq = 0;
+      set((s) => {
+        mergeSeq = s.agentTree.mergeSeq + 1;
+        return { agentTree: { ...s.agentTree, mergeLoading: true, mergeSeq } };
+      });
+      const fetched = await Promise.all(
+        descendantIds.map(async (id) => {
+          try {
+            const session = await sessionApi.getSession(id);
+            const events = normalizeSessionEvents(session.events as SessionEventRecord[]);
+            const rawLastId = events.length ? events[events.length - 1].data.event_id : undefined;
+            const lastEventId = typeof rawLastId === "string" ? rawLastId : null;
+            return { id, events, lastSeq: session.last_seq ?? null, lastEventId };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      // Re-check readiness after the awaits (user may have navigated). Guard on currentSession
+      // AND activeSessionId (R1#2 — activeSessionId flips first on navigation) AND the merge token
+      // so an older rebuild can't overwrite a newer poll's bundles (R5 P2).
+      const after = get();
+      if (
+        after.agentTree.mergeSeq !== mergeSeq ||
+        !after.currentSession ||
+        after.currentSession.session_id !== sessionId ||
+        (after.activeSessionId && after.activeSessionId !== sessionId)
+      ) {
+        return;
+      }
+      // Build FRESH, scoped to the current descendants (do NOT spread the existing map),
+      // so a stale entry from a previous session can never survive into this merge (R1#2).
+      const eventsByAgent: Record<
+        string,
+        { events: SessionEventRecord[]; lastSeq: number | null; lastEventId: string | null }
+      > = {};
+      for (const bundle of fetched) {
+        if (bundle) {
+          eventsByAgent[bundle.id] = {
+            events: bundle.events,
+            lastSeq: bundle.lastSeq,
+            lastEventId: bundle.lastEventId,
+          };
+        }
+      }
+      set((s) => ({
+        agentTree: {
+          ...s.agentTree,
+          eventsByAgent,
+          agentColors: assignAgentColors([sessionId, ...descendantIds]),
+          mergeLoading: false,
+        },
+      }));
+    },
+
+    pollActiveAgents: async (sessionId: string) => {
+      const state = get();
+      if (
+        !state.currentSession ||
+        state.currentSession.session_id !== sessionId ||
+        (state.activeSessionId && state.activeSessionId !== sessionId)
+      ) {
+        return;
+      }
+      const { byId, eventsByAgent } = state.agentTree;
+      const TERMINAL = new Set<string>(["completed", "timed_out"]);
+      // Iterate the TREE (byId), not just already-fetched agents, so a descendant whose initial
+      // fetch failed (or one that just appeared) is RETRIED instead of silently dropped (R4 P2).
+      // Poll a descendant when it is non-terminal (may have new events) OR has no bundle yet
+      // (never successfully fetched — a terminal-but-missing child still needs its one fetch).
+      const targetIds = Object.keys(byId).filter((id) => {
+        if (id === sessionId) {
+          return false; // root events come from currentSession (INV-10)
+        }
+        const node = byId[id];
+        if (!node) {
+          return false;
+        }
+        return !TERMINAL.has(node.status) || !(id in eventsByAgent);
+      });
+      if (targetIds.length === 0) {
+        return;
+      }
+      // Tokenize this eventsByAgent write (R5 P2): a newer merged load/poll bumps mergeSeq, so
+      // this older write is dropped instead of overwriting fresher bundles.
+      let mergeSeq = 0;
+      set((s) => {
+        mergeSeq = s.agentTree.mergeSeq + 1;
+        return { agentTree: { ...s.agentTree, mergeSeq } };
+      });
+      const updates = await Promise.all(
+        targetIds.map(async (id) => {
+          const bundle = eventsByAgent[id];
+          try {
+            if (bundle && bundle.lastEventId != null) {
+              // Incremental ONLY when we have an event-id cursor (BOTH cursors, INV-8). A bundle
+              // with no event-id floor (e.g. a title-only child whose events all normalize away)
+              // falls through to the full re-fetch below so we never degrade to a seq-only query.
+              const res = await sessionApi.getEventsSince(
+                id,
+                bundle.lastEventId ?? undefined,
+                bundle.lastSeq ?? undefined,
+              );
+              if (!res.events.length) {
+                return null;
+              }
+              const events = normalizeSessionEvents([
+                ...bundle.events,
+                ...(res.events as SessionEventRecord[]),
+              ]);
+              const rawLastId = events.length ? events[events.length - 1].data.event_id : undefined;
+              const lastEventId = typeof rawLastId === "string" ? rawLastId : bundle.lastEventId;
+              return { id, events, lastSeq: res.last_seq ?? bundle.lastSeq, lastEventId };
+            }
+            // No bundle (failed/new) OR a bundle with no event-id cursor → full fetch + normalize
+            // (INV-9, never seq-only), like loadMergedTimeline.
+            const session = await sessionApi.getSession(id);
+            const events = normalizeSessionEvents(session.events as SessionEventRecord[]);
+            const rawLastId = events.length ? events[events.length - 1].data.event_id : undefined;
+            const lastEventId = typeof rawLastId === "string" ? rawLastId : null;
+            return { id, events, lastSeq: session.last_seq ?? null, lastEventId };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      const after = get();
+      if (
+        after.agentTree.mergeSeq !== mergeSeq ||
+        !after.currentSession ||
+        after.currentSession.session_id !== sessionId ||
+        (after.activeSessionId && after.activeSessionId !== sessionId)
+      ) {
+        return;
+      }
+      if (updates.every((u) => u === null)) {
+        return;
+      }
+      const next = { ...after.agentTree.eventsByAgent };
+      for (const u of updates) {
+        if (u) {
+          next[u.id] = { events: u.events, lastSeq: u.lastSeq, lastEventId: u.lastEventId };
+        }
+      }
+      set((s) => ({ agentTree: { ...s.agentTree, eventsByAgent: next } }));
     },
 
     isSessionStreaming: (sessionId: string) => {
@@ -1930,6 +2106,49 @@ export function useFilteredSessionsForList(): ListSessionItem[] {
     () => sessions.filter((s) => s.parent_session_id === null),
     [sessions]
   );
+}
+
+export function useMergedTimeline(): MergedTimelineItem[] {
+  const rootId = useSessionStore((s) => s.agentTree.rootId);
+  const rootEvents = useSessionStore((s) => s.currentSession?.events);
+  const byId = useSessionStore((s) => s.agentTree.byId);
+  const eventsByAgent = useSessionStore((s) => s.agentTree.eventsByAgent);
+  const agentColors = useSessionStore((s) => s.agentTree.agentColors);
+  return useMemo(() => {
+    if (!rootId) {
+      return [];
+    }
+    const bundles: AgentEventBundle[] = [
+      {
+        sessionId: rootId,
+        role: "root",
+        color: agentColors[rootId] ?? "#6366f1",
+        events: (rootEvents ?? []) as SessionEventRecord[],
+      },
+    ];
+    for (const [id, bundle] of Object.entries(eventsByAgent)) {
+      bundles.push({
+        sessionId: id,
+        role: byId[id]?.role ?? "subagent",
+        color: agentColors[id] ?? "#94a3b8",
+        events: bundle.events,
+      });
+    }
+    return mergeAgentTimelines(bundles);
+  }, [rootId, rootEvents, byId, eventsByAgent, agentColors]);
+}
+
+export function useToolCallCount(nodeId: string): number | undefined {
+  const rootId = useSessionStore((s) => s.agentTree.rootId);
+  const rootEvents = useSessionStore((s) => s.currentSession?.events);
+  const descEvents = useSessionStore((s) => s.agentTree.eventsByAgent[nodeId]?.events);
+  return useMemo(() => {
+    const events = nodeId === rootId ? rootEvents : descEvents;
+    if (!events) {
+      return undefined;
+    }
+    return countToolCalls(events as SessionEventRecord[]);
+  }, [nodeId, rootId, rootEvents, descEvents]);
 }
 
 registerStoreResetter("session", () => {

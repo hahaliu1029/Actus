@@ -12,5 +12,23 @@
       "checkpointerExpired": "Checkpointer expired, original unavailable",
       "preB6Note": "Compaction occurred before B6 release; detail not recorded"
     }
+  },
+  "agentTree": {
+    "title": "Agent tree",
+    "untitled": "Untitled session",
+    "empty": "No sub-agents",
+    "truncated": "Showing first {{count}} sub-agents",
+    "loadError": "Failed to load agent tree",
+    "role": {
+      "root": "Main agent",
+      "coordinatorChild": "Coordinator sub-agent",
+      "researchChild": "Research sub-agent",
+      "subagent": "Sub-agent"
+    }
+  },
+  "mergedTimeline": {
+    "title": "Merged timeline",
+    "show": "Show merged timeline",
+    "hide": "Hide merged timeline"
   }
 }

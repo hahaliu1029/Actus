@@ -29,6 +29,26 @@ type SessionStoreState = {
   isLoadingCurrentSession: boolean;
   isChatting: boolean;
   chatSessionId: string | null;
+  agentTree: {
+    rootId: string | null;
+    root: null;
+    byId: Record<string, never>;
+    treeSignature: string | null;
+    truncated: boolean;
+    loading: boolean;
+    error: string | null;
+    lastFetchedAt: number | null;
+    costById: Record<string, never>;
+    eventsByAgent: Record<string, never>;
+    agentColors: Record<string, never>;
+    mergeLoading: boolean;
+  };
+  loadAgentTree: ReturnType<typeof vi.fn>;
+  refreshAgentTree: ReturnType<typeof vi.fn>;
+  resetAgentTree: ReturnType<typeof vi.fn>;
+  loadNodeCost: ReturnType<typeof vi.fn>;
+  loadMergedTimeline: ReturnType<typeof vi.fn>;
+  pollActiveAgents: ReturnType<typeof vi.fn>;
 };
 
 const sessionStoreState: SessionStoreState = {
@@ -45,6 +65,26 @@ const sessionStoreState: SessionStoreState = {
   isLoadingCurrentSession: false,
   isChatting: false,
   chatSessionId: null,
+  agentTree: {
+    rootId: null,
+    root: null,
+    byId: {},
+    treeSignature: null,
+    truncated: false,
+    loading: false,
+    error: null,
+    lastFetchedAt: null,
+    costById: {},
+    eventsByAgent: {},
+    agentColors: {},
+    mergeLoading: false,
+  },
+  loadAgentTree: vi.fn(async () => {}),
+  refreshAgentTree: vi.fn(async () => {}),
+  resetAgentTree: vi.fn(),
+  loadNodeCost: vi.fn(async () => {}),
+  loadMergedTimeline: vi.fn(async () => {}),
+  pollActiveAgents: vi.fn(async () => {}),
 };
 const markdownRendererMock = vi.fn(({ content }: { content: string }) => (
   <div data-testid="markdown-renderer">{content}</div>
@@ -141,6 +181,8 @@ vi.mock("@/lib/store/transfer-store", () => ({
 vi.mock("@/lib/store/session-store", () => ({
   useSessionStore: (selector: (state: SessionStoreState) => unknown) =>
     selector(sessionStoreState),
+  useMergedTimeline: () => [],
+  useToolCallCount: () => undefined,
 }));
 
 vi.mock("@/lib/store/ui-store", () => ({

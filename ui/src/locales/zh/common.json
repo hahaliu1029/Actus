@@ -12,5 +12,23 @@
       "checkpointerExpired": "checkpointer 已过期，原文不可恢复",
       "preB6Note": "该压缩发生在 B6 上线前，详情未记录"
     }
+  },
+  "agentTree": {
+    "title": "Agent 树",
+    "untitled": "未命名会话",
+    "empty": "暂无子 Agent",
+    "truncated": "仅显示前 {{count}} 个子 Agent",
+    "loadError": "加载 Agent 树失败",
+    "role": {
+      "root": "主 Agent",
+      "coordinatorChild": "协作子 Agent",
+      "researchChild": "研究子 Agent",
+      "subagent": "子 Agent"
+    }
+  },
+  "mergedTimeline": {
+    "title": "合并时间线",
+    "show": "显示合并时间线",
+    "hide": "隐藏合并时间线"
   }
 }
