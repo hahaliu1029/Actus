@@ -34,6 +34,9 @@ def anyio_backend() -> str:
 # ---------------------------------------------------------------------------
 
 _TOOL_WAS_CALLED = False
+# R5-P3 hardening: execution COUNT for the replay-B provenance test — a boolean
+# cannot detect a double-execution regression (tool run in phase 1 AND phase 3).
+_TOOL_CALL_COUNT = 0
 
 
 def _build_tool_node_fn():
@@ -446,4 +449,178 @@ class TestReplayRejectsWhenSessionInTakeover:
         # Tool wrapper should run in RUNNING mode
         assert _TOOL_WAS_CALLED is True, (
             "Tool wrapper should be invoked when session is RUNNING at replay time"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B1-1a Step 5b (spec §7 R15#3 + INV-B1-2): replay-B provenance — the cached
+# typed outcome is consumed WITHOUT re-running the N1 shell AST validator.
+# ---------------------------------------------------------------------------
+
+class TestReplayBProvenanceNoN1Rerun:
+    """The legitimate provenance of a cached shell_execute AllowSuccess is the
+    ORIGINAL evaluation (N1 validate → PE Asked → interrupt_helper commit_resume
+    → pe_resume_outcomes). On the post-resume tool_node replay, replay-path B
+    consumes the cached outcome BEFORE the N1 gate — so the validator must run
+    exactly ONCE across the whole cycle (the original gate pass), never a second
+    time on replay (spec §4.1 INV-B1-2).
+
+    Driver: law A/B hybrid — the pe_resume_outcomes value is produced by the
+    REAL interrupt_helper writer path (no hand-seeding), matching
+    test_interrupt_helper_pe_commit.py's commit contract.
+    """
+
+    @staticmethod
+    def _build_graph_fns():
+        from langchain_core.messages import AIMessage
+        from langchain_core.tools import tool as lc_tool
+
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        global _TOOL_WAS_CALLED, _TOOL_CALL_COUNT
+        _TOOL_WAS_CALLED = False
+        _TOOL_CALL_COUNT = 0
+
+        @lc_tool
+        async def shell_execute(command: str, exec_dir: str = "") -> str:
+            """Run a shell command."""
+            global _TOOL_WAS_CALLED, _TOOL_CALL_COUNT
+            _TOOL_WAS_CALLED = True
+            _TOOL_CALL_COUNT += 1
+            return "hi"
+
+        stub_llm = AsyncMock()
+        stub_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+        )
+        stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+        graph = build_react_graph(stub_llm, [shell_execute])
+        return (
+            graph.nodes["tool_node"].bound.afunc,
+            graph.nodes["interrupt_helper"].bound.afunc,
+        )
+
+    @staticmethod
+    def _shell_state(**overrides) -> dict:
+        state = {
+            "messages": [
+                AIMessage(content="", tool_calls=[{
+                    "id": "tc-shell", "name": "shell_execute",
+                    "args": {"command": "echo hi"}, "type": "tool_call",
+                }])
+            ],
+            "llm_input_messages": [],
+            "step_description": "test", "original_request": "test", "language": "en",
+            "attachments": [], "image_content_blocks": [], "events": [],
+            "should_interrupt": False, "soft_hint_sent": False,
+            "attempt_count": 0, "failure_count": 0,
+            "completed_tool_call_prefix": [], "approved_tool_call_ids": [],
+            "pe_resume_outcomes": {},
+            "pending_ask_outcome": None, "pending_ask_tool_call_id": None,
+            "pending_ask_artifact": None, "pending_ask_tool_args": None,
+        }
+        state.update(overrides)
+        return state
+
+    async def test_replay_b_provenance_no_n1_rerun(self, monkeypatch):
+        """INV-B1-2 provenance：replay-B 消费 typed outcome 不重跑 N1。
+
+        断言（本测试的规范部分）：
+        1. shell_ast_validator.validate 全程恰好调用 1 次（原始 gate 通道）——
+           replay-B 在 N1 块之前消费缓存 outcome，绝不重跑 validator；
+        2. pe.evaluate 全程恰好调用 1 次（replay 不重评估）；
+        3. 工具本体恰好执行 1 次，最终 ToolMessage 为成功结果。
+        """
+        import app.domain.services.safety.shell_ast_validator as ast_mod
+        from langchain_core.messages import ToolMessage
+
+        from app.domain.models.tool_result import (
+            AllowSuccess,
+            Asked,
+            DecisionReason,
+        )
+
+        # `validate` is a function-level local import inside the N1 gate; monkeypatch
+        # of the module attribute is picked up because a local `from mod import x`
+        # re-reads the module attribute on every call (codex R3 verified).
+        real_validate = ast_mod.validate
+        calls = {"n": 0}
+
+        def counting_validate(*args, **kwargs):
+            calls["n"] += 1
+            return real_validate(*args, **kwargs)
+
+        monkeypatch.setattr(ast_mod, "validate", counting_validate)
+
+        tool_node_fn, interrupt_helper_fn = self._build_graph_fns()
+
+        # --- Phase 1: original evaluation → N1 validate (#1) → PE Asked → interrupt.
+        asked_pe = AsyncMock()
+        asked_pe.evaluate = AsyncMock(return_value=Asked(
+            content="waiting for user",
+            reason=DecisionReason(type="risk_enforce", code="medium", message="confirm shell"),
+        ))
+        fake_ssm = _make_fake_ssm()
+        original = await tool_node_fn(
+            self._shell_state(), _make_config(asked_pe, fake_ssm)
+        )
+        assert original.goto == "interrupt_helper", "shell_execute Asked must route to interrupt"
+        assert asked_pe.evaluate.await_count == 1
+        assert calls["n"] == 1, "original gate must run N1 validate exactly once"
+        assert _TOOL_WAS_CALLED is False, "tool must not run before approval"
+
+        # --- Phase 2: interrupt_helper real commit_resume → writes pe_resume_outcomes.
+        commit_pe = AsyncMock()
+        commit_pe.commit_resume = AsyncMock(
+            return_value=AllowSuccess(content="ok", data={"via": "user_click"})
+        )
+        resume_state = self._shell_state(
+            pending_ask_outcome=original.update["pending_ask_outcome"],
+            pending_ask_tool_call_id=original.update["pending_ask_tool_call_id"],
+            pending_ask_artifact=original.update["pending_ask_artifact"],
+            pending_ask_tool_args=original.update["pending_ask_tool_args"],
+        )
+        resume_payload = {
+            "tool_call_id": "tc-shell",
+            "action": "approve",
+            "scope": "session",
+            "claim_nonce": "n" * 32,
+        }
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(
+                "app.domain.services.graphs.react_graph.interrupt",
+                lambda payload: resume_payload,
+            )
+            commit_cmd = await interrupt_helper_fn(
+                resume_state, _make_config(commit_pe, _make_fake_ssm())
+            )
+        pe_resume_outcomes = commit_cmd.update["pe_resume_outcomes"]
+        assert "tc-shell" in pe_resume_outcomes, "commit_resume must write the typed outcome"
+
+        # --- Phase 3: post-resume tool_node replay → replay-B consumes cached
+        #     outcome BEFORE N1; validate must NOT run again, pe.evaluate not re-run.
+        replay_pe = AsyncMock()  # its .evaluate must never be called
+        replay_state = self._shell_state(
+            pe_resume_outcomes=pe_resume_outcomes,
+            completed_tool_call_prefix=[],
+        )
+        replay_cmd = await tool_node_fn(
+            replay_state, _make_config(replay_pe, _make_fake_ssm())
+        )
+
+        # (1) N1 validator ran exactly once across the WHOLE cycle.
+        assert calls["n"] == 1, "replay-B must NOT re-run the N1 validator"
+        # (2) pe.evaluate ran exactly once (only in phase 1; replay never re-evaluates).
+        replay_pe.evaluate.assert_not_called()
+        # (3) the tool executed EXACTLY once across the whole cycle (R5-P3: count,
+        #     not boolean — a phase-1+phase-3 double execution must fail here).
+        assert _TOOL_WAS_CALLED is True, "replay-B must execute the approved tool"
+        assert _TOOL_CALL_COUNT == 1, (
+            f"replay-B must execute the approved tool exactly once, got {_TOOL_CALL_COUNT}"
+        )
+        replay_msgs = [
+            m for m in replay_cmd.update["messages"] if isinstance(m, ToolMessage)
+        ]
+        assert len(replay_msgs) == 1 and replay_msgs[0].status != "error", (
+            "replay-B success outcome must yield exactly one non-error ToolMessage"
         )

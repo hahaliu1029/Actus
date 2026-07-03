@@ -144,6 +144,20 @@ executor_node 在默认生产路径下**局部**消费 `StepMetadata.skill_conte
 **不**走 state。如果它也写回 state，两个数据源会竞争写入，updater 的值会
 在下一 loop 被 executor 覆盖。
 
+## B1 并发语义（spec 2026-07-02-b1-streaming-tool-execution §4.3）
+
+- **tracker gate-time 陈旧性（accepted drift）**：并发窗口内未完成执行的失败对后续
+  gate 的 `is_blocked` 不可见，最多晚一个 drain 点生效；记录动作在 drain 点按原始
+  tc 序执行，串行终态计数与 flag-OFF 一致。
+- **mode-enforcement = 执行起点锚定**：窗口内已启动的安全集（只读）工具不因
+  mid-flight mode 变更中止；与串行的可观测差异上界 = `tool_max_concurrency` 个。
+- **#7 checkpoint × queued CALLED**：并发 ON 时批尾 cancel 命中 `#7 tool_node_return`
+  会放弃 ToolMessage/prefix，而已入队的 CALLED 是持久的——有意语义（工具确已执行，
+  事件如实反映；CancelledByEventError 对该 run 是终态、无 replay 续跑）。
+- **INV-5 v2 sink 模型**：`_invoke_wrapper` 仅经 `_make_execute_thunk` /
+  `_legacy_make_execute_thunk` 可达；PE 工厂调用点受 A/B/C token 词法支配 +
+  三路径行为测试。变更 `CONCURRENCY_SAFE_TOOLS` / `_whitelists.py` 是安全决策。
+
 ## Sandbox Lifecycle 不变式（单 Worker 部署契约）
 
 Actus 的沙箱生命周期由 `SandboxLifecycleService` 管理，采用 K8s 风格的

@@ -56,26 +56,70 @@ INV4_SESSION_STATUS_MUTATOR_NAMES: tuple[str, ...] = (
     "transition_status",
 )
 
-# INV-5: tool_node _invoke_wrapper callsites must be PE-dominated.
-INV5_REACT_GRAPH_PATH = "api/app/domain/services/graphs/react_graph.py"
+# INV-5: files scanned for _invoke_wrapper reachability (v2 rule 3).
+# The executor PACKAGE is scanned to assert ZERO escape surface: no file in it
+# may ever contain _invoke_wrapper / the factories / pe.evaluate, and each may
+# only import from the allowlist.
+INV5_REACT_GRAPH_PATH = "api/app/domain/services/graphs/react_graph.py"  # kept: primary scan target
 
-# INV-5: functions in react_graph that are exempt from PE-dominance check.
-# tool_node: when PE is enabled it delegates immediately to _pe_dispatch which
-#   enforces PE dominance. The residual tool_node body retains TWO permanent /
-#   long-lived non-PE-dominated _invoke_wrapper callsites that are NOT removed by
-#   PE-4:
-#     1. meta-tool / unknown direct-execute passthrough (skill-creator/guide,
-#        mcp-discovery, unresolvable-source sentinel) — non-PE-eligible carve-outs
-#        by design, permanent.
-#     2. legacy-approved interrupt-replay bridge (pre-approved native
-#        direct-execute / missing-claim_nonce path) — sunsets with the legacy
-#        interrupt fallback, a LATER epic (NOT PE-4).
-#   The earlier "PE-4 removes this legacy body" claim was over-optimistic; PE-4
-#   removed the native risk gate + per-source flags, not the whole legacy body.
-# _legacy_*: any function starting with _legacy_ is also exempt.
-INV5_SKIP_FUNCTION_NAMES: frozenset[str] = frozenset({
-    "tool_node",
+# The executor package directory (relative to REPO_ROOT). The zero-escape +
+# import-allowlist rules (Rule 3 / R6#2) apply to EVERY .py file in this
+# package, not just batch_tool_executor.py — a forbidden escape (importlib,
+# _invoke_wrapper, pe.evaluate) added in a SIBLING module (e.g.
+# tool_call_stream_collector.py, __init__.py) must also be caught.
+# codex R1-P2: previously only batch_tool_executor.py was scanned, leaving
+# sibling modules an unscanned escape surface.
+INV5_EXECUTOR_PACKAGE_DIR = "api/app/domain/services/executor"
+
+# Kept for backward compatibility / anti-drift: the primary executor module.
+# It remains a member of the globbed package set below.
+INV5_EXECUTOR_MODULE_PATH = "api/app/domain/services/executor/batch_tool_executor.py"
+
+
+def executor_package_files() -> tuple[str, ...]:
+    """Dynamic RECURSIVE glob of every ``.py`` file in the executor package
+    (relative to REPO_ROOT), sorted for determinism.
+
+    Chosen over a hard-coded file list so that FUTURE sibling modules added to
+    the package are AUTOMATICALLY brought under the INV-5 zero-escape +
+    import-allowlist scan without a whitelist edit. Adding a file here is not a
+    security decision — it is scanned, not exempted.
+
+    codex R2-P2: uses ``rglob`` (not top-level ``glob``) so a future
+    ``executor/subpkg/backdoor.py`` is scanned too — a subdirectory module was
+    previously an UNSCANNED escape surface. Excludes ``__pycache__`` (compiled
+    ``.pyc`` files never match ``*.py``; source dirs under __pycache__ do not
+    exist).
+    """
+    pkg = REPO_ROOT / INV5_EXECUTOR_PACKAGE_DIR
+    return tuple(sorted(
+        str(p.relative_to(REPO_ROOT)).replace("\\", "/")
+        for p in pkg.rglob("*.py")
+        if "__pycache__" not in p.parts
+    ))
+
+
+# Rule 1 (sink) scan surface: react_graph (the ONLY file that legitimately
+# carries _invoke_wrapper callsites) PLUS every executor package file (all of
+# which must carry ZERO callsites — the expected zero-escape state).
+INV5_SCAN_PATHS: frozenset[str] = frozenset(
+    {INV5_REACT_GRAPH_PATH} | set(executor_package_files())
+)
+
+# INV-5 v2 (B1-1a): the ONLY two factory names whose nested thunk may call
+# _invoke_wrapper. Adding a name here is a SECURITY decision (codex review
+# required per feedback_pr_boundary_codex_audit.md).
+INV5_SINK_FACTORY_NAMES: frozenset[str] = frozenset({
+    "_make_execute_thunk",
+    "_legacy_make_execute_thunk",
 })
+
+# INV-5 v2 final (B1-1a Task 4): NO function-level exemptions remain.
+# tool_node's legacy body now routes execution through
+# _legacy_make_execute_thunk (whose CALLSITES are exempt from dominance —
+# the precise successor of the old fail-open semantics). Adding any name
+# back here is a SECURITY decision (codex review required).
+INV5_SKIP_FUNCTION_NAMES: frozenset[str] = frozenset()
 
 # INV-5 per-callsite documented safety-net whitelist.
 #

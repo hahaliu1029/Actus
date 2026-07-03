@@ -557,3 +557,108 @@ async def test_a2a_tool_call_routes_through_a2a_source():
     assert fake_pe.evaluate_calls[0].tool_source == "a2a"
     assert fake_pe._sources["a2a"].assess_risk_calls == 1, "A2aSource must run once"
     assert fake_pe._sources["native"].assess_risk_calls == 0, "native untouched"
+
+
+# ---------------------------------------------------------------------------
+# B1-1a INV-5 v2 path C: approved_tool_call_ids is an explicit authorization
+# provenance — pre-approved ids execute WITHOUT pe.evaluate; non-approved ids
+# cannot ride the bypass. (Lexical scanner cannot prove control flow — this
+# behavioral pair is the semantic guard. Companion coverage:
+# test_react_graph_pe_dispatch.py pre-approved group.)
+# ---------------------------------------------------------------------------
+
+class TestPathCPreApprovedProvenance:
+    @staticmethod
+    def _build():
+        from unittest.mock import AsyncMock, MagicMock
+
+        from langchain_core.messages import AIMessage
+        from langchain_core.tools import tool as lc_tool
+
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        @lc_tool
+        async def file_write(path: str, content: str = "") -> str:
+            """Write to a file."""
+            return f"wrote {path}"
+
+        stub_llm = AsyncMock()
+        stub_llm.ainvoke = AsyncMock(return_value=AIMessage(content="done"))
+        stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+        graph = build_react_graph(stub_llm, [file_write])
+        return graph.nodes["tool_node"].bound.afunc
+
+    @staticmethod
+    def _state(approved: list[str]) -> dict:
+        from langchain_core.messages import AIMessage
+
+        return {
+            "messages": [AIMessage(content="", tool_calls=[{
+                "id": "c1", "name": "file_write",
+                "args": {"path": "/x", "content": "y"}, "type": "tool_call",
+            }])],
+            "llm_input_messages": [],
+            "step_description": "t", "original_request": "t", "language": "en",
+            "attachments": [], "image_content_blocks": [], "events": [],
+            "should_interrupt": False, "soft_hint_sent": False,
+            "attempt_count": 0, "failure_count": 0,
+            "completed_tool_call_prefix": [],
+            "approved_tool_call_ids": approved,
+            "pending_ask_outcome": None, "pending_ask_tool_call_id": None,
+            "pending_ask_artifact": None, "pending_ask_tool_args": None,
+        }
+
+    @staticmethod
+    def _config(fake_pe, mode=None):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from app.domain.models.session import SessionStatus
+
+        ssm = AsyncMock()
+        ssm.get_mode_with_revision = AsyncMock(
+            return_value=(mode or SessionStatus.RUNNING, 1)
+        )
+        return {"configurable": {
+            "permission_engine": fake_pe,
+            "session_state_machine": ssm,
+            "tool_confirmation_config": SimpleNamespace(enabled=True),
+            "user_id": "u", "session_id": "s", "thread_id": "s",
+        }}
+
+    @staticmethod
+    def _recording_pe():
+        class _PE:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, call, ctx):
+                from app.domain.models.tool_result import AllowSuccess
+                self.calls.append(call)
+                return AllowSuccess(content="auto", data={})
+
+            async def preflight_resume(self, *a, **kw):
+                pass
+
+            async def commit_resume(self, *a, **kw):
+                pass
+
+        return _PE()
+
+    async def test_pre_approved_id_executes_without_evaluate(self):
+        from langchain_core.messages import ToolMessage
+
+        tool_node_fn = self._build()
+        pe = self._recording_pe()
+        result = await tool_node_fn(self._state(approved=["c1"]), self._config(pe))
+        assert pe.calls == [], "path C must bypass pe.evaluate entirely"
+        msgs = [m for m in result.update["messages"] if isinstance(m, ToolMessage)]
+        assert msgs and "wrote /x" in str(msgs[0].content), "pre-approved tool must actually execute"
+
+    async def test_non_approved_id_still_goes_through_pe(self):
+        tool_node_fn = self._build()
+        pe = self._recording_pe()
+        result = await tool_node_fn(
+            self._state(approved=["some-other-id"]), self._config(pe)
+        )
+        assert len(pe.calls) == 1, "non-approved id must NOT ride the path C bypass"

@@ -819,6 +819,7 @@ class ChildRunnerSharedDeps:
     checkpointer_pool: object
     execution_supervisor: object
     session_state_machine: object = None  # A4-1 §6: status-write authority for the child runner
+    tool_runtime: object = None  # B1: root 的 ToolRuntimeConfig（child/root flag 一致性，spec R2#1）
 
 
 def _make_shared_child_runner_builder(
@@ -866,6 +867,7 @@ def _make_shared_child_runner_builder(
             terminal_envelope_publisher_disabled=terminal_envelope_publisher_disabled,
             coord_deps=None,  # child is NOT a nested coordinator
             session_state_machine=deps.session_state_machine,
+            tool_runtime=deps.tool_runtime,
         )
 
     return _build

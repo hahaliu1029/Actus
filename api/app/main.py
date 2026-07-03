@@ -366,6 +366,11 @@ async def lifespan(app: FastAPI):
                 checkpointer_pool=svc._checkpointer_pool,
                 execution_supervisor=svc._supervisor,
                 session_state_machine=svc._ssm,
+                # B1: same-source as the root runner (agent_service.py builds
+                # the root with tool_runtime=snap.tool_runtime); child inherits
+                # the identical ToolRuntimeConfig so B1 flags flipped on root
+                # don't silently stay default-OFF for child graphs (spec R2#1).
+                tool_runtime=snap.tool_runtime,
             )
 
         coord_deps = None

@@ -90,9 +90,61 @@ def _calls_in_direct_body(if_node: ast.If, name: str) -> list[ast.Call]:
     return calls
 
 
+def _returns_wrapped_finalizer(if_node: ast.If, *, wrapper: str, name: str) -> list[ast.Call]:
+    """B1-1a (R9#3): credit a `return <wrapper>(result=await name(...))` in the
+    denial branch's DIRECT body. The two-phase gate replaced
+    `await _finalize_pe_outcome(...); continue` with a single
+    `return GateSurfaced(result=await _translate_to_result(...))` — the denial
+    still UNCONDITIONALLY surfaces (via ``name``) AND terminates (via ``return``).
+
+    The check stays SHAPE-precise (top-level `return`, wrapper is a bare-Name
+    call, ``name`` is an ``await``-unwrapped Call in one of the wrapper's args)
+    so a decoy branch that never actually denies cannot satisfy the lock —
+    exactly the guarantee ``_calls_in_direct_body`` provides for the legacy form.
+    """
+    found: list[ast.Call] = []
+    for stmt in if_node.body:
+        if not isinstance(stmt, ast.Return):
+            continue
+        outer = stmt.value
+        if not (
+            isinstance(outer, ast.Call)
+            and isinstance(outer.func, ast.Name)
+            and outer.func.id == wrapper
+        ):
+            continue
+        arg_values = list(outer.args) + [kw.value for kw in outer.keywords]
+        for arg in arg_values:
+            inner = arg.value if isinstance(arg, ast.Await) else arg
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == name
+            ):
+                found.append(inner)
+    return found
+
+
 def _assert_gate_decides_via_policy(
-    fn: ast.AST, *, result_var: str, denial_helper: str, finalizer: str | None
+    fn: ast.AST,
+    *,
+    result_var: str,
+    denial_helper: str,
+    finalizer: str | None,
+    finalizer_form: str = "finalize_continue",
 ) -> None:
+    """``finalizer_form`` selects the denial-branch TERMINAL shape:
+
+    - ``"finalize_continue"`` (legacy tool_node): the denial branch DIRECTLY
+      calls ``finalizer(...)`` then ``continue``s the batch loop.
+    - ``"return_surfaced"`` (B1-1a ``_pe_dispatch``, R9#3): the two-phase gate
+      replaced that with ``return GateSurfaced(result=await finalizer(...))`` —
+      the denial still UNCONDITIONALLY surfaces (via ``finalizer``) AND
+      terminates (via ``return``). Semantics identical; only the FORM changed.
+
+    The guarded invariant is unchanged either way: the shell allow/deny decision
+    must come from ``evaluate_command`` (not ``<result_var>.allowed``).
+    """
     # (a) evaluate_command is called; its policy= is build_command_policy(...) (or a
     #     local bound to one); and the fn constructs NO CommandPolicy(...) directly.
     eval_calls = _calls_to(fn, "evaluate_command")
@@ -159,7 +211,18 @@ def _assert_gate_decides_via_policy(
     assert _calls_in_direct_body(denial_if, denial_helper), (
         f"the `not {decision_var}.allowed` branch must DIRECTLY call {denial_helper}(...) (the real denial)"
     )
-    if finalizer is not None:  # PE / legacy gates: finalize + continue the loop
+    if finalizer is not None and finalizer_form == "return_surfaced":
+        # B1-1a _pe_dispatch (R9#3): return GateSurfaced(result=await <finalizer>(...))
+        assert _returns_wrapped_finalizer(
+            denial_if, wrapper="GateSurfaced", name=finalizer
+        ), (
+            f"the denial branch must DIRECTLY "
+            f"`return GateSurfaced(result=await {finalizer}(...))`"
+        )
+        assert any(isinstance(n, ast.Return) for n in denial_if.body), (
+            "the denial branch must `return` the surfaced result (direct child, not nested)"
+        )
+    elif finalizer is not None:  # legacy tool_node gate: finalize + continue the loop
         assert _calls_in_direct_body(denial_if, finalizer), (
             f"the denial branch must DIRECTLY call {finalizer}(...)"
         )
@@ -214,16 +277,34 @@ def _react_graph_tree() -> ast.AST:
 def test_pe_dispatch_decides_via_command_policy() -> None:
     fn = _find_function_recursive(_react_graph_tree(), "_pe_dispatch")
     assert fn is not None, "_pe_dispatch closure missing from react_graph.py"
+    # B1-1a (R9#3): the PE gate now surfaces the denial via
+    # `return GateSurfaced(result=await _translate_to_result(...))` instead of
+    # `await _finalize_pe_outcome(...); continue`. FORM changed, guard unchanged:
+    # the shell decision still flows through evaluate_command, not _ast_result.allowed.
     _assert_gate_decides_via_policy(
-        fn, result_var="_ast_result", denial_helper="to_typed_denied", finalizer="_finalize_pe_outcome"
+        fn,
+        result_var="_ast_result",
+        denial_helper="to_typed_denied",
+        finalizer="_translate_to_result",
+        finalizer_form="return_surfaced",
     )
 
 
 def test_tool_node_decides_via_command_policy() -> None:
     fn = _find_function_recursive(_react_graph_tree(), "tool_node")
     assert fn is not None, "tool_node closure missing from react_graph.py"
+    # B1-1a (R9#3): the legacy gate (_legacy_gate, nested in tool_node) now
+    # surfaces the shell denial via
+    # `return GateSurfaced(result=await _legacy_translate_to_result(...))`
+    # instead of `await _finalize_outcome(...); continue`. FORM changed, guard
+    # unchanged: the shell decision still flows through evaluate_command, not
+    # ast_result.allowed.
     _assert_gate_decides_via_policy(
-        fn, result_var="ast_result", denial_helper="to_typed_denied", finalizer="_finalize_outcome"
+        fn,
+        result_var="ast_result",
+        denial_helper="to_typed_denied",
+        finalizer="_legacy_translate_to_result",
+        finalizer_form="return_surfaced",
     )
 
 

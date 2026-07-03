@@ -629,6 +629,9 @@ export function getToolDisplayCopy(eventData: Record<string, unknown>): ToolDisp
   const functionName = asString(eventData.function);
   const args = isRecord(eventData.args) ? eventData.args : {};
   const status = asString(eventData.status);
+  // B1-1b: status 可能为 "calling" | "running" | "called"。running 走与
+  // calling 相同的 in-progress 文案分支（非 called 即进行中）——该宽容性由
+  // session-ui-running.test.ts 锁定，收紧判定属破坏性变更。
   const called = status === "called";
 
   if (toolName === "message" && functionName === "message_notify_user") {

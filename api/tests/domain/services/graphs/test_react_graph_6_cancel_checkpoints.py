@@ -11,12 +11,12 @@ This file covers:
 - ``CancelledByEventError`` is raised at each in-graph checkpoint when
   the event is already set.
 
-#4 (LLM streaming chunk boundary) is DEFERRED — live ``llm_node`` calls
-``await llm_with_tools.ainvoke(messages)`` (line 1067, atomic), not a
-streaming async-for. When ``llm_node`` is refactored to stream, checkpoint
-#4 belongs inside the ``async for chunk in ...`` loop. This test file
-includes a contract pin (test_chunk_boundary_deferred_until_streaming) so
-a future maintainer adding streaming without re-wiring #4 fails here.
+#4 (LLM streaming chunk boundary) is LIVE (B1-2) — when
+``llm_tool_call_streaming_enabled`` is ON, ``llm_node`` consumes the LLM via
+``async for chunk in llm_with_tools.astream(messages)`` and checks
+``_should_cancel`` at the top of every iteration. This test file includes a
+source pin (test_chunk_boundary_wired_in_streaming_branch); the runtime
+guarantee is locked by test_react_graph_b1_streaming.py::TestChunkBoundaryCancel.
 """
 from __future__ import annotations
 
@@ -95,8 +95,10 @@ def test_cancelled_by_event_error_carries_checkpoint_name() -> None:
 ACTIVE_CHECKPOINTS = (
     "react_loop_entry",     # #2 — pre_llm_node top
     "llm_node_entry",       # #3 — llm_node top
+    "llm_chunk_boundary",   # #4 — llm_node astream loop top (B1-2, LIVE)
     "llm_return",           # #5 — llm_node bottom (pre-return)
     "tool_node_entry",      # #6 — tool_node top
+    "tool_window_entry",    # #6.5 — B1-1c concurrency window (post-semaphore)
     "tool_node_return",     # #7 — tool_node bottom (pre-return)
 )
 
@@ -114,21 +116,18 @@ def test_checkpoint_name_appears_in_source(checkpoint: str) -> None:
     )
 
 
-def test_chunk_boundary_deferred_until_streaming() -> None:
-    """[deferred contract] #4 (llm_chunk_boundary) is NOT wired because the
-    live llm_node uses ``ainvoke`` (atomic). The string ``llm_chunk_boundary``
-    appears ONLY in a deferral docstring/comment, NOT in any actual checkpoint
-    call. When a future PR adds streaming, the developer MUST also wire
-    #4 into the new ``async for chunk in ...`` loop.
-
-    This test pins the deferral so the absence is intentional, not silent."""
+def test_chunk_boundary_wired_in_streaming_branch() -> None:
+    """[B1-2] #4 (llm_chunk_boundary) is LIVE: the astream branch of llm_node
+    must check _should_cancel at every chunk boundary. Positive source pin;
+    the runtime guarantee is locked by the behavior test
+    test_react_graph_b1_streaming.py::TestChunkBoundaryCancel (INV-B1-7 —
+    a dead branch can fake this string, the behavior test cannot)."""
     from app.domain.services.graphs import react_graph
     src = inspect.getsource(react_graph)
-    assert "llm_chunk_boundary" in src and "deferred" in src.lower(), (
-        "#4 (llm_chunk_boundary) must be explicitly noted as deferred in "
-        "react_graph.py until streaming is added; absent the marker, a "
-        "reviewer can't tell whether the omission is a bug or by design."
+    assert 'CancelledByEventError("llm_chunk_boundary")' in src, (
+        "#4 must be a real checkpoint raise inside the astream loop"
     )
+    assert "astream" in src, "streaming branch missing"
 
 
 # ---------------------------------------------------------------------------

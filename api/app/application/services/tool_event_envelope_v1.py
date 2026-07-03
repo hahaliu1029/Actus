@@ -83,7 +83,7 @@ def _wire_reason(reason: Optional[DecisionReason]) -> Optional[DecisionReasonWir
 
 def _project_common_top_fields(
     event: ToolEvent,
-    status_lit: Literal["calling", "called"],
+    status_lit: Literal["calling", "running", "called"],
 ) -> dict[str, Any]:
     """顶层 envelope metadata 字段, 所有路径共用. 用长名 + populate_by_name."""
     return {
@@ -228,7 +228,7 @@ def _derive_render_style_from_outcome(
 def _project_from_artifact(
     event: ToolEvent,
     artifact: ToolArtifact,
-    status_lit: Literal["calling", "called"],
+    status_lit: Literal["calling", "running", "called"],
 ) -> ToolEventEnvelopeV1:
     top = _project_common_top_fields(event, status_lit)
     outcome = artifact.outcome
@@ -260,7 +260,7 @@ def _project_from_artifact(
 def _project_from_legacy_result(
     event: ToolEvent,
     legacy: ToolResult,
-    status_lit: Literal["calling", "called"],
+    status_lit: Literal["calling", "running", "called"],
 ) -> ToolEventEnvelopeV1:
     top = _project_common_top_fields(event, status_lit)
     fr = FunctionResultV1(
@@ -273,7 +273,7 @@ def _project_from_legacy_result(
 
 def _project_skeleton(
     event: ToolEvent,
-    status_lit: Literal["calling", "called"],
+    status_lit: Literal["calling", "running", "called"],
 ) -> ToolEventEnvelopeV1:
     top = _project_common_top_fields(event, status_lit)
     return ToolEventEnvelopeV1(**top, function_result=None)
@@ -282,7 +282,7 @@ def _project_skeleton(
 def _project_unknown_variant_fallback(
     event: ToolEvent,
     variant: str,
-    status_lit: Literal["calling", "called"],
+    status_lit: Literal["calling", "running", "called"],
 ) -> ToolEventEnvelopeV1:
     """R2 加新 variant 且 projector 未适配时的 last-resort 降级.
 
@@ -328,9 +328,13 @@ def project_tool_event_to_envelope_v1(event: ToolEvent) -> ToolEventEnvelopeV1:
     event_id / created_at 从 event.id / event.created_at 直接注入
     (BaseEventData 基类字段).
     """
-    status_lit: Literal["calling", "called"] = (
-        "called" if event.status == ToolEventStatus.CALLED else "calling"
-    )
+    status_lit: Literal["calling", "running", "called"]
+    if event.status == ToolEventStatus.CALLED:
+        status_lit = "called"
+    elif event.status == ToolEventStatus.RUNNING:
+        status_lit = "running"
+    else:
+        status_lit = "calling"
 
     # --- 路径 1: event.artifact dict (R2 typed via adapter) ---
     if event.artifact is not None:
@@ -350,5 +354,5 @@ def project_tool_event_to_envelope_v1(event: ToolEvent) -> ToolEventEnvelopeV1:
     if event.function_result is not None:
         return _project_from_legacy_result(event, event.function_result, status_lit)
 
-    # --- 路径 3: CALLING 或空事件 ---
+    # --- 路径 3: CALLING / RUNNING（B1-1b）或空事件 ---
     return _project_skeleton(event, status_lit)

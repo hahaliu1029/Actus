@@ -75,6 +75,19 @@ from app.domain.services.tools.tool_source_resolver import (
     ToolSourceUnknownError,
     resolve_tool_source,
 )
+from app.domain.services.executor import (
+    Ask as GateAsk,
+    AskPayload,
+    BatchToolExecutor,
+    Execute as GateExecute,
+    FinalizeMeta,
+    GateOutcome,
+    PerTcResult,
+    Skip as GateSkip,
+    Surfaced as GateSurfaced,
+    TcMeta,
+    Waiting as GateWaiting,
+)
 
 from .message_utils import truncate_tool_content
 from .state import ReactGraphState
@@ -104,18 +117,16 @@ from app.domain.external.file_processor import MAX_FILE_VIEW_IMAGES as _MAX_FILE
 # and is caught by ``CoordinatorChildRunner.run_work_unit`` which routes
 # to ``_finalize_by_stop_reason`` (PR-4 Task 4.7).
 #
-# Active checkpoints in react_graph (5 of the 6 spec'd here; #4 deferred):
+# Active checkpoints in react_graph (all 6 spec'd here now wired):
 #   #2 react_loop_entry   — pre_llm_node top
 #   #3 llm_node_entry     — llm_node top
-#   #4 llm_chunk_boundary — DEFERRED: live llm_node uses ``ainvoke`` (atomic).
-#                           When llm_node is refactored to ``astream``, wire
-#                           the check inside the ``async for chunk in ...``
-#                           loop. The string ``llm_chunk_boundary`` is kept
-#                           in this docstring so a grep / a contract test
-#                           (test_chunk_boundary_deferred_until_streaming)
-#                           can detect a silent regression.
+#   #4 llm_chunk_boundary — LIVE (B1-2): wired inside llm_node's astream
+#                           branch, checked at the top of every chunk
+#                           iteration. The ainvoke branch (flag OFF) remains
+#                           atomic — #3/#5 cover it.
 #   #5 llm_return         — llm_node bottom, before ``return {...}``
 #   #6 tool_node_entry    — tool_node top
+#   #6.5 tool_window_entry — B1-1c 并发窗口任务：semaphore 后、执行前
 #   #7 tool_node_return   — tool_node bottom, before final ``return Command``
 # Spec checkpoints #1 (worker start) + #8 (artifact upload pre-publish) live
 # in ``CoordinatorChildRunner`` outside react_graph.
@@ -1048,10 +1059,10 @@ def build_react_graph(
         """Call the LLM with current messages.
 
         [C2 PR-4 §8.4 #3 llm_node_entry] Cancel checkpoint at LLM call
-        boundary. Raising here aborts BEFORE ``llm_with_tools.ainvoke``
-        spends a token. The atomic ``ainvoke`` (NOT a streaming
-        ``astream``) is why #4 llm_chunk_boundary is deferred until a
-        future streaming refactor (see module top docstring)."""
+        boundary. Raising here aborts BEFORE the LLM spends a token. When
+        ``llm_tool_call_streaming_enabled`` is ON, #4 llm_chunk_boundary is
+        checked at every chunk boundary inside the astream branch below; the
+        atomic ``ainvoke`` branch (flag OFF) is covered by #3/#5."""
         if _should_cancel(config):
             raise CancelledByEventError("llm_node_entry")
         import time as _time
@@ -1084,8 +1095,54 @@ def build_react_graph(
             )
 
         _llm_start = _time.monotonic()
-        response: AIMessage = await llm_with_tools.ainvoke(messages)
-        # D5: Record LLM latency
+        _emitted_streaming_ids: set[str] = set()  # per-attempt 排除集（§5.3(b)）
+        if _tool_runtime_cfg.llm_tool_call_streaming_enabled:
+
+            async def _stream_with_collector():
+                from langchain_core.messages import message_chunk_to_message
+
+                from app.domain.services.executor import ToolCallStreamCollector
+
+                collector = ToolCallStreamCollector()
+                _queue = _configurable.get("event_queue")
+                queue_mode = (
+                    _tool_runtime_cfg.llm_incremental_calling_events_enabled
+                    and _queue is not None
+                )
+
+                async def _emit_incremental(completed) -> None:
+                    if not queue_mode:
+                        return
+                    for call in completed:
+                        try:
+                            _cat = resolve_tool_source(call.name).category
+                        except ToolSourceUnknownError:
+                            _cat = "unknown"
+                        await _queue.put(
+                            ToolEvent(
+                                tool_call_id=call.tool_call_id,
+                                tool_name=_cat,
+                                function_name=call.name,
+                                function_args=call.args,
+                                status=ToolEventStatus.CALLING,
+                            )
+                        )
+                        _emitted_streaming_ids.add(call.tool_call_id)
+
+                async for chunk in llm_with_tools.astream(messages):
+                    # [C2 PR-4 §8.4 #4 llm_chunk_boundary] — LIVE (B1-2)
+                    if _should_cancel(config):
+                        raise CancelledByEventError("llm_chunk_boundary")
+                    await _emit_incremental(collector.ingest(chunk))
+                final, tail = collector.finalize()
+                await _emit_incremental(tail)
+                return message_chunk_to_message(final)
+
+            response = await _stream_with_collector()
+        else:
+            response: AIMessage = await llm_with_tools.ainvoke(messages)
+        # D5: Record LLM latency —— astream 分支记录全流时长（R7#9；
+        # first-token 延迟指标 deferred）
         if _metrics:
             _metrics.record_llm_call((_time.monotonic() - _llm_start) * 1000)
 
@@ -1103,6 +1160,8 @@ def build_react_graph(
         # see the companion fix in ``tool_node``).
         if response.tool_calls:
             for tc in response.tool_calls:
+                if tc["id"] in _emitted_streaming_ids:
+                    continue  # §5.3(b)：本 attempt 已经 queue 发射——单通道排除
                 func_name = tc["name"]
                 try:
                     _calling_category = resolve_tool_source(func_name).category
@@ -1260,25 +1319,20 @@ def build_react_graph(
                 )
                 return None  # type: ignore[return-value]
 
-        new_completed_ids: list[str] = []
-        new_messages: list = []
-        new_events: list = []
-        new_deferred_human: list[HumanMessage] = []
-        should_interrupt = False
-        new_failures = 0
-
         session_ctx = _session_ctx_from(config)
 
-        async def _finalize_pe_outcome(
+        async def _translate_to_result(
             tc: dict,
             tc_args: dict,
             tool_source: ToolSource,
             outcome: ToolOutcome,
             tool_start_ts: float,
-        ) -> None:
-            """Same as _finalize_outcome but for PE path — no tracker/metrics changes."""
-            nonlocal new_failures
-
+            *,
+            consumed_resume_id: str | None = None,
+        ) -> PerTcResult:
+            """B1-1a: build a PerTcResult (no accumulator mutation) —
+            replaces _finalize_pe_outcome. Bookkeeping (tracker/metrics/
+            failure count/completed ids) is consumed by BatchToolExecutor."""
             msg, deferred, events = await _translate_outcome(
                 outcome,
                 tc,
@@ -1288,73 +1342,216 @@ def build_react_graph(
                 guide_injector=guide_injector,
                 enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
             )
-            if msg is not None:
-                new_messages.append(msg)
-            new_deferred_human.extend(deferred)
-            for evt in events:
-                new_events.append(evt)
-
             is_success = isinstance(outcome, (AllowSuccess, Passthrough))
-            tc_name = tc["name"]
+            return PerTcResult(
+                tool_message=msg,
+                deferred_human=list(deferred),
+                events=list(events),
+                completed_ids=[tc["id"]],
+                is_failure=not is_success,
+                consumed_resume_id=consumed_resume_id,
+                finalize_meta=FinalizeMeta(
+                    tool_name_raw=tc["name"],
+                    args=tc_args,
+                    is_failure=not is_success,
+                    started_at=tool_start_ts,
+                    ended_at=_time.monotonic(),
+                ),
+            )
+
+        def _record_finalize(meta: FinalizeMeta) -> None:
+            """Executor 单点消费的 tracker/metrics 记录动作（今日 _finalize_pe_outcome 尾部语义）。"""
+            is_success = not meta.is_failure
             if _tracker:
                 if is_success:
-                    _tracker.record_success(tc_name, tc_args)
+                    _tracker.record_success(meta.tool_name_raw, meta.args)
                 else:
-                    _tracker.record_failure(tc_name, tc_args)
+                    _tracker.record_failure(meta.tool_name_raw, meta.args)
             if _metrics:
                 _metrics.record_tool_call(
                     success=is_success,
-                    latency_ms=(_time.monotonic() - tool_start_ts) * 1000,
+                    latency_ms=(meta.ended_at - meta.started_at) * 1000,
                 )
-            if not is_success:
-                new_failures += 1
 
-            new_completed_ids.append(tc["id"])
+        def _tc_meta(tc: dict, tc_args: dict, tool_source: ToolSource) -> TcMeta:
+            return TcMeta(
+                tool_call_id=tc["id"],
+                raw_function_name=tc["name"],
+                category_tool_name=tool_source.category,
+                args=tc_args,
+            )
+
+        def _make_execute_thunk(
+            tc: dict,
+            tc_args: dict,
+            tool_fn: BaseTool,
+            tool_source: ToolSource,
+            wrapper_session_id: str,
+            tool_start_ts: float,
+            *,
+            consumed_resume_id: str | None = None,
+        ):
+            """INV-5 v2 named sink（spec §4.1 v2）：PE 路径上 _invoke_wrapper 的
+            唯一可达居所。调用点必须被 path A/B/C token 词法支配（静态扫描
+            test_inv5_static_path_dominance.py 强制）。"""
+
+            async def _execute_thunk() -> PerTcResult:
+                tool_name = tc["name"]
+                call_id = tc["id"]
+                # Pre-wrapper live-mode fresh recheck —— 从 evaluate-allow 分支
+                # (round 34 P1#2) 原样迁入；R7#3 起统一覆盖全部执行路径
+                # (evaluate-allow / pre-approved / replay-B)。
+                from app.domain.models.session import SessionStatus as _LiveCheckStatus
+                _live_modes_for_wrapper = (
+                    _LiveCheckStatus.RUNNING,
+                    _LiveCheckStatus.WAITING,
+                )
+                try:
+                    _current_mode, _ = await _ssm.get_mode_with_revision(_session_id)
+                except Exception:
+                    logger.warning(
+                        "_pe_dispatch pre-wrapper: SSM.get_mode_with_revision "
+                        "failed for session %s (fail-closed before wrapper)",
+                        _session_id,
+                    )
+                    error_outcome = AllowError(
+                        content=(
+                            "[SSM_UNAVAILABLE] 会话状态暂时不可用，请重试"
+                            "（session state unavailable before wrapper execution）"
+                        ),
+                        reason=DecisionReason(
+                            type="exception",
+                            code="ssm_read_failure",
+                            message=(
+                                "SSM.get_mode_with_revision failed during pre-wrapper "
+                                "live-mode recheck; failing closed"
+                            ),
+                        ),
+                        retryable=True,
+                    )
+                    return await _translate_to_result(
+                        tc, tc_args, tool_source, error_outcome, tool_start_ts,
+                        consumed_resume_id=consumed_resume_id,
+                    )
+                if _current_mode not in _live_modes_for_wrapper:
+                    logger.warning(
+                        "_pe_dispatch pre-wrapper: session %s switched to non-live "
+                        "mode %s; converting to Denied for tool_call_id=%s",
+                        _session_id,
+                        _current_mode.value,
+                        call_id,
+                    )
+                    denied_outcome = Denied(
+                        content=(
+                            "[MODE_DENIED] 会话已切换至非活跃模式，工具执行被拒绝"
+                            f"（session mode changed to {_current_mode.value} "
+                            "before wrapper execution）"
+                        ),
+                        reason=DecisionReason(
+                            type="approval_policy",
+                            code="session_mode_changed_before_invoke",
+                            message=(
+                                f"session is {_current_mode.value} at wrapper "
+                                "execution time"
+                            ),
+                        ),
+                    )
+                    return await _translate_to_result(
+                        tc, tc_args, tool_source, denied_outcome, tool_start_ts,
+                        consumed_resume_id=consumed_resume_id,
+                    )
+                # B1-1b RUNNING（R7#3）：live-mode recheck 通过之后、wrapper 之前。
+                # 通道规则 P-9：flag ON + queue 存在 → queue 实时；queue 缺失 →
+                # per-attempt 回退 state-path（挂在 PerTcResult.events 头部）。
+                _running_event = None
+                if _tool_runtime_cfg.tool_running_events_enabled:
+                    _running_event = ToolEvent(
+                        tool_call_id=call_id,
+                        tool_name=tool_source.category,
+                        function_name=tool_name,
+                        function_args=tc_args,
+                        status=ToolEventStatus.RUNNING,
+                    )
+                    if event_queue is not None:
+                        await event_queue.put(_running_event)
+                        _running_event = None  # 已入队——绝不双通道
+                result_data = await _invoke_wrapper(
+                    tool_fn,
+                    tc,
+                    tool_source,
+                    session_id=wrapper_session_id,
+                    max_wrapper_output_bytes=_runtime_max_bytes,
+                )
+                result_data = _maybe_convert_shell_outcome_with_images(
+                    result_data, tool_name
+                )
+                _thunk_result = await _translate_to_result(
+                    tc, tc_args, tool_source, result_data, tool_start_ts,
+                    consumed_resume_id=consumed_resume_id,
+                )
+                if _running_event is not None:
+                    _thunk_result.events.insert(0, _running_event)
+                return _thunk_result
+
+            return _execute_thunk
 
         # PE-0 Phase 10: accumulate pe_resume_outcomes cleanup entries from
         # the replay path.  Merged into the batch-completion update after
         # the loop to clear consumed entries from state.
         _batch_pe_resume_consumed: dict[str, Any] = {}
 
-        for tc in tool_calls:
+        async def _pe_gate(tc: dict) -> GateOutcome:
             tool_name = tc["name"]
             args = tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"])
             call_id = tc["id"]
             _tool_start = _time.monotonic()
 
-            if call_id in already_done:
-                continue
+            if call_id in already_done:                      # M7 (replay-skip)
+                return GateSkip(tool_call_id=call_id)
 
-            _bypass_risk_gate = call_id in pre_approved
+            # INV-5 v2 path C token（显式授权出处，spec R8#1）：pre-approved 集
+            # 在 gate 函数内自证来源于 state["approved_tool_call_ids"]。
+            _approved_ids_snapshot = set(
+                state.get("approved_tool_call_ids", []) or []
+            )
+            _bypass_risk_gate = call_id in _approved_ids_snapshot
 
             # message_ask_user: no ToolSource — handle via legacy SOFT_HINT path
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
+                _mau_should_interrupt = False
                 if suggest in {"browser", "shell"}:
                     result_str = "WAITING_FOR_USER"
-                    should_interrupt = True
+                    _mau_should_interrupt = True
                 elif not has_prior_soft_hint:
                     result_str = "SOFT_HINT"
                     logger.info("message_ask_user (PE path): returning SOFT_HINT")
                 else:
                     result_str = "WAITING_FOR_USER"
-                    should_interrupt = True
+                    _mau_should_interrupt = True
 
-                new_messages.append(
-                    ToolMessage(content=result_str, tool_call_id=call_id, name=tool_name)
+                _mau_result = PerTcResult(
+                    tool_message=ToolMessage(
+                        content=result_str, tool_call_id=call_id, name=tool_name
+                    ),
+                    events=[
+                        ToolEvent(
+                            tool_call_id=call_id,
+                            tool_name=resolve_tool_source(tool_name).category,
+                            function_name=tool_name,
+                            function_args=args,
+                            function_result=ToolResult(success=True, message=result_str),
+                            status=ToolEventStatus.CALLED,
+                        )
+                    ],
+                    completed_ids=[call_id],
                 )
-                new_events.append(
-                    ToolEvent(
-                        tool_call_id=call_id,
-                        tool_name=resolve_tool_source(tool_name).category,
-                        function_name=tool_name,
-                        function_args=args,
-                        function_result=ToolResult(success=True, message=result_str),
-                        status=ToolEventStatus.CALLED,
-                    )
-                )
-                new_completed_ids.append(call_id)
-                continue
+                # WAITING (browser/shell takeover or second SOFT_HINT) → Waiting
+                # (executor sets should_interrupt but continues the batch);
+                # first SOFT_HINT → Surfaced (no interrupt). spec §4.1.1 R16#1.
+                if _mau_should_interrupt:
+                    return GateWaiting(result=_mau_result)
+                return GateSurfaced(result=_mau_result)
 
             # Resolve ToolSource
             try:
@@ -1402,11 +1599,13 @@ def build_react_graph(
                         ),
                     ),
                 )
-                await _finalize_pe_outcome(
+                # 唯一特例（spec M9）：翻译后再 append 一次 call_id，保留今日
+                # 双 append quirk（原 :1405 _finalize + :1408 显式 append）。
+                _elig_result = await _translate_to_result(
                     tc, args, tool_source, _non_pe_denied, _tool_start
                 )
-                new_completed_ids.append(call_id)
-                continue
+                _elig_result.completed_ids.append(call_id)
+                return GateSurfaced(result=_elig_result)
 
             # D5 tracker: block repeated failures
             if _tracker and _tracker.is_blocked(tool_name, args):
@@ -1421,8 +1620,9 @@ def build_react_graph(
                         message="Tool signature hit the tracker blocklist threshold",
                     ),
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, blocked_outcome, _tool_start)
-                continue
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, blocked_outcome, _tool_start
+                ))
 
             # Unknown tool
             tool_fn = tool_map.get(tool_name)
@@ -1435,8 +1635,9 @@ def build_react_graph(
                         message=f"Tool '{tool_name}' not in this graph's tool_map",
                     ),
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, unknown_outcome, _tool_start)
-                continue
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, unknown_outcome, _tool_start
+                ))
 
             # Run RiskAssessor unconditionally for all native tools so that
             # arg_digest / primary_arg are always populated in ToolCallSpec.
@@ -1473,10 +1674,9 @@ def build_react_graph(
                         ),
                         retryable=False,
                     )
-                    await _finalize_pe_outcome(
+                    return GateSurfaced(result=await _translate_to_result(
                         tc, args, tool_source, _missing_outcome, _tool_start,
-                    )
-                    continue
+                    ))
                 source_metadata = build_skill_call_metadata(
                     tool_name=tool_name,
                     tool_fn=tool_fn,
@@ -1508,8 +1708,9 @@ def build_react_graph(
                     ),
                     retryable=True,
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, ssm_error_outcome, _tool_start)
-                continue
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, ssm_error_outcome, _tool_start
+                ))
 
             from app.domain.services.permission.context import EvaluationContext
 
@@ -1567,33 +1768,26 @@ def build_react_graph(
                             message=f"session is {mode.value} at replay time",
                         ),
                     )
-                # For AllowSuccess/Passthrough → invoke the tool wrapper.
-                if isinstance(cached_outcome, (AllowSuccess, Passthrough)):
-                    result_data = await _invoke_wrapper(
-                        tool_fn,
-                        tc,
-                        tool_source,
-                        session_id=call_spec.session_id,
-                        max_wrapper_output_bytes=_runtime_max_bytes,
-                    )
-                    result_data = _maybe_convert_shell_outcome_with_images(result_data, tool_name)
-                    await _finalize_pe_outcome(tc, args, tool_source, result_data, _tool_start)
-                else:
-                    # Denied / AllowError / Asked — surface without invoking wrapper.
-                    await _finalize_pe_outcome(tc, args, tool_source, cached_outcome, _tool_start)
-
-                # Merge the state cleanup into the batch-final Command below
-                # by continuing the loop (the consumed_update is collected after
-                # the loop via a side-channel).  We accumulate it here so the
-                # batch-completion update block can merge it.
-                # Note: the per-tool continue applies to the normal batch path;
-                # we stay in the loop and handle the pe_resume_outcomes cleanup
-                # by accumulating into a mutable variable captured below.
-                if not hasattr(_pe_dispatch, "_accumulated_consumed"):
-                    pass  # consumed_update merged after the loop
-                # Store consumed_update for post-loop merge.
+                # consumed_update merge stays at GATE time (P-4a bug-for-bug):
+                # accumulate the pruned dict BEFORE returning either outcome so
+                # the executor's resume_cleanup() snapshot sees it in both exits.
                 _batch_pe_resume_consumed.update(consumed_update)
-                continue
+                # For AllowSuccess/Passthrough → schedule the tool wrapper via the
+                # named thunk (pre-wrapper fresh recheck now lives in the thunk).
+                if isinstance(cached_outcome, (AllowSuccess, Passthrough)):
+                    return GateExecute(
+                        thunk=_make_execute_thunk(
+                            tc, args, tool_fn, tool_source,
+                            call_spec.session_id, _tool_start,
+                            consumed_resume_id=call_id,
+                        ),
+                        tc_meta=_tc_meta(tc, args, tool_source),
+                    )
+                # Denied / AllowError / Asked — surface without invoking wrapper.
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, cached_outcome, _tool_start,
+                    consumed_resume_id=call_id,
+                ))
             # ---- end replay path B ---- #
 
             # P1#4: Shell AST validator gate (N1) — mirrors the legacy tool_node
@@ -1636,8 +1830,9 @@ def build_react_graph(
                         ),
                         retryable=False,
                     )
-                    await _finalize_pe_outcome(tc, args, tool_source, _ast_crash, _tool_start)
-                    continue
+                    return GateSurfaced(result=await _translate_to_result(
+                        tc, args, tool_source, _ast_crash, _tool_start
+                    ))
 
                 if _metrics is not None:
                     _metrics.record_ast_validation(_ast_result.code)
@@ -1697,8 +1892,9 @@ def build_react_graph(
                     _ast_denied = to_typed_denied(
                         _ast_result, original_command=args.get("command", "")
                     )
-                    await _finalize_pe_outcome(tc, args, tool_source, _ast_denied, _tool_start)
-                    continue
+                    return GateSurfaced(result=await _translate_to_result(
+                        tc, args, tool_source, _ast_denied, _tool_start
+                    ))
             # — end N1 gate (PE path) —
 
             # Codex round-20 P2#1: Pre-approved tool calls (approved_tool_call_ids)
@@ -1746,20 +1942,19 @@ def build_react_graph(
                             message=f"session is {mode.value} at legacy-approved replay time",
                         ),
                     )
-                    await _finalize_pe_outcome(tc, args, tool_source, _mode_denied, _tool_start)
-                    continue
-                _approved_result = await _invoke_wrapper(
-                    tool_fn,
-                    tc,
-                    tool_source,
-                    session_id=call_spec.session_id,
-                    max_wrapper_output_bytes=_runtime_max_bytes,
+                    return GateSurfaced(result=await _translate_to_result(
+                        tc, args, tool_source, _mode_denied, _tool_start
+                    ))
+                # path C authorized via approved_tool_call_ids (C token dominates
+                # this callsite through _approved_ids_snapshot above) — schedule
+                # the wrapper via the named thunk (fresh recheck lives in thunk).
+                return GateExecute(
+                    thunk=_make_execute_thunk(
+                        tc, args, tool_fn, tool_source,
+                        call_spec.session_id, _tool_start,
+                    ),
+                    tc_meta=_tc_meta(tc, args, tool_source),
                 )
-                _approved_result = _maybe_convert_shell_outcome_with_images(
-                    _approved_result, tool_name
-                )
-                await _finalize_pe_outcome(tc, args, tool_source, _approved_result, _tool_start)
-                continue
 
             # Evaluate through PE
             # PE-1 §2.7 / §5.1: explicit catches for UnsupportedSource and
@@ -1785,8 +1980,9 @@ def build_react_graph(
                     ),
                     retryable=False,
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, lifecycle_outcome, _tool_start)
-                continue
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, lifecycle_outcome, _tool_start
+                ))
             except PolicyConflict as exc:
                 logger.warning(
                     "PE PolicyConflict for tool '%s' session '%s': %s",
@@ -1803,8 +1999,9 @@ def build_react_graph(
                     ),
                     retryable=False,
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, conflict_outcome, _tool_start)
-                continue
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, conflict_outcome, _tool_start
+                ))
             except UnsupportedSource as exc:
                 # PE-1 §2.7 + Round 2 P1#2: caller should have gated via
                 # ``is_pe_eligible_tool_source`` (which delegates to
@@ -1831,10 +2028,9 @@ def build_react_graph(
                     ),
                     retryable=False,
                 )
-                await _finalize_pe_outcome(
+                return GateSurfaced(result=await _translate_to_result(
                     tc, args, tool_source, unsupported_outcome, _tool_start,
-                )
-                continue
+                ))
             except PEInfrastructureUnavailable as exc:
                 # PE-1 §5.1 / Round 2 P1#10: Redis / queue / writer crashed
                 # mid-evaluate. retryable=True so the agent retry chain can
@@ -1856,10 +2052,9 @@ def build_react_graph(
                     ),
                     retryable=True,
                 )
-                await _finalize_pe_outcome(
+                return GateSurfaced(result=await _translate_to_result(
                     tc, args, tool_source, infra_outcome, _tool_start,
-                )
-                continue
+                ))
             except ChildScopeViolation:
                 # [C2 PR-2 §5.4] Child scope violations must propagate past this
                 # catch-all so CoordinatorChildRunner finalizer (PR-4) can convert
@@ -1878,96 +2073,29 @@ def build_react_graph(
                     ),
                     retryable=False,
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, error_outcome, _tool_start)
-                continue
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, error_outcome, _tool_start
+                ))
 
             # Dispatch based on PE outcome
             if isinstance(pe_outcome, (AllowSuccess, Passthrough)):
-                # P1#2 (round 34): re-check session mode before invoking wrapper.
-                # pe.evaluate() awaits DB/SSM/policy reads above; the `mode` captured
-                # earlier (line ~1389) is stale by the time we get here. If the
-                # session switched to TAKEOVER or a terminal state during evaluate(),
-                # we must NOT execute the wrapper.
-                # Parity with replay path (round 23 P1#1) and the legacy
-                # approved_tool_call_ids path (round 25 P2#1) which already do
-                # this re-check using the single up-front fetch — here we need a
-                # fresh fetch since evaluate() interleaved its own awaits.
-                from app.domain.models.session import SessionStatus as _LiveCheckStatus
-                _live_modes_for_wrapper = (
-                    _LiveCheckStatus.RUNNING,
-                    _LiveCheckStatus.WAITING,
+                # M12: the pre-wrapper fresh live-mode recheck (round 34 P1#2)
+                # + wrapper execution moved into _make_execute_thunk (R7#3). The
+                # `await _pe.evaluate(...)` above (path A token) dominates this
+                # callsite for INV-5 v2 static dominance.
+                return GateExecute(
+                    thunk=_make_execute_thunk(
+                        tc, args, tool_fn, tool_source,
+                        call_spec.session_id, _tool_start,
+                    ),
+                    tc_meta=_tc_meta(tc, args, tool_source),
                 )
-                try:
-                    _current_mode, _ = await _ssm.get_mode_with_revision(_session_id)
-                except Exception:
-                    logger.warning(
-                        "_pe_dispatch live-mode recheck: SSM.get_mode_with_revision "
-                        "failed for session %s (fail-closed before wrapper)",
-                        _session_id,
-                    )
-                    error_outcome = AllowError(
-                        content=(
-                            "[SSM_UNAVAILABLE] 会话状态暂时不可用，请重试"
-                            "（session state unavailable before wrapper execution）"
-                        ),
-                        reason=DecisionReason(
-                            type="exception",
-                            code="ssm_read_failure",
-                            message=(
-                                "SSM.get_mode_with_revision failed during pre-wrapper "
-                                "live-mode recheck; failing closed"
-                            ),
-                        ),
-                        retryable=True,
-                    )
-                    await _finalize_pe_outcome(
-                        tc, args, tool_source, error_outcome, _tool_start,
-                    )
-                    continue
-
-                if _current_mode not in _live_modes_for_wrapper:
-                    logger.warning(
-                        "_pe_dispatch pre-wrapper: session %s switched to non-live "
-                        "mode %s after pe.evaluate; converting AllowSuccess/Passthrough "
-                        "to Denied for tool_call_id=%s",
-                        _session_id,
-                        _current_mode.value,
-                        call_id,
-                    )
-                    denied_outcome = Denied(
-                        content=(
-                            "[MODE_DENIED] 会话已切换至非活跃模式，工具执行被拒绝"
-                            f"（session mode changed to {_current_mode.value} "
-                            "before wrapper execution）"
-                        ),
-                        reason=DecisionReason(
-                            type="approval_policy",
-                            code="session_mode_changed_before_invoke",
-                            message=(
-                                f"session is {_current_mode.value} at wrapper "
-                                "execution time"
-                            ),
-                        ),
-                    )
-                    await _finalize_pe_outcome(
-                        tc, args, tool_source, denied_outcome, _tool_start,
-                    )
-                    continue
-
-                # Mode OK — execute the actual tool
-                result_data = await _invoke_wrapper(
-                    tool_fn,
-                    tc,
-                    tool_source,
-                    session_id=call_spec.session_id,
-                    max_wrapper_output_bytes=_runtime_max_bytes,
-                )
-                result_data = _maybe_convert_shell_outcome_with_images(result_data, tool_name)
-                await _finalize_pe_outcome(tc, args, tool_source, result_data, _tool_start)
 
             elif isinstance(pe_outcome, (Denied, AllowError)):
                 # No execution — emit ToolMessage directly
-                await _finalize_pe_outcome(tc, args, tool_source, pe_outcome, _tool_start)
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, pe_outcome, _tool_start
+                ))
 
             elif isinstance(pe_outcome, Asked):
                 # PE-1 §5.1: rebuild ToolConfirmationEvent from the
@@ -2027,14 +2155,9 @@ def build_react_graph(
                     suggested_alternative=suggested_alternative,
                     timeout_seconds=_timeout_seconds,
                 )
-                if event_queue:
-                    await event_queue.put(confirmation_event)
-
-                # P2#5: Do NOT call confirmation_manager.store() here.
-                # PE.evaluate() already called queue.store() (with status=pending +
-                # no claim_nonce) before returning Asked.  A second store() here
-                # would reset status=pending + clear any claim_nonce set by a
-                # racing preflight_resume, causing commit_resume nonce mismatch.
+                # NOTE: event_queue.put moved OUT of the gate — _pe_dispatch
+                # emits confirmation_event after _executor.run() returns (drain
+                # point). P2#5 still holds: no confirmation_manager.store() here.
 
                 _pending_outcome = pe_outcome
                 _pending_artifact = ToolArtifact(
@@ -2043,29 +2166,15 @@ def build_react_graph(
                     tool_source=tool_source,
                     outcome=_pending_outcome,
                 )
-                _update = {
-                    "messages": new_messages + new_deferred_human,
-                    "events": new_events,
-                    "attempt_count": state["attempt_count"] + 1,
-                    "failure_count": state["failure_count"] + new_failures,
-                    "completed_tool_call_prefix": (
-                        list(already_done) + new_completed_ids
-                    ),
-                    "pending_ask_outcome": _pending_outcome.model_dump(mode="json"),
-                    "pending_ask_tool_call_id": call_id,
-                    "pending_ask_artifact": _pending_artifact.model_dump(
+                return GateAsk(payload=AskPayload(
+                    pending_ask_outcome=_pending_outcome.model_dump(mode="json"),
+                    pending_ask_tool_call_id=call_id,
+                    pending_ask_artifact=_pending_artifact.model_dump(
                         mode="json", by_alias=True
                     ),
-                    "pending_ask_tool_args": dict(args),
-                }
-                # P2#3: merge already-consumed pe_resume_outcomes cleanup into
-                # this early-return Command so that replayed entries from earlier
-                # tools in the same batch are not left in state.  Without this,
-                # a second interrupt in the same batch would leave stale entries
-                # that could match a future tool_call_id with the same name.
-                if _batch_pe_resume_consumed:
-                    _update.update(_batch_pe_resume_consumed)
-                return Command(goto="interrupt_helper", update=_update)
+                    pending_ask_tool_args=dict(args),
+                    confirmation_event=confirmation_event,
+                ))
 
             else:
                 logger.error(
@@ -2081,39 +2190,48 @@ def build_react_graph(
                     ),
                     retryable=False,
                 )
-                await _finalize_pe_outcome(tc, args, tool_source, unknown_err, _tool_start)
+                return GateSurfaced(result=await _translate_to_result(
+                    tc, args, tool_source, unknown_err, _tool_start
+                ))
 
-        # Batch completed — same happy-path logic as legacy tool_node
-        new_messages.extend(new_deferred_human)
+        # B1-1a: executor owns the batch loop + accumulator + flush ordering.
+        # The gate closures above (_pe_gate / _make_execute_thunk) keep every
+        # security + execution-encapsulation decision. R11#5: enhancements_enabled
+        # is hardcoded True at this callsite — never from config/state.
+        def _window_cancel_checkpoint() -> None:
+            """[B1-1c] 并发窗口 cancel 点：semaphore 获取后、RUNNING 发射与
+            wrapper 之前（spec §4.3.5）。串行/flag-OFF 模式 executor 不调用。"""
+            if _should_cancel(config):
+                raise CancelledByEventError("tool_window_entry")
 
-        update: dict[str, Any] = {
-            "messages": new_messages,
-            "events": new_events,
-            "attempt_count": state["attempt_count"] + 1,
-            "failure_count": state["failure_count"] + new_failures,
-            "completed_tool_call_prefix": [],
-            "approved_tool_call_ids": [],
-            "pending_ask_outcome": None,
-            "pending_ask_tool_call_id": None,
-            "pending_ask_artifact": None,
-            "pending_ask_tool_args": None,
-        }
-        # PE-0 Phase 10: clear consumed pe_resume_outcomes entries.
-        # Replay path set _batch_pe_resume_consumed with the pruned dict;
-        # merge it into the batch update to keep state clean.
-        if _batch_pe_resume_consumed:
-            update.update(_batch_pe_resume_consumed)
-        if should_interrupt:
-            update["should_interrupt"] = True
-        if not has_prior_soft_hint and any(
-            m.content == "SOFT_HINT" and m.name == "message_ask_user"
-            for m in new_messages
-        ):
-            update["soft_hint_sent"] = True
-
+        _executor = BatchToolExecutor(
+            enhancements_enabled=True,   # R11#5: 调用点硬编码
+            concurrency_enabled=_tool_runtime_cfg.tool_concurrency_enabled,
+            max_concurrency=_tool_runtime_cfg.tool_max_concurrency,
+            running_events_enabled=_tool_runtime_cfg.tool_running_events_enabled,
+            emit_queue_event=(event_queue.put if event_queue is not None else None),
+            check_cancel=_window_cancel_checkpoint,
+            record_finalize=_record_finalize,
+        )
+        batch_result = await _executor.run(
+            tool_calls,
+            _pe_gate,
+            has_prior_soft_hint=has_prior_soft_hint,
+            attempt_count=state["attempt_count"],
+            failure_count=state["failure_count"],
+            already_done=list(already_done),
+            resume_cleanup=lambda: dict(_batch_pe_resume_consumed),
+        )
+        if batch_result.interrupted:
+            assert batch_result.ask_payload is not None
+            if event_queue:
+                await event_queue.put(batch_result.ask_payload.confirmation_event)
+            return Command(goto="interrupt_helper", update=batch_result.update)
+        update = batch_result.update
         goto: str = (
             END
-            if should_interrupt or update.get("attempt_count", 0) >= MAX_ITERATIONS
+            if update.get("should_interrupt")
+            or update.get("attempt_count", 0) >= MAX_ITERATIONS
             else "pre_llm_node"
         )
         return Command(goto=goto, update=update)
@@ -2259,28 +2377,25 @@ def build_react_graph(
         pre_approved: set[str] = set(
             state.get("approved_tool_call_ids", []) or []
         )
-        new_completed_ids: list[str] = []
-
-        new_messages: list = []
-        new_events: list = []
-        should_interrupt = False
-        new_failures = 0
-        # R2 CS2: Passthrough deferred HumanMessage list, appended AFTER all
-        # ToolMessages so the AIMessage → ToolMessage* pairing survives for
-        # group_messages() (context_assembler.py). _translate_outcome
-        # appends to this; tool_node owns the final flush.
-        new_deferred_human: list[HumanMessage] = []
-
         session_ctx = _session_ctx_from(config)
+        # Batch-invariant wrapper output cap — hoisted so _legacy_make_execute_thunk
+        # (a tool_node-scope factory) closes over it. Per-tc _session_id is still
+        # read inside _legacy_gate and passed explicitly to the factory.
+        _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
 
-        async def _finalize_outcome(
+        async def _legacy_translate_to_result(
             tc: dict,
             tc_args: dict,
             tool_source: ToolSource,
             outcome: ToolOutcome,
             tool_start_ts: float,
-        ) -> None:
-            """Layer 3 translate + tracker/metrics bookkeeping.
+        ) -> PerTcResult:
+            """Layer 3 translate + tracker/metrics bookkeeping (B1-1a).
+
+            Legacy sibling of ``_pe_dispatch._translate_to_result``: builds a
+            PerTcResult (no accumulator mutation) from a typed ``ToolOutcome``.
+            Bookkeeping (tracker/metrics via ``_legacy_record_finalize``,
+            failure count / completed ids) is consumed by BatchToolExecutor.
 
             Shared tail of the execution flow, used by:
             - tracker-blocked synthesis (AllowError)
@@ -2290,16 +2405,13 @@ def build_react_graph(
             - low-risk / no-risk path via Layer 2 (_invoke_wrapper)
 
             Every path that reaches this helper has a typed ``ToolOutcome``,
-            so the ToolMessage that lands in ``new_messages`` carries a
-            real typed ``artifact`` field. That is what makes Chunk 4's
-            LLM adapter prefix injection (``[TOOL_FAILED: timeout]`` /
-            ``[TOOL_DENIED: ast_validator]``) actually fire in
-            production — the pre-fix dispatcher handed the adapter bare
-            strings with ``artifact=None``, so the adapter always fell
-            back to the generic ``[TOOL_ERROR]``.
+            so the ToolMessage that lands in ``messages`` carries a real typed
+            ``artifact`` field. That is what makes Chunk 4's LLM adapter prefix
+            injection (``[TOOL_FAILED: timeout]`` / ``[TOOL_DENIED:
+            ast_validator]``) actually fire in production — the pre-fix
+            dispatcher handed the adapter bare strings with ``artifact=None``,
+            so the adapter always fell back to the generic ``[TOOL_ERROR]``.
             """
-            nonlocal new_failures
-
             msg, deferred, events = await _translate_outcome(
                 outcome,
                 tc,
@@ -2309,30 +2421,76 @@ def build_react_graph(
                 guide_injector=guide_injector,
                 enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
             )
-            if msg is not None:
-                new_messages.append(msg)
-            new_deferred_human.extend(deferred)
-            for evt in events:
-                new_events.append(evt)
-
             is_success = isinstance(outcome, (AllowSuccess, Passthrough))
-            tc_name = tc["name"]
+            return PerTcResult(
+                tool_message=msg,
+                deferred_human=list(deferred),
+                events=list(events),
+                completed_ids=[tc["id"]],
+                is_failure=not is_success,
+                finalize_meta=FinalizeMeta(
+                    tool_name_raw=tc["name"],
+                    args=tc_args,
+                    is_failure=not is_success,
+                    started_at=tool_start_ts,
+                    ended_at=_time.monotonic(),
+                ),
+            )
+
+        def _legacy_record_finalize(meta: FinalizeMeta) -> None:
+            """Executor 单点消费的 tracker/metrics 记录动作（今日 _finalize_outcome 尾部语义）。"""
+            is_success = not meta.is_failure
             if _tracker:
                 if is_success:
-                    _tracker.record_success(tc_name, tc_args)
+                    _tracker.record_success(meta.tool_name_raw, meta.args)
                 else:
-                    _tracker.record_failure(tc_name, tc_args)
+                    _tracker.record_failure(meta.tool_name_raw, meta.args)
             if _metrics:
                 _metrics.record_tool_call(
                     success=is_success,
-                    latency_ms=(_time.monotonic() - tool_start_ts) * 1000,
+                    latency_ms=(meta.ended_at - meta.started_at) * 1000,
                 )
-            if not is_success:
-                new_failures += 1
 
-            new_completed_ids.append(tc["id"])
+        def _legacy_make_execute_thunk(
+            tc: dict,
+            tc_args: dict,
+            tool_fn: BaseTool,
+            tool_source: ToolSource,
+            wrapper_session_id: str,
+            tool_start_ts: float,
+        ):
+            """INV-5 v2 legacy sink：legacy 直接执行的唯一居所。callsite 豁免
+            A/B/C 支配（今日 fail-open 语义的精确化，spec §4.1 v2 规则 2）。
+            legacy 冻结面：无 live-mode recheck、无 RUNNING、无并发增强。"""
 
-        for tc in tool_calls:
+            async def _legacy_execute_thunk() -> PerTcResult:
+                outcome = await _invoke_wrapper(
+                    tool_fn,
+                    tc,
+                    tool_source,
+                    session_id=wrapper_session_id,
+                    max_wrapper_output_bytes=_runtime_max_bytes,
+                )
+                outcome = _maybe_convert_shell_outcome_with_images(
+                    outcome, tc["name"]
+                )
+                return await _legacy_translate_to_result(
+                    tc, tc_args, tool_source, outcome, tool_start_ts
+                )
+
+            return _legacy_execute_thunk
+
+        def _legacy_tc_meta(
+            tc: dict, tc_args: dict, tool_source: ToolSource
+        ) -> TcMeta:
+            return TcMeta(
+                tool_call_id=tc["id"],
+                raw_function_name=tc["name"],
+                category_tool_name=tool_source.category,
+                args=tc_args,
+            )
+
+        async def _legacy_gate(tc: dict) -> GateOutcome:
             tool_name = tc["name"]
             args = tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"])
             call_id = tc["id"]
@@ -2341,8 +2499,8 @@ def build_react_graph(
             # R2 CS2 (I-4.1): skip tool_calls already executed in a prior
             # dispatcher entry — LangGraph replays the node on resume after
             # every interrupt, and the prefix must not re-run.
-            if call_id in already_done:
-                continue
+            if call_id in already_done:                      # M7 (replay-skip)
+                return GateSkip(tool_call_id=call_id)
 
             # R2 CS2 (I-4.2): pre-approved tool_calls bypass the risk gate
             # entirely on the replay following an approve resume.
@@ -2357,36 +2515,42 @@ def build_react_graph(
             # LLM adapter's prefix logic.
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
+                _mau_should_interrupt = False
                 if suggest in {"browser", "shell"}:
                     result_str = "WAITING_FOR_USER"
-                    should_interrupt = True
+                    _mau_should_interrupt = True
                 elif not has_prior_soft_hint:
                     result_str = "SOFT_HINT"
                     logger.info("message_ask_user: returning SOFT_HINT (first attempt)")
                 else:
                     result_str = "WAITING_FOR_USER"
-                    should_interrupt = True
+                    _mau_should_interrupt = True
                     logger.info("message_ask_user: user input required (after SOFT_HINT)")
 
-                new_messages.append(
-                    ToolMessage(
+                _mau_result = PerTcResult(
+                    tool_message=ToolMessage(
                         content=result_str,
                         tool_call_id=call_id,
                         name=tool_name,
-                    )
+                    ),
+                    events=[
+                        ToolEvent(
+                            tool_call_id=call_id,
+                            tool_name=resolve_tool_source(tool_name).category,
+                            function_name=tool_name,
+                            function_args=args,
+                            function_result=ToolResult(success=True, message=result_str),
+                            status=ToolEventStatus.CALLED,
+                        )
+                    ],
+                    completed_ids=[call_id],
                 )
-                new_events.append(
-                    ToolEvent(
-                        tool_call_id=call_id,
-                        tool_name=resolve_tool_source(tool_name).category,
-                        function_name=tool_name,
-                        function_args=args,
-                        function_result=ToolResult(success=True, message=result_str),
-                        status=ToolEventStatus.CALLED,
-                    )
-                )
-                new_completed_ids.append(call_id)
-                continue
+                # WAITING (browser/shell takeover or second SOFT_HINT) → Waiting
+                # (executor sets should_interrupt but continues the batch);
+                # first SOFT_HINT → Surfaced (no interrupt). Mirrors _pe_gate.
+                if _mau_should_interrupt:
+                    return GateWaiting(result=_mau_result)
+                return GateSurfaced(result=_mau_result)
 
             # Resolve the tool's ``ToolSource`` once — every downstream
             # branch (block, unknown, deny, execute) needs it for
@@ -2460,8 +2624,9 @@ def build_react_graph(
                         ),
                         retryable=False,
                     )
-                    await _finalize_outcome(tc, args, tool_source, crash_outcome, _tool_start)
-                    continue
+                    return GateSurfaced(result=await _legacy_translate_to_result(
+                        tc, args, tool_source, crash_outcome, _tool_start
+                    ))
 
                 if _metrics is not None:
                     _metrics.record_ast_validation(ast_result.code)
@@ -2519,8 +2684,9 @@ def build_react_graph(
                 )
                 if not _cmd_decision.allowed:
                     denied = to_typed_denied(ast_result, original_command=args.get("command", ""))
-                    await _finalize_outcome(tc, args, tool_source, denied, _tool_start)
-                    continue
+                    return GateSurfaced(result=await _legacy_translate_to_result(
+                        tc, args, tool_source, denied, _tool_start
+                    ))
             # — end N1 gate —
 
             # ---- D5 tracker: block signature with repeated failures ----
@@ -2536,10 +2702,9 @@ def build_react_graph(
                         message="Tool signature hit the tracker blocklist threshold",
                     ),
                 )
-                await _finalize_outcome(
+                return GateSurfaced(result=await _legacy_translate_to_result(
                     tc, args, tool_source, blocked_outcome, _tool_start
-                )
-                continue
+                ))
 
             # ---- Unknown tool: synthesize AllowError, let Layer 3 translate ----
             tool_fn = tool_map.get(tool_name)
@@ -2552,15 +2717,13 @@ def build_react_graph(
                         message=f"Tool '{tool_name}' not in this graph's tool_map",
                     ),
                 )
-                await _finalize_outcome(
+                return GateSurfaced(result=await _legacy_translate_to_result(
                     tc, args, tool_source, unknown_outcome, _tool_start
-                )
-                continue
+                ))
 
             # PE-4c: per-call execution context (the legacy native risk gate is removed).
             _tc_enabled = configurable.get("tool_confirmation_enabled", True)
             _session_id = configurable.get("session_id") or ""
-            _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
 
             # PE-2 §6: full config + PE-present flags for the MCP mixed-batch guard.
             _tc_config = configurable.get("tool_confirmation_config")
@@ -2601,10 +2764,9 @@ def build_react_graph(
                         ),
                     ),
                 )
-                await _finalize_outcome(
+                return GateSurfaced(result=await _legacy_translate_to_result(
                     tc, args, tool_source, _fail_closed, _tool_start
-                )
-                continue
+                ))
 
             # PE-2 §6: a PE-eligible MCP real tool must never execute via the
             # legacy fallback. A mixed batch (mcp + a2a / skill-creator / discovery)
@@ -2637,8 +2799,9 @@ def build_react_graph(
                         message="MCP reached legacy via mixed-batch fallback; PE routing required",
                     ),
                 )
-                await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
-                continue
+                return GateSurfaced(result=await _legacy_translate_to_result(
+                    tc, args, tool_source, _fail_closed, _tool_start
+                ))
 
             # PE-3: a PE-eligible A2A tool must never execute via the legacy
             # fallback. A mixed batch (a2a + skill-creator/guide / mcp-discovery)
@@ -2670,8 +2833,9 @@ def build_react_graph(
                         message="A2A reached legacy via mixed-batch fallback; PE routing required",
                     ),
                 )
-                await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
-                continue
+                return GateSurfaced(result=await _legacy_translate_to_result(
+                    tc, args, tool_source, _fail_closed, _tool_start
+                ))
 
             # PE-4b §3: parity with the PE pre-approved replay recheck (:1762).
             # A native+meta batch can legitimately enter legacy pre-approved
@@ -2716,10 +2880,9 @@ def build_react_graph(
                         ),
                         retryable=True,
                     )
-                    await _finalize_outcome(
+                    return GateSurfaced(result=await _legacy_translate_to_result(
                         tc, args, tool_source, _native_ssm_err, _tool_start
-                    )
-                    continue
+                    ))
                 if _native_mode not in _native_live_modes:
                     logger.warning(
                         "tool_node legacy pre-approved native replay: session %s "
@@ -2741,10 +2904,9 @@ def build_react_graph(
                             message=f"session is {_native_mode.value} at legacy-approved native replay time",
                         ),
                     )
-                    await _finalize_outcome(
+                    return GateSurfaced(result=await _legacy_translate_to_result(
                         tc, args, tool_source, _native_mode_denied, _tool_start
-                    )
-                    continue
+                    ))
 
             # PE-4b §3: a PE-eligible REAL native tool must never execute via the
             # legacy fallback. A mixed batch (native + skill-creator/guide /
@@ -2786,62 +2948,48 @@ def build_react_graph(
                         message="native reached legacy via mixed-batch fallback; PE routing required",
                     ),
                 )
-                await _finalize_outcome(tc, args, tool_source, _fail_closed, _tool_start)
-                continue
+                return GateSurfaced(result=await _legacy_translate_to_result(
+                    tc, args, tool_source, _fail_closed, _tool_start
+                ))
 
             # No risk metadata (or bypass via pre-approved) → execute directly
-            outcome = await _invoke_wrapper(
-                tool_fn,
-                tc,
-                tool_source,
-                session_id=_session_id,
-                max_wrapper_output_bytes=_runtime_max_bytes,
-            )
-            outcome = _maybe_convert_shell_outcome_with_images(
-                outcome, tool_name
-            )
-            await _finalize_outcome(
-                tc, args, tool_source, outcome, _tool_start
+            return GateExecute(
+                thunk=_legacy_make_execute_thunk(
+                    tc, args, tool_fn, tool_source, _session_id, _tool_start
+                ),
+                tc_meta=_legacy_tc_meta(tc, args, tool_source),
             )
 
-        # Append deferred HumanMessages AFTER all ToolMessages.
-        # Preserves AIMessage → ToolMessage* pairing for group_messages().
-        new_messages.extend(new_deferred_human)
-
-        # R2 CS2 happy path: the whole batch completed without hitting an
-        # Asked outcome. Reset prefix + pre-approved set + pending state
-        # and hand control back to pre_llm_node for the next LLM turn.
-        update: dict[str, Any] = {
-            "messages": new_messages,
-            "events": new_events,
-            "attempt_count": state["attempt_count"] + 1,
-            "failure_count": state["failure_count"] + new_failures,
-            "completed_tool_call_prefix": [],
-            "approved_tool_call_ids": [],
-            "pending_ask_outcome": None,
-            "pending_ask_tool_call_id": None,
-            "pending_ask_artifact": None,
-            "pending_ask_tool_args": None,
-        }
-        if should_interrupt:
-            update["should_interrupt"] = True
-        if not has_prior_soft_hint and any(
-            m.content == "SOFT_HINT" and m.name == "message_ask_user"
-            for m in new_messages
-        ):
-            update["soft_hint_sent"] = True
-
-        # R2 CS2: tool_node routes itself via Command; no conditional edge.
-        goto: str = (
+        # B1-1a: executor owns the batch loop + accumulator + flush ordering.
+        # The gate/thunk closures above (_legacy_gate / _legacy_make_execute_thunk)
+        # keep the legacy execution decisions. R11#5: enhancements_enabled is
+        # hardcoded False at this callsite — legacy 冻结面, never RUNNING/并发.
+        _legacy_executor = BatchToolExecutor(
+            enhancements_enabled=False,  # R11#5: legacy 冻结面，调用点硬编码
+            record_finalize=_legacy_record_finalize,
+        )
+        batch_result = await _legacy_executor.run(
+            tool_calls,
+            _legacy_gate,
+            has_prior_soft_hint=has_prior_soft_hint,
+            attempt_count=state["attempt_count"],
+            failure_count=state["failure_count"],
+            already_done=list(already_done),
+        )
+        # legacy gate 没有 Asked 分支（PE-4c 删除了 legacy 风险门）——防御性断言。
+        assert not batch_result.interrupted, "legacy path cannot produce Ask"
+        update = batch_result.update
+        goto = (
             END
-            if should_interrupt or update.get("attempt_count", 0) >= MAX_ITERATIONS
+            if update.get("should_interrupt")
+            or update.get("attempt_count", 0) >= MAX_ITERATIONS
             else "pre_llm_node"
         )
         # [C2 PR-4 §8.4 #7 tool_node_return] Cancel checkpoint at tool_node
-        # exit. By here the tool already executed; raising abandons the
-        # tool's just-built ToolMessage rather than feeding it to the next
+        # exit. By here the tools already executed; raising abandons the
+        # just-built ToolMessages rather than feeding them to the next
         # llm_node iteration. The cancel finalizer doesn't care about the
-        # residual message — it builds CANCEL_ACK from the existing state.
+        # residual messages — it builds CANCEL_ACK from the existing state.
         if _should_cancel(config):
             raise CancelledByEventError("tool_node_return")
         return Command(goto=goto, update=update)

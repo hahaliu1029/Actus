@@ -75,7 +75,7 @@ export type ExecutionStatus = "pending" | "running" | "completed" | "failed";
 /**
  * 工具事件状态
  */
-export type ToolEventStatus = "calling" | "called";
+export type ToolEventStatus = "calling" | "running" | "called";
 
 /**
  * MCP 传输类型
@@ -367,6 +367,10 @@ export type Session = {
   // B3-core PR-1 — null/0 when backend hasn't populated yet
   last_seq?: number;
   supervisor_snapshot?: SupervisorSnapshot | null;
+  /** B1-2 provisional CALLING 防重放水位线（触发权威事件的 seq） */
+  provisional_prune_watermark?: number;
+  /** B1-2 自上次 turn-close 信号后是否尚未开新轮 */
+  provisional_turn_closed?: boolean;
 };
 
 export type EventsSinceResponse = {
@@ -524,13 +528,14 @@ export type ToolEventEnvelopeV1 = {
   envelope_version: 1;
   event_id?: string;
   created_at?: number;
+  seq?: number | null;   // B3-core producer-side monotonic stamp — B1-2 水位线（防重放）
 
   tool_call_id: string;
   name: string;                          // wire 短名 (backend alias from tool_name)
   tool_source?: ToolSource | null;
   function: string;                      // wire 短名 (backend alias from function_name)
   args: Record<string, unknown>;         // wire 短名 (backend alias from function_args)
-  status: "calling" | "called";
+  status: "calling" | "running" | "called";
   activity_description: string;
   display_icon?: string | null;
   render_style?: RenderStyle | null;

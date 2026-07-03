@@ -35,6 +35,7 @@ class ToolEventStatus(str, Enum):
     """工具事件状态类型枚举"""
 
     CALLING = "calling"  # 调用中
+    RUNNING = "running"  # B1-1b: 执行中（thunk live-mode recheck 通过、wrapper 之前）
     CALLED = "called"  # 调用完毕
 
 

@@ -445,6 +445,44 @@ class ToolRuntimeConfig(BaseModel):
             "控制 coordinated rollout — 运维先灰度, 再启用 wrapper."
         ),
     )
+    tool_running_events_enabled: bool = Field(
+        default=False,
+        description=(
+            "B1-1b: emit ToolEvent(status=running) at each tool's execution "
+            "start (inside the PE execute thunk, after the live-mode recheck "
+            "passes). OFF preserves today's calling/called-only wire behavior."
+        ),
+    )
+    tool_concurrency_enabled: bool = Field(
+        default=False,
+        description=(
+            "B1-1c: in-batch concurrency window for CONCURRENCY_SAFE_TOOLS "
+            "(PE path only; legacy fallback stays serial). OFF = strict "
+            "serial execution, today's behavior."
+        ),
+    )
+    tool_max_concurrency: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="B1-1c: asyncio.Semaphore cap for the concurrency window.",
+    )
+    llm_tool_call_streaming_enabled: bool = Field(
+        default=False,
+        description=(
+            "B1-2: llm_node consumes the LLM via astream + "
+            "ToolCallStreamCollector (authoritative chunk-sum). OFF keeps the "
+            "atomic ainvoke branch verbatim (INV-B1-0)."
+        ),
+    )
+    llm_incremental_calling_events_enabled: bool = Field(
+        default=False,
+        description=(
+            "B1-2: emit provisional CALLING per completed tool_call mid-stream "
+            "via event_queue. Effective ONLY when "
+            "llm_tool_call_streaming_enabled is true."
+        ),
+    )
 
 
 class AppConfig(BaseModel):

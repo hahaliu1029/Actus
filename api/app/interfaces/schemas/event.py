@@ -281,7 +281,7 @@ class ToolEventEnvelopeV1(BaseEventData):
     tool_source: Optional[ToolSource] = None
     function_name: str = Field(alias="function")
     function_args: dict[str, Any] = Field(alias="args")
-    status: Literal["calling", "called"]
+    status: Literal["calling", "running", "called"]
     activity_description: str = ""
     display_icon: Optional[str] = None
     render_style: Optional[

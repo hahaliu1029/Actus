@@ -33,13 +33,16 @@ import {
   type MergedTimelineItem,
 } from "@/lib/agent-tree";
 import {
+  applyProvisionalSignal,
   asRecord,
+  createProvisionalState,
   eventIdOf,
   eventSemanticKey,
   normalizeSessionEvents,
   pruneRecoveredLLMErrors,
   syncPlanStepsByStepEvent,
   upsertSessionEvent,
+  type ProvisionalState,
   type SessionEventRecord,
 } from "@/lib/event-normalize";
 
@@ -499,6 +502,33 @@ function mergeSupervisorSnapshotByCursor(
   return remoteLastSeq >= localCursor ? remoteSnapshot : localSnapshot ?? null;
 }
 
+// B1-2: read/write the session-scoped provisional-CALLING state machine. Optional
+// fields + fallbacks (`?? 0` / `?? true`) keep every existing Session construction
+// and fixture unchanged.
+function provisionalStateOf(session: Session): ProvisionalState {
+  return {
+    watermark: session.provisional_prune_watermark ?? 0,
+    turnClosed: session.provisional_turn_closed ?? true,
+  };
+}
+
+function writeProvisionalState(
+  session: Session,
+  state: ProvisionalState
+): Session {
+  return {
+    ...session,
+    provisional_prune_watermark: state.watermark,
+    provisional_turn_closed: state.turnClosed,
+  };
+}
+
+// B1-2: the four event branches (tool/message/done/error) that carry
+// provisional-CALLING lifecycle semantics. The helper replaces ONLY the upsert
+// step — each branch's existing post-processing (plan-step sync, recovered-LLM
+// -error prune) runs on the helper's output (R13#2).
+const PROVISIONAL_SIGNAL_TYPES = new Set(["tool", "message", "done", "error"]);
+
 function applySSEToSession(session: Session, event: SSEEventData): Session {
   const sessionWithSeq = advanceSessionLastSeq(session, eventSeqOf({
     event: event.type,
@@ -523,10 +553,6 @@ function applySSEToSession(session: Session, event: SSEEventData): Session {
     };
   }
 
-  if (event.type === "done") {
-    return sessionWithSeq;
-  }
-
   if (event.type === "title") {
     const nextTitle =
       typeof event.data.title === "string" ? event.data.title : sessionWithSeq.title;
@@ -541,6 +567,33 @@ function applySSEToSession(session: Session, event: SSEEventData): Session {
     data: event.data as Record<string, unknown>,
   };
 
+  // B1-2: route tool/message/done/error through the provisional state machine.
+  // The helper replaces ONLY the upsert step; each branch's existing
+  // post-processing is preserved (R13#2). For `done` the helper returns the
+  // events with residual provisional cards pruned but does NOT persist the
+  // `done` event itself — matching the historical early-return that stored no
+  // `done` event and ran no extra passes.
+  if (PROVISIONAL_SIGNAL_TYPES.has(event.type)) {
+    const provisional = applyProvisionalSignal(
+      provisionalStateOf(session),
+      session.events as SessionEventRecord[],
+      nextEvent
+    );
+    // `done` historically did NOT run pruneRecoveredLLMErrors (it early-returned
+    // sessionWithSeq); keep that exact behavior so INV-0 holds flag-OFF.
+    const withRecoveredErrorsPruned =
+      event.type === "done" || event.type === "error"
+        ? provisional.events
+        : pruneRecoveredLLMErrors(provisional.events);
+    return writeProvisionalState(
+      {
+        ...sessionWithSeq,
+        events: withRecoveredErrorsPruned,
+      },
+      provisional.state
+    );
+  }
+
   const events = upsertSessionEvent(
     session.events as SessionEventRecord[],
     nextEvent
@@ -549,10 +602,7 @@ function applySSEToSession(session: Session, event: SSEEventData): Session {
     event.type === "step"
       ? syncPlanStepsByStepEvent(events, nextEvent)
       : events;
-  const withRecoveredErrorsPruned =
-    event.type !== "error"
-      ? pruneRecoveredLLMErrors(withPlanStepSynced)
-      : withPlanStepSynced;
+  const withRecoveredErrorsPruned = pruneRecoveredLLMErrors(withPlanStepSynced);
 
   return {
     ...sessionWithSeq,
@@ -624,6 +674,49 @@ function getLatestEventId(events: SessionEventRecord[]): string | undefined {
   return undefined;
 }
 
+// B1 R3-FIX (recovery≡live): when two events collide on the same `tool:<id>`
+// semantic key, keep the one with the HIGHER seq instead of blindly letting the
+// second argument win. mergeSessionEvents is called with OPPOSITE argument
+// orders at its two sites — fetchSessionById passes (remote, local) so LOCAL
+// wins, but recoverSession passes (local, recovered) so the RECOVERED payload
+// wins. Under a cursor race the recovery response can carry a stale
+// CALLING(a, seq=10) built before the FE's live CALLED(a, seq=11) landed;
+// second-arg-wins would drop the local CALLED, and applyProvisionalReplay then
+// folds from the LOCAL watermark (11) over a rebuilt list that no longer
+// contains the CALLED — shouldDropReplayedCalling(10 < 11) fires and tool card
+// `a` VANISHES, violating recovery≡live (R1#5 never-downgrade can't fire because
+// the fold's rebuilt list never sees the local CALLED). A seq-compare guard
+// (rather than a status-rank never-downgrade) is used because seq is the
+// monotonic authority the whole B1 anti-replay state machine already keys on and
+// it is direction-agnostic — it protects BOTH argument orders symmetrically.
+// The guard is scoped to `tool:` keys ONLY: message/step/plan/compaction keep
+// their existing overwrite semantics untouched. seq semantics follow
+// eventSeqOf (null when absent/non-positive): an incoming event with no seq is
+// treated as NOT-newer when the existing entry has a seq; when both lack a seq
+// we fall back to the original overwrite (last-writer-wins).
+function isToolSemanticKey(key: string | null): boolean {
+  return key !== null && key.startsWith("tool:");
+}
+
+function shouldKeepExistingToolEvent(
+  key: string | null,
+  existing: SessionEventRecord,
+  incoming: SessionEventRecord
+): boolean {
+  if (!isToolSemanticKey(key)) {
+    return false;
+  }
+  const existingSeq = eventSeqOf(existing);
+  const incomingSeq = eventSeqOf(incoming);
+  if (existingSeq === null) {
+    return false; // no anchor to protect — overwrite as before
+  }
+  if (incomingSeq === null) {
+    return true; // incoming has no seq → cannot prove it is newer → keep existing
+  }
+  return incomingSeq < existingSeq; // keep existing only when it is strictly newer
+}
+
 function mergeSessionEvents(
   remoteEvents: SessionEventRecord[],
   localEvents: SessionEventRecord[]
@@ -645,6 +738,13 @@ function mergeSessionEvents(
     const key = semanticKey || `local:${index}:${event.event}`;
     const existingIndex = indexByKey.get(key);
     if (existingIndex !== undefined) {
+      // Tool-key collisions keep the higher-seq event (recovery≡live);
+      // all other keys retain second-arg-wins overwrite semantics.
+      if (
+        shouldKeepExistingToolEvent(semanticKey, merged[existingIndex], event)
+      ) {
+        return;
+      }
       merged[existingIndex] = event;
       return;
     }
@@ -653,6 +753,30 @@ function mergeSessionEvents(
   });
 
   return merged;
+}
+
+// B1-2: applyProvisionalReplay — from (local ProvisionalState, empty list), fold
+// applyProvisionalSignal over the merge OUTPUT order to rebuild events and
+// advance the state. Order = merge output order, NEVER re-sorted on the FE (R12#1:
+// the backend recovery stream is already seq-ordered; a FE re-sort would move a
+// stale event ahead of the upgrade/error boundary that raised the watermark,
+// bypassing anti-replay). Replay result is authoritative (R12#2): watermark /
+// turnClosed take the fold's terminal values — no "local OR replay" merge, since
+// turnClosed is non-monotonic. Used at the recovery merge site and both
+// fetchSessionById full-refresh merge sites so recovered / refetched events are
+// equivalent to the fully-online live path (R18).
+function applyProvisionalReplay(
+  local: ProvisionalState,
+  mergedEvents: SessionEventRecord[]
+): { state: ProvisionalState; events: SessionEventRecord[] } {
+  let state = local;
+  let events: SessionEventRecord[] = [];
+  for (const e of mergedEvents) {
+    const out = applyProvisionalSignal(state, events, e);
+    state = out.state;
+    events = out.events;
+  }
+  return { state, events };
 }
 
 const STATUS_ORDER: Record<string, number> = {
@@ -1328,13 +1452,35 @@ export const useSessionStore = create<SessionStore>()(
 
           const localSession = state.currentSession;
           if (!localSession || localSession.session_id !== sessionId) {
-            return { currentSession: normalizedRemote };
+            // B1-2: no local session — fold the remote events from a fresh
+            // provisional state so orphan CALLING cards from a crashed turn are
+            // pruned and the watermark is rebuilt (R12#2). The remote payload
+            // carries no watermark keys, so start from createProvisionalState().
+            const freshReplay = applyProvisionalReplay(
+              createProvisionalState(),
+              normalizedRemote.events as SessionEventRecord[]
+            );
+            return {
+              currentSession: writeProvisionalState(
+                { ...normalizedRemote, events: freshReplay.events },
+                freshReplay.state
+              ),
+            };
           }
 
-          const mergedEvents = mergeSessionEvents(
+          // B1-2: fold from the LOCAL provisional state over the merge output so
+          // a full refresh is equivalent to the fully-online live path — the
+          // remote payload's absent watermark keys are overwritten by the fold's
+          // terminal state (R12#2); merge output order is authoritative (R12#1).
+          const mergedEventsRaw = mergeSessionEvents(
             normalizedRemote.events as SessionEventRecord[],
             localSession.events as SessionEventRecord[]
           );
+          const provisionalReplay = applyProvisionalReplay(
+            provisionalStateOf(localSession),
+            mergedEventsRaw
+          );
+          const mergedEvents = provisionalReplay.events;
           const nextLastSeq = Math.max(
             normalizedRemote.last_seq ?? 0,
             localSession.last_seq ?? 0,
@@ -1345,6 +1491,8 @@ export const useSessionStore = create<SessionStore>()(
               title: normalizedRemote.title || localSession.title,
               events: mergedEvents,
               last_seq: nextLastSeq,
+              provisional_prune_watermark: provisionalReplay.state.watermark,
+              provisional_turn_closed: provisionalReplay.state.turnClosed,
               supervisor_snapshot: normalizedRemote.supervisor_snapshot ?? null,
               // E2 + A4-0 (R7): control-mode transitions (end-takeover→running,
               // reopen→takeover_pending) must win over a stale local status; a
@@ -1573,10 +1721,20 @@ export const useSessionStore = create<SessionStore>()(
         set((s) => {
           const local = s.currentSession;
           if (!local || local.session_id !== sessionId) return {};
-          const merged = mergeSessionEvents(
+          const mergedRaw = mergeSessionEvents(
             local.events as SessionEventRecord[],
             normalized
           );
+          // B1-2: fold from the LOCAL provisional state over the merge output so a
+          // reconnect-recovery is equivalent to the fully-online live path — a
+          // replayed CALLING below the watermark cannot resurrect a pruned orphan,
+          // and a recovered `done`/message still prunes residual provisional cards
+          // (R18). Merge output order is authoritative — no FE re-sort (R12#1).
+          const provisionalReplay = applyProvisionalReplay(
+            provisionalStateOf(local),
+            mergedRaw
+          );
+          const merged = provisionalReplay.events;
           const monotonicStatus =
             pickMoreAdvancedStatus(
               remoteStatus,
@@ -1600,6 +1758,8 @@ export const useSessionStore = create<SessionStore>()(
             currentSession: {
               ...local,
               events: merged,
+              provisional_prune_watermark: provisionalReplay.state.watermark,
+              provisional_turn_closed: provisionalReplay.state.turnClosed,
               status: finalStatus,
               // B3-core PR-1 — advance cursor monotonically; preserve local snapshot
               // when remote returns null (avoids stomping good cursor on transient

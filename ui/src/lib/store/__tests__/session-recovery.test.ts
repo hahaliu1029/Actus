@@ -1785,3 +1785,304 @@ describe("live finishing→running clobber (A4-0 follow-up b)", () => {
     expect(useSessionStore.getState().currentSession?.status).toBe("running");
   });
 });
+
+// B1-2 (Task 13) — provisional CALLING lifecycle through the real store paths:
+// live SSE reducer (applySSEToSession), reconnect recovery merge, and
+// fetchSessionById full-refresh merge. Anchors the seq-watermark anti-replay
+// state machine end-to-end (spec §5.3). Reuses the fake-SSE/store harness above.
+describe("B1-2 provisional CALLING through store paths (Task 13)", () => {
+  type ChatCbs = {
+    onEvent: SSEEventHandler;
+    onError: (error: Error) => void;
+    onClose: () => void;
+    onConnected: () => void;
+  };
+
+  function captureChat(api: SessionApi): ChatCbs {
+    const cbs = {} as ChatCbs;
+    (api.chat as ReturnType<typeof vi.fn>).mockImplementation(
+      (
+        _sid: string,
+        _params: ChatParams,
+        onEvent: SSEEventHandler,
+        onError: (error: Error) => void,
+        onClose: () => void,
+        onConnected: () => void
+      ) => {
+        cbs.onEvent = onEvent;
+        cbs.onError = onError;
+        cbs.onClose = onClose;
+        cbs.onConnected = onConnected;
+        if (onConnected) onConnected();
+        return () => {};
+      }
+    );
+    return cbs;
+  }
+
+  function toolCallData(id: string, status: string, seq: number) {
+    return {
+      envelope_version: 1 as const,
+      tool_call_id: id,
+      status: status as "calling" | "running" | "called",
+      seq,
+      name: "file",
+      function: "file_write",
+      args: {},
+      activity_description: "",
+      event_id: `${id}-${status}-${seq}`,
+    };
+  }
+
+  function callingIds(): string[] {
+    const events =
+      (useSessionStore.getState().currentSession?.events as SessionEventRecord[]) ??
+      [];
+    return events
+      .filter((e) => e.event === "tool" && e.data?.status === "calling")
+      .map((e) => e.data?.tool_call_id as string);
+  }
+
+  beforeEach(() => {
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        events: [],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+      _isRecovering: false,
+    });
+    vi.clearAllMocks();
+  });
+
+  it("防复活 (recovery): a replayed CALLING below the watermark cannot resurrect a pruned card", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    // live: calling(10) → provisional card; message(20) closes the turn & prunes it.
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    expect(callingIds()).toEqual(["a"]);
+    cbs.onEvent({
+      type: "message",
+      data: { role: "assistant", message: "text", event_id: "m-20", seq: 20, attachments: [] },
+    });
+    expect(callingIds()).toEqual([]);
+
+    // reconnect: recovery stream replays the same calling(10). Must NOT resurrect.
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [{ event: "tool", data: toolCallData("a", "calling", 10) }],
+      session_status: "running",
+      has_more: false,
+      last_seq: 20,
+    });
+    await useSessionStore.getState().recoverSession("s1");
+
+    expect(callingIds()).toEqual([]);
+  });
+
+  it("recovered done prune-all: recovery stream ending in done drops residual provisional", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    // live: calling(10) — still provisional (no close signal seen live).
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    expect(callingIds()).toEqual(["a"]);
+
+    // reconnect: recovery = [calling(10), done(30)] → done prunes all provisional.
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        { event: "tool", data: toolCallData("a", "calling", 10) },
+        { event: "done", data: { event_id: "d-30", seq: 30 } },
+      ],
+      session_status: "completed",
+      has_more: false,
+      last_seq: 30,
+    });
+    await useSessionStore.getState().recoverSession("s1");
+
+    expect(callingIds()).toEqual([]);
+  });
+
+  it("防复活 (refetch): full refresh cannot resurrect a pruned card and preserves the local watermark", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    // live: calling(10) → message(20) closes & prunes, local watermark = 20.
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    cbs.onEvent({
+      type: "message",
+      data: { role: "assistant", message: "text", event_id: "m-20", seq: 20, attachments: [] },
+    });
+    expect(callingIds()).toEqual([]);
+    expect(
+      useSessionStore.getState().currentSession?.provisional_prune_watermark
+    ).toBe(20);
+
+    // fetchSessionById full refresh: remote replays the stale calling(10).
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      events: [
+        { event: "tool", data: toolCallData("a", "calling", 10) },
+        { event: "message", data: { role: "assistant", message: "text", event_id: "m-20", seq: 20 } },
+      ],
+    });
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(callingIds()).toEqual([]);
+    // Local watermark survives the refresh (remote payload has no watermark keys).
+    expect(
+      useSessionStore.getState().currentSession?.provisional_prune_watermark
+    ).toBe(20);
+  });
+
+  it("live error 边界 (scenario vi): error marks the boundary so the retry's new CALLING prunes the orphan", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    // seq lives on BaseEvent end-to-end; ErrorEvent's wire type doesn't declare
+    // it (out of this task's types.ts scope), so cast for the test literal.
+    cbs.onEvent({
+      type: "error",
+      data: { error: "boom", event_id: "e-15", seq: 15 },
+    } as unknown as SSEEventData);
+    // error does not prune (Done backstop owns that) — but advances the watermark.
+    expect(callingIds()).toEqual(["a"]);
+    cbs.onEvent({ type: "tool", data: toolCallData("a2", "calling", 20) });
+
+    expect(callingIds()).toEqual(["a2"]);
+    expect(
+      useSessionStore.getState().currentSession?.provisional_prune_watermark ?? 0
+    ).toBeGreaterThanOrEqual(15);
+  });
+
+  it("recovery 升级边界防复活 (scenario v-c): a stale different-id CALLING below the upgrade watermark is dropped", async () => {
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        { event: "tool", data: toolCallData("a", "calling", 10) },
+        { event: "tool", data: toolCallData("a", "called", 11) },
+        { event: "tool", data: toolCallData("z", "calling", 9) },
+      ],
+      session_status: "running",
+      has_more: false,
+      last_seq: 11,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const events =
+      (useSessionStore.getState().currentSession?.events as SessionEventRecord[]) ??
+      [];
+    expect(events.some((e) => e.data?.tool_call_id === "z")).toBe(false);
+    const aCard = events.find((e) => e.data?.tool_call_id === "a");
+    expect(aCard?.data?.status).toBe("called");
+  });
+
+  it("R3-FIX (recovery cursor race): a stale same-id CALLING in the recovery stream does NOT erase a local CALLED (recovery≡live)", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    // live: calling(a, 10) then called(a, 11) — the local card is CALLED and the
+    // watermark has advanced to 11 (the tool called branch pushes it).
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "called", 11) });
+    const cardStatus = () => {
+      const events =
+        (useSessionStore.getState().currentSession
+          ?.events as SessionEventRecord[]) ?? [];
+      return events.find((e) => e.data?.tool_call_id === "a")?.data?.status;
+    };
+    expect(cardStatus()).toBe("called");
+    expect(
+      useSessionStore.getState().currentSession?.provisional_prune_watermark
+    ).toBe(11);
+
+    // reconnect: recovery response was built before the FE's CALLED(11) landed,
+    // so it replays the stale CALLING(a, 10). Recovery events are the SECOND
+    // merge argument (recoverSession passes (local, recovered)) — pre-fix this
+    // overwrote the local CALLED and the fold then dropped the CALLING as an
+    // anti-replay orphan, making card `a` vanish. The seq-compare guard keeps the
+    // higher-seq local CALLED.
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [{ event: "tool", data: toolCallData("a", "calling", 10) }],
+      session_status: "running",
+      has_more: false,
+      last_seq: 11,
+    });
+    await useSessionStore.getState().recoverSession("s1");
+
+    // The `a` card REMAINS with status "called" and the watermark stays 11.
+    expect(cardStatus()).toBe("called");
+    expect(
+      useSessionStore.getState().currentSession?.provisional_prune_watermark
+    ).toBe(11);
+  });
+
+  it("R3-FIX (refetch direction twin): a stale remote CALLING cannot downgrade a newer local CALLED", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    // live: calling(a, 10) then called(a, 11) — local card CALLED, watermark 11.
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "called", 11) });
+    const cardStatus = () => {
+      const events =
+        (useSessionStore.getState().currentSession
+          ?.events as SessionEventRecord[]) ?? [];
+      return events.find((e) => e.data?.tool_call_id === "a")?.data?.status;
+    };
+    expect(cardStatus()).toBe("called");
+
+    // fetchSessionById full refresh: the remote payload (FIRST merge argument at
+    // this site) carries a stale CALLING(a, 10). Here LOCAL normally wins by
+    // arg-order, but the guard is direction-agnostic: even in the direction where
+    // remote is the first arg, the higher-seq CALLED must survive.
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      events: [{ event: "tool", data: toolCallData("a", "calling", 10) }],
+    });
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(cardStatus()).toBe("called");
+  });
+
+  it("refetch 保留开放 provisional (scenario vii): an open turn's own CALLING is not anti-replay pruned", async () => {
+    const { sessionApi } = await import("../../api/session");
+    const cbs = captureChat(sessionApi);
+    await useSessionStore.getState().sendChat("s1", {});
+
+    // live: calling(a, 10) with NO close signal → open turn, watermark = 10.
+    cbs.onEvent({ type: "tool", data: toolCallData("a", "calling", 10) });
+    expect(callingIds()).toEqual(["a"]);
+    expect(
+      useSessionStore.getState().currentSession?.provisional_turn_closed
+    ).toBe(false);
+
+    // fetchSessionById full refresh: remote = [calling(a, 10)] → fold must keep a.
+    (sessionApi.getSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      session_id: "s1",
+      title: "test",
+      status: "running",
+      events: [{ event: "tool", data: toolCallData("a", "calling", 10) }],
+    });
+    await useSessionStore.getState().fetchSessionById("s1", { silent: true });
+
+    expect(callingIds()).toEqual(["a"]);
+  });
+});
