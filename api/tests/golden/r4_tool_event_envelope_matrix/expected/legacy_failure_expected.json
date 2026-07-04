@@ -1,6 +1,7 @@
 {
   "event_id": "evt-golden-legacy-failure",
   "created_at": 1776340800,
+  "seq": null,
   "envelope_version": 1,
   "tool_call_id": "c_legacy_fail",
   "name": "shell",
@@ -14,6 +15,8 @@
   "display_icon": null,
   "render_style": null,
   "media_type": null,
+  "read_only": null,
+  "destructive": null,
   "function_result": {
     "status": "error",
     "message": "Command exited with code 1",

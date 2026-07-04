@@ -104,6 +104,8 @@ def _project_common_top_fields(
         "display_icon": event.display_icon,
         "render_style": event.render_style,
         "media_type": event.media_type,
+        "read_only": event.read_only,
+        "destructive": event.destructive,
         "content": (
             event.tool_content.model_dump(mode="json")
             if event.tool_content else None

@@ -70,6 +70,7 @@ from app.domain.services.permission.sources import (
     is_pe_enabled_for_source,
 )
 from app.domain.services.risk_assessor import RiskAssessor
+from app.domain.services.tools.tool_display_registry import resolve_display_attachment
 from app.domain.services.tools.tool_source_resolver import (
     ToolSource,
     ToolSourceUnknownError,
@@ -558,6 +559,7 @@ async def _translate_outcome(
     tool_result_max_chars: int,
     guide_injector: GuideInjector | None,
     enabled_outcome_variants: list[str] | None = None,   # ← NEW (Round 2f P1)
+    display_metadata_enabled: bool = False,  # ← B10: 默认 False 保证既有直调零改动 (§4.2)
 ) -> tuple[ToolMessage | None, list[HumanMessage], list[Any]]:
     """Layer 3: convert ``ToolOutcome`` → ``ToolMessage`` + deferred ``HumanMessage`` list + events.
 
@@ -574,6 +576,12 @@ async def _translate_outcome(
       (``test_file_view_integration.py``, ``message_utils``,
       ``main_graph._compact_messages``) keep working.
     - ``events`` is the domain event list to emit via the bridge.
+
+    ``display_metadata_enabled`` gates the B10 display attachment
+    (``resolve_display_attachment``) on the CALLED event: ``False``
+    (default) preserves pre-B10 behavior — display_icon/read_only/
+    destructive stay ``None`` while the existing ``tool_source`` argument
+    is passed through unchanged.
 
     **NOT done in Layer 3**: ``[TOOL_FAILED] / [TOOL_DENIED]`` error-prefix
     injection. That is the LLM adapter's job (Task 33/34, Commit 2b) and
@@ -675,6 +683,13 @@ async def _translate_outcome(
     # reason. Message uses ``final_content`` (already truncated + guide
     # injected for success paths, already the Denied/AllowError text for
     # failure paths).
+    # B10: display policy attach (spec §4.2). existing tool_source 传入以
+    # 保证 registry 按已解析 source 出 icon (动态工具 family 兜底, R8#3).
+    _display_att = resolve_display_attachment(
+        tool_call["name"],
+        enabled=display_metadata_enabled,
+        existing_tool_source=tool_source,
+    )
     _fn_result_success = isinstance(outcome, (AllowSuccess, Passthrough))
     events.append(
         ToolEvent(
@@ -690,6 +705,9 @@ async def _translate_outcome(
             # R4: artifact as dict (F2 fix). Projector 消费时用 TOOL_ARTIFACT_ADAPTER 懒校验.
             artifact=artifact_json,
             tool_source=tool_source,
+            display_icon=_display_att.display_icon,
+            read_only=_display_att.read_only,
+            destructive=_display_att.destructive,
         )
     )
 
@@ -1118,6 +1136,10 @@ def build_react_graph(
                             _cat = resolve_tool_source(call.name).category
                         except ToolSourceUnknownError:
                             _cat = "unknown"
+                        _att = resolve_display_attachment(
+                            call.name,
+                            enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                        )
                         await _queue.put(
                             ToolEvent(
                                 tool_call_id=call.tool_call_id,
@@ -1125,6 +1147,10 @@ def build_react_graph(
                                 function_name=call.name,
                                 function_args=call.args,
                                 status=ToolEventStatus.CALLING,
+                                tool_source=_att.tool_source,
+                                display_icon=_att.display_icon,
+                                read_only=_att.read_only,
+                                destructive=_att.destructive,
                             )
                         )
                         _emitted_streaming_ids.add(call.tool_call_id)
@@ -1167,6 +1193,10 @@ def build_react_graph(
                     _calling_category = resolve_tool_source(func_name).category
                 except ToolSourceUnknownError:
                     _calling_category = "unknown"
+                _att = resolve_display_attachment(
+                    func_name,
+                    enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                )
                 new_events.append(
                     ToolEvent(
                         tool_call_id=tc["id"],
@@ -1174,6 +1204,10 @@ def build_react_graph(
                         function_name=func_name,
                         function_args=tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"]),
                         status=ToolEventStatus.CALLING,
+                        tool_source=_att.tool_source,
+                        display_icon=_att.display_icon,
+                        read_only=_att.read_only,
+                        destructive=_att.destructive,
                     )
                 )
 
@@ -1341,6 +1375,7 @@ def build_react_graph(
                 tool_result_max_chars=tool_result_max_chars,
                 guide_injector=guide_injector,
                 enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
+                display_metadata_enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
             )
             is_success = isinstance(outcome, (AllowSuccess, Passthrough))
             return PerTcResult(
@@ -1465,12 +1500,21 @@ def build_react_graph(
                 # per-attempt 回退 state-path（挂在 PerTcResult.events 头部）。
                 _running_event = None
                 if _tool_runtime_cfg.tool_running_events_enabled:
+                    _att = resolve_display_attachment(
+                        tool_name,
+                        enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                        existing_tool_source=tool_source,
+                    )
                     _running_event = ToolEvent(
                         tool_call_id=call_id,
                         tool_name=tool_source.category,
                         function_name=tool_name,
                         function_args=tc_args,
                         status=ToolEventStatus.RUNNING,
+                        tool_source=_att.tool_source,
+                        display_icon=_att.display_icon,
+                        read_only=_att.read_only,
+                        destructive=_att.destructive,
                     )
                     if event_queue is not None:
                         await event_queue.put(_running_event)
@@ -1530,6 +1574,10 @@ def build_react_graph(
                     result_str = "WAITING_FOR_USER"
                     _mau_should_interrupt = True
 
+                _mau_att = resolve_display_attachment(
+                    tool_name,
+                    enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                )
                 _mau_result = PerTcResult(
                     tool_message=ToolMessage(
                         content=result_str, tool_call_id=call_id, name=tool_name
@@ -1542,6 +1590,10 @@ def build_react_graph(
                             function_args=args,
                             function_result=ToolResult(success=True, message=result_str),
                             status=ToolEventStatus.CALLED,
+                            tool_source=_mau_att.tool_source,
+                            display_icon=_mau_att.display_icon,
+                            read_only=_mau_att.read_only,
+                            destructive=_mau_att.destructive,
                         )
                     ],
                     completed_ids=[call_id],
@@ -2154,6 +2206,7 @@ def build_react_graph(
                     matched_patterns=matched_patterns,
                     suggested_alternative=suggested_alternative,
                     timeout_seconds=_timeout_seconds,
+                    decision_reason=_pe_reason,  # B10 §4.3: 整体直通, 不再只取 message
                 )
                 # NOTE: event_queue.put moved OUT of the gate — _pe_dispatch
                 # emits confirmation_event after _executor.run() returns (drain
@@ -2420,6 +2473,7 @@ def build_react_graph(
                 tool_result_max_chars=tool_result_max_chars,
                 guide_injector=guide_injector,
                 enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
+                display_metadata_enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
             )
             is_success = isinstance(outcome, (AllowSuccess, Passthrough))
             return PerTcResult(
@@ -2527,6 +2581,10 @@ def build_react_graph(
                     _mau_should_interrupt = True
                     logger.info("message_ask_user: user input required (after SOFT_HINT)")
 
+                _mau_att = resolve_display_attachment(
+                    tool_name,
+                    enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                )
                 _mau_result = PerTcResult(
                     tool_message=ToolMessage(
                         content=result_str,
@@ -2541,6 +2599,10 @@ def build_react_graph(
                             function_args=args,
                             function_result=ToolResult(success=True, message=result_str),
                             status=ToolEventStatus.CALLED,
+                            tool_source=_mau_att.tool_source,
+                            display_icon=_mau_att.display_icon,
+                            read_only=_mau_att.read_only,
+                            destructive=_mau_att.destructive,
                         )
                     ],
                     completed_ids=[call_id],
@@ -3098,6 +3160,7 @@ def build_react_graph(
             tool_result_max_chars=tool_result_max_chars,
             guide_injector=guide_injector,
             enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
+            display_metadata_enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
         )
 
         # NOTE: deny_events are regular ToolEvents (not ToolConfirmationEvents).

@@ -200,3 +200,4 @@ skill_risk_policy:
 #   tool_max_concurrency: 3
 #   llm_tool_call_streaming_enabled: false        # llm_node astream + collector (B1-2)
 #   llm_incremental_calling_events_enabled: false # provisional CALLING mid-stream (requires streaming flag)
+#   tool_display_metadata_enabled: false # B10: 工具卡 display policy 元数据（CALLING/RUNNING 提前携带 tool_source + display_icon/read_only/destructive；OFF 时这三个 display 键序列化为 null、既有字段不变）

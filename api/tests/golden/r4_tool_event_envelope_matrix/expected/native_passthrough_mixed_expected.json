@@ -1,6 +1,7 @@
 {
   "event_id": "evt-golden-native-passthrough-mixed",
   "created_at": 1776340800,
+  "seq": null,
   "envelope_version": 1,
   "tool_call_id": "c_native_ptm",
   "name": "file",
@@ -18,6 +19,8 @@
   "display_icon": null,
   "render_style": "document",
   "media_type": "application/pdf",
+  "read_only": null,
+  "destructive": null,
   "function_result": {
     "status": "passthrough",
     "message": "[file_view: 1 image(s) + 1 PDF(s) loaded]",

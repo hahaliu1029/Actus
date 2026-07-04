@@ -1,6 +1,7 @@
 {
   "event_id": "evt-golden-a2a-allow-success",
   "created_at": 1776340800,
+  "seq": null,
   "envelope_version": 1,
   "tool_call_id": "c_a2a_as",
   "name": "a2a",
@@ -19,6 +20,8 @@
   "display_icon": null,
   "render_style": null,
   "media_type": null,
+  "read_only": null,
+  "destructive": null,
   "function_result": {
     "status": "ok",
     "message": "Remote agent completed task: Summary generated",

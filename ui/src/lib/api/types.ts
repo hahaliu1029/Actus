@@ -540,6 +540,8 @@ export type ToolEventEnvelopeV1 = {
   display_icon?: string | null;
   render_style?: RenderStyle | null;
   media_type?: string | null;
+  read_only?: boolean | null;   // B10 display policy 位: true → FE 默认折叠; null/缺省 → 现状行为
+  destructive?: boolean | null; // B10 display policy 位: true → FE 红色高亮
 
   function_result?: FunctionResultV1 | null;
   content?: Record<string, unknown> | null;  // 保留 tool_content enrichment channel
@@ -771,6 +773,7 @@ export type ToolConfirmationEventData = {
   suggested_alternative: string | null;
   approval_options: string[];
   timeout_seconds: number;
+  decision_reason?: DecisionReasonWire | null; // B10 §3.2: PE reasoning 直通
 };
 
 export type SessionModeChangedEventData = {

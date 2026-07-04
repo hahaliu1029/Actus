@@ -14,6 +14,11 @@ interface ToolConfirmationCardProps {
     suggested_alternative: string | null;
     approval_options: string[];
     timeout_seconds: number;
+    decision_reason?: {
+      type: string;
+      code: string;
+      message: string;
+    } | null; // B10 §5.4: PE reasoning; code 禁止渲染 (R3#6)
   };
 }
 
@@ -132,6 +137,20 @@ export function ToolConfirmationCard({ data }: ToolConfirmationCardProps) {
         <details className="mb-3">
           <summary className="cursor-pointer text-xs text-muted-foreground">匹配模式详情</summary>
           <div className="mt-1 text-xs text-muted-foreground">{data.matched_patterns.join(", ")}</div>
+        </details>
+      )}
+      {data.decision_reason && (
+        <details className="mb-3">
+          <summary className="cursor-pointer text-xs text-muted-foreground">决策来源</summary>
+          <div className="mt-1 text-xs text-muted-foreground">
+            <span className="mr-1.5 rounded bg-muted px-1.5 py-0.5 font-mono">
+              {data.decision_reason.type}
+            </span>
+            {data.decision_reason.message &&
+            data.decision_reason.message !== data.risk_reason
+              ? data.decision_reason.message
+              : null}
+          </div>
         </details>
       )}
       <div className="flex flex-wrap gap-2">

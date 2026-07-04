@@ -11,7 +11,7 @@ from .message import SkillConfirmationAction
 from .patch_apply_plan import GroupOutcome
 from .plan import Plan, Step
 from .search import SearchResultItem
-from .tool_result import ToolResult
+from .tool_result import DecisionReason, ToolResult
 from app.domain.services.tools.tool_source_resolver import ToolSource
 
 
@@ -196,6 +196,10 @@ class ToolEvent(BaseEvent):
     ] = None                                         # B12 驱动
     media_type: Optional[str] = None                 # B12 驱动
 
+    # --- B10 display policy 位 (additive Optional, None = 未知/flag-off/老事件) ---
+    read_only: Optional[bool] = None                 # True → FE 默认折叠
+    destructive: Optional[bool] = None               # True → FE 红色高亮
+
 
 class WaitEvent(BaseEvent):
     """等待事件，等待用户输入确认"""
@@ -302,6 +306,9 @@ class ToolConfirmationEvent(BaseEvent):
     suggested_alternative: Optional[str] = None
     approval_options: List[str] = Field(default=["once", "session", "always", "deny"])
     timeout_seconds: int
+    # B10 §3.2: PE Asked.reason 结构化直通 (F0.11 验真: _pe_reason 已在手,
+    # 此前只取 .message 降维进 risk_reason). 不受 display flag 门控 (INV-B10-9).
+    decision_reason: Optional[DecisionReason] = None
 
 
 class SandboxStateChangedEvent(BaseEvent):

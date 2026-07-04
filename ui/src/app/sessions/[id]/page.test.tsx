@@ -611,4 +611,77 @@ describe("SessionPage", () => {
       expect(screen.queryByText("执行已终止")).not.toBeInTheDocument();
     });
   });
+
+  describe("B10 工具卡接线", () => {
+    it("tool 事件渲染新 ToolCallCard（envelope 解析转正 + 双时态文案）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "T",
+        status: "completed",
+        events: [
+          {
+            event: "tool",
+            data: {
+              event_id: "evt-t1",
+              envelope_version: 1,
+              tool_call_id: "tc-1",
+              name: "file",
+              function: "file_read",
+              args: { filepath: "/workspace/a.txt" },
+              status: "called",
+              activity_description: "",
+            },
+          },
+        ],
+      };
+      render(<SessionPage />);
+      expect(screen.getByText("已读取文件")).toBeInTheDocument();
+    });
+
+    it("parse-null（data 非对象）→ legacy 渲染分支不崩溃（R11#3）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "T",
+        status: "completed",
+        events: [
+          {
+            event: "tool",
+            data: [] as unknown as Record<string, unknown>, // 数组 → parse null
+          },
+        ],
+      };
+      render(<SessionPage />);
+      // legacy 分支现状兜底文案 (getToolActionTitle: 空 name/function/status →
+      // called=false → "正在调用工具", plan-R3#3 核实)
+      expect(screen.getByText("正在调用工具")).toBeInTheDocument();
+    });
+
+    it("read_only 折叠卡点击展开（override map 端到端）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "T",
+        status: "completed",
+        events: [
+          {
+            event: "tool",
+            data: {
+              event_id: "evt-t2",
+              envelope_version: 1,
+              tool_call_id: "tc-2",
+              name: "file",
+              function: "file_read",
+              args: { filepath: "/workspace/a.txt" },
+              status: "called",
+              activity_description: "",
+              read_only: true,
+            },
+          },
+        ],
+      };
+      render(<SessionPage />);
+      expect(screen.queryByText(/文件：/)).not.toBeInTheDocument(); // 默认折叠
+      fireEvent.click(screen.getByRole("button", { name: /已读取文件/ }));
+      expect(screen.getByText(/文件：/)).toBeInTheDocument(); // override 写入并展开
+    });
+  });
 });

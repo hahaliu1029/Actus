@@ -183,3 +183,10 @@ class TestMemoryConfigSummaryTimeoutSeconds:
     def test_over_3600_raises(self) -> None:
         with pytest.raises(ValidationError):
             MemoryConfig(summary_timeout_seconds=3601.0)
+
+
+def test_tool_display_metadata_enabled_defaults_off():
+    """B10 D7: dark-launch flag 默认 OFF."""
+    from app.domain.models.app_config import ToolRuntimeConfig
+
+    assert ToolRuntimeConfig().tool_display_metadata_enabled is False

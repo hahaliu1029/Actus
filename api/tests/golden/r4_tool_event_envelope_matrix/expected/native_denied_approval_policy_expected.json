@@ -1,6 +1,7 @@
 {
   "event_id": "evt-golden-native-denied-approval-policy",
   "created_at": 1776340800,
+  "seq": null,
   "envelope_version": 1,
   "tool_call_id": "c_native_dap",
   "name": "shell",
@@ -18,6 +19,8 @@
   "display_icon": null,
   "render_style": null,
   "media_type": null,
+  "read_only": null,
+  "destructive": null,
   "function_result": {
     "status": "denied",
     "message": "Tool denied by approval policy",

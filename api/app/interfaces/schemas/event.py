@@ -273,6 +273,15 @@ class ToolEventEnvelopeV1(BaseEventData):
 
     envelope_version 类型用 int + validator (>=1), 不用 Literal[1],
     以便未来 v2 事件流经老 server 时 Pydantic 不硬抛.
+
+    B10 additive 字段 (release minor, envelope_version 保持 1):
+    - read_only / destructive: display policy 位, None = 未知/flag-off/老事件.
+    - display_icon 取值收敛为受控词表 (spec §3.3):
+      "file" | "file-edit" | "terminal" | "browser" | "search" | "message"
+      | "memory" | "mcp" | "skill" | "a2a" | "generic"
+      类型保持 Optional[str] (开放 str + FE fallback 是 tolerant 方向,
+      Literal 值域收缩才是 breaking); FE 未知值降级 "generic";
+      词表扩展 = additive, 无需 version bump.
     """
     envelope_version: int = 1
 
@@ -288,6 +297,11 @@ class ToolEventEnvelopeV1(BaseEventData):
         Literal["text", "code", "table", "image", "document"]
     ] = None
     media_type: Optional[str] = None
+
+    # B10 display policy 位 (additive optional, envelope_version 保持 1):
+    # None = 未知/flag-off/老事件 → FE 不折叠不高亮 (fail-closed, spec §3.1).
+    read_only: Optional[bool] = None
+    destructive: Optional[bool] = None
 
     function_result: Optional[FunctionResultV1] = None
     content: Optional[dict[str, Any]] = None
@@ -425,6 +439,7 @@ class ToolConfirmationEventData(BaseEventData):
     suggested_alternative: str | None = None
     approval_options: list[str] = ["once", "session", "always", "deny"]
     timeout_seconds: int
+    decision_reason: DecisionReasonWire | None = None  # B10: PE reasoning 直通
 
 
 class ToolConfirmationSSEEvent(BaseSSEEvent):
@@ -447,6 +462,15 @@ class ToolConfirmationSSEEvent(BaseSSEEvent):
                 suggested_alternative=event.suggested_alternative,
                 approval_options=event.approval_options,
                 timeout_seconds=event.timeout_seconds,
+                decision_reason=(
+                    DecisionReasonWire(
+                        type=event.decision_reason.type,
+                        code=event.decision_reason.code,
+                        message=event.decision_reason.message,
+                    )
+                    if event.decision_reason is not None
+                    else None
+                ),
             )
         )
 

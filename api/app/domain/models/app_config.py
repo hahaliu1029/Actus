@@ -483,6 +483,17 @@ class ToolRuntimeConfig(BaseModel):
             "llm_tool_call_streaming_enabled is true."
         ),
     )
+    tool_display_metadata_enabled: bool = Field(
+        default=False,
+        description=(
+            "B10: attach display policy metadata at react_graph ToolEvent "
+            "construction points — tool_source on calling/running events plus "
+            "display_icon / read_only / destructive on all tool events. OFF "
+            "(default) keeps pre-B10 wire behavior: new envelope keys "
+            "serialize as null and every pre-existing field is unchanged "
+            "(INV-B10-0)."
+        ),
+    )
 
 
 class AppConfig(BaseModel):

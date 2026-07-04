@@ -22,7 +22,16 @@ import { CompactionFoldIndicator } from "@/components/session/compaction-fold-in
 import { CoordinatorTimelineItem } from "@/components/session/coordinator-timeline-item";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
+import { ToolCallCard } from "@/components/tool-call-card";
 import { ToolConfirmationCard } from "@/components/tool-confirmation-card";
+import {
+  asRecord,
+  ExpandableToolDetail,
+  getPathTail,
+  parseToolVisual,
+  toDisplayImageUrl,
+  toSearchThumbnail,
+} from "@/components/tool-visual";
 import { StatusIndicator } from "@/components/status-indicator";
 import { SubagentResearchButton } from "@/components/subagent-research-button";
 import { SessionTaskDock } from "@/components/session-task-dock";
@@ -55,7 +64,9 @@ import {
   getSessionEventStableKey,
   getToolDisplayCopy,
   normalizeMessageAttachments,
+  parseToolEventEnvelope,
 } from "@/lib/session-ui";
+import { toolCardOverrideKey } from "@/lib/tool-display";
 import { getSessionStatusMeta } from "@/lib/status-copy";
 import { t } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -67,20 +78,6 @@ import { useUIStore } from "@/lib/store/ui-store";
 type SessionEvent = {
   event: string;
   data: Record<string, unknown>;
-};
-
-type SearchResultCard = {
-  url: string;
-  title: string;
-  snippet: string;
-};
-
-type ToolVisualContent = {
-  screenshots: Array<{ src: string; title: string; filepath: string }>;
-  searchResults: SearchResultCard[];
-  filepath: string | null;
-  mcpResult: string | null;
-  mcpAttachments: string[] | null;
 };
 
 type TakeoverMeta = {
@@ -145,18 +142,6 @@ function formatAutoDegradeExpiry(value: string): string {
   return value;
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
-function getPathTail(path: string): string {
-  const normalized = path.split("?")[0]?.split("#")[0] || path;
-  const parts = normalized.split("/");
-  return parts[parts.length - 1] || path;
-}
-
 function shouldUseSandboxFile(file: FileInfo): boolean {
   return !file.key && Boolean(file.filepath);
 }
@@ -179,21 +164,6 @@ function deriveLatestOwnerConflict(events: SessionEvent[]): OwnerConflictMeta | 
     };
   }
   return null;
-}
-
-function toSearchThumbnail(url: string, width: number): string {
-  return `https://s.wordpress.com/mshots/v1/${encodeURIComponent(url)}?w=${width}`;
-}
-
-function toImageProxyUrl(url: string): string {
-  return `/api/image-proxy?url=${encodeURIComponent(url)}`;
-}
-
-function toDisplayImageUrl(url: string): string {
-  if (/^https?:\/\//i.test(url)) {
-    return toImageProxyUrl(url);
-  }
-  return url;
 }
 
 function isSandboxDestroyed(events: SessionEvent[]): boolean {
@@ -257,91 +227,6 @@ function deriveLatestSkillConfirmationPendingAction(
   }
 
   return null;
-}
-
-function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent {
-  const content = asRecord(eventData.content);
-  const args = asRecord(eventData.args);
-  const toolName = String(eventData.name || "");
-  const functionName = String(eventData.function || "");
-
-  const screenshots: Array<{ src: string; title: string; filepath: string }> = [];
-  const screenshot = content.screenshot;
-  if (typeof screenshot === "string" && screenshot.trim()) {
-    screenshots.push({
-      src: toDisplayImageUrl(screenshot),
-      title: "网页截图",
-      filepath: screenshot,
-    });
-  }
-
-  const searchResults: SearchResultCard[] = [];
-  const rawResults = content.results;
-  if (Array.isArray(rawResults)) {
-    rawResults.forEach((item) => {
-      const entry = asRecord(item);
-      const url = typeof entry.url === "string" ? entry.url : "";
-      if (!url) {
-        return;
-      }
-      const title = typeof entry.title === "string" ? entry.title : url;
-      const snippet = typeof entry.snippet === "string" ? entry.snippet : "";
-      searchResults.push({ url, title, snippet });
-    });
-  }
-
-  const filepath =
-    toolName === "file" &&
-    /write|append|edit|create|replace|move|copy/i.test(functionName) &&
-    typeof args.filepath === "string"
-      ? args.filepath
-      : null;
-
-  // MCP/A2A 工具调用结果
-  let mcpResult: string | null = null;
-  let mcpAttachments: string[] | null = null;
-  if ((toolName === "mcp" || toolName === "a2a" || toolName === "skill") && content) {
-    const rawResult = (toolName === "a2a")
-      ? (content as Record<string, unknown>).a2a_result
-      : (toolName === "skill")
-        ? (content as Record<string, unknown>).skill_result
-        : (content as Record<string, unknown>).result;
-    if (rawResult !== undefined && rawResult !== null) {
-      if (typeof rawResult === "object" && rawResult !== null && !Array.isArray(rawResult)) {
-        const obj = rawResult as Record<string, unknown>;
-        // 结构化结果：提取 result 文本和 attachments
-        if (typeof obj.result === "string") {
-          mcpResult = obj.result;
-          if (Array.isArray(obj.attachments) && obj.attachments.length > 0) {
-            mcpAttachments = obj.attachments.filter((a): a is string => typeof a === "string");
-          }
-        } else {
-          mcpResult = JSON.stringify(rawResult, null, 2);
-        }
-      } else {
-        mcpResult = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
-      }
-    }
-  }
-
-  return { screenshots, searchResults, filepath, mcpResult, mcpAttachments };
-}
-
-/** 可展开/折叠的工具详情文本 */
-function ExpandableToolDetail({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <p
-      className={cn(
-        "mt-1 text-xs text-muted-foreground cursor-pointer hover:text-foreground/70 transition-colors",
-        expanded ? "whitespace-pre-wrap break-words" : "truncate"
-      )}
-      onClick={() => setExpanded(!expanded)}
-      title={expanded ? undefined : text}
-    >
-      {text}
-    </p>
-  );
 }
 
 /** 流式纯文本渲染时，清理 XML 标签为可读文本 */
@@ -410,6 +295,8 @@ function renderEventItem(
   onPreviewFile: (file: FileInfo) => void,
   onPreviewFilePath: (filepath: string) => void,
   onPreviewImage: (src: string, title?: string) => void,
+  toolCardOpenOverrides: ReadonlyMap<string, boolean>,
+  onToolCardOpenChange: (key: string, open: boolean) => void,
   streamingAssistantEventId?: string | null
 ) {
   const eventKey = getSessionEventStableKey(event, index);
@@ -553,6 +440,26 @@ function renderEventItem(
       );
     }
 
+    // B10 §5.2 解析层 (SV5): parseToolEventEnvelope 转正为生产入口.
+    // null (非对象/数组 data) → 不渲染新卡, 走下方 legacy 分支 (R11#3).
+    const envelope = parseToolEventEnvelope(event.data);
+    if (envelope) {
+      const overrideKey = toolCardOverrideKey(sessionId, envelope.tool_call_id);
+      return (
+        <ToolCallCard
+          key={eventKey}
+          data={envelope}
+          sessionId={sessionId}
+          openOverride={toolCardOpenOverrides.get(overrideKey)}
+          onOpenChange={(open) => onToolCardOpenChange(overrideKey, open)}
+          onPreviewImage={onPreviewImage}
+          onPreviewFilePath={onPreviewFilePath}
+        />
+      );
+    }
+
+    // ↓↓↓ legacy 渲染分支 — 现状普通卡 JSX (isRunning/statusText/visual)
+    //     原样保留, 零改动 ↓↓↓
     const isRunning = event.data.status !== "called";
     const statusText = isRunning ? "执行中" : "已完成";
     const visual = parseToolVisual(event.data);
@@ -834,6 +741,19 @@ export default function SessionPage() {
   const [desktopWorkbenchVisible, setDesktopWorkbenchVisible] = useState(true);
   const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
   const [showMerged, setShowMerged] = useState(false);
+
+  // B10: 工具卡折叠 user override — key = `${sessionId}:${tool_call_id}` (R3#3).
+  // 跨 calling→called 同 key 存活: provisional 替换更新不重置 override (Q5 风险点).
+  const [toolCardOpenOverrides, setToolCardOpenOverrides] = useState<
+    ReadonlyMap<string, boolean>
+  >(new Map());
+  const handleToolCardOpenChange = useCallback((key: string, open: boolean) => {
+    setToolCardOpenOverrides((prev) => {
+      const next = new Map(prev);
+      next.set(key, open);
+      return next;
+    });
+  }, []);
 
   const eventScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -1550,6 +1470,8 @@ export default function SessionPage() {
                       title: title || "图片预览",
                     });
                   },
+                  toolCardOpenOverrides,
+                  handleToolCardOpenChange,
                   streamingAssistantEventId
                 )
               )
