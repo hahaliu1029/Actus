@@ -244,6 +244,10 @@ class AgentService:
         # ``_build_agent_service`` from ``coord_deps``; NOT threaded into
         # ``AgentTaskRunner`` and NOT added to ``_CoordinatorRuntimeDeps``.
         policy_snapshot_sink: object | None = None,  # C5a Seam B sink (DI-provided)
+        # B9 Task 20 (R3#2 必经转发点): extension stats recorder. Stored on self,
+        # forwarded to every AgentTaskRunner built by _create_task, which threads
+        # it into PlannerReActFlow → react_graph configurable. None = flag off.
+        extension_stats_recorder: object | None = None,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -276,6 +280,7 @@ class AgentService:
         # C2 coordinator-cancel — consumed only by stop_session (INV-C4 null-safe).
         self._coordinator_parent_cancel_fanout = coordinator_parent_cancel_fanout
         self._policy_snapshot_sink = policy_snapshot_sink
+        self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -836,6 +841,9 @@ class AgentService:
             # SKIPS the 18 coordinator cfg keys.
             coord_deps=getattr(self, "_coord_deps", None),
             policy_snapshot_sink=getattr(self, "_policy_snapshot_sink", None),
+            # B9 Task 20: forward the lifespan-scoped stats recorder. getattr
+            # defense mirrors the lines above for __new__-bypass tests.
+            extension_stats_recorder=getattr(self, "_extension_stats_recorder", None),
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);

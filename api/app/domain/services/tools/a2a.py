@@ -233,6 +233,14 @@ class A2ATool(BaseTool):
             finally:
                 self._initialized = True
 
+    def connected_server_ids(self) -> list[str]:
+        """B9 P-7 公开只读契约（spec §4 R2#4）：manager None 时返回 []；
+        数据源 = manager.agent_cards 的 keys（config uuid）。"""
+        manager = getattr(self, "manager", None)
+        if not manager:
+            return []
+        return list(manager.agent_cards.keys())
+
     @tool(
         name="get_remote_agent_cards",
         description="获取可远程调用的Agent卡片信息, 包含Agent id、名称、描述、技能、请求端点等。",

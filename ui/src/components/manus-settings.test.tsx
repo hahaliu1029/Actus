@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -54,6 +54,23 @@ type SettingsState = {
   deleteSkill: ReturnType<typeof vi.fn>;
   setSkillEnabled: ReturnType<typeof vi.fn>;
   setSkillToolEnabled: ReturnType<typeof vi.fn>;
+  // B9 runtime extensions slice（extensions tab 挂载 ExtensionsOverview 时经
+  // 同一 mocked store 自取；Task 22 R6#5 测试面）。
+  runtimeExtensions: Array<unknown>;
+  runtimeSnapshotMeta: { probe_enabled: boolean; stats_enabled: boolean } | null;
+  runtimeCatalog: Array<unknown>;
+  isRuntimeLoading: boolean;
+  runtimeLoadError: string | null;
+  // Task 23 mutation slice（ExtensionsOverview 现读这三个 map + 三个 action）。
+  runtimePendingIds: string[];
+  runtimeProbeCooldowns: Record<string, number>;
+  runtimeItemNotices: Record<string, string>;
+  loadRuntimeExtensions: ReturnType<typeof vi.fn>;
+  loadRuntimeCatalog: ReturnType<typeof vi.fn>;
+  invalidateRuntimeRequests: ReturnType<typeof vi.fn>;
+  probeRuntimeExtension: ReturnType<typeof vi.fn>;
+  setRuntimeExtensionEnabled: ReturnType<typeof vi.fn>;
+  setRuntimeUserEnabled: ReturnType<typeof vi.fn>;
 };
 
 const settingsState: SettingsState = {
@@ -107,12 +124,32 @@ const settingsState: SettingsState = {
   deleteSkill: vi.fn(async () => {}),
   setSkillEnabled: vi.fn(async () => {}),
   setSkillToolEnabled: vi.fn(async () => {}),
+  runtimeExtensions: [],
+  runtimeSnapshotMeta: null,
+  runtimeCatalog: [],
+  isRuntimeLoading: false,
+  runtimeLoadError: null,
+  runtimePendingIds: [],
+  runtimeProbeCooldowns: {},
+  runtimeItemNotices: {},
+  loadRuntimeExtensions: vi.fn(async () => {}),
+  loadRuntimeCatalog: vi.fn(async () => {}),
+  invalidateRuntimeRequests: vi.fn(),
+  probeRuntimeExtension: vi.fn(async () => {}),
+  setRuntimeExtensionEnabled: vi.fn(async () => {}),
+  setRuntimeUserEnabled: vi.fn(async () => {}),
 };
 
 const mockIsAdmin = vi.fn(() => true);
 
 vi.mock("@/lib/store/settings-store", () => ({
-  useSettingsStore: (selector: (state: SettingsState) => unknown) => selector(settingsState),
+  // ExtensionsOverview 的 unmount cleanup 会调
+  // useSettingsStore.getState().invalidateRuntimeRequests()（R2#5），
+  // 因此 mock 需同时提供 hook 调用形态与静态 getState。
+  useSettingsStore: Object.assign(
+    (selector: (state: SettingsState) => unknown) => selector(settingsState),
+    { getState: () => settingsState }
+  ),
 }));
 
 vi.mock("@/hooks/use-auth", () => ({
@@ -299,5 +336,83 @@ describe("ManusSettings - Skill risk policy", () => {
 
     await openSkillTab();
     expect(screen.getByRole("button", { name: "AI 创建" })).toBeInTheDocument();
+  });
+});
+
+describe("ManusSettings - 扩展总览 tab（R6#5）", () => {
+  beforeEach(() => {
+    mockIsAdmin.mockReturnValue(true);
+  });
+
+  it("切到 extensions tab 不额外触发 loadAll", async () => {
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+
+    // 打开设置面板：既有基线 loadAll() 照常发生。
+    const trigger = screen.getAllByRole("button")[0];
+    await user.click(trigger);
+    expect(settingsState.loadAll).toHaveBeenCalledTimes(1);
+
+    // R6#5 冻结语义：基线调用后 reset spy，再切 extensions tab，
+    // 断言 spy 0 新增调用（extensions tab 只走 runtime loads 自取）。
+    settingsState.loadAll.mockClear();
+
+    await user.click(screen.getByRole("button", { name: "扩展总览" }));
+
+    expect(
+      screen.getByRole("heading", { name: "扩展总览" })
+    ).toBeInTheDocument();
+    expect(settingsState.loadAll).not.toHaveBeenCalled();
+    // 佐证：tab 自取数据经 runtime loads（组件 mount effect），非 loadAll。
+    expect(settingsState.loadRuntimeExtensions).toHaveBeenCalled();
+  });
+
+  it("catalog 填入配置 → 切到 MCP tab + 预填添加弹窗（Task 24, P-12）", async () => {
+    const user = userEvent.setup();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    // 让真实 ExtensionsOverview 渲染出一个 catalog 条目（带 config_template）。
+    settingsState.runtimeCatalog = [
+      {
+        id: "fresh-mcp",
+        name: "Fresh MCP",
+        description: "not configured yet",
+        transport: "stdio",
+        config_template: { command: "npx", args: ["-y", "some-mcp"], transport: "stdio" },
+        homepage: "https://example.com/fresh-mcp",
+        tags: ["search"],
+        source: "builtin",
+        reviewed_at: "2026-07-04T00:00:00Z",
+      },
+    ];
+
+    render(<ManusSettings />);
+    const trigger = screen.getAllByRole("button")[0];
+    await user.click(trigger);
+    await user.click(screen.getByRole("button", { name: "扩展总览" }));
+
+    const prefillBtn = await screen.findByTestId("prefill-button-fresh-mcp");
+    await user.click(prefillBtn);
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      "该模板将以 stdio 命令/外部 URL 运行，请自行核实来源后再保存"
+    );
+
+    // 切到 MCP tab（添加弹窗打开——弹窗仅在 mcp tab 内条件渲染，其标题出现即
+    // 证明 tab 已切换）+ Textarea 预填完整包裹 JSON。
+    expect(
+      await screen.findByText("添加新的 MCP 服务器")
+    ).toBeInTheDocument();
+    const expected = JSON.stringify(
+      { mcpServers: { "fresh-mcp": { command: "npx", args: ["-y", "some-mcp"], transport: "stdio" } } },
+      null,
+      2
+    );
+    const dialogTitle = await screen.findByText("添加新的 MCP 服务器");
+    const dialog = dialogTitle.closest("[role='dialog']") as HTMLElement;
+    const textarea = within(dialog).getByRole("textbox") as HTMLTextAreaElement;
+    expect(textarea.value).toBe(expected);
+
+    confirmSpy.mockRestore();
+    settingsState.runtimeCatalog = [];
   });
 });

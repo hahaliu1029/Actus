@@ -84,6 +84,7 @@ from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.graphs.background_summary import run_background_summary
+from app.domain.services.runtime_liveness_registry import runtime_liveness_registry
 from app.domain.services.session.mode_event import ModeChangedEventSink
 from app.domain.services.session.session_state_machine import SessionStateMachine
 from app.domain.services.tools.a2a import A2ATool
@@ -426,6 +427,9 @@ class AgentTaskRunner(TaskRunner):
         event_seq_client: Any = None,  # B3-core PR-1: Redis client for session:seq:{sid}
         event_seq_ttl_seconds: int = _EVENT_SEQ_TTL_SECONDS,
         execution_supervisor: Any = None,
+        # B9 Task 20: extension stats recorder forwarded into PlannerReActFlow →
+        # _build_config → react_graph configurable. None = flag off (zero call).
+        extension_stats_recorder: Any = None,
         idle_watchdog: Any = None,
         was_background: bool = False,
         permission_engine: Any = None,  # PE-0 Phase 7: PermissionEngine | None
@@ -511,6 +515,7 @@ class AgentTaskRunner(TaskRunner):
         self.profile = profile
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
+        self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
         self._idle_watchdog = idle_watchdog
         self._event_seq_client = event_seq_client
         self._event_seq_ttl_seconds = event_seq_ttl_seconds
@@ -548,6 +553,8 @@ class AgentTaskRunner(TaskRunner):
         self._mcp_tool = MCPTool()
         self._a2a_config = a2a_config
         self._a2a_tool = A2ATool()
+        # B9 liveness 接线：对称 release 的 acquired 清单（spec §4 R14#1）
+        self._liveness_acquired: list[tuple[str, str]] = []
         settings = get_settings()
         self._skill_repository = FileSkillRepository(settings.skills_root_dir)
         self._skill_bundle_sync = SkillBundleSyncManager(
@@ -748,6 +755,8 @@ class AgentTaskRunner(TaskRunner):
             # B4 M0: session-scoped cost callback attached into every invoke.
             cost_callback_handler=self._cost_callback_handler,
             execution_supervisor=self._execution_supervisor,
+            # B9 Task 20: thread the stats recorder into the flow's configurable.
+            extension_stats_recorder=self._extension_stats_recorder,
             permission_engine=self._permission_engine,
             session_state_machine=self._session_state_machine,
             policy_snapshot_sink=self._policy_snapshot_sink,
@@ -3636,6 +3645,44 @@ class AgentTaskRunner(TaskRunner):
             return "user_cancel"
         return "natural"
 
+    def _liveness_begin_run(self) -> None:
+        """B9：run 注册（spec R14#1 全序——invoke() 开始处调用，先于任何 init）。"""
+        try:
+            runtime_liveness_registry.begin_run(self._session_id)
+        except Exception:
+            logger.warning("liveness begin_run 异常（fail-open）", exc_info=True)
+
+    def _liveness_acquire_connected(self) -> None:
+        """B9 liveness 旁路采集（spec §4）——fail-open：任何异常只 warn+degraded，不影响 init 结果。"""
+        try:
+            for server_id in self._mcp_tool.connected_server_ids():
+                runtime_liveness_registry.acquire("mcp", server_id, self._session_id)
+                self._liveness_acquired.append(("mcp", server_id))
+            for agent_id in self._a2a_tool.connected_server_ids():
+                runtime_liveness_registry.acquire("a2a", agent_id, self._session_id)
+                self._liveness_acquired.append(("a2a", agent_id))
+        except Exception:
+            logger.warning("liveness acquire 旁路异常（fail-open）", exc_info=True)
+            try:
+                runtime_liveness_registry.mark_degraded(self._session_id)
+            except Exception:
+                pass
+
+    def _liveness_release_all(self) -> None:
+        """B9：对称 release 已 acquire 的 ids → 无条件 end_run 兜底（spec §4 R14#1）。"""
+        try:
+            for kind, ext_id in self._liveness_acquired:
+                try:
+                    runtime_liveness_registry.release(kind, ext_id, self._session_id)
+                except Exception:
+                    logger.warning("liveness release 异常（fail-open）", exc_info=True)
+        finally:
+            self._liveness_acquired = []
+            try:
+                runtime_liveness_registry.end_run(self._session_id)
+            except Exception:
+                logger.warning("liveness end_run 异常（fail-open）", exc_info=True)
+
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
 
@@ -3672,6 +3719,9 @@ class AgentTaskRunner(TaskRunner):
         self._last_initialized_skill_ids = ()
         self._last_skill_risk_fp = ()
         self._last_initialized_skills = []
+        # B9 liveness 兜底：release 已 acquire 的 ids + 无条件 end_run（内部 fail-open）。
+        # end_run 对未知 run 也安全——即便某路径未走到 begin_run 也幂等。
+        self._liveness_release_all()
 
     async def _is_root_session(self) -> bool:
         """C3 PR-3c: lazy-cached check whether this runner drives a root session.
@@ -4233,6 +4283,8 @@ class AgentTaskRunner(TaskRunner):
 
     async def invoke(self, task: Task) -> None:
         """根据传递的任务处理agent消息队列并运行agent流"""
+        # B9 liveness 全序（spec R14#1）：run 注册先于任何 init/首个 try 块。
+        self._liveness_begin_run()
         try:
             # 1.任务一启动先推进会话状态，避免前端长期显示pending
             async with self._uow:
@@ -4340,6 +4392,9 @@ class AgentTaskRunner(TaskRunner):
             )
             await self._mcp_tool.initialize(filtered_mcp_config)
             await self._a2a_tool.initialize(filtered_a2a_config)
+            # B9 liveness 旁路采集（begin_run 已发生）：按已连接 server 逐个 acquire。
+            # fail-open——任何异常只 warn+degraded，绝不影响 init 结果。
+            self._liveness_acquire_connected()
             self._session_skill_pool = self._filter_skills_by_user_preferences(
                 enabled_skills,
                 skill_preference_map,

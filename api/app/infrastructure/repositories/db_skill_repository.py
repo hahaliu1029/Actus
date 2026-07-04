@@ -3,6 +3,7 @@ from __future__ import annotations
 """Skill 仓储实现"""
 
 from app.domain.models.skill import Skill
+from app.domain.models.skill_diagnostic import SkillDiagnostic
 from app.domain.repositories.skill_repository import SkillRepository
 from app.infrastructure.models.skill import SkillModel
 from sqlalchemy import delete, select
@@ -67,3 +68,10 @@ class DBSkillRepository(SkillRepository):
         stmt = delete(SkillModel).where(SkillModel.id == skill_id)
         result = await self.db_session.execute(stmt)
         return (result.rowcount or 0) > 0
+
+    async def list_with_diagnostics(self) -> list[SkillDiagnostic]:
+        """DB 行经 ORM/迁移约束，无文件损坏概念——恒 ok 包装（B9 spec §8 R10#4）。"""
+        return [
+            SkillDiagnostic(skill_key=skill.id, ok=True, skill=skill)
+            for skill in await self.list()
+        ]

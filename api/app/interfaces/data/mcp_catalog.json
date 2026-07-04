@@ -1,0 +1,101 @@
+[
+  {
+    "id": "filesystem",
+    "name": "Filesystem",
+    "description": "本地文件系统读写（官方参考实现）——为 Agent 提供受限目录的文件操作能力",
+    "transport": "stdio",
+    "config_template": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"],
+      "enabled": true
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+    "tags": ["official", "file"],
+    "source": "https://github.com/modelcontextprotocol/servers",
+    "reviewed_at": "2026-07-04"
+  },
+  {
+    "id": "fetch",
+    "name": "Fetch",
+    "description": "网页抓取与内容提取（官方参考实现）——为 Agent 提供拉取 URL 并转 Markdown 的能力",
+    "transport": "stdio",
+    "config_template": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "enabled": true
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+    "tags": ["official", "web"],
+    "source": "https://github.com/modelcontextprotocol/servers",
+    "reviewed_at": "2026-07-04"
+  },
+  {
+    "id": "github",
+    "name": "GitHub",
+    "description": "GitHub 仓库、Issue 与 PR 操作（官方参考实现）——需配置个人访问令牌方可使用",
+    "transport": "stdio",
+    "config_template": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "<YOUR_GITHUB_TOKEN>"
+      },
+      "enabled": true
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+    "tags": ["official", "git"],
+    "source": "https://github.com/modelcontextprotocol/servers",
+    "reviewed_at": "2026-07-04"
+  },
+  {
+    "id": "memory",
+    "name": "Memory",
+    "description": "基于知识图谱的持久化记忆（官方参考实现）——为 Agent 提供跨会话的实体与关系存储",
+    "transport": "stdio",
+    "config_template": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "enabled": true
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+    "tags": ["official", "memory"],
+    "source": "https://github.com/modelcontextprotocol/servers",
+    "reviewed_at": "2026-07-04"
+  },
+  {
+    "id": "sequential-thinking",
+    "name": "Sequential Thinking",
+    "description": "分步结构化推理（官方参考实现）——为 Agent 提供可回溯的链式思考工具",
+    "transport": "stdio",
+    "config_template": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "enabled": true
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
+    "tags": ["official", "reasoning"],
+    "source": "https://github.com/modelcontextprotocol/servers",
+    "reviewed_at": "2026-07-04"
+  },
+  {
+    "id": "everything",
+    "name": "Everything",
+    "description": "MCP 协议全能力演示服务（官方参考实现）——覆盖 prompts、resources、tools 的测试与教学样例",
+    "transport": "stdio",
+    "config_template": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "enabled": true
+    },
+    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/everything",
+    "tags": ["official", "reference"],
+    "source": "https://github.com/modelcontextprotocol/servers",
+    "reviewed_at": "2026-07-04"
+  }
+]

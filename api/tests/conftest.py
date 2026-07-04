@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 from app.main import app
 from fastapi.testclient import TestClient
+from tests._extension_attribution_testing import reset_extension_attribution
 from tests._tool_source_testing import reset_tool_source_registry
 
 # M1 memory 系统用的固定测试 user_id（UUID v4 格式）。
@@ -85,6 +86,20 @@ def _clear_tool_source_registry():
     reset_tool_source_registry()
     yield
     reset_tool_source_registry()
+
+
+@pytest.fixture(autouse=True)
+def _clear_extension_attribution():
+    """Clear the B9 extension attribution registry before and after every test.
+
+    Mirrors ``_clear_tool_source_registry``: dynamic mcp_/skill_ attribution
+    entries registered by one test must not leak into the next. Task 18/19/20
+    tests that consume ``resolve_extension()`` rely on this for isolation, so
+    no per-file manual reset is needed.
+    """
+    reset_extension_attribution()
+    yield
+    reset_extension_attribution()
 
 
 @pytest.fixture(scope="session")

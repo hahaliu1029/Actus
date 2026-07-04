@@ -62,6 +62,193 @@ def _on_stale_finishing_stop_done(task: asyncio.Task) -> None:
             exc_info=(type(exc), exc, exc.__traceback__),
         )
 
+
+# ---------------------------------------------------------------------------
+# B9 运行时扩展探测（Task 14）—— 后台循环 + lifespan 接线
+# ---------------------------------------------------------------------------
+def _start_b9_probe(app: FastAPI) -> None:
+    """B9 探测启动——任何失败 fail-open：只禁能力，不阻断 app startup（spec §3.5）。"""
+    # R2#2：安全默认值先落位，一切 import（含新模块导入期异常）都在 try 内
+    app.state.runtime_liveness_registry = None
+    app.state.extension_probe_service = None
+    app.state.extension_probe_started = False
+    try:
+        from app.application.services.extension_probe_service import (
+            DefaultExtensionProber, ExtensionProbeService,
+        )
+        from app.domain.services.runtime_liveness_registry import runtime_liveness_registry
+        from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
+        from app.interfaces.service_dependencies import _load_app_config
+
+        app.state.runtime_liveness_registry = runtime_liveness_registry
+        probe_service = ExtensionProbeService(
+            config_provider=_load_app_config,
+            skill_repository=FileSkillRepository(settings.skills_root_dir),
+            prober=DefaultExtensionProber(),
+            probe_flag_provider=lambda: _load_app_config().tool_runtime.extension_probe_enabled,
+            liveness_view=runtime_liveness_registry,
+        )
+        app.state.extension_probe_service = probe_service
+        task = asyncio.create_task(probe_service.run_loop())
+        task.add_done_callback(_log_b9_probe_exit)
+        app.state._extension_probe_task = task
+        app.state.extension_probe_started = True
+    except Exception:
+        logger.warning("B9 探测服务启动失败（fail-open，能力禁用）", exc_info=True)
+        app.state.extension_probe_service = None
+        app.state.extension_probe_started = False
+
+
+def _log_b9_probe_exit(task: "asyncio.Task") -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("B9 探测循环非预期退出", exc_info=exc)
+
+
+# B9 shutdown 等待上限（秒）——提取为模块常量，测试可 monkeypatch 缩小。
+PROBE_SHUTDOWN_WAIT_SECONDS = 5.0
+
+
+async def _stop_b9_probe(app: FastAPI) -> None:
+    """B9 探测后台 task 停机（belt-and-suspenders 三重防护）。
+
+    底层 MCP init/cleanup（``MCPClientManager.initialize()`` / ``cleanup()``，被
+    prober 在 ``_probe_locked`` 内调用）含 ``except BaseException`` 块，可能吞掉
+    lifespan 投递的 ``asyncio.CancelledError``。单靠 ``task.cancel()`` 无法保证退出，
+    故三层叠加：
+    1. **cooperative ``_stopping``**（``service.shutdown()``）——置 ``_stopping=True``，
+       即便 cancel 被吞，``run_loop`` 也会在至多一次 tick+sleep 后自然退出。
+    2. **``task.cancel()``**——正常路径立即中断在 sleep/await 上的循环。
+    3. **bounded ``asyncio.wait``**——即便前两者都失效，也只等 ``PROBE_SHUTDOWN_WAIT_SECONDS``
+       就 fail-open 放弃，绝不让 shutdown 无限挂起（不用 ``wait_for``：它 cancel 后
+       还要等任务确认取消，对吞 cancel 的任务同样会挂——正是本修复要防的失效模式）。
+    """
+    probe_service = getattr(app.state, "extension_probe_service", None)
+    if probe_service is not None:
+        # 先置 _stopping（cooperative stop），保证 cancel 被吞时循环仍会退出。
+        try:
+            await probe_service.shutdown()
+        except Exception:  # noqa: BLE001 - shutdown 仅置 flag，异常不阻断停机
+            logger.warning("B9 probe service.shutdown() 出错（继续 cancel）", exc_info=True)
+
+    probe_task = getattr(app.state, "_extension_probe_task", None)
+    if probe_task:
+        probe_task.cancel()
+        # 用 ``asyncio.wait``（非 ``wait_for``）做 bounded 等待：``wait_for`` 在超时时
+        # 会去 cancel 并 await 内层 task 的取消确认——若底层 MCP init 的
+        # ``except BaseException`` 把取消也吞掉，``wait_for`` 会永久挂在等确认上，达不到
+        # "5s 上限" 的承诺。``asyncio.wait`` 只返回 (done, pending)，不要求 task 确认取消，
+        # 因此即便 task 完全吞掉 cancel 也保证 ≤5s 返回（真·fail-open）。cooperative
+        # ``_stopping`` 已在上面置位，生产路径下 task 会自行退出、落 done。
+        try:
+            done, _pending = await asyncio.wait(
+                {probe_task}, timeout=PROBE_SHUTDOWN_WAIT_SECONDS
+            )
+        except (asyncio.CancelledError, Exception):
+            return
+        if not done:
+            logger.warning(
+                "B9 probe task 未在 5s 内退出——放弃等待（fail-open shutdown）"
+            )
+        else:
+            # task 已退出——消费其异常（若有）避免 "exception never retrieved" 警告。
+            exc_task = next(iter(done))
+            if not exc_task.cancelled():
+                exc_task.exception()
+
+
+# ---------------------------------------------------------------------------
+# B9 运行时扩展统计（Task 19）—— 有界队列 recorder + Redis flusher + lifespan 接线
+# ---------------------------------------------------------------------------
+def _start_b9_stats(app: FastAPI, redis_client) -> None:
+    """B9 统计启动——**仅 flag on 时**构造 recorder/flusher 并置 started=True。
+
+    **与 probe 侧的有意差异（此处冻结，R2#3）**：统计记录是工具执行热路径的组装期
+    注入——recorder 若无条件构造，flag-off 部署仍会记录。故 stats 用**条件注入**：
+    ``extension_stats_enabled`` on 才构造 ``RedisExtensionStats`` + 起 flusher 后台
+    task；off→on 翻转需重启进程才开始记录（wart 已随 plan 审查日志归档）；on→off 翻转
+    时 GET 顶层 ``stats_enabled`` 位即时变 False（getter 以 ``started ∧ flag`` 合成），
+    但已注入的 recorder 持续记录到重启——可接受。
+
+    任何失败 fail-open：只禁能力（``extension_stats=None`` / ``started=False``），
+    不阻断 app startup。
+    """
+    # R2#2 同款：安全默认值先落位，一切 import / 构造异常都在 try 内。
+    app.state.extension_stats = None
+    app.state.extension_stats_started = False
+    try:
+        from app.interfaces.service_dependencies import _load_app_config
+
+        if not _load_app_config().tool_runtime.extension_stats_enabled:
+            logger.info("B9 扩展统计未启用（flag off）——跳过 recorder/flusher 构造")
+            return
+
+        from app.infrastructure.external.runtime_stats.redis_extension_stats import (
+            RedisExtensionStats,
+        )
+
+        stats = RedisExtensionStats(redis_client.client)
+        app.state.extension_stats = stats
+        task = asyncio.create_task(stats.run_flusher())
+        task.add_done_callback(_log_b9_stats_exit)
+        app.state._extension_stats_task = task
+        app.state.extension_stats_started = True
+    except Exception:
+        logger.warning("B9 统计服务启动失败（fail-open，能力禁用）", exc_info=True)
+        app.state.extension_stats = None
+        app.state.extension_stats_started = False
+
+
+def _log_b9_stats_exit(task: "asyncio.Task") -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("B9 统计 flusher 循环非预期退出", exc_info=exc)
+
+
+# B9 统计 shutdown 等待上限（秒）——drain ≤2s 由 RedisExtensionStats.shutdown() 内部
+# 保证，这里再包一层 bounded wait 兜底（对齐 probe 侧防吞 cancel 的三层防护动机）。
+STATS_SHUTDOWN_WAIT_SECONDS = 5.0
+
+
+async def _stop_b9_stats(app: FastAPI) -> None:
+    """B9 统计停机（对齐 probe 侧 shape）：recorder 停收 → flusher 限时 drain → cancel。
+
+    顺序（spec §9）：先 ``stats.shutdown()``（置 ``_closed`` 拒收 + 限时 drain ≤2s），
+    再 cancel flusher task，最后 bounded ``asyncio.wait`` 兜底——即便 flusher 卡住也只
+    等 ``STATS_SHUTDOWN_WAIT_SECONDS`` 就 fail-open 放弃，绝不让 shutdown 无限挂起。
+    无 stats（flag off / 构造失败 fail-open 路径）时静默 no-op。
+    """
+    stats = getattr(app.state, "extension_stats", None)
+    if stats is not None:
+        try:
+            await stats.shutdown()
+        except Exception:  # noqa: BLE001 - drain 异常不阻断停机
+            logger.warning("B9 stats.shutdown() 出错（继续 cancel）", exc_info=True)
+
+    stats_task = getattr(app.state, "_extension_stats_task", None)
+    if stats_task:
+        stats_task.cancel()
+        try:
+            done, _pending = await asyncio.wait(
+                {stats_task}, timeout=STATS_SHUTDOWN_WAIT_SECONDS
+            )
+        except (asyncio.CancelledError, Exception):
+            return
+        if not done:
+            logger.warning(
+                "B9 stats flusher task 未在 %.0fs 内退出——放弃等待（fail-open shutdown）",
+                STATS_SHUTDOWN_WAIT_SECONDS,
+            )
+        else:
+            exc_task = next(iter(done))
+            if not exc_task.cancelled():
+                exc_task.exception()
+
+
 logger.info("应用程序启动中...")
 
 # 定义FastApi路由tags标签
@@ -206,6 +393,15 @@ async def lifespan(app: FastAPI):
         )
         app.state.flush_service = flush_service
         logger.info("MemoryFlushService 初始化完成")
+
+        # 7a. B9 运行时扩展探测（Task 14）——service + 后台 task 无条件构造/启动
+        # （不以 flag 为条件；循环内每 tick 经 probe_flag_provider 自检，flag off 空转）。
+        # 任何失败 fail-open：只禁能力，不阻断 startup。
+        _start_b9_probe(app)
+        logger.info(
+            "B9 扩展探测启动完成 (started=%s)",
+            getattr(app.state, "extension_probe_started", False),
+        )
 
         # 7b. FileMemoryStore 初始化（M1 PR-5A）：
         # FsMemoryWriter 接 ``memory_root_container`` 下的落盘路径。容器内的
@@ -371,6 +567,11 @@ async def lifespan(app: FastAPI):
                 # the identical ToolRuntimeConfig so B1 flags flipped on root
                 # don't silently stay default-OFF for child graphs (spec R2#1).
                 tool_runtime=snap.tool_runtime,
+                # B9 Task 20 (R4#1): child extension calls feed the same stats
+                # recorder as root. None when flag off.
+                extension_stats_recorder=getattr(
+                    app.state, "extension_stats", None
+                ),
             )
 
         coord_deps = None
@@ -459,6 +660,16 @@ async def lifespan(app: FastAPI):
         await sandbox_lifecycle_service.reconcile_orphans()
         logger.info("Sandbox orphan reconciliation 完成")
 
+        # 9b. B9 运行时扩展统计（Task 19）——**必须在 _build_agent_service 之前**：
+        # recorder 单例先就绪，才能进 AgentService → AgentTaskRunner 的热路径组装链
+        # （启动顺序硬约束）。stats 用条件注入（仅 flag on 时构造，见 _start_b9_stats
+        # docstring 冻结语义）；任何失败 fail-open 只禁能力。
+        _start_b9_stats(app, redis_client)
+        logger.info(
+            "B9 扩展统计启动完成 (started=%s)",
+            getattr(app.state, "extension_stats_started", False),
+        )
+
         # 10. 创建 AgentService 单例 (D2)
         from app.interfaces.service_dependencies import _build_agent_service
         app.state.agent_service = _build_agent_service(
@@ -474,6 +685,10 @@ async def lifespan(app: FastAPI):
             # ``_CoordinatorRuntimeDeps`` aggregator built above into the
             # AgentService → AgentTaskRunner → PlannerReActFlow chain.
             coord_deps=app.state.coord_deps,
+            # B9 Task 20: lifespan-scoped extension stats recorder. None when
+            # flag off (see _start_b9_stats). Threaded into the hot path so
+            # react_graph埋点 records ext tool calls.
+            extension_stats_recorder=getattr(app.state, "extension_stats", None),
         )
         logger.info("AgentService 单例初始化完成")
 
@@ -771,6 +986,25 @@ async def lifespan(app: FastAPI):
                 logger.warning("SandboxLifecycleService 关闭超时")
             except Exception as e:
                 logger.warning(f"SandboxLifecycleService 关闭时出错: {e}")
+
+        # 停 B9 探测后台循环（Task 14）——在 flush_service.shutdown() 之前、
+        # 既有 Redis/Postgres 关闭段之前（B9 先停，spec R3#7）。cancel 沿同 task
+        # 传播让 in-flight tick 的 cleanup 闭环（F4）；_stop_b9_probe 内部吞异常，
+        # 无 task（构造失败 fail-open 路径）时静默 no-op。
+        try:
+            await _stop_b9_probe(app)
+            logger.info("B9 扩展探测关闭成功")
+        except Exception as e:
+            logger.warning(f"B9 扩展探测关闭时出错: {e}")
+
+        # 停 B9 统计 flusher（Task 19）——先 probe 后 stats，均在既有 Redis 关闭段之前
+        # （spec §9 / brief）：recorder 停收 → flusher 限时 drain ≤2s → cancel。无 stats
+        # （flag off / fail-open 路径）时静默 no-op。
+        try:
+            await _stop_b9_stats(app)
+            logger.info("B9 扩展统计关闭成功")
+        except Exception as e:
+            logger.warning(f"B9 扩展统计关闭时出错: {e}")
 
         # 关闭 MemoryFlushService（等待后台 flush 任务完成）
         flush_service = getattr(app.state, "flush_service", None)

@@ -310,6 +310,14 @@ class RedactingFormatter(logging.Formatter):
         return text
 
 
+def redact_text(text: str) -> str:
+    """公共脱敏 API（B9 INV-B9-2/R5#5）：探测 error_message 等自由文本走此入口。
+
+    内部复用 RedactingFormatter 的规则实现，保证与日志脱敏单源同规则。
+    """
+    return RedactingFormatter._redact(text)
+
+
 # Third-party loggers that ship their own ``StreamHandler`` and would
 # otherwise bypass the root ``RedactingFormatter``. ``uvicorn.access``
 # is included because uvicorn installs its own handler on

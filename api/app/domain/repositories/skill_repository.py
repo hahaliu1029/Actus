@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from app.domain.models.skill import Skill
+from app.domain.models.skill_diagnostic import SkillDiagnostic
 
 
 class SkillRepository(ABC):
@@ -39,4 +40,12 @@ class SkillRepository(ABC):
     @abstractmethod
     async def delete(self, skill_id: str) -> bool:
         """删除 Skill"""
+        pass
+
+    @abstractmethod
+    async def list_with_diagnostics(self) -> list["SkillDiagnostic"]:
+        """获取全部 Skill 的 per-skill 诊断（含损坏条目占位；B9 spec §8）。
+
+        好条目 ok=True + skill 非 None；坏条目 ok=False + error_code/relative_file。
+        """
         pass

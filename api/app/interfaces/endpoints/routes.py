@@ -9,6 +9,7 @@ from . import (
     memory_routes,
     metrics_routes,
     notification_routes,
+    runtime_extension_routes,
     session_compaction_routes,
     skill_routes,
     skill_v2_routes,
@@ -39,6 +40,7 @@ def create_api_routes() -> APIRouter:
     api_router.include_router(user_routes.router)
     api_router.include_router(user_tools_v2_routes.router)
     api_router.include_router(user_tool_policies_routes.router)
+    api_router.include_router(runtime_extension_routes.router)
     api_router.include_router(memory_routes.router)
     api_router.include_router(notification_routes.router)
 

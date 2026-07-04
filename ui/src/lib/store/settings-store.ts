@@ -3,13 +3,15 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 
-import { configApi } from "@/lib/api/config";
+import { ApiError } from "@/lib/api/auth-utils";
+import { configApi, runtimeApi } from "@/lib/api/config";
 import { memoryApi } from "@/lib/api/memory";
 import { userToolsApi } from "@/lib/api/user-tools";
 import type {
   A2AServersData,
   AgentConfig,
   CreateA2AServerParams,
+  ExtensionKind,
   FileUnderstandingConfig,
   InstallSkillParams,
   LLMConfig,
@@ -17,12 +19,25 @@ import type {
   MCPServersData,
   MemoryItem,
   MemoryListParams,
+  RuntimeCatalogItem,
+  RuntimeConfigStatus,
+  RuntimeExtensionItem,
   SkillRiskPolicy,
   SkillListData,
   ToolWithPreference,
 } from "@/lib/api/types";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
+
+/**
+ * B9 运行时扩展加载/轮询的模块级请求 token（R6#2 冻结；R13#2 补全覆盖面）。
+ * 每次 loadRuntimeExtensions 开始时 `++runtimeRequestSeq`；success/catch/finally
+ * 三条路径写任何 state 前都必须先 `if (token !== runtimeRequestSeq) return;`，
+ * 旧请求的失败/收尾同样不得污染新状态（旧 reject 晚到不写 error、不动 loading）。
+ * invalidateRuntimeRequests()（unmount cleanup / reset / 未来 mutation）递增它，
+ * 使全部 in-flight load/poll 响应失效。
+ */
+let runtimeRequestSeq = 0;
 
 /**
  * 记忆变更已经在后端生效，但随后的列表刷新失败时抛出的错误。
@@ -63,6 +78,18 @@ type SettingsState = {
   isMemoryLoading: boolean;
   memoryFilters: MemoryListParams;
   memoryLoadError: string | null;
+  // B9 runtime extensions console 聚合 tab（P-12 slice）。
+  // 4a（本 task）填充 runtimeExtensions/runtimeSnapshotMeta/runtimeCatalog +
+  // isRuntimeLoading/runtimeLoadError；runtimePendingIds/runtimeProbeCooldowns/
+  // runtimeItemNotices 属于冻结的 slice 形状，此处声明并初始化，Task 23 的 mutation 填充。
+  runtimeExtensions: RuntimeExtensionItem[];
+  runtimeSnapshotMeta: { probe_enabled: boolean; stats_enabled: boolean } | null;
+  runtimeCatalog: RuntimeCatalogItem[];
+  isRuntimeLoading: boolean;
+  runtimeLoadError: string | null;
+  runtimePendingIds: string[]; // `${kind}:${id}` 操作中集合（Task 23）
+  runtimeProbeCooldowns: Record<string, number>; // `${kind}:${id}` → 可重试 epoch ms（429 倒计时，Task 23）
+  runtimeItemNotices: Record<string, string>; // `${kind}:${id}` → inline 提示文案（Task 23）
 };
 
 type SettingsActions = {
@@ -92,6 +119,23 @@ type SettingsActions = {
   deleteMemory: (id: string) => Promise<void>;
   bulkDeleteMemories: (ids: string[]) => Promise<void>;
   deleteAllMemories: () => Promise<void>;
+  // B9 runtime extensions console（P-12 slice 4a 部分）。
+  loadRuntimeExtensions: () => Promise<void>; // 带 request token 竞态守卫（R6#2）
+  loadRuntimeCatalog: () => Promise<void>;
+  invalidateRuntimeRequests: () => void; // R2#5：递增模块级 token，使全部 in-flight load/poll 响应失效
+  // B9 mutation actions（P-12 slice 4b，Task 23）。
+  probeRuntimeExtension: (kind: ExtensionKind, id: string) => Promise<void>;
+  setRuntimeExtensionEnabled: (
+    kind: ExtensionKind,
+    id: string,
+    enabled: boolean,
+  ) => Promise<void>;
+  setRuntimeUserEnabled: (
+    kind: ExtensionKind,
+    id: string,
+    enabled: boolean,
+  ) => Promise<void>;
+
   // M3-A: 清理 legacy session_flush 遗留记忆（后端条件合取：
   // source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL）。
   // 返回实际删除条数的承诺通过 reportSuccess toast 呈现。
@@ -126,6 +170,14 @@ const initialState: SettingsState = {
   isMemoryLoading: false,
   memoryFilters: {},
   memoryLoadError: null,
+  runtimeExtensions: [],
+  runtimeSnapshotMeta: null,
+  runtimeCatalog: [],
+  isRuntimeLoading: false,
+  runtimeLoadError: null,
+  runtimePendingIds: [],
+  runtimeProbeCooldowns: {},
+  runtimeItemNotices: {},
 };
 
 function mergeOptimisticMCPServers(
@@ -165,11 +217,62 @@ function reportSuccess(text: string): void {
   });
 }
 
+// B9 Task 23 — `${kind}:${id}` 复合 key（P-12 pending/cooldown/notice 三个 map 的键）。
+function runtimeKey(kind: ExtensionKind, id: string): string {
+  return `${kind}:${id}`;
+}
+
+// B9 Task 23 — 用户级偏好 patch 后本地重算 config 三字段（动作语义 R6#2/R7#3/R8#4 冻结）。
+// enabled_user=请求值；effective_enabled = enabled_global && enabled_user；
+// reason_code 按四组合表：true/true→enabled、true/false→disabled_user、
+// false/true→disabled_global、false/false→disabled_both——覆盖 user_enablement_unknown
+// 拿到明确值后的恢复（组合表天然处理）。enabled_global 取现有 config（不变）。
+function recomputeUserConfig(
+  config: RuntimeConfigStatus,
+  enabledUser: boolean,
+): RuntimeConfigStatus {
+  const enabledGlobal = config.enabled_global;
+  let reasonCode: string;
+  if (enabledGlobal && enabledUser) {
+    reasonCode = "enabled";
+  } else if (enabledGlobal && !enabledUser) {
+    reasonCode = "disabled_user";
+  } else if (!enabledGlobal && enabledUser) {
+    reasonCode = "disabled_global";
+  } else {
+    reasonCode = "disabled_both";
+  }
+  return {
+    ...config,
+    enabled_user: enabledUser,
+    effective_enabled: enabledGlobal && enabledUser,
+    reason_code: reasonCode,
+  };
+}
+
+// B9 Task 23 — ApiError.data.reason 读取（无 any；data 为 unknown）。
+function readErrorReason(error: unknown): string | undefined {
+  if (
+    error instanceof ApiError &&
+    typeof error.data === "object" &&
+    error.data !== null
+  ) {
+    const reason = (error.data as { reason?: unknown }).reason;
+    return typeof reason === "string" ? reason : undefined;
+  }
+  return undefined;
+}
+
 export const useSettingsStore = create<SettingsStore>()(
   subscribeWithSelector((set, get) => ({
     ...initialState,
 
-    reset: () => set(initialState),
+    // R2#5：reset 内递增 token（invalidateRuntimeRequests 等价逻辑），
+    // 防 logout / registerStoreResetter 后旧 in-flight 响应回写。
+    reset: () => {
+      runtimeRequestSeq += 1;
+      set(initialState);
+    },
 
     loadAll: async () => {
       set({ isLoading: true });
@@ -584,6 +687,222 @@ export const useSettingsStore = create<SettingsStore>()(
         throw new MemoryRefreshAfterMutationError(refreshError);
       }
       return deletedCount;
+    },
+
+    // B9 运行时扩展聚合加载（P-12 slice 4a）。
+    // 竞态语义（R6#2 冻结；R13#2 补全覆盖面）：模块级递增 token——
+    // 开始 `const token = ++runtimeRequestSeq`；success、catch、finally 三条路径
+    // 写任何 state 前都必须先 `if (token !== runtimeRequestSeq) return;`
+    // （旧请求的失败/收尾同样不得污染新状态）。
+    // 失败路径（token 仍最新时）：保留旧 runtimeExtensions（上次快照）+
+    // runtimeLoadError 置 message（R6 错误容忍）。
+    // loadRuntimeExtensions 不并入 loadAll()（F20 已知偏重，spec §10 独立 action）。
+    loadRuntimeExtensions: async () => {
+      const token = ++runtimeRequestSeq;
+      set({ isRuntimeLoading: true });
+      try {
+        const data = await runtimeApi.getExtensions();
+        if (token !== runtimeRequestSeq) {
+          return;
+        }
+        set({
+          runtimeExtensions: data.items,
+          runtimeSnapshotMeta: {
+            probe_enabled: data.probe_enabled,
+            stats_enabled: data.stats_enabled,
+          },
+          runtimeLoadError: null,
+        });
+      } catch (error) {
+        if (token !== runtimeRequestSeq) {
+          return;
+        }
+        // 保留上次快照（不清 runtimeExtensions），仅置错误。
+        const message =
+          error instanceof Error ? error.message : "加载运行时扩展失败";
+        set({ runtimeLoadError: message });
+      } finally {
+        if (token === runtimeRequestSeq) {
+          set({ isRuntimeLoading: false });
+        }
+      }
+    },
+
+    loadRuntimeCatalog: async () => {
+      const token = ++runtimeRequestSeq;
+      try {
+        const data = await runtimeApi.getCatalog();
+        if (token !== runtimeRequestSeq) {
+          return;
+        }
+        set({ runtimeCatalog: data.items });
+      } catch (error) {
+        if (token !== runtimeRequestSeq) {
+          return;
+        }
+        reportError(error, "加载扩展目录失败");
+      }
+    },
+
+    // R2#5：递增模块级 token，使全部 in-flight load/poll 响应失效。
+    // 组件 unmount cleanup 调用；reset() 内也执行等价逻辑。
+    invalidateRuntimeRequests: () => {
+      runtimeRequestSeq += 1;
+    },
+
+    // B9 Task 23 — Admin 全局开关 façade（动作语义 R6#2/R7#3 冻结）。
+    // POST 成功返回 ExtensionItem → 按 `${kind}:${id}` 单条 replace（不整列表刷新）
+    // + `++runtimeRequestSeq`（invalidate bump-all：本次 mutation 使 in-flight poll 失效，
+    // 设计如此——共享 token 竞态守卫）。期间 runtimePendingIds 含该 key（同项并发禁用）。
+    // 错误只走既有 reportError 全局 toast（此 action 无 409/429 细分语义）。
+    setRuntimeExtensionEnabled: async (kind, id, enabled) => {
+      const key = runtimeKey(kind, id);
+      set((state) => ({
+        runtimePendingIds: state.runtimePendingIds.includes(key)
+          ? state.runtimePendingIds
+          : [...state.runtimePendingIds, key],
+      }));
+      try {
+        const updated = await runtimeApi.setExtensionEnabled(kind, id, enabled);
+        runtimeRequestSeq += 1;
+        set((state) => ({
+          runtimeExtensions: state.runtimeExtensions.map((item) =>
+            runtimeKey(item.kind, item.id) === key ? updated : item,
+          ),
+        }));
+      } catch (error) {
+        reportError(error, "更新全局开关失败");
+      } finally {
+        set((state) => ({
+          runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
+        }));
+      }
+    },
+
+    // B9 Task 23 — 用户级偏好开关（动作语义 R7#3/R8#4 冻结）。
+    // 调 userToolsApi.*（按 kind 三分支）成功后单条 patch config 三字段本地重算——
+    // 不复用 legacy setMCPToolEnabled 等 store action（它们走 loadAll()）。
+    // config_unreadable 条目禁止发起 patch（开头 guard return）。
+    // 错误只走既有 reportError 全局 toast（此 action 无 409/429 细分语义）。
+    setRuntimeUserEnabled: async (kind, id, enabled) => {
+      const key = runtimeKey(kind, id);
+      const target = get().runtimeExtensions.find(
+        (item) => runtimeKey(item.kind, item.id) === key,
+      );
+      // config_unreadable：本地状态不可信，禁止发起 patch（guard return）。
+      if (!target || target.config.reason_code === "config_unreadable") {
+        return;
+      }
+      set((state) => ({
+        runtimePendingIds: state.runtimePendingIds.includes(key)
+          ? state.runtimePendingIds
+          : [...state.runtimePendingIds, key],
+      }));
+      try {
+        if (kind === "mcp") {
+          await userToolsApi.setMCPToolEnabled(id, enabled);
+        } else if (kind === "a2a") {
+          await userToolsApi.setA2AToolEnabled(id, enabled);
+        } else {
+          await userToolsApi.setSkillToolEnabled(id, enabled);
+        }
+        // P2 修复：与 Admin 全局路径（setRuntimeExtensionEnabled :767）对称——
+        // 本次 user-level mutation 成功后 bump-all，使任何 in-flight poll 失效。
+        // 否则先发的旧 poll 晚到时仍持有效 token，用全量数组覆盖本地重算结果，
+        // 把用户刚翻的开关回退到下次 poll 才纠正。
+        runtimeRequestSeq += 1;
+        set((state) => ({
+          runtimeExtensions: state.runtimeExtensions.map((item) =>
+            runtimeKey(item.kind, item.id) === key
+              ? { ...item, config: recomputeUserConfig(item.config, enabled) }
+              : item,
+          ),
+        }));
+      } catch (error) {
+        reportError(error, "更新个人开关失败");
+      } finally {
+        set((state) => ({
+          runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
+        }));
+      }
+    },
+
+    // B9 Task 23 — 手动探测/重扫（错误分流 R2#7 冻结：409/429 在 action 内消化为
+    // 细粒度 per-item state，不打全局 toast；仅未识别错误走既有 reportError）。
+    // 发起时先清 runtimeItemNotices[key] + 加入 pending；成功单条 replace。
+    // 429 → runtimeProbeCooldowns[key] = Date.now() + retryAfter*1000（UI 倒计时禁用）；
+    // 409 probe_disabled → 面板级横幅（置 runtimeSnapshotMeta.probe_enabled=false）；
+    // 409 extension_disabled → runtimeItemNotices[key] = "扩展已禁用"（inline 提示）；
+    // 404 → 触发一次 loadRuntimeExtensions()（条目消失）。
+    probeRuntimeExtension: async (kind, id) => {
+      const key = runtimeKey(kind, id);
+      // 发起时先清该 item 的 inline notice + 加入 pending。
+      set((state) => {
+        const nextNotices = { ...state.runtimeItemNotices };
+        delete nextNotices[key];
+        return {
+          runtimeItemNotices: nextNotices,
+          runtimePendingIds: state.runtimePendingIds.includes(key)
+            ? state.runtimePendingIds
+            : [...state.runtimePendingIds, key],
+        };
+      });
+      try {
+        const updated = await runtimeApi.probeExtension(kind, id);
+        runtimeRequestSeq += 1;
+        set((state) => ({
+          runtimeExtensions: state.runtimeExtensions.map((item) =>
+            runtimeKey(item.kind, item.id) === key ? updated : item,
+          ),
+        }));
+      } catch (error) {
+        if (error instanceof ApiError) {
+          if (error.httpStatus === 429) {
+            const retryAfter =
+              typeof error.retryAfter === "number" ? error.retryAfter : 0;
+            const readyAt = Date.now() + retryAfter * 1000;
+            set((state) => ({
+              runtimeProbeCooldowns: {
+                ...state.runtimeProbeCooldowns,
+                [key]: readyAt,
+              },
+            }));
+            return;
+          }
+          if (error.httpStatus === 409) {
+            const reason = readErrorReason(error);
+            if (reason === "probe_disabled") {
+              // 面板级横幅：复用 Task 22 横幅 state（置 probe_enabled=false，全部 probe 按钮禁用）。
+              set((state) => ({
+                runtimeSnapshotMeta: state.runtimeSnapshotMeta
+                  ? { ...state.runtimeSnapshotMeta, probe_enabled: false }
+                  : { probe_enabled: false, stats_enabled: false },
+              }));
+              return;
+            }
+            if (reason === "extension_disabled") {
+              set((state) => ({
+                runtimeItemNotices: {
+                  ...state.runtimeItemNotices,
+                  [key]: "扩展已禁用",
+                },
+              }));
+              return;
+            }
+          }
+          if (error.httpStatus === 404) {
+            // 目标已删：刷新一次列表（条目消失）。
+            await get().loadRuntimeExtensions();
+            return;
+          }
+        }
+        // 未识别错误：走既有全局 toast 风格。
+        reportError(error, "探测失败");
+      } finally {
+        set((state) => ({
+          runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
+        }));
+      }
     },
   }))
 );

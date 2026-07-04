@@ -17,6 +17,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
 
 from app.domain.models.tool_result import AllowError, AllowSuccess, DecisionReason, ToolOutcome
+from app.domain.services.tools.extension_attribution import register_extension_tool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
@@ -297,4 +298,16 @@ def create_mcp_langchain_tools(
 
     for tool in tools:
         annotate_and_register_tool_source(tool, source="mcp", category="mcp")
+
+    # B9 归因注册（spec §5.1）：消费 tool_server_bindings()（Task 11），**不解析名字反推**。
+    # fail-open——归因失败仅告警，绝不影响工具创建。
+    try:
+        bindings = mcp_tool.tool_server_bindings()
+        for tool in tools:
+            server_name = bindings.get(tool.name)
+            if server_name:
+                register_extension_tool(tool.name, "mcp", server_name)
+    except Exception:
+        logger.warning("MCP 归因注册失败（fail-open）", exc_info=True)
+
     return tools

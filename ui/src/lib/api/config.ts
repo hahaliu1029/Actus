@@ -3,11 +3,15 @@ import type {
   AgentConfig,
   A2AServersData,
   CreateA2AServerParams,
+  ExtensionKind,
   FileUnderstandingConfig,
   InstallSkillParams,
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  RuntimeCatalogData,
+  RuntimeExtensionItem,
+  RuntimeExtensionsData,
   SkillDetailData,
   SkillListData,
   SkillRiskPolicy,
@@ -116,5 +120,34 @@ export const configApi = {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  },
+};
+
+// B9 runtime extensions console (P-11): 路径不带 /api 前缀（API_BASE_URL 已含，R6#8）；
+// get/post 必须显式传泛型（fetch.ts 默认 T=unknown，configApi 现树惯例同款——plan-R6#1 修）。
+export const runtimeApi = {
+  getExtensions: (): Promise<RuntimeExtensionsData> => {
+    return get<RuntimeExtensionsData>("/v1/runtime/extensions");
+  },
+
+  probeExtension: (kind: ExtensionKind, id: string): Promise<RuntimeExtensionItem> => {
+    return post<RuntimeExtensionItem>(
+      `/v1/runtime/extensions/${kind}/${encodeURIComponent(id)}/probe`
+    );
+  },
+
+  setExtensionEnabled: (
+    kind: ExtensionKind,
+    id: string,
+    enabled: boolean
+  ): Promise<RuntimeExtensionItem> => {
+    return post<RuntimeExtensionItem>(
+      `/v1/runtime/extensions/${kind}/${encodeURIComponent(id)}/enabled`,
+      { enabled }
+    );
+  },
+
+  getCatalog: (): Promise<RuntimeCatalogData> => {
+    return get<RuntimeCatalogData>("/v1/runtime/extensions/catalog");
   },
 };

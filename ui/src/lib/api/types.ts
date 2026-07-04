@@ -1104,3 +1104,100 @@ export interface CostTreeResponse {
   max_depth_applied: number;
   truncated: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// B9 runtime extensions console (P-11): wire types mirror backend §2 schema.
+// datetime 字段一律 string（后端 @field_serializer 输出 ISO8601 Z 结尾）。
+// ---------------------------------------------------------------------------
+
+export type ExtensionKind = "mcp" | "a2a" | "skill";
+
+export type RuntimeConfigStatus = {
+  enabled_global: boolean;
+  enabled_user: boolean | null;
+  effective_enabled: boolean;
+  reason_code: string;
+};
+
+export type RuntimeHealth = {
+  kind: "probe" | "integrity";
+  state: "reachable" | "unreachable" | "ok" | "error" | "unknown" | "skipped";
+  last_checked_at: string | null;
+  latency_ms?: number | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  relative_file?: string | null;
+  stale: boolean;
+  consecutive_failures?: number;
+  next_probe_at?: string | null;
+};
+
+export type RuntimeLiveness = {
+  state: "in_use" | "idle" | "unknown" | "not_applicable";
+  active_run_count: number;
+};
+
+export type RuntimeStats = {
+  available: boolean;
+  unavailable_reason:
+    | "disabled"
+    | "redis_unavailable"
+    | "unsupported"
+    | "admin_only"
+    | null;
+  call_count: number;
+  success_count: number;
+  failure_count: number;
+  last_active_at: string | null;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+};
+
+// R5#1/R6#2 修：details 本体不含 kind；RuntimeExtensionItem 本身就是以 kind 为判别键的
+// discriminated union（spec §2 R6#1 原文要求）——组件里 `if (item.kind === "mcp")` 即自动收窄
+// item.details 类型，无需额外 helper。
+export type RuntimeMcpDetails = { transport: string; tool_count?: number | null };
+export type RuntimeA2aDetails = { streaming?: boolean | null; base_url?: string | null };
+export type RuntimeSkillDetails = {
+  runtime_type: string;
+  source_type?: string;
+  bundle_file_count?: number | null;
+};
+
+type RuntimeExtensionItemBase = {
+  id: string;
+  name: string;
+  description: string | null;
+  config: RuntimeConfigStatus;
+  health: RuntimeHealth;
+  liveness: RuntimeLiveness;
+  stats: RuntimeStats;
+};
+
+export type RuntimeExtensionItem =
+  | (RuntimeExtensionItemBase & { kind: "mcp"; details: RuntimeMcpDetails })
+  | (RuntimeExtensionItemBase & { kind: "a2a"; details: RuntimeA2aDetails })
+  | (RuntimeExtensionItemBase & { kind: "skill"; details: RuntimeSkillDetails });
+// 注：非 Admin 投影下 details 只含各自必有键的子集（mcp={transport} 等）——三类型的
+// admin-only 字段均已声明 optional，与最小投影 shape 兼容（R8#1）。
+
+export type RuntimeExtensionsData = {
+  items: RuntimeExtensionItem[];
+  snapshot_at: string;
+  probe_enabled: boolean;
+  stats_enabled: boolean;
+};
+
+export type RuntimeCatalogItem = {
+  id: string;
+  name: string;
+  description: string;
+  transport: "stdio" | "sse" | "streamable_http";
+  config_template: Record<string, unknown>;
+  homepage: string;
+  tags: string[];
+  source: string;
+  reviewed_at: string;
+};
+
+export type RuntimeCatalogData = { items: RuntimeCatalogItem[] };

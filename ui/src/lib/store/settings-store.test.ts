@@ -23,6 +23,14 @@ vi.mock("@/lib/api/config", () => ({
     getFileUnderstandingConfig: vi.fn(),
     updateFileUnderstandingConfig: vi.fn(),
   },
+  // R2#6：settings-store.ts 新增 `runtimeApi` import；此文件对 @/lib/api/config
+  // 是全量 mock，必须补 runtimeApi stub，否则 import 后为 undefined 导致既有测试崩。
+  runtimeApi: {
+    getExtensions: vi.fn(),
+    probeExtension: vi.fn(),
+    setExtensionEnabled: vi.fn(),
+    getCatalog: vi.fn(),
+  },
 }));
 
 vi.mock("@/lib/api/user-tools", () => ({

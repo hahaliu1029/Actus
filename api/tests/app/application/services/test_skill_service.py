@@ -7,6 +7,7 @@ import pytest
 from app.application.errors.exceptions import NotFoundError, ValidationError
 from app.application.services.skill_service import SkillService
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
+from app.domain.models.skill_diagnostic import SkillDiagnostic
 
 pytestmark = pytest.mark.anyio
 
@@ -25,6 +26,9 @@ class _InMemorySkillRepository:
 
     async def list_enabled(self) -> list[Skill]:
         return [item for item in self._items.values() if item.enabled]
+
+    async def list_with_diagnostics(self) -> list[SkillDiagnostic]:
+        return [SkillDiagnostic(skill_key=s.id, ok=True, skill=s) for s in await self.list()]
 
     async def get_by_id(self, skill_id: str) -> Skill | None:
         return self._items.get(skill_id)

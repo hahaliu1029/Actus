@@ -13,7 +13,13 @@ from app.application.services.app_config_service import AppConfigService
 from app.application.services.cost_rollup_service import CostRollupService
 from app.application.services.file_service import FileService
 from app.application.services.memory_management_service import MemoryManagementService
+from app.application.services.runtime_extension_service import (
+    RuntimeExtensionService,
+)
 from app.application.services.session_service import SessionService
+from app.application.services.user_tool_enablement_service import (
+    UserToolEnablementService,
+)
 from app.application.services.skill_creator_service import SkillCreatorService
 from app.application.services.skill_export_service import SkillExportService
 from app.application.services.skill_service import SkillService
@@ -62,6 +68,9 @@ from app.infrastructure.repositories.db_memory_system_notification_repository im
 )
 from app.infrastructure.repositories.db_user_tool_approval_policy_repository import (
     DBUserToolApprovalPolicyRepository,
+)
+from app.infrastructure.repositories.db_user_tool_enablement_repository import (
+    DBUserToolEnablementRepository,
 )
 from app.infrastructure.repositories.file_skill_repository import FileSkillRepository
 from app.infrastructure.repositories.file_team_repository import FileTeamRepository
@@ -200,6 +209,49 @@ def _load_app_config() -> "AppConfig":
         _config_expiry = now + settings.config_cache_ttl
         _config_generation += 1
         return _config_cache
+
+
+def get_runtime_extension_service(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> RuntimeExtensionService:
+    """B9：聚合器无状态每请求新建；probe/stats 单例句柄从 app.state 读（PR-2/3 起非 None）。"""
+    return RuntimeExtensionService(
+        config_provider=_load_app_config,
+        # 无独立工厂——skill repo 按 get_skill_service 同款构造
+        # （service_dependencies.py `SkillService(FileSkillRepository(settings.skills_root_dir))`）；
+        # enablement 按 user_tools_v2_routes.py:31-33 同款
+        # （`UserToolEnablementService(DBUserToolEnablementRepository(db_session))`）。
+        skill_repository=FileSkillRepository(settings.skills_root_dir),
+        enablement_service=UserToolEnablementService(
+            DBUserToolEnablementRepository(db_session)
+        ),
+        probe_view=getattr(request.app.state, "extension_probe_service", None),
+        liveness_view=getattr(request.app.state, "runtime_liveness_registry", None),
+        stats_reader=getattr(request.app.state, "extension_stats", None),
+        # 有效能力 = 后台任务启动成功 AND 当前 flag on（flag 经 TTL config loader 动态读取，
+        # 支持运行中翻转——R5#3/R18#1/R1#3 统一口径）
+        probe_enabled_provider=lambda: (
+            bool(getattr(request.app.state, "extension_probe_started", False))
+            and _load_app_config().tool_runtime.extension_probe_enabled
+        ),
+        stats_enabled_provider=lambda: (
+            bool(getattr(request.app.state, "extension_stats_started", False))
+            and _load_app_config().tool_runtime.extension_stats_enabled
+        ),
+    )
+
+
+def get_extension_probe_service(request: Request):
+    """B9：手动探测端点（Task 15/16）用——直接返回 lifespan 起的单例句柄。
+
+    句柄由 ``main._start_b9_probe`` 挂到 ``app.state.extension_probe_service``（后台
+    task 无条件构造）；fail-open 启动失败时为 ``None``。有效能力（flag on 且循环启动
+    成功）由端点层二次复核 / ``probe_flag_provider`` 判定——本 getter 只做句柄穿透，
+    不在此合成能力（与 ``get_runtime_extension_service`` 的 probe_enabled_provider
+    口径分离：GET 走聚合器 stub，手动探测走真单例）。
+    """
+    return getattr(request.app.state, "extension_probe_service", None)
 
 
 # --- LLM cache (D2) ---
@@ -820,6 +872,10 @@ class ChildRunnerSharedDeps:
     execution_supervisor: object
     session_state_machine: object = None  # A4-1 §6: status-write authority for the child runner
     tool_runtime: object = None  # B1: root 的 ToolRuntimeConfig（child/root flag 一致性，spec R2#1）
+    # B9 Task 20 (R4#1): ExtensionStatsRecorder | None. Coordinator child /
+    # subagent extension calls count into the same stats as root (no root-only
+    # amputation). main.py's lazy resolver fills this from app.state.extension_stats.
+    extension_stats_recorder: object = None
 
 
 def _make_shared_child_runner_builder(
@@ -868,6 +924,8 @@ def _make_shared_child_runner_builder(
             coord_deps=None,  # child is NOT a nested coordinator
             session_state_machine=deps.session_state_machine,
             tool_runtime=deps.tool_runtime,
+            # B9 Task 20 (R4#1): child extension calls also feed stats.
+            extension_stats_recorder=deps.extension_stats_recorder,
         )
 
     return _build
@@ -1631,6 +1689,11 @@ def _build_agent_service(
     sandbox_lifecycle_service: object | None = None,
     supervisor_registry: "SupervisorRegistry | None" = None,
     coord_deps: object | None = None,
+    # B9 Task 20 (R9#2): lifespan-scoped extension stats recorder. Mirrors the
+    # ``flush_service: object | None`` style. main.py passes
+    # ``app.state.extension_stats`` (None when flag off). Threaded into
+    # AgentService → AgentTaskRunner → PlannerReActFlow → react_graph.
+    extension_stats_recorder: object | None = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
@@ -1789,6 +1852,8 @@ def _build_agent_service(
         # C2 coordinator-cancel — consumed only by stop_session.
         coordinator_parent_cancel_fanout=coordinator_parent_cancel_fanout,
         policy_snapshot_sink=get_policy_snapshot_sink(),  # C5a: Logging sink when flag ON, else Noop
+        # B9 Task 20: root-path stats recorder (None when flag off).
+        extension_stats_recorder=extension_stats_recorder,
     )
     agent_svc._supervisor = supervisor
     # C3 PR-4.5 — bind AgentService into the supervisor callback bridge

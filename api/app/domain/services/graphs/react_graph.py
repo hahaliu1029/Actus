@@ -1277,6 +1277,10 @@ def build_react_graph(
         confirmation_manager = configurable.get("confirmation_manager")
         _tracker = configurable.get("tool_failure_tracker")
         _metrics = configurable.get("execution_metrics")
+        # B9 Task 20: extension stats side-channel recorder. None (flag off /
+        # not injected) = zero behavior. Attribution resolves INSIDE the
+        # recorder (Task 18/19); this hook only forwards raw tool name.
+        _stats_recorder = configurable.get("extension_stats_recorder")
         _session_id = configurable.get("session_id") or ""
         _user_id = configurable.get("user_id") or ""
         _runtime_max_bytes = _tool_runtime_cfg.max_wrapper_output_bytes
@@ -1407,6 +1411,17 @@ def build_react_graph(
                     success=is_success,
                     latency_ms=(meta.ended_at - meta.started_at) * 1000,
                 )
+            # B9 Task 20: extension stats埋点（fire-and-forget, fail-open）。
+            # recorder=None（flag off / 未注入）→ 零调用。record() 内部做归因解析
+            # + 有界队列入队，绝不 await；任何异常吞掉，不影响工具执行。
+            if _stats_recorder is not None:
+                try:
+                    _stats_recorder.record(
+                        meta.tool_name_raw, is_success,
+                        (meta.ended_at - meta.started_at) * 1000,
+                    )
+                except Exception:
+                    logger.debug("extension stats 记录失败（fail-open）", exc_info=True)
 
         def _tc_meta(tc: dict, tc_args: dict, tool_source: ToolSource) -> TcMeta:
             return TcMeta(
@@ -2355,6 +2370,9 @@ def build_react_graph(
         confirmation_manager = configurable.get("confirmation_manager")
         _tracker = configurable.get("tool_failure_tracker")
         _metrics = configurable.get("execution_metrics")
+        # B9 Task 20: extension stats side-channel recorder (legacy path mirror
+        # of the PE binding above). None = flag off / not injected = zero call.
+        _stats_recorder = configurable.get("extension_stats_recorder")
 
         # [C2b §4.3] Child-scope guard — enforce the coordinator child's manifest
         # allowlist + path lease + revision freshness BEFORE any tool side effect.
@@ -2504,6 +2522,16 @@ def build_react_graph(
                     success=is_success,
                     latency_ms=(meta.ended_at - meta.started_at) * 1000,
                 )
+            # B9 Task 20: extension stats埋点（fire-and-forget, fail-open）——PE 路径
+            # _record_finalize 同形复制。recorder=None → 零调用。
+            if _stats_recorder is not None:
+                try:
+                    _stats_recorder.record(
+                        meta.tool_name_raw, is_success,
+                        (meta.ended_at - meta.started_at) * 1000,
+                    )
+                except Exception:
+                    logger.debug("extension stats 记录失败（fail-open）", exc_info=True)
 
         def _legacy_make_execute_thunk(
             tc: dict,

@@ -22,6 +22,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import Field, create_model
 
 from app.domain.models.tool_result import ToolOutcome
+from app.domain.services.tools.extension_attribution import register_extension_tool
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
@@ -138,5 +139,14 @@ def create_dynamic_skill_langchain_tools(
             "trust_origin": binding.get("trust_origin", "user_installed"),
             "scan_verdict": binding.get("scan_verdict", "safe"),
         }
+
+        # B9 归因注册（spec §5.1）：仅动态 skill 工具，消费 binding["skill"].id
+        # （**不解析名字反推**）。fail-open——归因失败仅告警，绝不影响工具创建。
+        skill_obj = binding.get("skill")
+        if skill_obj is not None:
+            try:
+                register_extension_tool(name, "skill", skill_obj.id)
+            except Exception:
+                logger.warning("Skill 归因注册失败（fail-open）", exc_info=True)
 
     return tools

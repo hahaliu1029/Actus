@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
+  Blocks,
   Bot,
   Brain,
   Cog,
@@ -19,6 +20,7 @@ import {
 } from "lucide-react";
 
 import { AdminUsersSetting } from "@/components/settings/admin-users-setting";
+import { ExtensionsOverview } from "@/components/settings/extensions-overview";
 import { MemoryManagement } from "@/components/settings/memory-management";
 import { SkillDetailDrawer } from "@/components/settings/skill-detail-drawer";
 import { Badge } from "@/components/ui/badge";
@@ -44,6 +46,7 @@ import { useUIStore } from "@/lib/store/ui-store";
 const TABS = [
   { key: "agent", title: "通用配置", icon: Cog },
   { key: "llm", title: "模型提供商", icon: Languages },
+  { key: "extensions", title: "扩展总览", icon: Blocks },
   { key: "a2a", title: "A2A Agent 配置", icon: LayoutGrid },
   { key: "mcp", title: "MCP 服务器", icon: Server },
   { key: "skill", title: "Skill 生态", icon: Puzzle },
@@ -277,6 +280,17 @@ export function ManusSettings() {
         text: "MCP JSON 格式不合法",
       });
     }
+  }
+
+  // B9 Task 24 (P-12)：catalog "填入配置" 回调——切到 MCP tab + 预填添加弹窗
+  // 的局部 state（mcpPayload）+ 打开既有 MCP 添加弹窗。payloadJson 已是完整包裹
+  // 形态（顶层 mcpServers 键），走既有 handleAddMCPServer 校验/提交路径。
+  // 不代填 secrets、不自动连接——仅预填文本待用户确认后保存。
+  function handlePrefillMcpConfig(payloadJson: string): void {
+    setActiveTab("mcp");
+    setMcpPayload(payloadJson);
+    setMcpDialogError(null);
+    setIsMCPDialogOpen(true);
   }
 
   async function handleAddA2AServer(): Promise<void> {
@@ -924,6 +938,14 @@ export function ManusSettings() {
                     </label>
                   </div>
                 </div>
+              ) : null}
+
+              {activeTab === "extensions" ? (
+                <ExtensionsOverview
+                  isAdmin={isAdmin}
+                  onSelectTab={setActiveTab}
+                  onPrefillMcpConfig={handlePrefillMcpConfig}
+                />
               ) : null}
 
               {activeTab === "a2a" ? (

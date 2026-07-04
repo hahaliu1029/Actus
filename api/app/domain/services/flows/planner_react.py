@@ -204,6 +204,10 @@ class PlannerReActFlow(BaseFlow):
         # every LangGraph invoke so LLM calls generate CostRecord rows.
         cost_callback_handler: Any = None,
         execution_supervisor: Any = None,
+        # B9 Task 20: extension stats recorder (ExtensionStatsRecorder | None).
+        # None = flag off / not injected → _build_config threads None into
+        # configurable → react_graph埋点 is a no-op (zero-behavior).
+        extension_stats_recorder: Any = None,
         permission_engine: "PermissionEngine | None" = None,
         session_state_machine: "SessionStateMachine | None" = None,
         policy_snapshot_sink: Any = None,  # C5a observe-only sink (Seam B carrier)
@@ -215,6 +219,7 @@ class PlannerReActFlow(BaseFlow):
     ) -> None:
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
+        self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
         self._permission_engine = permission_engine
         self._session_state_machine = session_state_machine
         self._policy_snapshot_sink = policy_snapshot_sink
@@ -1682,6 +1687,9 @@ class PlannerReActFlow(BaseFlow):
                 "execution_control": control,
                 "tool_failure_tracker": self._tool_failure_tracker,
                 "execution_metrics": self._execution_metrics,
+                # B9 Task 20: extension stats recorder side-channel. None = flag
+                # off → react_graph埋点 no-op. Never awaited on the hot path.
+                "extension_stats_recorder": self._extension_stats_recorder,
                 "policy_snapshot_sink": self._policy_snapshot_sink,  # C5a Seam B carrier
                 # B5 C5a: make the LLM adapter and AgentConfig available to
                 # executor_node so PromptAssembler consumers (C5b) can read

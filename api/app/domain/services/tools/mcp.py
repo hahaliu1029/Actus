@@ -107,6 +107,23 @@ class MCPClientManager:
         """只读属性，返回每个MCP服务器的连接错误信息"""
         return self._errors
 
+    def connected_server_ids(self) -> list[str]:
+        """B9 公开只读契约（spec §4 R2#4）：当前持有活跃 ClientSession 的 server 名单。"""
+        return list(self._clients.keys())
+
+    def tool_server_bindings(self) -> dict[str, str]:
+        """B9 归因数据源（spec §5.1 R2#1）：{完整工具名: server_name}。
+
+        数据源 = self._tools（server → List[Tool]）+ _mcp_tool_namespace 前缀规则（F6），
+        与 get_all_tools()/invoke() 的命名法完全一致。
+        """
+        bindings: dict[str, str] = {}
+        for server_name, tools in self._tools.items():
+            prefix = _mcp_tool_namespace(server_name)
+            for tool in tools:
+                bindings[f"{prefix}_{tool.name}"] = server_name
+        return bindings
+
     def _validate_no_tool_namespace_collisions(self) -> None:
         """Reject configs where two ENABLED MCP servers map to CONFLICTING tool-name
         namespaces — either equal (e.g. 'foo' and 'mcp_foo' both → 'mcp_foo') OR a
@@ -578,6 +595,14 @@ class MCPTool(BaseTool):
     def get_tools(self) -> List[Dict[str, Any]]:
         """同步获取工具包下的所有工具列表"""
         return self._tools
+
+    def connected_server_ids(self) -> list[str]:
+        """B9 P-7 转发（_manager None 时返回空列表）。"""
+        return self._manager.connected_server_ids() if self._manager else []
+
+    def tool_server_bindings(self) -> dict[str, str]:
+        """B9 P-7 转发（_manager None 时返回空 dict）。"""
+        return self._manager.tool_server_bindings() if self._manager else {}
 
     def has_tool(self, tool_name: str) -> bool:
         """传递工具名字判断工具是否存在"""

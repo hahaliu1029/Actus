@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
+from app.domain.models.skill_diagnostic import SkillDiagnostic
 from app.domain.repositories.skill_repository import SkillRepository
+
+logger = logging.getLogger(__name__)
 
 
 class FileSkillRepository(SkillRepository):
@@ -43,6 +47,17 @@ class FileSkillRepository(SkillRepository):
     async def delete(self, skill_id: str) -> bool:
         return await asyncio.to_thread(self._delete_sync, skill_id)
 
+    async def list_with_diagnostics(self) -> list[SkillDiagnostic]:
+        return await asyncio.to_thread(self._list_with_diagnostics_sync)
+
+    def _list_with_diagnostics_sync(self) -> list[SkillDiagnostic]:
+        self._ensure_root()
+        return [
+            self._diagnose_skill_sync(child)
+            for child in sorted(self._root_dir.iterdir())
+            if child.is_dir()
+        ]
+
     def get_skill_dir(self, skill_id: str) -> Path:
         """Public accessor for the skill's filesystem directory."""
         return self._skill_dir(skill_id)
@@ -59,7 +74,12 @@ class FileSkillRepository(SkillRepository):
         for child in sorted(self._root_dir.iterdir()):
             if not child.is_dir():
                 continue
-            skill = self._read_skill_sync(child)
+            try:
+                skill = self._read_skill_sync(child)
+            except Exception:
+                # B9 PR-0（spec §8）：单 skill 损坏不塌整列表；诊断走 list_with_diagnostics
+                logger.warning("跳过损坏的 skill 目录: %s", child.name, exc_info=True)
+                continue
             if not skill:
                 continue
             if enabled_only and not skill.enabled:
@@ -108,6 +128,42 @@ class FileSkillRepository(SkillRepository):
             scan_report=meta.get("scan_report"),
             force_approved_hash=meta.get("force_approved_hash"),
         )
+
+    def _diagnose_skill_sync(self, skill_dir: Path) -> SkillDiagnostic:
+        key = skill_dir.name
+        meta_path = skill_dir / "meta.json"
+        manifest_path = skill_dir / "manifest.json"
+        if not meta_path.exists():
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="missing_meta", relative_file="meta.json")
+        if not manifest_path.exists():
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="missing_manifest", relative_file="manifest.json")
+        # 区分 meta / manifest 哪个解析失败：逐个 json.loads + 顶层 shape 校验。
+        # 顶层必须是 dict：非 dict（如 `[]`）虽是合法 JSON，但会让 _read_skill_sync
+        # 里 `manifest.get(...)` / 把非 dict 传给 Skill 崩溃——归因必须指向坏文件本身。
+        try:
+            meta_parsed = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="parse_error", relative_file="meta.json")
+        if not isinstance(meta_parsed, dict):
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="parse_error", relative_file="meta.json")
+        try:
+            manifest_parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="parse_error", relative_file="manifest.json")
+        if not isinstance(manifest_parsed, dict):
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="parse_error", relative_file="manifest.json")
+        try:
+            skill = self._read_skill_sync(skill_dir)
+        except Exception:
+            # 归因近似：两文件 shape-check 为 dict 后，Skill 构造失败（非法枚举/缺必填键）
+            # 源自 meta 字段——manifest 作为不透明 dict 原样透传。注意 _read_skill_sync
+            # 还会读 SKILL.md（bundle_index.json 异常在其内部被吞），SKILL.md 的 IO 失败
+            # 也走此 fallback；归 meta.json 是对罕见路径的保守近似（P-1 relative_file
+            # 词表只有两个文件名）。
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="parse_error", relative_file="meta.json")
+        if skill is None:
+            return SkillDiagnostic(skill_key=key, ok=False, error_code="missing_meta", relative_file="meta.json")
+        return SkillDiagnostic(skill_key=key, ok=True, skill=skill)
 
     def _upsert_sync(self, skill: Skill) -> None:
         self._ensure_root()

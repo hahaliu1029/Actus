@@ -501,6 +501,23 @@ class ToolRuntimeConfig(BaseModel):
             "(INV-B10-0)."
         ),
     )
+    extension_probe_enabled: bool = Field(
+        default=False,
+        description=(
+            "B9: 扩展健康探测——后台低频全握手探测循环 + Admin 手动 probe 端点。"
+            "OFF（默认）= GET /v1/runtime/extensions 仅返回配置清单，health 恒 unknown/skipped，"
+            "probe 端点 409。flip 判据：观察一周探测日志无 anyio cancel scope 报错。"
+            "设计：docs/superpowers/specs/2026-07-04-b9-runtime-console-design.md §3/§9"
+        ),
+    )
+    extension_stats_enabled: bool = Field(
+        default=False,
+        description=(
+            "B9: per-extension 调用统计——react_graph 热路径 fire-and-forget 记录 + Redis flusher。"
+            "OFF（默认）= 零记录，stats.available=false。flip 判据：Redis 写入量与队列丢弃率可接受。"
+            "设计：docs/superpowers/specs/2026-07-04-b9-runtime-console-design.md §5/§9"
+        ),
+    )
 
 
 class AppConfig(BaseModel):
