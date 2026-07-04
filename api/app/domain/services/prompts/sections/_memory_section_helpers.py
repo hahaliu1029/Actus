@@ -1,8 +1,9 @@
 """M2-PR3: shared rendering helpers for the three memory prompt sections.
 
 Underscore-prefixed module: these helpers are implementation details
-of ``memory_rules`` / ``memory_user_profile`` / ``memory_fact_index``
-and are not intended to be imported outside that trio (or their tests).
+of the memory prompt sections (M2 snapshot trio + B8 recalled_memory)
+and their provider-side callers, and are not intended to be imported
+outside the memory prompt surface (or its tests).
 Kept separate from ``memory_snapshot`` because the snapshot is a data
 concern (async fetch, sort order) while these are rendering concerns
 (token estimation, bullet assembly, language dispatch).

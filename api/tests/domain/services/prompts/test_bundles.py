@@ -127,26 +127,35 @@ def test_executor_registries_declare_canonical_sections_in_order() -> None:
         )
 
 
-def test_planner_and_updater_registries_populated_in_c6() -> None:
-    """WS0: planner/updater registries now carry the flag-gated
-    parallel_work_units_teaching section at index 1 (after planner_identity)."""
+def test_planner_registries_declare_canonical_sections_in_order() -> None:
+    """B8: planner registry 追加 recalled_memory（末位——预算压力下先丢，
+    声明序即组装序）。"""
     expected_ids = [
         "planner_identity",
         "parallel_work_units_teaching",
-        "agent_team_teaching",          # [S4] new — inserted after the S2 teaching section
+        "agent_team_teaching",
+        "planner_tool_summary_legacy",
+        "conversation_summaries",
+        "recalled_memory",              # [B8] planner-only query-time recall
+    ]
+    for registry in (ZH_PLANNER_REGISTRY, EN_PLANNER_REGISTRY):
+        ids = [s.id for s in registry.sections]
+        assert ids == expected_ids, f"{registry.name}: expected {expected_ids}, got {ids}"
+
+
+def test_updater_registries_unchanged_by_b8() -> None:
+    """B8 守卫：updater registry 保持原 5 section——recalled_memory 是
+    planner-only（spec N3）；updater 出现该 section 即回归。"""
+    expected_ids = [
+        "planner_identity",
+        "parallel_work_units_teaching",
+        "agent_team_teaching",
         "planner_tool_summary_legacy",
         "conversation_summaries",
     ]
-    for registry in (
-        ZH_PLANNER_REGISTRY,
-        ZH_UPDATER_REGISTRY,
-        EN_PLANNER_REGISTRY,
-        EN_UPDATER_REGISTRY,
-    ):
+    for registry in (ZH_UPDATER_REGISTRY, EN_UPDATER_REGISTRY):
         ids = [s.id for s in registry.sections]
-        assert ids == expected_ids, (
-            f"{registry.name}: expected {expected_ids}, got {ids}"
-        )
+        assert ids == expected_ids, f"{registry.name}: expected {expected_ids}, got {ids}"
 
 
 # ---- get_prompt_section_bundle dispatch -------------------------------- #

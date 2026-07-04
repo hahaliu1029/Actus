@@ -156,6 +156,32 @@ def apply_mmr(
     return selected
 
 
+def rank_memory_results_with_scores(
+    chunks: list[MemoryChunk],
+    query_embedding: list[float],
+    half_life_days: int,
+    mmr_lambda: float,
+    top_k: int,
+    now: datetime | None = None,
+) -> list[tuple[MemoryChunk, float]]:
+    """B8: composite pipeline 的保分变体（单一实现双出口）。
+
+    与 ``rank_memory_results`` 完全同管线（relevance → temporal decay →
+    MMR → top_k）；附带的 score = **decayed relevance**（relevance ×
+    time decay）。MMR 只决定选择与顺序，不改报告的分值。id→score 回填
+    安全：``chunk.id`` 是 UUID 主键，无碰撞。
+    """
+    if not chunks:
+        return []
+    scored = compute_relevance(chunks, query_embedding)
+    if not scored:
+        return []
+    decayed = apply_temporal_decay(scored, half_life_days, now=now)
+    selected = apply_mmr(decayed, mmr_lambda, top_k)
+    score_by_id = {chunk.id: score for chunk, score in decayed}
+    return [(chunk, score_by_id[chunk.id]) for chunk in selected]
+
+
 def rank_memory_results(
     chunks: list[MemoryChunk],
     query_embedding: list[float],
@@ -166,15 +192,12 @@ def rank_memory_results(
 ) -> list[MemoryChunk]:
     """Composite entry point: relevance → temporal decay → MMR → top_k.
 
-    Pipeline:
-    1. compute_relevance: cosine similarity to query
-    2. apply_temporal_decay: multiply by time decay factor
-    3. apply_mmr: diversity reranking, return top_k
+    B8 起是 ``rank_memory_results_with_scores`` 的 thin wrapper（单一
+    实现两个出口，行为字节等价——parity 测试锁定；spec R1#1+R3）。
     """
-    if not chunks:
-        return []
-    scored = compute_relevance(chunks, query_embedding)
-    if not scored:
-        return []
-    decayed = apply_temporal_decay(scored, half_life_days, now=now)
-    return apply_mmr(decayed, mmr_lambda, top_k)
+    return [
+        chunk
+        for chunk, _ in rank_memory_results_with_scores(
+            chunks, query_embedding, half_life_days, mmr_lambda, top_k, now=now,
+        )
+    ]

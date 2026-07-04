@@ -257,3 +257,80 @@ class TestRankMemoryResults:
         result = rank_memory_results([chunk], [1.0, 0.0], 30, 0.7, 5)
         assert len(result) == 1
         assert result[0].id == chunk.id
+
+
+# ---- B8: rank_memory_results_with_scores（保分变体 + thin wrapper parity） ---- #
+# 注意：rank_memory_results 必须在此显式 import——目标文件顶部没有它的
+# 全局 import（既有用例都是方法内局部 import，:213/:248/:254）
+
+from app.domain.services.memory_ranker import (
+    rank_memory_results,
+    rank_memory_results_with_scores,
+)
+
+
+def _b8_chunk(cid: str, embedding, days_old: int = 0, content: str = "c"):
+    from datetime import datetime, timedelta, timezone
+
+    from app.domain.models.memory_chunk import MemoryChunk
+
+    now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    return MemoryChunk(
+        id=cid,
+        user_id="u1",
+        content=content,
+        content_hash=f"h-{cid}",
+        source="manual",
+        metadata={},
+        created_at=now - timedelta(days=days_old),
+        updated_at=now,
+        embedding=embedding,
+    )
+
+
+class TestRankWithScores:
+    _NOW = __import__("datetime").datetime(2026, 7, 1, tzinfo=__import__("datetime").timezone.utc)
+
+    def test_score_is_decayed_relevance(self):
+        # 同向向量 → relevance=1.0；30 天前 + half_life=30 → decay=0.5
+        chunk = _b8_chunk("c1", (1.0, 0.0), days_old=30)
+        result = rank_memory_results_with_scores(
+            [chunk], [1.0, 0.0], half_life_days=30, mmr_lambda=0.7, top_k=5, now=self._NOW,
+        )
+        assert len(result) == 1
+        got_chunk, score = result[0]
+        assert got_chunk.id == "c1"
+        assert score == pytest.approx(0.5, abs=1e-9)
+
+    def test_mmr_does_not_alter_scores(self):
+        # 两条不同相似度：MMR 可能重排，但每条的 score 必须仍等于其 decayed 分
+        chunks = [
+            _b8_chunk("c1", (1.0, 0.0), days_old=0),
+            _b8_chunk("c2", (0.6, 0.8), days_old=0),
+        ]
+        result = rank_memory_results_with_scores(
+            chunks, [1.0, 0.0], half_life_days=30, mmr_lambda=0.5, top_k=2, now=self._NOW,
+        )
+        by_id = {c.id: s for c, s in result}
+        assert by_id["c1"] == pytest.approx(1.0, abs=1e-9)
+        assert by_id["c2"] == pytest.approx(0.6, abs=1e-9)
+
+    def test_wrapper_parity_with_scores_variant(self):
+        chunks = [
+            _b8_chunk("c1", (1.0, 0.0), days_old=10),
+            _b8_chunk("c2", (0.6, 0.8), days_old=3),
+            _b8_chunk("c3", (0.0, 1.0), days_old=0),
+            _b8_chunk("c-none", None, days_old=0),
+        ]
+        kwargs = dict(
+            query_embedding=[1.0, 0.0], half_life_days=30,
+            mmr_lambda=0.7, top_k=2, now=self._NOW,
+        )
+        with_scores = rank_memory_results_with_scores(chunks, **kwargs)
+        legacy = rank_memory_results(chunks, **kwargs)
+        assert [c.id for c, _ in with_scores] == [c.id for c in legacy]
+
+    def test_empty_and_all_none_embeddings(self):
+        assert rank_memory_results_with_scores([], [1.0], half_life_days=30, mmr_lambda=0.7, top_k=5) == []
+        only_none = [_b8_chunk("c1", None)]
+        assert rank_memory_results_with_scores(only_none, [1.0, 0.0], half_life_days=30, mmr_lambda=0.7, top_k=5) == []

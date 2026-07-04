@@ -47,6 +47,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CANDIDATE_MULTIPLIER = 3
+"""SQL 候选数放大倍数（top_k × 3 进 ranker 再收敛）。B8 起为模块级公共
+常量：memory_search 工具与 recall provider 双消费（单源，spec R2#3）。"""
+
 _MEMORY_CATEGORY = Literal["user", "rule", "fact"]
 
 
@@ -108,7 +112,6 @@ def create_memory_tools(
     ``session_id`` + ``memory_write_service`` + ``session_redis``. Partial
     wiring (e.g. planner context without a session) keeps the 2-tool shape.
     """
-    CANDIDATE_MULTIPLIER = 3
 
     @lc_tool(args_schema=MemorySearchInput, response_format="content_and_artifact")
     async def memory_search(query: str, max_results: int = 5) -> tuple[str, ToolOutcome]:

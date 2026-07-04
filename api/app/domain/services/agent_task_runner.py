@@ -691,6 +691,19 @@ class AgentTaskRunner(TaskRunner):
         self._summary_llm_for_telemetry = summary_llm
         self._attach_telemetry_to_llms(self._current_language)
 
+        # B8: session 级召回缓存组装（spec R4#3——composition root 在此，
+        # 镜像 :791 的局部 infrastructure import 先例；domain flow 只见
+        # RecallCache Protocol）。redis 缺失 → None = 不缓存每次直检。
+        recall_cache = None
+        if self._memory_session_redis is not None:
+            from app.infrastructure.external.memory.redis_recall_cache import (
+                RedisRecallCache,
+            )
+            recall_cache = RedisRecallCache(
+                self._memory_session_redis,
+                ttl=agent_config.memory.recall_cache_ttl_seconds,
+            )
+
         self._flow = PlannerReActFlow(
             uow_factory=uow_factory,
             llm=llm,
@@ -718,6 +731,7 @@ class AgentTaskRunner(TaskRunner):
             memory_write_service=self._memory_write_service,
             memory_session_redis=self._memory_session_redis,
             memory_session_save_cap=self._memory_session_save_cap,
+            recall_cache=recall_cache,
             memory_gate_llm=self._memory_gate_llm,
             memory_gate_breaker=self._memory_gate_breaker,
             memory_gate_daily_cap=self._memory_gate_daily_cap,

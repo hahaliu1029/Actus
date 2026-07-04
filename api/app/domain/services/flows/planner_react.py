@@ -5,7 +5,10 @@ so that AgentTaskRunner requires minimal changes.
 """
 
 import asyncio
+import json
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import (
     TYPE_CHECKING,
@@ -18,7 +21,9 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from app.domain.external.recall_cache import RecallCache
     from app.domain.models.app_config import ToolRuntimeConfig
+    from app.domain.models.memory_recall import RecalledMemory, RecallQueryMaterial
     from app.domain.services.permission.engine import PermissionEngine
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.prompts.memory_snapshot import MemorySnapshot
@@ -34,6 +39,7 @@ from app.application.services.coordinator_runtime_deps import (
     _NullCoordinatorRuntimeDeps,
 )
 from app.domain.external.browser import Browser
+from app.domain.external.embedding_provider import EmbeddingUnavailableError
 from app.domain.external.sandbox import SandboxHandle
 from app.domain.external.search import SearchEngine
 from app.domain.models.app_config import AgentConfig
@@ -89,6 +95,27 @@ from .skill_creation_graph import SkillCreationGraph
 from .skill_graph_canary import is_skill_graph_enabled
 
 logger = logging.getLogger(__name__)
+
+_RECALL_TELEMETRY_LOGGER = logging.getLogger("actus.memory_recall")
+
+
+def _emit_recall_telemetry(payload: dict) -> None:
+    """B8 telemetry 通道 1：专用 logger 一行 JSON（spec §5.8）。
+
+    级别 = INFO（生产默认 root level 是 INFO——DEBUG 事件在默认部署下
+    会静默丢失，shadow 期观察数据就没了；事件量 = 每用户消息一条）。
+    结构化 payload 同时挂 ``extra["recall_event"]``，PR-4 的 OTel metrics
+    handler 直接读字段、不重新解析 JSON。自身任何异常吞掉——telemetry
+    永不影响召回结果。不记录 raw query / raw memory content（PII 放大面）。
+    """
+    try:
+        _RECALL_TELEMETRY_LOGGER.info(
+            "%s",
+            json.dumps(payload, ensure_ascii=False, default=str),
+            extra={"recall_event": payload},
+        )
+    except Exception:
+        logger.debug("recall telemetry emit failed (swallowed)", exc_info=True)
 
 
 def _apply_plan_update(existing: Plan, response: PlanResponse) -> Plan:
@@ -155,6 +182,7 @@ class PlannerReActFlow(BaseFlow):
         memory_write_service=None,  # PR-3: memory_save routes writes here
         memory_session_redis=None,  # PR-3: per-session save counter
         memory_session_save_cap: int = 20,  # PR-3
+        recall_cache: "RecallCache | None" = None,  # B8: session 级召回缓存（runner 组装注入；None=不缓存每次直检）
         approval_state_reader: Any = None,  # R5b-2: ApprovalStateReader | None（读路径 single source）
         confirmation_manager: Any = None,  # ConfirmationManager | None
         prompt_assembler: "PromptAssembler | None" = None,  # B5 C5b
@@ -308,6 +336,10 @@ class PlannerReActFlow(BaseFlow):
         self._memory_write_service = memory_write_service
         self._memory_session_redis = memory_session_redis
         self._memory_session_save_cap = memory_session_save_cap
+        self._recall_cache = recall_cache
+        # B8: _ensure_graphs 时由 _build_memory_recall_provider 填充；
+        # detection 入口经此属性复用同一 provider。
+        self._memory_recall_provider = None
         self._has_memory_tools = False  # set by _collect_all_tools
 
         # M1 PR-4+8 gate state — all None when gate disabled, in which
@@ -615,6 +647,12 @@ class PlannerReActFlow(BaseFlow):
             tool_runtime_config=self._tool_runtime,
         )
         memory_snapshot_provider = self._build_memory_snapshot_provider()
+        # B8: recall provider 存实例属性——graph 入口经 build_main_graph
+        # kwarg 消费，detection 入口（_run_planner_for_detection）直接读
+        # self._memory_recall_provider（时序安全：_ensure_graphs 在
+        # detection 之前执行，invoke() :1577 → :1656）。
+        memory_recall_provider = self._build_memory_recall_provider()
+        self._memory_recall_provider = memory_recall_provider
 
         # B5 PR-S2-2: hand the OTel-backed traced_node decorator to the
         # graph builder so each registered LangGraph node emits a
@@ -634,6 +672,7 @@ class PlannerReActFlow(BaseFlow):
             prompt_assembler=self._prompt_assembler,
             supports_vision=self._supports_vision,
             memory_snapshot_provider=memory_snapshot_provider,
+            memory_recall_provider=memory_recall_provider,
             node_decorator=build_traced_node_decorator(),
             _allow_default_prompt_assembler=self._allow_default_prompt_assembler,
         )
@@ -681,6 +720,196 @@ class PlannerReActFlow(BaseFlow):
                     user_id, exc,
                 )
                 return None
+
+        return _provider
+
+    def _build_memory_recall_provider(
+        self,
+    ) -> "Callable[[RecallQueryMaterial], Awaitable[RecalledMemory | None]] | None":
+        """B8: 每调用一次执行一次 query-time 召回的 async 闭包（spec §5.5）。
+
+        镜像 ``_build_memory_snapshot_provider`` 的 DI 风格。返回 ``None``
+        当 recall 关闭或硬依赖缺失——``build_main_graph`` / detection 把
+        None 视为「无召回」，prompt byte-identical（INV-B8-OFF）。
+
+        失败合同（spec §6）：任何路径不得向 planner 抛错或阻塞超过
+        timeout；唯一例外 = ``asyncio.CancelledError``（BaseException）
+        自然透传，保持用户取消语义。telemetry 在 wait_for 之外发出
+        （不被 timeout 剪掉）；透传路径不发 telemetry。
+        """
+        cfg = self._memory_config
+        mode = getattr(cfg, "recall_mode", "off") if cfg is not None else "off"
+        # fail-closed：非法/脏配置值（如测试里的 MagicMock）一律视为 off
+        if mode not in ("shadow", "on"):
+            return None
+        if not (
+            self._user_id
+            and self._memory_session_factory
+            and self._memory_repo_factory
+            and self._memory_embedding_provider
+        ):
+            return None
+
+        from dataclasses import replace as _dc_replace
+
+        from app.domain.models.memory_recall import (
+            RecallCachePayload,
+            RecalledMemory,
+            RecalledMemoryItem,
+            RecallQueryMaterial,
+        )
+        from app.domain.services.memory_recall import (
+            RECALL_ITEM_RENDER_CAP,
+            build_params_version,
+            build_recall_query,
+            clean_session_title,
+            compute_query_hash,
+            normalize_recall_query,
+        )
+        from app.domain.services.memory_ranker import rank_memory_results_with_scores
+        from app.domain.services.prompts.sections._memory_section_helpers import (
+            sanitize_bullet_content,
+        )
+        from app.domain.services.tools.memory_tools import CANDIDATE_MULTIPLIER
+
+        embedding_provider = self._memory_embedding_provider
+        session_factory = self._memory_session_factory
+        repo_factory = self._memory_repo_factory
+        uow_factory = self._uow_factory
+        cache = self._recall_cache
+        user_id = self._user_id
+        session_id = self._session_id
+        params_version = build_params_version(cfg)
+
+        async def _recall_impl(
+            material: RecallQueryMaterial, meta: dict,
+        ) -> RecalledMemory:
+            # 1. session title best-effort（显式走 _uow_factory——不混用
+            #    _memory_session_factory，那是 SQLAlchemy factory，spec R1#5）
+            title: str | None = None
+            try:
+                async with uow_factory() as uow:
+                    session = await uow.session.get_by_id(session_id)
+                    title = getattr(session, "title", None) if session else None
+            except Exception:
+                title = None
+            material = _dc_replace(material, session_title=clean_session_title(title))
+
+            # 2. query → normalize → hash（config 是 max_chars 权威，R10#2）
+            query = build_recall_query(material, max_chars=cfg.recall_query_max_chars)
+            normalized = normalize_recall_query(query)
+            query_hash = compute_query_hash(normalized, params_version=params_version)
+            meta["query_hash"] = query_hash
+
+            # 3. cache get（第二层防御：impl 已 fail-soft，这里再兜 rogue impl）
+            if cache is not None:
+                payload = None
+                try:
+                    payload = await cache.get(session_id, query_hash)
+                except Exception:
+                    payload = None
+                if payload is not None:
+                    meta["cache_hit"] = True
+                    meta["candidate_count"] = payload.candidate_count
+                    return RecalledMemory(
+                        items=payload.items, query_hash=query_hash,
+                        cache_hit=True, recall_id=meta["recall_id"],
+                    )
+
+            # 4. 检索：embed → search_by_vector → rank（全现成管线）
+            vectors = await embedding_provider.embed([normalized])
+            embedding = vectors[0]
+            async with session_factory() as db_session:
+                repo = repo_factory(db_session)
+                chunks = await repo.search_by_vector(
+                    user_id=user_id,
+                    embedding=embedding,
+                    top_k=cfg.recall_top_k * CANDIDATE_MULTIPLIER,
+                    threshold=cfg.recall_threshold,
+                )
+            meta["candidate_count"] = len(chunks)
+            ranked = rank_memory_results_with_scores(
+                chunks,
+                query_embedding=embedding,
+                half_life_days=cfg.half_life_days,
+                mmr_lambda=cfg.mmr_lambda,
+                top_k=cfg.recall_top_k,
+            )
+            items = tuple(
+                RecalledMemoryItem(
+                    chunk_id=chunk.id,
+                    category=chunk.category,
+                    # 先折行再截断——render cap 计入 params_version，cap 变更自动失效缓存
+                    content=sanitize_bullet_content(chunk.content)[:RECALL_ITEM_RENDER_CAP],
+                    created_at=chunk.created_at,
+                    score=score,
+                )
+                for chunk, score in ranked
+            )
+
+            # 5. 写缓存（空结果也写——「不重复检索」对零命中同样成立，R6 P3-3；
+            #    shadow 与 on 写同一 cache，mode 只决定是否注入）
+            if cache is not None:
+                try:
+                    await cache.set(
+                        session_id, query_hash,
+                        RecallCachePayload(items=items, candidate_count=len(chunks)),
+                    )
+                except Exception:
+                    pass
+            return RecalledMemory(
+                items=items, query_hash=query_hash,
+                cache_hit=False, recall_id=meta["recall_id"],
+            )
+
+        async def _provider(material: RecallQueryMaterial) -> "RecalledMemory | None":
+            recall_id = uuid.uuid4().hex
+            meta: dict = {
+                "recall_id": recall_id, "query_hash": None,
+                "cache_hit": False, "candidate_count": None,
+            }
+            started = time.monotonic()
+            recalled: RecalledMemory | None = None
+            try:
+                recalled = await asyncio.wait_for(
+                    _recall_impl(material, meta),
+                    timeout=cfg.recall_timeout_seconds,
+                )
+                result = "items" if recalled.items else "empty"
+            except TimeoutError:
+                result = "timeout"
+            except EmbeddingUnavailableError:
+                result = "embed_unavailable"
+            except Exception:
+                logger.warning(
+                    "memory recall failed (fail-open, session=%s)",
+                    session_id, exc_info=True,
+                )
+                result = "error"
+            # CancelledError 是 BaseException——不进上面任何分支，自然透传，
+            # 也不发 telemetry（取消语义优先）。
+            _emit_recall_telemetry({
+                "recall_id": recall_id,
+                "session_id": session_id,
+                "entry": material.entry,
+                "query_hash": meta["query_hash"],
+                "mode": mode,
+                "result": result,
+                "cache_hit": meta["cache_hit"],
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "top_k": cfg.recall_top_k,
+                "threshold": cfg.recall_threshold,
+                "candidate_count": meta["candidate_count"],
+                "item_count": len(recalled.items) if recalled else 0,
+                "chunk_ids": [i.chunk_id for i in recalled.items] if recalled else [],
+                "categories": [i.category for i in recalled.items] if recalled else [],
+                "score_values": [i.score for i in recalled.items] if recalled else [],
+            })
+            if recalled is None:
+                return None
+            if mode == "shadow":
+                return None
+            return recalled
 
         return _provider
 
@@ -1202,9 +1431,36 @@ class PlannerReActFlow(BaseFlow):
             )
             team_members = None
 
+        # B8 (mirror of planner_node wiring — same provider instance,
+        # explicit entry). Detection runs on every new task when skill
+        # tools are available, not only turn 1: original_request mirrors
+        # what invoke() writes into the EXECUTING graph input
+        # (plan.goal, :1709). Provider failure degrades to no recall —
+        # never blocks detection.
+        recalled_memory = None
+        _recall_provider = getattr(self, "_memory_recall_provider", None)
+        if _recall_provider is not None:
+            try:
+                from app.domain.models.memory_recall import RecallQueryMaterial
+
+                _recall_material = RecallQueryMaterial(
+                    message=message.message,
+                    original_request=self.plan.goal if self.plan else None,
+                    session_title=None,   # provider 内 best-effort 预取
+                    entry="detection",    # R9#5：显式传值
+                )
+                recalled_memory = await _recall_provider(_recall_material)
+            except Exception:
+                logger.warning(
+                    "_run_planner_for_detection: recall failed; omitting",
+                    exc_info=True,
+                )
+                recalled_memory = None
+
         ctx = build_render_context(
             detection_state, detection_config, self._agent_config,
             team_members=team_members,
+            recalled_memory=recalled_memory,
         )
         result = self._prompt_assembler.assemble(
             section_bundle.planner,

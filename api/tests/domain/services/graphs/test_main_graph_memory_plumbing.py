@@ -726,6 +726,13 @@ class TestColdStartEmitsMemorySections:
         the provider not called from planner_node, but even if someone
         later wires it up, the sections still won't render because
         they're absent from the registry.
+
+        Guard object = the M2 snapshot trio (## User Profile / ## Project
+        Rules / ## Fact Index): those three sections stay executor-only.
+        B8 adds a DIFFERENT planner-only memory section (recalled_memory,
+        fenced block) — its header is deliberately NOT asserted here; the
+        B8 guards live in test_main_graph_recall_plumbing.py and
+        test_recalled_memory_flag_off_gate.py.
         """
         snapshot = _full_category_snapshot()
 

@@ -27,6 +27,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
 
 from app.domain.models.app_config import AgentConfig
+from app.domain.models.memory_recall import RecallQueryMaterial
 from app.domain.models.path_validation import CoordinatorPathContractError
 
 from app.application.errors.exceptions import ServerRequestsError
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     from .context_assembler import ContextAssembler
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.prompts.memory_snapshot import MemorySnapshot
+    from app.domain.models.memory_recall import RecalledMemory
 
 logger = logging.getLogger(__name__)
 
@@ -600,6 +602,7 @@ def build_main_graph(
     prompt_assembler: "PromptAssembler | None" = None,
     supports_vision: bool = True,
     memory_snapshot_provider: "Callable[[], Awaitable[MemorySnapshot | None]] | None" = None,
+    memory_recall_provider: "Callable[[RecallQueryMaterial], Awaitable[RecalledMemory | None]] | None" = None,
     node_decorator: "Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]] | None" = None,
     _allow_default_prompt_assembler: bool = False,
 ) -> CompiledStateGraph:
@@ -640,6 +643,15 @@ def build_main_graph(
 
         None means memory sections stay inert (tests, flows without
         memory wiring).
+    memory_recall_provider : B8 optional async callable performing one
+        query-time memory recall per call (built by
+        ``PlannerReActFlow._build_memory_recall_provider``; None when
+        ``recall_mode="off"`` or deps missing). **Invoked ONLY from
+        ``planner_node``** — the recalled_memory section lives exclusively
+        in the planner registry (spec N3); executor/updater renders keep
+        ``ctx.recalled_memory=None``. Orthogonal to
+        ``memory_snapshot_provider`` (M2, executor-only): separate
+        provider, separate section, shared repo only.
     _allow_default_prompt_assembler : Test-only escape hatch (leading
         underscore to mark internal). When True AND ``prompt_assembler``
         is None, this constructor builds a minimal-budget default
@@ -707,6 +719,33 @@ def build_main_graph(
             )
             return None
 
+    async def _resolve_memory_recall(state: MainGraphState) -> "RecalledMemory | None":
+        """B8: invoke ``memory_recall_provider`` defensively (second net).
+
+        The provider already fail-opens internally (timeout / embed /
+        cache / repo errors → None + telemetry). This wrapper mirrors
+        ``_resolve_memory_snapshot``: any unexpected raise from the
+        closure contract must never crash planner_node — no recall is
+        equivalent to "no memories matched". ``asyncio.CancelledError``
+        (BaseException) still passes through — cancellation semantics win.
+        """
+        if memory_recall_provider is None:
+            return None
+        try:
+            material = RecallQueryMaterial(
+                message=state.get("message") or "",
+                original_request=state.get("original_request") or None,
+                session_title=None,  # provider 内 best-effort 预取
+                entry="graph",       # R9#5：显式传值，不靠默认
+            )
+            return await memory_recall_provider(material)
+        except Exception as exc:
+            logger.warning(
+                "memory_recall_provider raised; degrading to no-recall prompt: %s",
+                exc,
+            )
+            return None
+
     # ---- Nodes --------------------------------------------------------- #
 
     async def planner_node(state: MainGraphState, config: RunnableConfig) -> dict:
@@ -770,8 +809,12 @@ def build_main_graph(
 
         # M2 PR-4: planner registry does NOT include memory sections —
         # skip the snapshot fetch. See ``memory_snapshot_provider`` docstring.
+        # B8: query-time recall is a SEPARATE provider (planner-only) — it
+        # feeds the recalled_memory section, not the M2 snapshot trio.
+        recall = await _resolve_memory_recall(state)
         ctx = build_render_context(
-            state, planner_config, agent_config, team_members=team_members
+            state, planner_config, agent_config, team_members=team_members,
+            recalled_memory=recall,
         )
         result = prompt_assembler.assemble(
             section_bundle.planner,

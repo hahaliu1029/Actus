@@ -232,6 +232,13 @@ class MemoryConfig(BaseModel):
     half_life_days: int = Field(30, ge=1, le=365)
     mmr_lambda: float = Field(0.7, ge=0.0, le=1.0)
     hybrid_alpha: float = Field(0.7, ge=0.0, le=1.0)  # C7 仅占位不参与计算, C8 生效
+    # B8: query-time 记忆召回（planner 前置召回）——三态 dark-launch
+    recall_mode: Literal["off", "shadow", "on"] = "off"
+    recall_top_k: int = Field(5, ge=1, le=20)
+    recall_threshold: float = Field(0.35, ge=0.0, le=1.0)
+    recall_timeout_seconds: float = Field(0.75, ge=0.1, le=15.0)
+    recall_cache_ttl_seconds: int = Field(86400, ge=60)
+    recall_query_max_chars: int = Field(2000, ge=100)
 
 
 class ToolConfirmationConfig(BaseModel):

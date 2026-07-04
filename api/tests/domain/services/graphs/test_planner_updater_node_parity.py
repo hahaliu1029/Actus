@@ -122,7 +122,17 @@ def test_planner_en_bundle_dispatches_english() -> None:
 
 
 def test_updater_bundle_produces_same_structure_as_planner() -> None:
-    """Updater uses the same 3 sections → same structural output."""
+    """Updater uses the same 3 sections → same structural output.
+
+    B8: the planner registry now carries an extra ``recalled_memory``
+    section that the updater registry deliberately omits (planner-only,
+    spec N3). This parity assertion still holds because ``build_render_context``
+    here leaves ``ctx.recalled_memory=None`` (default / off mode), so the
+    recalled_memory section renders ``text=None`` and contributes nothing —
+    planner and updater text stay byte-identical. (The registries only
+    diverge once a non-None recall bundle is injected at the two planner
+    entrances.)
+    """
     state = _representative_state()
     section_bundle = get_prompt_section_bundle("zh")
     agent_config = MagicMock(supports_vision=True, supports_pdf_input=True)

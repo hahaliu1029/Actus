@@ -41,6 +41,9 @@ from app.domain.services.prompts.sections.planner_identity import (
 from app.domain.services.prompts.sections.planner_tool_summary_legacy import (
     planner_tool_summary_legacy_section,
 )
+from app.domain.services.prompts.sections.recalled_memory import (
+    recalled_memory_section,
+)
 from app.domain.services.prompts.sections.sandbox_state import sandbox_state_section
 from app.domain.services.prompts.sections.skill_context import skill_context_section
 from app.domain.services.prompts.sections.tools_guide_dynamic import (
@@ -84,6 +87,13 @@ EN_PLANNER_REGISTRY = SectionRegistry(
         agent_team_teaching_section,
         planner_tool_summary_legacy_section,
         conversation_summaries_section,
+        # [B8] recalled_memory (prio 6) — query-time semantic recall,
+        # planner-only. Declared LAST: same priority as
+        # conversation_summaries, so under budget pressure the assembler's
+        # stable same-priority ordering drops recall first (deliberate:
+        # conversation continuity outranks semantic recall). Also keeps the
+        # registry prefix stable for a future planner prompt-cache epic.
+        recalled_memory_section,
     ),
     name="en_planner",
 )
@@ -92,6 +102,7 @@ EN_PLANNER_REGISTRY = SectionRegistry(
 # ---- Updater registry (B5 C6) ------------------------------------------ #
 
 # Mirror of ZH_UPDATER_REGISTRY. See bundles/zh.py for commentary.
+# [B8] deliberately NOT adding recalled_memory here — planner-only (spec N3).
 EN_UPDATER_REGISTRY = SectionRegistry(
     sections=(
         planner_identity_section,

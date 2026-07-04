@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Literal
 
+from app.domain.models.memory_recall import RecalledMemory
 from app.domain.services.prompts.errors import SectionValidationError
 from app.domain.services.prompts.invariants import _assert_no_dangling_skill_tool_refs
 from app.domain.services.prompts.memory_snapshot import MemorySnapshot
@@ -109,6 +110,13 @@ class RenderContext:
     ``_run_parallel_backend``). When ``None`` (flag-OFF / no team / load
     failure), the teaching section emits nothing, keeping all non-team
     call sites byte-identical (INV-0).
+    """
+    recalled_memory: RecalledMemory | None = None
+    """B8: planner query-time 召回结果，仅 planner registry 的
+    ``recalled_memory`` section 消费。由 recall provider 在两个 planner
+    入口解析后经 ``build_render_context`` kwarg 传入——不进 graph state。
+    ``None``（默认）= section 渲染 text=None，所有非召回调用点
+    byte-identical（INV-B8-OFF）。executor/updater 永不填充此字段。
     """
 
 

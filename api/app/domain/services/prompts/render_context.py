@@ -19,6 +19,7 @@ from app.domain.services.tools.tool_source_resolver import (
 )
 
 if TYPE_CHECKING:
+    from app.domain.models.memory_recall import RecalledMemory
     from app.domain.services.prompts.memory_snapshot import MemorySnapshot
 
 
@@ -102,6 +103,7 @@ def build_render_context(
     *,
     memory_snapshot: "MemorySnapshot | None" = None,
     team_members: "tuple[tuple[str, str], ...] | None" = None,
+    recalled_memory: "RecalledMemory | None" = None,
 ) -> RenderContext:
     """Build a ``RenderContext`` from LangGraph state + config + AgentConfig.
 
@@ -121,6 +123,11 @@ def build_render_context(
     await ``build_memory_snapshot`` upstream (in the async node) and pass
     the result here as a kwarg. Absent (the test / no-memory default)
     leaves the three memory sections inert.
+
+    B8: ``recalled_memory`` is the query-time recall bundle for the
+    planner's recalled_memory section. Only the two planner entrances
+    pass it; every other call site takes the None default and renders
+    byte-identically.
     """
     configurable = (config.get("configurable") if config else None) or {}
     llm = configurable.get("llm")
@@ -159,4 +166,5 @@ def build_render_context(
         a2a_active=_has_category(bound_tool_names, "a2a"),
         memory_snapshot=memory_snapshot,
         team_members=team_members,
+        recalled_memory=recalled_memory,
     )

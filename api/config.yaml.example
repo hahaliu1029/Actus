@@ -114,6 +114,27 @@ agent_config:
     half_life_days: 30                # 时间衰减半衰期（天）
     mmr_lambda: 0.7                   # MMR 多样性参数 (0=纯多样性, 1=纯相关性)
     hybrid_alpha: 0.7                 # 向量/文本混合权重 (C7 仅占位不参与计算, C8 生效)
+    # --- B8 query-time 记忆召回（planner 前置召回）------------------------
+    # recall_mode: off | shadow | on（默认 off = 完全关闭，prompt byte-identical）
+    #   shadow = 检索+telemetry 照跑但不注入 prompt（观察分布、校准阈值；
+    #            多付一次 embed + pgvector 查询成本）
+    #   on     = 注入 planner 系统提示的 recalled_memory 围栏段
+    # 翻 on 前置判据（guardrails，观察 shadow 期 telemetry——
+    # logger `actus.memory_recall` INFO 一行 JSON / metrics memory_recall_total）：
+    #   timeout_rate < 1%；(error + embed_unavailable) 率 < 1%；
+    #   latency_p95 < 600ms（< timeout 0.75s 留余量）；
+    #   empty 率无硬阈值（取决于记忆库密度，人工判断）；
+    #   人工抽样 recall 事件的 chunk_ids 反查内容，确认无明显无关召回。
+    # 回退 = 改回 off（纯读路径，无 schema/数据迁移）。
+    # ⚠ 安全注记：召回缓存以**明文**（截断 120 字符）存 Redis
+    #   （key 前缀 mem_recall:）——前提是私有内网 Redis（compose 默认拓扑）。
+    #   共享/暴露部署必须启用 Redis auth/ACL/TLS，否则保持 recall_mode: off。
+    # recall_mode: "off"
+    # recall_top_k: 5                  # 检索上限（渲染受 section 预算再截）
+    # recall_threshold: 0.35           # cosine 阈值（512-dim 分布未标定，shadow 期校准）
+    # recall_timeout_seconds: 0.75     # 整体召回预算，超时 fail-open 无注入
+    # recall_cache_ttl_seconds: 86400  # session 级召回缓存 TTL
+    # recall_query_max_chars: 2000     # query 素材总长上限
   # execution:                        # 执行健康监控（ExecutionWatchdog 双层超时）
   #   total_timeout_seconds: 900.0    # 整图执行总超时（秒）。代码默认 600s；配合 llm_config.timeout_seconds=300s 时建议 900s（300 x 3 graph retries）
   #   idle_timeout_seconds: 300.0     # 空闲无进度事件超时（秒）。代码默认 120s；非流式 LLM 调用需 >= llm_config.timeout_seconds，否则 watchdog 会先触发

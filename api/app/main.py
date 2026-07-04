@@ -721,6 +721,12 @@ async def lifespan(app: FastAPI):
             asyncio.wait_for(_background_skill_scan(), timeout=30.0)
         )
 
+        # B8: 召回 telemetry 通道 2——logger→OTel metrics 桥（幂等、失败吞掉）
+        from app.infrastructure.telemetry.memory_recall_telemetry import (
+            mount_memory_recall_metrics,
+        )
+        mount_memory_recall_metrics()
+
         # lifespan分界点
         yield
     finally:
