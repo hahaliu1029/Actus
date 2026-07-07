@@ -93,5 +93,12 @@ export async function dispatchCommand(
         );
       }
       return;
+    default: {
+      // Exhaustiveness guard: CommandOutcome is a closed union (types.ts). If a new
+      // variant is added without a matching case above, `outcome` is no longer `never`
+      // here and this fails to compile — a deliberate tripwire (#3b / Task 17 Minor).
+      const _exhaustive: never = outcome;
+      return _exhaustive;
+    }
   }
 }

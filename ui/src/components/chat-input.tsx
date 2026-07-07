@@ -51,6 +51,7 @@ export function ChatInput({
   const stopSession = useSessionStore((state) => state.stopSession);
   const isSessionStreaming = useSessionStore((state) => state.isSessionStreaming);
   const currentSession = useSessionStore((state) => state.currentSession);
+  const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
   const appendLocalCommandCard = useSessionStore((state) => state.appendLocalCommandCard);
   const setMessage = useUIStore((state) => state.setMessage);
 
@@ -317,12 +318,15 @@ export function ChatInput({
               const cur = useSessionStore.getState().currentSession;
               if (cur && cur.session_id === sid) {
                 appendLocalCommandCard(sid, card);
-              } else {
+              } else if (card.role !== "user") {
                 // codex R2 P2: the cold-load pre-fetch is best-effort; if it failed
                 // (silent fetch swallows errors, currentSession stays null/mismatched),
                 // appendLocalCommandCard would no-op and the synthetic card would
-                // vanish. Fall back to the toast channel so a command result is never
-                // silently lost.
+                // vanish. Fall back to the toast channel so the command RESULT is never
+                // silently lost. Skip the user-echo card (role === "user"): as a toast it
+                // just repeats what the user typed, and since setMessage is single-slot it
+                // would only flash then be overwritten by the result — a redundant double
+                // toast (#3a follow-up). The result card alone reaches the user.
                 setMessage({ type: "info", text: card.markdown });
               }
             },
@@ -401,12 +405,21 @@ export function ChatInput({
     Boolean(sessionId) &&
     !isBackgroundSuspended &&
     (isCurrentSessionStreaming || isCurrentSessionRunning);
+  // B11 follow-up (P3): a cold-opened session renders ChatInput with a route
+  // sessionId BEFORE currentSession loads, so sessionStatus is null and none of the
+  // running/takeover conditions below fire — the input would be wrongly usable during
+  // the load window (a user could submit against a running/takeover session). The
+  // session page drives a NON-silent fetchSessionById on mount, so isLoadingCurrentSession
+  // is true for the whole window and resets in a finally (self-healing, no stuck-disabled).
+  // Gate on it to close the race. Not slash-specific — protects normal sends too.
+  const isSessionStatusLoading = Boolean(sessionId) && isLoadingCurrentSession;
   const disableInput =
     uploading ||
     showStopAction ||
     isBackgroundSuspended ||
     isTakeoverActive ||
-    hasToolConfirmationPending;
+    hasToolConfirmationPending ||
+    isSessionStatusLoading;
   const canSubmit = Boolean(text.trim()) || pendingFiles.length > 0;
 
   // B11 command menu state. Placed AFTER disableInput (showMenu reads it) and after

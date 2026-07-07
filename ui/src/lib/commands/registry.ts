@@ -126,7 +126,6 @@ function makeSkillCommand(slug: string, description: string): CommandDef {
     requiresSession: false, // can create a session (§7 send_message exception)
     // no validateArgs → accepts arbitrary free-text args (consumed via rawRemainder)
     execute: async (_args, rawRemainder) => {
-      void _args;
       // Injection defense (§9 INV): template injects ONLY the validated slug +
       // the user's own rawRemainder — NEVER the SKILL.md description (3rd-party).
       const message = rawRemainder

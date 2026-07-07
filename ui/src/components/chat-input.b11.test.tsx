@@ -26,6 +26,7 @@ const sessionStoreState = {
   isSessionStreaming: vi.fn(() => false),
   appendLocalCommandCard: vi.fn(),
   currentSession: null as unknown,
+  isLoadingCurrentSession: false,
   sessions: [] as unknown[],
   // chat-input.tsx reads useSessionStore.getState() in the P2 cold-load pre-fetch
   // (before dispatch) and in the runTakeover dep. The hook mock below is a selector
@@ -124,6 +125,7 @@ describe("ChatInput B11 flag gating", () => {
     // SUCCESS golden mutates currentSession to a non-null session, so reset it
     // here to keep cold-load tests isolated from prior mutation.
     sessionStoreState.currentSession = null;
+    sessionStoreState.isLoadingCurrentSession = false;
   });
 
   // INV-B11-1: flag OFF → representative input set all sent verbatim as normal
@@ -395,5 +397,52 @@ describe("ChatInput B11 flag gating", () => {
     expect(infoCall).toBeTruthy();
     expect((infoCall?.[0] as { text?: string })?.text).toEqual(expect.any(String));
     expect((infoCall?.[0] as { text?: string })?.text?.length).toBeGreaterThan(0);
+  });
+
+  // ── P3 follow-up: cold-load input-gating (pre-existing race, not slash-specific) ──
+  // A cold-opened session mounts ChatInput with a route sessionId BEFORE
+  // currentSession loads, so sessionStatus is null and none of the running/takeover
+  // disable conditions fire — the input is wrongly usable during the load window.
+  // The session page drives a NON-silent fetchSessionById on mount → isLoadingCurrentSession
+  // stays true for the window and resets in a finally (self-healing). Gating the input
+  // on it closes the race. Flag state is irrelevant (the fix applies flag-OFF too).
+  it("P3: cold-load (isLoadingCurrentSession) → textarea disabled, Enter cannot submit", async () => {
+    settingsState.agentConfig = SLASH_ON_CONFIG;
+    sessionStoreState.currentSession = null; // status unknown during cold-load
+    sessionStoreState.isLoadingCurrentSession = true;
+    render(<ChatInput sessionId="sess-1" />);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(box).toBeDisabled();
+    // Even if a keyDown reaches the handler, the disableInput guard blocks submit.
+    fireEvent.keyDown(box, { key: "Enter", code: "Enter" });
+    await Promise.resolve();
+    expect(sessionStoreState.sendChat).not.toHaveBeenCalled();
+    expect(runtimeApi.getExtensions).not.toHaveBeenCalled();
+  });
+
+  // ── #3a: cold-load FAILURE must not DOUBLE-toast (user echo + result) ──
+  // The dispatcher appends TWO cards for a local_card command: the user echo
+  // (role:"user", markdown = raw "/mcp") then the result (role:"assistant"). When
+  // the timeline is unavailable (cold-load pre-fetch failed) BOTH previously fell
+  // back to setMessage — and since setMessage is single-slot, the echo toast just
+  // flashed then was overwritten by the result (a redundant double toast). The fix
+  // skips the user-echo card in the fallback, so exactly ONE toast (the result) fires.
+  it("#3a: cold-load FAILURE → only the RESULT toasts once; the user-echo is not double-toasted", async () => {
+    settingsState.agentConfig = SLASH_ON_CONFIG;
+    sessionStoreState.currentSession = null;
+    sessionStoreState.fetchSessionById.mockImplementationOnce(async () => {
+      // swallowed silent failure: currentSession stays null (mirrors session-store)
+    });
+    render(<ChatInput sessionId="sess-1" />);
+    submit("/mcp");
+    await waitFor(() => expect(runtimeApi.getExtensions).toHaveBeenCalled());
+    await waitFor(() => expect(setMessageSpy).toHaveBeenCalled());
+    const infoCalls = setMessageSpy.mock.calls.filter(
+      ([arg]) => (arg as { type?: string })?.type === "info"
+    );
+    // Exactly one toast (the result) — NOT two (echo + result).
+    expect(infoCalls).toHaveLength(1);
+    // And that single toast is the RESULT, never a verbatim echo of the raw input.
+    expect((infoCalls[0]?.[0] as { text?: string })?.text).not.toBe("/mcp");
   });
 });

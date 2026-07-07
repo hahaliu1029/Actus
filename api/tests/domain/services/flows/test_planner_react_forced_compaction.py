@@ -83,8 +83,8 @@ def test_forced_compaction_seam_precedes_planner_detection_in_invoke():
     precedes planner detection in invoke()'s source. invoke() is a straight-line
     async generator between the two (no planner event is yielded in between), so
     source order == yield order (Documented Deviation #7). Anchor
-    `_run_planner_for_detection` is invoke()'s earliest planner-emitting call
-    (planner_react.py:1920); seam-before-it ⟹ seam-before-every-planner-path (the
+    `_run_planner_for_detection` is invoke()'s earliest planner-emitting call;
+    seam-before-it ⟹ seam-before-every-planner-path (the
     main-graph astream path is later in source). This is synchronous source
     inspection — no anyio, DB, or graph needed, so it runs locally.
     """

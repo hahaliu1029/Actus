@@ -53,10 +53,7 @@ export async function executeSkills(
   _ctx: CommandContext
 ): Promise<CommandOutcome> {
   // /skills reads no positional args but keeps the fixed CommandDef.execute
-  // arity; reference the unused params so lint is satisfied without a cast.
-  void _args;
-  void _raw;
-  void _ctx;
+  // arity (unused params are `_`-prefixed per the eslint no-unused-vars config).
   try {
     const data = await runtimeApi.getExtensions();
     const skills = data.items.filter(
@@ -103,8 +100,6 @@ export async function executePermissions(
   _raw: string,
   _ctx: CommandContext
 ): Promise<CommandOutcome> {
-  void _raw;
-  void _ctx;
   try {
     const sub = args[0];
     if (sub === undefined || sub === "list") {
@@ -142,8 +137,6 @@ export async function executeTakeover(
   _raw: string,
   _ctx: CommandContext
 ): Promise<CommandOutcome> {
-  void _raw;
-  void _ctx;
   // validateArgs guarantees args[0] ∈ {shell, browser}
   const scope = args[0] as TakeoverScope;
   return { kind: "delegate_ui", action: "start_takeover", scope };

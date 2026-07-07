@@ -1130,7 +1130,7 @@ class PlannerReActFlow(BaseFlow):
 
         Reuses _check_overflow(force=True) (which persists the record + commits)
         then yields SSE compaction events via the shared pure builder. Clears
-        _last_compaction_result so the run-end second _check_overflow (:2111)
+        _last_compaction_result so the run-end second _check_overflow call
         can't double-emit. Explicitly counts the D5 metric because we bypass the
         runner's _build_compaction_events_if_any on this path.
         """
