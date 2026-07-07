@@ -112,11 +112,20 @@ export type ToolConfirmationConfig = {
   smart_approve_medium_only: boolean;
 };
 
+export type SlashCommandsConfig = {
+  enabled: boolean;
+  skill_commands_enabled: boolean;
+  manual_compaction_enabled: boolean;
+};
+
+export type ApprovalPolicy = "auto" | "ask" | "deny";
+
 export type AgentConfig = {
   max_iterations: number;
   max_retries: number;
   max_search_results: number;
   tool_confirmation?: ToolConfirmationConfig;
+  slash_commands?: SlashCommandsConfig;
 };
 
 export type VisionFallbackConfig = {
@@ -260,6 +269,7 @@ export type ToolWithPreference = {
   description: string | null;
   enabled_global: boolean;
   enabled_user: boolean;
+  slug?: string | null;
 };
 
 export type ToolPreferenceListResponse = {

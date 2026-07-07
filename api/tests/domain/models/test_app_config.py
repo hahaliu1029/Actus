@@ -190,3 +190,60 @@ def test_tool_display_metadata_enabled_defaults_off():
     from app.domain.models.app_config import ToolRuntimeConfig
 
     assert ToolRuntimeConfig().tool_display_metadata_enabled is False
+
+
+def test_agent_config_has_default_slash_commands_config() -> None:
+    config = AgentConfig()
+
+    assert config.slash_commands.enabled is False
+    assert config.slash_commands.skill_commands_enabled is False
+    assert config.slash_commands.manual_compaction_enabled is False
+
+
+def test_agent_config_accepts_custom_slash_commands_config() -> None:
+    from app.domain.models.app_config import SlashCommandsConfig
+
+    config = AgentConfig(
+        slash_commands=SlashCommandsConfig(
+            enabled=True,
+            skill_commands_enabled=True,
+            manual_compaction_enabled=True,
+        )
+    )
+
+    assert config.slash_commands.enabled is True
+    assert config.slash_commands.skill_commands_enabled is True
+    assert config.slash_commands.manual_compaction_enabled is True
+
+
+def test_slash_commands_config_round_trips_through_agent_config_dict() -> None:
+    # settings 保存 round-trip：非默认值经 dict 序列化后不丢（对齐 §10 INV-B11-1 传输链）
+    from app.domain.models.app_config import SlashCommandsConfig
+
+    config = AgentConfig(
+        slash_commands=SlashCommandsConfig(enabled=True, manual_compaction_enabled=True)
+    )
+    rebuilt = AgentConfig(**config.model_dump())
+
+    assert rebuilt.slash_commands.enabled is True
+    assert rebuilt.slash_commands.manual_compaction_enabled is True
+    assert rebuilt.slash_commands.skill_commands_enabled is False
+
+
+def test_config_yaml_example_declares_slash_commands_flags() -> None:
+    """§12 test 15: the shipped config.yaml.example must carry the three
+    slash_commands flags under agent_config, all default-OFF, so a mis-indent or
+    omission in the release template is caught by a test (the plan itself flags
+    YAML indentation as a real ship risk — B8 R1). Red until Step 4 adds the YAML.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    # test file: api/tests/domain/models/test_app_config.py → parents[3] == api/
+    example = Path(__file__).resolve().parents[3] / "config.yaml.example"
+    data = yaml.safe_load(example.read_text(encoding="utf-8"))
+    sc = data["agent_config"]["slash_commands"]
+    assert sc["enabled"] is False
+    assert sc["skill_commands_enabled"] is False
+    assert sc["manual_compaction_enabled"] is False

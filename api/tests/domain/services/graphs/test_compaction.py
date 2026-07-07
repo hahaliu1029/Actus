@@ -371,3 +371,105 @@ async def test_try_compact_threads_config_to_summary_llm_ainvoke():
         "soft/hard trigger ratios and re-tune _pad sizing so "
         "usage_ratio ∈ (soft_trigger_ratio, hard_trigger_ratio)."
     )
+
+
+# ── B11 §8: pure build_compaction_events ──────────────────────────────────────
+
+def test_build_compaction_events_level0_only_context_status():
+    from app.domain.services.graphs.compaction import build_compaction_events
+
+    result = CompactionResult(
+        messages=(),
+        level_applied=0,
+        tokens_before=500,
+        tokens_after=500,
+        summary_injected=False,
+        messages_removed=0,
+        usage_ratio_after=0.4,
+    )
+    events = build_compaction_events(result, None)
+
+    assert [type(e).__name__ for e in events] == ["ContextStatusEvent"]
+    ctx = events[0]
+    assert ctx.used_tokens == 500
+    assert ctx.context_window == 0        # overflow_config=None → window 0
+    assert ctx.soft_threshold == 0.85
+    assert ctx.hard_threshold == 0.95
+
+
+def test_build_compaction_events_level2_appends_compaction_event():
+    from app.domain.services.graphs.compaction import build_compaction_events
+
+    result = CompactionResult(
+        messages=(),
+        level_applied=2,
+        tokens_before=1000,
+        tokens_after=600,
+        summary_injected=True,
+        messages_removed=5,
+        usage_ratio_after=0.5,
+        compaction_id="cmp-123",
+    )
+    events = build_compaction_events(result, None)
+
+    assert [type(e).__name__ for e in events] == ["ContextStatusEvent", "CompactionEvent"]
+    comp = events[1]
+    assert comp.level == 2
+    assert comp.tokens_before == 1000
+    assert comp.tokens_after == 600
+    assert comp.messages_removed == 5
+    assert comp.compaction_id == "cmp-123"
+
+
+# ── B11 §8: try_compact(force=...) ────────────────────────────────────────────
+
+class TestForceCompact:
+    @pytest.mark.anyio
+    async def test_force_below_soft_with_llm_compacts_level2(self):
+        # 90 tokens in a 200 window → usage 0.45 (< soft 0.85). Without force = level 0.
+        c = _make_compactor()
+        msgs = [SystemMessage(content=_pad(10))] + [
+            HumanMessage(content=_pad(4)) for _ in range(20)
+        ]
+        mock_llm = _make_mock_llm("Short summary.")
+        result = await c.try_compact(
+            msgs, context_window=200, summary_llm=mock_llm, force=True
+        )
+        assert result.level_applied == 2
+        assert mock_llm.ainvoke.called is True
+
+    @pytest.mark.anyio
+    async def test_force_below_soft_no_llm_skips_never_hard_truncates(self):
+        c = _make_compactor()
+        msgs = [SystemMessage(content=_pad(10))] + [
+            HumanMessage(content=_pad(4)) for _ in range(20)
+        ]
+        result = await c.try_compact(
+            msgs, context_window=200, summary_llm=None, force=True
+        )
+        # Manual /compact with no summary LLM must NOT trigger destructive Level 3.
+        assert result.level_applied == 0
+
+    @pytest.mark.anyio
+    async def test_force_above_hard_no_llm_still_skips_never_level3(self):
+        # HIGH water (>= hard) + force + no summary LLM must STILL skip (level 0),
+        # never Level-3. Same input WITHOUT force → Level 3 (water-triggered path).
+        c = _make_compactor()
+        msgs = [SystemMessage(content=_pad(10))] + [
+            HumanMessage(content=_pad(4)) for _ in range(24)
+        ]  # 10 + 96 = 106 tokens; window 100 → usage 1.06 (>= hard 0.95)
+        forced = await c.try_compact(msgs, context_window=100, summary_llm=None, force=True)
+        assert forced.level_applied == 0  # manual command never hard-truncates
+        auto = await c.try_compact(msgs, context_window=100, summary_llm=None, force=False)
+        assert auto.level_applied == 3  # sanity: automatic path still hard-truncates
+
+    @pytest.mark.anyio
+    async def test_force_false_below_soft_unchanged(self):
+        c = _make_compactor()
+        msgs = [SystemMessage(content=_pad(10))] + [
+            HumanMessage(content=_pad(4)) for _ in range(20)
+        ]
+        result = await c.try_compact(
+            msgs, context_window=200, summary_llm=_make_mock_llm(), force=False
+        )
+        assert result.level_applied == 0  # force defaults False → byte-identical low-water no-op

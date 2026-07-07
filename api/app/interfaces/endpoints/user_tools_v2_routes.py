@@ -44,6 +44,7 @@ async def get_skill_tools(
             description=skill.description,
             enabled_global=skill.enabled,
             enabled_user=pref_map.get(skill.id, True),
+            slug=skill.slug,
         )
         for skill in skills
     ]

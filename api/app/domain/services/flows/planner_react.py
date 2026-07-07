@@ -211,6 +211,7 @@ class PlannerReActFlow(BaseFlow):
         permission_engine: "PermissionEngine | None" = None,
         session_state_machine: "SessionStateMachine | None" = None,
         policy_snapshot_sink: Any = None,  # C5a observe-only sink (Seam B carrier)
+        force_initial_compaction: bool = False,  # B11 §8: consume a pending manual /compact at run start
         # PR-9b-A A5: lifespan-scoped coordinator runtime deps. Default is the
         # frozen NullCoordinatorRuntimeDeps sentinel so legacy callers (tests
         # + non-coordinator paths) inject zero coord cfg keys; production
@@ -235,6 +236,7 @@ class PlannerReActFlow(BaseFlow):
         self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
         self._overflow_config = overflow_config
+        self._force_initial_compaction = force_initial_compaction
         self._tool_runtime = tool_runtime
         self._token_estimator = TokenEstimator(
             strategy=self._overflow_config.token_estimator,
@@ -1038,7 +1040,7 @@ class PlannerReActFlow(BaseFlow):
             unresolved=parsed.unresolved,
         )
 
-    async def _check_overflow(self, memory: Memory) -> CompactionResult | None:
+    async def _check_overflow(self, memory: Memory, *, force: bool = False) -> CompactionResult | None:
         """检测上下文溢出，根据水位触发渐进压缩。"""
         if not self._overflow_config or not self._overflow_config.context_overflow_guard_enabled:
             return None
@@ -1078,6 +1080,7 @@ class PlannerReActFlow(BaseFlow):
             context_window=total_window,
             summary_llm=self._summary_llm,
             config=compact_config,
+            force=force,
         )
 
         if result.level_applied > 0:
@@ -1121,6 +1124,33 @@ class PlannerReActFlow(BaseFlow):
 
         self._last_compaction_result = result
         return result
+
+    async def _run_forced_initial_compaction(self, memory: Memory):
+        """B11 §8: consume a pending manual /compact at run start.
+
+        Reuses _check_overflow(force=True) (which persists the record + commits)
+        then yields SSE compaction events via the shared pure builder. Clears
+        _last_compaction_result so the run-end second _check_overflow (:2111)
+        can't double-emit. Explicitly counts the D5 metric because we bypass the
+        runner's _build_compaction_events_if_any on this path.
+        """
+        forced_result = await self._check_overflow(memory, force=True)
+        if forced_result is None:
+            return
+        from app.domain.services.graphs.compaction import build_compaction_events
+        events = build_compaction_events(forced_result, self._overflow_config)
+        # Count metrics + clear _last_compaction_result BEFORE yielding, so a
+        # cancelled/short-circuited consumer can't leave the field set and make
+        # the run-end _build_compaction_events_if_any re-materialize the same
+        # result (double-emit). All non-yield side effects happen first.
+        if forced_result.level_applied > 0:
+            _em = getattr(self, "_execution_metrics", None)
+            if _em is not None:
+                _em.compaction_count += 1
+                _em.context_usage_ratio = forced_result.usage_ratio_after
+        self._last_compaction_result = None  # event already accounted for above
+        for ev in events:
+            yield ev
 
     def _build_on_context_overflow_callback(self):
         """Session-scoped OnContextOverflow closure consumed by ActusRecoveryChatModel
@@ -1880,6 +1910,13 @@ class PlannerReActFlow(BaseFlow):
             # New task path
             async with self._uow_factory() as uow:
                 memory = await uow.session.get_memory(self._session_id, "react")
+
+            # B11 §8: consume a pending manual /compact BEFORE anchor injection —
+            # forced compaction only compresses prior history, never the anchor
+            # we're about to add this turn (messages_input_hash = pure history).
+            if self._force_initial_compaction:
+                async for _forced_ev in self._run_forced_initial_compaction(memory):
+                    yield _forced_ev
 
             # Context anchor injection
             if self._memory_config.context_anchor_enabled and not memory.empty:

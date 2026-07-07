@@ -50,6 +50,11 @@ agent_config:
   max_iterations: 100                     # Agent 最大迭代次数
   max_retries: 3                          # 工具调用最大重试次数
   max_search_results: 10                  # 搜索结果数量
+  # B11 快捷命令层（前端 slash commands）。三 flag 出厂关闭，翻转是部署决策。
+  slash_commands:
+    enabled: false                    # FE 总开关：关=无拦截/无菜单
+    skill_commands_enabled: false     # enabled skill 自动暴露为 /<slug> prompt 展开命令
+    manual_compaction_enabled: false  # 开放 POST /sessions/{id}/compactions 端点
   skill_selection:
     base_threshold: 3
     short_message_max_chars: 24

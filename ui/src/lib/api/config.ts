@@ -1,6 +1,7 @@
-import { del, get, post, requestBlob } from "./fetch";
+import { del, get, post, put, requestBlob } from "./fetch";
 import type {
   AgentConfig,
+  ApprovalPolicy,
   A2AServersData,
   CreateA2AServerParams,
   ExtensionKind,
@@ -150,4 +151,25 @@ export const runtimeApi = {
   getCatalog: (): Promise<RuntimeCatalogData> => {
     return get<RuntimeCatalogData>("/v1/runtime/extensions/catalog");
   },
+};
+
+// B11 slash commands (Task 12): per-user tool approval policy over
+// /v2/user/tool-policies. Consumed by the /allow /ask /deny executors (Task 15).
+export type UserToolPolicy = {
+  tool_name: string;
+  policy: ApprovalPolicy;
+  updated_at?: string;
+};
+
+const policyBase = "/v2/user/tool-policies";
+
+export const userToolPolicyApi = {
+  list: async (): Promise<UserToolPolicy[]> => {
+    const data = await get<{ policies: UserToolPolicy[] }>(policyBase);
+    return data.policies;
+  },
+  set: (toolName: string, policy: ApprovalPolicy): Promise<UserToolPolicy> =>
+    put<UserToolPolicy>(`${policyBase}/${encodeURIComponent(toolName)}`, { policy }),
+  clear: (toolName: string): Promise<void> =>
+    del<void>(`${policyBase}/${encodeURIComponent(toolName)}`),
 };

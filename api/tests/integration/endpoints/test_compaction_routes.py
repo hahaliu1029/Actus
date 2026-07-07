@@ -412,3 +412,136 @@ async def test_original_content_200_happy_path(uow_factory, async_session_factor
             seed["session_id"],
             seed["compaction_id"],
         )
+
+
+# ── B11 §8: POST /compactions (integration — host DB + DI overrides; CI-only) ──
+import uuid as _uuid2
+
+from app.domain.models.app_config import AgentConfig, LLMConfig, SlashCommandsConfig
+from app.domain.models.user import User, UserRole, UserStatus
+from app.infrastructure.storage.redis import get_redis
+from app.interfaces.dependencies.rate_limit import rate_limit_write
+from app.interfaces.service_dependencies import get_app_config_service
+from app.main import app
+
+
+class _FakeRedisClient:
+    class _Inner:
+        def __init__(self):
+            self.store: dict[str, str] = {}
+        async def set(self, k, v, ex=None):
+            self.store[k] = v
+        async def getdel(self, k):
+            return self.store.pop(k, None)
+    def __init__(self):
+        self.client = self._Inner()
+
+
+class _StubConfig:
+    def __init__(self, *, manual: bool, guard: bool):
+        self._m, self._g = manual, guard
+    async def get_agent_config(self):
+        return AgentConfig(slash_commands=SlashCommandsConfig(manual_compaction_enabled=self._m))
+    async def get_llm_config(self):
+        return LLMConfig(context_overflow_guard_enabled=self._g)
+
+
+async def _seed_status(uow_factory, status: str):
+    from app.infrastructure.models.session import SessionModel
+    from app.infrastructure.models.user import UserModel
+    uid = str(_uuid2.uuid4())
+    sid = f"sess-b11-{_uuid2.uuid4().hex[:12]}"
+    async with uow_factory() as uow:
+        uow.db_session.add_all([
+            UserModel(id=uid, username=f"b11_{uid[:8]}", password_hash="x"),
+            SessionModel(id=sid, user_id=uid, status=status, title="b11"),
+        ])
+        await uow.db_session.commit()
+    return uid, sid
+
+
+async def _post_compaction(async_session_factory, *, auth_user, sid, fake_redis, manual, guard):
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_app_config_service] = lambda: _StubConfig(manual=manual, guard=guard)
+    app.dependency_overrides[rate_limit_write] = lambda: None  # no-op (skip limiter Redis)
+    try:
+        async with _build_test_client(async_session_factory, auth_user) as client:
+            return await client.post(f"/api/sessions/{sid}/compactions")
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_post_compaction_completed_owner_queues(uow_factory, async_session_factory):
+    uid, sid = await _seed_status(uow_factory, "completed")
+    fake = _FakeRedisClient()
+    try:
+        resp = await _post_compaction(
+            async_session_factory,
+            auth_user=User(id=uid, username="b11", role=UserRole.USER, status=UserStatus.ACTIVE),
+            sid=sid, fake_redis=fake, manual=True, guard=True,
+        )
+        assert resp.status_code == 200 and resp.json()["request_status"] == "queued"
+        assert f"manual_compact_pending:{sid}" in fake.client.store
+    finally:
+        await _cleanup(uow_factory, uid, sid)
+
+
+async def test_post_compaction_timed_out_owner_queues(uow_factory, async_session_factory):
+    # TIMED_OUT is the SECOND pass state (alongside COMPLETED). Exercise its
+    # full-stack success wiring (200 + Redis SET) so both pass-states have route
+    # coverage, not just the decision unit test (§12 test 7 wiring half).
+    uid, sid = await _seed_status(uow_factory, "timed_out")
+    fake = _FakeRedisClient()
+    try:
+        resp = await _post_compaction(
+            async_session_factory,
+            auth_user=User(id=uid, username="b11", role=UserRole.USER, status=UserStatus.ACTIVE),
+            sid=sid, fake_redis=fake, manual=True, guard=True,
+        )
+        assert resp.status_code == 200 and resp.json()["request_status"] == "queued"
+        assert f"manual_compact_pending:{sid}" in fake.client.store
+    finally:
+        await _cleanup(uow_factory, uid, sid)
+
+
+async def test_post_compaction_flag_off_409(uow_factory, async_session_factory):
+    uid, sid = await _seed_status(uow_factory, "completed")
+    fake = _FakeRedisClient()
+    try:
+        resp = await _post_compaction(
+            async_session_factory,
+            auth_user=User(id=uid, username="b11", role=UserRole.USER, status=UserStatus.ACTIVE),
+            sid=sid, fake_redis=fake, manual=False, guard=True,
+        )
+        assert resp.status_code == 409 and resp.json()["detail"] == "manual_compaction_disabled"
+        assert f"manual_compact_pending:{sid}" not in fake.client.store  # never SET on reject
+    finally:
+        await _cleanup(uow_factory, uid, sid)
+
+
+async def test_post_compaction_running_409_run_active(uow_factory, async_session_factory):
+    uid, sid = await _seed_status(uow_factory, "running")
+    try:
+        resp = await _post_compaction(
+            async_session_factory,
+            auth_user=User(id=uid, username="b11", role=UserRole.USER, status=UserStatus.ACTIVE),
+            sid=sid, fake_redis=_FakeRedisClient(), manual=True, guard=True,
+        )
+        assert resp.status_code == 409 and resp.json()["detail"] == "run_active"
+    finally:
+        await _cleanup(uow_factory, uid, sid)
+
+
+async def test_post_compaction_non_owner_403(uow_factory, async_session_factory):
+    uid, sid = await _seed_status(uow_factory, "completed")
+    fake = _FakeRedisClient()
+    try:
+        resp = await _post_compaction(
+            async_session_factory,
+            auth_user=User(id=str(_uuid2.uuid4()), username="other", role=UserRole.USER, status=UserStatus.ACTIVE),  # NON-owner
+            sid=sid, fake_redis=fake, manual=True, guard=True,
+        )
+        assert resp.status_code == 403
+        assert f"manual_compact_pending:{sid}" not in fake.client.store
+    finally:
+        await _cleanup(uow_factory, uid, sid)

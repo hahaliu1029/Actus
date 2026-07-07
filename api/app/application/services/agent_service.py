@@ -422,6 +422,7 @@ class AgentService:
         session: Session,
         *,
         tool_filter: Optional[FrozenSet[str]] = None,
+        force_initial_compaction: bool = False,
     ) -> Task:
         """根据传递的会话创建一个新任务
 
@@ -820,6 +821,7 @@ class AgentService:
             idle_watchdog=getattr(self, "_idle_watchdog", None),
             was_background=session.was_background,
             tool_filter=tool_filter,
+            force_initial_compaction=force_initial_compaction,  # B11 §8
             # C3 PR-3c: ``getattr`` mirrors the ``_idle_watchdog`` line above —
             # several tests build ``AgentService`` via ``__new__`` to bypass the
             # heavy ctor wiring, then drive ``_create_task``; defensiveness keeps
@@ -2952,10 +2954,28 @@ class AgentService:
                             await self._sandbox_lifecycle_service.resume(session.id)
                         except Exception:
                             pass  # acquire inside _create_task will handle the actual state
+                    # B11 §8: consume a pending manual /compact request. Only at
+                    # COMPLETED/TIMED_OUT (same gate as sandbox-resume) — WAITING/
+                    # FINISHING resume paths by construction never consume it.
+                    _force_compact = False
+                    if session.status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
+                        try:
+                            from app.application.services.manual_compaction_flag import (
+                                consume_manual_compact_pending,
+                            )
+                            _force_compact = await consume_manual_compact_pending(
+                                self._redis_client.client, session_id
+                            )
+                        except Exception:
+                            _force_compact = False  # Redis failure must not block chat
                     # Phase 1 minimal subagent: only the fresh-chat creation path
                     # propagates tool_filter — resume / FINISHING / sweeper paths
                     # have no fresh allowlist context and stay on the default None.
-                    task = await self._create_task(session, tool_filter=tool_filter)
+                    task = await self._create_task(
+                        session,
+                        tool_filter=tool_filter,
+                        force_initial_compaction=_force_compact,
+                    )
                     if not task:
                         logger.error(f"会话[{session_id}]创建任务失败")
                         raise RuntimeError(f"会话[{session_id}]创建任务失败")

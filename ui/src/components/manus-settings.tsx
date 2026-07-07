@@ -39,6 +39,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
 import type { AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
+import { mergeAgentSavePayload } from "@/lib/settings/merge-agent-config";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useSettingsStore } from "@/lib/store/settings-store";
 import { useUIStore } from "@/lib/store/ui-store";
@@ -227,7 +228,13 @@ export function ManusSettings() {
 
   async function handleSave(): Promise<void> {
     if (activeTab === "agent") {
-      await updateAgentConfig(agentForm);
+      if (!agentConfig) {
+        // config 未加载：无从保留 slash_commands（+skill_selection/memory/execution），
+        // 阻断保存而非把它们 reset 为默认。用组件既有错误呈现提示用户稍后再试。
+        setMessage({ type: "error", text: "配置尚未加载完成，请稍后重试" });
+        return;
+      }
+      await updateAgentConfig(mergeAgentSavePayload(agentConfig, agentForm));
       return;
     }
 

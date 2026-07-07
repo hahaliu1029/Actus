@@ -260,6 +260,14 @@ class ExecutionConfig(BaseModel):
     max_same_tool_failures: int = Field(default=3, ge=1, le=20, description="同签名工具最大连续失败数")
 
 
+class SlashCommandsConfig(BaseModel):
+    """B11: 前端快捷命令层配置。三 flag 全 default-OFF（部署翻转，不在实现范围）。"""
+
+    enabled: bool = False                    # FE 总开关：OFF=parser/menu/拦截全旁路
+    skill_commands_enabled: bool = False     # skill prompt-expansion 命令组
+    manual_compaction_enabled: bool = False  # POST /sessions/{id}/compactions 端点
+
+
 class AgentConfig(BaseModel):
     """Agent通用配置"""
 
@@ -271,6 +279,7 @@ class AgentConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     tool_confirmation: ToolConfirmationConfig = Field(default_factory=ToolConfirmationConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    slash_commands: SlashCommandsConfig = Field(default_factory=SlashCommandsConfig)
 
 
 class MCPTransport(str, Enum):

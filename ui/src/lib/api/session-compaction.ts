@@ -1,4 +1,4 @@
-import { ApiError, get } from "./fetch";
+import { ApiError, get, post } from "./fetch";
 import type {
   CompactionDetail,
   CompactionListItem,
@@ -46,4 +46,12 @@ export async function fetchCompactionOriginalContent(
     }
     throw err;
   }
+}
+
+export async function requestManualCompaction(
+  sessionId: string,
+): Promise<{ request_status: string }> {
+  // POST to the compactions collection — bare {"request_status":"queued"} body,
+  // wrapped by request() into data (spec §8). 409 → ApiError (executor shows error_card).
+  return await post<{ request_status: string }>(base(sessionId), {});
 }

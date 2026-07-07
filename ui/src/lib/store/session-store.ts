@@ -19,6 +19,7 @@ import type {
   SupervisorSnapshot,
 } from "@/lib/api/types";
 import type { CompactionListItem } from "@/types/session-compaction";
+import type { LocalCommandCard } from "@/lib/commands/types";
 import { registerStoreResetter } from "@/lib/store/reset";
 import { useUIStore } from "@/lib/store/ui-store";
 import { normalizeSessionStatus } from "@/lib/utils/session-status";
@@ -134,6 +135,7 @@ type SessionActions = {
   recoverSession: (sessionId: string) => Promise<void>;
   retryFromSuspend: (sessionId: string) => Promise<void>;
   mergeCompactionList: (items: CompactionListItem[]) => void;
+  appendLocalCommandCard: (sessionId: string, card: LocalCommandCard) => void;
   // Phase 1 minimal subagent research
   getFilteredSessionsForList: () => ListSessionItem[];
   resetProbe: () => void;
@@ -1845,6 +1847,30 @@ export const useSessionStore = create<SessionStore>()(
           ...state,
           currentSession: { ...state.currentSession, events: next },
         };
+      });
+    },
+
+    appendLocalCommandCard: (sessionId: string, card: LocalCommandCard) => {
+      set((state) => {
+        if (!state.currentSession || state.currentSession.session_id !== sessionId) {
+          return {};
+        }
+        const existing = (state.currentSession.events ?? []) as SessionEventRecord[];
+        const synthetic: SessionEventRecord = {
+          event: "message",
+          data: {
+            role: card.role,
+            message: card.markdown,
+            // INV-B11-2: synthetic cards MUST NOT carry event_id or seq — they
+            // would poison the SSE replay cursor / provisional watermark (F3).
+            // stream_id carries a local-cmd- prefix + uuid for semantic-key dedup.
+            created_at: Math.floor(Date.now() / 1000),
+            attachments: [],
+            stream_id: `local-cmd-${card.commandName}-${card.role}-${crypto.randomUUID()}`,
+          },
+        };
+        const next = upsertSessionEvent(existing, synthetic);
+        return { ...state, currentSession: { ...state.currentSession, events: next } };
       });
     },
 

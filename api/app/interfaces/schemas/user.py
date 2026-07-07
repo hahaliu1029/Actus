@@ -35,6 +35,9 @@ class ToolWithPreference(BaseModel):
     description: Optional[str] = Field(None, description="工具描述")
     enabled_global: bool = Field(..., description="全局启用状态")
     enabled_user: bool = Field(..., description="用户个人启用状态")
+    slug: Optional[str] = Field(
+        None, description="Skill slug（仅 skill 分支填充，MCP/A2A 为 None）"
+    )
 
 
 class MCPToolListResponse(BaseModel):

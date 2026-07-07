@@ -9,6 +9,7 @@ type SessionStoreState = {
   uploadFile: ReturnType<typeof vi.fn>;
   stopSession: ReturnType<typeof vi.fn>;
   isSessionStreaming: ReturnType<typeof vi.fn>;
+  appendLocalCommandCard: ReturnType<typeof vi.fn>;
   isChatting: boolean;
   chatSessionId: string | null;
   currentSession: {
@@ -34,6 +35,7 @@ const sessionStoreState: SessionStoreState = {
       sessionStoreState.isChatting && sessionStoreState.chatSessionId === sessionId
     );
   }),
+  appendLocalCommandCard: vi.fn(),
   isChatting: false,
   chatSessionId: null,
   currentSession: null,
@@ -56,6 +58,18 @@ vi.mock("@/lib/store/ui-store", () => ({
     selector({
       setMessage: vi.fn(),
     }),
+}));
+
+vi.mock("@/lib/store/settings-store", () => ({
+  useSettingsStore: (selector: (state: {
+    agentConfig: null;
+    ensureAgentConfigLoaded: ReturnType<typeof vi.fn>;
+  }) => unknown) =>
+    selector({ agentConfig: null, ensureAgentConfigLoaded: vi.fn(async () => {}) }),
+}));
+
+vi.mock("@/lib/api/user-tools", () => ({
+  userToolsApi: { getSkillTools: vi.fn(async () => ({ tools: [] })) },
 }));
 
 const transferStoreState = {
@@ -93,6 +107,7 @@ describe("ChatInput", () => {
     sessionStoreState.uploadFile.mockClear();
     sessionStoreState.stopSession.mockClear();
     sessionStoreState.isSessionStreaming.mockClear();
+    sessionStoreState.appendLocalCommandCard.mockClear();
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;
     sessionStoreState.currentSession = null;

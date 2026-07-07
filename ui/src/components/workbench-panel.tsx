@@ -24,6 +24,7 @@ import {
   type WorkbenchMode,
   type WorkbenchSnapshot,
 } from "@/lib/session-ui";
+import { startTakeoverWithReopen } from "@/lib/session-takeover";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 import { useAuthStore } from "@/lib/store/auth-store";
@@ -427,10 +428,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
   const handleStartTakeover = async (scope: TakeoverScope) => {
     setTakeoverSubmitting(true);
     try {
-      if (status === "completed") {
-        await sessionApi.reopenTakeover(sessionId);
-      }
-      const result = await sessionApi.startTakeover(sessionId, { scope });
+      const result = await startTakeoverWithReopen(sessionId, scope, status);
       lockAndSwitchMode(scope === "browser" ? "browser" : "shell");
       await fetchSessionById(sessionId, { silent: true });
       setMessage({

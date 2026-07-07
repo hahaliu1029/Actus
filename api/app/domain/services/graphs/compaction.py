@@ -164,6 +164,60 @@ class CompactionResult:
     compaction_id: str | None = None
 
 
+def build_compaction_events(
+    result: "CompactionResult",
+    overflow_config: "ContextOverflowConfig | None",
+) -> "list[BaseEvent]":
+    """B11 §8: pure builder for compaction SSE events.
+
+    Extracted from AgentTaskRunner._build_compaction_events_if_any so both the
+    runner (normal path) and PlannerReActFlow (forced /compact path) build the
+    same [ContextStatusEvent, CompactionEvent] pair without duplicating logic.
+
+    Pure: does NOT read/write _last_compaction_result, does NOT touch metrics —
+    those side effects stay in each caller.
+    """
+    # Imports local to the function to avoid any import-cycle risk (mirrors the
+    # runner's defensive resolve_context_window import).
+    from app.domain.models.event import BaseEvent, CompactionEvent, ContextStatusEvent
+
+    context_window = 0
+    if overflow_config is not None:
+        try:
+            from app.domain.services.context.model_context_window import resolve_context_window
+            context_window = resolve_context_window(
+                overflow_config.model_name, overflow_config
+            )
+        except Exception as exc:  # pragma: no cover — defensive, mirrors runner
+            logger.warning("Failed to resolve context window for SSE event: %s", exc)
+            context_window = overflow_config.context_window or 0
+
+    soft_threshold = overflow_config.soft_trigger_ratio if overflow_config else 0.85
+    hard_threshold = overflow_config.hard_trigger_ratio if overflow_config else 0.95
+
+    events: "list[BaseEvent]" = [
+        ContextStatusEvent(
+            used_tokens=result.tokens_after,
+            context_window=context_window,
+            usage_ratio=result.usage_ratio_after,
+            soft_threshold=soft_threshold,
+            hard_threshold=hard_threshold,
+        )
+    ]
+    if result.level_applied > 0:
+        events.append(
+            CompactionEvent(
+                compaction_id=result.compaction_id,
+                level=result.level_applied,
+                tokens_before=result.tokens_before,
+                tokens_after=result.tokens_after,
+                messages_removed=result.messages_removed,
+                usage_ratio_after=result.usage_ratio_after,
+            )
+        )
+    return events
+
+
 # ── GradualCompactor ──────────────────────────────────────────────────────────
 
 _HARD_COMPACT_KEEP = 19  # number of non-system messages to keep in Level 3
@@ -218,6 +272,7 @@ class GradualCompactor:
         summary_llm: "BaseChatModel | None",
         *,
         config: dict | None = None,
+        force: bool = False,
     ) -> CompactionResult:
         """Route to the appropriate compaction level based on current token usage.
 
@@ -241,14 +296,34 @@ class GradualCompactor:
             usage_ratio,
         )
 
-        # No compaction needed
-        if usage_ratio < self._soft:
-            tokens_after = tokens_before
+        # B11 §8: a manual /compact with NO summary LLM must NEVER trigger the
+        # destructive Level-3 hard truncation — at ANY water level (this guard is
+        # BEFORE the Level 2/3 branching, not just under soft water). The
+        # automatic water-triggered path (force=False) still hard-truncates on
+        # real overflow; only the manual command is barred from destruction.
+        if force and summary_llm is None:
+            logger.info(
+                "forced /compact with no summary_llm at usage %.3f; skipping "
+                "(a manual command never hard-truncates)",
+                usage_ratio,
+            )
             return CompactionResult(
                 messages=tuple(messages),
                 level_applied=0,
                 tokens_before=tokens_before,
-                tokens_after=tokens_after,
+                tokens_after=tokens_before,
+                summary_injected=False,
+                messages_removed=0,
+                usage_ratio_after=usage_ratio,
+            )
+
+        # No compaction needed — unless a manual /compact forces it below soft water.
+        if usage_ratio < self._soft and not force:
+            return CompactionResult(
+                messages=tuple(messages),
+                level_applied=0,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
                 summary_injected=False,
                 messages_removed=0,
                 usage_ratio_after=usage_ratio,

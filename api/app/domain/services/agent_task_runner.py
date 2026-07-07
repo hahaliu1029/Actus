@@ -44,8 +44,6 @@ from app.domain.models.event import (
     A2AToolContent,
     BaseEvent,
     BrowserToolContent,
-    CompactionEvent,
-    ContextStatusEvent,
     ControlAction,
     ControlEvent,
     DoneEvent,
@@ -436,6 +434,7 @@ class AgentTaskRunner(TaskRunner):
         session_state_machine: Any = None,  # PE-0 Phase 7: SessionStateMachine | None
         policy_snapshot_sink: Any = None,  # C5a Seam B sink (forwarded into PlannerReActFlow)
         tool_filter: Optional[FrozenSet[str]] = None,  # Phase 1 minimal subagent: tool-name allowlist (None = no filter)
+        force_initial_compaction: bool = False,  # B11 §8: forward to PlannerReActFlow
         supervisor_registry: Optional[SupervisorRegistryPort] = None,  # C3 PR-3c: per-pod MailboxSupervisor registry (None when mailbox plane disabled)
         mailbox_supervisor_enabled: bool = False,  # C3 PR-3c: deployment-time flag mirror (false unless wired by application layer)
         mailbox_publisher: Optional[MailboxPublisher] = None,  # C3 PR-4.5: child-side envelope publisher (None when mailbox plane disabled or this runner is a root)
@@ -463,6 +462,10 @@ class AgentTaskRunner(TaskRunner):
         # legacy behavior"). See _build_lc_tools_full /
         # _build_available_tool_summary for application.
         self._tool_filter: Optional[FrozenSet[str]] = tool_filter
+        # B11 §8: forwarded into PlannerReActFlow so a pending manual /compact
+        # request forces a compaction pass at run start. Default False =
+        # legacy behavior (no forced compaction).
+        self._force_initial_compaction: bool = force_initial_compaction
         # C3 PR-3c — lifecycle hooks to spawn/stop the per-pod MailboxSupervisor
         # for THIS session iff this runner is for a root session AND the
         # deployment flag is enabled. Both default to None / False so existing
@@ -716,6 +719,7 @@ class AgentTaskRunner(TaskRunner):
             llm=llm,
             agent_config=agent_config,
             session_id=session_id,
+            force_initial_compaction=self._force_initial_compaction,  # B11 §8
             browser=browser,
             sandbox=sandbox,
             search_engine=search_engine,
@@ -3171,40 +3175,11 @@ class AgentTaskRunner(TaskRunner):
             return []
 
         overflow_config = getattr(self._flow, "_overflow_config", None)
-        context_window = 0
-        if overflow_config is not None:
-            try:
-                from app.domain.services.context.model_context_window import resolve_context_window
-                context_window = resolve_context_window(
-                    overflow_config.model_name, overflow_config
-                )
-            except Exception as exc:
-                logger.warning("Failed to resolve context window for SSE event: %s", exc)
-                context_window = overflow_config.context_window or 0
-
-        soft_threshold = overflow_config.soft_trigger_ratio if overflow_config else 0.85
-        hard_threshold = overflow_config.hard_trigger_ratio if overflow_config else 0.95
-
-        events: list[BaseEvent] = [
-            ContextStatusEvent(
-                used_tokens=compaction_result.tokens_after,
-                context_window=context_window,
-                usage_ratio=compaction_result.usage_ratio_after,
-                soft_threshold=soft_threshold,
-                hard_threshold=hard_threshold,
-            )
-        ]
+        from app.domain.services.graphs.compaction import build_compaction_events
+        events = build_compaction_events(compaction_result, overflow_config)
 
         if compaction_result.level_applied > 0:
-            events.append(CompactionEvent(
-                compaction_id=compaction_result.compaction_id,
-                level=compaction_result.level_applied,
-                tokens_before=compaction_result.tokens_before,
-                tokens_after=compaction_result.tokens_after,
-                messages_removed=compaction_result.messages_removed,
-                usage_ratio_after=compaction_result.usage_ratio_after,
-            ))
-            # D5: Track compaction count for metrics
+            # D5: Track compaction count for metrics (stays in runner)
             if self._flow:
                 _em = getattr(self._flow, "_execution_metrics", None)
                 if _em:

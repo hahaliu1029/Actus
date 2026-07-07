@@ -95,6 +95,7 @@ type SettingsState = {
 type SettingsActions = {
   reset: () => void;
   loadAll: () => Promise<void>;
+  ensureAgentConfigLoaded: () => Promise<void>;
   updateLLMConfig: (config: LLMConfig) => Promise<void>;
   updateAgentConfig: (config: AgentConfig) => Promise<void>;
   addMCPServer: (config: MCPConfig) => Promise<boolean>;
@@ -179,6 +180,9 @@ const initialState: SettingsState = {
   runtimeProbeCooldowns: {},
   runtimeItemNotices: {},
 };
+
+// B11 §10: single-flight guard for lazy agent-config load from ChatInput mount.
+let agentConfigInFlight: Promise<void> | null = null;
 
 function mergeOptimisticMCPServers(
   currentServers: MCPServersData["mcp_servers"],
@@ -272,6 +276,23 @@ export const useSettingsStore = create<SettingsStore>()(
     reset: () => {
       runtimeRequestSeq += 1;
       set(initialState);
+    },
+
+    ensureAgentConfigLoaded: async () => {
+      if (get().agentConfig) return; // already loaded
+      if (agentConfigInFlight) return agentConfigInFlight; // in-flight → dedupe
+      agentConfigInFlight = (async () => {
+        try {
+          const cfg = await configApi.getAgentConfig();
+          set({ agentConfig: cfg });
+        } catch {
+          // slash is enhancement-only: on failure stay OFF, retry on next mount.
+          // No auto-poll, no user-facing error (spec §10).
+        } finally {
+          agentConfigInFlight = null;
+        }
+      })();
+      return agentConfigInFlight;
     },
 
     loadAll: async () => {

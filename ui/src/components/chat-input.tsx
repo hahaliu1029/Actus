@@ -8,10 +8,19 @@ import type { FileInfo } from "@/lib/api/types";
 import { formatFileSize } from "@/lib/session-ui";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/lib/store/session-store";
+import { useSettingsStore } from "@/lib/store/settings-store";
 import { useUIStore } from "@/lib/store/ui-store";
 import { useTransferStore, selectHasActiveUploads } from "@/lib/store/transfer-store";
 import { TransferProgress } from "@/components/transfer-progress";
 import { Button } from "@/components/ui/button";
+import { userToolsApi } from "@/lib/api/user-tools"; // NOT config.ts — userToolsApi lives here (getSkillTools → ToolPreferenceListResponse{tools})
+import { BUILTIN_COMMANDS, mergeSkillCommands } from "@/lib/commands/registry";
+import { parseSlashCommand } from "@/lib/commands/parser";
+import { dispatchCommand } from "@/lib/commands/dispatcher";
+import { startTakeoverWithReopen } from "@/lib/session-takeover";
+import { CommandMenu, commandMenuQuery, shouldShowCommandMenu } from "@/components/command-menu";
+import type { CommandContext, CommandDef } from "@/lib/commands/types";
+import type { ToolWithPreference } from "@/lib/api/types";
 
 interface ChatInputProps {
   className?: string;
@@ -42,7 +51,18 @@ export function ChatInput({
   const stopSession = useSessionStore((state) => state.stopSession);
   const isSessionStreaming = useSessionStore((state) => state.isSessionStreaming);
   const currentSession = useSessionStore((state) => state.currentSession);
+  const appendLocalCommandCard = useSessionStore((state) => state.appendLocalCommandCard);
   const setMessage = useUIStore((state) => state.setMessage);
+
+  const slashEnabled = useSettingsStore(
+    (state) => state.agentConfig?.slash_commands?.enabled ?? false
+  );
+  const skillCommandsEnabled = useSettingsStore(
+    (state) => state.agentConfig?.slash_commands?.skill_commands_enabled ?? false
+  );
+  const ensureAgentConfigLoaded = useSettingsStore(
+    (state) => state.ensureAgentConfigLoaded
+  );
 
   const [text, setText] = useState("");
   const [pendingFiles, setPendingFiles] = useState<FileInfo[]>([]);
@@ -79,6 +99,39 @@ export function ChatInput({
     [allTransferTasks, sessionId]
   );
   const [taskIdByFileId, setTaskIdByFileId] = useState<Record<string, string>>({});
+
+  // B11: ensure the agent config (with slash_commands flags) is loaded on mount.
+  useEffect(() => {
+    void ensureAgentConfigLoaded();
+  }, [ensureAgentConfigLoaded]);
+
+  const [skillTools, setSkillTools] = useState<ToolWithPreference[]>([]);
+  useEffect(() => {
+    if (!slashEnabled || !skillCommandsEnabled) {
+      setSkillTools([]);
+      return;
+    }
+    let cancelled = false;
+    userToolsApi
+      .getSkillTools()
+      .then((res) => {
+        if (!cancelled) setSkillTools(res.tools);
+      })
+      .catch(() => {
+        if (!cancelled) setSkillTools([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [slashEnabled, skillCommandsEnabled]);
+
+  const commands = useMemo<readonly CommandDef[]>(
+    () =>
+      slashEnabled && skillCommandsEnabled
+        ? mergeSkillCommands(BUILTIN_COMMANDS, skillTools)
+        : BUILTIN_COMMANDS,
+    [slashEnabled, skillCommandsEnabled, skillTools]
+  );
 
   useEffect(() => {
     if (!draftText) {
@@ -200,45 +253,109 @@ export function ChatInput({
     }
   };
 
+  // Extracted normal send path (behavior-equivalent to the pre-B11 handleSubmit
+  // body). Used directly for the normal case AND as the dispatcher's sendNormal
+  // dependency (escaped / send_message channels route through here).
+  const sendNormal = async (messageText: string) => {
+    let targetSessionId = sessionId;
+    if (!targetSessionId) {
+      targetSessionId = await createSession();
+      bindTaskSession(undefined, targetSessionId);
+      router.push(`/sessions/${targetSessionId}`);
+    }
+    if (!targetSessionId) return;
+    await fetchSessionById(targetSessionId);
+    await fetchSessionFiles(targetSessionId);
+    await sendChat(targetSessionId, {
+      message: messageText || undefined,
+      attachments: pendingFiles.map((file) => file.id),
+    });
+    pendingFiles.forEach((file) => {
+      const tid = taskIdByFileId[file.id];
+      if (tid) removeTransferTask(tid);
+    });
+    setText("");
+    setPendingFiles([]);
+    setTaskIdByFileId({});
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+  };
+
+  const buildCommandContext = (): CommandContext => ({
+    sessionId: sessionId ?? null,
+    sessionStatus,
+    isAdmin: false, // menu/formatter-only hint; server is the authority (INV-B11-4)
+  });
+
   const handleSubmit = async () => {
     if (!text.trim() && pendingFiles.length === 0) {
       return;
     }
-
+    const rawText = text; // raw (untrimmed) — slash detection basis (§5.1b)
     const normalizedText = text.trim();
-
     try {
-      let targetSessionId = sessionId;
-      if (!targetSessionId) {
-        targetSessionId = await createSession();
-        bindTaskSession(undefined, targetSessionId);
-        router.push(`/sessions/${targetSessionId}`);
+      // B11: only intercept when flag ON and no attachments (attachments + slash
+      // command is a v1 non-goal; fall through to preserve attachments).
+      if (slashEnabled && pendingFiles.length === 0) {
+        const parsed = parseSlashCommand(rawText, commands);
+        if (parsed.type !== "not_command") {
+          setMenuOpen(false);
+          // P2 fix: a cold-opened session renders ChatInput before currentSession
+          // is fetched; the dispatcher's timeline channel would then silently drop
+          // the synthetic card (appendLocalCommandCard no-ops when currentSession is
+          // null/mismatched). Load it first so the card lands. No-cost when already loaded.
+          if (sessionId) {
+            const cur = useSessionStore.getState().currentSession;
+            if (!cur || cur.session_id !== sessionId) {
+              await fetchSessionById(sessionId, { silent: true });
+            }
+          }
+          await dispatchCommand(parsed, buildCommandContext(), {
+            rawInput: rawText,
+            appendCard: (sid, card) => {
+              const cur = useSessionStore.getState().currentSession;
+              if (cur && cur.session_id === sid) {
+                appendLocalCommandCard(sid, card);
+              } else {
+                // codex R2 P2: the cold-load pre-fetch is best-effort; if it failed
+                // (silent fetch swallows errors, currentSession stays null/mismatched),
+                // appendLocalCommandCard would no-op and the synthetic card would
+                // vanish. Fall back to the toast channel so a command result is never
+                // silently lost.
+                setMessage({ type: "info", text: card.markdown });
+              }
+            },
+            toast: (markdown) => setMessage({ type: "info", text: markdown }),
+            sendNormal,
+            runTakeover: async (scope) => {
+              const sid = sessionId ?? "";
+              let status = sessionStatus;
+              if (status === null && sid) {
+                // Cold-opened session: currentSession not loaded yet → sessionStatus
+                // is null → startTakeoverWithReopen would skip the completed→reopen
+                // step and the server 409s. Fetch first so it sees the real status.
+                await fetchSessionById(sid, { silent: true });
+                status = useSessionStore.getState().currentSession?.status ?? null;
+              }
+              await startTakeoverWithReopen(sid, scope, status);
+              await fetchSessionById(sid, { silent: true });
+            },
+          });
+          if (parsed.type !== "escaped") {
+            // escaped/not_command already routed via sendNormal (which clears);
+            // command/usage_error clear the input here.
+            setText("");
+          }
+          return;
+        }
+        // not_command → fall through to the normal path below (INV-B11-3).
+        // Deliberately NOT routed through dispatchCommand: this path sends
+        // normalizedText (TRIMMED), so " /mcp" / "/tmp/x" match flag-OFF byte-for-byte.
+        // The dispatcher's not_command branch sends rawInput (untrimmed) and must stay
+        // unreachable from here — Task 19's flag-ON golden locks the trimmed payload.
       }
-
-      if (!targetSessionId) {
-        return;
-      }
-
-      await fetchSessionById(targetSessionId);
-      await fetchSessionFiles(targetSessionId);
-
-      await sendChat(targetSessionId, {
-        message: normalizedText || undefined,
-        attachments: pendingFiles.map((file) => file.id),
-      });
-
-      // Clean up completed upload tasks from store
-      pendingFiles.forEach((file) => {
-        const tid = taskIdByFileId[file.id];
-        if (tid) removeTransferTask(tid);
-      });
-
-      setText("");
-      setPendingFiles([]);
-      setTaskIdByFileId({});
-      requestAnimationFrame(() => {
-        textareaRef.current?.focus();
-      });
+      await sendNormal(normalizedText);
     } catch (error) {
       setMessage({
         type: "error",
@@ -291,6 +408,44 @@ export function ChatInput({
     isTakeoverActive ||
     hasToolConfirmationPending;
   const canSubmit = Boolean(text.trim()) || pendingFiles.length > 0;
+
+  // B11 command menu state. Placed AFTER disableInput (showMenu reads it) and after
+  // buildCommandContext (fillCommand calls it) to avoid a render-init TDZ.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [highlightIndex, setHighlightIndex] = useState(0);
+
+  // `pendingFiles.length === 0` mirrors handleSubmit's intercept gate: when an
+  // attachment is pending, slash is treated as plain text (Deviation #4 fall-through),
+  // so the menu must NOT open and hijack Enter — otherwise Enter would autocomplete
+  // the command instead of sending the attachment-carrying message. Keeps menu +
+  // submit paths consistent (spec §10 "带附件消息" golden).
+  const showMenu =
+    menuOpen &&
+    shouldShowCommandMenu(text, slashEnabled) &&
+    !disableInput &&
+    pendingFiles.length === 0;
+  const menuQuery = commandMenuQuery(text);
+  const menuCommands = useMemo(
+    () => commands.filter((c) => c.name.startsWith(menuQuery)),
+    [commands, menuQuery]
+  );
+  const highlightedName = menuCommands[highlightIndex]?.name ?? "";
+
+  useEffect(() => {
+    setMenuOpen(shouldShowCommandMenu(text, slashEnabled));
+    setHighlightIndex(0);
+  }, [text, slashEnabled]);
+
+  const fillCommand = (command: CommandDef) => {
+    // Single availability guard for BOTH mouse (CommandMenu onSelect) and keyboard
+    // (Enter/Tab) — greyed commands (e.g. /cost with no session) are never fillable.
+    if (command.isAvailable && !command.isAvailable(buildCommandContext())) {
+      return;
+    }
+    setText(`/${command.name} `);
+    setMenuOpen(false);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
 
   const handleStopTask = async () => {
     if (!sessionId) {
@@ -430,31 +585,76 @@ export function ChatInput({
         </div>
       ) : null}
 
-      <textarea
-        ref={textareaRef}
-        rows={1}
-        value={text}
-        disabled={disableInput}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
-            return;
+      <div className="relative">
+        {showMenu ? (
+          <CommandMenu
+            commands={commands}
+            ctx={buildCommandContext()}
+            query={menuQuery}
+            highlightedName={highlightedName}
+            onSelect={fillCommand}
+          />
+        ) : null}
+        <textarea
+          ref={textareaRef}
+          rows={1}
+          value={text}
+          disabled={disableInput}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            // IME composition: never intercept (unchanged).
+            if (event.nativeEvent.isComposing) {
+              return;
+            }
+            // B11: while the menu is open, Arrow/Escape are handled here and Tab
+            // autocompletes the highlighted command. Enter is DELIBERATELY not
+            // captured — it falls through to the original Enter-submit path below so
+            // that: an exact command dispatches on ONE Enter (not autocomplete-then-
+            // dispatch), a not_command prefix (e.g. "/h") routes as a normal message
+            // (INV-B11-3), and a requiresSession command with no session lets the
+            // dispatcher's own guard toast real feedback instead of a dead no-op.
+            if (showMenu && menuCommands.length > 0) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setHighlightIndex((i) => (i + 1) % menuCommands.length);
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setHighlightIndex((i) => (i - 1 + menuCommands.length) % menuCommands.length);
+                return;
+              }
+              if (event.key === "Tab") {
+                event.preventDefault();
+                fillCommand(menuCommands[highlightIndex]);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setMenuOpen(false);
+                return;
+              }
+            }
+            // Original Enter-submit — behavior-equivalent when menu closed (INV-B11-1).
+            if (event.key !== "Enter" || event.shiftKey) {
+              return;
+            }
+            event.preventDefault();
+            if (disableInput) {
+              return;
+            }
+            void handleSubmit();
+          }}
+          placeholder={
+            isBackgroundSuspended
+              ? "后台任务已挂起，请先重试后台任务"
+              : isTakeoverActive
+                ? "接管中，暂不支持发送消息"
+                : "分配一个任务或提问任何问题..."
           }
-          event.preventDefault();
-          if (disableInput) {
-            return;
-          }
-          void handleSubmit();
-        }}
-        placeholder={
-          isBackgroundSuspended
-            ? "后台任务已挂起，请先重试后台任务"
-            : isTakeoverActive
-              ? "接管中，暂不支持发送消息"
-              : "分配一个任务或提问任何问题..."
-        }
-        className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
-      />
+          className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
+        />
+      </div>
 
       <div className="mt-2 flex items-center justify-between px-1">
         <button

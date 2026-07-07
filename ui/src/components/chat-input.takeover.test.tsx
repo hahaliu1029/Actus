@@ -19,8 +19,21 @@ vi.mock("@/lib/store/session-store", () => ({
       uploadFile: vi.fn(),
       stopSession: vi.fn(),
       isSessionStreaming: () => false,
+      appendLocalCommandCard: vi.fn(),
       currentSession: mockCurrentSession,
     }),
+}));
+
+vi.mock("@/lib/store/settings-store", () => ({
+  useSettingsStore: (selector: (state: {
+    agentConfig: null;
+    ensureAgentConfigLoaded: ReturnType<typeof vi.fn>;
+  }) => unknown) =>
+    selector({ agentConfig: null, ensureAgentConfigLoaded: vi.fn(async () => {}) }),
+}));
+
+vi.mock("@/lib/api/user-tools", () => ({
+  userToolsApi: { getSkillTools: vi.fn(async () => ({ tools: [] })) },
 }));
 
 vi.mock("@/lib/store/ui-store", () => ({
