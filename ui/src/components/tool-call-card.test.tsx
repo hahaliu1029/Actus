@@ -269,6 +269,59 @@ describe("render_style 分派 + 8 行截断 + 三层独立 (R8#4/R10#9)", () => 
     }
   );
 
+  it("document + thumbnail → 缩略图, 点击回调预览", () => {
+    const { onPreviewImage } = renderCard(
+      makeEnvelope({
+        status: "called",
+        render_style: "document",
+        function_result: result("ok", {
+          data: {
+            document_preview: {
+              filename: "r.pdf",
+              media_type: "application/pdf",
+              page_count: 3,
+              thumbnail: { url: "/files/p0.jpg", media_type: "image/jpeg", page: 0 },
+            },
+          },
+        }),
+      })
+    );
+    fireEvent.click(screen.getByRole("img"));
+    expect(onPreviewImage).toHaveBeenCalled();
+  });
+
+  it("document 无 thumbnail → PDF 图标卡（文件名 + 页数）", () => {
+    renderCard(
+      makeEnvelope({
+        status: "called",
+        render_style: "document",
+        function_result: result("ok", {
+          data: {
+            document_preview: {
+              filename: "report.pdf",
+              media_type: "application/pdf",
+              page_count: 12,
+              thumbnail: null,
+            },
+          },
+        }),
+      })
+    );
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    expect(screen.getByText(/12/)).toBeInTheDocument();
+  });
+
+  it("document 缺 document_preview → 文本降级 (fallback 保留)", () => {
+    renderCard(
+      makeEnvelope({
+        status: "called",
+        render_style: "document",
+        function_result: result("ok", { message: "extracted text", data: null }),
+      })
+    );
+    expect(screen.getByText("extracted text")).toBeInTheDocument();
+  });
+
   it("render_style null → 不新增结果区 (现状渲染等价)", () => {
     renderCard(
       makeEnvelope({

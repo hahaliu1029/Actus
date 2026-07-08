@@ -36,6 +36,7 @@ from app.domain.models.tool_result import (
     Asked,
     DecisionReason,
     Denied,
+    DocumentPreview,
     FileBlock,
     FilePayload,
     ImageUrlBlock,
@@ -218,6 +219,26 @@ FIXTURES: list[tuple[str, ToolArtifact]] = [
                             )
                         )
                     ]
+                ),
+            ),
+        ),
+    ),
+    (
+        "native_passthrough_pdf_docpreview.json",
+        ToolArtifact(
+            tool_call_id="n_pdf_dp",
+            tool_name="file_view",
+            tool_source=NATIVE_FILE,
+            outcome=Passthrough(
+                content="[PDF: report.pdf, 3 pages]",
+                data=MultimodalPayload(
+                    blocks=[
+                        FileBlock(file=FilePayload(
+                            filename="report.pdf",
+                            file_data="data:application/pdf;base64,JVBERi..."))
+                    ],
+                    document_preview=DocumentPreview(
+                        filename="report.pdf", media_type="application/pdf", page_count=3),
                 ),
             ),
         ),
@@ -423,8 +444,8 @@ FIXTURES: list[tuple[str, ToolArtifact]] = [
 
 
 def main() -> None:
-    assert len(FIXTURES) == 23, (
-        f"Expected 23 fixtures, got {len(FIXTURES)} — update the FIXTURES "
+    assert len(FIXTURES) == 24, (
+        f"Expected 24 fixtures, got {len(FIXTURES)} — update the FIXTURES "
         f"list in tests/golden/r2_tool_outcome_matrix/_generate_fixtures.py"
     )
     for fname, artifact in FIXTURES:

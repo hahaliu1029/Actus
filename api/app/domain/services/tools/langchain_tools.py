@@ -720,6 +720,33 @@ _EXT_MIME_MAP = {
 }
 
 
+_FILE_VIEW_CACHE_VERSION = 1  # bump when processor output shape changes
+
+
+async def _stat_file_for_cache(sandbox: SandboxHandle, filepath: str) -> dict | None:
+    """B12 P3: argv-style os.stat（免 shell 注入 + ns 精度）。失败 → None → cache bypass。"""
+    import json as _json
+
+    script = (
+        "import os,sys,json;"
+        "s=os.stat(sys.argv[1]);"
+        "print(json.dumps({"
+        "'realpath':os.path.realpath(sys.argv[1]),"
+        "'size':s.st_size,'mtime_ns':s.st_mtime_ns,'ctime_ns':s.st_ctime_ns,"
+        "'dev':s.st_dev,'ino':s.st_ino}))"
+    )
+    try:
+        result = await sandbox.exec_command(
+            "default", "", f"python3 -c {shlex.quote(script)} {shlex.quote(filepath)}"
+        )
+        if (hasattr(result, "data") and isinstance(result.data, dict)
+                and result.data.get("returncode") == 0):
+            return _json.loads((result.data.get("output") or "").strip())
+    except Exception:
+        pass
+    return None
+
+
 def _make_file_view_tools(
     sandbox: SandboxHandle,
     processor_lookup: FileProcessorLookup,
@@ -727,6 +754,8 @@ def _make_file_view_tools(
     supports_pdf_input: bool = False,
     *,
     file_view_media_type_enabled: bool = False,
+    file_view_image_cache_enabled: bool = False,
+    document_preview_enabled: bool = False,
 ) -> list[StructuredTool]:
     """Create file_view tool for multimodal file understanding."""
 
@@ -795,19 +824,38 @@ def _make_file_view_tools(
             )
             return outcome.content, outcome
 
-        # 3. Process file — tool_node splits: text → ToolMessage, image_blocks → HumanMessage
+        # 3. Process file (with optional B12 P3 session-scoped cache)
+        # tool_node splits: text → ToolMessage, image_blocks → HumanMessage
         filename = filepath.rsplit("/", 1)[-1]
-        try:
-            result = await processor.process(
-                sandbox_path=filepath,
-                filename=filename,
-                mime_type=mime_type,
-                supports_vision=supports_vision,
-                supports_pdf_input=supports_pdf_input,
-            )
-        except Exception as exc:
-            outcome = _exception_outcome("file_view", exc)
-            return outcome.content, outcome
+        _cache_key = None
+        result = None
+        if file_view_image_cache_enabled and hasattr(processor_lookup, "cache_get"):
+            _stat = await _stat_file_for_cache(sandbox, filepath)
+            if _stat is not None:
+                _cache_key = (
+                    getattr(sandbox, "generation", None),
+                    _stat.get("realpath"), _stat.get("size"), _stat.get("mtime_ns"),
+                    _stat.get("ctime_ns"),  # PR-3 codex R1#P2: ctime 无法被 os.utime 回拨 → 防 mtime-restore stale-hit
+                    _stat.get("dev"), _stat.get("ino"), mime_type,
+                    supports_vision, supports_pdf_input, _FILE_VIEW_CACHE_VERSION,
+                )
+                result = processor_lookup.cache_get(_cache_key)  # None on miss
+        if result is None:
+            import time as _time
+            _process_start = _time.time()
+            try:
+                result = await processor.process(
+                    sandbox_path=filepath,
+                    filename=filename,
+                    mime_type=mime_type,
+                    supports_vision=supports_vision,
+                    supports_pdf_input=supports_pdf_input,
+                )
+            except Exception as exc:
+                outcome = _exception_outcome("file_view", exc)
+                return outcome.content, outcome
+            if _cache_key is not None and hasattr(processor_lookup, "cache_put"):
+                processor_lookup.cache_put(_cache_key, result, _process_start)
 
         typed_blocks = [
             _multimodal_block_from_dict(block)
@@ -826,6 +874,9 @@ def _make_file_view_tools(
                     blocks=typed_blocks,
                     media_type=(
                         result.media_type if file_view_media_type_enabled else None
+                    ),
+                    document_preview=(
+                        result.document_preview if document_preview_enabled else None
                     ),
                 ),
             )
@@ -856,6 +907,8 @@ def create_native_tools(
     supervisor: Any | None = None,
     *,
     file_view_media_type_enabled: bool = False,
+    file_view_image_cache_enabled: bool = False,
+    document_preview_enabled: bool = False,
 ) -> list[BaseTool]:
     """Create all native LangChain tools.
 
@@ -872,6 +925,8 @@ def create_native_tools(
         tools.extend(_make_file_view_tools(
             sandbox, processor_lookup, supports_vision, supports_pdf_input,
             file_view_media_type_enabled=file_view_media_type_enabled,
+            file_view_image_cache_enabled=file_view_image_cache_enabled,
+            document_preview_enabled=document_preview_enabled,
         ))
     tools.extend(_make_shell_tools(sandbox))
     tools.extend(_make_browser_tools(browser))

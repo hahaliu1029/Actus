@@ -2231,6 +2231,8 @@ class AgentTaskRunner(TaskRunner):
                 memory_mount_scope=self._build_memory_mount_scope(),
                 supervisor=self._execution_supervisor,
                 file_view_media_type_enabled=self._tool_runtime.file_view_media_type_enabled,
+                file_view_image_cache_enabled=self._tool_runtime.file_view_image_cache_enabled,
+                document_preview_enabled=self._tool_runtime.document_preview_enabled,
             )
         )
 

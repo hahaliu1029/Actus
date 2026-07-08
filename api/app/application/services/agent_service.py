@@ -510,6 +510,7 @@ class AgentService:
                 vision_model=snap.vision_fallback_model,
                 audio_config=snap.file_understanding_config.audio,
                 video_config=snap.file_understanding_config.video,
+                pdf_page_parallel_enabled=snap.tool_runtime.pdf_page_parallel_enabled,
             )
 
         # R5b-4 (cleanup): ApprovalCache 已被 ApprovalStateReader (R5b-2) +

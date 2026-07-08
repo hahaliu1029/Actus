@@ -22,7 +22,7 @@ import {
   toDisplayImageUrl,
   toSearchThumbnail,
 } from "@/components/tool-visual";
-import type { ToolEventEnvelopeV1 } from "@/lib/api/types";
+import type { DocumentPreview, ToolEventEnvelopeV1 } from "@/lib/api/types";
 import { resolveToolDisplay } from "@/lib/tool-display";
 import { cn } from "@/lib/utils";
 
@@ -51,6 +51,30 @@ function extractImageUrls(
     }
   }
   return urls;
+}
+
+// B12 Task 5.6: render_style==="document" 时从 FunctionResultV1.data 里解析
+// document_preview。纯 unknown + type guard（禁 any），非法/缺字段一律降级 null。
+function parseDocumentPreview(data: unknown): DocumentPreview | null {
+  if (!data || typeof data !== "object") return null;
+  const dp = (data as Record<string, unknown>).document_preview;
+  if (!dp || typeof dp !== "object") return null;
+  const o = dp as Record<string, unknown>;
+  if (typeof o.filename !== "string" || typeof o.media_type !== "string") return null;
+  let thumbnail: DocumentPreview["thumbnail"] = null;
+  const t = o.thumbnail;
+  if (t && typeof t === "object") {
+    const to = t as Record<string, unknown>;
+    if (typeof to.url === "string" && typeof to.media_type === "string" && typeof to.page === "number") {
+      thumbnail = { url: to.url, media_type: to.media_type, page: to.page };
+    }
+  }
+  return {
+    filename: o.filename,
+    media_type: o.media_type,
+    page_count: typeof o.page_count === "number" ? o.page_count : null,
+    thumbnail,
+  };
 }
 
 function TruncatedResultBlock({
@@ -143,9 +167,9 @@ export function ToolCallCard({
     );
   }
 
-  // render_style 分派 (§5.2, 本期 text/code/image — spec §1 目标 1):
-  // code → 等宽 8 行截断块; text → 非等宽 8 行截断块;
-  // table/document → text 降级 (B12, R1#2: 降级后 message 必须可见);
+  // render_style 分派 (§5.2, 本期 text/code/image/document):
+  // code → 等宽 8 行截断块; text → 非等宽 8 行截断块; table → text 降级;
+  // document → 缩略图卡 / PDF 图标卡 / 文本降级 (B12 Task 5.6, R1#2: 降级后 message 必须可见);
   // image → result_blocks 缩略图; null → 现状渲染 (visual 产物), 不新增结果区.
   let styledResult: ReactElement | null = null;
   if (!isRunning && !isError && !denied) {
@@ -181,10 +205,48 @@ export function ToolCallCard({
           </div>
         );
       }
+    } else if (data.render_style === "document") {
+      const preview = parseDocumentPreview(data.function_result?.data);
+      if (preview?.thumbnail) {
+        styledResult = (
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="overflow-hidden rounded-lg border border-border"
+              onClick={() =>
+                onPreviewImage(toDisplayImageUrl(preview.thumbnail!.url), preview.filename)
+              }
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={toDisplayImageUrl(preview.thumbnail.url)}
+                alt={preview.filename}
+                className="h-24 w-36 object-cover"
+              />
+            </button>
+          </div>
+        );
+      } else if (preview) {
+        styledResult = (
+          <div className="mt-2 flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+            <span aria-hidden>📄</span>
+            <span className="font-medium">{preview.filename}</span>
+            {preview.page_count != null && (
+              <span className="text-muted-foreground">· {preview.page_count} 页</span>
+            )}
+          </div>
+        );
+      } else if (resultMessage) {
+        styledResult = (
+          <TruncatedResultBlock
+            text={resultMessage}
+            expanded={resultExpanded}
+            onToggle={() => setResultExpanded(!resultExpanded)}
+          />
+        );
+      }
     } else if (
-      (data.render_style === "text" ||
-        data.render_style === "table" ||
-        data.render_style === "document") &&
+      (data.render_style === "text" || data.render_style === "table") &&
       resultMessage
     ) {
       styledResult = (

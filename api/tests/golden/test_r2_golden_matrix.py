@@ -54,8 +54,8 @@ def _all_fixture_files() -> list[Path]:
 
 def test_22_fixtures_present():
     files = _all_fixture_files()
-    assert len(files) == 23, (
-        f"Expected 23 golden fixtures in {FIXTURE_DIR}, found {len(files)}: "
+    assert len(files) == 24, (
+        f"Expected 24 golden fixtures in {FIXTURE_DIR}, found {len(files)}: "
         f"{sorted(f.name for f in files)}"
     )
 

@@ -1,0 +1,30 @@
+{
+  "tool_call_id": "n_pdf_dp",
+  "tool_name": "file_view",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "outcome": {
+    "variant": "passthrough",
+    "content": "[PDF: report.pdf, 3 pages]",
+    "data": {
+      "blocks": [
+        {
+          "type": "file",
+          "file": {
+            "filename": "report.pdf",
+            "file_data": "data:application/pdf;base64,JVBERi..."
+          }
+        }
+      ],
+      "document_preview": {
+        "filename": "report.pdf",
+        "media_type": "application/pdf",
+        "page_count": 3,
+        "thumbnail": null
+      }
+    }
+  }
+}

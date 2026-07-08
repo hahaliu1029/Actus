@@ -246,6 +246,69 @@ class TestFunctionResultFromOutcome:
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz", "detail": "auto"}},
         ]
 
+    def test_passthrough_document_preview_projected_to_data(self) -> None:
+        from app.domain.models.tool_result import (
+            DocumentPreview, FileBlock, FilePayload,
+        )
+        outcome = Passthrough(
+            content="[PDF]",
+            data=MultimodalPayload(
+                blocks=[FileBlock(file=FilePayload(
+                    filename="r.pdf", file_data="data:application/pdf;base64,abc"))],
+                document_preview=DocumentPreview(
+                    filename="r.pdf", media_type="application/pdf", page_count=3),
+            ),
+        )
+        fr = _function_result_from_outcome(outcome)
+        assert fr.data["document_preview"]["filename"] == "r.pdf"
+        assert fr.data["document_preview"]["page_count"] == 3
+
+    def test_native_pdf_base64_stripped_when_preview_present(self) -> None:
+        from app.domain.models.tool_result import (
+            DocumentPreview, FileBlock, FilePayload,
+        )
+        outcome = Passthrough(
+            content="[PDF]",
+            data=MultimodalPayload(
+                blocks=[FileBlock(file=FilePayload(
+                    filename="r.pdf", file_data="data:application/pdf;base64,BIGB64"))],
+                document_preview=DocumentPreview(
+                    filename="r.pdf", media_type="application/pdf", page_count=3),
+            ),
+        )
+        fr = _function_result_from_outcome(outcome)
+        assert fr.result_blocks == []  # native PDF base64 stripped from FE wire
+
+    def test_result_blocks_unchanged_without_preview(self) -> None:
+        from app.domain.models.tool_result import FileBlock, FilePayload
+        outcome = Passthrough(
+            content="[PDF]",
+            data=MultimodalPayload(blocks=[FileBlock(file=FilePayload(
+                filename="r.pdf", file_data="data:application/pdf;base64,abc"))]),
+        )
+        fr = _function_result_from_outcome(outcome)
+        assert len(fr.result_blocks) == 1  # no preview → not stripped (今日行为)
+
+    def test_mixed_keeps_image_strips_pdf(self) -> None:
+        from app.domain.models.tool_result import (
+            DocumentPreview, FileBlock, FilePayload,
+        )
+        outcome = Passthrough(
+            content="[PDF]",
+            data=MultimodalPayload(
+                blocks=[
+                    ImageUrlBlock(image_url=ImageUrlPayload(url="https://s/p0.jpg")),
+                    FileBlock(file=FilePayload(
+                        filename="r.pdf", file_data="data:application/pdf;base64,x")),
+                ],
+                document_preview=DocumentPreview(
+                    filename="r.pdf", media_type="application/pdf", page_count=1),
+            ),
+        )
+        fr = _function_result_from_outcome(outcome)
+        assert len(fr.result_blocks) == 1
+        assert fr.result_blocks[0]["type"] == "image_url"
+
     def test_asked_triggers_assertion_error(self) -> None:
         """Asked 走独立 ToolConfirmationEvent, projector 不应收到."""
         outcome = Asked(
@@ -315,6 +378,17 @@ class TestDeriveRenderStyle:
             blocks=[ImageUrlBlock(image_url=ImageUrlPayload(url="data:image/png;base64,x"))],
         )
         assert _derive_render_style_from_passthrough(payload) == ("image", None)
+
+    def test_document_preview_forces_render_style_document(self) -> None:
+        """extraction PDF 只有 image_blocks，但 document_preview 存在 → 强制 document。"""
+        from app.domain.models.tool_result import DocumentPreview, DocumentThumbnail
+        payload = MultimodalPayload(
+            blocks=[ImageUrlBlock(image_url=ImageUrlPayload(url="https://s/p0.jpg"))],
+            document_preview=DocumentPreview(
+                filename="r.pdf", media_type="application/pdf", page_count=1,
+                thumbnail=DocumentThumbnail(url="https://s/p0.jpg", media_type="image/jpeg", page=0)),
+        )
+        assert _derive_render_style_from_passthrough(payload) == ("document", "application/pdf")
 
     def test_non_passthrough_outcome_returns_none_none(self) -> None:
         outcome = AllowSuccess(content="ok")

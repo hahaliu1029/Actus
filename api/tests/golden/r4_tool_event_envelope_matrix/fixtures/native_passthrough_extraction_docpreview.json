@@ -1,0 +1,30 @@
+{
+  "type": "tool",
+  "id": "evt-golden-native-extraction-docpreview",
+  "created_at": "2026-04-16T12:00:00+00:00",
+  "tool_call_id": "c_native_edp",
+  "tool_name": "file",
+  "function_name": "file_view",
+  "function_args": {"path": "/workspace/scan.pdf"},
+  "status": "called",
+  "tool_source": {"source": "native", "category": "file", "canonical_name": "file_view"},
+  "artifact": {
+    "tool_call_id": "c_native_edp",
+    "tool_name": "file_view",
+    "tool_source": {"source": "native", "category": "file", "canonical_name": "file_view"},
+    "outcome": {
+      "variant": "passthrough",
+      "content": "[PDF: scan.pdf, 1 pages]",
+      "data": {
+        "blocks": [
+          {"type": "image_url", "image_url": {"url": "https://minio/scan_p0.jpg", "detail": "auto"}}
+        ],
+        "media_type": "application/pdf",
+        "document_preview": {
+          "filename": "scan.pdf", "media_type": "application/pdf", "page_count": 1,
+          "thumbnail": {"url": "https://minio/scan_p0.jpg", "media_type": "image/jpeg", "page": 0}
+        }
+      }
+    }
+  }
+}

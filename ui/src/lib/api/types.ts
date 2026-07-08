@@ -526,6 +526,21 @@ export type FunctionResultV1 = {
   result_blocks?: Array<Record<string, unknown>> | null;
 };
 
+// B12 Task 5.3/5.6: document_preview 载荷放在 FunctionResultV1.data 里，
+// 当 render_style === "document" 时由后端投放；FE 用 parseDocumentPreview 守卫解析。
+export type DocumentThumbnail = {
+  url: string;
+  media_type: string;
+  page: number;
+};
+
+export type DocumentPreview = {
+  filename: string;
+  media_type: string;
+  page_count: number | null;
+  thumbnail: DocumentThumbnail | null;
+};
+
 export type RenderStyle = "text" | "code" | "table" | "image" | "document";
 
 export type ToolSource = {

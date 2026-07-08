@@ -37,3 +37,24 @@ class TestFileProcessorRegistry:
         # May be None (ImportError) or PdfFileProcessor — just ensure no crash
         if proc is not None:
             assert type(proc).__name__ == "PdfFileProcessor"
+
+
+def test_registry_threads_pdf_parallel_flag_to_processor() -> None:
+    from unittest.mock import AsyncMock
+    from app.infrastructure.external.file_processors.registry import FileProcessorRegistry
+    from app.infrastructure.external.file_processors.pdf import PdfFileProcessor
+
+    reg = FileProcessorRegistry(
+        sandbox=AsyncMock(), file_uploader=AsyncMock(), pdf_page_parallel_enabled=True,
+    )
+    pdf_proc = reg.get_processor("application/pdf")
+    assert isinstance(pdf_proc, PdfFileProcessor)
+    assert pdf_proc._page_parallel_enabled is True
+
+
+def test_registry_pdf_parallel_flag_defaults_off() -> None:
+    from unittest.mock import AsyncMock
+    from app.infrastructure.external.file_processors.registry import FileProcessorRegistry
+
+    reg = FileProcessorRegistry(sandbox=AsyncMock(), file_uploader=AsyncMock())
+    assert reg.get_processor("application/pdf")._page_parallel_enabled is False

@@ -341,6 +341,50 @@ class TestExtractionPath:
         # exec_command should not have been called for extraction (only possibly cleanup)
         sandbox.write_file.assert_not_called()
 
+    def test_parallel_renders_complex_pages_in_order(self):
+        """P4: page_parallel_enabled=True → 并行渲染 2 复杂页，产 2 image_blocks。"""
+        pages = [{"text": "![c0](a.png)"}, {"text": "![c1](b.png)"}]  # 短页+图 → complex
+        sandbox = _make_sandbox(
+            file_bytes=_VALID_PDF_HEADER,
+            exec_results=[
+                _make_exec_result(0, self._make_page_output(pages)),  # extraction
+                _make_exec_result(0, ""),                             # render (rc=0)
+                _make_exec_result(0, ""),                             # cleanup
+            ],
+        )
+        proc = PdfFileProcessor(
+            sandbox=sandbox,
+            file_uploader=_make_uploader("https://storage/page.jpg"),
+            page_parallel_enabled=True,
+        )
+        result = _run(
+            proc.process("/tmp/t.pdf", "t.pdf", "application/pdf",
+                         supports_vision=True, supports_pdf_input=False)
+        )
+        assert len(result.image_blocks) == 2
+        assert all(b["type"] == "image_url" for b in result.image_blocks)
+
+    def test_parallel_partial_upload_failure_degrades_that_page(self):
+        """P4: 一页上传失败（url=None）→ 只少该页 image block，剩 1 个。"""
+        from unittest.mock import AsyncMock
+        pages = [{"text": "![c0](a.png)"}, {"text": "![c1](b.png)"}]
+        sandbox = _make_sandbox(
+            file_bytes=_VALID_PDF_HEADER,
+            exec_results=[
+                _make_exec_result(0, self._make_page_output(pages)),
+                _make_exec_result(0, ""),
+                _make_exec_result(0, ""),
+            ],
+        )
+        # 一次成功一次 None（并行下顺序不确定，但成功计数确定 = 1）
+        uploader = AsyncMock(side_effect=["https://storage/ok.jpg", None])
+        proc = PdfFileProcessor(sandbox=sandbox, file_uploader=uploader, page_parallel_enabled=True)
+        result = _run(
+            proc.process("/tmp/t.pdf", "t.pdf", "application/pdf",
+                         supports_vision=True, supports_pdf_input=False)
+        )
+        assert len(result.image_blocks) == 1
+
 
 def test_native_path_sets_media_type():
     sandbox = _make_sandbox(
@@ -352,3 +396,33 @@ def test_native_path_sets_media_type():
                                supports_vision=True, supports_pdf_input=True))
     assert result.media_type == "application/pdf"
     assert result.document_blocks  # native path produced a file block
+
+
+def test_native_path_fills_document_preview_no_thumbnail():
+    sandbox = _make_sandbox(file_bytes=_VALID_PDF_HEADER, exec_results=[_make_exec_result(0, "7")])
+    proc = PdfFileProcessor(sandbox=sandbox, file_uploader=_make_uploader())
+    result = _run(proc.process("/tmp/r.pdf", "r.pdf", "application/pdf",
+                               supports_vision=True, supports_pdf_input=True))
+    assert result.document_preview is not None
+    assert result.document_preview.filename == "r.pdf"
+    assert result.document_preview.page_count == 7
+    assert result.document_preview.thumbnail is None
+
+
+def test_extraction_path_fills_document_preview_thumbnail():
+    import json as _json
+    pages = [{"text": "![c0](a.png)"}]  # 1 complex page → rendered
+    sandbox = _make_sandbox(
+        file_bytes=_VALID_PDF_HEADER,
+        exec_results=[
+            _make_exec_result(0, _json.dumps(pages)),
+            _make_exec_result(0, ""),
+            _make_exec_result(0, ""),
+        ],
+    )
+    proc = PdfFileProcessor(sandbox=sandbox, file_uploader=_make_uploader("https://s/p0.jpg"))
+    result = _run(proc.process("/tmp/t.pdf", "t.pdf", "application/pdf",
+                               supports_vision=True, supports_pdf_input=False))
+    assert result.document_preview is not None
+    assert result.document_preview.thumbnail is not None
+    assert result.document_preview.thumbnail.url == "https://s/p0.jpg"

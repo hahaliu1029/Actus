@@ -472,6 +472,12 @@ class PlannerReActFlow(BaseFlow):
             file_view_media_type_enabled=getattr(
                 self._tool_runtime, "file_view_media_type_enabled", False
             ),
+            file_view_image_cache_enabled=getattr(
+                self._tool_runtime, "file_view_image_cache_enabled", False
+            ),
+            document_preview_enabled=getattr(
+                self._tool_runtime, "document_preview_enabled", False
+            ),
         )
 
     def _build_memory_mount_scope(self):

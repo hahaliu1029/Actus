@@ -118,6 +118,27 @@ def _project_common_top_fields(
 # ============================================================
 
 
+def _project_result_blocks(payload: MultimodalPayload) -> list[dict]:
+    """B12 P5: document_preview 存在时从 FE-wire result_blocks 裁 native PDF 大 base64
+    file block（FE 改读 document_preview）。只裁 FileBlock 的 data:application/pdf；
+    image block 保留。document_preview 缺失 → 原样（今日行为）。
+    仅瘦 FE wire——artifact/DB/LLM 路的 outcome.data.blocks 不受影响（INV-B12-3）。"""
+    blocks = [b.model_dump(by_alias=True) for b in payload.blocks]
+    if payload.document_preview is None:
+        return blocks
+    kept: list[dict] = []
+    for b in blocks:
+        if (
+            b.get("type") == "file"
+            and str((b.get("file") or {}).get("file_data", "")).startswith(
+                "data:application/pdf"
+            )
+        ):
+            continue  # 裁
+        kept.append(b)
+    return kept
+
+
 def _function_result_from_outcome(outcome: ToolOutcome) -> FunctionResultV1:
     """ToolOutcome 5 variant → FunctionResultV1 的分发表实现.
 
@@ -151,12 +172,21 @@ def _function_result_from_outcome(outcome: ToolOutcome) -> FunctionResultV1:
             reason=_wire_reason(outcome.reason),
         )
     if isinstance(outcome, Passthrough):
+        # B12 P5: project structured document_preview into function_result.data
+        # for the FE document-card renderer (presence-gate, not flag-gated — the
+        # upstream file_view flag decides whether document_preview exists at all).
+        data_payload = None
+        if outcome.data.document_preview is not None:
+            data_payload = {
+                "document_preview": outcome.data.document_preview.model_dump(
+                    mode="json"
+                )
+            }
         return FunctionResultV1(
             status="passthrough",
             message=outcome.content,
-            result_blocks=[
-                b.model_dump(by_alias=True) for b in outcome.data.blocks
-            ],
+            data=data_payload,
+            result_blocks=_project_result_blocks(outcome.data),
         )
     if isinstance(outcome, Asked):
         raise AssertionError(
@@ -184,6 +214,12 @@ def _derive_render_style_from_passthrough(
 ]:
     """R4 只覆盖 Passthrough 3 种基础情况 + 混合 tiebreaker.
     B12 P2: payload.media_type（producer 显式提供）优先于 block-derived mime."""
+    # B12 P5: document_preview presence forces "document"（覆盖 extraction-path PDF
+    # 只产 image_blocks 的 image 推导，使 FE document branch 触发）。presence-gate,
+    # 无 document_preview 的 payload 仍走下方 T1.6 原推导（INV-B12-0 零漂移）。
+    if getattr(payload, "document_preview", None) is not None:
+        explicit_mime = getattr(payload, "media_type", None)
+        return ("document", explicit_mime or "application/pdf")
     if not payload.blocks:
         return (None, None)
     block_kinds = {b.kind for b in payload.blocks}

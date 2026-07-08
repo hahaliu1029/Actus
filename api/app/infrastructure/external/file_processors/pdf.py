@@ -12,6 +12,7 @@ from typing import Awaitable, Callable
 
 from app.domain.external.file_processor import FileProcessResult
 from app.domain.external.sandbox import SandboxHandle
+from app.domain.models.tool_result import DocumentPreview, DocumentThumbnail
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +80,16 @@ def _is_complex_page(page_markdown: str) -> bool:
 
 
 class PdfFileProcessor:
-    def __init__(self, sandbox: SandboxHandle, file_uploader: FileUploader) -> None:
+    def __init__(
+        self,
+        sandbox: SandboxHandle,
+        file_uploader: FileUploader,
+        *,
+        page_parallel_enabled: bool = False,
+    ) -> None:
         self._sandbox = sandbox
         self._file_uploader = file_uploader
+        self._page_parallel_enabled = page_parallel_enabled
 
     async def process(
         self,
@@ -159,6 +167,12 @@ class PdfFileProcessor:
                 },
             ),
             media_type="application/pdf",
+            document_preview=DocumentPreview(
+                filename=filename,
+                media_type="application/pdf",
+                page_count=page_count,
+                thumbnail=None,
+            ),
         )
 
     async def _extraction_path(
@@ -253,7 +267,7 @@ class PdfFileProcessor:
                 )
 
                 if render_ok:
-                    for idx in render_pages:
+                    async def _render_one(idx: int) -> tuple[int, dict | None]:
                         try:
                             img_io = await self._sandbox.download_file(
                                 f"{work_dir}/page_{idx}.jpg"
@@ -261,12 +275,36 @@ class PdfFileProcessor:
                             img_bytes = img_io.read() if hasattr(img_io, "read") else img_io
                             url = await self._file_uploader(img_bytes, f"{filename}_p{idx}.jpg")
                             if url:
-                                image_blocks.append(
-                                    {"type": "image_url", "image_url": {"url": url, "detail": "auto"}}
-                                )
-                                rendered_ok.add(idx)
+                                return (idx, {"type": "image_url",
+                                              "image_url": {"url": url, "detail": "auto"}})
                         except Exception as e:
                             logger.warning("Failed to upload page %d image: %s", idx, e)
+                        return (idx, None)
+
+                    if self._page_parallel_enabled:
+                        sem = asyncio.Semaphore(4)
+
+                        async def _bounded(idx: int) -> tuple[int, dict | None]:
+                            async with sem:
+                                return await _render_one(idx)
+
+                        gathered = await asyncio.gather(
+                            *[_bounded(i) for i in render_pages], return_exceptions=True
+                        )
+                        # 按 idx 恢复页序；异常/None 页降级（只少该页 image）
+                        for res in sorted(
+                            (r for r in gathered if isinstance(r, tuple)), key=lambda x: x[0]
+                        ):
+                            idx, block = res
+                            if block is not None:
+                                image_blocks.append(block)
+                                rendered_ok.add(idx)
+                    else:
+                        for idx in render_pages:
+                            _idx, block = await _render_one(idx)
+                            if block is not None:
+                                image_blocks.append(block)
+                                rendered_ok.add(_idx)
                 else:
                     logger.warning("PDF page rendering failed")
 
@@ -292,10 +330,24 @@ class PdfFileProcessor:
                     + full_text[-half:]
                 )
 
+            _thumb = None
+            if image_blocks:
+                _first_page = sorted(rendered_ok)[0] if rendered_ok else 0
+                _thumb = DocumentThumbnail(
+                    url=image_blocks[0]["image_url"]["url"],
+                    media_type="image/jpeg",
+                    page=_first_page,
+                )
             return FileProcessResult(
                 text=full_text,
                 image_blocks=tuple(image_blocks),
                 media_type="application/pdf",
+                document_preview=DocumentPreview(
+                    filename=filename,
+                    media_type="application/pdf",
+                    page_count=total_pages,
+                    thumbnail=_thumb,
+                ),
             )
 
         except asyncio.TimeoutError:

@@ -1,0 +1,41 @@
+{
+  "event_id": "evt-golden-native-pdf-docpreview",
+  "created_at": 1776340800,
+  "seq": null,
+  "envelope_version": 1,
+  "tool_call_id": "c_native_pdp",
+  "name": "file",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "function": "file_view",
+  "args": {
+    "path": "/workspace/report.pdf"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": "document",
+  "media_type": "application/pdf",
+  "read_only": null,
+  "destructive": null,
+  "function_result": {
+    "status": "passthrough",
+    "message": "[PDF: report.pdf, 3 pages]",
+    "data": {
+      "document_preview": {
+        "filename": "report.pdf",
+        "media_type": "application/pdf",
+        "page_count": 3,
+        "thumbnail": null
+      }
+    },
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": []
+  },
+  "content": null
+}
