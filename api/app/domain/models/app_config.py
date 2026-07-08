@@ -528,51 +528,53 @@ class ToolRuntimeConfig(BaseModel):
         ),
     )
     # ============================================================
-    # B12 多模态管线增强 flags（全 default-OFF，flip 留用户）
+    # B12 多模态管线增强 flags（全 default-ON——用户 2026-07-08 flip；OFF 为 opt-out 回退）
     # spec: docs/superpowers/specs/2026-07-07-b12-multimodal-pipeline-design.md §9
     # ============================================================
     file_view_media_type_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "B12 P2: file_view 组 MultimodalPayload 时把 processor 探测的 "
-            "media_type 挂到 payload（projector 优先读它）。OFF（默认）= "
-            "media_type 恒 null（今日行为）。producer gate——OFF 时 file_view "
-            "不设字段，None-omitting serializer 省略 → golden 不变。"
+            "media_type 挂到 payload（projector 优先读它）。ON（默认）= "
+            "media_type 随探测填充。OFF = media_type 恒 null（pre-flip 行为）；"
+            "producer gate——OFF 时 file_view 不设字段，None-omitting "
+            "serializer 省略 → golden 不变。"
         ),
     )
     file_view_provider_materialize_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "B12 P1: _translate_outcome 构 deferred HumanMessage 时按 "
             "profile.accepts_image_url reshape image_url block（Kimi 类 "
-            "accepts_image_url=False → base64/placeholder）。OFF（默认）= "
-            "今日行为（file_view 图 + accepts_image_url=False provider 潜在崩）。"
-            "这是 crash-fix，验证后建议优先 flip。"
+            "accepts_image_url=False → base64/placeholder）。ON（默认）= "
+            "crash-fix 生效。OFF = pre-flip 行为（file_view 图 + "
+            "accepts_image_url=False provider 潜在崩）。用户 2026-07-08 flip。"
         ),
     )
     file_view_image_cache_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "B12 P3: 同 session 内重复 file_view 同一文件（path+mtime+size "
-            "未变）命中 registry LRU，跳过 download+PIL+压缩+上传。OFF（默认）"
-            "= 每次重处理（今日行为）。"
+            "B12 P3: 同 session 内重复 file_view 同一文件（path+mtime+size"
+            "+ctime 未变）命中 registry LRU，跳过 download+PIL+压缩+上传。"
+            "ON（默认）= 缓存生效。OFF = 每次重处理（pre-flip 行为）。"
         ),
     )
     pdf_page_parallel_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "B12 P4: PdfFileProcessor extraction path 的多页图 download+upload "
-            "bounded 并行（asyncio.gather + Semaphore）。OFF（默认）= 顺序 "
-            "loop（今日行为）。"
+            "bounded 并行（asyncio.gather + Semaphore）。ON（默认）= 并行。"
+            "OFF = 顺序 loop（pre-flip 行为）。"
         ),
     )
     document_preview_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "B12 P5: file_view 组 MultimodalPayload 时产结构化 document_preview"
             "（projector 按 presence 投 function_result.data + 强制 "
-            "render_style=document + 裁 FE wire PDF base64）。OFF（默认）= "
-            "document 走文本降级 + result_blocks 保留 base64（今日行为）。"
+            "render_style=document + 裁 FE wire PDF base64）。ON（默认）= "
+            "结构化预览。OFF = document 走文本降级 + result_blocks 保留 "
+            "base64（pre-flip 行为）。"
         ),
     )
 

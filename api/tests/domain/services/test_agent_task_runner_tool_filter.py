@@ -282,6 +282,10 @@ async def test_tool_filter_blocks_tool_at_registry_construction(monkeypatch) -> 
     runner._memory_repo_factory = None
     runner._user_id = "u1"
     runner._session_id = "s1"
+    # B12/a1d84f6: _build_lc_tools_full reads self._tool_runtime.file_view_* at
+    # agent_task_runner.py:2233 (unconditional) — provide a real config.
+    from app.domain.models.app_config import ToolRuntimeConfig
+    runner._tool_runtime = ToolRuntimeConfig()
 
     result = AgentTaskRunner._build_lc_tools_full(runner)
 

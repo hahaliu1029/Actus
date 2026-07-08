@@ -328,11 +328,14 @@ async def test_chat_with_message_does_not_trigger_running_status_reconcile(
     async def fake_get_task(_session: Session):
         return None
 
-    async def fake_create_task(_session: Session, *, tool_filter=None):
+    async def fake_create_task(
+        _session: Session, *, tool_filter=None, force_initial_compaction: bool = False,
+    ):
         # Explicit keyword-only signature mirrors production
-        # ``_create_task(self, session, *, tool_filter=None)`` so any
-        # future kwarg drift (e.g. a new sigchain parameter) breaks this
-        # fake noisily rather than being silently absorbed by ``**kwargs``.
+        # ``_create_task(self, session, *, tool_filter=None,
+        # force_initial_compaction=False)`` so any future kwarg drift
+        # (e.g. a new sigchain parameter) breaks this fake noisily rather
+        # than being silently absorbed by ``**kwargs``.
         return created_task
 
     async def fake_safe_update_unread_count(_session_id: str) -> None:

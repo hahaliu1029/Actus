@@ -113,6 +113,11 @@ class TestVPRealGraphToolNode:
             return AIMessage(content='{"success": true, "result": "done", "attachments": []}')
 
         fake_llm = MagicMock()
+        # B12 flip: MagicMock auto-creates a truthy `.profile`; with P1 materialize
+        # now default-ON, pin None so the reshape branch is skipped (no real
+        # provider profile configured — this test exercises the file_view→deferred
+        # HumanMessage flow, not provider-specific image reshaping).
+        fake_llm.profile = None
         fake_llm.bind_tools = MagicMock(return_value=fake_llm)
         fake_llm.ainvoke = fake_ainvoke
 

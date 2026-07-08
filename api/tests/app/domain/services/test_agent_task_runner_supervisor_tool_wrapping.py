@@ -182,6 +182,10 @@ def test_build_lc_tools_full_wraps_non_native_aggregate_tools(
     runner._flow = SimpleNamespace(
         _memory_config=SimpleNamespace(half_life_days=30, mmr_lambda=0.5),
     )
+    # B12/a1d84f6: _build_lc_tools_full reads self._tool_runtime.file_view_* at
+    # agent_task_runner.py:2233 (unconditional) — provide a real config.
+    from app.domain.models.app_config import ToolRuntimeConfig
+    runner._tool_runtime = ToolRuntimeConfig()
 
     tools = AgentTaskRunner._build_lc_tools_full(runner)
 

@@ -404,7 +404,9 @@ async def test_chat_propagates_tool_filter_to_agent_task_runner(monkeypatch) -> 
 
     captured: dict = {}
 
-    async def fake_create_task(session: Session, *, tool_filter=None):
+    async def fake_create_task(
+        session: Session, *, tool_filter=None, force_initial_compaction: bool = False,
+    ):
         captured["tool_filter"] = tool_filter
         captured["session_id"] = session.id
         return _DummyTask()

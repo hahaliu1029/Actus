@@ -14,6 +14,7 @@ from app.domain.models.app_config import (
     A2AServerConfig,
     MCPConfig,
     MCPServerConfig,
+    ToolRuntimeConfig,
 )
 from app.domain.services.agent_task_runner import (
     _apply_member_skill_floor,
@@ -348,6 +349,10 @@ def _build_lc_tools_runner_no_cpc(monkeypatch):
     runner._memory_repo_factory = None
     runner._user_id = "u1"
     runner._session_id = "s1"
+    # B12/a1d84f6: _build_lc_tools_full reads self._tool_runtime.file_view_* at
+    # agent_task_runner.py:2233 (unconditional) — the partial runner must carry
+    # a real config or arg-building AttributeErrors before create_native_tools.
+    runner._tool_runtime = ToolRuntimeConfig()
     return AgentTaskRunner, runner
 
 

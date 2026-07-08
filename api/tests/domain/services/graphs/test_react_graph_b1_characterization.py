@@ -160,6 +160,12 @@ def _build_graph_fns(record: list | None = None, shell_result: str = "ok"):
         return shell_result
 
     stub_llm = AsyncMock()
+    # B12 flip: a bare AsyncMock auto-creates a truthy `.profile`; with the P1
+    # materialize flag now default-ON, `getattr(llm, "profile", None)` would feed
+    # that junk mock into the reshape (`min(AsyncMock, int)` → TypeError). These
+    # C-tests characterize message/event ordering, not provider reshape (covered
+    # by test_react_graph_b12_materialize.py) — pin None so the branch is skipped.
+    stub_llm.profile = None
     stub_llm.ainvoke = AsyncMock(return_value=AIMessage(content="done"))
     # C1 tripwire: any astream call on the default path is a regression.
     stub_llm.astream = MagicMock(

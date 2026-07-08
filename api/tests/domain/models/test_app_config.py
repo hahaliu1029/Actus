@@ -249,15 +249,16 @@ def test_config_yaml_example_declares_slash_commands_flags() -> None:
     assert sc["manual_compaction_enabled"] is False
 
 
-def test_tool_runtime_config_has_b12_flags_default_off() -> None:
+def test_tool_runtime_config_has_b12_flags_default_on() -> None:
+    """用户 2026-07-08 flip：5 个 B12 flag 均 default-ON（改代码默认激活）。"""
     from app.domain.models.app_config import ToolRuntimeConfig
 
     cfg = ToolRuntimeConfig()
-    assert cfg.file_view_media_type_enabled is False
-    assert cfg.file_view_provider_materialize_enabled is False
-    assert cfg.file_view_image_cache_enabled is False
-    assert cfg.pdf_page_parallel_enabled is False
-    assert cfg.document_preview_enabled is False
+    assert cfg.file_view_media_type_enabled is True
+    assert cfg.file_view_provider_materialize_enabled is True
+    assert cfg.file_view_image_cache_enabled is True
+    assert cfg.pdf_page_parallel_enabled is True
+    assert cfg.document_preview_enabled is True
 
 
 def test_tool_runtime_config_b12_flags_json_round_trip() -> None:
