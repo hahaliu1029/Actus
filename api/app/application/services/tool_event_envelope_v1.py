@@ -182,10 +182,13 @@ def _derive_render_style_from_passthrough(
     Optional[Literal["text", "code", "table", "image", "document"]],
     Optional[str],
 ]:
-    """R4 只覆盖 Passthrough 3 种基础情况 + 混合 tiebreaker, B12 扩展 code/table."""
+    """R4 只覆盖 Passthrough 3 种基础情况 + 混合 tiebreaker.
+    B12 P2: payload.media_type（producer 显式提供）优先于 block-derived mime."""
     if not payload.blocks:
         return (None, None)
     block_kinds = {b.kind for b in payload.blocks}
+    # B12 P2: explicit media_type from producer wins over block sniffing.
+    explicit_mime = getattr(payload, "media_type", None)
 
     # 混合 file+image: file 优先 tiebreaker
     if "file" in block_kinds:
@@ -193,16 +196,16 @@ def _derive_render_style_from_passthrough(
             if b.kind == "file":
                 file_data = b.file.file_data
                 if file_data.startswith("data:application/pdf"):
-                    return ("document", "application/pdf")
-                return ("document", None)
+                    return ("document", explicit_mime or "application/pdf")
+                return ("document", explicit_mime)
 
     # 纯 image (无 file)
     if "image_url" in block_kinds:
-        return ("image", None)
+        return ("image", explicit_mime)
 
     # 纯 text
     if block_kinds == {"text"}:
-        return ("text", None)
+        return ("text", explicit_mime)
 
     return (None, None)
 

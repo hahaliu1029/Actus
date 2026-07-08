@@ -131,11 +131,50 @@ MultimodalBlock = Annotated[
 ]
 
 
+class DocumentThumbnail(BaseModel):
+    """B12 P5 文档预览缩略图（首页 presigned URL，非 base64）。"""
+    url: str
+    media_type: str
+    page: int
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class DocumentPreview(BaseModel):
+    """B12 P5 结构化文档预览 metadata，挂 MultimodalPayload.document_preview。
+
+    extraction path（有页图）→ thumbnail = 首页 image_url（presigned URL）;
+    native path（无页图）→ thumbnail=None（仅 filename/page_count）。
+    """
+    filename: str
+    media_type: str
+    page_count: int | None = None
+    thumbnail: DocumentThumbnail | None = None
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
 class MultimodalPayload(BaseModel):
     """Passthrough variant 的结构化 artifact payload. blocks 可以为空."""
     blocks: list[MultimodalBlock]
+    # B12 P2/P5: optional metadata. None-omitting serializer 保证值为 None 时
+    # 不出现在 dump 输出 → flag-OFF 旧 passthrough artifact 结构 identical
+    # （INV-B12-1；对照 Asked._omit_none_confirmation_id）。
+    media_type: str | None = None
+    document_preview: DocumentPreview | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_serializer(mode="wrap")
+    def _omit_none_b12_fields(self, handler: Any) -> dict:
+        """Omit B12 optional fields when None. Mirrors Asked (PE-0). handler(self)
+        preserves nested block by_alias/mode=json; only pops top-level None keys."""
+        data: dict = handler(self)
+        if data.get("media_type") is None:
+            data.pop("media_type", None)
+        if data.get("document_preview") is None:
+            data.pop("document_preview", None)
+        return data
 
 
 # ============================================================

@@ -250,3 +250,37 @@ async def test_profile_forbids_both_url_and_base64_emits_text_placeholder(
         "forbids both image URL and base64" in r.getMessage()
         for r in caplog.records if r.levelno >= logging.WARNING
     )
+
+
+async def test_profile_over_5mb_capped_by_sanitizer_limit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R2#P2-2: profile.image_max_bytes > 5MiB 时，base64 fallback 仍按 5MiB(sanitizer)
+    cap——6MiB raw 图应被拒（min(6MiB,5MiB)=5MiB），出 text placeholder。"""
+    from dataclasses import replace
+    import logging
+    base = get_profile("kimi_k2")  # accepts_image_url=False → 强制 base64 路
+    prof = replace(base, image_max_bytes=6 * 1024 * 1024, accepts_image_url=False,
+                   accepts_image_base64=True, supports_vision=True)
+    oversized = b"\x89PNG\r\n\x1a\n" + b"x" * (5_500_000)  # 5.5MiB raw
+    storage = MagicMock()
+    storage.download_file = AsyncMock(return_value=(io.BytesIO(oversized), None))
+    runner = _make_runner_with_profile(prof, storage)
+    runner._get_image_presigned_url = AsyncMock(return_value=None)  # 无 URL → base64 路
+
+    attachment = MagicMock()
+    attachment.id = "att1"
+    attachment.mime_type = "image/png"
+    attachment.filename = "big.png"
+    attachment.filepath = None
+    attachment.multimodal_eligible = True
+    attachment.width = attachment.height = None
+    attachment.original_width = attachment.original_height = None
+
+    with caplog.at_level(logging.WARNING):
+        blocks = await runner._build_image_blocks([attachment])
+
+    for b in blocks:
+        if b.get("type") == "image_url":
+            assert not b["image_url"]["url"].startswith("data:"), "oversized image base64 despite 5MiB cap"
+    assert any("[image unavailable:" in b.get("text", "") for b in blocks)

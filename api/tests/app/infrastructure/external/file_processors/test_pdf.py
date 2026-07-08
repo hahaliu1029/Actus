@@ -340,3 +340,15 @@ class TestExtractionPath:
         assert "too large to extract" in result.text
         # exec_command should not have been called for extraction (only possibly cleanup)
         sandbox.write_file.assert_not_called()
+
+
+def test_native_path_sets_media_type():
+    sandbox = _make_sandbox(
+        file_bytes=_VALID_PDF_HEADER,
+        exec_results=[_make_exec_result(0, "3")],  # page count = 3
+    )
+    proc = PdfFileProcessor(sandbox=sandbox, file_uploader=_make_uploader())
+    result = _run(proc.process("/tmp/r.pdf", "r.pdf", "application/pdf",
+                               supports_vision=True, supports_pdf_input=True))
+    assert result.media_type == "application/pdf"
+    assert result.document_blocks  # native path produced a file block

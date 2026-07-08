@@ -560,6 +560,9 @@ async def _translate_outcome(
     guide_injector: GuideInjector | None,
     enabled_outcome_variants: list[str] | None = None,   # ← NEW (Round 2f P1)
     display_metadata_enabled: bool = False,  # ← B10: 默认 False 保证既有直调零改动 (§4.2)
+    image_transport_profile: Any = None,   # ← B12 P1: llm.profile（build_react_graph 闭包捕获）
+    image_bytes_resolver: Any = None,      # ← B12 P1: FileViewImageBytesResolver | None
+    materialize_enabled: bool = False,     # ← B12 P1: ToolRuntimeConfig.file_view_provider_materialize_enabled
 ) -> tuple[ToolMessage | None, list[HumanMessage], list[Any]]:
     """Layer 3: convert ``ToolOutcome`` → ``ToolMessage`` + deferred ``HumanMessage`` list + events.
 
@@ -718,23 +721,66 @@ async def _translate_outcome(
     if isinstance(outcome, Passthrough):
         blocks_capped = outcome.data.blocks[:_MAX_FILE_VIEW_IMAGES]
         omitted = len(outcome.data.blocks) - len(blocks_capped)
+
+        if materialize_enabled and image_transport_profile is not None:
+            # B12 P1: reshape image_url blocks per provider profile (LLM-facing only).
+            from app.domain.services.provider_profiles._image_transport import (
+                select_image_transport,
+            )
+            from app.infrastructure.external.llm.message_sanitizer import MAX_IMAGE_BYTES
+
+            _prof = image_transport_profile
+            _max_bytes = min(
+                getattr(_prof, "image_max_bytes", MAX_IMAGE_BYTES), MAX_IMAGE_BYTES
+            )
+            _resolver = image_bytes_resolver
+            # R5#P2: payload.media_type 是**文档级** MIME（extraction PDF="application/pdf"），
+            # 不能套到 image_url block（页图是 JPEG）——否则 Kimi 路产
+            # `data:application/pdf;base64,<jpeg>`，被 adapter sanitizer 当非-image MIME strip 掉。
+            # 取 image MIME 优先级：payload.media_type(若 image/*) → document_preview.thumbnail
+            # .media_type(extraction 页图=image/jpeg) → None（select_image_transport 回落 image/png）。
+            _payload_mime = outcome.data.media_type
+            if (_payload_mime or "").startswith("image/"):
+                _img_mime = _payload_mime
+            else:
+                _dp = outcome.data.document_preview
+                _thumb_mime = getattr(getattr(_dp, "thumbnail", None), "media_type", None)
+                _img_mime = _thumb_mime if (_thumb_mime or "").startswith("image/") else None
+            transformed: list[dict] = []
+            for block in blocks_capped:
+                raw = block.model_dump(by_alias=True)
+                if raw.get("type") == "image_url":
+                    _display_url = (raw.get("image_url") or {}).get("url", "")
+                    _detail = (raw.get("image_url") or {}).get("detail", "auto")
+
+                    async def _load(_url=_display_url) -> "bytes | None":
+                        if _resolver is None:
+                            return None
+                        return await _resolver.load_image_bytes(_url, max_bytes=_max_bytes)
+
+                    raw = await select_image_transport(
+                        _display_url, _img_mime, tool_call["name"],
+                        _prof, _load, detail=_detail,
+                    )
+                transformed.append(raw)
+            header_count = sum(1 for b in transformed if b.get("type") == "image_url")
+        else:
+            # flag OFF：逐字保持既有行为（header = len(blocks_capped)）
+            transformed = [block.model_dump(by_alias=True) for block in blocks_capped]
+            header_count = len(blocks_capped)
+
         human_content: list[dict] = [
             {
                 "type": "text",
                 "text": (
-                    f"[file_view: {tool_call['name']} — "
-                    f"{len(blocks_capped)} image(s) loaded]"
+                    f"[file_view: {tool_call['name']} — {header_count} image(s) loaded]"
                 ),
             }
         ]
-        for block in blocks_capped:
-            human_content.append(block.model_dump(by_alias=True))
+        human_content.extend(transformed)
         if omitted > 0:
             human_content.append(
-                {
-                    "type": "text",
-                    "text": f"[... {omitted} more images omitted]",
-                }
+                {"type": "text", "text": f"[... {omitted} more images omitted]"}
             )
         deferred.append(HumanMessage(content=human_content))
 
@@ -1016,6 +1062,7 @@ def build_react_graph(
     assembler: ContextAssembler | None = None,
     checkpointer: Any = None,
     tool_runtime_config: "ToolRuntimeConfig | None" = None,
+    image_bytes_resolver: Any = None,  # ← B12 P1: FileViewImageBytesResolver | None（非持久 DI）
 ) -> CompiledStateGraph:
     """Build and compile the inner ReAct loop graph.
 
@@ -1048,6 +1095,10 @@ def build_react_graph(
         _tool_runtime_cfg = _TRC()
     else:
         _tool_runtime_cfg = tool_runtime_config
+
+    # B12 P1: capture provider profile from the adapter for file_view image
+    # materialize（non-persistent；llm.profile 由 adapter 提供，见 actus_chat_model.py）。
+    _image_transport_profile = getattr(llm, "profile", None)
 
     # Build tool lookup
     tool_map: dict[str, BaseTool] = {t.name: t for t in tools}
@@ -1380,6 +1431,9 @@ def build_react_graph(
                 guide_injector=guide_injector,
                 enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
                 display_metadata_enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                materialize_enabled=_tool_runtime_cfg.file_view_provider_materialize_enabled,
+                image_transport_profile=_image_transport_profile,
+                image_bytes_resolver=image_bytes_resolver,
             )
             is_success = isinstance(outcome, (AllowSuccess, Passthrough))
             return PerTcResult(
@@ -2492,6 +2546,9 @@ def build_react_graph(
                 guide_injector=guide_injector,
                 enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
                 display_metadata_enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+                materialize_enabled=_tool_runtime_cfg.file_view_provider_materialize_enabled,
+                image_transport_profile=_image_transport_profile,
+                image_bytes_resolver=image_bytes_resolver,
             )
             is_success = isinstance(outcome, (AllowSuccess, Passthrough))
             return PerTcResult(
@@ -3189,6 +3246,9 @@ def build_react_graph(
             guide_injector=guide_injector,
             enabled_outcome_variants=_tool_runtime_cfg.enabled_outcome_variants,
             display_metadata_enabled=_tool_runtime_cfg.tool_display_metadata_enabled,
+            materialize_enabled=_tool_runtime_cfg.file_view_provider_materialize_enabled,
+            image_transport_profile=_image_transport_profile,
+            image_bytes_resolver=image_bytes_resolver,
         )
 
         # NOTE: deny_events are regular ToolEvents (not ToolConfirmationEvents).

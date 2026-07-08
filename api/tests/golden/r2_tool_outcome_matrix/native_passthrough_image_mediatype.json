@@ -1,0 +1,25 @@
+{
+  "tool_call_id": "n_img_mt",
+  "tool_name": "file_view",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "outcome": {
+    "variant": "passthrough",
+    "content": "[file_view: file_view — 1 image(s) loaded]",
+    "data": {
+      "blocks": [
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBOR...",
+            "detail": "auto"
+          }
+        }
+      ],
+      "media_type": "image/png"
+    }
+  }
+}

@@ -527,6 +527,54 @@ class ToolRuntimeConfig(BaseModel):
             "设计：docs/superpowers/specs/2026-07-04-b9-runtime-console-design.md §5/§9"
         ),
     )
+    # ============================================================
+    # B12 多模态管线增强 flags（全 default-OFF，flip 留用户）
+    # spec: docs/superpowers/specs/2026-07-07-b12-multimodal-pipeline-design.md §9
+    # ============================================================
+    file_view_media_type_enabled: bool = Field(
+        default=False,
+        description=(
+            "B12 P2: file_view 组 MultimodalPayload 时把 processor 探测的 "
+            "media_type 挂到 payload（projector 优先读它）。OFF（默认）= "
+            "media_type 恒 null（今日行为）。producer gate——OFF 时 file_view "
+            "不设字段，None-omitting serializer 省略 → golden 不变。"
+        ),
+    )
+    file_view_provider_materialize_enabled: bool = Field(
+        default=False,
+        description=(
+            "B12 P1: _translate_outcome 构 deferred HumanMessage 时按 "
+            "profile.accepts_image_url reshape image_url block（Kimi 类 "
+            "accepts_image_url=False → base64/placeholder）。OFF（默认）= "
+            "今日行为（file_view 图 + accepts_image_url=False provider 潜在崩）。"
+            "这是 crash-fix，验证后建议优先 flip。"
+        ),
+    )
+    file_view_image_cache_enabled: bool = Field(
+        default=False,
+        description=(
+            "B12 P3: 同 session 内重复 file_view 同一文件（path+mtime+size "
+            "未变）命中 registry LRU，跳过 download+PIL+压缩+上传。OFF（默认）"
+            "= 每次重处理（今日行为）。"
+        ),
+    )
+    pdf_page_parallel_enabled: bool = Field(
+        default=False,
+        description=(
+            "B12 P4: PdfFileProcessor extraction path 的多页图 download+upload "
+            "bounded 并行（asyncio.gather + Semaphore）。OFF（默认）= 顺序 "
+            "loop（今日行为）。"
+        ),
+    )
+    document_preview_enabled: bool = Field(
+        default=False,
+        description=(
+            "B12 P5: file_view 组 MultimodalPayload 时产结构化 document_preview"
+            "（projector 按 presence 投 function_result.data + 强制 "
+            "render_style=document + 裁 FE wire PDF base64）。OFF（默认）= "
+            "document 走文本降级 + result_blocks 保留 base64（今日行为）。"
+        ),
+    )
 
 
 class AppConfig(BaseModel):

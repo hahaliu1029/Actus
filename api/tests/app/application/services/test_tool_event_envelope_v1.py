@@ -301,6 +301,21 @@ class TestDeriveRenderStyle:
         assert style == "document"
         assert mime == "application/pdf"
 
+    def test_explicit_media_type_preferred_for_image(self) -> None:
+        """B12 P2: payload.media_type 存在时优先于 block 推导。"""
+        payload = MultimodalPayload(
+            blocks=[ImageUrlBlock(image_url=ImageUrlPayload(url="data:image/png;base64,x"))],
+            media_type="image/png",
+        )
+        assert _derive_render_style_from_passthrough(payload) == ("image", "image/png")
+
+    def test_image_without_media_type_unchanged(self) -> None:
+        """回归：无 media_type（flag-OFF）→ 保持 ('image', None)。"""
+        payload = MultimodalPayload(
+            blocks=[ImageUrlBlock(image_url=ImageUrlPayload(url="data:image/png;base64,x"))],
+        )
+        assert _derive_render_style_from_passthrough(payload) == ("image", None)
+
     def test_non_passthrough_outcome_returns_none_none(self) -> None:
         outcome = AllowSuccess(content="ok")
         assert _derive_render_style_from_outcome(outcome) == (None, None)

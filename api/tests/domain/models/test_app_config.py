@@ -247,3 +247,30 @@ def test_config_yaml_example_declares_slash_commands_flags() -> None:
     assert sc["enabled"] is False
     assert sc["skill_commands_enabled"] is False
     assert sc["manual_compaction_enabled"] is False
+
+
+def test_tool_runtime_config_has_b12_flags_default_off() -> None:
+    from app.domain.models.app_config import ToolRuntimeConfig
+
+    cfg = ToolRuntimeConfig()
+    assert cfg.file_view_media_type_enabled is False
+    assert cfg.file_view_provider_materialize_enabled is False
+    assert cfg.file_view_image_cache_enabled is False
+    assert cfg.pdf_page_parallel_enabled is False
+    assert cfg.document_preview_enabled is False
+
+
+def test_tool_runtime_config_b12_flags_json_round_trip() -> None:
+    """flag 是纯 bool → 可进持久 AppConfig（YAML dump/load）。INV-B12-4。"""
+    from app.domain.models.app_config import ToolRuntimeConfig
+
+    cfg = ToolRuntimeConfig(
+        file_view_media_type_enabled=True,
+        document_preview_enabled=True,
+    )
+    dumped = cfg.model_dump(mode="json")
+    assert dumped["file_view_media_type_enabled"] is True
+    assert dumped["document_preview_enabled"] is True
+    restored = ToolRuntimeConfig.model_validate(dumped)
+    assert restored.file_view_media_type_enabled is True
+    assert restored.document_preview_enabled is True

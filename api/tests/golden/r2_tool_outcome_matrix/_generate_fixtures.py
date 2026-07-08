@@ -182,6 +182,24 @@ FIXTURES: list[tuple[str, ToolArtifact]] = [
         ),
     ),
     (
+        "native_passthrough_image_mediatype.json",
+        ToolArtifact(
+            tool_call_id="n_img_mt",
+            tool_name="file_view",
+            tool_source=NATIVE_FILE,
+            outcome=Passthrough(
+                content="[file_view: file_view — 1 image(s) loaded]",
+                data=MultimodalPayload(
+                    blocks=[
+                        ImageUrlBlock(image_url=ImageUrlPayload(
+                            url="data:image/png;base64,iVBOR..."))
+                    ],
+                    media_type="image/png",
+                ),
+            ),
+        ),
+    ),
+    (
         "native_passthrough_pdf.json",
         ToolArtifact(
             tool_call_id="n_pdf",
@@ -405,8 +423,8 @@ FIXTURES: list[tuple[str, ToolArtifact]] = [
 
 
 def main() -> None:
-    assert len(FIXTURES) == 22, (
-        f"Expected 22 fixtures, got {len(FIXTURES)} — update the FIXTURES "
+    assert len(FIXTURES) == 23, (
+        f"Expected 23 fixtures, got {len(FIXTURES)} — update the FIXTURES "
         f"list in tests/golden/r2_tool_outcome_matrix/_generate_fixtures.py"
     )
     for fname, artifact in FIXTURES:

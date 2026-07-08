@@ -725,6 +725,8 @@ def _make_file_view_tools(
     processor_lookup: FileProcessorLookup,
     supports_vision: bool,
     supports_pdf_input: bool = False,
+    *,
+    file_view_media_type_enabled: bool = False,
 ) -> list[StructuredTool]:
     """Create file_view tool for multimodal file understanding."""
 
@@ -820,7 +822,12 @@ def _make_file_view_tools(
             )
             outcome = Passthrough(
                 content=summary,
-                data=MultimodalPayload(blocks=typed_blocks),
+                data=MultimodalPayload(
+                    blocks=typed_blocks,
+                    media_type=(
+                        result.media_type if file_view_media_type_enabled else None
+                    ),
+                ),
             )
             return outcome.content, outcome
 
@@ -847,6 +854,8 @@ def create_native_tools(
     supports_pdf_input: bool = False,
     memory_mount_scope: MemoryMountScope | None = None,
     supervisor: Any | None = None,
+    *,
+    file_view_media_type_enabled: bool = False,
 ) -> list[BaseTool]:
     """Create all native LangChain tools.
 
@@ -860,7 +869,10 @@ def create_native_tools(
     tools.extend(_make_message_tools())
     tools.extend(_make_file_tools(sandbox, memory_mount_scope=memory_mount_scope))
     if processor_lookup:
-        tools.extend(_make_file_view_tools(sandbox, processor_lookup, supports_vision, supports_pdf_input))
+        tools.extend(_make_file_view_tools(
+            sandbox, processor_lookup, supports_vision, supports_pdf_input,
+            file_view_media_type_enabled=file_view_media_type_enabled,
+        ))
     tools.extend(_make_shell_tools(sandbox))
     tools.extend(_make_browser_tools(browser))
     tools.extend(_make_search_tools(search_engine))

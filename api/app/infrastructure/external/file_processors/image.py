@@ -84,6 +84,7 @@ class ImageFileProcessor:
                 image_blocks=(
                     {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}},
                 ),
+                media_type=mime_type,
             )
         elif self._vision_model:
             desc = await self._describe_with_vision(file_bytes, mime_type, url)

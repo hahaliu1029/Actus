@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import hashlib
 import io
 import logging
@@ -654,6 +653,20 @@ class AgentTaskRunner(TaskRunner):
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_storage = file_storage
+        # B12 P1: file_view 图片 provider 合规 resolver（composition root，
+        # 镜像 :708 RedisRecallCache 的局部 infra import 先例；build_react_graph
+        # 消费 domain FileViewImageBytesResolver Protocol）。get_settings 走
+        # 模块级 import（:104，本 __init__ :560 已用）——不在函数内重复 import，
+        # 否则会把 get_settings 变成 __init__ 局部名，:560 的调用触发
+        # UnboundLocalError。
+        self._file_view_image_resolver = None
+        if file_storage is not None:
+            from app.infrastructure.external.file_view.image_bytes_resolver import (
+                MinioFileViewImageResolver,
+            )
+            self._file_view_image_resolver = MinioFileViewImageResolver(
+                file_storage, get_settings().minio_endpoint,
+            )
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
         self._browser = browser
@@ -756,6 +769,10 @@ class AgentTaskRunner(TaskRunner):
             # B2: forward provider profile so PlannerReActFlow can wrap
             # ``self._llm`` in ActusRecoveryChatModel during _ensure_graphs.
             profile=self.profile,
+            # B12 P1: forward the composition-root file_view image resolver so
+            # the flow's own build_react_graph call activates provider-compliant
+            # image materialization (Kimi-class profiles won't crash).
+            file_view_image_resolver=self._file_view_image_resolver,
             # B4 M0: session-scoped cost callback attached into every invoke.
             cost_callback_handler=self._cost_callback_handler,
             execution_supervisor=self._execution_supervisor,
@@ -1117,33 +1134,30 @@ class AgentTaskRunner(TaskRunner):
     async def _build_image_blocks(self, attachments: list) -> list[dict]:
         """为图片附件构建 OpenAI multimodal content blocks + 元数据注入。
 
-        A7 profile-aware: honors ``profile.accepts_image_url``.
-        - accepts_image_url=True (OpenAI / generic) → use presigned URL when available
-        - accepts_image_url=False (Kimi) → force base64 data: URL
-        - On base64 I/O failure: degrade to ``text`` placeholder (§4.3b contract);
-          NEVER fall back to an unsupported URL.
-
+        A7 profile-aware: 决策委托给 B12 select_image_transport（与 file_view
+        materialize 路共用同一策略）。attachment 侧保留 _image_url_map 副作用 +
+        metadata 注入 + 具体诊断日志。
         Vision mode (supports_vision=True): 嵌入图片 blocks + 元数据
-        Tool mode (supports_vision=False): 不嵌入图片 blocks，只记录 URL 映射供 MCP 工具使用
+        Tool mode (supports_vision=False): 不嵌入 blocks，只记录 URL 映射供 MCP 用
         """
+        from app.domain.services.provider_profiles._image_transport import (
+            select_image_transport,
+        )
+        from app.infrastructure.external.llm.message_sanitizer import MAX_IMAGE_BYTES
+
         blocks: list[dict] = []
         self._image_url_map.clear()
 
         for attachment in attachments:
-            # Three-state multimodal eligibility check
             if attachment.multimodal_eligible is False:
                 continue
             elif attachment.multimodal_eligible is None:
-                # None: non-image OR pre-migration image → fallback to mime_type
                 mime = attachment.mime_type or ""
                 if not any(mime.startswith(p) for p in self._IMAGE_MIME_PREFIXES):
                     continue
 
             try:
-                # Always capture URL mapping (needed for MCP path resolution in both modes).
-                # Wrap in its own try so a storage misconfig doesn't blow up the
-                # entire image-block build (esp. on Kimi, where the URL is not
-                # used for the LLM payload anyway).
+                # presigned URL capture（副作用：_image_url_map 供 MCP 路径解析，两模式都需要）
                 presigned_url = None
                 if hasattr(self, "_get_image_presigned_url"):
                     try:
@@ -1157,99 +1171,76 @@ class AgentTaskRunner(TaskRunner):
                 if presigned_url and attachment.filepath:
                     self._image_url_map[attachment.filepath] = presigned_url
 
-                # Tool mode (non-vision model): skip image blocks, only keep URL mapping
+                # Tool mode: skip image blocks, only keep URL mapping
                 if not self._supports_vision:
                     continue
 
-                # A7 P1: profile.supports_vision acts as a hard ceiling. Even if
-                # the user's LLMConfig says supports_vision=True, a profile that
-                # declares no vision (e.g. DeepSeek Reasoner) must NOT embed
-                # image blocks end-to-end.
+                # A7 P1: profile.supports_vision hard ceiling
                 profile = getattr(self, "profile", None)
                 if profile is not None and not profile.supports_vision:
                     continue
 
-                # Vision mode: embed image blocks
                 w, h = attachment.width, attachment.height
                 detail = "low" if (w and h and w <= 512 and h <= 512) else "high"
-
-                use_url = (
-                    presigned_url and profile.accepts_image_url
-                    if profile is not None
-                    else bool(presigned_url)
+                filename = (
+                    getattr(attachment, "filename", None) or attachment.id or "unknown"
                 )
 
-                if not use_url and profile is not None and not profile.accepts_image_base64:
-                    # A7 P1: profile forbids both URL and base64 → no viable
-                    # embedding path. Emit text placeholder directly without
-                    # attempting download+encode.
-                    filename = (
-                        getattr(attachment, "filename", None)
-                        or attachment.id
-                        or "unknown"
-                    )
-                    blocks.append({
-                        "type": "text",
-                        "text": f"[image unavailable: {filename}]",
-                    })
-                    logger.warning(
-                        "[A7] profile %s forbids both image URL and base64; "
-                        "emitted text placeholder for attachment_id=%s",
-                        profile.provider_id, attachment.id,
-                    )
-                    continue
-
-                if use_url:
-                    blocks.append({
-                        "type": "image_url",
-                        "image_url": {"url": presigned_url, "detail": detail},
-                    })
-                else:
-                    # profile forbids URL (or no presigned URL) → base64 or degrade to text
+                async def _load(_att=attachment, _prof=profile, _fn=filename) -> bytes | None:
+                    """Download raw bytes for base64 fallback; enforce profile size cap.
+                    Bound via default args so the closure is loop-safe."""
                     try:
-                        file_data, _ = await self._file_storage.download_file(
-                            attachment.id
-                        )
+                        file_data, _ = await self._file_storage.download_file(_att.id)
                         with file_data:
                             raw_bytes = file_data.read()
-                        # Profile-level size guard (A7) supersedes the hard-coded
-                        # _IMAGE_TARGET_RAW_SIZE when a profile is present.
+                        # R2#P2-2: cap 取 min(image_max_bytes, sanitizer 5MiB)，否则
+                        # 超 5MiB 的 base64 会被 adapter sanitizer 再 strip（白做+丢图）。
+                        # OpenAI 仍 3.75MiB（<5MiB，min 无变化）；kimi_k2 profile 实为
+                        # 100MiB（R3#P2-1），min 有意收敛到 sanitizer 5MiB。既有 6 A7 测试
+                        # 不受影响：无大图 Kimi 断言，小图 <5MiB 不触发 cap。
                         max_bytes = (
-                            profile.image_max_bytes
-                            if profile is not None
+                            min(_prof.image_max_bytes, MAX_IMAGE_BYTES) if _prof is not None
                             else self._IMAGE_TARGET_RAW_SIZE
                         )
                         if len(raw_bytes) > max_bytes:
-                            raise ValueError(
-                                f"image {len(raw_bytes)}B exceeds "
-                                f"image_max_bytes={max_bytes}"
+                            logger.warning(
+                                "[A7] image %d bytes exceeds image_max_bytes=%d for "
+                                "attachment_id=%s; emitting text placeholder",
+                                len(raw_bytes), max_bytes, _att.id,
                             )
-                        b64_data = base64.b64encode(raw_bytes).decode("ascii")
-                        mime = attachment.mime_type or "image/png"
-                        data_url = f"data:{mime};base64,{b64_data}"
-                        blocks.append({
-                            "type": "image_url",
-                            "image_url": {"url": data_url, "detail": detail},
-                        })
-                    except Exception as e:
-                        # A7 §4.3b degrade contract: do NOT fall back to URL;
-                        # emit text placeholder instead.
-                        filename = (
-                            getattr(attachment, "filename", None)
-                            or attachment.id
-                            or "unknown"
-                        )
-                        blocks.append({
-                            "type": "text",
-                            "text": f"[image unavailable: {filename}]",
-                        })
+                            return None
+                        return raw_bytes
+                    except Exception as e:  # noqa: BLE001
                         logger.warning(
                             "[A7] image base64 encode failed for attachment_id=%s "
                             "filename=%s reason=%s; emitted text placeholder instead",
-                            attachment.id, filename, repr(e),
+                            _att.id, _fn, repr(e),
                         )
-                        # Skip metadata injection for degraded path.
-                        continue
+                        return None
+
+                block = await select_image_transport(
+                    presigned_url or "",
+                    attachment.mime_type or "image/png",
+                    filename,
+                    profile,
+                    _load,
+                    detail=detail,
+                )
+                blocks.append(block)
+
+                if block.get("type") != "image_url":
+                    # placeholder 路 — 保留 forbids-both 诊断（A7 §4.3b）+ 跳过 metadata
+                    if (
+                        profile is not None
+                        and not profile.accepts_image_url
+                        and not profile.accepts_image_base64
+                    ):
+                        logger.warning(
+                            "[A7] profile %s forbids both image URL and base64; "
+                            "emitted text placeholder for attachment_id=%s",
+                            profile.provider_id, attachment.id,
+                        )
+                    continue
 
                 # Metadata injection (skip for pre-migration images without dimensions)
                 if w and h:
@@ -2239,6 +2230,7 @@ class AgentTaskRunner(TaskRunner):
                 # 否则 planner 阶段守护拦了，实际 tool call 路径还是裸透传。
                 memory_mount_scope=self._build_memory_mount_scope(),
                 supervisor=self._execution_supervisor,
+                file_view_media_type_enabled=self._tool_runtime.file_view_media_type_enabled,
             )
         )
 
@@ -2539,6 +2531,7 @@ class AgentTaskRunner(TaskRunner):
                 ),
                 assembler=getattr(self._flow, "_assembler", None),
                 tool_runtime_config=self._tool_runtime,
+                image_bytes_resolver=self._file_view_image_resolver,
             )
 
             # Post-build atomic commit: only now do we advance

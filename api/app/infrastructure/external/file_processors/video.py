@@ -239,7 +239,15 @@ class VideoFileProcessor:
                 half = _MAX_TRANSCRIPT_CHARS // 2
                 full_text = full_text[:half] + "\n...(已截断)\n" + full_text[-half:]
 
-            return FileProcessResult(text=full_text, image_blocks=tuple(image_blocks))
+            return FileProcessResult(
+                text=full_text,
+                image_blocks=tuple(image_blocks),
+                # B12 PR-1 producer-contract: keyframe blocks carry the SOURCE video
+                # mime (mirrors pdf.py page-image blocks → media_type='application/pdf').
+                # No keyframe blocks (no-vision text-only path) → None, like image.py/
+                # pdf.py text-only returns. Other 3 returns are text-only/error → None.
+                media_type=mime_type if image_blocks else None,
+            )
 
         except Exception as e:
             return FileProcessResult(text=f"[Video: {filename} — processing error: {e}]")

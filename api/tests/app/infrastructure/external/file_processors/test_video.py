@@ -480,6 +480,28 @@ class TestVideoFileProcessorWithVision:
         assert len(result.image_blocks) == 5
         assert result.image_blocks[0]["type"] == "image_url"
 
+    def test_process_vision_keyframes_set_media_type(self):
+        """B12 PR-1: vision keyframe passthrough carries the SOURCE video media_type.
+
+        Mirrors test_process_vision_true_returns_image_blocks; adds the media_type
+        producer-contract assertion. Consistent with image.py (media_type=mime_type)
+        and pdf.py (media_type='application/pdf') — the SOURCE file mime, not the
+        block image mime. RED before the fix: the :242 success return omits
+        media_type, so it defaults to None.
+        """
+        kf_files = [f"/tmp/_fv_test/keyframe_{i:03d}.jpg" for i in range(1, 6)]
+        sandbox = _make_sandbox(ls_output=_make_ls_output(kf_files))
+        uploader = AsyncMock(return_value="https://minio.example.com/frame.jpg")
+        proc = _make_processor(sandbox=sandbox, file_uploader=uploader)
+
+        result = asyncio.run(
+            proc.process("/tmp/video.mp4", "video.mp4", "video/mp4", supports_vision=True)
+        )
+
+        # Keyframe blocks produced → media_type carries the source video mime.
+        assert len(result.image_blocks) > 0
+        assert result.media_type == "video/mp4"
+
     def test_process_vision_true_includes_duration_and_resolution(self):
         sandbox = _make_sandbox(
             ffprobe_output=_make_ffprobe_output(duration=125.0, width=1280, height=720),
@@ -593,6 +615,25 @@ class TestVideoFileProcessorNoVisionNoFallback:
         assert "keyframe_001.jpg" in result.text
         assert "Keyframe 2:" in result.text
         assert "Keyframe 3:" in result.text
+
+    def test_process_no_vision_keyframes_media_type_is_none(self):
+        """B12 PR-1: no image blocks produced (text-only keyframe listing) →
+        media_type stays None, consistent with image.py/pdf.py text-only returns.
+
+        Proves the `if image_blocks else None` conditional is non-vacuous: keyframes
+        WERE extracted, but no multimodal block was emitted (no-vision path), so
+        media_type must remain None rather than asserting the source video mime.
+        """
+        files = [f"/tmp/_fv_test/keyframe_{i:03d}.jpg" for i in range(1, 4)]
+        sandbox = _make_sandbox(ls_output=_make_ls_output(files))
+        proc = _make_processor(sandbox=sandbox, vision_model=None)
+
+        result = asyncio.run(
+            proc.process("/tmp/video.mp4", "video.mp4", "video/mp4", supports_vision=False)
+        )
+
+        assert result.image_blocks == ()
+        assert result.media_type is None
 
     def test_process_no_keyframes_no_frame_section(self):
         sandbox = _make_sandbox(ls_output="")

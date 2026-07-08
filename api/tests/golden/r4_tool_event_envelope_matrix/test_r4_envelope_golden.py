@@ -46,6 +46,7 @@ FIXTURE_NAMES = [
     "skill_denied_approval_policy",
     # mixed / extra (2)
     "native_passthrough_mixed",
+    "native_passthrough_image_mediatype",
     "skill_denied_risk_enforce",
     # legacy (5)
     "legacy_allow_success",
@@ -82,7 +83,7 @@ def test_envelope_transform_binary_equality(fixture_name: str) -> None:
 
 
 def test_fixture_count_matches_expected() -> None:
-    assert len(FIXTURE_NAMES) == 26
+    assert len(FIXTURE_NAMES) == 27
     for name in FIXTURE_NAMES:
         assert (FIXTURES_DIR / f"{name}.json").exists(), f"missing fixture: {name}"
         assert (EXPECTED_DIR / f"{name}_expected.json").exists(), f"missing expected: {name}"

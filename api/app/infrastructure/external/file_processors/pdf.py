@@ -158,6 +158,7 @@ class PdfFileProcessor:
                     },
                 },
             ),
+            media_type="application/pdf",
         )
 
     async def _extraction_path(
@@ -291,7 +292,11 @@ class PdfFileProcessor:
                     + full_text[-half:]
                 )
 
-            return FileProcessResult(text=full_text, image_blocks=tuple(image_blocks))
+            return FileProcessResult(
+                text=full_text,
+                image_blocks=tuple(image_blocks),
+                media_type="application/pdf",
+            )
 
         except asyncio.TimeoutError:
             return FileProcessResult(text=f"[PDF: {filename} — extraction timed out]")

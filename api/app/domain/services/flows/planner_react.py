@@ -212,6 +212,7 @@ class PlannerReActFlow(BaseFlow):
         session_state_machine: "SessionStateMachine | None" = None,
         policy_snapshot_sink: Any = None,  # C5a observe-only sink (Seam B carrier)
         force_initial_compaction: bool = False,  # B11 §8: consume a pending manual /compact at run start
+        file_view_image_resolver: Any = None,  # B12 P1: FileViewImageBytesResolver | None（build_react_graph 注入）
         # PR-9b-A A5: lifespan-scoped coordinator runtime deps. Default is the
         # frozen NullCoordinatorRuntimeDeps sentinel so legacy callers (tests
         # + non-coordinator paths) inject zero coord cfg keys; production
@@ -276,6 +277,7 @@ class PlannerReActFlow(BaseFlow):
         # _ensure_graphs wraps self._llm with wrap_with_recovery on first
         # call. The flag prevents nested wrapping on subsequent calls.
         self._profile = profile
+        self._file_view_image_resolver = file_view_image_resolver  # B12 P1
         self._recovery_wrapped: bool = False
 
         # LangGraph checkpointer — 跨 graph 重建复用，支持 interrupt/resume
@@ -467,6 +469,9 @@ class PlannerReActFlow(BaseFlow):
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
             supervisor=self._execution_supervisor,
+            file_view_media_type_enabled=getattr(
+                self._tool_runtime, "file_view_media_type_enabled", False
+            ),
         )
 
     def _build_memory_mount_scope(self):
@@ -652,6 +657,7 @@ class PlannerReActFlow(BaseFlow):
             ),
             assembler=assembler,
             tool_runtime_config=self._tool_runtime,
+            image_bytes_resolver=self._file_view_image_resolver,
         )
         memory_snapshot_provider = self._build_memory_snapshot_provider()
         # B8: recall provider 存实例属性——graph 入口经 build_main_graph

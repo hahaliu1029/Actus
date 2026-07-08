@@ -107,3 +107,10 @@ class TestImageFileProcessor:
         assert len(result.image_blocks) == 1
         assert result.image_blocks[0]["image_url"]["url"].startswith("data:image/png;base64,")
         assert "100x200" in result.text
+
+    def test_vision_mode_sets_media_type(self):
+        proc = ImageFileProcessor(sandbox=_make_sandbox(), file_uploader=_make_uploader())
+        result = asyncio.run(
+            proc.process("/tmp/test.png", "test.png", "image/png", supports_vision=True)
+        )
+        assert result.media_type == "image/png"

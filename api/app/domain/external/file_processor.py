@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from app.domain.models.tool_result import DocumentPreview
 
 
 # Shared constant: max image blocks per file_view call.
@@ -15,6 +18,11 @@ class FileProcessResult:
     text: str
     image_blocks: tuple[dict, ...] = ()
     document_blocks: tuple[dict, ...] = ()
+    # B12 P2: processor 探测的原始 media_type（简单版；storage 压缩后 mime 漂移
+    # 可接受，见 spec §4）。file_view 按 flag 决定是否挂到 MultimodalPayload。
+    media_type: str | None = None
+    # B12 P5: 结构化文档预览（PdfFileProcessor 填；其他 processor 恒 None）。
+    document_preview: "DocumentPreview | None" = None
 
 
 class FileProcessor(Protocol):
