@@ -1,0 +1,42 @@
+{
+  "event_id": "evt-golden-native-passthrough-video-mediatype",
+  "created_at": 1776340800,
+  "seq": null,
+  "envelope_version": 1,
+  "tool_call_id": "c_native_ptvidmt",
+  "name": "file",
+  "tool_source": {
+    "source": "native",
+    "category": "file",
+    "canonical_name": "file_view"
+  },
+  "function": "file_view",
+  "args": {
+    "path": "/workspace/clip.mp4"
+  },
+  "status": "called",
+  "activity_description": "",
+  "display_icon": null,
+  "render_style": "image",
+  "media_type": "video/mp4",
+  "read_only": null,
+  "destructive": null,
+  "function_result": {
+    "status": "passthrough",
+    "message": "[file_view: clip.mp4 — 1 image(s) loaded]",
+    "data": null,
+    "retryable": false,
+    "user_action_required": false,
+    "reason": null,
+    "result_blocks": [
+      {
+        "type": "image_url",
+        "image_url": {
+          "url": "data:image/jpeg;base64,/9j/4AAQ",
+          "detail": "auto"
+        }
+      }
+    ]
+  },
+  "content": null
+}

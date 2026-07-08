@@ -47,6 +47,7 @@ FIXTURE_NAMES = [
     # mixed / extra (2)
     "native_passthrough_mixed",
     "native_passthrough_image_mediatype",
+    "native_passthrough_video_mediatype",
     "native_passthrough_pdf_docpreview",
     "native_passthrough_extraction_docpreview",
     "native_passthrough_mixed_docpreview",
@@ -86,7 +87,7 @@ def test_envelope_transform_binary_equality(fixture_name: str) -> None:
 
 
 def test_fixture_count_matches_expected() -> None:
-    assert len(FIXTURE_NAMES) == 30
+    assert len(FIXTURE_NAMES) == 31
     for name in FIXTURE_NAMES:
         assert (FIXTURES_DIR / f"{name}.json").exists(), f"missing fixture: {name}"
         assert (EXPECTED_DIR / f"{name}_expected.json").exists(), f"missing expected: {name}"

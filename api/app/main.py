@@ -572,6 +572,13 @@ async def lifespan(app: FastAPI):
                 extension_stats_recorder=getattr(
                     app.state, "extension_stats", None
                 ),
+                # B12 follow-up: thread the same file_view multimodal deps the root
+                # runner gets (agent_service builds the root registry from these).
+                # The child builds its OWN sandbox-bound registry in _build.
+                supports_vision=snap.supports_vision,
+                supports_pdf_input=snap.supports_pdf_input,
+                file_understanding_config=snap.file_understanding_config,
+                vision_fallback_model=snap.vision_fallback_model,
             )
 
         coord_deps = None

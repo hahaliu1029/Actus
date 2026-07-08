@@ -201,6 +201,27 @@ FIXTURES: list[tuple[str, ToolArtifact]] = [
         ),
     ),
     (
+        "native_passthrough_video_mediatype.json",
+        ToolArtifact(
+            tool_call_id="n_vid_mt",
+            tool_name="file_view",
+            tool_source=NATIVE_FILE,
+            outcome=Passthrough(
+                content="[file_view: file_view — 1 image(s) loaded]",
+                data=MultimodalPayload(
+                    blocks=[
+                        ImageUrlBlock(image_url=ImageUrlPayload(
+                            url="data:image/jpeg;base64,/9j/4AAQ..."))
+                    ],
+                    # B12 PR-1: video keyframe blocks are image_url (JPEG); payload
+                    # media_type is the SOURCE video mime (document-level, mirrors
+                    # pdf.py). Projector → render_style=image + media_type=video/mp4.
+                    media_type="video/mp4",
+                ),
+            ),
+        ),
+    ),
+    (
         "native_passthrough_pdf.json",
         ToolArtifact(
             tool_call_id="n_pdf",
@@ -444,8 +465,8 @@ FIXTURES: list[tuple[str, ToolArtifact]] = [
 
 
 def main() -> None:
-    assert len(FIXTURES) == 24, (
-        f"Expected 24 fixtures, got {len(FIXTURES)} — update the FIXTURES "
+    assert len(FIXTURES) == 25, (
+        f"Expected 25 fixtures, got {len(FIXTURES)} — update the FIXTURES "
         f"list in tests/golden/r2_tool_outcome_matrix/_generate_fixtures.py"
     )
     for fname, artifact in FIXTURES:

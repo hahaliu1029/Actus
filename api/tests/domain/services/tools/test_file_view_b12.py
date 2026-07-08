@@ -169,6 +169,55 @@ def test_file_view_cache_disabled_no_lookup() -> None:
     assert len(lookup.get_calls) == 0                  # cache never consulted
 
 
+class _ThrowingCacheLookup:
+    """cache_get/cache_put raise — simulates a remote cache backend outage.
+
+    B12 P3 follow-up: the session cache is best-effort; a throwing backend must
+    degrade to reprocess (get) / swallow (put), never break file_view.
+    """
+
+    def __init__(self, fresh, *, throw_get=False, throw_put=False, cached=None):
+        self._cached = cached
+        self._proc = AsyncMock()
+        self._proc.process = AsyncMock(return_value=fresh)
+        self._throw_get = throw_get
+        self._throw_put = throw_put
+        self.get_calls = 0
+        self.put_calls = 0
+
+    def get_processor(self, mime):
+        return self._proc
+
+    def cache_get(self, key):
+        self.get_calls += 1
+        if self._throw_get:
+            raise RuntimeError("cache backend down (get)")
+        return self._cached
+
+    def cache_put(self, key, result, ts):
+        self.put_calls += 1
+        if self._throw_put:
+            raise RuntimeError("cache backend down (put)")
+
+
+def test_file_view_cache_get_failure_degrades_to_reprocess() -> None:
+    """A throwing cache_get must not break file_view — degrade to reprocess."""
+    lookup = _ThrowingCacheLookup(fresh=_img_result("[fresh]"), throw_get=True)
+    result = _invoke_cache(lookup, file_view_image_cache_enabled=True)
+    assert result.artifact.content == "[fresh]"        # reprocessed despite cache_get raising
+    lookup._proc.process.assert_awaited_once()
+    assert lookup.get_calls == 1
+
+
+def test_file_view_cache_put_failure_still_returns_result() -> None:
+    """A throwing cache_put must not break file_view — result already computed."""
+    lookup = _ThrowingCacheLookup(fresh=_img_result("[fresh]"), throw_put=True)  # get→None miss
+    result = _invoke_cache(lookup, file_view_image_cache_enabled=True)
+    assert result.artifact.content == "[fresh]"
+    lookup._proc.process.assert_awaited_once()
+    assert lookup.put_calls == 1                        # put attempted, raised, swallowed
+
+
 def test_cache_hit_result_still_materializes_for_kimi() -> None:
     """spec §12 / R2#P2-3: cache 命中的 result（含 presigned URL）→ file_view Passthrough
     → _translate_outcome(materialize) 仍为 accepts_image_url=False provider 拉 bytes 转 base64

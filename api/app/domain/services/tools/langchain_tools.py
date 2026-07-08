@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
 from typing import Any, Awaitable, List, Literal, Optional, Union
 
@@ -40,6 +41,8 @@ from app.domain.services.tools._supervisor_tool_wrapper import (
 from app.domain.services.tools.tool_source_resolver import (
     annotate_and_register_tool_source,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_result_content(result: object) -> str:
@@ -839,7 +842,11 @@ def _make_file_view_tools(
                     _stat.get("dev"), _stat.get("ino"), mime_type,
                     supports_vision, supports_pdf_input, _FILE_VIEW_CACHE_VERSION,
                 )
-                result = processor_lookup.cache_get(_cache_key)  # None on miss
+                try:
+                    result = processor_lookup.cache_get(_cache_key)  # None on miss
+                except Exception:  # noqa: BLE001 — best-effort cache; a throwing backend (e.g. remote) must not break file_view
+                    logger.warning("file_view cache_get failed; reprocessing", exc_info=True)
+                    result = None
         if result is None:
             import time as _time
             _process_start = _time.time()
@@ -855,7 +862,10 @@ def _make_file_view_tools(
                 outcome = _exception_outcome("file_view", exc)
                 return outcome.content, outcome
             if _cache_key is not None and hasattr(processor_lookup, "cache_put"):
-                processor_lookup.cache_put(_cache_key, result, _process_start)
+                try:
+                    processor_lookup.cache_put(_cache_key, result, _process_start)
+                except Exception:  # noqa: BLE001 — best-effort cache write; result already computed, never fail the tool
+                    logger.warning("file_view cache_put failed; result already returned", exc_info=True)
 
         typed_blocks = [
             _multimodal_block_from_dict(block)

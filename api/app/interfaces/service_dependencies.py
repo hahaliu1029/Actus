@@ -876,6 +876,16 @@ class ChildRunnerSharedDeps:
     # subagent extension calls count into the same stats as root (no root-only
     # amputation). main.py's lazy resolver fills this from app.state.extension_stats.
     extension_stats_recorder: object = None
+    # B12 follow-up: file_view multimodal deps for the coordinator-child path.
+    # Sandbox-INDEPENDENT ingredients only — the child builds its OWN
+    # FileProcessorRegistry bound to its own sandbox inside `_build` (registry
+    # processors are sandbox-bound; the child runs in a separate sandbox). Left
+    # None keeps today's behavior (no file_view binding). `tool_runtime` (above)
+    # already carries the B12 flags.
+    supports_vision: object = None
+    supports_pdf_input: object = None
+    file_understanding_config: object = None
+    vision_fallback_model: object = None
 
 
 def _make_shared_child_runner_builder(
@@ -904,6 +914,45 @@ def _make_shared_child_runner_builder(
                 ),
             })
             _cache["child_agent_config"] = child_agent_config
+        # B12 follow-up: build the child's OWN FileProcessorRegistry bound to the
+        # child's sandbox (registry processors are sandbox-bound; the child runs in
+        # a separate sandbox from root). Mirrors agent_service._create_task. Producer
+        # gate: only when file_understanding is configured (else None →
+        # create_native_tools skips file_view binding — today's behavior).
+        child_file_processor_lookup = None
+        if deps.file_understanding_config:
+            from app.infrastructure.external.file_processors.registry import (
+                FileProcessorRegistry,
+            )
+
+            _file_storage = deps.file_storage
+
+            async def _upload_bytes(file_bytes: bytes, filename: str) -> "str | None":
+                from io import BytesIO
+
+                from fastapi import UploadFile
+                try:
+                    upload = UploadFile(
+                        file=BytesIO(file_bytes), filename=filename, size=len(file_bytes)
+                    )
+                    file_obj = await _file_storage.upload_file(upload)
+                    return await _file_storage.get_presigned_url(file_obj)
+                except Exception:
+                    logger.warning(
+                        "child file_uploader failed for %s", filename, exc_info=True
+                    )
+                    return None
+
+            child_file_processor_lookup = FileProcessorRegistry(
+                sandbox=sandbox,
+                file_uploader=_upload_bytes,
+                vision_model=deps.vision_fallback_model,
+                audio_config=deps.file_understanding_config.audio,
+                video_config=deps.file_understanding_config.video,
+                pdf_page_parallel_enabled=getattr(
+                    deps.tool_runtime, "pdf_page_parallel_enabled", False
+                ),
+            )
         return AgentTaskRunner(
             uow_factory=deps.uow_factory,
             llm=deps.llm,
@@ -926,6 +975,20 @@ def _make_shared_child_runner_builder(
             tool_runtime=deps.tool_runtime,
             # B9 Task 20 (R4#1): child extension calls also feed stats.
             extension_stats_recorder=deps.extension_stats_recorder,
+            # B12 follow-up: coordinator-child file_view parity. supports_vision/
+            # supports_pdf_input inherit the root's resolved capability ceiling;
+            # None (un-populated legacy/test deps) falls back to the runner default
+            # so pre-B12 behavior is preserved. file_processor_lookup is the child's
+            # own sandbox-bound registry (None when file_understanding unconfigured).
+            supports_vision=(
+                deps.supports_vision if deps.supports_vision is not None else True
+            ),
+            supports_pdf_input=(
+                deps.supports_pdf_input
+                if deps.supports_pdf_input is not None
+                else False
+            ),
+            file_processor_lookup=child_file_processor_lookup,
         )
 
     return _build
