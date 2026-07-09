@@ -102,6 +102,7 @@ class SubagentResearchService:
         supervisor_registry: Optional[SupervisorRegistryPort] = None,
         mailbox_publisher: Optional[MailboxPublisher] = None,
         subagent_run_repo: Optional[SubagentRunRepository] = None,
+        lifecycle_sink: Optional[Any] = None,
     ) -> None:
         self._session_service = session_service
         self._agent_service = agent_service
@@ -114,6 +115,11 @@ class SubagentResearchService:
         # [C4.1a §5.2] Optional subagent-run observation sink. None on flag-OFF
         # (repo-or-None at the composition root) → _record_child_run no-ops.
         self._subagent_run_repo = subagent_run_repo
+        # [C7 §4.5 R15] Optional research lifecycle sink. Injected unconditionally
+        # at the composition root; the AND-gate (master ∧ subagent) is evaluated
+        # at runtime inside the sink so config hot-reload takes effect immediately.
+        # None on the test/bypass path → the guarded call sites no-op.
+        self._lifecycle_sink = lifecycle_sink
         # codex r3 [R3-3, HIGH ARCH] — set of child IDs whose
         # SPAWN_REQUEST publish actually succeeded during the most
         # recent ``_ensure_supervisor_and_publish_spawns`` invocation.
@@ -820,6 +826,12 @@ class SubagentResearchService:
                     )
                     completed_results.append(rr)
                     await self._record_child_run(rr, parent_id)  # [C4.1a §5.2] BEFORE yield
+                    if self._lifecycle_sink is not None:
+                        await self._lifecycle_sink.child_done(
+                            parent_session_id=parent_id,
+                            child_session_id=child.id,
+                            outcome=ChildOutcome.FAILED,
+                        )
                     yield ChildDoneEvent(
                         id=f"done-{child.id}",
                         probe_run_id=probe_run_id,
@@ -836,6 +848,10 @@ class SubagentResearchService:
                 startable_children.append((child, prompt))
 
             for child, prompt in startable_children:
+                if self._lifecycle_sink is not None:
+                    await self._lifecycle_sink.child_started(
+                        parent_session_id=parent_id, child_session_id=child.id,
+                    )
                 yield ChildStartedEvent(
                     id=f"started-{child.id}",
                     probe_run_id=probe_run_id,
@@ -874,6 +890,12 @@ class SubagentResearchService:
                     result = await done_task
                     completed_results.append(result)
                     await self._record_child_run(result, parent_id)  # [C4.1a §5.2] BEFORE yield
+                    if self._lifecycle_sink is not None:
+                        await self._lifecycle_sink.child_done(
+                            parent_session_id=parent_id,
+                            child_session_id=result.child_id,
+                            outcome=result.outcome,
+                        )
                     yield ChildDoneEvent(
                         id=f"done-{result.child_id}",
                         probe_run_id=probe_run_id,

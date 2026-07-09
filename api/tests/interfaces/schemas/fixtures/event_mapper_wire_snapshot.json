@@ -1,0 +1,331 @@
+{
+  "compaction": {
+    "data_keys": [
+      "compaction_id",
+      "created_at",
+      "event_id",
+      "level",
+      "messages_removed",
+      "seq",
+      "tokens_after",
+      "tokens_before",
+      "usage_ratio_after"
+    ],
+    "sse_class": "CommonSSEEvent",
+    "wire_event": "compaction"
+  },
+  "context_status": {
+    "data_keys": [
+      "context_window",
+      "created_at",
+      "event_id",
+      "hard_threshold",
+      "seq",
+      "soft_threshold",
+      "usage_ratio",
+      "used_tokens"
+    ],
+    "sse_class": "CommonSSEEvent",
+    "wire_event": "context_status"
+  },
+  "control": {
+    "data_keys": [
+      "action",
+      "created_at",
+      "event_id",
+      "expires_at",
+      "handoff_mode",
+      "reason",
+      "request_status",
+      "scope",
+      "seq",
+      "source",
+      "takeover_id"
+    ],
+    "sse_class": "ControlSSEEvent",
+    "wire_event": "control"
+  },
+  "coordinator_apply": {
+    "data_keys": [
+      "apply_status",
+      "child_session_id",
+      "coordinator_run_id",
+      "created_at",
+      "event_id",
+      "failed_at_path",
+      "file_count",
+      "parent_session_id",
+      "rollback_status",
+      "root_session_id",
+      "seq",
+      "total_bytes",
+      "work_unit_id"
+    ],
+    "sse_class": "CoordinatorApplySSEEvent",
+    "wire_event": "coordinator_apply"
+  },
+  "coordinator_dispatch": {
+    "data_keys": [
+      "child_session_id",
+      "coordinator_run_id",
+      "created_at",
+      "event_id",
+      "parent_session_id",
+      "phases",
+      "root_session_id",
+      "seq",
+      "step_id",
+      "work_unit_count",
+      "work_unit_id",
+      "work_unit_ids"
+    ],
+    "sse_class": "CoordinatorDispatchSSEEvent",
+    "wire_event": "coordinator_dispatch"
+  },
+  "coordinator_reduce": {
+    "data_keys": [
+      "child_session_id",
+      "conflict_paths",
+      "coordinator_run_id",
+      "cost_total",
+      "created_at",
+      "diagnostics_summary",
+      "event_id",
+      "group_outcome",
+      "parent_session_id",
+      "per_worker_outcomes",
+      "root_session_id",
+      "seq",
+      "work_unit_id"
+    ],
+    "sse_class": "CoordinatorReduceSSEEvent",
+    "wire_event": "coordinator_reduce"
+  },
+  "coordinator_sibling_cancel": {
+    "data_keys": [
+      "cancelled_work_unit_ids",
+      "child_session_id",
+      "coordinator_run_id",
+      "created_at",
+      "event_id",
+      "parent_session_id",
+      "reason",
+      "root_session_id",
+      "seq",
+      "triggered_by_outcome",
+      "triggered_by_work_unit_id",
+      "work_unit_id"
+    ],
+    "sse_class": "CoordinatorSiblingCancelSSEEvent",
+    "wire_event": "coordinator_sibling_cancel"
+  },
+  "coordinator_worker_spawned": {
+    "data_keys": [
+      "allowed_tools",
+      "child_session_id",
+      "coordinator_run_id",
+      "created_at",
+      "event_id",
+      "objective",
+      "parent_session_id",
+      "phase",
+      "root_session_id",
+      "seq",
+      "work_unit_id",
+      "write_lease_count"
+    ],
+    "sse_class": "CoordinatorWorkerSpawnedSSEEvent",
+    "wire_event": "coordinator_worker_spawned"
+  },
+  "done": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "metrics",
+      "seq"
+    ],
+    "sse_class": "DoneSSEEvent",
+    "wire_event": "done"
+  },
+  "error": {
+    "data_keys": [
+      "created_at",
+      "error",
+      "event_id",
+      "seq"
+    ],
+    "sse_class": "ErrorSSEEvent",
+    "wire_event": "error"
+  },
+  "execution_state_changed": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "payload",
+      "seq"
+    ],
+    "sse_class": "CommonSSEEvent",
+    "wire_event": "execution_state_changed"
+  },
+  "finishing": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "seq"
+    ],
+    "sse_class": "FinishingSSEEvent",
+    "wire_event": "finishing"
+  },
+  "health": {
+    "data_keys": [
+      "action",
+      "created_at",
+      "event_id",
+      "idle_seconds",
+      "last_node",
+      "metrics",
+      "reason",
+      "seq",
+      "status",
+      "tool_failures"
+    ],
+    "sse_class": "HealthSSEEvent",
+    "wire_event": "health"
+  },
+  "message": {
+    "data_keys": [
+      "attachments",
+      "created_at",
+      "event_id",
+      "message",
+      "partial",
+      "role",
+      "seq",
+      "stream_id"
+    ],
+    "sse_class": "MessageSSEEvent",
+    "wire_event": "message"
+  },
+  "owner_conflict": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "payload",
+      "seq"
+    ],
+    "sse_class": "CommonSSEEvent",
+    "wire_event": "owner_conflict"
+  },
+  "plan": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "seq",
+      "steps"
+    ],
+    "sse_class": "PlanSSEEvent",
+    "wire_event": "plan"
+  },
+  "sandbox_state_changed": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "generation",
+      "new_state",
+      "old_state",
+      "reason",
+      "sandbox_id",
+      "seq"
+    ],
+    "sse_class": "SandboxStateChangedSSEEvent",
+    "wire_event": "sandbox_state_changed"
+  },
+  "session_mode_changed": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "from_mode",
+      "mode_revision",
+      "reason",
+      "seq",
+      "to"
+    ],
+    "sse_class": "SessionModeChangedSSEEvent",
+    "wire_event": "session_mode_changed"
+  },
+  "step": {
+    "data_keys": [
+      "created_at",
+      "description",
+      "event_id",
+      "id",
+      "seq",
+      "status"
+    ],
+    "sse_class": "StepSSEEvent",
+    "wire_event": "step"
+  },
+  "title": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "seq",
+      "title"
+    ],
+    "sse_class": "TitleSSEEvent",
+    "wire_event": "title"
+  },
+  "tool": {
+    "data_keys": [
+      "activity_description",
+      "args",
+      "content",
+      "created_at",
+      "destructive",
+      "display_icon",
+      "envelope_version",
+      "event_id",
+      "function",
+      "function_result",
+      "media_type",
+      "name",
+      "read_only",
+      "render_style",
+      "seq",
+      "status",
+      "tool_call_id",
+      "tool_source"
+    ],
+    "sse_class": "ToolSSEEvent",
+    "wire_event": "tool"
+  },
+  "tool_confirmation": {
+    "data_keys": [
+      "approval_options",
+      "created_at",
+      "decision_reason",
+      "event_id",
+      "matched_patterns",
+      "risk_level",
+      "risk_reason",
+      "seq",
+      "suggested_alternative",
+      "timeout_seconds",
+      "tool_args",
+      "tool_call_id",
+      "tool_name"
+    ],
+    "sse_class": "ToolConfirmationSSEEvent",
+    "wire_event": "tool_confirmation"
+  },
+  "wait": {
+    "data_keys": [
+      "created_at",
+      "event_id",
+      "pending_action",
+      "seq"
+    ],
+    "sse_class": "WaitSSEEvent",
+    "wire_event": "wait"
+  }
+}

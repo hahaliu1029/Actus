@@ -28,6 +28,7 @@ from app.domain.errors.supervisor import SupervisorContractError
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
+    LifecycleRuntimeConfig,
     MCPConfig,
     SkillRiskPolicy,
     ToolRuntimeConfig,
@@ -47,6 +48,7 @@ from app.domain.models.event import (
     WaitEvent,
 )
 from app.domain.models.file import File
+from app.domain.models.lifecycle import RETRY_BUDGET_INITIAL, RetryLifecycleContext
 from app.domain.models.message import SkillConfirmationAction
 from app.domain.models.session import SandboxBindingState, Session, SessionStatus
 
@@ -157,6 +159,8 @@ class _ConfigSnapshot:
     memory_gate_llm: BaseChatModel | None = None
     memory_gate_threshold: float = 0.7
     memory_gate_batch_cap: int = 20
+    # C7: lifecycle flag 快照（default-OFF；config refresh 原子换新）
+    lifecycle_runtime: LifecycleRuntimeConfig = field(default_factory=LifecycleRuntimeConfig)
 
 
 @dataclass
@@ -423,6 +427,7 @@ class AgentService:
         *,
         tool_filter: Optional[FrozenSet[str]] = None,
         force_initial_compaction: bool = False,
+        retry_lifecycle_context: Optional[RetryLifecycleContext] = None,
     ) -> Task:
         """根据传递的会话创建一个新任务
 
@@ -802,6 +807,14 @@ class AgentService:
             session_state_machine=self._ssm,
             initial_language=initial_language,
             tool_runtime=snap.tool_runtime,
+            # C7: lifecycle flags 前半段布线终点——runner 持有，graph/flow 不接（spec §8）
+            lifecycle_runtime=snap.lifecycle_runtime,
+            retry_lifecycle_context=retry_lifecycle_context,
+            # C7 §5 R10#A3 — epoch 从持久列派生（每次建 task 都算，retry 后的
+            # follow-up task 亦携带当前 epoch）；禁止内存计数。
+            lifecycle_task_epoch=max(
+                0, RETRY_BUDGET_INITIAL - session.retry_budget_remaining
+            ),
             on_session_complete=self._compose_completion_callbacks(
                 original=self._on_task_runner_complete,
                 session_id=session.id,
@@ -3866,9 +3879,16 @@ end
         )
         return await task.input_stream.put(handoff_event.model_dump_json())
 
-    async def _resume_task_with_handoff(self, session: Session, text: str) -> Task:
-        """重建任务并注入handoff消息后启动任务。"""
-        task = await self._create_task(session)
+    async def _resume_task_with_handoff(
+        self, session: Session, text: str, *, retry_lifecycle_context=None,
+    ) -> Task:
+        """重建任务并注入handoff消息后启动任务。
+
+        retry_lifecycle_context（C7 §5，R3#7）：独立 optional 参数、仅
+        retry_from_suspend 传入——不与普通 takeover handoff 文本混流；
+        透传不受 lifecycle flag 门控（R7#P3c）。
+        """
+        task = await self._create_task(session, retry_lifecycle_context=retry_lifecycle_context)
         await self._inject_handoff_message(task, text)
         await task.invoke()
         return task
@@ -3963,6 +3983,9 @@ end
             await self._resume_task_with_handoff(
                 session,
                 "用户请求重试挂起的后台任务，请从上次中断处继续执行。",
+                retry_lifecycle_context=RetryLifecycleContext(
+                    retry_budget_remaining=claimed_retry_budget,
+                ),
             )
         except (SessionDestroyingError, SessionFinalizedError) as exc:
             await self._finalize_lost_background_retry(

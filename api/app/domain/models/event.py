@@ -10,6 +10,13 @@ from .mailbox_envelope import CostAggregate, ResultReadyOutcome
 from .message import SkillConfirmationAction
 from .patch_apply_plan import GroupOutcome
 from .plan import Plan, Step
+from .lifecycle import (
+    LifecycleCorrelationV1,
+    LifecycleDetailV1,
+    LifecycleEventKind,
+    LifecycleState,
+    LifecycleType,
+)
 from .search import SearchResultItem
 from .tool_result import DecisionReason, ToolResult
 from app.domain.services.tools.tool_source_resolver import ToolSource
@@ -465,6 +472,34 @@ class CoordinatorSiblingCancelEvent(BaseEvent, CoordinatorLineageMixin):
     reason: str
 
 
+class LifecycleEvent(BaseEvent):
+    """C7 §3.1 — 统一生命周期事件（dual-emit 旁路）。
+
+    构造纪律（INV-C7-2）：生产代码只能经
+    ``app.domain.services.lifecycle_emit.build_lifecycle_event`` 构造本类；
+    禁止直接实例化 / model_construct / model_validate / model_copy(update=) /
+    子类化（AST gate: tests/invariants/test_inv_c7_2_lifecycle_single_constructor.py）。
+    ``state`` 由 STATE_FOR 派生表决定，不由调用方传入（R10#A4）。
+    """
+
+    type: Literal["lifecycle"] = "lifecycle"
+    lifecycle_type: LifecycleType
+    event: LifecycleEventKind
+    state: LifecycleState                 # source 投影出的「事件后状态」；reducer effective state 可因 sticky 规则不同（R1#8）
+    unit_id: str
+    epoch: int = Field(0, ge=0)           # 顶层 attempt 纪元；非 TASK 恒 0（INV-C7-8）
+    # 溯源（dual-emit 配对审计，INV-C7-6：配对靠这三元组，不承诺相邻）
+    source_event_type: Optional[str] = None
+    source_event_id: Optional[str] = None
+    source_seq: Optional[int] = None
+    # 受控语义载荷（R4#1）
+    reason: Optional[str] = None
+    detail: Optional[LifecycleDetailV1] = None
+    # 关联
+    parent_unit_id: Optional[str] = None
+    correlation: Optional[LifecycleCorrelationV1] = None
+
+
 # 定义应用事件类型声明
 Event = Annotated[
     Union[
@@ -490,6 +525,7 @@ Event = Annotated[
         CoordinatorReduceEvent,       # C2 PR-8
         CoordinatorApplyEvent,        # C2 PR-8
         CoordinatorSiblingCancelEvent,  # C2 PR-8
+        LifecycleEvent,               # C7 PR1
         DoneEvent,
     ],
     Field(discriminator="type"),

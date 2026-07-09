@@ -39,13 +39,13 @@ import {
   createProvisionalState,
   eventIdOf,
   eventSemanticKey,
-  normalizeSessionEvents,
   pruneRecoveredLLMErrors,
   syncPlanStepsByStepEvent,
   upsertSessionEvent,
   type ProvisionalState,
   type SessionEventRecord,
 } from "@/lib/event-normalize";
+import { normalizeAndRouteSessionEvents } from "@/lib/lifecycle/dispatch";
 
 // ---------------------------------------------------------------------------
 // Phase 1 minimal subagent research — probe state slice
@@ -1202,7 +1202,7 @@ export const useSessionStore = create<SessionStore>()(
         descendantIds.map(async (id) => {
           try {
             const session = await sessionApi.getSession(id);
-            const events = normalizeSessionEvents(session.events as SessionEventRecord[]);
+            const events = normalizeAndRouteSessionEvents(session.events as SessionEventRecord[]);
             const rawLastId = events.length ? events[events.length - 1].data.event_id : undefined;
             const lastEventId = typeof rawLastId === "string" ? rawLastId : null;
             return { id, events, lastSeq: session.last_seq ?? null, lastEventId };
@@ -1299,7 +1299,7 @@ export const useSessionStore = create<SessionStore>()(
               if (!res.events.length) {
                 return null;
               }
-              const events = normalizeSessionEvents([
+              const events = normalizeAndRouteSessionEvents([
                 ...bundle.events,
                 ...(res.events as SessionEventRecord[]),
               ]);
@@ -1310,7 +1310,7 @@ export const useSessionStore = create<SessionStore>()(
             // No bundle (failed/new) OR a bundle with no event-id cursor → full fetch + normalize
             // (INV-9, never seq-only), like loadMergedTimeline.
             const session = await sessionApi.getSession(id);
-            const events = normalizeSessionEvents(session.events as SessionEventRecord[]);
+            const events = normalizeAndRouteSessionEvents(session.events as SessionEventRecord[]);
             const rawLastId = events.length ? events[events.length - 1].data.event_id : undefined;
             const lastEventId = typeof rawLastId === "string" ? rawLastId : null;
             return { id, events, lastSeq: session.last_seq ?? null, lastEventId };
@@ -1437,7 +1437,7 @@ export const useSessionStore = create<SessionStore>()(
       }
       try {
         const session = await sessionApi.getSession(sessionId);
-        const normalizedEvents = normalizeSessionEvents(session.events as SessionEventRecord[]);
+        const normalizedEvents = normalizeAndRouteSessionEvents(session.events as SessionEventRecord[]);
         const normalizedRemote: Session = {
           ...session,
           status: normalizeSessionStatus(session.status),
@@ -1718,7 +1718,7 @@ export const useSessionStore = create<SessionStore>()(
           return;
         }
 
-        const normalized = normalizeSessionEvents(recoveredEvents);
+        const normalized = normalizeAndRouteSessionEvents(recoveredEvents);
 
         set((s) => {
           const local = s.currentSession;

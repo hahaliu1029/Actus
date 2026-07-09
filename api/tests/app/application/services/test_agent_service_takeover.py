@@ -269,7 +269,7 @@ async def test_reject_takeover_continue_switches_back_to_running(
     async def fake_get_accessible_session(*args, **kwargs) -> Session:
         return session
 
-    async def fake_create_task(_session: Session):
+    async def fake_create_task(_session: Session, *, retry_lifecycle_context=None):
         return task
 
     async def fake_append_control_event(_session_id: str, **kwargs):
@@ -507,7 +507,7 @@ async def test_end_takeover_continue_passes_takeover_id_and_releases_lease(
     async def fake_get_accessible_session(*args, **kwargs) -> Session:
         return session
 
-    async def fake_create_task(_session: Session):
+    async def fake_create_task(_session: Session, *, retry_lifecycle_context=None):
         return task
 
     async def fake_append_control_event(_session_id: str, **kwargs):

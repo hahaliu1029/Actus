@@ -189,6 +189,7 @@ async def test_create_task_registers_cancelable_task_not_task_runner(
         memory_gate_threshold=0.8,
         memory_gate_batch_cap=10,
         tool_runtime=None,
+        lifecycle_runtime=None,
     )
     service._sandbox_lifecycle_service = _Lifecycle()
     service._uow_factory = lambda: _Uow(session)

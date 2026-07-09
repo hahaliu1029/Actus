@@ -1,5 +1,6 @@
 import { createSSEStream, get, parseSSEStream, post } from "./fetch";
 import { fileTransferClient } from "./axios-client";
+import { dispatchLifecycleWireEvent } from "@/lib/lifecycle/dispatch";
 import {
   API_BASE_URL,
   getAccessToken,
@@ -150,7 +151,13 @@ export const sessionApi = {
               return;
             }
 
-            const eventType = messageEvent.type as SSEEventData["type"];
+            const rawEventType = messageEvent.type;
+            // C7 §7：raw SSE 层最先分流 lifecycle.*，命中即 return——
+            // 永不构造旧 SSEEventData（R1#9 分流规则唯一化）
+            if (dispatchLifecycleWireEvent(rawEventType, messageEvent.data)) {
+              return;
+            }
+            const eventType = rawEventType as SSEEventData["type"];
             const data = messageEvent.data as SSEEventData["data"];
 
             onEvent({

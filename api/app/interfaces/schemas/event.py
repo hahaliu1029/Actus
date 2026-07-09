@@ -15,6 +15,7 @@ from app.domain.models.event import (
     Event,
     HealthEvent,
     HealthStatus,
+    LifecycleEvent,
     PlanEvent,
     SandboxStateChangedEvent,
     SessionModeChangedEvent,
@@ -205,6 +206,57 @@ class PlanSSEEvent(BaseSSEEvent):
                     for step in event.plan.steps
                 ],
             )
+        )
+
+
+class LifecycleEventData(BaseEventData):
+    """C7 §3.2 — lifecycle SSE 载荷。data 内保留结构化判别字段（type/lifecycle_type/event），
+    点分 wire 名仅在 LifecycleSSEEvent.event 上（日志/人读/订阅过滤用）。"""
+
+    type: str = "lifecycle"               # domain 判别符显式随载荷下发（spec §3.2 data 示例）
+    lifecycle_type: str
+    event: str                            # LifecycleEventKind value（与外层 SSE event 点分名分职）
+    state: str
+    unit_id: str
+    epoch: int = 0
+    source_event_type: Optional[str] = None
+    source_event_id: Optional[str] = None
+    source_seq: Optional[int] = None
+    reason: Optional[str] = None
+    detail: Optional[Dict[str, Any]] = None
+    parent_unit_id: Optional[str] = None
+    correlation: Optional[Dict[str, Any]] = None
+
+
+class LifecycleSSEEvent(BaseSSEEvent):
+    """C7 §3.2 — wire `event:` 行 = `lifecycle.{lifecycle_type}.{event}` 点分名。
+
+    ``event`` 故意声明为 ``str``（非 Literal）：反射建表（:765）静默跳过本类，
+    映射由 _get_event_type_mapping 尾部的显式注册提供（R2#5/R6#P3b）。
+    """
+
+    event: str
+    data: LifecycleEventData
+
+    @classmethod
+    def from_event(cls, event: LifecycleEvent) -> "LifecycleSSEEvent":
+        return cls(
+            event=f"lifecycle.{event.lifecycle_type.value}.{event.event.value}",
+            data=LifecycleEventData(
+                **BaseEventData.base_event_data(event),
+                lifecycle_type=event.lifecycle_type.value,
+                event=event.event.value,
+                state=event.state.value,
+                unit_id=event.unit_id,
+                epoch=event.epoch,
+                source_event_type=event.source_event_type,
+                source_event_id=event.source_event_id,
+                source_seq=event.source_seq,
+                reason=event.reason,
+                detail=(event.detail.model_dump(mode="json") if event.detail is not None else None),
+                parent_unit_id=event.parent_unit_id,
+                correlation=(event.correlation.model_dump(mode="json") if event.correlation is not None else None),
+            ),
         )
 
 
@@ -718,6 +770,7 @@ AgentSSEEvent = Union[
     CoordinatorReduceSSEEvent,
     CoordinatorApplySSEEvent,
     CoordinatorSiblingCancelSSEEvent,
+    LifecycleSSEEvent,
 ]
 
 
@@ -779,6 +832,17 @@ class EventMapper:
                         data_class=data_class,
                         event_type=event_type,
                     )
+
+        # C7 PR1 — 显式注册（R2#5/R6#P3b/R10#A8）：LifecycleSSEEvent.event 是 str
+        # （点分名在 from_event 计算），反射循环拿不到 Literal 值静默跳过；此处
+        # 用 domain 判别符 "lifecycle" 直接建映射。注册无条件（不 flag 门控）——
+        # 类级缓存一次建表，flag 门控注册会在运行期翻 flag 后因缓存陈旧降级
+        # CommonSSEEvent（F6/F22 教训）；无发射即 wire 不可见，注册零 wire 差异。
+        mapping["lifecycle"] = EventMapping(
+            sse_event_class=LifecycleSSEEvent,
+            data_class=LifecycleEventData,
+            event_type="lifecycle",
+        )
 
         # 10.更新类级缓存
         EventMapper._cache_mapping = mapping

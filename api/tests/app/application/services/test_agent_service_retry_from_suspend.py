@@ -210,7 +210,9 @@ async def test_retry_from_suspend_resumes_sandbox_and_restarts_background_task(
     async def _get_accessible_session(*args, **kwargs) -> Session:
         return session
 
-    async def _resume_task_with_handoff(session_arg: Session, text: str) -> object:
+    async def _resume_task_with_handoff(
+        session_arg: Session, text: str, *, retry_lifecycle_context=None,
+    ) -> object:
         resumed.append((session_arg, text))
         return object()
 

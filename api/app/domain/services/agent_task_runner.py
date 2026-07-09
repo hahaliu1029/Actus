@@ -34,6 +34,7 @@ from app.domain.external.task import Task, TaskRunner
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
+    LifecycleRuntimeConfig,
     MCPConfig,
     SkillRiskPolicy,
     ToolRuntimeConfig,
@@ -67,6 +68,7 @@ from app.domain.models.event import (
     WaitEvent,
 )
 from app.domain.models.file import File
+from app.domain.models.lifecycle import LifecycleDetailV1, LifecycleEventKind
 from app.domain.models.message import Message
 from app.domain.models.search import SearchResults
 from app.domain.models.session import SessionStatus
@@ -452,6 +454,9 @@ class AgentTaskRunner(TaskRunner):
         # planner ctor — preserves legacy/test behavior so callers that
         # don't wire coordinator infrastructure SKIP the 18 coord cfg keys.
         coord_deps: Any = None,
+        lifecycle_runtime: Any = None,  # C7: LifecycleRuntimeConfig | None（None=flag-off，测试/旧调用方零改动）
+        retry_lifecycle_context: Any = None,  # C7 §5: RetryLifecycleContext | None（仅 retry_from_suspend 路径传入）
+        lifecycle_task_epoch: int = 0,  # C7 §5: _create_task 从 session.retry_budget_remaining 持久派生（R10#A3）
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -465,6 +470,25 @@ class AgentTaskRunner(TaskRunner):
         # request forces a compaction pass at run start. Default False =
         # legacy behavior (no forced compaction).
         self._force_initial_compaction: bool = force_initial_compaction
+        # C7 — lifecycle dual-emit 配置与运行态（spec §6/§8）。
+        # None（旧调用方/测试 __new__ 路径）等价 flag-off；hook 侧用 getattr 防御读取。
+        self._lifecycle_runtime = lifecycle_runtime or LifecycleRuntimeConfig()
+        from app.domain.services.lifecycle_projector import LifecycleProjector as _LifecycleProjector
+        self._lifecycle_projector = _LifecycleProjector(
+            parent_session_id=session_id,
+            subagent_enabled=lambda: (
+                self._lifecycle_runtime.lifecycle_subagent_events_enabled
+            ),
+            child_lookup=self._lifecycle_lookup_children,
+        )
+        self._lifecycle_terminal_emitted: set = set()  # INV-C7-5 emitter in-process 终态去重
+        # PR4 Task 12: RetryLifecycleContext 与 task 层 epoch 均由 _create_task
+        # 传入——context 仅 retry_from_suspend 路径非 None；epoch 从 session
+        # 持久列 retry_budget_remaining 派生（R10#A3，禁止内存计数）。
+        # postprocess 失败单发标记防 watchdog timeout 竞态双发（见 invoke() 布点 4/5）。
+        self._retry_lifecycle_context = retry_lifecycle_context
+        self._lifecycle_task_epoch = max(0, int(lifecycle_task_epoch))
+        self._lifecycle_postprocess_failed = False
         # C3 PR-3c — lifecycle hooks to spawn/stop the per-pod MailboxSupervisor
         # for THIS session iff this runner is for a root session AND the
         # deployment flag is enabled. Both default to None / False so existing
@@ -937,7 +961,8 @@ class AgentTaskRunner(TaskRunner):
         )
 
     async def _put_and_add_event(
-        self, task: Task, event: Event, persist: bool = True
+        self, task: Task, event: Event, persist: bool = True,
+        project_lifecycle: bool = True,
     ) -> None:
         """往指定任务的消息队列中添加事件"""
         await self._stamp_event_seq(event)
@@ -950,6 +975,133 @@ class AgentTaskRunner(TaskRunner):
         if persist:
             async with self._uow:
                 await self._uow.session.add_event(self._session_id, event)
+
+        # 3. C7 §6 post-stamp hook：source 的 seq/id/persist 全部落位后、同协程
+        #    内联投影 lifecycle（R10#A5：禁 create_task——否则多 source 的
+        #    lifecycle 相对序不保；不得移到 persist 之前——否则 PG events
+        #    列表序与 seq 序反转）。lifecycle 自身发射传 project_lifecycle=False。
+        if project_lifecycle:
+            await self._project_and_emit_lifecycle(task, event, source_persisted=persist)
+
+    async def _project_and_emit_lifecycle(
+        self, task: Task, source: Event, *, source_persisted: bool
+    ) -> None:
+        """C7 §6 咽喉投影器入口。INV-C7-3：flag guard 在本方法入口——flag-off
+        下零构造零发射零 repo 调用零 side-effect。getattr 防御（__new__ 构造的
+        既有测试 runner 不设 C7 属性）。"""
+        cfg = getattr(self, "_lifecycle_runtime", None)
+        if cfg is None or not cfg.lifecycle_events_enabled:
+            return
+        # 双保险（R3#5）：投影器自身有 isinstance 守卫，此处再拦一道热路径
+        if getattr(source, "type", None) == "lifecycle":
+            return
+        projector = getattr(self, "_lifecycle_projector", None)
+        if projector is None:
+            return
+        try:
+            lifecycle_events = await projector.project(source)
+        except Exception:
+            logger.warning(
+                "lifecycle projection failed: source=%s session=%s",
+                getattr(source, "type", "?"), self._session_id, exc_info=True,
+            )
+            return
+        from app.domain.models.lifecycle import is_terminal
+        for lc in lifecycle_events:
+            # INV-C7-5：emitter 侧 in-process best-effort 终态去重（权威去重在
+            # 前端 reducer sticky；跨重启重复终态 wire 层允许）。progress 不去重。
+            if is_terminal(lc.state):
+                key = (lc.lifecycle_type.value, lc.unit_id, lc.epoch)
+                emitted = getattr(self, "_lifecycle_terminal_emitted", None)
+                if emitted is None:
+                    emitted = set()
+                    self._lifecycle_terminal_emitted = emitted
+                if key in emitted:
+                    continue
+                emitted.add(key)
+            await self._put_and_add_event(
+                task, lc, persist=source_persisted, project_lifecycle=False,
+            )
+
+    async def _lifecycle_lookup_children(self, coordinator_run_id: str) -> "Dict[str, str]":
+        """C7 §4.5/R3#2 — (run_id, parent=self) → {work_unit_id: child_session_id}。
+        child 行持久携带 work_unit_id/coordinator_run_id（session.py:121-122，
+        spawn 时写入）；parent 固定为本 runner session（repo 双谓词 defense-in-depth）。"""
+        async with self._uow:
+            rows = await self._uow.session.find_children_by_coordinator_run(
+                coordinator_run_id=coordinator_run_id,
+                parent_session_id=self._session_id,
+            )
+        return {
+            row.work_unit_id: row.id
+            for row in rows
+            if getattr(row, "work_unit_id", None)
+        }
+
+    async def _emit_task_lifecycle(
+        self,
+        task: Task,
+        kind: "LifecycleEventKind",
+        *,
+        reason: "Optional[str]" = None,
+        detail: "Optional[LifecycleDetailV1]" = None,
+    ) -> None:
+        """C7 §4.4 — task 层 lifecycle 本地发射（runner 终止分支持有判别上下文，R4#2）。
+
+        纪律：flag guard 最先（INV-C7-3：off 时连 root 查询都不做）；root-only
+        （child 观测归 subagent 层，§12-7b）；epoch 全事件附着（§5）；终态
+        in-process 去重与投影侧共用（INV-C7-5）；**永不 raise**——lifecycle 是
+        观测面，不得影响终止分支主流程。
+        """
+        cfg = getattr(self, "_lifecycle_runtime", None)
+        if cfg is None or not cfg.lifecycle_events_enabled:
+            return
+        try:
+            if not await self._is_root_session():
+                return
+            from app.domain.models.lifecycle import LifecycleType, is_terminal
+            from app.domain.services.lifecycle_emit import build_lifecycle_event
+            lc = build_lifecycle_event(
+                LifecycleType.TASK, kind,
+                unit_id=self._session_id,
+                epoch=getattr(self, "_lifecycle_task_epoch", 0),
+                reason=reason, detail=detail,
+            )
+            if is_terminal(lc.state):
+                key = (lc.lifecycle_type.value, lc.unit_id, lc.epoch)
+                emitted = getattr(self, "_lifecycle_terminal_emitted", None)
+                if emitted is None:
+                    emitted = set()
+                    self._lifecycle_terminal_emitted = emitted
+                if key in emitted:
+                    return
+                emitted.add(key)
+            await self._put_and_add_event(task, lc, persist=True, project_lifecycle=False)
+        except Exception:
+            logger.warning(
+                "task lifecycle emit failed (session=%s kind=%s)",
+                self._session_id, kind, exc_info=True,
+            )
+
+    async def _emit_task_started_or_retried(self, task: Task) -> None:
+        """C7 §5 — 新 task 首事件调度：RetryLifecycleContext 存在 → 发 retried 并
+        suppress started（同一 task 不得既 retried 又 started，语义互斥）；否则 started。
+        context 消费一次即清（无论 flag 状态——flag-off 下 context 传了无人消费也要清，
+        语义上它属于本次 task 启动）。"""
+        ctx = getattr(self, "_retry_lifecycle_context", None)
+        if ctx is None:
+            await self._emit_task_lifecycle(task, LifecycleEventKind.STARTED)
+            return
+        self._retry_lifecycle_context = None
+        await self._emit_task_lifecycle(
+            task, LifecycleEventKind.RETRIED,
+            reason="retry_from_suspend",
+            detail=LifecycleDetailV1(
+                trigger=ctx.trigger,
+                previous_state=ctx.previous_state,
+                retry_budget_remaining=ctx.retry_budget_remaining,
+            ),
+        )
 
     async def _touch_idle_activity(self) -> None:
         watchdog = getattr(self, "_idle_watchdog", None)
@@ -4265,6 +4417,9 @@ class AgentTaskRunner(TaskRunner):
                     session_repo=self._uow.session,
                 )
 
+            # C7 §4.4/§5 — task 首事件：started 或 retried（互斥）
+            await self._emit_task_started_or_retried(task)
+
             # [C2b §4.2] After the child session's PENDING→RUNNING bump committed
             # above, refresh the cpc revision baseline so the tool_node child-scope
             # guard's live revision read matches (else the first child tool call
@@ -4565,6 +4720,13 @@ class AgentTaskRunner(TaskRunner):
                             # 8-12. 发送事件到输出流并处理各类侧效应
                             result = await self._emit_flow_event(task, event)
                             if result is not None:
+                                if result is FlowYieldSignal.WAIT:
+                                    # C7 §4.4 — human-in-the-loop 中断进入 WAITING：
+                                    # 中间态 progress；TAKEOVER_REQUESTED 不发（模式切换非终态）
+                                    await self._emit_task_lifecycle(
+                                        task, LifecycleEventKind.PROGRESS,
+                                        reason="waiting_confirmation",
+                                    )
                                 return
 
                         # 单条消息执行结束后重置step锁定状态
@@ -4580,6 +4742,9 @@ class AgentTaskRunner(TaskRunner):
                                 session_repo=self._uow.session,
                             )
                         await self._put_and_add_event(task, FinishingEvent())
+                        await self._emit_task_lifecycle(
+                            task, LifecycleEventKind.PROGRESS, reason="finishing",
+                        )
 
                         try:
                             cancelled = await self._run_postprocess_or_cancel(task)
@@ -4589,6 +4754,10 @@ class AgentTaskRunner(TaskRunner):
                             for ev in self._build_compaction_events_if_any():
                                 await self._put_and_add_event(task, ev)
                             await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                            # C7 §4.4 布点4 — 标记 postprocess 失败；终态发射统一在下方
+                            # 终局分支（布点5）reason=postprocess_failed，防 watchdog
+                            # timeout 竞态在同一 (unit,epoch) 上双发终态。
+                            self._lifecycle_postprocess_failed = True
                             break
 
                         if cancelled:
@@ -4647,10 +4816,22 @@ class AgentTaskRunner(TaskRunner):
                         action="terminated",
                         metrics=self._snapshot_metrics(),
                     ))
+                    # C7 §4.4 — watchdog 超时映射 failed（不映射 cancelled）
+                    await self._emit_task_lifecycle(
+                        task, LifecycleEventKind.FAILED, reason="watchdog_timeout",
+                    )
                     await self._set_terminal_status_with_notifications(
                         SessionStatus.TIMED_OUT
                     )
                 else:
+                    await self._emit_task_lifecycle(
+                        task, LifecycleEventKind.COMPLETED,
+                        reason=(
+                            "postprocess_failed"
+                            if getattr(self, "_lifecycle_postprocess_failed", False)
+                            else None
+                        ),
+                    )
                     await self._set_terminal_status_with_notifications(
                         SessionStatus.COMPLETED
                     )
@@ -4670,6 +4851,12 @@ class AgentTaskRunner(TaskRunner):
                     raise
 
                 await self._put_and_add_event(task, DoneEvent())
+                if cancel_reason == "stop":
+                    # C7 §4.4 — 仅用户 stop 映射 cancelled；suspend/takeover/delete
+                    # 已在上方 re-raise（非终态清单，禁止「所有 CancelledError→cancelled」）
+                    await self._emit_task_lifecycle(
+                        task, LifecycleEventKind.CANCELLED, reason="user_cancel",
+                    )
                 await self._set_terminal_status_with_notifications(
                     SessionStatus.COMPLETED,
                     self._terminal_reason_for_cancel(cancel_reason),
@@ -4755,6 +4942,11 @@ class AgentTaskRunner(TaskRunner):
                 # caller-default; the flag overrides outcome only
                 # for the mailbox audit wire).
                 self._runner_exception_terminal = True
+                # C7 §4.4 — 受控 code（runner_error）；异常文本只在上方 ErrorEvent
+                # (source) 里，绝不进 lifecycle reason（spec §3.1）。
+                await self._emit_task_lifecycle(
+                    task, LifecycleEventKind.FAILED, reason="runner_error",
+                )
                 await self._set_terminal_status_with_notifications(
                     SessionStatus.COMPLETED
                 )
@@ -4803,6 +4995,13 @@ class AgentTaskRunner(TaskRunner):
 
                 result = await self._emit_flow_event(task, event)
                 if result is not None:
+                    if result is FlowYieldSignal.WAIT:
+                        # C7 §4.4 — human-in-the-loop 中断进入 WAITING：中间态
+                        # progress；TAKEOVER_REQUESTED 不发（模式切换非终态）
+                        await self._emit_task_lifecycle(
+                            task, LifecycleEventKind.PROGRESS,
+                            reason="waiting_confirmation",
+                        )
                     return
 
             # FINISHING: run deferred post-processing then emit DoneEvent (mirrors invoke())
@@ -4815,6 +5014,9 @@ class AgentTaskRunner(TaskRunner):
                         session_repo=self._uow.session,
                     )
                 await self._put_and_add_event(task, FinishingEvent())
+                await self._emit_task_lifecycle(
+                    task, LifecycleEventKind.PROGRESS, reason="finishing",
+                )
 
                 try:
                     cancelled = await self._run_postprocess_or_cancel(task)
@@ -4823,6 +5025,10 @@ class AgentTaskRunner(TaskRunner):
                     for ev in self._build_compaction_events_if_any():
                         await self._put_and_add_event(task, ev)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
+                    # C7 §4.4 resume 行——postprocess 失败仍映射 completed（保持行为一致）
+                    await self._emit_task_lifecycle(
+                        task, LifecycleEventKind.COMPLETED, reason="postprocess_failed",
+                    )
                     await self._set_terminal_status_with_notifications(
                         SessionStatus.COMPLETED
                     )
@@ -4834,6 +5040,13 @@ class AgentTaskRunner(TaskRunner):
                         await self._put_and_add_event(task, ev)
                     await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                     _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
+                    # C7 §4.4 — watchdog 超时映射 failed，否则 completed（终态状态写之前）
+                    if self._was_timed_out:
+                        await self._emit_task_lifecycle(
+                            task, LifecycleEventKind.FAILED, reason="watchdog_timeout",
+                        )
+                    else:
+                        await self._emit_task_lifecycle(task, LifecycleEventKind.COMPLETED)
                     await self._set_terminal_status_with_notifications(_final_status)
                 else:
                     # Resume postprocess cancelled mid-execution by a new user message.
@@ -4872,6 +5085,13 @@ class AgentTaskRunner(TaskRunner):
             else:
                 await self._put_and_add_event(task, DoneEvent(metrics=self._snapshot_metrics()))
                 _final_status = SessionStatus.TIMED_OUT if self._was_timed_out else SessionStatus.COMPLETED
+                # C7 §4.4 — 无延迟后处理直达终态：同 R4 映射（timed_out→failed）
+                if self._was_timed_out:
+                    await self._emit_task_lifecycle(
+                        task, LifecycleEventKind.FAILED, reason="watchdog_timeout",
+                    )
+                else:
+                    await self._emit_task_lifecycle(task, LifecycleEventKind.COMPLETED)
                 await self._set_terminal_status_with_notifications(_final_status)
 
         except Exception as e:

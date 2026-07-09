@@ -157,3 +157,68 @@ def test_shared_runner_builder_no_file_view_binding_when_unconfigured():
     )
     assert runner._file_processor_lookup is None
     assert runner._supports_vision is True  # runner default preserved (not None)
+
+
+def test_shared_runner_builder_threads_lifecycle_runtime():
+    """C7 Task 5 fix: ChildRunnerSharedDeps carries lifecycle_runtime and the
+    child-runner builder forwards it into the constructed AgentTaskRunner by
+    identity (mirrors the B1 tool_runtime pattern — root-flipped flags must
+    not silently stay default-OFF for children, §12-8)."""
+    from app.interfaces.service_dependencies import (
+        _make_shared_child_runner_builder, ChildRunnerSharedDeps,
+    )
+    from app.domain.models.app_config import (
+        AgentConfig, MCPConfig, A2AConfig, LifecycleRuntimeConfig,
+        ToolRuntimeConfig,
+    )
+
+    sentinel_lifecycle = LifecycleRuntimeConfig(lifecycle_events_enabled=True)
+    # (a) ChildRunnerSharedDeps accepts the new field (frozen dataclass ctor).
+    deps = ChildRunnerSharedDeps(
+        uow_factory=lambda: MagicMock(), llm=MagicMock(),
+        agent_config=AgentConfig(), mcp_config=MCPConfig(), a2a_config=A2AConfig(),
+        file_storage=MagicMock(), search_engine=MagicMock(),
+        checkpointer_pool=MagicMock(), execution_supervisor=MagicMock(),
+        tool_runtime=ToolRuntimeConfig(),
+        lifecycle_runtime=sentinel_lifecycle,
+    )
+    assert deps.lifecycle_runtime is sentinel_lifecycle
+    builder = _make_shared_child_runner_builder(resolve_child_runner_deps=lambda: deps)
+    runner = builder(
+        session_id="c1", tool_filter=frozenset({"file_write"}),
+        mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
+        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        cost_callback_handler=MagicMock(),
+    )
+    # (b) forwarded by identity (runner ctor keeps a non-None config as-is).
+    assert runner._lifecycle_runtime is sentinel_lifecycle
+
+
+def test_shared_runner_builder_lifecycle_runtime_defaults_off_when_unset():
+    """C7: legacy deps (field unset → None) collapse to a default-OFF
+    LifecycleRuntimeConfig inside the runner ctor — flag-off zero-change."""
+    from app.interfaces.service_dependencies import (
+        _make_shared_child_runner_builder, ChildRunnerSharedDeps,
+    )
+    from app.domain.models.app_config import (
+        AgentConfig, MCPConfig, A2AConfig, ToolRuntimeConfig,
+    )
+
+    deps = ChildRunnerSharedDeps(
+        uow_factory=lambda: MagicMock(), llm=MagicMock(),
+        agent_config=AgentConfig(), mcp_config=MCPConfig(), a2a_config=A2AConfig(),
+        file_storage=MagicMock(), search_engine=MagicMock(),
+        checkpointer_pool=MagicMock(), execution_supervisor=MagicMock(),
+        tool_runtime=ToolRuntimeConfig(),
+        # lifecycle_runtime left unset (legacy/test deps) → None
+    )
+    assert deps.lifecycle_runtime is None
+    builder = _make_shared_child_runner_builder(resolve_child_runner_deps=lambda: deps)
+    runner = builder(
+        session_id="c1", tool_filter=frozenset({"file_write"}),
+        mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
+        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        cost_callback_handler=MagicMock(),
+    )
+    assert runner._lifecycle_runtime.lifecycle_events_enabled is False
+    assert runner._lifecycle_runtime.lifecycle_subagent_events_enabled is False

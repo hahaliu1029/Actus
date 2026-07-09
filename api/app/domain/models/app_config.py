@@ -579,6 +579,29 @@ class ToolRuntimeConfig(BaseModel):
     )
 
 
+class LifecycleRuntimeConfig(BaseModel):
+    """C7 生命周期统一 flags（spec §8；default-OFF，F20 惯例）。"""
+
+    lifecycle_events_enabled: bool = Field(
+        default=False,
+        description=(
+            "C7 master flag: runner 咽喉投影器 dual-emit LifecycleEvent"
+            "（plan/step/tool/task 层，PR2-4）。OFF（默认）= 零构造零发射零 "
+            "wire 差异（INV-C7-3）。上线约束：全部 API pod 同版本后才可开启"
+            "（PG session.events 含 lifecycle 成员会使旧 pod 整 session 校验失败，"
+            "spec §3.1/§8）。设计：docs/superpowers/specs/"
+            "2026-07-08-c7-lifecycle-unification-design.md"
+        ),
+    )
+    lifecycle_subagent_events_enabled: bool = Field(
+        default=False,
+        description=(
+            "C7 subagent 层投影（coordinator child + research child，PR5）。"
+            "运行期与 master flag 取 AND（R10#A9）——master-off 时本 flag 无效。"
+        ),
+    )
+
+
 class AppConfig(BaseModel):
     """应用配置信息，包含Agent配置、LLM提供商配置、MCP配置、A2A配置"""
 
@@ -590,6 +613,8 @@ class AppConfig(BaseModel):
     file_understanding: FileUnderstandingConfig = FileUnderstandingConfig()
     # R2 CS2: Layer 1/2 runtime limits (defaults preserve pre-R2 constants)
     tool_runtime: ToolRuntimeConfig = Field(default_factory=ToolRuntimeConfig)
+    # C7: lifecycle 事件层归一化 flags（default-OFF）
+    lifecycle_runtime: LifecycleRuntimeConfig = Field(default_factory=LifecycleRuntimeConfig)
 
     # Pydantic配置，允许传递额外的字段初始化
     model_config = ConfigDict(extra="allow")

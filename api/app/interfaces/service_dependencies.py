@@ -557,6 +557,7 @@ def _build_config_snapshot(app_config: "AppConfig") -> _ConfigSnapshot:
         supports_pdf_input=effective_pdf_input,
         file_understanding_config=app_config.file_understanding,
         tool_runtime=app_config.tool_runtime,
+        lifecycle_runtime=app_config.lifecycle_runtime,
         memory_gate_llm=memory_gate_llm,
         memory_gate_threshold=settings.memory_gate_threshold,
         memory_gate_batch_cap=settings.memory_gate_batch_cap,
@@ -886,6 +887,9 @@ class ChildRunnerSharedDeps:
     supports_pdf_input: object = None
     file_understanding_config: object = None
     vision_fallback_model: object = None
+    # C7: root 的 LifecycleRuntimeConfig | None（child/root flag 同源，§12-8；
+    # None（legacy/test deps）→ runner ctor 内坍缩为 default-OFF 配置）。
+    lifecycle_runtime: object = None
 
 
 def _make_shared_child_runner_builder(
@@ -973,6 +977,9 @@ def _make_shared_child_runner_builder(
             coord_deps=None,  # child is NOT a nested coordinator
             session_state_machine=deps.session_state_machine,
             tool_runtime=deps.tool_runtime,
+            # C7: child runner 同源持有 lifecycle flags（§12-8）——与 tool_runtime
+            # 同模式，防 root 翻 flag 后 child 静默停留 default-OFF（B1 spec R2#1 教训）。
+            lifecycle_runtime=deps.lifecycle_runtime,
             # B9 Task 20 (R4#1): child extension calls also feed stats.
             extension_stats_recorder=deps.extension_stats_recorder,
             # B12 follow-up: coordinator-child file_view parity. supports_vision/
@@ -2359,6 +2366,17 @@ def get_subagent_research_service(
         SubagentResearchService,
     )
 
+    # C7 §4.5 R15 — research child lifecycle sink. Injected unconditionally
+    # (the master ∧ subagent AND-gate is evaluated at runtime inside the sink,
+    # so config hot-reload takes effect immediately). Best-effort delivery into
+    # the parent's main stream via AgentService._emit_event + PG session.events.
+    from app.application.services.research_lifecycle_sink import ResearchLifecycleSink
+    lifecycle_sink = ResearchLifecycleSink(
+        emit_event=agent_service._emit_event,
+        uow_factory=agent_service._uow_factory,
+        flags_getter=lambda: agent_service._config_snapshot.lifecycle_runtime,
+    )
+
     return SubagentResearchService(
         session_service=session_service,
         agent_service=agent_service,
@@ -2375,4 +2393,6 @@ def get_subagent_research_service(
         mailbox_publisher=mailbox_publisher,
         # C4.1a PR-4 — research subagent-run observation sink. flag OFF → None.
         subagent_run_repo=get_subagent_run_repository(settings),
+        # C7 §4.5 R15 — research lifecycle sink (injected unconditionally).
+        lifecycle_sink=lifecycle_sink,
     )

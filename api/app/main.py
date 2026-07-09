@@ -567,6 +567,10 @@ async def lifespan(app: FastAPI):
                 # the identical ToolRuntimeConfig so B1 flags flipped on root
                 # don't silently stay default-OFF for child graphs (spec R2#1).
                 tool_runtime=snap.tool_runtime,
+                # C7: child runner 同源持有 lifecycle flags——child 照常投影其
+                # plan/step/tool lifecycle（§12-8 positive acceptance）；task 层
+                # 由 _is_root_session() gate 在 runner 内拦（PR4）。
+                lifecycle_runtime=snap.lifecycle_runtime,
                 # B9 Task 20 (R4#1): child extension calls feed the same stats
                 # recorder as root. None when flag off.
                 extension_stats_recorder=getattr(
