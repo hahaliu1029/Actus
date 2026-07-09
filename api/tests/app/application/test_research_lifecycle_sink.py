@@ -5,6 +5,7 @@ import pytest
 
 from app.application.services.research_lifecycle_sink import ResearchLifecycleSink
 from app.domain.models.app_config import LifecycleRuntimeConfig
+from app.domain.models.lifecycle import LifecycleContractError
 from app.interfaces.schemas.subagent import ChildOutcome
 
 
@@ -114,6 +115,29 @@ async def test_sink_never_raises(caplog):
     with caplog.at_level("WARNING"):
         ok = await sink.child_started(parent_session_id="p", child_session_id="c")
     assert ok is False  # 观测面永不破坏 research 主流程
+
+
+@pytest.mark.asyncio
+async def test_sink_contains_event_build_failure(monkeypatch, caplog):
+    # T15 flip 前硬化（final review R1）：构造期 LifecycleContractError（词表漂移等）
+    # 同样不得穿透 research 主流程——「sink 永不 raise」覆盖构造+投递全程
+    import app.application.services.research_lifecycle_sink as mod
+
+    def _boom(*args, **kwargs):
+        raise LifecycleContractError("vocab drift")
+
+    monkeypatch.setattr(mod, "build_lifecycle_event", _boom)
+    sink, emit, repo, counter = _sink()
+    with caplog.at_level("WARNING"):
+        ok_started = await sink.child_started(parent_session_id="p", child_session_id="c")
+        ok_done = await sink.child_done(
+            parent_session_id="p", child_session_id="c", outcome=ChildOutcome.COMPLETED,
+        )
+    assert (ok_started, ok_done) == (False, False)
+    emit.assert_not_awaited()  # 构造失败 → 不投递不 persist，仅告警日志
+    assert repo.persisted == []
+    assert counter.count == 0  # skip 计数器语义保留给「无活跃 task」投递缺口
+    assert sum("build failed" in r.message for r in caplog.records) == 2
 
 
 def test_service_call_sites_pinned():

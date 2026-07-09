@@ -75,10 +75,17 @@ class ResearchLifecycleSink:
     async def child_started(self, *, parent_session_id: str, child_session_id: str) -> bool:
         if not self._enabled():
             return False  # flag-off 不是 skip，是零构造（INV-C7-3）
-        ev = build_lifecycle_event(
-            LifecycleType.SUBAGENT, LifecycleEventKind.STARTED,
-            unit_id=child_session_id, parent_unit_id=parent_session_id,
-        )
+        try:
+            ev = build_lifecycle_event(
+                LifecycleType.SUBAGENT, LifecycleEventKind.STARTED,
+                unit_id=child_session_id, parent_unit_id=parent_session_id,
+            )
+        except Exception:  # noqa: BLE001 — 构造失败与投递失败同责：永不破坏 research 主流程
+            logger.warning(
+                "research lifecycle sink event build failed: parent=%s unit=%s",
+                parent_session_id, child_session_id, exc_info=True,
+            )
+            return False
         return await self._deliver(parent_session_id, ev)
 
     async def child_done(
@@ -86,15 +93,22 @@ class ResearchLifecycleSink:
     ) -> bool:
         if not self._enabled():
             return False
-        kind, reason = _DONE_MAP.get(outcome, (LifecycleEventKind.FAILED, "unknown_terminal_outcome"))
-        detail = None
-        if reason in ("waiting_unsupported", "unknown_terminal_outcome"):
-            detail = LifecycleDetailV1(original_outcome=getattr(outcome, "value", str(outcome)))
-        ev = build_lifecycle_event(
-            LifecycleType.SUBAGENT, kind,
-            unit_id=child_session_id, parent_unit_id=parent_session_id,
-            reason=reason, detail=detail,
-        )
+        try:
+            kind, reason = _DONE_MAP.get(outcome, (LifecycleEventKind.FAILED, "unknown_terminal_outcome"))
+            detail = None
+            if reason in ("waiting_unsupported", "unknown_terminal_outcome"):
+                detail = LifecycleDetailV1(original_outcome=getattr(outcome, "value", str(outcome)))
+            ev = build_lifecycle_event(
+                LifecycleType.SUBAGENT, kind,
+                unit_id=child_session_id, parent_unit_id=parent_session_id,
+                reason=reason, detail=detail,
+            )
+        except Exception:  # noqa: BLE001 — 构造失败与投递失败同责：永不破坏 research 主流程
+            logger.warning(
+                "research lifecycle sink event build failed: parent=%s unit=%s",
+                parent_session_id, child_session_id, exc_info=True,
+            )
+            return False
         return await self._deliver(parent_session_id, ev)
 
     async def _deliver(self, parent_session_id: str, event: LifecycleEvent) -> bool:
