@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   CircleDashed,
   Loader2,
+  MessageCircleDashed,
   MessageCircleQuestion,
   PanelRightClose,
   PanelRightOpen,
@@ -418,6 +419,31 @@ function renderEventItem(
             </div>
             <div className="text-sm text-foreground/85">
               <MarkdownRenderer content={display.detail || "请补充下一步操作信息"} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+    if (display.kind === "hint") {
+      // SOFT_HINT 软门控：后端未暂停、agent 已自行继续——去掉 ask 卡的
+      // primary 强调（左侧色条/主题色标题），全部走 muted，避免被误读为
+      // 阻塞等待用户回复。
+      return (
+        <div key={eventKey} className="mt-4">
+          <div className="mb-1 flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground/85">
+              <Bot size={16} />
+              Actus
+            </div>
+            <span className="text-xs text-muted-foreground">{getEventTime(event.data)}</span>
+          </div>
+          <div className="rounded-2xl border border-border bg-card px-4 py-3 shadow-[var(--shadow-subtle)]">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              <MessageCircleDashed size={14} />
+              {display.title}
+            </div>
+            <div className="text-sm text-muted-foreground">
+              <MarkdownRenderer content={display.detail || "Agent 已先自行尝试解决"} />
             </div>
           </div>
         </div>

@@ -12,7 +12,7 @@ type SessionEventLike = {
 };
 
 export type FilePreviewKind = "text" | "image" | "pdf" | "unsupported";
-export type ToolDisplayKind = "tool" | "progress" | "ask";
+export type ToolDisplayKind = "tool" | "progress" | "ask" | "hint";
 export type WorkbenchMode = "shell" | "browser";
 export type TimelineCursorState =
   | "live_following"
@@ -645,6 +645,22 @@ export function getToolDisplayCopy(eventData: Record<string, unknown>): ToolDisp
 
   if (toolName === "message" && functionName === "message_ask_user") {
     const text = asString(args.text);
+    // SOFT_HINT 软门控（react_graph message_ask_user 首次调用）：后端未暂停、
+    // agent 已自行继续，不能渲染成阻塞提问卡。哨兵值 "SOFT_HINT" /
+    // "WAITING_FOR_USER" 是 gate → envelope 的 wire 契约，由
+    // test_react_graph_b10_display.py::TestMessageAskUserSoftHintWireContract
+    // 钉死。function_result 缺失（CALLING 态 / 旧历史事件）时保持 "ask"
+    // 兜底——真阻塞误降级为提示比软提示误升级为提问更糟。
+    const functionResult = isRecord(eventData.function_result)
+      ? eventData.function_result
+      : {};
+    if (asString(functionResult.message) === "SOFT_HINT") {
+      return {
+        kind: "hint",
+        title: "考虑过向你提问，已自行继续尝试",
+        detail: text || "Agent 已按系统建议先自行尝试解决",
+      };
+    }
     return {
       kind: "ask",
       title: "需要你的回复",

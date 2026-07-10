@@ -365,6 +365,70 @@ class TestMessageAskUserCalledAttach:
         assert evt.destructive is None
 
 
+class TestMessageAskUserSoftHintWireContract:
+    """SOFT_HINT 软门控 vs WAITING_FOR_USER 真阻塞的 wire 区分面.
+
+    FE (ui/src/lib/session-ui.ts getToolDisplayCopy) 依赖 envelope
+    function_result.message 上的这两个哨兵值把软门控渲染成非阻塞提示卡
+    (kind:"hint")、真阻塞保持提问卡 (kind:"ask")。此处把两条 gate 路径
+    构造的 ToolEvent → ToolEventEnvelopeV1 投影钉死, 后端改动若使哨兵
+    不再上 wire, 这里先红。
+    """
+
+    @staticmethod
+    def _project(evt: ToolEvent):
+        from app.application.services.tool_event_envelope_v1 import (
+            project_tool_event_to_envelope_v1,
+        )
+        return project_tool_event_to_envelope_v1(evt)
+
+    async def test_pe_path_first_ask_soft_hint_on_wire(self):
+        fns = _build_fns(True)
+        result = await fns.tool_node(
+            _state([_tc("message_ask_user", {"text": "?"})]),
+            _config(AllowPE(), _ssm()),
+        )
+        [evt] = _tool_events(result.update, ToolEventStatus.CALLED)
+        env = self._project(evt)
+        assert env.function_result is not None
+        assert env.function_result.message == "SOFT_HINT"
+        assert env.function_result.status == "ok"
+
+    async def test_legacy_path_first_ask_soft_hint_on_wire(self):
+        fns = _build_fns(True)
+        result = await fns.tool_node(
+            _state([_tc("message_ask_user", {"text": "?"})]),
+            _config(),
+        )
+        [evt] = _tool_events(result.update, ToolEventStatus.CALLED)
+        env = self._project(evt)
+        assert env.function_result is not None
+        assert env.function_result.message == "SOFT_HINT"
+
+    async def test_pe_path_takeover_ask_waiting_on_wire(self):
+        fns = _build_fns(True)
+        result = await fns.tool_node(
+            _state([_tc("message_ask_user", {"text": "?", "suggest_user_takeover": "browser"})]),
+            _config(AllowPE(), _ssm()),
+        )
+        [evt] = _tool_events(result.update, ToolEventStatus.CALLED)
+        env = self._project(evt)
+        assert env.function_result is not None
+        assert env.function_result.message == "WAITING_FOR_USER"
+
+    async def test_legacy_path_second_ask_waiting_on_wire(self):
+        # soft_hint_sent=True（react_graph.py:2496 state 派生）→ 第二次
+        # ask 必须投影真阻塞哨兵
+        fns = _build_fns(True)
+        state = _state([_tc("message_ask_user", {"text": "?"})])
+        state["soft_hint_sent"] = True
+        result = await fns.tool_node(state, _config())
+        [evt] = _tool_events(result.update, ToolEventStatus.CALLED)
+        env = self._project(evt)
+        assert env.function_result is not None
+        assert env.function_result.message == "WAITING_FOR_USER"
+
+
 class TestTranslateOutcomeDirect:
     """CALLED 点直调面: 动态 family 兜底 (R8#3) + 默认参零改动."""
 

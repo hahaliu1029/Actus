@@ -147,17 +147,57 @@ describe("session-ui", () => {
       expect(copy.detail).toContain("正在整理");
     });
 
-    it("message_ask_user 渲染为提问样式", () => {
+    it("message_ask_user 真阻塞（WAITING_FOR_USER）渲染为提问样式", () => {
       const copy = getToolDisplayCopy({
         name: "message",
         function: "message_ask_user",
         args: { text: "你从哪个校区出发？" },
         status: "called",
+        function_result: { status: "ok", message: "WAITING_FOR_USER" },
       });
 
       expect(copy.kind).toBe("ask");
       expect(copy.title).toBe("需要你的回复");
       expect(copy.detail).toContain("校区");
+    });
+
+    it("message_ask_user 缺 function_result（CALLING 态/旧事件）兜底为提问样式", () => {
+      const copy = getToolDisplayCopy({
+        name: "message",
+        function: "message_ask_user",
+        args: { text: "你从哪个校区出发？" },
+        status: "calling",
+      });
+
+      expect(copy.kind).toBe("ask");
+      expect(copy.title).toBe("需要你的回复");
+    });
+
+    it("message_ask_user SOFT_HINT 软门控渲染为非阻塞提示", () => {
+      const copy = getToolDisplayCopy({
+        name: "message",
+        function: "message_ask_user",
+        args: { text: "你从哪个校区出发？" },
+        status: "called",
+        function_result: { status: "ok", message: "SOFT_HINT" },
+      });
+
+      expect(copy.kind).toBe("hint");
+      expect(copy.title).toContain("已自行继续");
+      expect(copy.detail).toContain("校区");
+    });
+
+    it("message_ask_user SOFT_HINT 无提问文本时提供兜底说明", () => {
+      const copy = getToolDisplayCopy({
+        name: "message",
+        function: "message_ask_user",
+        args: {},
+        status: "called",
+        function_result: { status: "ok", message: "SOFT_HINT" },
+      });
+
+      expect(copy.kind).toBe("hint");
+      expect(copy.detail.length).toBeGreaterThan(0);
     });
 
     it("search_web 渲染为可读工具文案", () => {
