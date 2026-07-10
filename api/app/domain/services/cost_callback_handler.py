@@ -46,6 +46,23 @@ from app.domain.services.pricing.static_pricing import (
 logger = logging.getLogger(__name__)
 
 
+class SessionRowGoneError(Exception):
+    """A cost_records parent row this handler references no longer exists.
+
+    Raised by persisters when the INSERT hits a cost_records parent FK
+    (``fk_cost_records_session_id_sessions`` / ``..._user_id_users``)
+    because the session — or its owning user — was deleted while the task
+    was still finishing. Either way the FK can never be satisfied again
+    for this handler: its ``session_id``/``user_id`` are fixed for its
+    lifetime (note ``sessions.user_id`` is SET NULL on user delete, so a
+    user-FK hit doesn't imply the session row itself vanished). The
+    handler treats this as a benign lifecycle race, not a persist
+    failure: the row can never land (a deleted session already had its
+    ledger CASCADE-deleted), so retrying or writing a degraded marker
+    against the same dead FK is pure log noise.
+    """
+
+
 Persister = Callable[[CostRecord], Awaitable[None]]
 
 # UUID5 namespace for session-level degraded sentinel rows. Constant on
@@ -220,6 +237,11 @@ class CostCallbackHandler(AsyncCallbackHandler):
         # at most — ops only need to know "this session had an overlong
         # value at least once for this kind", not the count.
         self._seen_overlong: set[str] = set()
+        # Latched when a persister raises SessionRowGoneError (session
+        # deleted while the task was still finishing). Once set, every
+        # persist — including degraded markers — short-circuits: the
+        # parent FK can never be satisfied again for this handler.
+        self._session_row_gone: bool = False
 
     # ---- LangChain callback surface ------------------------------------- #
 
@@ -691,6 +713,14 @@ class CostCallbackHandler(AsyncCallbackHandler):
         without raising; False on bound exceeded, persister exception, or
         any other error.
         """
+        if self._session_row_gone:
+            logger.debug(
+                "CostCallbackHandler: session row gone — skipping "
+                "session-level degraded marker for session_id=%s reason=%s",
+                self.session_id,
+                reason,
+            )
+            return False
         marker = self._build_session_degraded_record(reason)
         task = asyncio.create_task(
             self._persister(marker),
@@ -727,6 +757,12 @@ class CostCallbackHandler(AsyncCallbackHandler):
             return False
         exc = task.exception()
         if exc is not None:
+            if isinstance(exc, SessionRowGoneError):
+                # The session row is gone — the marker's own FK can never
+                # be satisfied. Latch skip mode so later marker/persist
+                # attempts stop touching the DB.
+                self._mark_session_row_gone(exc, marker.run_id)
+                return False
             logger.warning(
                 "marker write failed for session=%s reason=%s: %s",
                 self.session_id,
@@ -745,9 +781,38 @@ class CostCallbackHandler(AsyncCallbackHandler):
         """
         return self._persist_failure_count
 
+    def _mark_session_row_gone(self, exc: BaseException, run_id: str) -> None:
+        """Latch skip mode; INFO once (not WARNING — expected lifecycle race)."""
+        if self._session_row_gone:
+            return
+        self._session_row_gone = True
+        logger.info(
+            "CostCallbackHandler: session row gone for session_id=%s "
+            "(run_id=%s) — skipping cost persistence from here on: %s",
+            self.session_id,
+            run_id,
+            exc,
+        )
+
     async def _persist_safely(self, record: CostRecord) -> None:
+        if self._session_row_gone:
+            logger.debug(
+                "CostCallbackHandler: session row gone — dropping cost "
+                "record for session_id=%s run_id=%s",
+                self.session_id,
+                record.run_id,
+            )
+            return
         try:
             await self._persister(record)
+            return
+        except SessionRowGoneError as exc:
+            # Session deleted while the task was still finishing. Not a
+            # persist failure: the ledger was CASCADE-deleted with the
+            # session, and the degraded-marker fallback below would hit
+            # the exact same dead FK. Counting it would also make the
+            # terminal drain chase it with a session-level marker.
+            self._mark_session_row_gone(exc, record.run_id)
             return
         except Exception as exc:  # noqa: BLE001 — fire-and-forget by design
             self._persist_failure_count += 1
@@ -780,6 +845,10 @@ class CostCallbackHandler(AsyncCallbackHandler):
                 node_name="persist_degraded",
             )
             await self._persister(marker)
+        except SessionRowGoneError as marker_exc:
+            # Session vanished between the failed primary write and the
+            # marker retry — same skip semantics as above.
+            self._mark_session_row_gone(marker_exc, record.run_id)
         except Exception as marker_exc:  # noqa: BLE001
             logger.warning(
                 "CostCallbackHandler: degraded marker insert also failed "
