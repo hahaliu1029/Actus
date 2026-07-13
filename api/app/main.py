@@ -11,6 +11,12 @@ from app.infrastructure.observability import setup_observability
 from app.infrastructure.storage.minio import get_minio
 from app.infrastructure.storage.postgres import get_postgres
 from app.infrastructure.storage.redis import get_redis
+from app.interfaces.endpoints.extension_governance_routes import (
+    router as extension_governance_router,
+)
+from app.interfaces.endpoints.plugin_routes import (
+    router as plugin_router,
+)
 from app.interfaces.endpoints.routes import router as api_router
 from app.interfaces.errors.exception_handlers import register_exception_handlers
 from app.interfaces.middlewares.observability_middleware import (
@@ -87,6 +93,9 @@ def _start_b9_probe(app: FastAPI) -> None:
             prober=DefaultExtensionProber(),
             probe_flag_provider=lambda: _load_app_config().tool_runtime.extension_probe_enabled,
             liveness_view=runtime_liveness_registry,
+            # R2#F6：治理观测生产链第 5 跳（mode=off → None；T9 保证 port 构造先于 probe）。
+            # getattr 兜底：port 未装配（off / 早期 state）→ None = 零 registry 交互。
+            admission_port=getattr(app.state, "extension_admission_port", None),
         )
         app.state.extension_probe_service = probe_service
         task = asyncio.create_task(probe_service.run_loop())
@@ -333,6 +342,88 @@ async def lifespan(app: FastAPI):
         await checkpointer_pool.open()
         app.state.checkpointer_pool = checkpointer_pool
         logger.info("Checkpointer 连接池初始化完成")
+
+        # D1a §4.1：治理 port 单例（mode=off → 不构造=None，INV-D1-0 ①层）
+        # 位置=最早段（R2#F2）：DB ready 后、首次 config load 与 _start_b9_probe 之前，
+        # 使 _governance_mode 与 port 类对后续 T14 sweep / T23 closure 在此前已定义。
+        _governance_mode = settings.extension_governance_mode
+        if _governance_mode != "off":
+            from app.infrastructure.external.governance.db_extension_admission import (
+                DbExtensionAdmissionPort,
+            )
+            from app.infrastructure.external.governance.db_extension_registry import (
+                DbExtensionRegistryReadPort,
+                DbExtensionRegistryWritePort,
+            )
+            app.state.extension_admission_port = DbExtensionAdmissionPort(
+                postgres_client.session_factory, mode=_governance_mode)
+            app.state.extension_registry_write_port = DbExtensionRegistryWritePort(
+                postgres_client.session_factory)
+            app.state.extension_registry_read_port = DbExtensionRegistryReadPort(
+                postgres_client.session_factory)
+        else:
+            app.state.extension_admission_port = None
+            app.state.extension_registry_write_port = None
+            app.state.extension_registry_read_port = None
+        # off = 零新增日志 I/O：仅治理开启时才记 mode 行（off 缺省下不 emit）。
+        if _governance_mode != "off":
+            logger.info("D1a extension governance mode=%s", _governance_mode)
+
+        # D1a startup 四段全序①（②saga 收尾在 T23 插入本行之后、normal load 之前）
+        # 清扫 config 目录孤儿 temp（SIGKILL 残留含 secrets，不过夜；§8.3-3 R51#3）。
+        # mode=off zero behavior change：仅 mode≠off 才做此启动新工作。
+        if _governance_mode != "off":
+            from app.infrastructure.repositories.file_app_config_repository import (
+                sweep_orphan_config_temps,
+            )
+            sweep_orphan_config_temps(str(settings.app_config_filepath))
+
+        # D1a startup 四段全序②（saga 收尾）：孤儿 in_progress install → 逆序补偿；孤儿 uninstall →
+        # 标 failed；终态 op 的 staging 目录整删。**必须先于 ③normal config load**——config 不可读
+        # 场景下普通 load 抛 ServerRequestsError 中止 boot，closure 排后则恢复不可达（R52#2）；
+        # migration 已在更早段（command.upgrade）跑完，DB 可用窗口成立。局部构造最小实例（不依赖后续
+        # lifespan 服务）；config 不可读经 _tolerant_load_config_entries 三态兜底（不触 config 依赖）。
+        # mode=off zero behavior change：off 下治理阻断与收尾全退场（§6.0/INV-D1-0）。
+        if _governance_mode != "off":
+            try:
+                from app.application.services.app_config_service import AppConfigService
+                from app.application.services.extension_reconciler import (
+                    ExtensionReconciler,
+                )
+                from app.application.services.plugin_install_service import (
+                    run_startup_saga_closure,
+                )
+                from app.application.services.skill_service import SkillService
+                from app.infrastructure.external.governance.plugin_saga_store import (
+                    PluginSagaStore,
+                )
+                from app.infrastructure.repositories.file_app_config_repository import (
+                    FileAppConfigRepository,
+                )
+                from app.infrastructure.repositories.file_skill_repository import (
+                    FileSkillRepository,
+                )
+
+                _closure_write_port = app.state.extension_registry_write_port
+                _closure_read_port = app.state.extension_registry_read_port
+                _closure_reconciler = ExtensionReconciler(
+                    _closure_write_port, app.state.extension_admission_port)
+                await run_startup_saga_closure(
+                    saga_store=PluginSagaStore(postgres_client.session_factory),
+                    app_config_service=AppConfigService(
+                        FileAppConfigRepository(settings.app_config_filepath),
+                        reconciler=_closure_reconciler,
+                        registry_read_port=_closure_read_port),
+                    skill_service=SkillService(
+                        FileSkillRepository(settings.skills_root_dir),
+                        registry_write_port=_closure_write_port,
+                        registry_read_port=_closure_read_port),
+                    write_port=_closure_write_port,
+                    config_path=str(settings.app_config_filepath))
+            except Exception:
+                logger.error(
+                    "D1a saga closure failed; boot continues (registry 阻断态保守)",
+                    exc_info=True)
 
         # 6. 初始化 Memory Embedding Provider（C4 维度串联 + 容错）
         from app.interfaces.service_dependencies import _load_app_config
@@ -583,6 +674,9 @@ async def lifespan(app: FastAPI):
                 supports_pdf_input=snap.supports_pdf_input,
                 file_understanding_config=snap.file_understanding_config,
                 vision_fallback_model=snap.vision_fallback_model,
+                # D1a §4.1 注入链第 2 跳：root/child 共享同一 AdmissionPort 实例
+                # （admission 必须同源）。None when mode off. Built earlier in lifespan.
+                extension_admission_port=app.state.extension_admission_port,
             )
 
         coord_deps = None
@@ -700,6 +794,10 @@ async def lifespan(app: FastAPI):
             # flag off (see _start_b9_stats). Threaded into the hot path so
             # react_graph埋点 records ext tool calls.
             extension_stats_recorder=getattr(app.state, "extension_stats", None),
+            # D1a §4.1 (R2#F12): governance AdmissionPort singleton built above
+            # (None when mode off). Threaded into AgentService → AgentTaskRunner →
+            # SkillTool / SkillBundleSyncManager. Root/child same-source instance.
+            extension_admission_port=app.state.extension_admission_port,
         )
         logger.info("AgentService 单例初始化完成")
 
@@ -953,6 +1051,131 @@ async def lifespan(app: FastAPI):
         )
         mount_memory_recall_metrics()
 
+        # D1a startup 四段全序④：全量 reconcile（ports/服务构造后 inline await）。
+        # advisory lock(74520011) 保证并发 pod 单跑者；reconcile 失败 fail-open 不阻断启动。
+        # mode=off zero behavior change：mode≠off 才构造 reconciler + 跑对账。
+        if _governance_mode != "off":
+            from sqlalchemy import text
+
+            from app.application.services.extension_reconciler import (
+                D1A_STARTUP_RECONCILE_LOCK_KEY,
+                ExtensionReconciler,
+            )
+            from app.infrastructure.repositories.file_skill_repository import (
+                FileSkillRepository,
+            )
+
+            _reconciler = ExtensionReconciler(
+                app.state.extension_registry_write_port,
+                app.state.extension_admission_port,
+            )
+            app.state.extension_reconciler = _reconciler
+
+            # D1a Task 19：MCP/A2A 两阶段安装管道单例（mode≠off；off 分支下 None）。
+            # 自建 reconciler-wired AppConfigService（stateless——每次 load 重读文件）；
+            # commit 经它的 install_context 触发 reconciler → WritePort 记账。
+            from app.application.services.app_config_service import AppConfigService
+            from app.application.services.extension_install_service import (
+                ExtensionInstallService,
+            )
+            from app.application.services.extension_probe_service import (
+                DefaultExtensionProber,
+            )
+            from app.infrastructure.repositories.file_app_config_repository import (
+                FileAppConfigRepository,
+            )
+
+            _install_app_config_service = AppConfigService(
+                FileAppConfigRepository(settings.app_config_filepath),
+                reconciler=_reconciler,
+                registry_read_port=app.state.extension_registry_read_port,
+            )
+            app.state.extension_install_service = ExtensionInstallService(
+                _install_app_config_service,
+                app.state.extension_registry_read_port,
+                DefaultExtensionProber(),
+                _governance_mode,
+            )
+            # D1a Task 20：§9.2 治理服务单例（mode≠off；off 分支下 None）。行政动作 +
+            # 观测刷新（skill/plugin 本地 hash / mcp·a2a probe）+ 审计翻页；plugins_root
+            # 对齐 startup reconcile 的 /app/data/plugins。
+            from app.application.services.extension_governance_service import (
+                ExtensionGovernanceService,
+            )
+
+            app.state.extension_governance_service = ExtensionGovernanceService(
+                app.state.extension_registry_read_port,
+                app.state.extension_registry_write_port,
+                app.state.extension_admission_port,
+                DefaultExtensionProber(),
+                _load_app_config,
+                FileSkillRepository(settings.skills_root_dir),
+                Path("/app/data/plugins"),
+            )
+            # D1a Task 24：Plugin 元容器安装管道单例 + saga store（mode≠off；off → None）。
+            # install/uninstall 走 PluginInstallService（T21-T23 saga）；GET list 走同一
+            # PluginSagaStore；reject_audit = DbPluginRejectAuditSink（关闭 T21 注入的 Protocol
+            # 占位——preflight/锁内重检拒绝真实 install 时写自持 install_rejected audit）。
+            # app_config_service 复用上方 reconciler-wired _install_app_config_service；
+            # skill_service 局部构造（照 closure builder 最小参数集）。config_loader 无生产实现
+            # （T22/T23 fake-only 注入面）→ None（Documented Limitation：见 task-24 报告）。
+            from app.application.services.plugin_install_service import (
+                PluginInstallService,
+            )
+            from app.application.services.skill_service import SkillService
+            from app.application.services.skill_source_loader import SkillSourceLoader
+            from app.infrastructure.external.governance.plugin_saga_store import (
+                DbPluginRejectAuditSink,
+                PluginSagaStore,
+            )
+
+            _plugin_saga_store = PluginSagaStore(postgres_client.session_factory)
+            app.state.plugin_saga_store = _plugin_saga_store
+            app.state.plugin_install_service = PluginInstallService(
+                loader=SkillSourceLoader(),
+                prober=DefaultExtensionProber(),
+                read_port=app.state.extension_registry_read_port,
+                mode=_governance_mode,
+                reject_audit=DbPluginRejectAuditSink(postgres_client.session_factory),
+                store=_plugin_saga_store,
+                skill_service=SkillService(
+                    FileSkillRepository(settings.skills_root_dir),
+                    registry_write_port=app.state.extension_registry_write_port,
+                    registry_read_port=app.state.extension_registry_read_port),
+                app_config_service=_install_app_config_service,
+                write_port=app.state.extension_registry_write_port,
+                config_loader=None,
+            )
+            try:
+                async with postgres_client.session_factory() as _s:
+                    _got = (await _s.execute(
+                        text("SELECT pg_try_advisory_lock(:k)"),
+                        {"k": D1A_STARTUP_RECONCILE_LOCK_KEY})).scalar()
+                    if _got:
+                        try:
+                            await _reconciler.run_startup_reconcile(
+                                app_config=_app_config,
+                                skill_repository=FileSkillRepository(
+                                    settings.skills_root_dir),
+                                read_port=app.state.extension_registry_read_port,
+                                plugins_root=Path("/app/data/plugins"))
+                        finally:
+                            await _s.execute(
+                                text("SELECT pg_advisory_unlock(:k)"),
+                                {"k": D1A_STARTUP_RECONCILE_LOCK_KEY})
+                    else:
+                        logger.info(
+                            "D1a startup reconcile skipped: another pod holds the lock")
+            except Exception:
+                logger.warning(
+                    "D1a startup reconcile failed; continuing boot", exc_info=True)
+        else:
+            app.state.extension_reconciler = None
+            app.state.extension_install_service = None   # D1a T19：off → 路由旧直通
+            app.state.extension_governance_service = None  # D1a T20：off → 治理路由 409
+            app.state.plugin_install_service = None      # D1a T24：off → plugin 路由 409
+            app.state.plugin_saga_store = None           # D1a T24：off → GET /v2/plugins 409
+
         # lifespan分界点
         yield
     finally:
@@ -1086,5 +1309,9 @@ app.add_middleware(ObservabilityMiddleware)
 register_exception_handlers(app)
 
 app.include_router(api_router, prefix="/api")
+# D1a Task 20：§9.2 治理路由族（独立 APIRouter，off 门在 handler 层——照抄 include 区）。
+app.include_router(extension_governance_router, prefix="/api")
+# D1a Task 24：§9.2 Plugin 路由族（install/delete/enabled/list；off 门在 handler 层）。
+app.include_router(plugin_router, prefix="/api")
 
 logger.info("FastAPI应用程序实例已创建。")

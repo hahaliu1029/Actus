@@ -72,6 +72,10 @@ class A2AClientManager:
         """只读属性，返回agent卡片信息"""
         return self._agent_cards
 
+    def remove_agent_card(self, agent_id: str) -> None:
+        """D1a G3：治理剔除未准入 agent 卡（mismatch quarantine / 行政阻断）。"""
+        self._agent_cards.pop(agent_id, None)
+
     async def initialize(self) -> None:
         """异步初始化函数，用于初始化所有已配置的a2a服务"""
         # 1.检测是否已经初始化
@@ -240,6 +244,18 @@ class A2ATool(BaseTool):
         if not manager:
             return []
         return list(manager.agent_cards.keys())
+
+    @property
+    def agent_cards(self) -> Dict[str, Any]:
+        """D1a G3：委托 manager.agent_cards（manager None 时返回空 dict）。"""
+        manager = getattr(self, "manager", None)
+        return manager.agent_cards if manager is not None else {}
+
+    def remove_agent_card(self, agent_id: str) -> None:
+        """D1a G3：委托 manager.remove_agent_card（manager None 时 no-op）。"""
+        manager = getattr(self, "manager", None)
+        if manager is not None:
+            manager.remove_agent_card(agent_id)
 
     @tool(
         name="get_remote_agent_cards",

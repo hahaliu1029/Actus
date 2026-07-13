@@ -1,15 +1,21 @@
+import { ApiError } from "./auth-utils";
 import { del, get, post, put, requestBlob } from "./fetch";
 import type {
   AgentConfig,
   ApprovalPolicy,
   A2AServersData,
   CreateA2AServerParams,
+  ExtensionInstallPreviewWire,
   ExtensionKind,
   FileUnderstandingConfig,
+  GovernanceSummary,
   InstallSkillParams,
   LLMConfig,
   MCPConfig,
   MCPServersData,
+  PluginDetail,
+  PluginInstallCommitResult,
+  PluginInstallPreviewWire,
   RuntimeCatalogData,
   RuntimeExtensionItem,
   RuntimeExtensionsData,
@@ -17,6 +23,21 @@ import type {
   SkillListData,
   SkillRiskPolicy,
 } from "./types";
+
+// D1a T27：两阶段安装 commit 的 acknowledge/force 门放行意图（§7.2 policy）。
+export type InstallGateOptions = { acknowledge?: boolean; force?: boolean };
+
+function installGateQuery(opts?: InstallGateOptions): string {
+  const params = new URLSearchParams();
+  if (opts?.acknowledge) {
+    params.set("acknowledge", "true");
+  }
+  if (opts?.force) {
+    params.set("force", "true");
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
 
 const SETTINGS_LIST_TIMEOUT = 30000;
 
@@ -55,6 +76,26 @@ export const configApi = {
     return post<void>("/app-config/mcp-servers", config);
   },
 
+  // D1a T27：治理模式 MCP 两阶段安装。dry_run → ExtensionInstallPreview（零写）；
+  // commit（无 dry_run）→ 成功回 {warnings?} | null，caution 无 ack→409 acknowledge_required /
+  // dangerous 无 force→422 force_required（异常经 fetch 层抛 ApiError，调用方按 code 升级）。
+  previewMCPServer: (config: MCPConfig): Promise<ExtensionInstallPreviewWire> => {
+    return post<ExtensionInstallPreviewWire>(
+      "/app-config/mcp-servers?dry_run=true",
+      config
+    );
+  },
+
+  commitMCPServer: (
+    config: MCPConfig,
+    opts?: InstallGateOptions
+  ): Promise<{ warnings?: string[] } | null> => {
+    return post<{ warnings?: string[] } | null>(
+      `/app-config/mcp-servers${installGateQuery(opts)}`,
+      config
+    );
+  },
+
   deleteMCPServer: (serverName: string): Promise<void> => {
     return post<void>(`/app-config/mcp-servers/${serverName}/delete`, {});
   },
@@ -71,6 +112,26 @@ export const configApi = {
 
   addA2AServer: (params: CreateA2AServerParams): Promise<void> => {
     return post<void>("/app-config/a2a-servers", params);
+  },
+
+  // D1a T27：治理模式 A2A 两阶段安装（a2a 单 base_url 无批量语义；镜像 MCP 语义）。
+  previewA2AServer: (
+    params: CreateA2AServerParams
+  ): Promise<ExtensionInstallPreviewWire> => {
+    return post<ExtensionInstallPreviewWire>(
+      "/app-config/a2a-servers?dry_run=true",
+      params
+    );
+  },
+
+  commitA2AServer: (
+    params: CreateA2AServerParams,
+    opts?: InstallGateOptions
+  ): Promise<{ warnings?: string[] } | null> => {
+    return post<{ warnings?: string[] } | null>(
+      `/app-config/a2a-servers${installGateQuery(opts)}`,
+      params
+    );
   },
 
   deleteA2AServer: (a2aId: string): Promise<void> => {
@@ -150,6 +211,159 @@ export const runtimeApi = {
 
   getCatalog: (): Promise<RuntimeCatalogData> => {
     return get<RuntimeCatalogData>("/v1/runtime/extensions/catalog");
+  },
+};
+
+// D1a T20/T24 治理面 client（Admin-only 端点；路径不带 /api 前缀，与 runtimeApi 同惯例）。
+// CAS 语义：每个 mutation 携 `expected_row_revision`（真值，调用方从 governance 块读，
+// 绝不 `?? 0` 伪造）；quarantine/reapprove/governance-enable/disable 返回新 row_revision。
+export type ApprovePinsPayload =
+  | { all: true }
+  | {
+      items: Array<{
+        kind: ExtensionKind;
+        ext_id: string;
+        expected_row_revision?: number;
+      }>;
+    };
+
+export const governanceApi = {
+  getGovernanceSummary: (): Promise<GovernanceSummary> => {
+    return get<GovernanceSummary>("/v2/extensions/governance");
+  },
+
+  postQuarantine: (
+    kind: ExtensionKind,
+    extId: string,
+    revision: number,
+    note?: string
+  ): Promise<{ row_revision: number }> => {
+    return post<{ row_revision: number }>(
+      `/v2/extensions/${kind}/${encodeURIComponent(extId)}/quarantine`,
+      { expected_row_revision: revision, note: note ?? null }
+    );
+  },
+
+  postReapprove: (
+    kind: ExtensionKind,
+    extId: string,
+    revision: number
+  ): Promise<{ row_revision: number }> => {
+    return post<{ row_revision: number }>(
+      `/v2/extensions/${kind}/${encodeURIComponent(extId)}/reapprove`,
+      { expected_row_revision: revision }
+    );
+  },
+
+  postGovernanceEnable: (
+    kind: ExtensionKind,
+    extId: string,
+    revision: number
+  ): Promise<{ row_revision: number }> => {
+    return post<{ row_revision: number }>(
+      `/v2/extensions/${kind}/${encodeURIComponent(extId)}/governance-enable`,
+      { expected_row_revision: revision }
+    );
+  },
+
+  postGovernanceDisable: (
+    kind: ExtensionKind,
+    extId: string,
+    revision: number
+  ): Promise<{ row_revision: number }> => {
+    return post<{ row_revision: number }>(
+      `/v2/extensions/${kind}/${encodeURIComponent(extId)}/governance-disable`,
+      { expected_row_revision: revision }
+    );
+  },
+
+  postApprovePins: (
+    payload: ApprovePinsPayload
+  ): Promise<{ items: unknown[] }> => {
+    return post<{ items: unknown[] }>("/v2/extensions/approve-pins", payload);
+  },
+
+  // Plugin 父级启停：复用 T20 迁移服务，返回新 row_revision（非 ExtensionItem）。
+  postPluginEnabled: (
+    extId: string,
+    enabled: boolean,
+    revision: number
+  ): Promise<{ row_revision: number }> => {
+    return post<{ row_revision: number }>(
+      `/v2/plugins/${encodeURIComponent(extId)}/enabled`,
+      { enabled, expected_row_revision: revision }
+    );
+  },
+
+  // Plugin 列表（membership 子行展开数据源；行展开时惰性拉取）。
+  getPlugins: (): Promise<PluginDetail[]> => {
+    return get<PluginDetail[]>("/v2/plugins");
+  },
+
+  // D1a T27：Plugin 元容器安装。dry_run → PluginInstallPreview（成员/scan/policy/probe 摘要，零写）。
+  previewPlugin: (req: {
+    source_type: "local" | "github";
+    source_ref: string;
+  }): Promise<PluginInstallPreviewWire> => {
+    return post<PluginInstallPreviewWire>("/v2/plugins/install", {
+      ...req,
+      dry_run: true,
+    });
+  },
+
+  // commit（dry_run:false）→ §8.3 三态 API 合同（completed→200 / compensated→422
+  // collided_targets / failed→500 requires-admin）。异常经 fetch 层 ApiError 映射为三态结果；
+  // 校验类 422（manifest/version/zip，code=数字）/ governance_disabled 409 仍向上抛（通用错误）。
+  commitPlugin: async (req: {
+    source_type: "local" | "github";
+    source_ref: string;
+    acknowledge?: boolean;
+    force?: boolean;
+  }): Promise<PluginInstallCommitResult> => {
+    try {
+      const data = await post<{
+        plugin_ext_id: string;
+        operation_id: string;
+        status: string;
+      }>("/v2/plugins/install", { ...req, dry_run: false });
+      return {
+        status: "completed",
+        plugin_ext_id: data.plugin_ext_id,
+        operation_id: data.operation_id,
+      };
+    } catch (error) {
+      if (error instanceof ApiError) {
+        const body =
+          error.data && typeof error.data === "object"
+            ? (error.data as Record<string, unknown>)
+            : {};
+        const operationId =
+          typeof body.operation_id === "string" ? body.operation_id : "";
+        // 治理错误码在 body 顶层 `code`（字符串），经 fetch 层落到 ApiError.code
+        // （类型标注 number，运行期为该字符串）——String() 规避类型误判。
+        const code = String(error.code);
+        if (code === "plugin_install_failed_compensated") {
+          const collided = Array.isArray(body.collided_targets)
+            ? body.collided_targets.filter(
+                (item): item is string => typeof item === "string"
+              )
+            : [];
+          return {
+            status: "compensated",
+            operation_id: operationId,
+            error: typeof body.error === "string" ? body.error : null,
+            collided_targets: collided,
+          };
+        }
+        if (
+          code === "plugin_install_failed_requires_admin" ||
+          error.httpStatus === 500
+        ) {
+          return { status: "failed", operation_id: operationId };
+        }
+      }
+      throw error;
+    }
   },
 };
 

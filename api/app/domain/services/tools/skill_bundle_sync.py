@@ -8,10 +8,15 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from app.domain.external.sandbox import SandboxHandle
+from app.domain.models.extension_governance import SyncOutcome
 from app.domain.models.skill import Skill, SkillRuntimeType
+from app.domain.services.extension_admission_gates import (
+    skill_invoke_gate,
+    verify_skill_artifact,
+)
 from app.domain.services.skills_guard import SkillsGuard, ScanReport
 from app.domain.services.trust_matrix import scan_skill_source, get_install_decision
 
@@ -29,6 +34,16 @@ class SkillSyncState:
     sandbox_dir: str = ""
     error: str | None = None
     task: asyncio.Task[str | None] | None = None
+    outcome: SyncOutcome | None = None   # D1a §4.2: 治理同步 outcome（追加键，旧读者零感知）
+
+
+@dataclass(frozen=True)
+class BundleSyncResult:
+    """D1a §4.2 _sync_bundle typed 结果：SyncOutcome 五态全路径穷尽赋值。"""
+
+    outcome: SyncOutcome
+    synced_dir: str | None
+    error: str | None
 
 
 class SkillBundleSyncManager:
@@ -40,11 +55,13 @@ class SkillBundleSyncManager:
         skills_root_dir: str | Path,
         sandbox_skill_root: str,
         background_concurrency: int = DEFAULT_BACKGROUND_CONCURRENCY,
+        admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 旧路径零调用）
     ) -> None:
         self._sandbox = sandbox
         self._skills_root_dir = Path(skills_root_dir)
         self.sandbox_skill_root = str(sandbox_skill_root).rstrip("/")
         self._background_concurrency = max(1, int(background_concurrency or 1))
+        self._admission_port = admission_port  # D1a §4.1: G 逻辑在 T10-T12 消费
         self._skill_pool: dict[str, Skill] = {}
         self._sync_states: dict[str, SkillSyncState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -133,6 +150,10 @@ class SkillBundleSyncManager:
             return None, state.error or f"Skill[{resolved_skill.id}]同步失败"
         if state.status != "success":
             return None, f"Skill[{resolved_skill.id}]同步未完成"
+        # D1a §4.2 G4b/G5：治理拒绝映射为 extension_unavailable（非硬同步失败；
+        # off-mode port=None 永不产出此 outcome → 分支零命中，(None,None) 语义不变）
+        if state.outcome == "governance_rejected":
+            return None, f"extension_unavailable: {state.error}"
         return state.sandbox_dir or None, None
 
     async def cleanup(self) -> None:
@@ -175,17 +196,22 @@ class SkillBundleSyncManager:
         async with lock:
             state.status = "running"
             state.error = None
+            state.outcome = None   # D1a: 终态收敛——重置，防上一轮 outcome 残留
             try:
-                sandbox_dir = await self._sync_bundle(skill)
+                result = await self._sync_bundle(skill)
+                state.outcome = result.outcome
                 state.status = "success"
-                state.sandbox_dir = sandbox_dir or ""
+                # 簿记只放 result.synced_dir，绝不放 result 对象（旧读者零感知）
+                state.sandbox_dir = result.synced_dir or ""
+                state.error = result.error
                 # Cache file listing from bundle directory (covers both
                 # fresh upload and version-match early return paths)
                 self._cache_file_listing(skill)
-                return sandbox_dir
+                return result.synced_dir
             except Exception as e:  # noqa: BLE001
                 state.status = "failed"
                 state.error = str(e)
+                # outcome 保持上面重置的 None：硬失败走 status 通道，非五态治理 outcome
                 logger.warning("Skill bundle同步失败(skill=%s): %s", skill.id, str(e))
                 return None
 
@@ -220,17 +246,30 @@ class SkillBundleSyncManager:
         finally:
             self._background_task = None
 
-    async def _sync_bundle(self, skill: Skill) -> str | None:
+    async def _sync_bundle(self, skill: Skill) -> BundleSyncResult:
         bundle_count = self._bundle_file_count(skill)
         if bundle_count <= 0:
-            return None
+            return BundleSyncResult("no_bundle", None, None)
 
         sandbox_skill_dir = f"{self.sandbox_skill_root}/{skill.id}"
         marker_path = f"{sandbox_skill_dir}/{SYNC_MARKER_FILENAME}"
         version = self._version_of(skill)
+
+        # D1a §4.2 G4b/G5 前置状态门（R2#3）：置于 marker 快路径之前，否则已同步
+        # 版本会绕过治理判定。admission_port=None → None（off 直通，零 I/O）。
+        _gate_reason = await skill_invoke_gate(self._admission_port, skill.id)
+        if _gate_reason is not None:
+            return BundleSyncResult("governance_rejected", None, _gate_reason)
+
         marker_version = await self._read_marker_version(marker_path)
         if marker_version and marker_version == version:
-            return sandbox_skill_dir
+            # marker 命中：机会性 artifact verify（复用已存 content_hash，零额外 I/O）
+            stored = (skill.scan_report or {}).get("content_hash")
+            if stored and not await verify_skill_artifact(
+                self._admission_port, skill.id, stored
+            ):
+                return BundleSyncResult("governance_rejected", None, "artifact_mismatch")
+            return BundleSyncResult("already_current", sandbox_skill_dir, None)
 
         bundle_dir = self._skills_root_dir / skill.id / "bundle"
         if not bundle_dir.exists() or not bundle_dir.is_dir():
@@ -242,6 +281,11 @@ class SkillBundleSyncManager:
         _skill_root_dir = self._skills_root_dir / skill.id
         new_hash = SkillsGuard.compute_content_hash(_skill_root_dir)
         old_hash = (skill.scan_report or {}).get("content_hash")
+
+        # D1a §4.2 G5 artifact verify：hash 算出即 verify（payload=已算 hash，零重复
+        # I/O，R9#3）。verify 失败 → 拒写、保留旧盘版本继续服务。off → True 直通。
+        if not await verify_skill_artifact(self._admission_port, skill.id, new_hash):
+            return BundleSyncResult("governance_rejected", None, "artifact_mismatch")
 
         if new_hash != old_hash:
             # Check if this hash was force-approved at install time
@@ -263,7 +307,9 @@ class SkillBundleSyncManager:
                         [f.pattern_id for f in report.findings[:5]],
                     )
                     self._write_last_rejected_sync(skill, report)
-                    return None  # Skip sync, old version continues serving
+                    # R3 拒新 bundle：保留旧盘版本继续服务（synced_dir=None → 调用方
+                    # 回退 default_exec_dir；error=None 保持 off-mode ensure_ready (None,None)）
+                    return BundleSyncResult("r3_rejected_old_bundle", None, None)
 
                 if decision == "warn":
                     logger.warning(
@@ -313,7 +359,7 @@ class SkillBundleSyncManager:
             raise RuntimeError(
                 f"写入同步标记失败: {marker_result.message or 'unknown error'}"
             )
-        return sandbox_skill_dir
+        return BundleSyncResult("uploaded", sandbox_skill_dir, None)
 
     def _write_last_rejected_sync(self, skill: Skill, report: ScanReport) -> None:
         """Write rejected sync info to meta.json without changing scan_report."""

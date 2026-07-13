@@ -10,8 +10,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { governanceApi } from "@/lib/api/config";
 import type {
   ExtensionKind,
+  GovernanceBlock,
+  PluginMemberDetail,
   RuntimeCatalogItem,
   RuntimeConfigStatus,
   RuntimeExtensionItem,
@@ -70,7 +73,46 @@ const KIND_LABELS: Record<ExtensionKind, string> = {
   mcp: "MCP",
   a2a: "A2A",
   skill: "Skill",
+  plugin: "Plugin",
 };
+
+// D1a Task 26 — 治理状态 / 扫描裁决中文文案。
+const GOV_STATUS_LABELS: Record<GovernanceBlock["status"], string> = {
+  active: "生效中",
+  quarantined: "已隔离",
+  disabled: "已停用",
+  deleted: "已删除",
+};
+
+const GOV_SCAN_LABELS: Record<NonNullable<GovernanceBlock["scan_verdict"]>, string> = {
+  safe: "扫描安全",
+  caution: "扫描存疑",
+  dangerous: "扫描危险",
+};
+
+const GOV_QUARANTINE_REASON_LABELS: Record<
+  NonNullable<GovernanceBlock["quarantine_reason"]>,
+  string
+> = {
+  pin_mismatch: "pin 不匹配（观测哈希漂移）",
+  admin_manual: "管理员手动隔离",
+};
+
+function govScanLabel(verdict: GovernanceBlock["scan_verdict"]): string {
+  if (verdict === "safe" || verdict === "caution" || verdict === "dangerous") {
+    return GOV_SCAN_LABELS[verdict];
+  }
+  return "扫描未知";
+}
+
+function govQuarantineReasonLabel(
+  reason: GovernanceBlock["quarantine_reason"]
+): string {
+  if (reason === "pin_mismatch" || reason === "admin_manual") {
+    return GOV_QUARANTINE_REASON_LABELS[reason];
+  }
+  return "未知原因";
+}
 
 // probe 按钮文案：mcp/a2a="重新探测"（网络握手）；skill="重新扫描"（短路重扫语义，R9#1）。
 function probeButtonLabel(kind: ExtensionKind): string {
@@ -275,9 +317,219 @@ function UserSwitch({
   return control;
 }
 
+// D1a Task 26 — Admin 治理徽章行（status/trust_origin/unpinned/scan_verdict）。
+function GovernanceBadges({
+  itemKey,
+  governance,
+}: Readonly<{ itemKey: string; governance: GovernanceBlock }>) {
+  return (
+    <div
+      className="flex flex-wrap items-center gap-1.5"
+      data-testid={`gov-badges-${itemKey}`}
+    >
+      <span
+        className="rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200"
+        data-testid={`gov-status-${itemKey}`}
+      >
+        {GOV_STATUS_LABELS[governance.status]}
+      </span>
+      <span
+        className="rounded px-1.5 py-0.5 text-xs font-medium bg-muted/60 text-muted-foreground"
+        data-testid={`gov-trust-${itemKey}`}
+      >
+        来源：{governance.trust_origin}
+      </span>
+      {governance.unpinned ? (
+        <span
+          className="rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 text-amber-700"
+          data-testid={`gov-unpinned-${itemKey}`}
+        >
+          未固定
+        </span>
+      ) : null}
+      {governance.scan_verdict !== null ? (
+        <span
+          className="rounded px-1.5 py-0.5 text-xs font-medium bg-muted text-muted-foreground"
+          data-testid={`gov-scan-${itemKey}`}
+        >
+          {govScanLabel(governance.scan_verdict)}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+// D1a Task 26 — Admin 治理行内动作（reapprove/quarantine/governance-disable/enable，带确认）。
+// revision 从 governance.row_revision 取真值传给 store CAS（绝不伪造）。
+function GovernanceActions({
+  item,
+  governance,
+  disabled,
+  onQuarantine,
+  onReapprove,
+  onGovernanceToggle,
+}: Readonly<{
+  item: RuntimeExtensionItem;
+  governance: GovernanceBlock;
+  disabled: boolean;
+  onQuarantine: (kind: ExtensionKind, id: string, revision: number) => void;
+  onReapprove: (kind: ExtensionKind, id: string, revision: number) => void;
+  onGovernanceToggle: (
+    kind: ExtensionKind,
+    id: string,
+    enabled: boolean,
+    revision: number
+  ) => void;
+}>) {
+  const { kind, id } = item;
+  const rev = governance.row_revision;
+  const confirmThen = (message: string, run: () => void) => {
+    if (window.confirm(message)) {
+      run();
+    }
+  };
+  const btnClass = "h-7 rounded-lg border-border px-2 text-xs";
+  return (
+    <div className="flex flex-wrap gap-2" data-testid={`gov-actions-${kind}:${id}`}>
+      {governance.status === "quarantined" ? (
+        <Button
+          variant="outline"
+          size="sm"
+          className={btnClass}
+          data-testid={`gov-reapprove-${kind}:${id}`}
+          disabled={disabled}
+          onClick={() =>
+            confirmThen("确认解除隔离并把当前观测重新 pin 为可信基线？", () =>
+              onReapprove(kind, id, rev)
+            )
+          }
+        >
+          解除隔离
+        </Button>
+      ) : null}
+      {governance.status === "active" ? (
+        <>
+          <Button
+            variant="outline"
+            size="sm"
+            className={btnClass}
+            data-testid={`gov-quarantine-${kind}:${id}`}
+            disabled={disabled}
+            onClick={() =>
+              confirmThen("确认隔离该扩展？隔离后将不可被 Agent 调用。", () =>
+                onQuarantine(kind, id, rev)
+              )
+            }
+          >
+            隔离
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className={btnClass}
+            data-testid={`gov-disable-${kind}:${id}`}
+            disabled={disabled}
+            onClick={() =>
+              confirmThen("确认治理停用该扩展？", () =>
+                onGovernanceToggle(kind, id, false, rev)
+              )
+            }
+          >
+            治理停用
+          </Button>
+        </>
+      ) : null}
+      {governance.status === "disabled" ? (
+        <Button
+          variant="outline"
+          size="sm"
+          className={btnClass}
+          data-testid={`gov-enable-${kind}:${id}`}
+          disabled={disabled}
+          onClick={() =>
+            confirmThen("确认治理启用该扩展？", () =>
+              onGovernanceToggle(kind, id, true, rev)
+            )
+          }
+        >
+          治理启用
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+// D1a Task 26 — plugin 成员子行展开（Admin-only，惰性拉取 GET /v2/plugins）。
+function PluginMembership({
+  itemKey,
+  extId,
+  memberCount,
+}: Readonly<{ itemKey: string; extId: string; memberCount: number }>) {
+  const [expanded, setExpanded] = useState(false);
+  const [members, setMembers] = useState<PluginMemberDetail[] | null>(null);
+  const [loadError, setLoadError] = useState(false);
+
+  async function toggle() {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && members === null && !loadError) {
+      try {
+        const plugins = await governanceApi.getPlugins();
+        const detail = plugins.find((p) => p.ext_id === extId);
+        setMembers(detail?.members ?? []);
+      } catch {
+        setLoadError(true);
+      }
+    }
+  }
+
+  return (
+    <div className="mt-3">
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 rounded-lg px-2 text-xs text-muted-foreground"
+        data-testid={`plugin-expand-${itemKey}`}
+        onClick={() => void toggle()}
+      >
+        {expanded ? "收起成员" : `展开成员（${memberCount}）`}
+      </Button>
+      {expanded ? (
+        <div
+          className="mt-2 space-y-1 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+          data-testid={`plugin-members-${itemKey}`}
+        >
+          {loadError ? (
+            <p>成员加载失败</p>
+          ) : members === null ? (
+            <p>加载成员中…</p>
+          ) : members.length === 0 ? (
+            <p>无成员</p>
+          ) : (
+            members.map((m) => (
+              <div
+                key={m.declared_component_id}
+                className="flex flex-wrap items-center gap-x-3 gap-y-0.5"
+              >
+                <span className="font-medium text-foreground/85">
+                  {m.declared_component_id}
+                </span>
+                <span>{KIND_LABELS[m.kind as ExtensionKind] ?? m.kind}</span>
+                <span className="font-mono">{m.ext_id}</span>
+                <span>{m.status}</span>
+              </div>
+            ))
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ExtensionCard({
   item,
   isAdmin,
+  governanceActive,
   probeEnabled,
   pending,
   notice,
@@ -286,9 +538,13 @@ function ExtensionCard({
   onSetGlobal,
   onSetUser,
   onProbe,
+  onQuarantine,
+  onReapprove,
+  onGovernanceToggle,
 }: Readonly<{
   item: RuntimeExtensionItem;
   isAdmin: boolean;
+  governanceActive: boolean;
   probeEnabled: boolean;
   pending: boolean;
   notice: string | undefined;
@@ -297,10 +553,25 @@ function ExtensionCard({
   onSetGlobal: (kind: ExtensionKind, id: string, enabled: boolean) => void;
   onSetUser: (kind: ExtensionKind, id: string, enabled: boolean) => void;
   onProbe: (kind: ExtensionKind, id: string) => void;
+  onQuarantine: (kind: ExtensionKind, id: string, revision: number) => void;
+  onReapprove: (kind: ExtensionKind, id: string, revision: number) => void;
+  onGovernanceToggle: (
+    kind: ExtensionKind,
+    id: string,
+    enabled: boolean,
+    revision: number
+  ) => void;
 }>) {
   const { health, liveness, config } = item;
   const isFaulted = health.state === "unreachable" || health.state === "error";
   const itemKey = `${item.kind}:${item.id}`;
+  const isPlugin = item.kind === "plugin";
+  // 治理块只在 Admin + governanceActive + 块存在时渲染（三层门；R7#7 非 Admin 恒不渲染）。
+  const governance = item.governance;
+  const showGovernance = isAdmin && governanceActive && governance !== undefined;
+  // plugin 父级启停需真实 revision（governance 块必带）；缺失 → 全局 Switch 禁用（绝不 `?? 0`）。
+  const pluginRevisionMissing =
+    isPlugin && item.governance?.row_revision === undefined;
 
   // 非 Admin 的 unreachable/error 卡片：泛化文案（R8#2）。
   const showGenericFault = !isAdmin && isFaulted;
@@ -312,8 +583,9 @@ function ExtensionCard({
   // （含 config_unreadable 保守占位 false）、或 probe_enabled=false（面板级）、或非 Admin
   // 时隐藏。disabled_user（global on + user off）条目仍显示可探测——user 级禁用不影响
   // 共享 health/probe。
+  // plugin 行隐藏 probe 按钮（元容器无握手/短路重扫语义）。
   const showProbeButton =
-    isAdmin && probeEnabled && config.enabled_global === true;
+    isAdmin && probeEnabled && config.enabled_global === true && !isPlugin;
 
   const cooldownRemainingMs =
     typeof cooldownReadyAt === "number" ? cooldownReadyAt - now : 0;
@@ -343,6 +615,9 @@ function ExtensionCard({
             配置：{config.effective_enabled ? "已启用" : "已禁用"}
             <span className="ml-1 opacity-70">（{config.reason_code}）</span>
           </p>
+          {showGovernance && governance ? (
+            <GovernanceBadges itemKey={itemKey} governance={governance} />
+          ) : null}
         </div>
 
         {/* 操作区：全局 Switch（Admin）/ 用户级 Switch / probe 按钮。 */}
@@ -355,22 +630,25 @@ function ExtensionCard({
                   className="data-[state=checked]:bg-primary"
                   data-testid={`global-switch-${itemKey}`}
                   checked={config.enabled_global}
-                  disabled={pending || configUnreadable}
+                  disabled={pending || configUnreadable || pluginRevisionMissing}
                   onCheckedChange={(checked) =>
                     onSetGlobal(item.kind, item.id, checked)
                   }
                 />
               </label>
             ) : null}
-            <label className="flex items-center gap-1.5">
-              个人
-              <UserSwitch
-                itemKey={itemKey}
-                config={config}
-                disabled={pending || configUnreadable}
-                onToggle={(checked) => onSetUser(item.kind, item.id, checked)}
-              />
-            </label>
+            {/* plugin 无 per-user 启停语义——隐藏个人 Switch（父级启停走 Admin 全局）。 */}
+            {!isPlugin ? (
+              <label className="flex items-center gap-1.5">
+                个人
+                <UserSwitch
+                  itemKey={itemKey}
+                  config={config}
+                  disabled={pending || configUnreadable}
+                  onToggle={(checked) => onSetUser(item.kind, item.id, checked)}
+                />
+              </label>
+            ) : null}
           </div>
           {showProbeButton ? (
             <Button
@@ -448,6 +726,38 @@ function ExtensionCard({
 
       {/* 调用统计区（Task 24）。非 Admin / admin_only 时内部早退不渲染。 */}
       <StatsBlock itemKey={itemKey} isAdmin={isAdmin} stats={item.stats} />
+
+      {/* D1a Task 26 — 治理区（Admin + governanceActive + 块存在）：隔离横幅 + 行内动作。 */}
+      {showGovernance && governance ? (
+        <div className="mt-3 space-y-2" data-testid={`gov-section-${itemKey}`}>
+          {governance.status === "quarantined" ? (
+            <p
+              className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-800 dark:text-red-200"
+              role="status"
+              data-testid={`gov-quarantine-banner-${itemKey}`}
+            >
+              已隔离：{govQuarantineReasonLabel(governance.quarantine_reason)}——已停止被 Agent 调用。
+            </p>
+          ) : null}
+          <GovernanceActions
+            item={item}
+            governance={governance}
+            disabled={pending}
+            onQuarantine={onQuarantine}
+            onReapprove={onReapprove}
+            onGovernanceToggle={onGovernanceToggle}
+          />
+        </div>
+      ) : null}
+
+      {/* D1a Task 26 — plugin 成员展开（Admin-only，惰性拉取；item.kind 内联收窄 details）。 */}
+      {isAdmin && item.kind === "plugin" ? (
+        <PluginMembership
+          itemKey={itemKey}
+          extId={item.id}
+          memberCount={item.details.member_count}
+        />
+      ) : null}
     </div>
   );
 }
@@ -505,6 +815,19 @@ export function ExtensionsOverview({
   const probeRuntimeExtension = useSettingsStore(
     (state) => state.probeRuntimeExtension
   );
+  const runtimeGovernanceSummary = useSettingsStore(
+    (state) => state.runtimeGovernanceSummary
+  );
+  const quarantineExtension = useSettingsStore(
+    (state) => state.quarantineExtension
+  );
+  const reapproveExtension = useSettingsStore(
+    (state) => state.reapproveExtension
+  );
+  const setGovernanceEnabled = useSettingsStore(
+    (state) => state.setGovernanceEnabled
+  );
+  const approveAllPins = useSettingsStore((state) => state.approveAllPins);
 
   const pendingSet = useMemo(
     () => new Set(runtimePendingIds),
@@ -561,6 +884,42 @@ export function ExtensionsOverview({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 治理是否开启的 FE 侧唯一可信信号：后端仅在 governance≠off 时给扩展条目挂 `governance`
+  // 块（off 时 None-omit）。据此门控 summary 拉取——OFF 部署零 governance-summary 请求。
+  const hasGovernanceBlock = useMemo(
+    () => runtimeExtensions.some((item) => item.governance !== undefined),
+    [runtimeExtensions]
+  );
+
+  // D1a Task 26 — 治理摘要轮询（R3#11：端点全 AdminUser，非 Admin 挂载会周期性 403，故仅
+  // isAdmin）。Finding #1（off-mode）：再叠加 hasGovernanceBlock 门——治理 OFF（无 governance
+  // 块）时不拉取、不起 interval，避免每 30s 打一次 summary 端点（pre-D1a 从无此 I/O）。
+  // 独立 effect（[isAdmin, hasGovernanceBlock] 依赖）+ generation 守卫（StrictMode replay
+  // 安全，语义同上）。fetchGovernanceSummary 经 getState() 读，稳定引用不入依赖数组；其内部
+  // 另有 mode:"off" back-off latch 作为 belt-and-suspenders（防不一致快照下的空转轮询）。
+  const govGenRef = useRef(0);
+  useEffect(() => {
+    if (!isAdmin || !hasGovernanceBlock) {
+      return;
+    }
+    const gen = ++govGenRef.current;
+    const loadGov = async () => {
+      if (govGenRef.current !== gen) {
+        return;
+      }
+      await useSettingsStore.getState().fetchGovernanceSummary();
+    };
+    void loadGov();
+    const id = window.setInterval(() => {
+      void loadGov();
+    }, POLL_INTERVAL_MS);
+    return () => {
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      govGenRef.current++;
+      window.clearInterval(id);
+    };
+  }, [isAdmin, hasGovernanceBlock]);
+
   // catalog "已配置" 徽章：catalog.id 与已配置 mcp 条目 id 精确匹配。
   const configuredMcpIds = useMemo(() => {
     const ids = new Set<string>();
@@ -574,6 +933,24 @@ export function ExtensionsOverview({
 
   const probeDisabled = runtimeSnapshotMeta?.probe_enabled === false;
   const statsDisabled = runtimeSnapshotMeta?.stats_enabled === false;
+
+  // D1a Task 26 — 治理 UI 总门：Admin + summary 已拉取 + mode≠off。非 Admin/off → 全隐藏。
+  const governanceMode = runtimeGovernanceSummary?.mode;
+  const governanceActive =
+    isAdmin && governanceMode !== undefined && governanceMode !== "off";
+  const unpinnedCount = runtimeGovernanceSummary?.unpinned_count ?? 0;
+  const quarantinedCount = runtimeGovernanceSummary?.quarantined_count ?? 0;
+
+  function handleApprovePins(): void {
+    if (
+      !window.confirm(
+        `确认把 ${unpinnedCount} 个待 pin 观测批量转正为可信基线？`
+      )
+    ) {
+      return;
+    }
+    void approveAllPins();
+  }
 
   // "填入配置"：风险确认 → 回调宿主完整包裹 JSON（Task 24, P-12）。confirm 拒绝零调用。
   function handlePrefill(entry: RuntimeCatalogItem): void {
@@ -631,6 +1008,30 @@ export function ExtensionsOverview({
         </div>
       ) : null}
 
+      {/* D1a Task 26 — 治理工具栏（Admin + mode≠off）：模式/计数提示 + 批量 pin 转正。 */}
+      {governanceActive ? (
+        <div
+          className="flex flex-wrap items-center gap-3 rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs"
+          data-testid="governance-toolbar"
+        >
+          <span className="text-muted-foreground">
+            治理模式：{governanceMode === "enforce" ? "强制" : "影子"}
+            {unpinnedCount > 0 ? ` · 待 pin ${unpinnedCount}` : ""}
+            {quarantinedCount > 0 ? ` · 已隔离 ${quarantinedCount}` : ""}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 rounded-lg border-border px-2 text-xs"
+            data-testid="approve-pins-button"
+            disabled={unpinnedCount === 0}
+            onClick={handleApprovePins}
+          >
+            批量转正 pin（{unpinnedCount}）
+          </Button>
+        </div>
+      ) : null}
+
       {/* 已配置扩展区。 */}
       <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/30 p-3">
         {runtimeExtensions.length === 0 ? (
@@ -645,6 +1046,7 @@ export function ExtensionsOverview({
                 key={itemKey}
                 item={item}
                 isAdmin={isAdmin}
+                governanceActive={governanceActive}
                 probeEnabled={runtimeSnapshotMeta?.probe_enabled === true}
                 pending={pendingSet.has(itemKey)}
                 notice={runtimeItemNotices[itemKey]}
@@ -653,6 +1055,9 @@ export function ExtensionsOverview({
                 onSetGlobal={setRuntimeExtensionEnabled}
                 onSetUser={setRuntimeUserEnabled}
                 onProbe={probeRuntimeExtension}
+                onQuarantine={quarantineExtension}
+                onReapprove={reapproveExtension}
+                onGovernanceToggle={setGovernanceEnabled}
               />
             );
           })

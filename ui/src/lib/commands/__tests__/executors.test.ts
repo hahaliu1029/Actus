@@ -91,6 +91,30 @@ function skillItem(
     details: { runtime_type: over.runtimeType ?? "native" },
   };
 }
+// D1a Task 26 (R6#C3): plugin fixture — /mcp 与 /skills 均不得含 plugin 条目
+// （union 扩值后 kind-specific filter 语义锁：plugin 是第四值，不落 mcp/skill 筛选面）。
+function pluginItem(over: { name?: string } = {}): RuntimeExtensionItem {
+  return {
+    kind: "plugin",
+    id: "plg-1",
+    name: over.name ?? "plugin-container",
+    description: null,
+    config: { enabled_global: true, enabled_user: null, effective_enabled: true, reason_code: "ok" },
+    health: { kind: "integrity", state: "ok", last_checked_at: null, stale: false },
+    liveness: { state: "not_applicable", active_run_count: 0 },
+    stats: {
+      available: false,
+      unavailable_reason: "unsupported",
+      call_count: 0,
+      success_count: 0,
+      failure_count: 0,
+      last_active_at: null,
+      last_success_at: null,
+      last_failure_at: null,
+    },
+    details: { member_count: 3, plugin_version: "1.2.0" },
+  };
+}
 function extData(items: RuntimeExtensionItem[]): RuntimeExtensionsData {
   return { items, snapshot_at: "t", probe_enabled: false, stats_enabled: false };
 }
@@ -98,13 +122,18 @@ function extData(items: RuntimeExtensionItem[]): RuntimeExtensionsData {
 describe("executeMcp", () => {
   it("filters kind==='mcp' → local_card", async () => {
     vi.mocked(runtimeApi.getExtensions).mockResolvedValue(
-      extData([mcpItem({ name: "srv", toolCount: 0 }), skillItem({ name: "sk" })])
+      extData([
+        mcpItem({ name: "srv", toolCount: 0 }),
+        skillItem({ name: "sk" }),
+        pluginItem({ name: "plugin-container" }),
+      ])
     );
     const out = await executeMcp([], "", ctx());
     expect(out.kind).toBe("local_card");
     if (out.kind === "local_card") {
       expect(out.markdown).toContain("srv");
       expect(out.markdown).not.toContain("sk"); // skill filtered out
+      expect(out.markdown).not.toContain("plugin-container"); // plugin filtered out (R6#C3)
     }
   });
 
@@ -118,7 +147,11 @@ describe("executeMcp", () => {
 describe("executeSkills", () => {
   it("filters kind==='skill' → local_card with runtime/enabled", async () => {
     vi.mocked(runtimeApi.getExtensions).mockResolvedValue(
-      extData([mcpItem({ name: "srv" }), skillItem({ name: "repo-map", runtimeType: "native", enabled: true })])
+      extData([
+        mcpItem({ name: "srv" }),
+        skillItem({ name: "repo-map", runtimeType: "native", enabled: true }),
+        pluginItem({ name: "plugin-container" }),
+      ])
     );
     const out = await executeSkills([], "", ctx());
     expect(out.kind).toBe("local_card");
@@ -126,6 +159,7 @@ describe("executeSkills", () => {
       expect(out.markdown).toContain("repo-map");
       expect(out.markdown).toContain("native");
       expect(out.markdown).not.toContain("srv"); // mcp filtered out
+      expect(out.markdown).not.toContain("plugin-container"); // plugin filtered out (R6#C3)
     }
   });
 

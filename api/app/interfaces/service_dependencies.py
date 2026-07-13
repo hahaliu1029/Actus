@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -13,8 +14,12 @@ from app.application.services.app_config_service import AppConfigService
 from app.application.services.cost_rollup_service import CostRollupService
 from app.application.services.file_service import FileService
 from app.application.services.memory_management_service import MemoryManagementService
+from app.application.services.plugin_install_service import PLUGIN_STORE_ROOT
 from app.application.services.runtime_extension_service import (
     RuntimeExtensionService,
+)
+from app.infrastructure.external.governance.plugin_display_name import (
+    read_plugin_display_name,
 )
 from app.application.services.session_service import SessionService
 from app.application.services.user_tool_enablement_service import (
@@ -105,15 +110,24 @@ _config_generation: int = 0
 _config_lock = threading.Lock()
 
 
-# @lru_cache()
-def get_app_config_service() -> AppConfigService:
-    """获取应用配置服务"""
+def get_app_config_service(request: Request) -> AppConfigService:
+    """获取应用配置服务（R3#15：FastAPI 依赖形态——注入 D1a 治理 reconciler/read_port）。
+
+    off（默认 ``EXTENSION_GOVERNANCE_MODE=off``）→ app.state 上两句柄均 None → 双 None
+    注入 → 六个写方法行为与治理接线前 byte 级一致。非 request 上下文（lifespan/T23
+    closure 局部构造）继续直构 ``AppConfigService(repo, reconciler=..., registry_read_port=...)``。
+    ``@lru_cache`` 不再适用（Request 不可哈希）——所有消费处均经 ``Depends`` 透明适配。
+    """
     # 1.获取数据仓库并打印日志
     logger.info("加载获取AppConfigService")
     file_app_config_repository = FileAppConfigRepository(settings.app_config_filepath)
 
-    # 2.实例化AppConfigService
-    return AppConfigService(app_config_repository=file_app_config_repository)
+    # 2.实例化AppConfigService（治理挂钩 off=None 零行为变化）
+    return AppConfigService(
+        app_config_repository=file_app_config_repository,
+        reconciler=getattr(request.app.state, "extension_reconciler", None),
+        registry_read_port=getattr(request.app.state, "extension_registry_read_port", None),
+    )
 
 
 def get_subagent_limits() -> "SubagentLimitsConfig":
@@ -229,6 +243,13 @@ def get_runtime_extension_service(
         probe_view=getattr(request.app.state, "extension_probe_service", None),
         liveness_view=getattr(request.app.state, "runtime_liveness_registry", None),
         stats_reader=getattr(request.app.state, "extension_stats", None),
+        # D1a Task 25：治理只读 port（mode=off → None，INV-D1-0 零行为）+ plugin 展示名
+        # resolver（helper 偏函数 bind PLUGIN_STORE_ROOT；registry 无 name 列 → best-effort
+        # 读 plugin.json，失败 fallback ext_id）。
+        registry_read_port=getattr(
+            request.app.state, "extension_registry_read_port", None
+        ),
+        plugin_name_resolver=partial(read_plugin_display_name, PLUGIN_STORE_ROOT),
         # 有效能力 = 后台任务启动成功 AND 当前 flag on（flag 经 TTL config loader 动态读取，
         # 支持运行中翻转——R5#3/R18#1/R1#3 统一口径）
         probe_enabled_provider=lambda: (
@@ -252,6 +273,38 @@ def get_extension_probe_service(request: Request):
     口径分离：GET 走聚合器 stub，手动探测走真单例）。
     """
     return getattr(request.app.state, "extension_probe_service", None)
+
+
+def get_extension_registry_read_port(request: Request):
+    """D1a Task 13（G6 façade §4.2）：治理只读 port 单例句柄穿透。
+
+    句柄由 lifespan 治理段构造挂到 ``app.state.extension_registry_read_port``
+    （mode≠off → ``DbExtensionRegistryReadPort``；mode=off → ``None``，INV-D1-0）。
+    与 ``get_extension_probe_service`` 同款——只做句柄穿透，不在此合成能力：G6 门
+    读到 ``None`` 即恒等直通（治理关闭时装配咽喉零行为）。
+    """
+    return getattr(request.app.state, "extension_registry_read_port", None)
+
+
+def get_extension_install_service(request: Request):
+    """D1a Task 19：MCP/A2A 两阶段安装管道单例句柄穿透（§7.1/§9.2）。
+
+    句柄由 lifespan 治理段构造挂到 ``app.state.extension_install_service``
+    （``mode≠off`` → ``ExtensionInstallService``；``mode=off`` → ``None``，INV-D1-0）。
+    路由 ``Depends`` 的真实注入面：读到 ``None`` → 走旧直通（治理关闭零行为变化）；
+    非 ``None`` → dry_run/commit 两阶段管道。挂 app.state 本身不满足 ``Depends``——
+    本 provider 是承载面（R7#2）。"""
+    return getattr(request.app.state, "extension_install_service", None)
+
+
+def get_extension_governance_service(request: Request):
+    """D1a Task 20：§9.2 治理服务单例句柄穿透（行政动作 + 观测刷新 + 审计翻页）。
+
+    句柄由 lifespan 治理段构造挂到 ``app.state.extension_governance_service``
+    （``mode≠off`` → ``ExtensionGovernanceService``；``mode=off`` → ``None``，INV-D1-0）。
+    治理路由 ``Depends`` 的真实注入面（R7#2）：读到 ``None`` → 除 ``GET /governance``
+    返回字面量零外一律 409 ``governance_disabled``；挂 app.state 本身不满足 ``Depends``。"""
+    return getattr(request.app.state, "extension_governance_service", None)
 
 
 # --- LLM cache (D2) ---
@@ -890,6 +943,9 @@ class ChildRunnerSharedDeps:
     # C7: root 的 LifecycleRuntimeConfig | None（child/root flag 同源，§12-8；
     # None（legacy/test deps）→ runner ctor 内坍缩为 default-OFF 配置）。
     lifecycle_runtime: object = None
+    # D1a §4.1 注入链第 2 跳：root/child 共享同一 AdmissionPort 实例（admission 必须同源，
+    # 与 B12 file_view child 自建 registry 先例不同）。None=off/legacy 向后兼容。
+    extension_admission_port: object = None
 
 
 def _make_shared_child_runner_builder(
@@ -996,6 +1052,10 @@ def _make_shared_child_runner_builder(
                 else False
             ),
             file_processor_lookup=child_file_processor_lookup,
+            # D1a §4.1: child inherits the SAME AdmissionPort instance as root
+            # (admission 必须同源). None when mode off. deps default None keeps
+            # legacy/test child builds working unchanged.
+            extension_admission_port=deps.extension_admission_port,
         )
 
     return _build
@@ -1764,6 +1824,10 @@ def _build_agent_service(
     # ``app.state.extension_stats`` (None when flag off). Threaded into
     # AgentService → AgentTaskRunner → PlannerReActFlow → react_graph.
     extension_stats_recorder: object | None = None,
+    # D1a §4.1 (R2#F12): lifespan-scoped governance AdmissionPort. main.py passes
+    # ``app.state.extension_admission_port`` (None when mode off). Threaded into
+    # AgentService → AgentTaskRunner → SkillTool / SkillBundleSyncManager.
+    extension_admission_port: object | None = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
@@ -1924,6 +1988,8 @@ def _build_agent_service(
         policy_snapshot_sink=get_policy_snapshot_sink(),  # C5a: Logging sink when flag ON, else Noop
         # B9 Task 20: root-path stats recorder (None when flag off).
         extension_stats_recorder=extension_stats_recorder,
+        # D1a §4.1: root-path governance AdmissionPort (None when mode off).
+        extension_admission_port=extension_admission_port,
     )
     agent_svc._supervisor = supervisor
     # C3 PR-4.5 — bind AgentService into the supervisor callback bridge

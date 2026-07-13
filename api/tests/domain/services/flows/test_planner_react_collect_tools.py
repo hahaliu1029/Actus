@@ -125,6 +125,88 @@ class TestCollectMcpTools:
         assert tools == []
 
 
+class TestCollectMcpToolsExcludedServers:
+    """D1a G2 / R2#F5: PlannerReActFlow drops governance-blocked servers from
+    BOTH the direct-bind (<=15) and discovery (>15) collection paths."""
+
+    @pytest.mark.anyio
+    async def test_direct_bind_excludes_blocked_servers(self):
+        """Small set: blocked-server tools never enter the direct-bind list."""
+        mcp_tool = MagicMock()
+        mcp_tool.get_tools.return_value = [
+            {"function": {"name": "mcp_ok_a", "description": "", "parameters": {}}},
+            {"function": {"name": "mcp_ok_b", "description": "", "parameters": {}}},
+            {"function": {"name": "mcp_bad_c", "description": "", "parameters": {}}},
+        ]
+        mcp_tool.tool_server_bindings.return_value = {
+            "mcp_ok_a": "srv-ok",
+            "mcp_ok_b": "srv-ok",
+            "mcp_bad_c": "srv-bad",
+        }
+        flow = _make_flow(mcp_tool=mcp_tool, excluded_mcp_servers={"srv-bad"})
+        tools = await flow._collect_mcp_tools()
+        names = {t.name for t in tools}
+        assert "mcp_ok_a" in names and "mcp_ok_b" in names
+        assert "mcp_bad_c" not in names, (
+            f"blocked-server tool leaked into planner direct-bind: {names}"
+        )
+
+    @pytest.mark.anyio
+    async def test_no_excluded_keeps_legacy_direct_bind(self):
+        """Empty excluded set = identity (all direct-bound, legacy behavior)."""
+        mcp_tool = MagicMock()
+        mcp_tool.get_tools.return_value = [
+            {"function": {"name": "mcp_ok_a", "description": "", "parameters": {}}},
+            {"function": {"name": "mcp_bad_c", "description": "", "parameters": {}}},
+        ]
+        mcp_tool.tool_server_bindings.return_value = {
+            "mcp_ok_a": "srv-ok",
+            "mcp_bad_c": "srv-bad",
+        }
+        flow = _make_flow(mcp_tool=mcp_tool)  # excluded_mcp_servers defaults to empty
+        tools = await flow._collect_mcp_tools()
+        names = {t.name for t in tools}
+        assert names == {"mcp_ok_a", "mcp_bad_c"}
+
+    @pytest.mark.anyio
+    async def test_discovery_path_receives_excluded_and_filters_always_bind(
+        self, monkeypatch
+    ):
+        """Large set: discovery factory gets excluded_servers, and blocked
+        always-bind tools are stripped from the direct-bind path."""
+        mcp_tool = MagicMock()
+        mcp_tool.get_tools.return_value = [
+            {"function": {"name": f"mcp_test_tool_{i}"}} for i in range(20)
+        ]
+        mcp_tool.tool_server_bindings.return_value = {
+            f"mcp_test_tool_{i}": ("srv-bad" if i == 0 else "srv-ok")
+            for i in range(20)
+        }
+        flow = _make_flow(mcp_tool=mcp_tool, excluded_mcp_servers={"srv-bad"})
+        flow._mcp_always_bind_names = {"mcp_test_tool_0", "mcp_test_tool_1"}
+        flow._mcp_tool_ref = lambda: mcp_tool
+        flow._activated_mcp_tools_ref = lambda: set()
+
+        captured: dict = {}
+
+        def _fake_discovery(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        monkeypatch.setattr(
+            "app.domain.services.tools.langchain_mcp_discovery.create_mcp_discovery_tools",
+            _fake_discovery,
+        )
+
+        tools = await flow._collect_mcp_tools()
+        # Discovery factory received the blocked server set.
+        assert captured.get("excluded_servers") == {"srv-bad"}
+        names = {t.name for t in tools}
+        # Blocked always-bind tool stripped; allowed always-bind tool kept.
+        assert "mcp_test_tool_0" not in names
+        assert "mcp_test_tool_1" in names
+
+
 class TestCollectA2aTools:
     def test_returns_a2a_tool_names(self):
         a2a_tool = MagicMock()

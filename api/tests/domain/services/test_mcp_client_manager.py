@@ -139,3 +139,20 @@ async def test_mcp_manager_invoke_returns_timeout_when_call_tool_hangs(
 
     assert result.success is False
     assert "超时" in (result.message or "")
+
+
+async def test_mcptool_server_tool_surfaces_delegates_to_manager() -> None:
+    """D1a G2: MCPTool.server_tool_surfaces() returns a shallow copy of the
+    manager's server→List[Tool] cache; None manager → empty dict."""
+    tool = MCPTool()
+    tool._manager = None
+    assert tool.server_tool_surfaces() == {}
+
+    mgr = MCPClientManager(MCPConfig(mcpServers={}))
+    mgr._tools = {"srv-a": ["t1"], "srv-b": ["t2"]}
+    tool._manager = mgr
+    surfaces = tool.server_tool_surfaces()
+    assert surfaces == {"srv-a": ["t1"], "srv-b": ["t2"]}
+    # Shallow copy — adding a new server key must not leak back into manager.
+    surfaces["srv-c"] = []
+    assert "srv-c" not in mgr.tools

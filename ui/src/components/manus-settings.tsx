@@ -21,7 +21,9 @@ import {
 
 import { AdminUsersSetting } from "@/components/settings/admin-users-setting";
 import { ExtensionsOverview } from "@/components/settings/extensions-overview";
+import { ExtensionInstallPreviewFlow } from "@/components/settings/mcp-install-preview";
 import { MemoryManagement } from "@/components/settings/memory-management";
+import { PluginInstallDialog } from "@/components/settings/plugin-install-dialog";
 import { SkillDetailDrawer } from "@/components/settings/skill-detail-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -37,7 +39,8 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
-import type { AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
+import { configApi } from "@/lib/api/config";
+import type { AgentConfig, ExtensionInstallPreviewWire, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
 import { mergeAgentSavePayload } from "@/lib/settings/merge-agent-config";
 import { useSessionStore } from "@/lib/store/session-store";
@@ -107,11 +110,9 @@ export function ManusSettings() {
   const loadAll = useSettingsStore((state) => state.loadAll);
   const updateLLMConfig = useSettingsStore((state) => state.updateLLMConfig);
   const updateAgentConfig = useSettingsStore((state) => state.updateAgentConfig);
-  const addMCPServer = useSettingsStore((state) => state.addMCPServer);
   const deleteMCPServer = useSettingsStore((state) => state.deleteMCPServer);
   const setMCPServerEnabled = useSettingsStore((state) => state.setMCPServerEnabled);
   const setMCPToolEnabled = useSettingsStore((state) => state.setMCPToolEnabled);
-  const addA2AServer = useSettingsStore((state) => state.addA2AServer);
   const deleteA2AServer = useSettingsStore((state) => state.deleteA2AServer);
   const setA2AServerEnabled = useSettingsStore((state) => state.setA2AServerEnabled);
   const setA2AToolEnabled = useSettingsStore((state) => state.setA2AToolEnabled);
@@ -122,6 +123,12 @@ export function ManusSettings() {
   const setSkillToolEnabled = useSettingsStore((state) => state.setSkillToolEnabled);
   const fileUnderstanding = useSettingsStore((state) => state.fileUnderstanding);
   const updateFileUnderstandingConfig = useSettingsStore((state) => state.updateFileUnderstandingConfig);
+  // D1a T27：治理 mode 驱动 MCP/A2A 添加弹窗的 preview 步（off/未知 → 现状直提；≠off →
+  // dry_run preview + 三态 commit）+ plugin 安装入口可见性。summary 由 Admin 打开设置面板时
+  // 拉取（isAdmin-gated——端点全 AdminUser），mode 缺省即安全直通。
+  const runtimeGovernanceSummary = useSettingsStore((state) => state.runtimeGovernanceSummary);
+  const fetchGovernanceSummary = useSettingsStore((state) => state.fetchGovernanceSummary);
+  const governanceMode = runtimeGovernanceSummary?.mode;
 
   const [agentForm, setAgentForm] = useState<AgentConfig>({
     max_iterations: 100,
@@ -179,6 +186,13 @@ export function ManusSettings() {
       void loadAll();
     }
   }, [open, loadAll]);
+
+  // 设置面板打开时（Admin）拉取治理 summary，使 governanceMode 在任意 tab 可用。
+  useEffect(() => {
+    if (open && isAdmin) {
+      void fetchGovernanceSummary();
+    }
+  }, [open, isAdmin, fetchGovernanceSummary]);
 
   useEffect(() => {
     if (agentConfig) {
@@ -251,47 +265,47 @@ export function ManusSettings() {
     setOpen(false);
   }
 
-  async function handleAddMCPServer(): Promise<void> {
+  // D1a T27：MCP 添加走 ExtensionInstallPreviewFlow 两阶段。parseMcpConfig 抛错由 flow
+  // 展示；mode=off 时 flow 跳过 preview 直接 commit（后端 install_service=None 分支直通，
+  // INV-D1-0 零行为变化）；mode≠off 时 dry_run preview + 三态 commit。
+  function parseMcpConfig(): MCPConfig {
     if (!mcpPayload.trim()) {
-      setMcpDialogError("请输入 MCP 配置 JSON");
-      return;
+      throw new Error("请输入 MCP 配置 JSON");
     }
-
+    let parsed: unknown;
     try {
-      setMcpDialogError(null);
-      const parsed = JSON.parse(mcpPayload) as MCPConfig;
-      const normalized = normalizeMCPConfigInput(parsed);
-      if (!normalized.ok) {
-        setMessage({
-          type: "error",
-          text: normalized.error,
-        });
-        setMcpDialogError(normalized.error);
-        return;
-      }
-
-      const added = await addMCPServer(normalized.config);
-      if (!added) {
-        setMcpDialogError(
-          useUIStore.getState().message?.text || "新增 MCP 服务失败，请检查配置后重试"
-        );
-        return;
-      }
-      setMcpPayload(MCP_EXAMPLE);
-      setMcpDialogError(null);
-      setIsMCPDialogOpen(false);
+      parsed = JSON.parse(mcpPayload);
     } catch {
-      setMcpDialogError("MCP JSON 格式不合法");
-      setMessage({
-        type: "error",
-        text: "MCP JSON 格式不合法",
-      });
+      throw new Error("MCP JSON 格式不合法");
     }
+    const normalized = normalizeMCPConfigInput(parsed);
+    if (!normalized.ok) {
+      throw new Error(normalized.error);
+    }
+    return normalized.config;
+  }
+
+  function mcpRunPreview(): Promise<ExtensionInstallPreviewWire> {
+    return configApi.previewMCPServer(parseMcpConfig());
+  }
+
+  async function mcpRunCommit(opts: {
+    acknowledge: boolean;
+    force: boolean;
+  }): Promise<void> {
+    await configApi.commitMCPServer(parseMcpConfig(), opts);
+  }
+
+  async function mcpOnInstalled(): Promise<void> {
+    setMessage({ type: "success", text: "新增 MCP 服务配置成功" });
+    await loadAll();
+    setMcpPayload(MCP_EXAMPLE);
+    setIsMCPDialogOpen(false);
   }
 
   // B9 Task 24 (P-12)：catalog "填入配置" 回调——切到 MCP tab + 预填添加弹窗
   // 的局部 state（mcpPayload）+ 打开既有 MCP 添加弹窗。payloadJson 已是完整包裹
-  // 形态（顶层 mcpServers 键），走既有 handleAddMCPServer 校验/提交路径。
+  // 形态（顶层 mcpServers 键），走 ExtensionInstallPreviewFlow 的预检/提交路径。
   // 不代填 secrets、不自动连接——仅预填文本待用户确认后保存。
   function handlePrefillMcpConfig(payloadJson: string): void {
     setActiveTab("mcp");
@@ -300,22 +314,29 @@ export function ManusSettings() {
     setIsMCPDialogOpen(true);
   }
 
-  async function handleAddA2AServer(): Promise<void> {
-    if (!a2aBaseUrl.trim()) {
-      setA2ADialogError("请输入 A2A Agent 基础 URL");
-      return;
+  function a2aRunPreview(): Promise<ExtensionInstallPreviewWire> {
+    const url = a2aBaseUrl.trim();
+    if (!url) {
+      return Promise.reject(new Error("请输入 A2A Agent 基础 URL"));
     }
+    return configApi.previewA2AServer({ base_url: url });
+  }
 
-    setA2ADialogError(null);
-    const added = await addA2AServer({ base_url: a2aBaseUrl.trim() });
-    if (!added) {
-      setA2ADialogError(
-        useUIStore.getState().message?.text || "新增 A2A 服务失败，请检查配置后重试"
-      );
-      return;
+  async function a2aRunCommit(opts: {
+    acknowledge: boolean;
+    force: boolean;
+  }): Promise<void> {
+    const url = a2aBaseUrl.trim();
+    if (!url) {
+      throw new Error("请输入 A2A Agent 基础 URL");
     }
+    await configApi.commitA2AServer({ base_url: url }, opts);
+  }
+
+  async function a2aOnInstalled(): Promise<void> {
+    setMessage({ type: "success", text: "新增 A2A 服务配置成功" });
+    await loadAll();
     setA2ABaseUrl("");
-    setA2ADialogError(null);
     setIsA2ADialogOpen(false);
   }
 
@@ -948,11 +969,22 @@ export function ManusSettings() {
               ) : null}
 
               {activeTab === "extensions" ? (
-                <ExtensionsOverview
-                  isAdmin={isAdmin}
-                  onSelectTab={setActiveTab}
-                  onPrefillMcpConfig={handlePrefillMcpConfig}
-                />
+                <div className="space-y-4">
+                  <div className="flex justify-end">
+                    <PluginInstallDialog
+                      isAdmin={isAdmin}
+                      governanceMode={governanceMode}
+                      onInstalled={() => {
+                        void loadAll();
+                      }}
+                    />
+                  </div>
+                  <ExtensionsOverview
+                    isAdmin={isAdmin}
+                    onSelectTab={setActiveTab}
+                    onPrefillMcpConfig={handlePrefillMcpConfig}
+                  />
+                </div>
               ) : null}
 
               {activeTab === "a2a" ? (
@@ -1009,22 +1041,15 @@ export function ManusSettings() {
                             </p>
                           ) : null}
                         </div>
-                        <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
-                          <Button
-                            variant="outline"
-                            className="h-10 rounded-xl border-border px-5"
-                            onClick={() => setIsA2ADialogOpen(false)}
-                          >
-                            取消
-                          </Button>
-                          <Button
-                            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
-                            onClick={() => {
-                              void handleAddA2AServer();
-                            }}
-                          >
-                            添加
-                          </Button>
+                        <div className="shrink-0 border-t border-border px-6 py-3">
+                          <ExtensionInstallPreviewFlow
+                            governanceMode={governanceMode}
+                            runPreview={a2aRunPreview}
+                            runCommit={a2aRunCommit}
+                            onSuccess={a2aOnInstalled}
+                            onCancel={() => setIsA2ADialogOpen(false)}
+                            submitLabel="添加"
+                          />
                         </div>
                       </DialogContent>
                     </Dialog>
@@ -1178,22 +1203,15 @@ export function ManusSettings() {
                             </p>
                           ) : null}
                         </div>
-                        <div className="flex shrink-0 justify-end gap-2 border-t border-border px-6 py-3">
-                          <Button
-                            variant="outline"
-                            className="h-10 rounded-xl border-border px-5"
-                            onClick={() => setIsMCPDialogOpen(false)}
-                          >
-                            取消
-                          </Button>
-                          <Button
-                            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
-                            onClick={() => {
-                              void handleAddMCPServer();
-                            }}
-                          >
-                            添加
-                          </Button>
+                        <div className="shrink-0 border-t border-border px-6 py-3">
+                          <ExtensionInstallPreviewFlow
+                            governanceMode={governanceMode}
+                            runPreview={mcpRunPreview}
+                            runCommit={mcpRunCommit}
+                            onSuccess={mcpOnInstalled}
+                            onCancel={() => setIsMCPDialogOpen(false)}
+                            submitLabel="添加"
+                          />
                         </div>
                       </DialogContent>
                     </Dialog>

@@ -156,6 +156,10 @@ services:
       # is read from os.environ directly, so without this passthrough a Docker
       # deployment can never enable it.
       ACTUS_C2_AGENT_TEAMS_ENABLED: ${ACTUS_C2_AGENT_TEAMS_ENABLED:-false}
+      # D1a extension governance mode (spec §2). env-only three-state switch;
+      # default off. Without this passthrough a Docker deployment can never
+      # enable governance (compose env block is an explicit whitelist).
+      EXTENSION_GOVERNANCE_MODE: ${EXTENSION_GOVERNANCE_MODE:-off}
       # Metrics endpoint auth token (B5 observability). Empty (default) →
       # /api/v1/metrics 404s (endpoint disabled). Required for the C2 coordinator
       # live-acceptance + perf-sampling runbooks (scrape sends Authorization:

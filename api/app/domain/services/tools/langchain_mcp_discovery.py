@@ -26,6 +26,8 @@ def create_mcp_discovery_tools(
     mcp_tool_ref: Callable[[], Any],
     activated_tools_ref: Callable[[], set[str]],
     tool_filter: Optional[FrozenSet[str]] = None,
+    *,
+    excluded_servers: Optional[set[str]] = None,
 ) -> list[StructuredTool]:
     """Create MCP discovery tools for progressive loading.
 
@@ -44,7 +46,30 @@ def create_mcp_discovery_tools(
             caller already chose to mention) and no schema/metadata.
         ``None`` (default) preserves legacy "no filter" behaviour and is
         the correct value at the top-level / parent-agent layer.
+    excluded_servers : optional set of MCP server names blocked by extension
+        governance (D1a G2, R1#19). When non-empty, every tool belonging to a
+        blocked server (resolved via the wrapper's ``tool_server_bindings()``)
+        is hidden from ``list_mcp_tools`` and refused activation by
+        ``get_mcp_tool`` — otherwise a blocked server's name/description/schema
+        would still reach the LLM through the discovery surface, defeating G2.
+        ``None`` / empty set (default) preserves legacy behaviour (no filter).
     """
+
+    def _blocked_tool_names() -> set[str]:
+        """Full MCP tool names belonging to governance-blocked servers.
+
+        Resolved via the wrapper's ``tool_server_bindings()`` (``{full tool
+        name: server}``) — same source the runner's G2 exclusion uses, so the
+        two consumer surfaces stay in lock-step. fail-open: any error yields an
+        empty set (never crash discovery over an attribution hiccup)."""
+        if not excluded_servers:
+            return set()
+        try:
+            bindings = mcp_tool_ref().tool_server_bindings()
+        except Exception:
+            logger.warning("MCP excluded_servers 绑定解析失败（fail-open）", exc_info=True)
+            return set()
+        return {n for n, s in bindings.items() if s in excluded_servers}
 
     async def _list_mcp_tools(server_name: str = "") -> tuple[str, ToolOutcome]:
         """列出可用的 MCP 工具。不传参数返回所有概览；传入服务器名返回该服务器详情。"""
@@ -54,6 +79,7 @@ def create_mcp_discovery_tools(
             outcome = AllowSuccess(content="No MCP tools available.")
             return outcome.content, outcome
 
+        blocked_names = _blocked_tool_names()   # D1a G2 (R1#19)
         lines = ["## Available MCP Tools\n"]
         for schema in all_tools:
             fn = schema.get("function", {})
@@ -70,6 +96,10 @@ def create_mcp_discovery_tools(
             # skip any tool whose canonical name is not in the allowlist
             # so the metadata never reaches the LLM.
             if tool_filter is not None and name not in tool_filter:
+                continue
+            # D1a G2 (R1#19): skip tools of governance-blocked servers so the
+            # blocked surface never reaches the LLM via discovery metadata.
+            if name in blocked_names:
                 continue
             lines.append(f"- **{name}**: {desc}")
 
@@ -118,6 +148,18 @@ def create_mcp_discovery_tools(
             else:
                 content = base
             outcome = AllowSuccess(content=content)
+            return outcome.content, outcome
+
+        # D1a G2 (R1#19): refuse activation for any tool of a governance-blocked
+        # server BEFORE touching the catalog, so no schema/metadata leaks. The
+        # message echoes only the caller-supplied ``tool_name`` (no new info).
+        if excluded_servers and tool_name in _blocked_tool_names():
+            outcome = AllowSuccess(
+                content=(
+                    f"MCP tool '{tool_name}' is not available: its server has "
+                    "been blocked by extension governance."
+                )
+            )
             return outcome.content, outcome
 
         mcp = mcp_tool_ref()

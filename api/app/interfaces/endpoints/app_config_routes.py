@@ -9,8 +9,11 @@ from app.interfaces.schemas.app_config import (
     ListMCPServerResponse,
 )
 from app.interfaces.schemas.base import Response
-from app.interfaces.service_dependencies import get_app_config_service
-from fastapi import APIRouter, Body, Depends
+from app.interfaces.service_dependencies import (
+    get_app_config_service,
+    get_extension_install_service,
+)
+from fastapi import APIRouter, Body, Depends, Query
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/app-config", tags=["设置模块"])
@@ -145,11 +148,31 @@ async def get_mcp_servers(
 async def create_mcp_servers(
     mcp_config: MCPConfig,
     admin_user: AdminUser,
+    dry_run: bool = Query(False, description="dry-run 预检（不落盘）"),
+    acknowledge: bool = Query(False, description="确认 caution-tier 扫描结果"),
+    force: bool = Query(False, description="强制安装 dangerous-tier 扩展"),
     app_config_service: AppConfigService = Depends(get_app_config_service),
+    install_service=Depends(get_extension_install_service),
 ) -> Response[Optional[Dict]]:
-    """根据传递的配置信息创建mcp服务（仅限管理员）"""
-    await app_config_service.update_and_create_mcp_servers(mcp_config)
-    return Response.success(msg="新增MCP服务配置成功")
+    """根据传递的配置信息创建mcp服务（仅限管理员）。
+
+    治理关闭（install_service=None）→ 旧直通（INV-D1-0 零行为变化）；开启 → dry_run
+    预检 / commit 两阶段管道（逐个安装；warnings 加性附 data.warnings，旧 FE 零感知）。"""
+    if install_service is None:                       # mode=off
+        # dry_run 是治理新参——off 下对其透明（pre-D1a：未知参被忽略走正常创建）。
+        # 只在治理开启时才 honor dry_run（下方 preview 分支）。
+        await app_config_service.update_and_create_mcp_servers(mcp_config)
+        return Response.success(msg="新增MCP服务配置成功")
+    # 治理模式逐个安装（>1 → BatchNotAllowedError → 422 single_server_required）
+    server_name, server_config = install_service.ensure_single_mcp(mcp_config)
+    if dry_run:
+        preview = await install_service.preview_mcp(server_name, server_config)
+        return Response.success(msg="dry-run 预检完成", data=preview.model_dump())
+    _new, warnings = await install_service.commit_mcp(
+        server_name, server_config,
+        actor_id=admin_user.id, acknowledged=acknowledge, forced=force)
+    data = {"warnings": warnings} if warnings else None
+    return Response.success(msg="新增MCP服务配置成功", data=data)
 
 
 @router.post(
@@ -164,7 +187,8 @@ async def delete_mcp_server(
     app_config_service: AppConfigService = Depends(get_app_config_service),
 ) -> Response[Optional[Dict]]:
     """根据服务名字删除MCP服务器（仅限管理员）"""
-    await app_config_service.delete_mcp_server(server_name)
+    # actor 透传关闭 T16 transient（mode≠off 时 delete delta 需 actor 构造 UninstallContext）
+    await app_config_service.delete_mcp_server(server_name, actor_id=admin_user.id)
     return Response.success(msg="删除MCP服务配置成功")
 
 
@@ -181,7 +205,8 @@ async def set_mcp_server_enabled(
     app_config_service: AppConfigService = Depends(get_app_config_service),
 ) -> Response[Optional[Dict]]:
     """根据传递的server_name+enabled更新服务的全局启用状态（仅限管理员）"""
-    await app_config_service.set_mcp_server_enabled(server_name, enabled)
+    await app_config_service.set_mcp_server_enabled(
+        server_name, enabled, actor_id=admin_user.id)
     return Response.success(msg="更新MCP服务启用状态成功")
 
 
@@ -211,11 +236,27 @@ async def get_a2a_servers(
 async def create_a2a_server(
     admin_user: AdminUser,
     base_url: str = Body(..., embed=True),
+    dry_run: bool = Query(False, description="dry-run 预检（不落盘）"),
+    acknowledge: bool = Query(False, description="确认 caution-tier 扫描结果"),
+    force: bool = Query(False, description="强制安装 dangerous-tier 扩展"),
     app_config_service: AppConfigService = Depends(get_app_config_service),
+    install_service=Depends(get_extension_install_service),
 ) -> Response[Optional[Dict]]:
-    """新增a2a服务器（仅限管理员）"""
-    await app_config_service.create_a2a_server(base_url)
-    return Response.success(msg="新增A2A服务配置成功")
+    """新增a2a服务器（仅限管理员）。
+
+    治理关闭 → 旧直通（INV-D1-0）；开启 → dry_run 预检 / commit 两阶段管道
+    （a2a 单 base_url 无批量语义；warnings 加性附 data.warnings）。"""
+    if install_service is None:                       # mode=off
+        # dry_run 是治理新参——off 下对其透明（pre-D1a：未知参被忽略走正常创建）。
+        await app_config_service.create_a2a_server(base_url)
+        return Response.success(msg="新增A2A服务配置成功")
+    if dry_run:
+        preview = await install_service.preview_a2a(base_url)
+        return Response.success(msg="dry-run 预检完成", data=preview.model_dump())
+    _new, warnings = await install_service.commit_a2a(
+        base_url, actor_id=admin_user.id, acknowledged=acknowledge, forced=force)
+    data = {"warnings": warnings} if warnings else None
+    return Response.success(msg="新增A2A服务配置成功", data=data)
 
 
 @router.post(
@@ -230,7 +271,7 @@ async def delete_a2a_server(
     app_config_service: AppConfigService = Depends(get_app_config_service),
 ) -> Response[Optional[Dict]]:
     """删除a2a服务器（仅限管理员）"""
-    await app_config_service.delete_a2a_server(a2a_id)
+    await app_config_service.delete_a2a_server(a2a_id, actor_id=admin_user.id)
     return Response.success(msg="删除a2a服务器成功")
 
 
@@ -247,5 +288,6 @@ async def set_a2a_server_enabled(
     app_config_service: AppConfigService = Depends(get_app_config_service),
 ) -> Response[Optional[Dict]]:
     """更新A2A服务的全局启用状态（仅限管理员）"""
-    await app_config_service.set_a2a_server_enabled(a2a_id, enabled)
+    await app_config_service.set_a2a_server_enabled(
+        a2a_id, enabled, actor_id=admin_user.id)
     return Response.success(msg="更新a2a服务器启用状态成功")

@@ -147,3 +147,30 @@ async def test_run_with_timeout_isolated_runs_in_current_task_context() -> None:
     await _run_with_timeout_isolated(probe(), timeout_seconds=1)
 
     assert probe_task is parent_task
+
+
+async def test_a2a_manager_remove_agent_card_idempotent() -> None:
+    """D1a G3: A2AClientManager.remove_agent_card pops by id; missing id is a
+    no-op (no KeyError)."""
+    mgr = A2AClientManager(A2AConfig(a2a_servers=[]))
+    mgr._agent_cards = {"id-1": {"name": "A"}}
+    mgr.remove_agent_card("nonexistent")   # no crash
+    assert set(mgr._agent_cards) == {"id-1"}
+    mgr.remove_agent_card("id-1")
+    assert mgr._agent_cards == {}
+
+
+async def test_a2atool_agent_cards_and_remove_delegate_to_manager() -> None:
+    """D1a G3: A2ATool.agent_cards / remove_agent_card delegate to manager;
+    None manager → empty dict / no-op."""
+    tool = A2ATool()
+    tool.manager = None
+    assert tool.agent_cards == {}
+    tool.remove_agent_card("x")   # no-op, no crash
+
+    mgr = A2AClientManager(A2AConfig(a2a_servers=[]))
+    mgr._agent_cards = {"id-1": {"name": "A"}, "id-2": {"name": "B"}}
+    tool.manager = mgr
+    assert tool.agent_cards == {"id-1": {"name": "A"}, "id-2": {"name": "B"}}
+    tool.remove_agent_card("id-2")
+    assert set(tool.agent_cards) == {"id-1"}

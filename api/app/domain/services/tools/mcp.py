@@ -604,6 +604,11 @@ class MCPTool(BaseTool):
         """B9 P-7 转发（_manager None 时返回空 dict）。"""
         return self._manager.tool_server_bindings() if self._manager else {}
 
+    def server_tool_surfaces(self) -> dict[str, list]:
+        """D1a G2：per-server 工具面（委托 manager 的 server→List[Tool] 缓存，mcp.py:91-103）。"""
+        manager = self._manager
+        return dict(manager.tools) if manager is not None else {}
+
     def has_tool(self, tool_name: str) -> bool:
         """传递工具名字判断工具是否存在"""
         # 1.循环遍历所有的工具

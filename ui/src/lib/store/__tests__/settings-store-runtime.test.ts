@@ -13,6 +13,16 @@ vi.mock("@/lib/api/config", async (importOriginal) => {
       setExtensionEnabled: vi.fn(),
       getCatalog: vi.fn(),
     },
+    governanceApi: {
+      getGovernanceSummary: vi.fn(),
+      postQuarantine: vi.fn(),
+      postReapprove: vi.fn(),
+      postGovernanceEnable: vi.fn(),
+      postGovernanceDisable: vi.fn(),
+      postApprovePins: vi.fn(),
+      postPluginEnabled: vi.fn(),
+      getPlugins: vi.fn(),
+    },
   };
 });
 
@@ -27,7 +37,7 @@ vi.mock("@/lib/api/user-tools", () => ({
   },
 }));
 
-import { runtimeApi } from "@/lib/api/config";
+import { governanceApi, runtimeApi } from "@/lib/api/config";
 import { userToolsApi } from "@/lib/api/user-tools";
 import { ApiError } from "@/lib/api/auth-utils";
 import type { RuntimeExtensionItem, RuntimeExtensionsData } from "@/lib/api/types";
@@ -409,5 +419,249 @@ describe("probeRuntimeExtension (429/409/404 分流)", () => {
     vi.mocked(runtimeApi.probeExtension).mockRejectedValue(new Error("kaboom"));
     await useSettingsStore.getState().probeRuntimeExtension("mcp", "srv-a");
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ type: "error" }));
+  });
+});
+
+// ===== D1a Task 26: plugin 四值分派 + 治理 actions =====
+
+function pluginItem(
+  overrides: Partial<RuntimeExtensionItem> = {},
+): RuntimeExtensionItem {
+  return {
+    kind: "plugin",
+    id: "plg-1",
+    name: "plg-1",
+    description: null,
+    config: {
+      enabled_global: true,
+      enabled_user: null,
+      effective_enabled: true,
+      reason_code: "enabled",
+    },
+    health: { kind: "integrity", state: "ok", last_checked_at: null, stale: false },
+    liveness: { state: "not_applicable", active_run_count: 0 },
+    stats: {
+      available: false,
+      unavailable_reason: "unsupported",
+      call_count: 0,
+      success_count: 0,
+      failure_count: 0,
+      last_active_at: null,
+      last_success_at: null,
+      last_failure_at: null,
+    },
+    details: { member_count: 2, plugin_version: "1.0.0" },
+    governance: {
+      status: "active",
+      trust_origin: "github",
+      pinned: true,
+      unpinned: false,
+      pin_stale: false,
+      scan_verdict: "safe",
+      quarantine_reason: null,
+      last_mismatch_at: null,
+      last_verified_at: null,
+      row_revision: 7,
+      observed_surface_hash: null,
+      observed_artifact_hash: null,
+      observed_config_fingerprint: null,
+      pinned_at: null,
+      pinned_by: null,
+      installed_by: null,
+      source_type: "github",
+      source_ref: null,
+      version: "1.0.0",
+      source_missing_at: null,
+      parent_plugin_ext_id: null,
+    },
+    ...overrides,
+  } as RuntimeExtensionItem;
+}
+
+describe("setRuntimeExtensionEnabled plugin branch (Task 26)", () => {
+  beforeEach(() => {
+    useSettingsStore.getState().reset();
+    useUIStore.getState().reset();
+    vi.mocked(runtimeApi.getExtensions).mockReset();
+    vi.mocked(runtimeApi.setExtensionEnabled).mockReset();
+    vi.mocked(governanceApi.postPluginEnabled)
+      .mockReset()
+      .mockResolvedValue({ row_revision: 8 });
+  });
+
+  // ① Admin setter plugin 分支：打 /v2/plugins/（postPluginEnabled），绝不走旧 façade。
+  it("routes plugin parent enable to governanceApi.postPluginEnabled (not the extensions façade)", async () => {
+    await seed([pluginItem({ id: "plg-1" })]);
+    await useSettingsStore
+      .getState()
+      .setRuntimeExtensionEnabled("plugin", "plg-1", false);
+    // revision 取自 governance.row_revision（真值），非 `?? 0` 伪造 CAS。
+    expect(governanceApi.postPluginEnabled).toHaveBeenCalledWith("plg-1", false, 7);
+    expect(runtimeApi.setExtensionEnabled).not.toHaveBeenCalled();
+    expect(useSettingsStore.getState().runtimePendingIds).not.toContain("plugin:plg-1");
+  });
+
+  it("throws without a request when plugin governance.row_revision is absent (never fakes CAS)", async () => {
+    await seed([pluginItem({ id: "plg-2", governance: undefined })]);
+    await useSettingsStore
+      .getState()
+      .setRuntimeExtensionEnabled("plugin", "plg-2", false);
+    expect(governanceApi.postPluginEnabled).not.toHaveBeenCalled();
+  });
+
+  // Finding #5: postPluginEnabled returns only {row_revision} (not an ExtensionItem),
+  // so unlike the mcp/a2a/skill façade there is no single-row replace. Without a refresh
+  // the Switch stays stale until the next 30s GET. The plugin branch must reload the
+  // extensions list so the Switch reflects the backend-projected new enabled_global
+  // (enabled_global = status ∉ {quarantined, disabled}).
+  it("refreshes the item after a plugin disable so enabled_global reflects the new projection (Finding #5)", async () => {
+    await seed([pluginItem({ id: "plg-1" })]);
+    expect(
+      useSettingsStore.getState().runtimeExtensions[0].config.enabled_global,
+    ).toBe(true);
+    // Backend now projects enabled_global=false once the plugin is disabled.
+    const disabled = pluginItem({
+      id: "plg-1",
+      config: {
+        enabled_global: false,
+        enabled_user: null,
+        effective_enabled: false,
+        reason_code: "disabled_global",
+      },
+    });
+    vi.mocked(runtimeApi.getExtensions).mockResolvedValue({
+      items: [disabled],
+      snapshot_at: "2026-07-04T00:00:00Z",
+      probe_enabled: true,
+      stats_enabled: false,
+    });
+    await useSettingsStore
+      .getState()
+      .setRuntimeExtensionEnabled("plugin", "plg-1", false);
+    const item = useSettingsStore
+      .getState()
+      .runtimeExtensions.find((i) => i.id === "plg-1");
+    // Switch is bound to config.enabled_global — must be false without waiting 30s.
+    expect(item?.config.enabled_global).toBe(false);
+  });
+});
+
+describe("setRuntimeUserEnabled plugin rejection (R6#C2)", () => {
+  beforeEach(() => {
+    useSettingsStore.getState().reset();
+    useUIStore.getState().reset();
+    vi.mocked(runtimeApi.getExtensions).mockReset();
+    vi.mocked(userToolsApi.setMCPToolEnabled).mockReset().mockResolvedValue(undefined);
+    vi.mocked(userToolsApi.setA2AToolEnabled).mockReset().mockResolvedValue(undefined);
+    vi.mocked(userToolsApi.setSkillToolEnabled).mockReset().mockResolvedValue(undefined);
+  });
+
+  // R6#C2：plugin 误入 else→skill 会打 skill user-enable。直接调 plugin user setter →
+  // 三个 userToolsApi 均零调用 + 条目 config 未被 recompute 改动（no-op reject）。
+  it("never dispatches plugin to any userToolsApi branch (no skill misroute)", async () => {
+    await seed([pluginItem({ id: "plg-1" })]);
+    await useSettingsStore.getState().setRuntimeUserEnabled("plugin", "plg-1", false);
+    expect(userToolsApi.setMCPToolEnabled).not.toHaveBeenCalled();
+    expect(userToolsApi.setA2AToolEnabled).not.toHaveBeenCalled();
+    expect(userToolsApi.setSkillToolEnabled).not.toHaveBeenCalled();
+    const item = useSettingsStore
+      .getState()
+      .runtimeExtensions.find((i) => i.id === "plg-1");
+    expect(item?.config.reason_code).toBe("enabled");
+  });
+});
+
+describe("governance actions (Task 26)", () => {
+  beforeEach(() => {
+    useSettingsStore.getState().reset();
+    useUIStore.getState().reset();
+    vi.mocked(runtimeApi.getExtensions).mockReset().mockResolvedValue({
+      items: [pluginItem({ id: "plg-1" })],
+      snapshot_at: "2026-07-04T00:00:00Z",
+      probe_enabled: true,
+      stats_enabled: false,
+    });
+    vi.mocked(governanceApi.getGovernanceSummary).mockReset().mockResolvedValue({
+      mode: "enforce",
+      unpinned_count: 0,
+      missing_observation_count: 0,
+      quarantined_count: 0,
+    });
+    vi.mocked(governanceApi.postQuarantine).mockReset().mockResolvedValue({ row_revision: 8 });
+    vi.mocked(governanceApi.postReapprove).mockReset().mockResolvedValue({ row_revision: 9 });
+    vi.mocked(governanceApi.postGovernanceEnable).mockReset().mockResolvedValue({ row_revision: 9 });
+    vi.mocked(governanceApi.postGovernanceDisable).mockReset().mockResolvedValue({ row_revision: 9 });
+    vi.mocked(governanceApi.postApprovePins).mockReset().mockResolvedValue({ items: [] });
+  });
+
+  it("fetchGovernanceSummary stores the summary (mode + counts)", async () => {
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    expect(useSettingsStore.getState().runtimeGovernanceSummary).toEqual({
+      mode: "enforce",
+      unpinned_count: 0,
+      missing_observation_count: 0,
+      quarantined_count: 0,
+    });
+  });
+
+  it("fetchGovernanceSummary swallows errors (passive poll, no toast, keeps prior)", async () => {
+    const spy = vi.spyOn(useUIStore.getState(), "setMessage");
+    vi.mocked(governanceApi.getGovernanceSummary).mockRejectedValueOnce(new Error("403"));
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    expect(useSettingsStore.getState().runtimeGovernanceSummary).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  // Finding #1 defensive back-off: the summary GET returns 200 mode:"off" (not 409) when
+  // governance is disabled. After learning mode:"off" the store must latch and stop
+  // re-fetching — belt-and-suspenders that also curbs the manus-settings per-open fetch
+  // to one request per session on an OFF deployment (mode is fixed at app lifespan).
+  it("backs off after learning mode:off (no repeat request)", async () => {
+    vi.mocked(governanceApi.getGovernanceSummary).mockReset().mockResolvedValue({
+      mode: "off",
+      unpinned_count: 0,
+      missing_observation_count: 0,
+      quarantined_count: 0,
+    });
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    expect(governanceApi.getGovernanceSummary).toHaveBeenCalledTimes(1);
+    expect(useSettingsStore.getState().runtimeGovernanceSummary?.mode).toBe("off");
+    // Latched off → subsequent calls short-circuit (zero extra I/O when off).
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    expect(governanceApi.getGovernanceSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps re-fetching while mode is on (enforce → no back-off)", async () => {
+    // beforeEach mocks enforce.
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    await useSettingsStore.getState().fetchGovernanceSummary();
+    expect(governanceApi.getGovernanceSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it("quarantineExtension posts with the real row_revision + refreshes", async () => {
+    await useSettingsStore.getState().quarantineExtension("plugin", "plg-1", 7, "manual");
+    expect(governanceApi.postQuarantine).toHaveBeenCalledWith("plugin", "plg-1", 7, "manual");
+    // 变更后刷新 extensions（拿新 governance 块）+ summary。
+    expect(runtimeApi.getExtensions).toHaveBeenCalled();
+    expect(governanceApi.getGovernanceSummary).toHaveBeenCalled();
+  });
+
+  it("reapproveExtension posts with the real row_revision", async () => {
+    await useSettingsStore.getState().reapproveExtension("plugin", "plg-1", 7);
+    expect(governanceApi.postReapprove).toHaveBeenCalledWith("plugin", "plg-1", 7);
+  });
+
+  it("setGovernanceEnabled dispatches enable vs disable by flag", async () => {
+    await useSettingsStore.getState().setGovernanceEnabled("plugin", "plg-1", false, 7);
+    expect(governanceApi.postGovernanceDisable).toHaveBeenCalledWith("plugin", "plg-1", 7);
+    await useSettingsStore.getState().setGovernanceEnabled("plugin", "plg-1", true, 9);
+    expect(governanceApi.postGovernanceEnable).toHaveBeenCalledWith("plugin", "plg-1", 9);
+  });
+
+  it("approveAllPins posts {all:true} and refreshes", async () => {
+    await useSettingsStore.getState().approveAllPins();
+    expect(governanceApi.postApprovePins).toHaveBeenCalledWith({ all: true });
+    expect(runtimeApi.getExtensions).toHaveBeenCalled();
   });
 });
