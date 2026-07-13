@@ -57,6 +57,7 @@ from app.interfaces.schemas.runtime_extensions import (
 from app.interfaces.service_dependencies import (
     get_app_config_service,
     get_extension_probe_service,
+    get_extension_registry_read_port,
     get_runtime_extension_service,
 )
 from core.config import get_settings
@@ -195,13 +196,31 @@ async def set_extension_enabled(
     runtime_service: Annotated[
         RuntimeExtensionService, Depends(get_runtime_extension_service)
     ],
+    read_port: Annotated[object | None, Depends(get_extension_registry_read_port)],
     _rate: Annotated[None, Depends(rate_limit_write)],
 ) -> ExtensionItem:
     """B9 统一启停 façade（INV-B9-7）：委托 F9 既有 service，不新增写路径。
 
     四段（R3#1，缺一不可）：写委托 → probe 快照 invalidate（fail-open）→
     重组装取更新后条目 → 返回 wire item。
+
+    D1a G6（§4.2）前置：quarantined 行 enable → 409（read_port=None 时即 mode=off
+    恒等直通，INV-D1-0）。
     """
+    # 0) D1a G6（§4.2）：quarantined 行 enable → 409（enable **不**解除隔离，
+    #    reapprove 是独立行政动作 §9.2）。read_port=None（mode=off）/ 未注册行
+    #    （get_row→None）/ 非 quarantined → 直通现状行为。仅门 enable=True：
+    #    disable 恒放行（下线一个已隔离扩展无需治理阻拦）。
+    if read_port is not None and payload.enabled:
+        row = await read_port.get_row(kind, ext_id)
+        if row is not None and row.status == "quarantined":
+            raise AppException(
+                code=409,
+                status_code=409,
+                msg="扩展已隔离，无法启用（reapprove 是独立行政动作）",
+                data={"reason": "extension_quarantined"},
+            )
+
     # 1) 写委托——单一写路径（INV-B9-7），既有 service 对不存在 id 抛
     #    NotFoundError → 经 AppException handler 透传为 404。
     if kind == "mcp":

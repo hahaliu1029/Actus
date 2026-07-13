@@ -3,7 +3,7 @@ import posixpath
 import socket
 from datetime import datetime
 from functools import lru_cache
-from typing import Optional
+from typing import ClassVar, Optional
 
 from pydantic import (
     AliasChoices,
@@ -258,6 +258,23 @@ class Settings(BaseSettings):
             "ACTUS_C4_SUBAGENT_RUN_RECORD_ENABLED",
         ),
     )
+
+    # D1a §11.1：扩展治理三态开关（env-only，禁入 config.yaml——
+    # config.yaml 是运行期可写面，治理开关放那里等于让被治理的写路径能降级治理，R3#7）。
+    # 允许值集与 domain GovernanceMode 词表的一致性由测试层缝合（INV-D1-1，core 不 import app.domain）。
+    EXTENSION_GOVERNANCE_MODE_ALLOWED: ClassVar[set[str]] = {"off", "shadow", "enforce"}
+    extension_governance_mode: str = "off"
+
+    @field_validator("extension_governance_mode")
+    @classmethod
+    def _validate_extension_governance_mode(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in cls.EXTENSION_GOVERNANCE_MODE_ALLOWED:
+            raise ValueError(
+                "EXTENSION_GOVERNANCE_MODE must be one of "
+                f"{sorted(cls.EXTENSION_GOVERNANCE_MODE_ALLOWED)}, got {v!r}"
+            )
+        return normalized
 
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶

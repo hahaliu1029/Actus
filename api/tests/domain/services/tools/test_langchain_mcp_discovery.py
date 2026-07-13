@@ -135,3 +135,93 @@ class TestGetMcpTool:
         get_tool = next(t for t in tools if t.name == "get_mcp_tool")
         result = await get_tool.ainvoke({"tool_name": "mcp_amap_weather"})
         assert "(required)" in result
+
+
+class TestExcludedServers:
+    """D1a G2 (R1#19): governance-blocked servers filtered from discovery."""
+
+    def _make_two_server_mcp(self):
+        mock = MagicMock()
+        mock.get_tools.return_value = [
+            {
+                "function": {
+                    "name": "mcp_ok_weather",
+                    "description": "[ok] weather",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            },
+            {
+                "function": {
+                    "name": "mcp_bad_lookup",
+                    "description": "[bad] SHOULD NOT LEAK",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"apikey": {"type": "string"}},
+                    },
+                }
+            },
+        ]
+        mock.tool_server_bindings.return_value = {
+            "mcp_ok_weather": "srv-ok",
+            "mcp_bad_lookup": "srv-bad",
+        }
+        return mock
+
+    async def test_list_omits_blocked_server_tools(self):
+        mcp = self._make_two_server_mcp()
+        tools = create_mcp_discovery_tools(
+            mcp_tool_ref=lambda: mcp,
+            activated_tools_ref=lambda: set(),
+            excluded_servers={"srv-bad"},
+        )
+        list_tool = next(t for t in tools if t.name == "list_mcp_tools")
+        result = await list_tool.ainvoke({"server_name": ""})
+        assert "mcp_ok_weather" in result
+        assert "mcp_bad_lookup" not in result, (
+            f"blocked-server tool leaked into list output:\n{result}"
+        )
+        assert "SHOULD NOT LEAK" not in result
+
+    async def test_get_refuses_blocked_server_activation(self):
+        mcp = self._make_two_server_mcp()
+        activated: set[str] = set()
+        tools = create_mcp_discovery_tools(
+            mcp_tool_ref=lambda: mcp,
+            activated_tools_ref=lambda: activated,
+            excluded_servers={"srv-bad"},
+        )
+        get_tool = next(t for t in tools if t.name == "get_mcp_tool")
+        result = await get_tool.ainvoke({"tool_name": "mcp_bad_lookup"})
+        assert "mcp_bad_lookup" not in activated, (
+            f"blocked-server tool was activated: {activated}"
+        )
+        # schema param name must not leak in the denial
+        assert "apikey" not in result
+
+    async def test_none_excluded_keeps_legacy_behavior(self):
+        mcp = self._make_two_server_mcp()
+        activated: set[str] = set()
+        tools = create_mcp_discovery_tools(
+            mcp_tool_ref=lambda: mcp,
+            activated_tools_ref=lambda: activated,
+            excluded_servers=None,
+        )
+        list_tool = next(t for t in tools if t.name == "list_mcp_tools")
+        get_tool = next(t for t in tools if t.name == "get_mcp_tool")
+        result = await list_tool.ainvoke({"server_name": ""})
+        assert "mcp_ok_weather" in result and "mcp_bad_lookup" in result
+        await get_tool.ainvoke({"tool_name": "mcp_bad_lookup"})
+        assert "mcp_bad_lookup" in activated
+
+    async def test_allowed_server_tool_still_activates(self):
+        mcp = self._make_two_server_mcp()
+        activated: set[str] = set()
+        tools = create_mcp_discovery_tools(
+            mcp_tool_ref=lambda: mcp,
+            activated_tools_ref=lambda: activated,
+            excluded_servers={"srv-bad"},
+        )
+        get_tool = next(t for t in tools if t.name == "get_mcp_tool")
+        result = await get_tool.ainvoke({"tool_name": "mcp_ok_weather"})
+        assert "mcp_ok_weather" in activated
+        assert "mcp_ok_weather" in result

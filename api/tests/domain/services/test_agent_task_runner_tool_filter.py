@@ -1107,3 +1107,119 @@ async def test_tool_filter_wrapper_passthrough_on_success(monkeypatch) -> None:
         f"Wrapper did not return the underlying provider's value verbatim: "
         f"{result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 9. D1a G2 (R7#5): tool-summary excludes governance-blocked MCP servers
+# ---------------------------------------------------------------------------
+
+
+def test_tool_summary_excludes_blocked_servers() -> None:
+    """``_build_available_tool_summary`` must NOT surface the tool names of a
+    governance-blocked MCP server (else the blocked surface reaches the LLM via
+    the runtime system context even though G2 stripped it from the bindings)."""
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = _seed_summary_runner(tool_filter=None)  # no allowlist — isolate G2
+    runner._admission_blocked_mcp_servers = {"srv-bad"}
+    # Small (<=15) MCP catalog spanning an allowed and a blocked server.
+    runner._mcp_tool.get_tools = MagicMock(
+        return_value=[
+            {"function": {"name": "mcp_okserver_alpha"}},
+            {"function": {"name": "mcp_okserver_beta"}},
+            {"function": {"name": "mcp_badserver_gamma"}},
+        ]
+    )
+    runner._mcp_tool.tool_server_bindings = MagicMock(
+        return_value={
+            "mcp_okserver_alpha": "srv-ok",
+            "mcp_okserver_beta": "srv-ok",
+            "mcp_badserver_gamma": "srv-bad",
+        }
+    )
+
+    summary = AgentTaskRunner._build_available_tool_summary(runner)
+
+    # Allowed server tools appear.
+    assert "mcp_okserver_alpha" in summary
+    assert "mcp_okserver_beta" in summary
+    # Blocked server tool must not appear anywhere (token-level).
+    tokens = set(re.findall(r"[a-z_][a-z0-9_]+", summary))
+    assert "mcp_badserver_gamma" not in tokens, (
+        f"blocked-server MCP tool leaked into summary:\n{summary}"
+    )
+
+
+def test_tool_summary_no_blocked_servers_is_identity() -> None:
+    """Empty blocked set = zero behavior change (all MCP tools listed)."""
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = _seed_summary_runner(tool_filter=None)
+    runner._admission_blocked_mcp_servers = set()
+    runner._mcp_tool.get_tools = MagicMock(
+        return_value=[
+            {"function": {"name": "mcp_okserver_alpha"}},
+            {"function": {"name": "mcp_badserver_gamma"}},
+        ]
+    )
+    runner._mcp_tool.tool_server_bindings = MagicMock(
+        return_value={
+            "mcp_okserver_alpha": "srv-ok",
+            "mcp_badserver_gamma": "srv-bad",
+        }
+    )
+
+    summary = AgentTaskRunner._build_available_tool_summary(runner)
+    assert "mcp_okserver_alpha" in summary
+    assert "mcp_badserver_gamma" in summary
+
+
+# ---------------------------------------------------------------------------
+# 10. D1a G2 (direct-bind surface): _exclude_admission_blocked_mcp helper
+# ---------------------------------------------------------------------------
+
+
+def _make_exclude_runner(blocked, bindings):
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = object.__new__(AgentTaskRunner)
+    runner._admission_blocked_mcp_servers = set(blocked)
+    runner._mcp_tool = MagicMock()
+    runner._mcp_tool.tool_server_bindings = MagicMock(return_value=dict(bindings))
+    return runner
+
+
+def test_exclude_blocked_mcp_none_input_returns_all_non_blocked() -> None:
+    """tool_names=None (bind-all) → all names minus blocked-server names."""
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = _make_exclude_runner(
+        blocked={"srv-bad"},
+        bindings={"mcp_ok_a": "srv-ok", "mcp_ok_b": "srv-ok", "mcp_bad_c": "srv-bad"},
+    )
+    out = AgentTaskRunner._exclude_admission_blocked_mcp(runner, None)
+    assert out == {"mcp_ok_a", "mcp_ok_b"}
+
+
+def test_exclude_blocked_mcp_filters_explicit_set() -> None:
+    """explicit tool_names set → blocked-server names removed from it."""
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = _make_exclude_runner(
+        blocked={"srv-bad"},
+        bindings={"mcp_ok_a": "srv-ok", "mcp_bad_c": "srv-bad"},
+    )
+    out = AgentTaskRunner._exclude_admission_blocked_mcp(
+        runner, {"mcp_ok_a", "mcp_bad_c"}
+    )
+    assert out == {"mcp_ok_a"}
+
+
+def test_exclude_blocked_mcp_empty_blocked_is_identity() -> None:
+    """No blocked servers → the argument is returned unchanged (identity)."""
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    runner = _make_exclude_runner(blocked=set(), bindings={})
+    assert AgentTaskRunner._exclude_admission_blocked_mcp(runner, None) is None
+    same = {"mcp_ok_a", "mcp_ok_b"}
+    assert AgentTaskRunner._exclude_admission_blocked_mcp(runner, same) is same

@@ -252,6 +252,10 @@ class AgentService:
         # forwarded to every AgentTaskRunner built by _create_task, which threads
         # it into PlannerReActFlow → react_graph configurable. None = flag off.
         extension_stats_recorder: object | None = None,
+        # D1a §4.1 (R2#F12): governance AdmissionPort. Stored on self, forwarded
+        # to every AgentTaskRunner built by _create_task → SkillTool /
+        # SkillBundleSyncManager. None = mode off (lifespan constructs nothing).
+        extension_admission_port: object | None = None,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -285,6 +289,7 @@ class AgentService:
         self._coordinator_parent_cancel_fanout = coordinator_parent_cancel_fanout
         self._policy_snapshot_sink = policy_snapshot_sink
         self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
+        self._extension_admission_port = extension_admission_port  # D1a §4.1
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -860,6 +865,9 @@ class AgentService:
             # B9 Task 20: forward the lifespan-scoped stats recorder. getattr
             # defense mirrors the lines above for __new__-bypass tests.
             extension_stats_recorder=getattr(self, "_extension_stats_recorder", None),
+            # D1a §4.1: forward the governance AdmissionPort (None when mode off).
+            # getattr defense mirrors the line above for __new__-bypass tests.
+            extension_admission_port=getattr(self, "_extension_admission_port", None),
         )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);

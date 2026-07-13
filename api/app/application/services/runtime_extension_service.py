@@ -21,6 +21,7 @@ PR-2/3 接入真实 probe/liveness/stats view 后本文件**不再改语义**，
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -29,8 +30,10 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from app.domain.external.extension_stats import ExtensionStatsReader
+from app.domain.models.extension_governance import HASH_SCHEMA_VERSION
 from app.domain.models.runtime_extension import (
     ExtensionConfigInfo,
+    ExtensionGovernanceInfo,
     ExtensionHealthInfo,
     ExtensionItemInfo,
     ExtensionLivenessInfo,
@@ -38,8 +41,16 @@ from app.domain.models.runtime_extension import (
     RuntimeExtensionsSnapshot,
 )
 from app.domain.models.user_tool_enablement import ToolType
+from app.domain.services.extension_admission_logic import (
+    REQUIRED_OBSERVED_CATEGORIES,
+    pin_presence,
+)
 
 if TYPE_CHECKING:  # 仅类型注解，避免 domain/infra 具体实现在运行时被强绑
+    from app.domain.external.extension_admission import (
+        ExtensionRegistryReadPort,
+        GovernanceRowSnapshot,
+    )
     from app.domain.models.app_config import (
         AppConfig,
         A2AServerConfig,
@@ -50,6 +61,61 @@ if TYPE_CHECKING:  # 仅类型注解，避免 domain/infra 具体实现在运行
     from app.domain.repositories.skill_repository import SkillRepository
     from app.application.services.user_tool_enablement_service import (
         UserToolEnablementService,
+    )
+
+# §5.2 pin 类别 → GovernanceRowSnapshot pin 列（镜像 infrastructure `_PIN_FOR_CATEGORY`；
+# application 不 import infrastructure，此处按 §5.1 冻结类别本地复刻，snapshot 词表锁保护）。
+_PIN_COLUMN_FOR_CATEGORY = {
+    "surface": "surface_hash",
+    "artifact": "artifact_hash",
+    "config_fingerprint": "config_fingerprint",
+}
+
+_BLOCKING_STATUSES = frozenset({"quarantined", "disabled"})
+
+
+def _derive_pin_flags(row: "GovernanceRowSnapshot") -> tuple[bool, bool, bool]:
+    """对该 kind 必需 pin 写集聚合派生（全 pinned→pinned；任一 unpinned→unpinned；
+    任一 stale→pin_stale）——与 governance_counters 同源 pin_presence 规则。"""
+    presences = [
+        pin_presence(
+            getattr(row, _PIN_COLUMN_FOR_CATEGORY[c]),
+            row.hash_schema_version,
+            HASH_SCHEMA_VERSION,
+        )
+        for c in REQUIRED_OBSERVED_CATEGORIES[row.kind]
+    ]
+    pinned = bool(presences) and all(p == "pinned" for p in presences)
+    unpinned = any(p == "unpinned" for p in presences)
+    pin_stale = any(p == "pin_stale" for p in presences)
+    return pinned, unpinned, pin_stale
+
+
+def _governance_info_from_row(row: "GovernanceRowSnapshot") -> ExtensionGovernanceInfo:
+    """GovernanceRowSnapshot → ExtensionGovernanceInfo（§9.1 全字段平移 + pin 派生）。"""
+    pinned, unpinned, pin_stale = _derive_pin_flags(row)
+    return ExtensionGovernanceInfo(
+        status=row.status,
+        trust_origin=row.trust_origin,
+        pinned=pinned,
+        unpinned=unpinned,
+        pin_stale=pin_stale,
+        scan_verdict=row.scan_verdict,
+        quarantine_reason=row.quarantine_reason,
+        last_mismatch_at=row.last_mismatch_at,
+        last_verified_at=row.last_verified_at,
+        row_revision=row.row_revision,
+        observed_surface_hash=row.observed_surface_hash,
+        observed_artifact_hash=row.observed_artifact_hash,
+        observed_config_fingerprint=row.observed_config_fingerprint,
+        pinned_at=row.pinned_at,
+        pinned_by=row.pinned_by,
+        installed_by=row.installed_by,
+        source_type=row.source_type,
+        source_ref=row.source_ref,
+        version=row.version,
+        source_missing_at=row.source_missing_at,
+        parent_plugin_ext_id=row.parent_plugin_ext_id,
     )
 
 logger = logging.getLogger(__name__)
@@ -105,6 +171,8 @@ class RuntimeExtensionService:
         probe_enabled_provider: Callable[[], bool] = lambda: False,
         stats_enabled_provider: Callable[[], bool] = lambda: False,
         clock: Callable[[], datetime] = _utcnow,
+        registry_read_port: "ExtensionRegistryReadPort | None" = None,
+        plugin_name_resolver: Callable[[str, str | None], str] | None = None,
     ) -> None:
         self._config_provider = config_provider
         self._skill_repository = skill_repository
@@ -116,6 +184,10 @@ class RuntimeExtensionService:
         self._stats_enabled_provider = stats_enabled_provider
         # 测试注入 fake clock；生产默认 UTC now。stale 计算与 snapshot_at 复用同一时钟源。
         self._clock = clock
+        # D1a Task 25：治理只读 port（None=mode off，INV-D1-0 零行为）+ plugin 展示名 resolver
+        # （None → fallback ext_id；provider 注入 read_plugin_display_name 偏函数）。
+        self._registry_read_port = registry_read_port
+        self._plugin_name_resolver = plugin_name_resolver
 
     async def get_extensions(
         self, *, user_id: str, is_admin: bool
@@ -153,6 +225,24 @@ class RuntimeExtensionService:
         if diags is not None:
             for diag in diags:
                 items.append(self._build_skill_item(diag, enablement_map))
+
+        # D1a Task 25：治理投影——拉全部 live 行 map（read_port=None → mode off，零行为
+        # INV-D1-0）。读失败降级：零 governance/零 plugin（R3#2，config/skill 照常）。
+        governance_map: dict[tuple[str, str], "GovernanceRowSnapshot"] = {}
+        if self._registry_read_port is not None:
+            try:
+                governance_map = {
+                    (r.kind, r.ext_id): r
+                    for r in await self._registry_read_port.list_live_rows()
+                }
+            except Exception:  # noqa: BLE001 — 治理读故障不 5xx（降级：零 governance）
+                logger.warning(
+                    "governance projection degraded (read failed)", exc_info=True
+                )
+        # 第五段（序尾）：plugin 元容器条目
+        items.extend(await self._build_plugin_items(governance_map))
+        # 逐条 attach 治理块 + 阻断投影（在 stats/角色投影之前）
+        items = [self._attach_governance(info, governance_map) for info in items]
 
         stats_map = await self._load_stats({(i.kind, i.id) for i in items})
         items = [
@@ -507,6 +597,94 @@ class RuntimeExtensionService:
         )
 
     # ------------------------------------------------------------------ #
+    # D1a Task 25：plugin 第五段 + 治理 attach
+    # ------------------------------------------------------------------ #
+    async def _build_plugin_items(
+        self, governance_map: dict[tuple[str, str], "GovernanceRowSnapshot"]
+    ) -> list[ExtensionItemInfo]:
+        """plugin 元容器条目（第五段，序尾）：来源=governance_map 中 kind=plugin 行（按
+        ext_id 稳定序）。details={member_count, plugin_version}；member_count=governance_map
+        中 parent_plugin_ext_id 命中该 plugin 的成员行数。展示名经 resolver（线程池，
+        registry 无 name 列）——None → fallback ext_id。config=not_applicable_plugin（阻断
+        投影在 _attach_governance 统一处理）；health=integrity、liveness=not_applicable、
+        stats reason=unsupported（在投影阶段裁定）。"""
+        plugin_rows = sorted(
+            (r for r in governance_map.values() if r.kind == "plugin"),
+            key=lambda r: r.ext_id,
+        )
+        items: list[ExtensionItemInfo] = []
+        for row in plugin_rows:
+            member_count = sum(
+                1
+                for r in governance_map.values()
+                if r.parent_plugin_ext_id == row.ext_id
+            )
+            if self._plugin_name_resolver is not None:
+                # 仓库全异步硬约束：同步小文件读走线程池（helper 本体保持纯同步便于单测）
+                name = await asyncio.to_thread(
+                    self._plugin_name_resolver, row.ext_id, row.version
+                )
+            else:
+                name = row.ext_id
+            # #5：plugin 无独立 config 级用户偏好——其全局启用态即治理状态。enabled_global
+            # 须映射真实治理启用（active=True / quarantined|disabled=False），使 FE Switch
+            # 不对已停用/隔离 plugin 恒显 ON。阻断细化（effective_enabled=False +
+            # reason_code=governance_blocked）仍由 _attach_governance 统一裁定。
+            governance_enabled = row.status not in _BLOCKING_STATUSES
+            items.append(
+                ExtensionItemInfo(
+                    kind="plugin",
+                    id=row.ext_id,
+                    name=name,
+                    description=None,
+                    config=ExtensionConfigInfo(
+                        enabled_global=governance_enabled,
+                        enabled_user=None,
+                        effective_enabled=governance_enabled,
+                        reason_code="not_applicable_plugin",
+                    ),
+                    health=ExtensionHealthInfo(kind="integrity", state="ok"),
+                    liveness=ExtensionLivenessInfo(
+                        state="not_applicable", active_run_count=0
+                    ),
+                    stats=ExtensionStatsInfo(available=False),
+                    details={"member_count": member_count, "plugin_version": row.version},
+                )
+            )
+        return items
+
+    def _attach_governance(
+        self,
+        info: ExtensionItemInfo,
+        governance_map: dict[tuple[str, str], "GovernanceRowSnapshot"],
+    ) -> ExtensionItemInfo:
+        """纯 helper：命中治理行 → attach ExtensionGovernanceInfo（Admin 裁剪在
+        _project_item）；命中且行阻断（own status ∈ {quarantined, disabled}）或父 plugin
+        阻断（成员行经 parent_plugin_ext_id → 父行 status 查 governance_map）→ config
+        投影替换 effective_enabled=False + reason_code=governance_blocked（普通用户可见的
+        唯一治理泄漏）。用户启停偏好（enabled_global/enabled_user）原样保留。"""
+        if not governance_map:
+            return info
+        row = governance_map.get((info.kind, info.id))
+        if row is None:
+            return info
+        info = dataclasses.replace(info, governance=_governance_info_from_row(row))
+        blocked = row.status in _BLOCKING_STATUSES
+        if not blocked and row.parent_plugin_ext_id is not None:
+            parent = governance_map.get(("plugin", row.parent_plugin_ext_id))
+            blocked = parent is not None and parent.status in _BLOCKING_STATUSES
+        if blocked:
+            info = dataclasses.replace(
+                info,
+                config=dataclasses.replace(
+                    info.config,
+                    effective_enabled=False,
+                    reason_code="governance_blocked",
+                ),
+            )
+        return info
+
+    # ------------------------------------------------------------------ #
     # 统计裁定 + 角色投影
     # ------------------------------------------------------------------ #
     def _stats_reason(
@@ -515,13 +693,13 @@ class RuntimeExtensionService:
         """stats.unavailable_reason 优先级（R5#4）：
         admin_only ＞ unsupported ＞ disabled ＞ redis_unavailable。
 
-        PR-1 stub（stats_reader=None）：非 Admin → admin_only；A2A → unsupported；
+        PR-1 stub（stats_reader=None）：非 Admin → admin_only；A2A/plugin → unsupported；
         mcp/skill → disabled。真实 reader（PR-3）读取失败才 redis_unavailable。
         """
         if not is_admin:
             return "admin_only"
-        if kind == "a2a":
-            return "unsupported"
+        if kind in ("a2a", "plugin"):
+            return "unsupported"  # A2A（v1 无归因）+ plugin（元容器不采集执行统计）
         # disabled = 有效开关 false（extension_stats_enabled=false，含启动失败——DI
         # provider 已封装 started ∧ flag）；压过 redis_unavailable。
         if not self._stats_enabled_provider():
@@ -572,6 +750,8 @@ class RuntimeExtensionService:
         """
         if is_admin:
             return info
+        # 非 Admin：治理块整体剥离（Admin-only 三层剥离第①层——service 投影层，R7#7）。
+        info = dataclasses.replace(info, governance=None)
         health = dataclasses.replace(
             info.health,
             latency_ms=None,
@@ -587,6 +767,14 @@ class RuntimeExtensionService:
         elif info.kind == "mcp":
             liveness = ExtensionLivenessInfo(state="unknown", active_run_count=0)
             details = {"transport": info.details.get("transport")}
+        elif info.kind == "plugin":
+            # plugin 显式分支（防误落 a2a else，R2#6）；member_count/plugin_version 非敏感
+            # 元数据，非 Admin 保留（治理块已剥离）。
+            liveness = ExtensionLivenessInfo(state="not_applicable", active_run_count=0)
+            details = {
+                "member_count": info.details.get("member_count"),
+                "plugin_version": info.details.get("plugin_version"),
+            }
         else:  # a2a
             liveness = ExtensionLivenessInfo(state="unknown", active_run_count=0)
             details = {"streaming": info.details.get("streaming")}

@@ -27,11 +27,17 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Callable, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
 import httpx
 
+from app.domain.external.extension_admission import Observation
+from app.domain.models.extension_governance import HASH_SCHEMA_VERSION
 from app.domain.models.runtime_extension import HealthState
+from app.domain.services.extension_hashing import (
+    a2a_config_fingerprint,
+    mcp_config_fingerprint,
+)
 from app.domain.services.tools.mcp import MCPClientManager
 from app.infrastructure.logging.redaction import redact_text
 
@@ -95,6 +101,9 @@ class ProbeOutcome:                            # prober 返回值（Task 13 生�
     error_message: str | None = None           # raw；落 record 前过 redact_text
     tool_count: int | None = None              # mcp 专用
     display_name: str | None = None            # a2a 专用 = agent_card.name
+    surface_payload: Any = None                # R2#4：immutable 表面载荷（治理观测生产用）
+                                               # mcp=[{name, description, input_schema}] / a2a=原始卡 dict
+                                               # None=probe 失败/未观测（不进快照，仅喂 verify_observation）
 
 
 class ProbeBusyError(Exception):
@@ -132,6 +141,7 @@ class ExtensionProbeService:
         liveness_view: "LivenessView | None" = None,
         clock: Callable[[], datetime] = _utcnow,
         rng: Callable[[], float] = random.random,
+        admission_port: Any = None,
     ) -> None:
         self._config_provider = config_provider
         self._skill_repository = skill_repository
@@ -140,6 +150,9 @@ class ExtensionProbeService:
         self._liveness_view = liveness_view
         self._clock = clock
         self._rng = rng
+        # R1#20 第 5 跳（spec §4.1 拓扑）：治理 AdmissionPort（mode=off → None）。
+        # None=零 registry 交互——既有 probe 行为零变化。
+        self._admission_port = admission_port
 
         self._records: dict[tuple[str, str], ProbeRecord] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -353,9 +366,44 @@ class ExtensionProbeService:
 
         if outcome.ok:
             self._write_success(record, outcome, now)
+            # R2#F7 手动路成功写点：治理观测生产（off/None=零交互，best-effort）
+            await self._maybe_verify_observation(kind, ext_id, config_obj, outcome)
         else:
             self._write_failure(record, outcome, now)
         return record
+
+    # —— 治理观测生产（R1#20；probe 成功 → best-effort surface 观测）——
+
+    async def _maybe_verify_observation(
+        self, kind: str, ext_id: str, config_obj, outcome: ProbeOutcome
+    ) -> None:
+        """probe 成功 → 向 admission_port 提交 surface 观测（§4.1 第 5 跳）。
+
+        ``admission_port=None``（mode off / 未注入）或无 ``surface_payload`` → 零 registry
+        交互。verify 是**辅助证据**——``try/except`` warn 兜底，任何失败绝不影响 probe 主流程
+        （spec §7.1 probe 失败不阻塞先例的对称语义）。``under_config_fingerprint`` 用 §5.1
+        canonicalizer 自算（G2/G3 同源，Port 侧持久化门比对）。
+        """
+        port = self._admission_port
+        if port is None or not outcome.ok or outcome.surface_payload is None:
+            return
+        try:
+            if kind == "mcp":
+                fingerprint = mcp_config_fingerprint(config_obj)
+            else:
+                fingerprint = a2a_config_fingerprint(config_obj.base_url)
+            obs = Observation(
+                category="surface",
+                payload=outcome.surface_payload,
+                schema_version=HASH_SCHEMA_VERSION,
+                under_config_fingerprint=fingerprint,
+            )
+            await port.verify_observation(kind, ext_id, obs)
+        except Exception:  # noqa: BLE001 - 观测生产失败不影响 probe 主流程
+            logger.warning(
+                "D1a probe 观测生产失败（非致命，probe 主流程不受影响）",
+                exc_info=True,
+            )
 
     # —— 内存同步：invalidate / reconcile ——
 
@@ -494,6 +542,8 @@ class ExtensionProbeService:
 
         if outcome.ok:
             self._write_success(record, outcome, now)
+            # R2#F7 后台路成功写点：治理观测生产（只接单点会让后台 tick 永不生产观测）
+            await self._maybe_verify_observation(kind, ext_id, config_obj, outcome)
         else:
             self._write_failure(record, outcome, now)
 
@@ -700,8 +750,21 @@ class DefaultExtensionProber:
                     error_code=_map_mcp_error(error_msg),
                     error_message=error_msg,
                 )
-            tool_count = len(manager.tools.get(server_name, []))
-            return ProbeOutcome(ok=True, latency_ms=latency, tool_count=tool_count)
+            tools = manager.tools.get(server_name, [])
+            # R2#4 surface_payload：[{name, description, input_schema}]（G2 同投影，
+            # mcp_surface_hash 消费）；getattr 兜底非标准工具对象不抛。
+            surface_payload = [
+                {
+                    "name": getattr(t, "name", None),
+                    "description": getattr(t, "description", None),
+                    "input_schema": getattr(t, "inputSchema", None),
+                }
+                for t in tools
+            ]
+            return ProbeOutcome(
+                ok=True, latency_ms=latency, tool_count=len(tools),
+                surface_payload=surface_payload,
+            )
         except Exception as exc:  # noqa: BLE001 - 映射为 outcome，不外泄
             latency = int((time.monotonic() - started) * 1000)
             return ProbeOutcome(
@@ -727,6 +790,7 @@ class DefaultExtensionProber:
                 ok=True,
                 latency_ms=latency,
                 display_name=str(name) if name else None,
+                surface_payload=payload if isinstance(payload, dict) else None,
             )
         except Exception as exc:  # noqa: BLE001 - 映射为 outcome，不外泄
             # JSON 解析失败（resp.json() 抛 ValueError）落 protocol_error——mapper 兜底覆盖

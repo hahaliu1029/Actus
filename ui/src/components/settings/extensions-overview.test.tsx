@@ -13,19 +13,91 @@ vi.mock("@/lib/api/config", () => ({
     probeExtension: vi.fn(),
     setExtensionEnabled: vi.fn(),
   },
+  governanceApi: {
+    getGovernanceSummary: vi.fn(),
+    postQuarantine: vi.fn(),
+    postReapprove: vi.fn(),
+    postGovernanceEnable: vi.fn(),
+    postGovernanceDisable: vi.fn(),
+    postApprovePins: vi.fn(),
+    postPluginEnabled: vi.fn(),
+    getPlugins: vi.fn(),
+  },
 }));
 
-import { runtimeApi } from "@/lib/api/config";
+import { governanceApi, runtimeApi } from "@/lib/api/config";
 import { ExtensionsOverview } from "@/components/settings/extensions-overview";
 import { useSettingsStore } from "@/lib/store/settings-store";
 import { useUIStore } from "@/lib/store/ui-store";
 import type {
+  GovernanceBlock,
+  GovernanceSummary,
+  PluginDetail,
   RuntimeCatalogData,
   RuntimeExtensionItem,
   RuntimeExtensionsData,
 } from "@/lib/api/types";
 
 const mockedRuntimeApi = vi.mocked(runtimeApi, { deep: true });
+const mockedGovernanceApi = vi.mocked(governanceApi, { deep: true });
+
+// D1a Task 26: 治理块 + plugin 条目 + summary fixtures。
+function makeGovernance(overrides: Partial<GovernanceBlock> = {}): GovernanceBlock {
+  return {
+    status: "active",
+    trust_origin: "github",
+    pinned: true,
+    unpinned: false,
+    pin_stale: false,
+    scan_verdict: "safe",
+    quarantine_reason: null,
+    last_mismatch_at: null,
+    last_verified_at: null,
+    row_revision: 7,
+    observed_surface_hash: null,
+    observed_artifact_hash: null,
+    observed_config_fingerprint: null,
+    pinned_at: null,
+    pinned_by: null,
+    installed_by: null,
+    source_type: "github",
+    source_ref: null,
+    version: "1.0.0",
+    source_missing_at: null,
+    parent_plugin_ext_id: null,
+    ...overrides,
+  };
+}
+
+function makePluginItem(
+  overrides: {
+    id?: string;
+    name?: string;
+    governance?: GovernanceBlock | undefined;
+  } = {}
+): RuntimeExtensionItem {
+  const base = makeMcpItem({ id: overrides.id ?? "plg-1", name: overrides.name ?? "Plugin One" });
+  return {
+    ...base,
+    kind: "plugin",
+    details: { member_count: 2, plugin_version: "1.0.0" },
+    health: { kind: "integrity", state: "ok", last_checked_at: null, stale: false },
+    governance: "governance" in overrides ? overrides.governance : makeGovernance(),
+  };
+}
+
+const ENFORCE_SUMMARY: GovernanceSummary = {
+  mode: "enforce",
+  unpinned_count: 0,
+  missing_observation_count: 0,
+  quarantined_count: 0,
+};
+const OFF_SUMMARY: GovernanceSummary = {
+  mode: "off",
+  unpinned_count: 0,
+  missing_observation_count: 0,
+  quarantined_count: 0,
+};
 
 function makeMcpItem(
   overrides: Partial<Extract<RuntimeExtensionItem, { kind: "mcp" }>> = {}
@@ -90,6 +162,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockedRuntimeApi.getExtensions.mockResolvedValue(makeExtensionsData());
   mockedRuntimeApi.getCatalog.mockResolvedValue(EMPTY_CATALOG);
+  // 默认 off-mode：既有测试不触发治理 UI（governanceActive=false）。
+  mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(OFF_SUMMARY);
+  mockedGovernanceApi.getPlugins.mockResolvedValue([]);
+  mockedGovernanceApi.postQuarantine.mockResolvedValue({ row_revision: 8 });
+  mockedGovernanceApi.postReapprove.mockResolvedValue({ row_revision: 9 });
+  mockedGovernanceApi.postGovernanceEnable.mockResolvedValue({ row_revision: 9 });
+  mockedGovernanceApi.postGovernanceDisable.mockResolvedValue({ row_revision: 9 });
+  mockedGovernanceApi.postApprovePins.mockResolvedValue({ items: [] });
 });
 
 afterEach(() => {
@@ -1103,5 +1183,275 @@ describe("ExtensionsOverview catalog prefill flow (Task 24, P-12)", () => {
     expect(
       await screen.findByTestId("prefill-button-fresh-mcp")
     ).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D1a Task 26: governance badges/actions + plugin row rules + mode gating.
+// ---------------------------------------------------------------------------
+
+function govMcpItem(governance: GovernanceBlock): RuntimeExtensionItem {
+  return { ...makeMcpItem({ id: "gov-1", name: "Gov One" }), governance };
+}
+
+describe("ExtensionsOverview D1a governance surface (Task 26)", () => {
+  it("admin + enforce mode renders governance badges (status/trust/unpinned/scan)", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({
+        items: [
+          govMcpItem(
+            makeGovernance({ status: "active", trust_origin: "github", unpinned: true, scan_verdict: "caution" })
+          ),
+        ],
+      })
+    );
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+
+    expect(await screen.findByTestId("gov-status-mcp:gov-1")).toHaveTextContent("生效中");
+    expect(screen.getByTestId("gov-trust-mcp:gov-1")).toHaveTextContent("github");
+    expect(screen.getByTestId("gov-unpinned-mcp:gov-1")).toHaveTextContent("未固定");
+    expect(screen.getByTestId("gov-scan-mcp:gov-1")).toHaveTextContent("扫描存疑");
+  });
+
+  it("off mode hides all governance UI", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(OFF_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({
+        items: [govMcpItem(makeGovernance({ status: "quarantined" }))],
+      })
+    );
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+
+    await screen.findByText("Gov One");
+    expect(screen.queryByTestId("gov-status-mcp:gov-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gov-quarantine-banner-mcp:gov-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("approve-pins-button")).not.toBeInTheDocument();
+  });
+
+  // Finding #1 (off-mode): governance-summary fetch/poll must be gated on a signal
+  // that governance is ACTIVE — namely at least one loaded extension carrying a
+  // `governance` block (backend None-omits the block when governance is off). An OFF
+  // deployment must therefore make ZERO governance-summary requests + start no interval.
+  it("admin + no governance blocks (off) → zero summary requests + no interval started (Finding #1)", async () => {
+    vi.useFakeTimers();
+    // Items carry NO governance block → governance is off (backend None-omits it).
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [makeMcpItem({ id: "no-gov", name: "No Gov" })] })
+    );
+    await act(async () => {
+      render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+    });
+    // No governance block → summary never fetched, no poll interval started.
+    expect(mockedGovernanceApi.getGovernanceSummary).not.toHaveBeenCalled();
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(mockedGovernanceApi.getGovernanceSummary).not.toHaveBeenCalled();
+  });
+
+  it("admin + governance blocks present (on) → summary fetched + 30s poll runs (Finding #1)", async () => {
+    vi.useFakeTimers();
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [govMcpItem(makeGovernance())] })
+    );
+    await act(async () => {
+      render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+    });
+    // Gov block present → summary fetched once after extensions load.
+    expect(mockedGovernanceApi.getGovernanceSummary).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+    });
+    // 30s poll re-fetches (enforce mode → no back-off latch).
+    expect(mockedGovernanceApi.getGovernanceSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it("non-admin renders zero governance requests (summary + plugins)", async () => {
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [makePluginItem({ id: "plg-1", name: "Plugin One" })] })
+    );
+    render(<ExtensionsOverview isAdmin={false} onSelectTab={noop} />);
+
+    await screen.findByText("Plugin One");
+    expect(mockedGovernanceApi.getGovernanceSummary).not.toHaveBeenCalled();
+    expect(mockedGovernanceApi.getPlugins).not.toHaveBeenCalled();
+  });
+
+  it("non-admin never renders governance block even if the item carries one (R7#7)", async () => {
+    // Defense: even if wire leaked a governance block, isAdmin gate suppresses it.
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({
+        items: [govMcpItem(makeGovernance({ status: "quarantined" }))],
+      })
+    );
+    render(<ExtensionsOverview isAdmin={false} onSelectTab={noop} />);
+
+    await screen.findByText("Gov One");
+    expect(screen.queryByTestId("gov-status-mcp:gov-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gov-quarantine-banner-mcp:gov-1")).not.toBeInTheDocument();
+  });
+
+  it("quarantined item shows banner + reapprove action wired to the store", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue({ ...ENFORCE_SUMMARY, quarantined_count: 1 });
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({
+        items: [
+          govMcpItem(
+            makeGovernance({ status: "quarantined", quarantine_reason: "pin_mismatch", row_revision: 12 })
+          ),
+        ],
+      })
+    );
+    const spy = vi
+      .spyOn(useSettingsStore.getState(), "reapproveExtension")
+      .mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+
+    expect(await screen.findByTestId("gov-quarantine-banner-mcp:gov-1")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("gov-reapprove-mcp:gov-1"));
+    expect(spy).toHaveBeenCalledWith("mcp", "gov-1", 12);
+    confirmSpy.mockRestore();
+  });
+
+  it("active item shows quarantine + governance-disable actions with the real revision", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({
+        items: [govMcpItem(makeGovernance({ status: "active", row_revision: 5 }))],
+      })
+    );
+    const quarantineSpy = vi
+      .spyOn(useSettingsStore.getState(), "quarantineExtension")
+      .mockResolvedValue(undefined);
+    const disableSpy = vi
+      .spyOn(useSettingsStore.getState(), "setGovernanceEnabled")
+      .mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+
+    fireEvent.click(await screen.findByTestId("gov-quarantine-mcp:gov-1"));
+    expect(quarantineSpy).toHaveBeenCalledWith("mcp", "gov-1", 5);
+    fireEvent.click(screen.getByTestId("gov-disable-mcp:gov-1"));
+    expect(disableSpy).toHaveBeenCalledWith("mcp", "gov-1", false, 5);
+    confirmSpy.mockRestore();
+  });
+
+  it("approve-pins button disabled when unpinned_count === 0, enabled + wired otherwise", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue({ ...ENFORCE_SUMMARY, unpinned_count: 0 });
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [govMcpItem(makeGovernance())] })
+    );
+    const { unmount } = render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+    expect(await screen.findByTestId("approve-pins-button")).toBeDisabled();
+    act(() => unmount());
+    act(() => useSettingsStore.getState().invalidateRuntimeRequests());
+
+    useSettingsStore.getState().reset();
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue({ ...ENFORCE_SUMMARY, unpinned_count: 3 });
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [govMcpItem(makeGovernance())] })
+    );
+    const spy = vi
+      .spyOn(useSettingsStore.getState(), "approveAllPins")
+      .mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+    const btn = await screen.findByTestId("approve-pins-button");
+    expect(btn).not.toBeDisabled();
+    fireEvent.click(btn);
+    expect(spy).toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+});
+
+describe("ExtensionsOverview plugin row rules (Task 26)", () => {
+  it("plugin row hides probe button and per-user Switch, keeps admin global Switch", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ probe_enabled: true, items: [makePluginItem({ id: "plg-1", name: "Plugin One" })] })
+    );
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+
+    await screen.findByText("Plugin One");
+    expect(screen.queryByTestId("probe-button-plugin:plg-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("user-switch-plugin:plg-1")).not.toBeInTheDocument();
+    expect(screen.getByTestId("global-switch-plugin:plg-1")).toBeInTheDocument();
+  });
+
+  it("plugin row global Switch routes parent enable to setRuntimeExtensionEnabled", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [makePluginItem({ id: "plg-1", name: "Plugin One" })] })
+    );
+    const spy = vi
+      .spyOn(useSettingsStore.getState(), "setRuntimeExtensionEnabled")
+      .mockResolvedValue(undefined);
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+    const toggle = await screen.findByTestId("global-switch-plugin:plg-1");
+    fireEvent.click(toggle);
+    expect(spy).toHaveBeenCalledWith("plugin", "plg-1", false);
+  });
+
+  it("plugin row global Switch disabled when governance.row_revision absent", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({
+        items: [makePluginItem({ id: "plg-1", name: "Plugin One", governance: undefined })],
+      })
+    );
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+    expect(await screen.findByTestId("global-switch-plugin:plg-1")).toBeDisabled();
+  });
+
+  it("admin plugin row expands membership lazily via getPlugins", async () => {
+    mockedGovernanceApi.getGovernanceSummary.mockResolvedValue(ENFORCE_SUMMARY);
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [makePluginItem({ id: "plg-1", name: "Plugin One" })] })
+    );
+    const pluginDetail: PluginDetail = {
+      ext_id: "plg-1",
+      name: "Plugin One",
+      version: "1.0.0",
+      status: "active",
+      artifact_hash: null,
+      row_revision: 7,
+      last_operation: null,
+      members: [
+        {
+          declared_component_id: "comp-a",
+          kind: "mcp",
+          ext_id: "child-mcp",
+          expected_hash: null,
+          installed_version: null,
+          managed_by_plugin: true,
+          status: "active",
+          scan_verdict: "safe",
+          scan_report: null,
+        },
+      ],
+    };
+    mockedGovernanceApi.getPlugins.mockResolvedValue([pluginDetail]);
+    render(<ExtensionsOverview isAdmin onSelectTab={noop} />);
+
+    const expand = await screen.findByTestId("plugin-expand-plugin:plg-1");
+    // Not fetched until expanded (lazy).
+    expect(mockedGovernanceApi.getPlugins).not.toHaveBeenCalled();
+    fireEvent.click(expand);
+    expect(await screen.findByText("child-mcp")).toBeInTheDocument();
+    expect(mockedGovernanceApi.getPlugins).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-admin plugin row has no expand control and never calls getPlugins", async () => {
+    mockedRuntimeApi.getExtensions.mockResolvedValue(
+      makeExtensionsData({ items: [makePluginItem({ id: "plg-1", name: "Plugin One" })] })
+    );
+    render(<ExtensionsOverview isAdmin={false} onSelectTab={noop} />);
+
+    await screen.findByText("Plugin One");
+    expect(screen.queryByTestId("plugin-expand-plugin:plg-1")).not.toBeInTheDocument();
+    expect(mockedGovernanceApi.getPlugins).not.toHaveBeenCalled();
   });
 });

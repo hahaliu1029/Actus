@@ -15,9 +15,10 @@ import dataclasses
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, field_serializer, model_serializer
 
 from app.domain.models.runtime_extension import (
+    ExtensionGovernanceInfo,
     ExtensionItemInfo,
     ExtensionKind,
     RuntimeExtensionsSnapshot,
@@ -109,6 +110,39 @@ class ExtensionStats(BaseModel):
         return _iso_utc(v)
 
 
+class GovernanceBlock(BaseModel):
+    """D1a §9.1 R46#8：registry 治理块（Admin-only 投影；ExtensionGovernanceInfo 的
+    wire 镜像）。None-omit：mode=off / 非 Admin 时整块不出现（见 ExtensionItem 序列化器）。
+    kind=plugin 时 parent_plugin_ext_id 恒 None（顶层容器）；成员条目携父 plugin ext_id。"""
+    status: str
+    trust_origin: str
+    pinned: bool
+    unpinned: bool
+    pin_stale: bool
+    scan_verdict: str | None = None
+    quarantine_reason: str | None = None
+    last_mismatch_at: datetime | None = None
+    last_verified_at: datetime | None = None
+    row_revision: int
+    observed_surface_hash: str | None = None
+    observed_artifact_hash: str | None = None
+    observed_config_fingerprint: str | None = None
+    pinned_at: datetime | None = None
+    pinned_by: str | None = None
+    installed_by: str | None = None
+    source_type: str
+    source_ref: str | None = None
+    version: str | None = None
+    source_missing_at: datetime | None = None
+    parent_plugin_ext_id: str | None = None
+
+    @field_serializer(
+        "last_mismatch_at", "last_verified_at", "pinned_at", "source_missing_at"
+    )
+    def _ser_dt(self, v: datetime | None) -> str | None:
+        return _iso_utc(v)
+
+
 class ExtensionItem(BaseModel):
     kind: ExtensionKind
     id: str                                 # mcp=server_name；a2a=config uuid；skill=skill.id
@@ -125,6 +159,18 @@ class ExtensionItem(BaseModel):
                                             #             （base_url 仅 Admin 投影存在，§6）
                                             # kind=skill: {runtime_type: str, source_type: str,
                                             #              bundle_file_count: int|None}
+                                            # kind=plugin:{member_count: int, plugin_version: str|None}
+    governance: GovernanceBlock | None = None  # D1a：Admin-only 治理块；None 时序列化器 pop（F24）
+
+    @model_serializer(mode="wrap")
+    def _omit_none_governance(self, handler: Any) -> dict:
+        """None-omit governance（F24/R2#1）：值为 None 时键**不存在**（非 null）——保证
+        mode=off 字节 golden（T13 D1-0 ③层）零漂移。局部 wrap（**禁**全局 exclude_none），
+        照抄 domain 侧 None-omit wrap serializer 先例；handler(self) 保留嵌套 serializer。"""
+        data: dict = handler(self)
+        if data.get("governance") is None:
+            data.pop("governance", None)
+        return data
 
 
 class CatalogItem(BaseModel):               # R12#5：结构显式冻结（§7 语义详述）
@@ -157,6 +203,15 @@ class RuntimeExtensionsResponse(BaseModel):
         return _iso_utc(v)
 
 
+def _to_governance_block(
+    info: ExtensionGovernanceInfo | None,
+) -> GovernanceBlock | None:
+    """domain ExtensionGovernanceInfo → wire GovernanceBlock（None 透传 → 序列化器 pop）。"""
+    if info is None:
+        return None
+    return GovernanceBlock(**dataclasses.asdict(info))
+
+
 def to_wire_item(info: ExtensionItemInfo) -> ExtensionItem:
     return ExtensionItem(
         kind=info.kind, id=info.id, name=info.name, description=info.description,
@@ -165,6 +220,7 @@ def to_wire_item(info: ExtensionItemInfo) -> ExtensionItem:
         liveness=ExtensionLiveness(**dataclasses.asdict(info.liveness)),
         stats=ExtensionStats(**dataclasses.asdict(info.stats)),
         details=dict(info.details),
+        governance=_to_governance_block(info.governance),  # R1#16：唯一 domain→wire 平移点
     )
 
 

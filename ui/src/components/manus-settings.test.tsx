@@ -71,6 +71,19 @@ type SettingsState = {
   probeRuntimeExtension: ReturnType<typeof vi.fn>;
   setRuntimeExtensionEnabled: ReturnType<typeof vi.fn>;
   setRuntimeUserEnabled: ReturnType<typeof vi.fn>;
+  // D1a Task 26 governance slice（ExtensionsOverview mount effect 读 summary + 调治理动作；
+  // 缺字段 → 组件 getState().fetchGovernanceSummary() undefined 崩溃，R6#C5 撞击）。
+  runtimeGovernanceSummary: {
+    mode: "off" | "shadow" | "enforce";
+    unpinned_count: number;
+    missing_observation_count: number;
+    quarantined_count: number;
+  } | null;
+  fetchGovernanceSummary: ReturnType<typeof vi.fn>;
+  quarantineExtension: ReturnType<typeof vi.fn>;
+  reapproveExtension: ReturnType<typeof vi.fn>;
+  setGovernanceEnabled: ReturnType<typeof vi.fn>;
+  approveAllPins: ReturnType<typeof vi.fn>;
 };
 
 const settingsState: SettingsState = {
@@ -138,6 +151,12 @@ const settingsState: SettingsState = {
   probeRuntimeExtension: vi.fn(async () => {}),
   setRuntimeExtensionEnabled: vi.fn(async () => {}),
   setRuntimeUserEnabled: vi.fn(async () => {}),
+  runtimeGovernanceSummary: null,
+  fetchGovernanceSummary: vi.fn(async () => {}),
+  quarantineExtension: vi.fn(async () => {}),
+  reapproveExtension: vi.fn(async () => {}),
+  setGovernanceEnabled: vi.fn(async () => {}),
+  approveAllPins: vi.fn(async () => {}),
 };
 
 const mockIsAdmin = vi.fn(() => true);
@@ -365,6 +384,24 @@ describe("ManusSettings - 扩展总览 tab（R6#5）", () => {
     expect(settingsState.loadAll).not.toHaveBeenCalled();
     // 佐证：tab 自取数据经 runtime loads（组件 mount effect），非 loadAll。
     expect(settingsState.loadRuntimeExtensions).toHaveBeenCalled();
+  });
+
+  it("非 Admin 挂载扩展总览零治理请求（R6#C5）", async () => {
+    // 端点全 AdminUser：非 Admin 挂载 ExtensionsOverview 的 isAdmin-gated 治理 effect
+    // 不得触发 summary 拉取（否则周期性 403）。
+    mockIsAdmin.mockReturnValue(false);
+    settingsState.fetchGovernanceSummary.mockClear();
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+
+    const trigger = screen.getAllByRole("button")[0];
+    await user.click(trigger);
+    await user.click(screen.getByRole("button", { name: "扩展总览" }));
+
+    expect(
+      screen.getByRole("heading", { name: "扩展总览" })
+    ).toBeInTheDocument();
+    expect(settingsState.fetchGovernanceSummary).not.toHaveBeenCalled();
   });
 
   it("catalog 填入配置 → 切到 MCP tab + 预填添加弹窗（Task 24, P-12）", async () => {

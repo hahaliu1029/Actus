@@ -35,7 +35,7 @@ from app.interfaces.service_dependencies import (
     get_skill_export_service,
 )
 from core.config import get_settings
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -46,8 +46,19 @@ router = APIRouter(prefix="/v2/skills", tags=["Skill生态v2"])
 SSE_HEADERS = {"X-Accel-Buffering": "no"}
 
 
-def _build_skill_service() -> SkillService:
-    return SkillService(FileSkillRepository(settings.skills_root_dir))
+def _build_skill_service(request: Request | None = None) -> SkillService:
+    """构造 SkillService；request 在场时注入 D1a 治理 ports（off=None 零行为变化）。
+
+    治理触发路由（install/delete）透传 request 让 ports 生效；只读路由（detail/enabled）
+    不透传 → ports 默认 None → off-safe byte-identical。
+    """
+    write_port = getattr(request.app.state, "extension_registry_write_port", None) if request else None
+    read_port = getattr(request.app.state, "extension_registry_read_port", None) if request else None
+    return SkillService(
+        FileSkillRepository(settings.skills_root_dir),
+        registry_write_port=write_port,
+        registry_read_port=read_port,
+    )
 
 
 class SkillCreateRequest(BaseModel):
@@ -100,9 +111,10 @@ async def list_skills(admin_user: AdminUser) -> Response[SkillListResponse]:
 async def install_skill(
     request: SkillInstallRequest,
     admin_user: AdminUser,
+    http_request: Request,
     force: bool = Query(False, description="强制安装 dangerous skill"),
 ) -> Response[dict]:
-    service = _build_skill_service()
+    service = _build_skill_service(http_request)
     skill = await service.install_skill(
         source_type=request.source_type,
         source_ref=request.source_ref,
@@ -111,6 +123,7 @@ async def install_skill(
         installed_by=admin_user.id,
         trust_origin="user_installed",
         force=force,
+        actor_id=admin_user.id,   # D1a §6.1-3：standalone 安装 actor 透传治理 hook
     )
 
     scan_report = skill.scan_report or {}
@@ -193,12 +206,13 @@ async def set_skill_enabled(
 async def delete_skill(
     skill_key: str,
     admin_user: AdminUser,
+    http_request: Request,
     db_session: AsyncSession = Depends(get_db_session),
 ) -> Response[dict | None]:
-    skill_service = _build_skill_service()
+    skill_service = _build_skill_service(http_request)
     pref_service = UserToolEnablementService(DBUserToolEnablementRepository(db_session))
 
-    await skill_service.delete_skill(skill_key)
+    await skill_service.delete_skill(skill_key, actor_id=admin_user.id)
     await pref_service.delete_enablements_by_tool(ToolType.SKILL, skill_key)
     await db_session.commit()
     return Response.success(msg="Skill 删除成功")

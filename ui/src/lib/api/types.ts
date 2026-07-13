@@ -1135,7 +1135,42 @@ export interface CostTreeResponse {
 // datetime 字段一律 string（后端 @field_serializer 输出 ISO8601 Z 结尾）。
 // ---------------------------------------------------------------------------
 
-export type ExtensionKind = "mcp" | "a2a" | "skill";
+export type ExtensionKind = "mcp" | "a2a" | "skill" | "plugin";
+
+// D1a §9.1：registry 治理块（Admin-only 投影；mode=off / 非 Admin 时后端 None-omit
+// 序列化器整块 pop → wire 缺省 → 此处 optional）。逐字镜像后端 GovernanceBlock wire
+// （interfaces/schemas/runtime_extensions.py）——datetime 字段一律 string。
+export interface GovernanceBlock {
+  status: "active" | "quarantined" | "disabled" | "deleted";
+  trust_origin: string;
+  pinned: boolean;
+  unpinned: boolean;
+  pin_stale: boolean;
+  scan_verdict: "safe" | "caution" | "dangerous" | null;
+  quarantine_reason: "pin_mismatch" | "admin_manual" | null;
+  last_mismatch_at: string | null;
+  last_verified_at: string | null;
+  row_revision: number;
+  observed_surface_hash: string | null;
+  observed_artifact_hash: string | null;
+  observed_config_fingerprint: string | null;
+  pinned_at: string | null;
+  pinned_by: string | null;
+  installed_by: string | null;
+  source_type: string;
+  source_ref: string | null;
+  version: string | null;
+  source_missing_at: string | null;
+  parent_plugin_ext_id: string | null;
+}
+
+// D1a §9.1：治理摘要（GET /v2/extensions/governance；Admin-only）。off → 字面量零。
+export interface GovernanceSummary {
+  mode: "off" | "shadow" | "enforce";
+  unpinned_count: number;
+  missing_observation_count: number;
+  quarantined_count: number;
+}
 
 export type RuntimeConfigStatus = {
   enabled_global: boolean;
@@ -1188,6 +1223,11 @@ export type RuntimeSkillDetails = {
   source_type?: string;
   bundle_file_count?: number | null;
 };
+// D1a T24：plugin 元容器条目 details（member_count/plugin_version 逐字镜像 B9 投影）。
+export type RuntimePluginDetails = {
+  member_count: number;
+  plugin_version: string | null;
+};
 
 type RuntimeExtensionItemBase = {
   id: string;
@@ -1197,12 +1237,15 @@ type RuntimeExtensionItemBase = {
   health: RuntimeHealth;
   liveness: RuntimeLiveness;
   stats: RuntimeStats;
+  // D1a（R4#6）：wire 治理块在基底、四分支共同携带；Admin-only + None-omit → optional。
+  governance?: GovernanceBlock;
 };
 
 export type RuntimeExtensionItem =
   | (RuntimeExtensionItemBase & { kind: "mcp"; details: RuntimeMcpDetails })
   | (RuntimeExtensionItemBase & { kind: "a2a"; details: RuntimeA2aDetails })
-  | (RuntimeExtensionItemBase & { kind: "skill"; details: RuntimeSkillDetails });
+  | (RuntimeExtensionItemBase & { kind: "skill"; details: RuntimeSkillDetails })
+  | (RuntimeExtensionItemBase & { kind: "plugin"; details: RuntimePluginDetails });
 // 注：非 Admin 投影下 details 只含各自必有键的子集（mcp={transport} 等）——三类型的
 // admin-only 字段均已声明 optional，与最小投影 shape 兼容（R8#1）。
 
@@ -1226,3 +1269,117 @@ export type RuntimeCatalogItem = {
 };
 
 export type RuntimeCatalogData = { items: RuntimeCatalogItem[] };
+
+// ---------------------------------------------------------------------------
+// D1a T24 §9.2：GET /v2/plugins（Admin-only）——plugin 元容器详情 + membership 子行。
+// overview plugin 行的 membership 展开数据源。逐字镜像后端 PluginDetail wire
+// （interfaces/schemas/extension_governance.py）。
+// ---------------------------------------------------------------------------
+
+export type PluginLastOperation = {
+  type: string;
+  state: string;
+  error: string | null;
+  updated_at: string | null;
+};
+
+export type PluginMemberDetail = {
+  declared_component_id: string;
+  kind: string;
+  ext_id: string;
+  expected_hash: string | null;
+  installed_version: string | null;
+  managed_by_plugin: boolean;
+  status: string;
+  scan_verdict: string | null;
+  scan_report: Record<string, unknown> | null;
+};
+
+export type PluginDetail = {
+  ext_id: string;
+  name: string | null;
+  version: string | null;
+  status: string;
+  artifact_hash: string | null;
+  row_revision: number;
+  last_operation: PluginLastOperation | null;
+  members: PluginMemberDetail[];
+};
+
+// ---------------------------------------------------------------------------
+// D1a T19/T24 §9.2：两阶段安装 preview wire（dry_run 响应）+ plugin 安装三态。
+// 逐字镜像后端 ExtensionInstallPreview / PluginInstallPreview / GovernanceScanSummary
+// （interfaces/schemas/extension_governance.py + application/services/plugin_install_service.py）。
+// ---------------------------------------------------------------------------
+
+// §3.1 R6#8：scan_report 允许的唯一 finding 形态（禁原始 match 文本）。
+export type GovernanceScanFinding = {
+  category: string;
+  severity: string;
+  pattern_id: string;
+  path: string;
+  line: number | null;
+};
+
+// §7.3：持久化与对外 DTO 的唯一 scan 形态。
+export type GovernanceScanSummary = {
+  verdict: "safe" | "caution" | "dangerous";
+  finding_count: number;
+  findings: GovernanceScanFinding[];
+};
+
+// MCP/A2A create dry_run preview（ExtensionInstallPreview wire）。observed_surface：
+// mcp=工具名+描述截断列表 / a2a=卡片名+描述+skills 名（probe 失败/空=null）。
+export type ExtensionInstallPreviewWire = {
+  scan_report: GovernanceScanSummary;
+  observed_surface: Array<Record<string, unknown>> | Record<string, unknown> | null;
+  surface_hash: string | null;
+  config_fingerprint: string;
+  install_policy_decision: string;
+  warnings: string[];
+};
+
+// Plugin dry_run preview 单成员（PluginMemberPreview——脱敏 hash + scan 摘要）。
+export type PluginMemberPreviewWire = {
+  kind: string;
+  declared_component_id: string;
+  ext_id: string;
+  scan_report: GovernanceScanSummary;
+  surface_hash: string | null;
+  artifact_hash: string | null;
+  config_fingerprint: string | null;
+  probe_failed: boolean;
+  warnings: string[];
+};
+
+// Plugin dry_run preview（PluginInstallPreview——成员清单 + scan + policy + probe 摘要）。
+export type PluginInstallPreviewWire = {
+  plugin_id: string;
+  name: string;
+  version: string;
+  aggregate_verdict: string;
+  install_policy_decision: string;
+  members: PluginMemberPreviewWire[];
+  warnings: string[];
+};
+
+// Plugin install commit 三态（plugin_routes.py _install_result_response：completed→200 /
+// compensated→422 collided_targets / failed→500 requires-admin）。
+export type PluginInstallCommitResult =
+  | { status: "completed"; plugin_ext_id: string; operation_id: string }
+  | {
+      status: "compensated";
+      operation_id: string;
+      error: string | null;
+      collided_targets: string[];
+    }
+  | { status: "failed"; operation_id: string };
+
+// POST /v2/plugins/install 全 body（source + dry_run/force/acknowledge，R13#8）。
+export type PluginInstallRequest = {
+  source_type: "local" | "github";
+  source_ref: string;
+  dry_run?: boolean;
+  force?: boolean;
+  acknowledge?: boolean;
+};

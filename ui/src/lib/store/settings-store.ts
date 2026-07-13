@@ -4,7 +4,7 @@ import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 
 import { ApiError } from "@/lib/api/auth-utils";
-import { configApi, runtimeApi } from "@/lib/api/config";
+import { configApi, governanceApi, runtimeApi } from "@/lib/api/config";
 import { memoryApi } from "@/lib/api/memory";
 import { userToolsApi } from "@/lib/api/user-tools";
 import type {
@@ -13,6 +13,7 @@ import type {
   CreateA2AServerParams,
   ExtensionKind,
   FileUnderstandingConfig,
+  GovernanceSummary,
   InstallSkillParams,
   LLMConfig,
   MCPConfig,
@@ -90,6 +91,14 @@ type SettingsState = {
   runtimePendingIds: string[]; // `${kind}:${id}` 操作中集合（Task 23）
   runtimeProbeCooldowns: Record<string, number>; // `${kind}:${id}` → 可重试 epoch ms（429 倒计时，Task 23）
   runtimeItemNotices: Record<string, string>; // `${kind}:${id}` → inline 提示文案（Task 23）
+  // D1a Task 26 — 治理摘要（GET /v2/extensions/governance；Admin-only）。
+  // null = 未拉取 / 非 Admin；mode==="off" → 组件隐藏全部治理 UI。30s 轮询刷新 quarantined_count。
+  runtimeGovernanceSummary: GovernanceSummary | null;
+  // Finding #1（off-mode back-off latch）：summary GET 在治理关闭时返回 200 mode:"off"（非 409）。
+  // 一旦学到 mode:"off" 即置真，后续 fetchGovernanceSummary 短路——belt-and-suspenders，把
+  // manus-settings 打开即拉的路径在 OFF 部署收敛到每 session 一次。mode 由 app lifespan 固定
+  // （非运行时可翻），故无「翻开后卡死」风险；reset()/刷新页面复位。
+  governanceSummaryDisabled: boolean;
 };
 
 type SettingsActions = {
@@ -136,6 +145,26 @@ type SettingsActions = {
     id: string,
     enabled: boolean,
   ) => Promise<void>;
+  // D1a Task 26 — 治理 actions（对应 T20 端点，携 expected_row_revision）。
+  fetchGovernanceSummary: () => Promise<void>;
+  quarantineExtension: (
+    kind: ExtensionKind,
+    id: string,
+    revision: number,
+    note?: string,
+  ) => Promise<void>;
+  reapproveExtension: (
+    kind: ExtensionKind,
+    id: string,
+    revision: number,
+  ) => Promise<void>;
+  setGovernanceEnabled: (
+    kind: ExtensionKind,
+    id: string,
+    enabled: boolean,
+    revision: number,
+  ) => Promise<void>;
+  approveAllPins: () => Promise<void>;
 
   // M3-A: 清理 legacy session_flush 遗留记忆（后端条件合取：
   // source='session_flush' AND category IS NULL AND auto_promoted_at IS NULL）。
@@ -179,6 +208,8 @@ const initialState: SettingsState = {
   runtimePendingIds: [],
   runtimeProbeCooldowns: {},
   runtimeItemNotices: {},
+  runtimeGovernanceSummary: null,
+  governanceSummaryDisabled: false,
 };
 
 // B11 §10: single-flight guard for lazy agent-config load from ChatInput mount.
@@ -224,6 +255,12 @@ function reportSuccess(text: string): void {
 // B9 Task 23 — `${kind}:${id}` 复合 key（P-12 pending/cooldown/notice 三个 map 的键）。
 function runtimeKey(kind: ExtensionKind, id: string): string {
   return `${kind}:${id}`;
+}
+
+// D1a Task 26 — ExtensionKind 分派穷尽收底（编译期 tripwire）：新增 kind 若漏 case，
+// 传入实参不再是 `never` → 编译失败。runtime throw 兜底不可达路径。
+function assertNever(x: never): never {
+  throw new Error(`Unhandled ExtensionKind: ${String(x)}`);
 }
 
 // B9 Task 23 — 用户级偏好 patch 后本地重算 config 三字段（动作语义 R6#2/R7#3/R8#4 冻结）。
@@ -784,13 +821,44 @@ export const useSettingsStore = create<SettingsStore>()(
           : [...state.runtimePendingIds, key],
       }));
       try {
-        const updated = await runtimeApi.setExtensionEnabled(kind, id, enabled);
-        runtimeRequestSeq += 1;
-        set((state) => ({
-          runtimeExtensions: state.runtimeExtensions.map((item) =>
-            runtimeKey(item.kind, item.id) === key ? updated : item,
-          ),
-        }));
+        switch (kind) {
+          // 既有 façade（mcp/a2a/skill）：POST 返回 ExtensionItem → 单条 replace。
+          case "mcp":
+          case "a2a":
+          case "skill": {
+            const updated = await runtimeApi.setExtensionEnabled(kind, id, enabled);
+            runtimeRequestSeq += 1;
+            set((state) => ({
+              runtimeExtensions: state.runtimeExtensions.map((item) =>
+                runtimeKey(item.kind, item.id) === key ? updated : item,
+              ),
+            }));
+            break;
+          }
+          // R3#9 + R4#5：plugin 父级启停是 Admin 动作，落 postPluginEnabled（非 user setter）。
+          // setter 签名无 item——从 state 现有 runtime items 按 kind/id 定位取 governance.row_revision；
+          // revision 必须真实存在（Admin 视图 governance 块必带），缺失=抛错不发请求（UI 层已禁用
+          // 按钮），绝不 `?? 0` 伪造 CAS。postPluginEnabled 返回 {row_revision}（非 ExtensionItem）。
+          case "plugin": {
+            const item = get().runtimeExtensions.find(
+              (i) => i.kind === kind && i.id === id,
+            );
+            const revision = item?.governance?.row_revision;
+            if (revision === undefined) {
+              throw new Error("plugin enable requires governance.row_revision");
+            }
+            await governanceApi.postPluginEnabled(id, enabled, revision);
+            // Finding #5：postPluginEnabled 只返回 {row_revision}（非 ExtensionItem），
+            // 无法单条 replace——必须重拉列表，让 Switch 反映后端投影的新 enabled_global
+            // （= status ∉ {quarantined, disabled}），否则开关滞留到下次 30s GET 才纠正。
+            // 与 quarantine/reapprove/setGovernanceEnabled 一致（均 loadRuntimeExtensions
+            // 刷新）；loadRuntimeExtensions 内部 ++runtimeRequestSeq 亦承担 in-flight 失效。
+            await get().loadRuntimeExtensions();
+            break;
+          }
+          default:
+            assertNever(kind);
+        }
       } catch (error) {
         reportError(error, "更新全局开关失败");
       } finally {
@@ -820,12 +888,24 @@ export const useSettingsStore = create<SettingsStore>()(
           : [...state.runtimePendingIds, key],
       }));
       try {
-        if (kind === "mcp") {
-          await userToolsApi.setMCPToolEnabled(id, enabled);
-        } else if (kind === "a2a") {
-          await userToolsApi.setA2AToolEnabled(id, enabled);
-        } else {
-          await userToolsApi.setSkillToolEnabled(id, enabled);
+        // R2#6/R6#C2：显式四值分派——plugin 无 per-user 启停语义（父级启停走 Admin
+        // setRuntimeExtensionEnabled → postPluginEnabled）。旧 `else→skill` 会把 plugin
+        // 误当 skill 打 user-enable；此处 plugin 显式拒绝 + assertNever 收底（新增 kind 漏 case
+        // 编译失败）。UI 已隐藏 plugin 行 per-user Switch，此分支为 defensive。
+        switch (kind) {
+          case "mcp":
+            await userToolsApi.setMCPToolEnabled(id, enabled);
+            break;
+          case "a2a":
+            await userToolsApi.setA2AToolEnabled(id, enabled);
+            break;
+          case "skill":
+            await userToolsApi.setSkillToolEnabled(id, enabled);
+            break;
+          case "plugin":
+            throw new Error("plugin has no per-user enablement");
+          default:
+            assertNever(kind);
         }
         // P2 修复：与 Admin 全局路径（setRuntimeExtensionEnabled :767）对称——
         // 本次 user-level mutation 成功后 bump-all，使任何 in-flight poll 失效。
@@ -845,6 +925,106 @@ export const useSettingsStore = create<SettingsStore>()(
         set((state) => ({
           runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
         }));
+      }
+    },
+
+    // D1a Task 26 — 治理摘要拉取（Admin-only；组件 mount + 30s 轮询触发，仅 isAdmin）。
+    // 被动轮询：失败静默（保留上次 summary，不打全局 toast）——端点 Admin-only，非 Admin
+    // 组件不触发；异常时不泄露、不打断只读总览（R4-10 被动发现合同）。
+    fetchGovernanceSummary: async () => {
+      // Finding #1 back-off latch：已学到治理关闭（mode:"off"）→ 停止后续拉取（零额外 I/O）。
+      if (get().governanceSummaryDisabled) {
+        return;
+      }
+      try {
+        const summary = await governanceApi.getGovernanceSummary();
+        // summary GET 治理关闭时返回 200 mode:"off"（非 409）——据此置 back-off latch。
+        // mode≠off（enforce/shadow）→ latch 保持 false，30s 轮询继续刷新计数。
+        set({
+          runtimeGovernanceSummary: summary,
+          governanceSummaryDisabled: summary.mode === "off",
+        });
+      } catch {
+        // 静默：保留上次 summary（避免闪烁），不 toast。错误不置 latch（下次仍可重试）。
+      }
+    },
+
+    // D1a Task 26 — 隔离（quarantine）。revision 真值（调用方从 governance.row_revision 读）。
+    // 成功后刷新 extensions（拿新 governance 块 status/revision）+ summary。
+    quarantineExtension: async (kind, id, revision, note) => {
+      const key = runtimeKey(kind, id);
+      set((state) => ({
+        runtimePendingIds: state.runtimePendingIds.includes(key)
+          ? state.runtimePendingIds
+          : [...state.runtimePendingIds, key],
+      }));
+      try {
+        await governanceApi.postQuarantine(kind, id, revision, note);
+        await get().loadRuntimeExtensions();
+        await get().fetchGovernanceSummary();
+      } catch (error) {
+        reportError(error, "隔离扩展失败");
+      } finally {
+        set((state) => ({
+          runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
+        }));
+      }
+    },
+
+    // D1a Task 26 — 解除隔离并重新 pin（reapprove）。
+    reapproveExtension: async (kind, id, revision) => {
+      const key = runtimeKey(kind, id);
+      set((state) => ({
+        runtimePendingIds: state.runtimePendingIds.includes(key)
+          ? state.runtimePendingIds
+          : [...state.runtimePendingIds, key],
+      }));
+      try {
+        await governanceApi.postReapprove(kind, id, revision);
+        await get().loadRuntimeExtensions();
+        await get().fetchGovernanceSummary();
+      } catch (error) {
+        reportError(error, "解除隔离失败");
+      } finally {
+        set((state) => ({
+          runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
+        }));
+      }
+    },
+
+    // D1a Task 26 — 治理启用/停用（governance-enable/disable，按 enabled 分派）。
+    setGovernanceEnabled: async (kind, id, enabled, revision) => {
+      const key = runtimeKey(kind, id);
+      set((state) => ({
+        runtimePendingIds: state.runtimePendingIds.includes(key)
+          ? state.runtimePendingIds
+          : [...state.runtimePendingIds, key],
+      }));
+      try {
+        if (enabled) {
+          await governanceApi.postGovernanceEnable(kind, id, revision);
+        } else {
+          await governanceApi.postGovernanceDisable(kind, id, revision);
+        }
+        await get().loadRuntimeExtensions();
+        await get().fetchGovernanceSummary();
+      } catch (error) {
+        reportError(error, "更新治理开关失败");
+      } finally {
+        set((state) => ({
+          runtimePendingIds: state.runtimePendingIds.filter((k) => k !== key),
+        }));
+      }
+    },
+
+    // D1a Task 26 — 批量 pin 转正（approve-pins all）。成功后刷新 extensions + summary。
+    approveAllPins: async () => {
+      try {
+        await governanceApi.postApprovePins({ all: true });
+        await get().loadRuntimeExtensions();
+        await get().fetchGovernanceSummary();
+      } catch (error) {
+        reportError(error, "批量转正 pin 失败");
       }
     },
 

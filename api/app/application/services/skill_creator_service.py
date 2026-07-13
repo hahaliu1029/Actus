@@ -1175,5 +1175,6 @@ class SkillCreatorService:
                 skill_md=files.skill_md,
                 installed_by=installed_by,
                 trust_origin="agent_created",
+                actor_id=installed_by,   # D1a §6.1-3：agent_created 会话用户即 actor
             )
 

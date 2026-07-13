@@ -882,3 +882,18 @@ async def test_probe_invalid_kind_422(fake_prober):
         assert resp.status_code == 422
     finally:
         client._teardown()  # type: ignore[attr-defined]
+
+
+async def test_facade_plugin_path_422(client_admin):
+    """D1a §9.1 F2 + R6#C1：两条 façade path 的 kind Literal 各自内联三值
+    （mcp/a2a/skill），**不含** plugin——POST /extensions/plugin/x/{enabled,probe} 均
+    422（path Literal 不扩，语义=plugin 不可执行/不支持启停探测）；聚合 service **零调用**
+    （422 由 path 参数校验触发，handler 从不运行）。"""
+    r_enabled = await client_admin.post(
+        "/api/v1/runtime/extensions/plugin/x/enabled", json={"enabled": True}
+    )
+    assert r_enabled.status_code == 422
+    r_probe = await client_admin.post("/api/v1/runtime/extensions/plugin/x/probe")
+    assert r_probe.status_code == 422
+    # service 零调用（enabled step 3 / probe step 1 的 get_extensions 均未触达）。
+    client_admin.fake_service.get_extensions.assert_not_awaited()

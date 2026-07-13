@@ -81,6 +81,13 @@ from app.domain.models.user_tool_enablement import ToolType
 from app.domain.repositories.uow import IUnitOfWork
 from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
+from app.domain.services.extension_admission_gates import (
+    filter_a2a_config,
+    filter_mcp_config,
+    filter_skills,
+    verify_a2a_cards,
+    verify_mcp_surfaces,
+)
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.graphs.background_summary import run_background_summary
 from app.domain.services.runtime_liveness_registry import runtime_liveness_registry
@@ -457,6 +464,7 @@ class AgentTaskRunner(TaskRunner):
         lifecycle_runtime: Any = None,  # C7: LifecycleRuntimeConfig | None（None=flag-off，测试/旧调用方零改动）
         retry_lifecycle_context: Any = None,  # C7 §5: RetryLifecycleContext | None（仅 retry_from_suspend 路径传入）
         lifecycle_task_epoch: int = 0,  # C7 §5: _create_task 从 session.retry_budget_remaining 持久派生（R10#A3）
+        extension_admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 全走旧路径零调用）
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -542,6 +550,14 @@ class AgentTaskRunner(TaskRunner):
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
         self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
+        # D1a §4.1 注入链末端：root/child 同源 AdmissionPort（off=None → SkillTool /
+        # SkillBundleSyncManager G 逻辑在 T10-T12 短路成旧路径）。
+        self._admission_port = extension_admission_port
+        # D1a G1/G2：G1 会话装配算出的 server→config_fingerprint map 暂存（T11 G2 under_config 复用）。
+        self._admission_config_fingerprints: dict = {"mcp": {}, "a2a": {}}
+        # D1a G2：G2 表面校验判定为未准入的 MCP server 集合（run() 内 initialize 后填充；
+        # 四个消费面——直绑/discovery/planner flow/工具摘要——据此剔除被阻断 server 的工具）。
+        self._admission_blocked_mcp_servers: set[str] = set()
         self._idle_watchdog = idle_watchdog
         self._event_seq_client = event_seq_client
         self._event_seq_ttl_seconds = event_seq_ttl_seconds
@@ -587,6 +603,7 @@ class AgentTaskRunner(TaskRunner):
             sandbox=sandbox,
             skills_root_dir=settings.skills_root_dir,
             sandbox_skill_root=settings.skill_sandbox_bundle_root,
+            admission_port=self._admission_port,  # D1a §4.1: off=None
         )
         self._skill_tool = SkillTool(
             sandbox=sandbox,
@@ -595,6 +612,7 @@ class AgentTaskRunner(TaskRunner):
             risk_mode=(skill_risk_policy or SkillRiskPolicy()).mode.value,
             bundle_sync_manager=self._skill_bundle_sync,
             skill_sandbox_bundle_root=settings.skill_sandbox_bundle_root,
+            admission_port=self._admission_port,  # D1a §4.1: off=None
         )
         self._create_skill_tool = (
             CreateSkillTool(
@@ -2026,6 +2044,18 @@ class AgentTaskRunner(TaskRunner):
                     mcp_all_names.append(name)
         except Exception:
             pass
+        # D1a G2 (R7#5): drop tool names of governance-blocked MCP servers so
+        # their name/description never reach the LLM via the runtime tool
+        # summary. Empty blocked set = identity (off-mode zero behavior change).
+        _blocked_mcp = getattr(self, "_admission_blocked_mcp_servers", set())
+        if _blocked_mcp and mcp_all_names:
+            try:
+                _bindings = self._mcp_tool.tool_server_bindings()
+                mcp_all_names = [
+                    n for n in mcp_all_names if _bindings.get(n) not in _blocked_mcp
+                ]
+            except Exception:
+                pass
         if mcp_all_names:
             if len(mcp_all_names) <= MCP_AUTO_BIND_THRESHOLD:
                 # Small set: all tools directly bound — group by server for clarity
@@ -2220,6 +2250,7 @@ class AgentTaskRunner(TaskRunner):
         skills = _apply_member_skill_floor(
             skills, self._session_skill_pool, getattr(self, "_member_skill_slugs", ()),
         )
+        skills = await filter_skills(getattr(self, "_admission_port", None), skills)   # D1a G4 终选集
         context = self._build_runtime_system_context(skills, scores=scores)
         return RefreshedSkillsResult(
             skills=tuple(skills),
@@ -2347,6 +2378,17 @@ class AgentTaskRunner(TaskRunner):
                 names.add(f"{prefix}_{tool_short_name}")
         return names
 
+    def _exclude_admission_blocked_mcp(self, tool_names: set[str] | None) -> set[str] | None:
+        """G2 enforce 动作：被阻断 server 的全部工具不构建（剔除该 server，不 500）。"""
+        blocked = getattr(self, "_admission_blocked_mcp_servers", set())
+        if not blocked:
+            return tool_names
+        bindings = self._mcp_tool.tool_server_bindings()   # {完整工具名: server_name}
+        blocked_names = {n for n, s in bindings.items() if s in blocked}
+        if tool_names is None:
+            return {n for n in bindings if n not in blocked_names}
+        return {n for n in tool_names if n not in blocked_names}
+
     def _build_lc_tools_full(self) -> list[Any]:
         """Build the full lc_tools set for a step.
 
@@ -2397,7 +2439,9 @@ class AgentTaskRunner(TaskRunner):
             lc_tools.extend(
                 create_mcp_langchain_tools(
                     self._mcp_tool,
-                    tool_names=None,
+                    # D1a G2: strip governance-blocked servers (None → all
+                    # non-blocked names; identity when nothing blocked).
+                    tool_names=self._exclude_admission_blocked_mcp(None),
                     url_map_ref=_url_map_ref,
                     sandbox_file_uploader=_sandbox_uploader,
                 )
@@ -2409,7 +2453,8 @@ class AgentTaskRunner(TaskRunner):
             lc_tools.extend(
                 create_mcp_langchain_tools(
                     self._mcp_tool,
-                    tool_names=mcp_bind_names,
+                    # D1a G2: strip governance-blocked servers from the bind set.
+                    tool_names=self._exclude_admission_blocked_mcp(mcp_bind_names),
                     url_map_ref=_url_map_ref,
                     sandbox_file_uploader=_sandbox_uploader,
                 )
@@ -2421,11 +2466,14 @@ class AgentTaskRunner(TaskRunner):
             # so that ``list_mcp_tools`` / ``get_mcp_tool`` cannot leak
             # metadata or activate blocked MCP tools. The factory itself
             # treats ``None`` as "no filter" (legacy behavior).
+            # D1a G2 (R1#19): also exclude governance-blocked servers so their
+            # surface never reaches the LLM via the discovery surface.
             lc_tools.extend(
                 create_mcp_discovery_tools(
                     mcp_tool_ref=lambda: self._mcp_tool,
                     activated_tools_ref=lambda: self._activated_mcp_tools,
                     tool_filter=getattr(self, "_tool_filter", None),
+                    excluded_servers=self._admission_blocked_mcp_servers,
                 )
             )
 
@@ -2853,6 +2901,7 @@ class AgentTaskRunner(TaskRunner):
             self._session_skill_pool,
             getattr(self, "_member_skill_slugs", ()),
         )
+        target_skills = await filter_skills(getattr(self, "_admission_port", None), target_skills)   # D1a G4 终选集
         await self._apply_preselected_skills(target_skills)
         self._step_skill_state = StepSkillActivationState(
             step_id=step_id,
@@ -2918,6 +2967,7 @@ class AgentTaskRunner(TaskRunner):
             self._session_skill_pool,
             getattr(self, "_member_skill_slugs", ()),
         )
+        selected_skills = await filter_skills(getattr(self, "_admission_port", None), selected_skills)   # D1a G4 终选集
         # Field split (TODO #30 spec §3.2 Site 4):
         # - Attempt counters (reselect_count, consecutive_unknown_tool_calls)
         #   advance BEFORE apply so max_reselect cap is preserved even if
@@ -4515,8 +4565,27 @@ class AgentTaskRunner(TaskRunner):
                 self._a2a_config,
                 a2a_preference_map,
             )
+            # D1a G1（§4.2）：user-pref 过滤后、initialize 前——未准入项剔除（skip 不 500）
+            filtered_mcp_config, _mcp_fps = await filter_mcp_config(
+                self._admission_port, filtered_mcp_config)
+            filtered_a2a_config, _a2a_fps = await filter_a2a_config(
+                self._admission_port, filtered_a2a_config)
+            self._admission_config_fingerprints = {"mcp": _mcp_fps, "a2a": _a2a_fps}
             await self._mcp_tool.initialize(filtered_mcp_config)
             await self._a2a_tool.initialize(filtered_a2a_config)
+            # D1a G2/G3（§4.2）：schemas/卡片在手后、构建/使用前 verify——
+            # under_config 复用 G1 已算指纹（R34#2）。off-mode（port=None）整体短路，
+            # 完全不触碰 mcp/a2a 工具的 surface/card 读取——保证 byte-identical
+            # 且不对 fake 工具产生新交互（verify_* 本身也 port=None 恒等，此处是显式守卫）。
+            if self._admission_port is not None:
+                self._admission_blocked_mcp_servers = await verify_mcp_surfaces(
+                    self._admission_port, self._mcp_tool.server_tool_surfaces(),
+                    self._admission_config_fingerprints["mcp"])
+                _blocked_agents = await verify_a2a_cards(
+                    self._admission_port, self._a2a_tool.agent_cards,
+                    self._admission_config_fingerprints["a2a"])
+                for _aid in _blocked_agents:
+                    self._a2a_tool.remove_agent_card(_aid)
             # B9 liveness 旁路采集（begin_run 已发生）：按已连接 server 逐个 acquire。
             # fail-open——任何异常只 warn+degraded，绝不影响 init 结果。
             self._liveness_acquire_connected()
@@ -4530,6 +4599,9 @@ class AgentTaskRunner(TaskRunner):
             self._session_skill_pool = _force_include_member_skills(
                 self._session_skill_pool, enabled_skills, _member_slugs,
             )
+            # D1a G4：最终池过滤（team force-include 也不得越过 admission，F22/R1#13）
+            self._session_skill_pool = await filter_skills(
+                self._admission_port, self._session_skill_pool)
             # Phase 1: Embedding 索引构建
             embedding_config = getattr(self._agent_config, 'skill_embedding', None)
             if embedding_config and embedding_config.enabled and embedding_config.api_base and embedding_config.api_key:
@@ -4567,6 +4639,7 @@ class AgentTaskRunner(TaskRunner):
                 self._session_skill_pool,
                 _member_slugs,
             )
+            initial_skills = await filter_skills(getattr(self, "_admission_port", None), initial_skills)   # D1a G4 终选集
             await self._skill_bundle_sync.prepare_startup_sync(
                 skill_pool=self._session_skill_pool,
                 initial_selected=initial_skills,
@@ -4586,6 +4659,11 @@ class AgentTaskRunner(TaskRunner):
                 self._flow._mcp_tool_ref = lambda: self._mcp_tool
                 self._flow._activated_mcp_tools_ref = lambda: self._activated_mcp_tools
                 self._flow._mcp_always_bind_names = self._get_always_bind_tool_names()
+                # D1a G2 / R2#F5: hand the flow the governance-blocked server set
+                # computed by G2 above (the flow was constructed before MCP
+                # initialize, so this run() setter is authoritative — mirrors
+                # _mcp_always_bind_names). Empty set = zero behavior change.
+                self._flow._excluded_mcp_servers = self._admission_blocked_mcp_servers
 
             # 3. 主消息循环 + FINISHING 后处理
             try:
@@ -4664,6 +4742,8 @@ class AgentTaskRunner(TaskRunner):
                             self._session_skill_pool,
                             getattr(self, "_member_skill_slugs", ()),
                         )
+                        selected_skills = await filter_skills(
+                            getattr(self, "_admission_port", None), selected_skills)   # D1a G4 终选集
                         self._current_message_text = message_obj.message
                         self._current_message_selected_skills = list(selected_skills)
                         self._step_skill_state = None

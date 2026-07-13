@@ -4,16 +4,27 @@ import json
 import logging
 import re
 import tempfile
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from app.application.errors.exceptions import NotFoundError, ValidationError
+from app.application.services.extension_identity_locks import get_identity_locks
 from app.application.services.skill_source_loader import (
     SkillBundleFile,
     SkillSourceLoader,
     TEXT_INJECT_EXTENSIONS,
+)
+from app.domain.external.extension_admission import InstallContext, UninstallContext
+from app.domain.models.extension_governance import (
+    HASH_SCHEMA_VERSION,
+    TRUST_ORIGINS,
+    GovernanceScanFinding,
+    GovernanceScanSummary,
+    InvalidStateTransitionError,
+    ManagedByPluginError,
 )
 from app.domain.models.skill import (
     Skill,
@@ -23,6 +34,7 @@ from app.domain.models.skill import (
     normalize_skill_slug,
 )
 from app.domain.repositories.skill_repository import SkillRepository
+from app.domain.services.extension_scan import canonicalize_source_ref
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -37,6 +49,38 @@ DEFAULT_BLOCKED_NATIVE_COMMAND_PATTERNS = (
 MAX_CONTEXT_BLOB_CHARS = 12 * 1024
 MAX_CONTEXT_REF_FILE_CHARS = 2 * 1024
 
+_GOV_FINDING_FIELD_MAX = 256   # GovernanceScanFinding str 字段上限（防 pydantic 校验失败）
+
+
+def _to_governance_scan_summary(scan_report: Any) -> GovernanceScanSummary | None:
+    """§7.3：内存 ScanReport → 持久化/DTO 唯一 scan 形态。
+
+    逐字段投影（category/severity/pattern_id/path/line）+ 截断 findings ≤50 +
+    **丢弃原始 match 文本**（INV-D1-7 audit 禁 secrets）。
+    """
+    if scan_report is None:
+        return None
+    findings = list(getattr(scan_report, "findings", None) or [])
+
+    def _s(value: Any) -> str:
+        return str(value or "")[:_GOV_FINDING_FIELD_MAX]
+
+    projected = [
+        GovernanceScanFinding(
+            category=_s(getattr(f, "category", "")),
+            severity=_s(getattr(f, "severity", "")),
+            pattern_id=_s(getattr(f, "pattern_id", "")),
+            path=_s(getattr(f, "file", "")),   # ScanFinding.file → 受控 schema.path
+            line=getattr(f, "line", None),
+        )
+        for f in findings[:50]
+    ]
+    return GovernanceScanSummary(
+        verdict=getattr(scan_report, "verdict", "safe"),
+        finding_count=len(findings),
+        findings=projected,
+    )
+
 
 class SkillService:
     """Skill 生态管理服务"""
@@ -45,9 +89,17 @@ class SkillService:
         self,
         skill_repository: SkillRepository,
         source_loader: SkillSourceLoader | None = None,
+        *,
+        registry_write_port: Any = None,
+        registry_read_port: Any = None,
+        identity_locks: Any = None,
     ) -> None:
         self.skill_repository = skill_repository
         self._source_loader = source_loader or SkillSourceLoader()
+        # D1a §6.1-3 治理挂钩——off（默认）=三 None → install/delete 行为 byte 级一致
+        self._registry_write_port = registry_write_port
+        self._registry_read_port = registry_read_port
+        self._identity_locks = identity_locks    # R3#1：进程单例锁；取用式 self._x or get_identity_locks()
 
     async def list_skills(self) -> list[Skill]:
         return await self.skill_repository.list()
@@ -71,6 +123,8 @@ class SkillService:
         *,
         trust_origin: str = "user_installed",
         force: bool = False,
+        actor_id: str | None = None,
+        governance_install_context: "InstallContext | None" = None,
     ) -> Skill:
         if source_type not in {SkillSourceType.LOCAL, SkillSourceType.GITHUB}:
             raise ValidationError(msg="source_type 仅支持 local 或 github")
@@ -152,6 +206,82 @@ class SkillService:
 
         skill = Skill(**skill_payload)
 
+        # ========== D1a §3.6 identity-locked governance envelope ==========
+        # off (write_port=None) → nullcontext：零锁、零 factory、install 行为 byte-identical。
+        _governed = self._registry_write_port is not None
+        _lock_cm = (
+            (self._identity_locks or get_identity_locks()).acquire_all([("skill", skill.id)])
+            if _governed
+            else nullcontext()
+        )
+        async with _lock_cm:
+            # D1a standalone 占用预检（R33#4/R44#3）——saga 成员路（correlation 非 None）跳过：
+            # membership/骨架行由 saga 事务先建，属设计内占用。
+            _is_saga_member = (
+                governance_install_context is not None
+                and governance_install_context.correlation_id is not None
+            )
+            if self._registry_read_port is not None and not _is_saga_member:
+                _row = await self._registry_read_port.get_row("skill", skill.id)
+                if _row is not None:
+                    if _row.parent_plugin_ext_id is not None:
+                        raise ManagedByPluginError(
+                            f"skill[{skill.id}] 由 plugin 管理，禁 standalone 重装")
+                    if _row.status in ("quarantined", "disabled"):
+                        raise InvalidStateTransitionError(
+                            f"skill[{skill.id}] 处于 {_row.status}——重装不是恢复动作"
+                            "（先 reapprove/enable 或 delete）")
+
+            result, _scan_report = await self._run_scan_gate_and_persist(
+                skill, trust_origin=trust_origin, force=force, installed_by=installed_by,
+                bundle_files=bundle_files, effective_skill_md=effective_skill_md,
+                normalized_manifest=normalized_manifest)
+
+            # ---------- D1a §6.1-3 registry hook（R2#5 锚点：二次 upsert 之后、broad except 之外）----------
+            if self._registry_write_port is not None:
+                _final_hash = (result.scan_report or {}).get("content_hash")
+                if governance_install_context is not None:
+                    # R1#6：saga 成员安装——成员 InstallContext **逐字**使用（correlation=operation.id、
+                    # provenance source_type="plugin"、pins/scan 取自 PluginInstallContext 不重算
+                    # [spec §8.3-3]；盘上内容与 ctx 同源自同一 bundle 快照——偏差由发布前复验兜底
+                    # 走补偿，不在此静默覆盖 pin）。
+                    _ctx = governance_install_context
+                else:
+                    _ctx = InstallContext(
+                        actor_user_id=actor_id or "system",
+                        correlation_id=None,
+                        source_type=getattr(result, "source_type", "local") or "local",
+                        source_ref=canonicalize_source_ref(getattr(result, "source_ref", None)),
+                        version=(result.manifest or {}).get("version"),
+                        # R7#4/spec §2：registry 列值由治理写入方决定——未知 trust_origin 回退
+                        # user_installed（与 INSTALL_POLICY 回退语义一致，F13）。
+                        trust_origin=(result.trust_origin
+                                      if result.trust_origin in TRUST_ORIGINS else "user_installed"),
+                        artifact_hash=_final_hash,
+                        surface_hash=None, config_fingerprint=None,
+                        hash_schema_version=HASH_SCHEMA_VERSION,
+                        scan=_to_governance_scan_summary(_scan_report),
+                        forced=bool(force and _scan_report.verdict == "dangerous"),
+                    )
+                await self._registry_write_port.record_install("skill", result.id, _ctx)
+            return result
+
+    async def _run_scan_gate_and_persist(
+        self,
+        skill: Skill,
+        *,
+        trust_origin: str,
+        force: bool,
+        installed_by: str,
+        bundle_files: dict[str, SkillBundleFile],
+        effective_skill_md: str,
+        normalized_manifest: dict,
+    ) -> tuple[Skill, Any]:
+        """R3 install-time scan gate + 二次 upsert（实际磁盘 content_hash 重算）。
+
+        返回 (result, scan_report)——scan_report 供治理 hook 投影 GovernanceScanSummary。
+        行为与治理接线前 byte 级一致（纯抽取，无逻辑改动）。
+        """
         # ========== R3: Install-time scan gate ==========
         from app.domain.services.trust_matrix import (
             compute_base_floor,
@@ -253,7 +383,7 @@ class SkillService:
         except Exception:
             logger.warning("R3: failed to recompute content_hash post-upsert", exc_info=True)
 
-        return result
+        return result, _scan_report
 
     async def set_skill_enabled(self, skill_id: str, enabled: bool) -> Skill:
         skill = await self.skill_repository.get_by_id(skill_id)
@@ -263,10 +393,36 @@ class SkillService:
         skill.enabled = enabled
         return await self.skill_repository.upsert(skill)
 
-    async def delete_skill(self, skill_id: str) -> None:
+    async def delete_skill(
+        self,
+        skill_id: str,
+        *,
+        actor_id: str | None = None,
+        uninstall_context: "UninstallContext | None" = None,
+        missing_ok: bool = False,
+    ) -> None:
+        # standalone 成员守卫（§8.4）：uninstall_context 为 None 或 correlation 为 None →
+        # 查 read_port；行带 parent_plugin_ext_id 拒删。saga 路（correlation 非 None）跳过。
+        if self._registry_read_port is not None and (
+                uninstall_context is None or uninstall_context.correlation_id is None):
+            _row = await self._registry_read_port.get_row("skill", skill_id)
+            if _row is not None and _row.parent_plugin_ext_id is not None:
+                raise ManagedByPluginError("managed by plugin——先卸 plugin（§8.4）")
+
         deleted = await self.skill_repository.delete(skill_id)
         if not deleted:
+            if missing_ok:
+                return                      # saga 幂等（R19#F3）
             raise NotFoundError(f"Skill[{skill_id}]不存在")
+
+        # D1a §6.1 delete hook（standalone → 构造 UninstallContext；off=None 时零记账）
+        if self._registry_write_port is not None:
+            ctx = uninstall_context
+            if ctx is None and actor_id is not None:
+                ctx = UninstallContext(correlation_id=None, actor_user_id=actor_id)
+            if ctx is not None:
+                await self._registry_write_port.record_delete(
+                    "skill", skill_id, uninstall_context=ctx)
 
     @classmethod
     def _build_context_blob(

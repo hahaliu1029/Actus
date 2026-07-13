@@ -1,4 +1,7 @@
+import errno
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +18,27 @@ from app.domain.repositories.app_config_repository import AppConfigRepository
 from filelock import FileLock
 
 logger = logging.getLogger(__name__)
+
+CONFIG_TMP_PREFIX = ".config.yaml.tmp-"
+
+
+def sweep_orphan_config_temps(config_path: str) -> int:
+    """§8.3-3 R51#3：清扫 config 目录孤儿 temp（SIGKILL 残留含 secrets，不过夜）。
+    lifespan startup 四段全序的第①段调用（T17）。"""
+    config_dir = os.path.dirname(str(config_path)) or "."
+    removed = 0
+    try:
+        names = os.listdir(config_dir)
+    except OSError:
+        return 0
+    for name in names:
+        if name.startswith(CONFIG_TMP_PREFIX):
+            try:
+                os.remove(os.path.join(config_dir, name))
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 class FileAppConfigRepository(AppConfigRepository):
@@ -56,18 +80,53 @@ class FileAppConfigRepository(AppConfigRepository):
             raise ServerRequestsError("读取应用配置失败，请稍后尝试")
 
     def save(self, app_config: AppConfig) -> None:
-        """将app_config存储到本地yaml配置"""
-        # 1.写入之前先上锁
-        lock = FileLock(self._lock_file, timeout=5)
+        """将app_config存储到本地yaml配置。
 
+        D1a（spec §8.3-3，R50#2+R51#2+R52#1）：尽力原子——mkstemp 同目录+fsync →
+        os.replace；生产单文件 bind-mount 拓扑（docker-compose.yml:139）replace 抛
+        {EBUSY, EXDEV} → fallback FileLock 下 truncate 写（现状语义不劣化）；
+        其余 errno 重抛。load-modify-save 读改写竞争仍 defer（spec §1.2）。
+        """
+        lock = FileLock(self._lock_file, timeout=5)
         try:
             with lock:
-                # 2.将app_config转换成json
                 data_to_dump = app_config.model_dump(mode="json")
-
-                # 3.打开yaml文件并写入
-                with open(self._config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(data_to_dump, f, allow_unicode=True, sort_keys=False)
+                payload = yaml.dump(data_to_dump, allow_unicode=True, sort_keys=False)
+                self._write_best_effort_atomic(payload)
         except TimeoutError:
             logger.error("无法获取配置文件")
             raise ServerRequestsError("写入配置文件失败，请稍后尝试")
+
+    def _write_best_effort_atomic(self, payload: str) -> None:
+        config_dir = os.path.dirname(str(self._config_path)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=CONFIG_TMP_PREFIX, dir=config_dir)  # mkstemp 默认 0600（temp 含 secrets）
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                # 权限保持（off-mode 行为等价，非 bind-mount dev 部署）：目标已存在 →
+                # temp 继承其权限位，使 os.replace 不把 config 从 0644 降级到 mkstemp 的
+                # 0600；首写（目标不存在）→ 保留 0600（secrets 文件稳健默认）。
+                try:
+                    existing_mode = os.stat(self._config_path).st_mode & 0o777
+                except FileNotFoundError:
+                    existing_mode = None
+                if existing_mode is not None:
+                    os.chmod(tmp_path, existing_mode)
+                os.replace(tmp_path, self._config_path)
+                tmp_path = None   # 已被原子消费
+            except OSError as e:
+                if e.errno not in (errno.EBUSY, errno.EXDEV):
+                    raise
+                with open(self._config_path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass

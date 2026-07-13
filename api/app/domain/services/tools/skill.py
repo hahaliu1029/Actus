@@ -21,6 +21,7 @@ from app.domain.models.tool_result import (
     ToolOutcome,
     ToolResult,
 )
+from app.domain.services.extension_admission_gates import skill_invoke_gate
 from core.config import get_settings
 
 from .a2a import A2ATool
@@ -80,6 +81,7 @@ class SkillTool(BaseTool):
         blocked_command_patterns: list[str] | None = None,
         bundle_sync_manager: SkillBundleSyncManager | None = None,
         skill_sandbox_bundle_root: str | None = None,
+        admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 旧路径零调用）
     ) -> None:
         super().__init__()
         self._sandbox = sandbox
@@ -87,6 +89,7 @@ class SkillTool(BaseTool):
         self._a2a_tool = a2a_tool
         self._risk_mode = risk_mode
         self._bundle_sync_manager = bundle_sync_manager
+        self._admission_port = admission_port  # D1a §4.1: G 逻辑在 T10-T12 消费
         self._skills: list[Skill] = []
         self._tools: list[dict[str, Any]] = []
         self._tool_bindings: dict[str, dict[str, Any]] = {}
@@ -325,6 +328,21 @@ class SkillTool(BaseTool):
         skill: Skill = binding["skill"]
         runtime_type: SkillRuntimeType = binding["runtime_type"]
         manifest_tool: dict[str, Any] = binding["manifest_tool"]
+
+        # D1a §4.2 G4b：invoke 前状态门——独立于 PE，不依赖 R3 refresh（R2#2）。
+        # 错误形态复刻 _tool_result_to_outcome 先例（AllowError + DecisionReason，
+        # type="exception"），仅 code 改 extension_unavailable。off → None 直通零改动。
+        _gate_reason = await skill_invoke_gate(self._admission_port, skill.id)
+        if _gate_reason is not None:
+            _gate_msg = f"Skill 被治理策略阻断（{_gate_reason}），本次调用不执行"
+            return AllowError(
+                content=_gate_msg,
+                reason=DecisionReason(
+                    type="exception",
+                    code="extension_unavailable",
+                    message=_gate_msg,
+                ),
+            )
 
         if runtime_type == SkillRuntimeType.NATIVE:
             result = await self._invoke_native(skill, manifest_tool, kwargs)

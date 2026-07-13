@@ -2,7 +2,19 @@ import logging
 import uuid
 
 from app.application.errors.exceptions import AppException, TooManyRequestsError
+from app.application.services.extension_install_service import (
+    AcknowledgeRequiredError,
+    BatchNotAllowedError,
+    ForceRequiredError,
+)
 from app.domain.external.mailbox_publisher import MailboxPublishOversize
+from app.domain.models.extension_governance import (
+    InvalidStateTransitionError,
+    ManagedByPluginError,
+    MissingObservationError,
+    OperationPendingError,
+    RevisionConflictError,
+)
 from app.domain.services.permission.errors import (
     PEInfrastructureUnavailable,
     PolicyConflict,
@@ -225,6 +237,71 @@ def register_exception_handlers(app: FastAPI) -> None:
             },
             headers=_request_id_headers(request) or None,
         )
+
+    # ---- D1a 治理异常 → HTTP 映射（§9.2；T19 注册全量 8 条，T20 只消费不再注册）----
+    # 返回体形状照抄本文件既有 PE handler 惯例（JSONResponse + {"code": ...}）——
+    # 不走 ``Response`` schema（其 ``msg: str`` 无法承载 dict/findings）。
+    def _governance_error(request: Request, status_code: int, code: str,
+                          exc: Exception) -> JSONResponse:
+        content: dict = {"code": code, "detail": str(exc)}
+        summary = getattr(exc, "summary", None)
+        if summary is not None:                    # Acknowledge/Force 携带 scan → +findings
+            dumped = summary.model_dump()
+            content["scan_report"] = dumped
+            content["findings"] = dumped.get("findings", [])
+        return JSONResponse(
+            status_code=status_code,
+            content=content,
+            headers=_request_id_headers(request) or None,
+        )
+
+    @app.exception_handler(RevisionConflictError)
+    async def revision_conflict_handler(
+        request: Request, exc: RevisionConflictError
+    ) -> JSONResponse:
+        return _governance_error(request, 409, "revision_conflict", exc)
+
+    @app.exception_handler(InvalidStateTransitionError)
+    async def invalid_state_handler(
+        request: Request, exc: InvalidStateTransitionError
+    ) -> JSONResponse:
+        return _governance_error(request, 409, "invalid_state", exc)
+
+    @app.exception_handler(MissingObservationError)
+    async def missing_observation_handler(
+        request: Request, exc: MissingObservationError
+    ) -> JSONResponse:
+        return _governance_error(request, 409, "missing_observation", exc)
+
+    @app.exception_handler(OperationPendingError)
+    async def operation_pending_handler(
+        request: Request, exc: OperationPendingError
+    ) -> JSONResponse:
+        return _governance_error(request, 409, "operation_pending", exc)
+
+    @app.exception_handler(ManagedByPluginError)
+    async def managed_by_plugin_handler(
+        request: Request, exc: ManagedByPluginError
+    ) -> JSONResponse:
+        return _governance_error(request, 409, "managed_by_plugin", exc)
+
+    @app.exception_handler(AcknowledgeRequiredError)
+    async def acknowledge_required_handler(
+        request: Request, exc: AcknowledgeRequiredError
+    ) -> JSONResponse:
+        return _governance_error(request, 409, "acknowledge_required", exc)
+
+    @app.exception_handler(ForceRequiredError)
+    async def force_required_handler(
+        request: Request, exc: ForceRequiredError
+    ) -> JSONResponse:
+        return _governance_error(request, 422, "force_required", exc)
+
+    @app.exception_handler(BatchNotAllowedError)
+    async def batch_not_allowed_handler(
+        request: Request, exc: BatchNotAllowedError
+    ) -> JSONResponse:
+        return _governance_error(request, 422, "single_server_required", exc)
 
     @app.exception_handler(Exception)
     async def exception_handler(request: Request, exc: Exception) -> JSONResponse:

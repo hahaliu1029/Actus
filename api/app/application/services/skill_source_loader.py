@@ -32,7 +32,9 @@ class SkillBundleFile:
 @dataclass(slots=True)
 class SkillBundle:
     normalized_source_ref: str
-    skill_md: str
+    # R8#1：plugin bundle 根无 SKILL.md（合法）——放宽 str | None。skill 路
+    # require_skill_md=True（默认）恒非 None，既有消费方零感知。
+    skill_md: str | None
     files: dict[str, SkillBundleFile]
     # Phase B: parser-extracted fields from SKILL.md frontmatter
     parsed_meta: dict[str, Any] = field(default_factory=dict)
@@ -42,14 +44,24 @@ class SkillBundle:
 class SkillSourceLoader:
     """Load skill source directory and return an in-memory bundle."""
 
-    async def load(self, source_type: SkillSourceType, source_ref: str) -> SkillBundle:
+    async def load(
+        self,
+        source_type: SkillSourceType,
+        source_ref: str,
+        *,
+        require_skill_md: bool = True,
+    ) -> SkillBundle:
+        # require_skill_md 默认 True = 现状零行为变化；plugin bundle 传 False（根无 SKILL.md，
+        # 根合法性由 preflight 校验 plugin.json，R8#1）。
         if source_type == SkillSourceType.LOCAL:
-            return await self._load_from_local(source_ref)
+            return await self._load_from_local(source_ref, require_skill_md=require_skill_md)
         if source_type == SkillSourceType.GITHUB:
-            return await self._load_from_github(source_ref)
+            return await self._load_from_github(source_ref, require_skill_md=require_skill_md)
         raise ValidationError(msg="source_type 仅支持 local 或 github")
 
-    async def _load_from_local(self, source_ref: str) -> SkillBundle:
+    async def _load_from_local(
+        self, source_ref: str, *, require_skill_md: bool = True
+    ) -> SkillBundle:
         source = (source_ref or "").strip()
         if not source:
             raise ValidationError(msg="source_ref 不能为空")
@@ -90,10 +102,19 @@ class SkillSourceLoader:
                 is_text=Path(normalized_path).suffix.lower() in TEXT_INJECT_EXTENSIONS,
             )
 
-        if "SKILL.md" not in files:
+        # R8#1 三步落法②：`.get` 取代 `["SKILL.md"]`——require=False 且缺失 → skill_md=None
+        # 放行（不转 KeyError）；require=True 缺失 → 现状报错不变。
+        skill_md_file = files.get("SKILL.md")
+        if require_skill_md and skill_md_file is None:
             raise ValidationError(msg="目录中缺少 SKILL.md")
+        if skill_md_file is None:
+            return SkillBundle(
+                normalized_source_ref=f"local:{skill_root.as_posix()}",
+                skill_md=None,
+                files=files,
+            )
 
-        skill_md = self._decode_utf8(files["SKILL.md"].content, "SKILL.md")
+        skill_md = self._decode_utf8(skill_md_file.content, "SKILL.md")
         parse_result = SkillMdParser.parse(skill_md)
         return SkillBundle(
             normalized_source_ref=f"local:{skill_root.as_posix()}",
@@ -103,7 +124,9 @@ class SkillSourceLoader:
             parsed_manifest=parse_result.manifest,
         )
 
-    async def _load_from_github(self, source_ref: str) -> SkillBundle:
+    async def _load_from_github(
+        self, source_ref: str, *, require_skill_md: bool = True
+    ) -> SkillBundle:
         owner, repo, parsed_ref, base_path = self._parse_github_source_ref(source_ref)
         files: dict[str, SkillBundleFile] = {}
         total_size = 0
@@ -132,7 +155,10 @@ class SkillSourceLoader:
                 total_size=total_size,
             )
 
-        if "SKILL.md" not in files:
+        # R8#1 三步落法②：`.get` 取代 `["SKILL.md"]`——require=False 且缺失 → skill_md=None
+        # 放行；require=True 缺失 → 现状双分支报错不变。
+        skill_md_file = files.get("SKILL.md")
+        if require_skill_md and skill_md_file is None:
             if not base_path:
                 raise ValidationError(
                     msg=(
@@ -141,8 +167,14 @@ class SkillSourceLoader:
                     )
                 )
             raise ValidationError(msg="GitHub Skill 目录中缺少 SKILL.md")
+        if skill_md_file is None:
+            return SkillBundle(
+                normalized_source_ref=self._build_github_source_ref(owner, repo, ref, base_path),
+                skill_md=None,
+                files=files,
+            )
 
-        skill_md = self._decode_utf8(files["SKILL.md"].content, "SKILL.md")
+        skill_md = self._decode_utf8(skill_md_file.content, "SKILL.md")
         parse_result = SkillMdParser.parse(skill_md)
         return SkillBundle(
             normalized_source_ref=self._build_github_source_ref(owner, repo, ref, base_path),

@@ -213,6 +213,14 @@ class PlannerReActFlow(BaseFlow):
         policy_snapshot_sink: Any = None,  # C5a observe-only sink (Seam B carrier)
         force_initial_compaction: bool = False,  # B11 §8: consume a pending manual /compact at run start
         file_view_image_resolver: Any = None,  # B12 P1: FileViewImageBytesResolver | None（build_react_graph 注入）
+        # D1a G2 / R2#F5: MCP server names blocked by extension governance.
+        # ``_collect_mcp_tools`` strips their tool surfaces from BOTH the
+        # direct-bind and discovery paths so a blocked server never reaches the
+        # initial graph. None/empty = zero behavior change (legacy). Production
+        # value is set by AgentTaskRunner in run() AFTER G2 verify computes the
+        # blocked set (the flow is constructed before MCP initialize), mirroring
+        # how ``_mcp_always_bind_names`` is wired.
+        excluded_mcp_servers: set[str] | None = None,
         # PR-9b-A A5: lifespan-scoped coordinator runtime deps. Default is the
         # frozen NullCoordinatorRuntimeDeps sentinel so legacy callers (tests
         # + non-coordinator paths) inject zero coord cfg keys; production
@@ -333,6 +341,9 @@ class PlannerReActFlow(BaseFlow):
         self._mcp_tool_ref: Callable | None = None
         self._activated_mcp_tools_ref: Callable[[], set[str]] | None = None
         self._mcp_always_bind_names: set[str] = set()
+        # D1a G2 / R2#F5: governance-blocked MCP servers (set by
+        # AgentTaskRunner in run() after G2 verify; copied so the flow owns it).
+        self._excluded_mcp_servers: set[str] = set(excluded_mcp_servers or ())
 
         # Flush scheduling: cursor + pending batch
         self._flush_cursor: int = 0
@@ -510,18 +521,41 @@ class PlannerReActFlow(BaseFlow):
         MCP_AUTO_BIND_THRESHOLD = 15
         all_mcp_tools = self._mcp_tool.get_tools()
         tools: list = []
+        # D1a G2 / R2#F5: names of tools belonging to governance-blocked
+        # servers (empty set = identity / legacy behavior).
+        blocked_servers = self._excluded_mcp_servers
+        blocked_names: set[str] = set()
+        if blocked_servers:
+            bindings = self._mcp_tool.tool_server_bindings()
+            blocked_names = {n for n, s in bindings.items() if s in blocked_servers}
         if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
-            tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+            # Direct-bind path: legacy binds all (tool_names=None). When a
+            # server is blocked, convert to an explicit allow-list of the
+            # non-blocked tool names so the blocked surface is never bound.
+            if blocked_names:
+                direct_names = {
+                    n for n in self._mcp_tool.tool_server_bindings()
+                    if n not in blocked_names
+                }
+                tools.extend(create_mcp_langchain_tools(
+                    self._mcp_tool, tool_names=direct_names,
+                ))
+            else:
+                tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
         else:
             if self._mcp_always_bind_names:
+                bind_names = self._mcp_always_bind_names
+                if blocked_names:
+                    bind_names = {n for n in bind_names if n not in blocked_names}
                 tools.extend(create_mcp_langchain_tools(
-                    self._mcp_tool, tool_names=self._mcp_always_bind_names,
+                    self._mcp_tool, tool_names=bind_names,
                 ))
             if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
                 from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
                 tools.extend(create_mcp_discovery_tools(
                     mcp_tool_ref=self._mcp_tool_ref,
                     activated_tools_ref=self._activated_mcp_tools_ref,
+                    excluded_servers=blocked_servers or None,
                 ))
         return tools
 

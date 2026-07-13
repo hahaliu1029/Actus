@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-ExtensionKind = Literal["mcp", "a2a", "skill"]          # domain 权威定义；interfaces 复用此 Literal
+ExtensionKind = Literal["mcp", "a2a", "skill", "plugin"]  # domain 权威定义；interfaces 复用此 Literal（D1a §9.1 扩 plugin）
 
 ConfigReasonCode = Literal[
     "enabled", "disabled_global", "disabled_user", "disabled_both",
     "user_enablement_unknown", "config_unreadable",
+    "not_applicable_plugin",   # D1a §9.1：plugin 元容器不可执行/不可用户启停（enablement N/A）
+    "governance_blocked",      # D1a §9.1：quarantined/disabled/parent_blocked → 有效停用（唯一治理泄漏）
 ]
 HealthState = Literal["reachable", "unreachable", "ok", "error", "unknown", "skipped"]
 LivenessState = Literal["in_use", "idle", "unknown", "not_applicable"]
@@ -58,6 +60,35 @@ class ExtensionStatsInfo:
 
 
 @dataclass(frozen=True)
+class ExtensionGovernanceInfo:
+    """D1a §9.1 R46#8：registry 治理块（Admin-only 投影）——GovernanceRowSnapshot 的
+    读模型平移 + pin_presence 派生布尔。非 Admin 投影层置 None（三层剥离第①层）。"""
+    status: str
+    trust_origin: str
+    # pinned/unpinned/pin_stale：对该 kind 必需 pin 写集聚合派生（全 pinned→pinned；
+    # 任一 unpinned→unpinned；任一 stale→pin_stale）
+    pinned: bool
+    unpinned: bool
+    pin_stale: bool
+    scan_verdict: str | None
+    quarantine_reason: str | None
+    last_mismatch_at: datetime | None
+    last_verified_at: datetime | None
+    row_revision: int
+    observed_surface_hash: str | None
+    observed_artifact_hash: str | None
+    observed_config_fingerprint: str | None
+    pinned_at: datetime | None
+    pinned_by: str | None
+    installed_by: str | None
+    source_type: str
+    source_ref: str | None
+    version: str | None
+    source_missing_at: datetime | None
+    parent_plugin_ext_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ExtensionItemInfo:
     kind: ExtensionKind
     id: str                                   # mcp=server_name；a2a=config uuid；skill=skill.id
@@ -68,6 +99,7 @@ class ExtensionItemInfo:
     liveness: ExtensionLivenessInfo
     stats: ExtensionStatsInfo
     details: dict[str, Any]                   # 已按角色投影后的 shape（§6 冻结）
+    governance: ExtensionGovernanceInfo | None = None  # D1a：Admin-only；mode=off/非 Admin=None
 
 
 @dataclass(frozen=True)
