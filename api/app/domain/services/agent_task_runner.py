@@ -3430,7 +3430,7 @@ class AgentTaskRunner(TaskRunner):
         for ev in self._build_compaction_events_if_any():
             yield ev
 
-    async def _do_persist_and_flush(self) -> None:
+    async def _do_persist_and_flush(self, *, allow_llm: bool = True) -> None:
         """Phase 1+2: persist state then submit flush.
 
         Runs inside asyncio.shield() so CancelledError cannot interrupt
@@ -3439,9 +3439,16 @@ class AgentTaskRunner(TaskRunner):
         flow = self._flow
 
         # Phase 1: persist (Memory/ConversationSummary/flush gate/overflow check)
-        await flow._persist_after_graph(
-            flow._deferred_final_state, flow._deferred_summaries
-        )
+        if allow_llm:
+            await flow._persist_after_graph(
+                flow._deferred_final_state, flow._deferred_summaries
+            )
+        else:
+            await flow._persist_after_graph(
+                flow._deferred_final_state,
+                flow._deferred_summaries,
+                allow_llm=False,
+            )
 
         # Phase 2: flush submit (synchronous fire-and-forget)
         flush_batch = getattr(flow, "_pending_flush_batch", None)
@@ -3458,7 +3465,13 @@ class AgentTaskRunner(TaskRunner):
         # Shield Phase 1+2: CancelledError cannot reach _persist_after_graph
         # or flush submit.  If the outer task is cancelled while shield is
         # running, CancelledError is raised HERE after shield finishes.
-        await asyncio.shield(self._do_persist_and_flush())
+        allow_llm = not getattr(self, "_was_timed_out", False)
+        await asyncio.shield(
+            self._do_persist_and_flush(allow_llm=allow_llm)
+        )
+
+        if not allow_llm:
+            return
 
         # Phase 3: user-visible streaming summary
         flow = self._flow

@@ -166,6 +166,29 @@ async def test_do_postprocess_calls_persist_then_flush_then_summary():
 
 
 @pytest.mark.anyio
+async def test_do_postprocess_timeout_skips_all_llm_postprocessing():
+    """The graph watchdog is the whole-run deadline.  After it fires, FINISHING
+    may persist state but must not start conversation/background summary LLMs.
+    """
+    runner = _make_runner_with_mocks()
+    runner._was_timed_out = True
+    task = MagicMock()
+
+    with patch(
+        "app.domain.services.agent_task_runner.run_background_summary",
+        new_callable=AsyncMock,
+    ) as mock_summary:
+        await runner._do_postprocess(task)
+
+    runner._flow._persist_after_graph.assert_awaited_once_with(
+        runner._flow._deferred_final_state,
+        runner._flow._deferred_summaries,
+        allow_llm=False,
+    )
+    mock_summary.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_do_postprocess_summary_failure_is_silent():
     """Phase 3 summary failure must not propagate — only logged."""
     runner = _make_runner_with_mocks()

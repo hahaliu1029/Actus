@@ -782,6 +782,7 @@ export default function SessionPage() {
   }, []);
 
   const eventScrollRef = useRef<HTMLDivElement | null>(null);
+  const pollingSessionRef = useRef<string | null>(null);
 
   const resetPreviewState = useCallback(() => {
     setPreviewError(null);
@@ -950,8 +951,13 @@ export default function SessionPage() {
       void fetchSessionFiles(sessionId, { silent: true });
     };
 
-    // 任务运行期间做轻量轮询，确保进度与文件列表持续更新
-    refresh();
+    // 任务运行期间做轻量轮询，确保进度与文件列表持续更新。流断开会让
+    // isCurrentSessionStreaming 翻转并重建本 effect；同一会话此时不要再次
+    // 立即 refresh，否则 fetchSessionById 的自动续流会形成紧密重连环。
+    if (pollingSessionRef.current !== sessionId) {
+      pollingSessionRef.current = sessionId;
+      refresh();
+    }
     const timer = window.setInterval(refresh, 2000);
     return () => {
       stopped = true;
@@ -1023,12 +1029,13 @@ export default function SessionPage() {
     node.scrollTo({
       top: node.scrollHeight,
       behavior:
-        eventList.at(-1)?.event === "message" &&
-        Boolean(eventList.at(-1)?.data?.partial)
+        isCurrentSessionStreaming ||
+        (eventList.at(-1)?.event === "message" &&
+          Boolean(eventList.at(-1)?.data?.partial))
           ? "auto"
           : "smooth",
     });
-  }, [eventList]);
+  }, [eventList, isCurrentSessionStreaming]);
 
   // Retry watcher: when global TransferPanel retries a download task,
   // detect the status flip back to "pending" and re-initiate the download.
@@ -1357,11 +1364,11 @@ export default function SessionPage() {
   }
 
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <SessionHeader sessionId={sessionId} />
 
-      <div className="mx-auto flex w-full max-w-[1700px] flex-1 gap-4 px-4 py-4">
-        <main className="flex min-w-0 flex-1 flex-col">
+      <div className="mx-auto flex min-h-0 w-full max-w-[1700px] flex-1 gap-4 px-4 py-4">
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <span className="inline-flex items-center gap-1">
@@ -1459,20 +1466,20 @@ export default function SessionPage() {
             </div>
           ) : null}
 
-          <AgentTreePanel />
-          {hasSubagents ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setShowMerged((v) => !v)}
-                className="self-start rounded-md border border-border px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-accent"
-              >
-                {showMerged ? t("mergedTimeline.hide") : t("mergedTimeline.show")}
-              </button>
-              {showMerged ? <MergedTimelinePanel /> : null}
-            </>
-          ) : null}
-          <div ref={eventScrollRef} className="flex-1 space-y-0 overflow-y-auto pb-4">
+          <div ref={eventScrollRef} className="min-h-0 flex-1 space-y-0 overflow-y-auto pb-4">
+            <AgentTreePanel />
+            {hasSubagents ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowMerged((v) => !v)}
+                  className="self-start rounded-md border border-border px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-accent"
+                >
+                  {showMerged ? t("mergedTimeline.hide") : t("mergedTimeline.show")}
+                </button>
+                {showMerged ? <MergedTimelinePanel /> : null}
+              </>
+            ) : null}
             {eventList.length === 0 ? (
               <div className="rounded-2xl border border-border bg-card p-3 text-sm text-muted-foreground">
                 暂无会话事件，输入消息后开始。
@@ -1508,17 +1515,17 @@ export default function SessionPage() {
                 正在持续生成执行结果...
               </div>
             ) : null}
-          </div>
-
-          <div className="mt-3 border-t border-border bg-surface-1 pt-3">
             <SessionTaskDock
-              className="mb-3"
+              className="mb-3 mt-3"
               summary={progressSummary}
               files={currentSessionFiles}
               running={sessionRunning}
               onPreviewFile={handleTaskDockPreviewFile}
               onDownloadFile={handleTaskDockDownloadFile}
             />
+          </div>
+
+          <div className="mt-3 border-t border-border bg-surface-1 pt-3">
             {sandboxDestroyed ? (
               <div className="flex flex-col items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-5 text-center dark:border-red-500/30 dark:bg-red-500/10">
                 <XCircle size={24} className="text-red-500" />

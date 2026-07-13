@@ -3,6 +3,7 @@
 import { ExternalLink, Globe, ImageOff } from "lucide-react";
 import { memo, useState } from "react";
 
+import { toDisplayImageUrl } from "@/components/tool-visual";
 import type { WorkbenchSnapshot } from "@/lib/session-ui";
 import { cn } from "@/lib/utils";
 
@@ -17,9 +18,7 @@ export const WorkbenchBrowserPreview = memo(function WorkbenchBrowserPreview({
 }: WorkbenchBrowserPreviewProps) {
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
   const screenshot = snapshot?.screenshot || "";
-  const screenshotSrc = /^https?:\/\//i.test(screenshot)
-    ? `/api/image-proxy?url=${encodeURIComponent(screenshot)}`
-    : screenshot;
+  const screenshotSrc = toDisplayImageUrl(screenshot);
   const pageUrl = snapshot?.url || "";
   const imageBroken = Boolean(screenshotSrc) && failedSrc === screenshotSrc;
 

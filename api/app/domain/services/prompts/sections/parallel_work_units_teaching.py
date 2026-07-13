@@ -71,6 +71,11 @@ directory-qualified, workspace-relative path (e.g. `api/utils/foo.py`,
 absolute path that resolves to the workspace root. A bare path is rejected
 before any child is dispatched. For a brand-new file with no natural package,
 put it in a subdirectory such as `workspace/` (e.g. `workspace/result.md`).
+Even when the user explicitly names an absolute workspace-root target (e.g.
+`/home/ubuntu/report.md`), do NOT copy it into `proposed_paths` — have the
+parallel step produce the file under a subdirectory (e.g.
+`workspace/report.md`), then add a follow-up sequential step that moves it to
+the user's requested location.
 
 Hard cap: 5 work_units per step.
 """
@@ -116,7 +121,10 @@ Schema:
 路径（例如 `api/utils/foo.py`、`workspace/notes.md`），禁止使用裸文件名（如
 `notes.md`），也禁止使用解析到 workspace 根目录的绝对路径。裸路径会在派发任何
 子 agent 之前被直接拒绝。新建文件若没有天然所属目录，请放到 `workspace/` 等
-子目录下（例如 `workspace/result.md`）。
+子目录下（例如 `workspace/result.md`）。即使用户明确点名 workspace 根目录的
+绝对路径（如 `/home/ubuntu/report.md`），也不要把它照抄进 `proposed_paths`——
+让并行步骤先产出到子目录（如 `workspace/report.md`），再安排一个后续串行步骤
+把文件移动到用户要求的位置。
 
 硬上限：每个 step 最多 5 个 work_units。
 """
@@ -225,8 +233,14 @@ def _render(ctx: RenderContext) -> SectionOutput:
     [S2 §3.5] When the shell-mode master flag is ALSO on, append the
     shell/tree schema extension so a flag-on real provider learns to emit
     ``shell_mode`` / ``proposed_trees``. Coordinator-on + shell-off ⇒
-    byte-for-byte the existing typed-only teaching (regression-safe)."""
-    if not is_coordinator_enabled():
+    byte-for-byte the existing typed-only teaching (regression-safe).
+
+    [child-pwu fix] ALSO suppressed when ``ctx.parallel_dispatch_allowed``
+    is False: coordinator children (and any runner without the subgraph
+    wired) cannot dispatch, so teaching them the schema only produces
+    emissions that get stripped at the parse boundary
+    (``main_graph._parallel_dispatch_allowed``)."""
+    if not is_coordinator_enabled() or not ctx.parallel_dispatch_allowed:
         return SectionOutput(text=None)
     is_en = ctx.lang == "en"
     text = (

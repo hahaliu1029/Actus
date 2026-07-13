@@ -946,6 +946,12 @@ class ChildRunnerSharedDeps:
     # D1a §4.1 注入链第 2 跳：root/child 共享同一 AdmissionPort 实例（admission 必须同源，
     # 与 B12 file_view child 自建 registry 先例不同）。None=off/legacy 向后兼容。
     extension_admission_port: object = None
+    # [child SPAWN_ACK fix] 每 pod 的 SupervisorRegistry 单例（main.py lifespan
+    # 构建，"mailbox plane mandatory"）。child runner 的
+    # ``_maybe_emit_spawn_ack_and_heartbeat`` 需要它做 best-effort ensure-parent-
+    # supervisor 再发 SPAWN_ACK/heartbeat；缺席时该路径整体跳过（supervisor 只能靠
+    # orphan_reconcile 兜底发现 child）。None=legacy/test 向后兼容（child 不自建）。
+    supervisor_registry: object = None
 
 
 def _make_shared_child_runner_builder(
@@ -1056,6 +1062,10 @@ def _make_shared_child_runner_builder(
             # (admission 必须同源). None when mode off. deps default None keeps
             # legacy/test child builds working unchanged.
             extension_admission_port=deps.extension_admission_port,
+            # [child SPAWN_ACK fix] Same per-pod SupervisorRegistry instance the
+            # root runners get — the child-side SPAWN_ACK/heartbeat path skips
+            # entirely when this is None (it can't confirm a consumer exists).
+            supervisor_registry=deps.supervisor_registry,
         )
 
     return _build

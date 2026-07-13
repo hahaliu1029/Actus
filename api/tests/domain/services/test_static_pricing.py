@@ -142,3 +142,43 @@ class TestComputeCost:
             for dim in ("input", "output", "cache_read", "cache_write", "reasoning")
         }
         assert compute_cost(None, price) is None
+
+
+class TestGlm5FamilyPriced:
+    """[child-budget fix] glm-5.2 is the live deployed model (root + coordinator
+    children). Unpriced, every coordinator child lands on the wallclock-only
+    budget rung ("token budget enforcement DISABLED" warning) and every glm
+    CostRecord stamps cost_status=unknown ($0.0000 in the UI). Rates from the
+    SAME source the existing ``glm`` entries cite: Z.AI official USD pricing
+    (https://docs.z.ai/guides/overview/pricing, fetched 2026-07-13).
+    """
+
+    def test_glm_5_2_priced(self) -> None:
+        p = get_price("glm-5.2", "glm")
+        assert p is not None
+        assert p["input"] == Decimal("1.4")
+        assert p["output"] == Decimal("4.4")
+        assert p["cache_read"] == Decimal("0.26")
+
+    def test_glm_5_1_priced(self) -> None:
+        p = get_price("glm-5.1", "glm")
+        assert p is not None
+        assert p["input"] == Decimal("1.4")
+        assert p["output"] == Decimal("4.4")
+
+    def test_glm_5_priced(self) -> None:
+        p = get_price("glm-5", "glm")
+        assert p is not None
+        assert p["input"] == Decimal("1.0")
+        assert p["output"] == Decimal("3.2")
+
+    def test_glm_5_2_suffixed_variant_prefix_falls_back(self) -> None:
+        """Dated/suffixed variants must longest-prefix-match glm-5.2, not
+        the shorter glm-5 key."""
+        assert get_price("glm-5.2-20260701", "glm") == get_price("glm-5.2", "glm")
+
+    def test_glm_5v_turbo_still_exact_match(self) -> None:
+        """Adding the glm-5 key must NOT shadow the existing exact entry."""
+        p = get_price("glm-5v-turbo", "glm")
+        assert p is not None
+        assert p["input"] == Decimal("1.2")

@@ -1078,6 +1078,161 @@ async def test_updater_node_sanitizes_parallel_work_units_flag_off(monkeypatch):
     assert all(s.parallel_work_units is None for s in plan.steps)
 
 
+async def test_updater_node_deduplicates_ids_against_completed_prefix():
+    """A replan must not reintroduce an already-completed step id.
+
+    The production incident expanded ``[1, 2]`` into ``[1(done), 1, 2]`` and
+    executed the search step twice.  IDs from the completed prefix are reserved;
+    a colliding updated step must receive a deterministic fallback id.
+    """
+    from app.domain.services.graphs.main_graph import build_main_graph
+
+    create_response = PlanResponse(
+        title="T",
+        goal="G",
+        language="zh",
+        steps=[
+            StepDef(id="1", description="first search"),
+            StepDef(id="2", description="write summary"),
+        ],
+        message="ok",
+    )
+    update_structured = AsyncMock()
+    update_structured.ainvoke = AsyncMock(
+        side_effect=[
+            PlanUpdateResponse(
+                steps=[
+                    StepDef(id="1", description="retry first search"),
+                    StepDef(id="2", description="write summary"),
+                ]
+            ),
+            PlanUpdateResponse(steps=[]),
+            PlanUpdateResponse(steps=[]),
+        ]
+    )
+    create_structured = AsyncMock()
+    create_structured.ainvoke = AsyncMock(return_value=create_response)
+    planner_llm = MagicMock()
+
+    def _wso(schema, **kwargs):
+        return create_structured if schema is PlanResponse else update_structured
+
+    planner_llm.with_structured_output = MagicMock(side_effect=_wso)
+
+    graph = build_main_graph(
+        _allow_default_prompt_assembler=True,
+        planner_llm=planner_llm,
+        react_graph=_make_mock_react_graph(),
+        summary_llm=planner_llm,
+        uow_factory=MagicMock(),
+        session_id="sess-updater-dedupe",
+    )
+    result = await graph.ainvoke(
+        {
+            "message": "do work",
+            "language": "zh",
+            "attachments": [],
+            "image_content_blocks": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-updater-dedupe",
+            "should_interrupt": False,
+            "resume_value": None,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        }
+    )
+
+    ids = [step.id for step in result["plan"].steps]
+    assert len(ids) == len(set(ids))
+    assert ids[0] == "1"
+    assert ids[1] != "1"
+    assert ids[2] == "2"
+
+
+async def test_executor_uses_tool_outputs_when_react_hits_iteration_limit():
+    """If ReAct stops immediately after a tool at its iteration cap, the last
+    AI content is only a pre-tool note.  The step result must retain the actual
+    tool output so updater does not mistake a long research step for no output.
+    """
+    from langchain_core.messages import ToolMessage
+    from app.domain.services.graphs.main_graph import build_main_graph
+
+    planner_llm = _make_structured_planner_llm(
+        create_response=PlanResponse(
+            title="T",
+            goal="G",
+            language="zh",
+            steps=[StepDef(id="1", description="research")],
+            message="ok",
+        )
+    )
+
+    class IterationLimitedReactGraph:
+        async def astream(self, input_state, config=None, **kwargs):
+            yield {
+                "tool_node": {
+                    "events": [],
+                    "messages": [
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": "call-1",
+                                    "name": "browser_view",
+                                    "args": {},
+                                }
+                            ],
+                        ),
+                        ToolMessage(
+                            content="关键产出：OpenAI 发布了新的企业级智能体功能。",
+                            tool_call_id="call-1",
+                            name="browser_view",
+                        ),
+                    ],
+                    "attempt_count": 30,
+                    "failure_count": 0,
+                    "should_interrupt": False,
+                }
+            }
+
+    graph = build_main_graph(
+        _allow_default_prompt_assembler=True,
+        planner_llm=planner_llm,
+        react_graph=IterationLimitedReactGraph(),
+        summary_llm=planner_llm,
+        uow_factory=MagicMock(),
+        session_id="sess-tool-summary",
+    )
+    result = await graph.ainvoke(
+        {
+            "message": "research news",
+            "language": "zh",
+            "attachments": [],
+            "image_content_blocks": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-tool-summary",
+            "should_interrupt": False,
+            "resume_value": None,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        }
+    )
+
+    assert "OpenAI 发布了新的企业级智能体功能" in result["plan"].steps[0].result
+
+
 class TestCoordinatorStepCompletion:
     """P0 — executor_node coordinator branch must complete a
     ``parallel_work_units`` step exactly like the react branch: mark it

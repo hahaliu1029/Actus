@@ -1063,3 +1063,22 @@ async def test_starter_passes_snapshot_limits_to_runner(monkeypatch):
     sl = captured["ctor"]["snapshot_limits"]
     assert sl.max_snapshot_paths == 20000
     assert sl.max_snapshot_seconds == 30.0
+
+
+def test_resolve_child_llm_price_finds_glm_5_2() -> None:
+    """[child-budget fix] Live regression: the deployed glm-5.2 child llm must
+    resolve a static price so BudgetEnforcementCallback attaches instead of
+    hitting the 'no static price … token budget enforcement DISABLED' rung."""
+    from types import SimpleNamespace
+
+    from app.application.services.coordinator_child_runner_starter import (
+        _resolve_child_llm_price,
+    )
+
+    llm = SimpleNamespace(
+        _identifying_params={"provider_id": "glm", "model": "glm-5.2"},
+        model_name="glm-5.2",
+    )
+    price = _resolve_child_llm_price(llm)
+    assert price is not None
+    assert price["input"] > 0 and price["output"] > 0

@@ -14,8 +14,11 @@ _SHELL_FIVE = (
 
 
 class _Ctx:
-    def __init__(self, lang="en"):
+    def __init__(self, lang="en", parallel_dispatch_allowed=True):
         self.lang = lang
+        # [child-pwu fix] mirror RenderContext's default so the stub keeps
+        # satisfying the section contract (render gates on this attr).
+        self.parallel_dispatch_allowed = parallel_dispatch_allowed
 
 
 def _render(ctx):

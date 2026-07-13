@@ -31,7 +31,7 @@ type SessionStoreState = {
   chatSessionId: string | null;
   agentTree: {
     rootId: string | null;
-    root: null;
+    root: { children: unknown[] } | null;
     byId: Record<string, never>;
     treeSignature: string | null;
     truncated: boolean;
@@ -113,6 +113,14 @@ vi.mock("@/components/markdown-renderer", () => ({
 
 vi.mock("@/components/session-header", () => ({
   SessionHeader: () => <div data-testid="session-header" />,
+}));
+
+vi.mock("@/components/session/agent-tree-panel", () => ({
+  AgentTreePanel: () => <div data-testid="agent-tree-panel" />,
+}));
+
+vi.mock("@/components/session/merged-timeline-panel", () => ({
+  MergedTimelinePanel: () => <div data-testid="merged-timeline-panel" />,
 }));
 
 vi.mock("@/components/session-task-dock", () => ({
@@ -225,6 +233,7 @@ describe("SessionPage", () => {
     sessionStoreState.isLoadingCurrentSession = false;
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;
+    sessionStoreState.agentTree.root = null;
     markdownRendererMock.mockClear();
     sessionApiMocks.startTakeover.mockClear();
     sessionApiMocks.viewFile.mockClear();
@@ -290,6 +299,75 @@ describe("SessionPage", () => {
     expect(screen.queryByText("正在执行中")).not.toBeInTheDocument();
   });
 
+  it("流式事件增长时只滚动事件区，不撑高外层页面", () => {
+    render(<SessionPage />);
+
+    const pageRoot = screen.getByTestId("session-header").parentElement;
+    expect(pageRoot).toHaveClass("h-full", "min-h-0", "overflow-hidden");
+    expect(pageRoot).not.toHaveClass("min-h-screen");
+
+    const contentRow = pageRoot?.children.item(1);
+    expect(contentRow).toHaveClass("min-h-0");
+
+    const main = contentRow?.querySelector("main");
+    expect(main).toHaveClass("min-h-0");
+
+    const eventScrollRegion = screen.getByText("暂无会话事件，输入消息后开始。")
+      .parentElement;
+    expect(eventScrollRegion).toHaveClass("min-h-0", "overflow-y-auto");
+  });
+
+  it("当前会话仍在流式执行时，最终消息也不启动平滑滚动", () => {
+    sessionStoreState.isChatting = true;
+    sessionStoreState.chatSessionId = "s-b";
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      events: [
+        {
+          event: "message",
+          data: {
+            event_id: "evt-final-before-done",
+            role: "assistant",
+            message: "最终消息",
+            partial: false,
+          },
+        },
+      ],
+    };
+
+    render(<SessionPage />);
+
+    expect(HTMLElement.prototype.scrollTo).toHaveBeenCalledWith({
+      top: 0,
+      behavior: "auto",
+    });
+  });
+
+  it("展开合并时间线后，时间线仍属于事件滚动区", () => {
+    sessionStoreState.agentTree.root = { children: [{}] };
+
+    render(<SessionPage />);
+    fireEvent.click(screen.getByRole("button", { name: "显示合并时间线" }));
+
+    const eventScrollRegion = screen.getByText("暂无会话事件，输入消息后开始。")
+      .parentElement;
+    expect(eventScrollRegion).toContainElement(screen.getByTestId("agent-tree-panel"));
+    expect(eventScrollRegion).toContainElement(
+      screen.getByTestId("merged-timeline-panel")
+    );
+  });
+
+  it("任务摘要属于事件滚动区，展开后可随主内容滚动", () => {
+    render(<SessionPage />);
+
+    const eventScrollRegion = screen.getByText("暂无会话事件，输入消息后开始。")
+      .parentElement;
+    expect(eventScrollRegion).toContainElement(screen.getByTestId("session-task-dock"));
+    expect(eventScrollRegion).not.toContainElement(screen.getByTestId("chat-input"));
+  });
+
   it("当前会话运行中且流式属于其他会话时，仍应轮询 fetchSessionById", async () => {
     sessionStoreState.isChatting = true;
     sessionStoreState.chatSessionId = "s-a";
@@ -310,6 +388,29 @@ describe("SessionPage", () => {
       expect(sessionStoreState.fetchSessionById).toHaveBeenCalledWith("s-b", {
         silent: true,
       });
+    });
+  });
+
+  it("当前会话流断开时不应因 effect 重建立即触发续流风暴", () => {
+    sessionStoreState.isChatting = true;
+    sessionStoreState.chatSessionId = "s-b";
+    sessionStoreState.currentSession = {
+      session_id: "s-b",
+      title: "B 会话",
+      status: "running",
+      events: [],
+    };
+
+    const { rerender } = render(<SessionPage />);
+    sessionStoreState.fetchSessionById.mockClear();
+    sessionStoreState.fetchSessionFiles.mockClear();
+
+    sessionStoreState.isChatting = false;
+    sessionStoreState.chatSessionId = null;
+    rerender(<SessionPage />);
+
+    expect(sessionStoreState.fetchSessionById).not.toHaveBeenCalledWith("s-b", {
+      silent: true,
     });
   });
 

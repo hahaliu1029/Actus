@@ -45,6 +45,14 @@ export function toImageProxyUrl(url: string): string {
 
 export function toDisplayImageUrl(url: string): string {
   if (/^https?:\/\//i.test(url)) {
+    try {
+      const hostname = new URL(url).hostname.toLowerCase();
+      if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
+        return url;
+      }
+    } catch {
+      // 保持原行为：格式错误的 HTTP(S) 地址交给代理路由统一返回错误。
+    }
     return toImageProxyUrl(url);
   }
   return url;

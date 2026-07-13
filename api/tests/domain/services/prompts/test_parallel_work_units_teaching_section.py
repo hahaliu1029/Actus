@@ -99,18 +99,20 @@ def test_flag_on_bundle_import_does_not_raise_section_validation() -> None:
     assert "OK" in result.stdout
 
 
-def _assemble_planner_prompt():
+def _assemble_planner_prompt(ctx: RenderContext | None = None):
     from app.domain.services.graphs.token_estimator import TokenEstimator
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.prompts.budget import SystemPromptBudget
     from app.domain.services.prompts.bundles.en import EN_PLANNER_REGISTRY
-    from app.domain.services.prompts.section import PromptMode, RenderContext
+    from app.domain.services.prompts.section import PromptMode
 
     assembler = PromptAssembler(
         budget=SystemPromptBudget(max_tokens=10000),
         token_estimator=TokenEstimator(),
     )
-    return assembler.assemble(EN_PLANNER_REGISTRY, RenderContext(lang="en"), PromptMode.FULL)
+    return assembler.assemble(
+        EN_PLANNER_REGISTRY, ctx or RenderContext(lang="en"), PromptMode.FULL
+    )
 
 
 def test_flag_off_assembled_planner_prompt_omits_teaching(
@@ -129,3 +131,53 @@ def test_flag_on_assembled_planner_prompt_includes_teaching(
     result = _assemble_planner_prompt()
     assert "parallel_work_units" in result.text
     assert "parallel_work_units_teaching" in result.sections_included
+
+
+def test_flag_on_child_ctx_renders_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """[child-pwu fix] A coordinator child cannot dispatch parallel work
+    units (no subgraph wired, depth cap = 1) — teaching it the schema only
+    makes its planner emit steps that get stripped at the parse boundary.
+    ctx.parallel_dispatch_allowed=False must suppress the section even
+    flag-ON."""
+    monkeypatch.setenv(_FLAG, "true")
+    out = parallel_work_units_teaching_section.render(
+        RenderContext(lang="zh", parallel_dispatch_allowed=False)
+    )
+    assert out.text is None
+
+
+def test_flag_on_child_assembled_planner_prompt_omits_teaching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[child-pwu fix] End-to-end: a child-shaped RenderContext keeps the
+    teaching out of the assembled planner prompt."""
+    monkeypatch.setenv(_FLAG, "true")
+    result = _assemble_planner_prompt(
+        RenderContext(lang="en", parallel_dispatch_allowed=False)
+    )
+    assert "parallel_work_units_teaching" not in result.sections_included
+
+
+def test_teaching_covers_user_named_absolute_root_paths_en(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[dispatch-fallback fix] Live 2026-07-13: user asked for
+    /home/ubuntu/part_*.md, planner copied the absolute paths verbatim and
+    dispatch rejected pre-spawn. Teach the produce-then-move pattern
+    explicitly so the planner keeps parallelism AND satisfies the user's
+    literal target location."""
+    monkeypatch.setenv(_FLAG, "true")
+    out = parallel_work_units_teaching_section.render(RenderContext(lang="en"))
+    assert out.text is not None
+    assert "absolute" in out.text.lower()
+    assert "move" in out.text.lower()
+
+
+def test_teaching_covers_user_named_absolute_root_paths_zh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_FLAG, "true")
+    out = parallel_work_units_teaching_section.render(RenderContext(lang="zh"))
+    assert out.text is not None
+    assert "绝对路径" in out.text
+    assert "移动" in out.text

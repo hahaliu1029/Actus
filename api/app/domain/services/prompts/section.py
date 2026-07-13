@@ -118,6 +118,16 @@ class RenderContext:
     ``None``（默认）= section 渲染 text=None，所有非召回调用点
     byte-identical（INV-B8-OFF）。executor/updater 永不填充此字段。
     """
+    parallel_dispatch_allowed: bool = True
+    """[child-pwu fix] Whether the invoking runner can actually dispatch
+    ``parallel_work_units`` (True only when the coordinator subgraph is
+    wired into configurable — root runners with real coord_deps).
+    Coordinator children / legacy runners get False so the
+    ``parallel_work_units_teaching`` section stops teaching a schema whose
+    emissions would only be stripped at the parse boundary
+    (``main_graph._parallel_dispatch_allowed``). Default True keeps every
+    non-threaded call site (executor ctx, fixtures, tests) byte-identical.
+    """
 
 
 # ---- SectionOutput ------------------------------------------------------ #

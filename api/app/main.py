@@ -677,6 +677,11 @@ async def lifespan(app: FastAPI):
                 # D1a §4.1 注入链第 2 跳：root/child 共享同一 AdmissionPort 实例
                 # （admission 必须同源）。None when mode off. Built earlier in lifespan.
                 extension_admission_port=app.state.extension_admission_port,
+                # [child SPAWN_ACK fix] 每 pod SupervisorRegistry 单例——与 root 的
+                # _build_agent_service(supervisor_registry=...) 同源。lazy getattr：
+                # 单例在本 def 之后、任何 child dispatch 之前构建（resolver 只在
+                # dispatch 时调用）；getattr 兜底 None 保持 legacy/test 路径不炸。
+                supervisor_registry=getattr(app.state, "supervisor_registry", None),
             )
 
         coord_deps = None

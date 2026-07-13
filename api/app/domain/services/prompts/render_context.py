@@ -104,6 +104,7 @@ def build_render_context(
     memory_snapshot: "MemorySnapshot | None" = None,
     team_members: "tuple[tuple[str, str], ...] | None" = None,
     recalled_memory: "RecalledMemory | None" = None,
+    parallel_dispatch_allowed: bool = True,
 ) -> RenderContext:
     """Build a ``RenderContext`` from LangGraph state + config + AgentConfig.
 
@@ -167,4 +168,5 @@ def build_render_context(
         memory_snapshot=memory_snapshot,
         team_members=team_members,
         recalled_memory=recalled_memory,
+        parallel_dispatch_allowed=parallel_dispatch_allowed,
     )

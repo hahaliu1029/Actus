@@ -454,8 +454,65 @@ def _assign_fallback_step_id(plan_id: str, index: int) -> str:
     return f"step_{plan_id}_{index:02d}"
 
 
+def _parallel_dispatch_allowed(config: Any) -> bool:
+    """Whether this graph invocation has a usable coordinator backend."""
+    configurable = (config.get("configurable") or {}) if config else {}
+    return configurable.get("parallel_execution_subgraph") is not None
+
+
+def _pwu_paths_contract_ok(step: Any) -> bool:
+    """[dispatch-fallback fix] Pre-flight the single-path contract over every
+    ``proposed_paths`` entry BEFORE entering the parallel branch.
+
+    Live 2026-07-13: the user asked for ``/home/ubuntu/part_{a,b,c}.md``, the
+    planner copied those absolute workspace-root paths verbatim, dispatch
+    rejected the WHOLE step pre-spawn (``CoordinatorPathContractError``) and —
+    because a single-step plan gets no replan round — the session ended
+    "completed" with ZERO files written. Checking here lets executor_node
+    route the step through the normal ReAct branch instead (work still gets
+    done, sequentially), with zero coordinator side effects and no duplicate
+    StepEvents. ``_build_work_units_from_requests``
+    (parallel_execution_subgraph.py) remains the authoritative gate — this
+    uses the SAME ``validate_coordinator_path`` so the two can't drift.
+
+    Fail-open on anything that is NOT a contract error: a weird pwu shape
+    falls through to the parallel branch where the authoritative gate keeps
+    today's graceful-FAILED behavior (e.g. cross-unit tree overlap, team
+    errors — those are not per-path checks and stay out of scope here).
+    """
+    pwu = getattr(step, "parallel_work_units", None)
+    if pwu is None:
+        return True
+    from app.domain.models.path_validation import (
+        CoordinatorPathContractError,
+        validate_coordinator_path,
+    )
+    try:
+        for wu in getattr(pwu, "work_units", None) or ():
+            for p in getattr(wu, "proposed_paths", None) or ():
+                validate_coordinator_path(p.path)
+    except CoordinatorPathContractError as exc:
+        logger.warning(
+            "executor_node: step %s parallel dispatch pre-check failed — "
+            "invalid proposed_path (%s); falling back to sequential ReAct so "
+            "the work still gets done (coordinator paths must be "
+            "directory-qualified workspace-relative, e.g. 'workspace/foo.md')",
+            getattr(step, "id", "?"), exc,
+        )
+        return False
+    except Exception:  # noqa: BLE001 — fail-open: let the authoritative gate decide
+        logger.debug(
+            "executor_node: pwu path pre-check errored non-contractually; "
+            "deferring to the dispatch-side validator", exc_info=True,
+        )
+    return True
+
+
 def _build_plan_from_response(
-    response: PlanResponse, *, plan_id: str | None = None
+    response: PlanResponse,
+    *,
+    plan_id: str | None = None,
+    allow_parallel_work_units: bool = True,
 ) -> Plan:
     """[C2 PR-1 §4.2 r7 P0-2] Build a Plan from a PlanResponse.
 
@@ -493,7 +550,10 @@ def _build_plan_from_response(
         from app.domain.services.coordinator_feature_flag import (
             is_coordinator_enabled,
         )
-        _pwu = sd.parallel_work_units if is_coordinator_enabled() else None
+        _coordinator_available = (
+            is_coordinator_enabled() and allow_parallel_work_units
+        )
+        _pwu = sd.parallel_work_units if _coordinator_available else None
         steps.append(
             Step(
                 id=step_id,
@@ -815,6 +875,10 @@ def build_main_graph(
         ctx = build_render_context(
             state, planner_config, agent_config, team_members=team_members,
             recalled_memory=recall,
+            # [child-pwu fix] Children (no subgraph in the REAL config) must
+            # not be taught a schema they cannot dispatch — emissions would
+            # only be stripped at the parse boundary below.
+            parallel_dispatch_allowed=_parallel_dispatch_allowed(config),
         )
         result = prompt_assembler.assemble(
             section_bundle.planner,
@@ -874,7 +938,10 @@ def build_main_graph(
             title=parsed.title or "Task",
             goal=parsed.goal or state["message"],
             language=parsed.language or state.get("language", "zh"),
-            steps=_build_plan_from_response(parsed).steps,
+            steps=_build_plan_from_response(
+                parsed,
+                allow_parallel_work_units=_parallel_dispatch_allowed(config),
+            ).steps,
             message=parsed.message or "",
             status=ExecutionStatus.RUNNING,
         )
@@ -970,7 +1037,29 @@ def build_main_graph(
         # to the coordinator subgraph instead of react_graph. Hard-gated by
         # ``assert_coordinator_enabled()`` so an env var typo cannot silently
         # enable the cold code path.
-        if getattr(step, "parallel_work_units", None) is not None:
+        # [child-pwu fix] ALSO gated on ``_parallel_dispatch_allowed``: a step
+        # carrying pwu on a runner without the subgraph (coordinator child
+        # resuming a stale pre-sanitation checkpoint) falls through to the
+        # react branch instead of dying on the ``_run_parallel_backend``
+        # guard — loudly, so mis-wired roots stay diagnosable.
+        if (
+            getattr(step, "parallel_work_units", None) is not None
+            and not _parallel_dispatch_allowed(config)
+        ):
+            logger.warning(
+                "executor_node: step %s carries parallel_work_units but no "
+                "parallel_execution_subgraph is wired (coordinator child or "
+                "stale checkpoint) — executing sequentially via ReAct",
+                getattr(step, "id", "?"),
+            )
+        if (
+            getattr(step, "parallel_work_units", None) is not None
+            and _parallel_dispatch_allowed(config)
+            # [dispatch-fallback fix] Contract-invalid proposed_paths would be
+            # rejected by dispatch pre-spawn anyway; degrade to ReAct HERE so
+            # the step's work still gets done (warning logged in the helper).
+            and _pwu_paths_contract_ok(step)
+        ):
             from app.domain.services.coordinator_feature_flag import (
                 assert_coordinator_enabled,
             )
@@ -1252,14 +1341,36 @@ def build_main_graph(
         # attachments into every subsequent step.
         summary = ""
         step_attachments: list[str] = []
+        last_ai_message: AIMessage | None = None
         for msg in reversed(all_react_messages):
-            if isinstance(msg, AIMessage) and msg.content:
+            if isinstance(msg, AIMessage):
+                if last_ai_message is None:
+                    last_ai_message = msg
+                if not msg.content:
+                    continue
                 content_str = (
                     msg.content if isinstance(msg.content, str) else str(msg.content)
                 )
-                summary = content_str[:500]
-                _, step_attachments = unwrap_message_envelope(content_str)
+                display_text, step_attachments = unwrap_message_envelope(content_str)
+                summary = display_text[:500]
                 break
+
+        # When ReAct stops immediately after a tool call (most commonly at its
+        # iteration cap), the last AI content is only a pre-tool note. Preserve
+        # the actual recent tool outputs for updater_node instead of reporting
+        # that note as the step's sole result.
+        if last_ai_message is not None and last_ai_message.tool_calls:
+            recent_tool_messages = [
+                msg
+                for msg in all_react_messages
+                if isinstance(msg, ToolMessage) and msg.content
+            ][-3:]
+            if recent_tool_messages:
+                summary = "\n\n".join(
+                    f"[{msg.name or 'tool'}]\n"
+                    f"{truncate_tool_content(str(msg.content), max_chars=600)}"
+                    for msg in recent_tool_messages
+                )[:2000]
 
         # Detect step success from react_graph's accumulated failure_count
         step_success = react_final.get("failure_count", 0) == 0
@@ -1460,7 +1571,11 @@ def build_main_graph(
                 # skip the snapshot fetch. See ``memory_snapshot_provider``
                 # docstring.
                 ctx = build_render_context(
-                    state, updater_config, agent_config, team_members=team_members
+                    state, updater_config, agent_config, team_members=team_members,
+                    # [child-pwu fix] Same suppression as planner_node — the
+                    # updater registry shares the teaching section and its
+                    # re-plan emissions are stripped by the same gate below.
+                    parallel_dispatch_allowed=_parallel_dispatch_allowed(config),
                 )
                 result = prompt_assembler.assemble(
                     section_bundle.updater,
@@ -1486,27 +1601,51 @@ def build_main_graph(
                     from app.domain.services.coordinator_feature_flag import (
                         is_coordinator_enabled,
                     )
-                    _coord_on = is_coordinator_enabled()
-                    new_steps = [
-                        Step(
-                            description=s.description,
-                            id=s.id or _assign_fallback_step_id(plan.id, i),
-                            parallel_work_units=(
-                                s.parallel_work_units if _coord_on else None
-                            ),
+                    _coord_on = (
+                        is_coordinator_enabled()
+                        and _parallel_dispatch_allowed(config)
+                    )
+                    first_pending_index = next(
+                        (
+                            idx
+                            for idx, existing in enumerate(plan.steps)
+                            if not existing.done
+                        ),
+                        None,
+                    )
+                    reserved_ids = {
+                        existing.id
+                        for existing in (
+                            plan.steps[:first_pending_index]
+                            if first_pending_index is not None
+                            else plan.steps
                         )
-                        for i, s in enumerate(parsed_obj.steps)
-                        if s.description
-                    ]
+                    }
+                    new_steps: list[Step] = []
+                    for i, step_def in enumerate(parsed_obj.steps):
+                        if not step_def.description:
+                            continue
+                        step_id = step_def.id
+                        fallback_index = i
+                        while not step_id or step_id in reserved_ids:
+                            step_id = _assign_fallback_step_id(
+                                plan.id, fallback_index
+                            )
+                            fallback_index += 1
+                        reserved_ids.add(step_id)
+                        new_steps.append(
+                            Step(
+                                description=step_def.description,
+                                id=step_id,
+                                parallel_work_units=(
+                                    step_def.parallel_work_units
+                                    if _coord_on
+                                    else None
+                                ),
+                            )
+                        )
 
                     if new_steps:
-                        # Find first pending step index
-                        first_pending_index = None
-                        for idx, s in enumerate(plan.steps):
-                            if not s.done:
-                                first_pending_index = idx
-                                break
-
                         if first_pending_index is not None:
                             # Preserve completed steps, replace pending with new
                             merged = list(plan.steps[:first_pending_index]) + new_steps

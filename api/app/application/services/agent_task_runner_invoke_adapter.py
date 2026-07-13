@@ -165,6 +165,11 @@ class AgentTaskRunnerInvokeAdapter:
                     )
                 continue
             if isinstance(event, ErrorEvent):
+                # AgentTaskRunner emits ErrorEvent before its terminal session
+                # write.  Let that bounded write finish before propagating the
+                # failure; otherwise invoke_until_done's unwind guard cancels
+                # the task and can leave the child row stuck RUNNING.
+                await self._await_task_done_bounded(task, grace_seconds=5.0)
                 raise ChildInnerRunError(event.error or "child runner error")
             if isinstance(event, DoneEvent):
                 # R3 P1 — cost-flush race: AgentTaskRunner.invoke emits DoneEvent

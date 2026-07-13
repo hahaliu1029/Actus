@@ -102,6 +102,16 @@ PRICING_TABLE: dict[str, dict[str, dict[str, Decimal]]] = {
         "glm-5v-turbo": _price(
             "1.2", "4.0", cache_read="0.24", reasoning="4.0"
         ),
+        # GLM-5.x text family — same source, re-fetched 2026-07-13. The page
+        # lists no separate thinking-token rate; mirror the glm-5v-turbo
+        # convention (reasoning billed at the output rate) so adapters that
+        # report reasoning tokens separately don't undercount.
+        # [child-budget fix] Unpriced glm-5.2 put every coordinator child on
+        # the wallclock-only budget rung and stamped cost_status=unknown on
+        # every glm CostRecord.
+        "glm-5.2": _price("1.4", "4.4", cache_read="0.26", reasoning="4.4"),
+        "glm-5.1": _price("1.4", "4.4", cache_read="0.26", reasoning="4.4"),
+        "glm-5": _price("1.0", "3.2", cache_read="0.2", reasoning="3.2"),
     },
 }
 

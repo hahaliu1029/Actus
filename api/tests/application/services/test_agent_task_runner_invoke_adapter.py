@@ -143,6 +143,42 @@ async def test_adapter_waits_for_task_done_after_done_event():
     assert isinstance(result.done_event, DoneEvent)  # returned only after done flipped
 
 
+async def test_adapter_waits_for_task_done_after_error_event():
+    """The runner writes ErrorEvent before its terminal session status.  The
+    adapter must let that bounded terminal write finish before propagating the
+    child failure, otherwise its unwind cancellation leaves a RUNNING zombie.
+    """
+    created: list[_FakeTask] = []
+
+    class _SlowErrorTerminalTask(_FakeTask):
+        @classmethod
+        def create(cls, *, task_runner):
+            task = cls(task_runner)
+            created.append(task)
+            return task
+
+        async def invoke(self):
+            await self.output_stream.put(ErrorEvent(error="boom").model_dump_json())
+
+            async def _finish_terminal_write():
+                await asyncio.sleep(0.03)
+                self.done = True
+
+            asyncio.create_task(_finish_terminal_write())
+
+    adapter = AgentTaskRunnerInvokeAdapter(
+        runner=_ScriptedRunner([]),
+        cancel_event=asyncio.Event(),
+        task_cls=_SlowErrorTerminalTask,
+    )
+
+    with pytest.raises(ChildInnerRunError, match="boom"):
+        await adapter.invoke_until_done(user_message="x")
+
+    assert created[0].done is True
+    assert created[0].cancelled_with is None
+
+
 async def test_adapter_raises_when_task_done_without_terminal_event():
     """Runner emits zero events, task flips done, cancel NOT set → the drain
     sees a None pull with task.done and raises (not a silent empty result)."""

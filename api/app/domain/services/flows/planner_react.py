@@ -468,6 +468,20 @@ class PlannerReActFlow(BaseFlow):
             return ""
         return self._skill_context_provider()
 
+    def _parallel_dispatch_capable(self) -> bool:
+        """[child-pwu fix] Whether THIS flow can dispatch parallel work units.
+
+        True only when real coord_deps carry a ``parallel_execution_subgraph``
+        (root runners). Coordinator children get the Null sentinel and legacy
+        test stubs may lack ``_coord_deps`` entirely — both mean False, so
+        detection-path teaching and parse keep pwu out of undispatchable
+        plans (mirrors ``main_graph._parallel_dispatch_allowed``).
+        """
+        coord_deps = getattr(self, "_coord_deps", None)
+        return (
+            getattr(coord_deps, "parallel_execution_subgraph", None) is not None
+        )
+
     # -- Tool collection sub-methods ------------------------------------------
 
     def _collect_native_tools(self) -> list:
@@ -1542,6 +1556,10 @@ class PlannerReActFlow(BaseFlow):
             detection_state, detection_config, self._agent_config,
             team_members=team_members,
             recalled_memory=recalled_memory,
+            # [child-pwu fix] Mirror the detection-parse gate below: without a
+            # real subgraph (coordinator child / Null coord_deps) the teaching
+            # section must not train the planner on an undispatchable schema.
+            parallel_dispatch_allowed=self._parallel_dispatch_capable(),
         )
         result = self._prompt_assembler.assemble(
             section_bundle.planner,
@@ -1608,7 +1626,10 @@ class PlannerReActFlow(BaseFlow):
             _build_plan_from_response,
         )
 
-        steps = _build_plan_from_response(parsed).steps
+        steps = _build_plan_from_response(
+            parsed,
+            allow_parallel_work_units=self._parallel_dispatch_capable(),
+        ).steps
         if not steps:
             steps = [
                 Step(
@@ -2102,7 +2123,11 @@ class PlannerReActFlow(BaseFlow):
                 self._deferred_summaries = summaries
 
     async def _persist_after_graph(
-        self, final: dict, summaries: list[ConversationSummary],
+        self,
+        final: dict,
+        summaries: list[ConversationSummary],
+        *,
+        allow_llm: bool = True,
     ) -> None:
         """Post-graph persistence: save memory and summaries.
 
@@ -2112,14 +2137,22 @@ class PlannerReActFlow(BaseFlow):
         因此整个方法用 try/except 包裹，确保永不向上抛出异常。
         """
         try:
-            await self._persist_after_graph_inner(final, summaries)
+            await self._persist_after_graph_inner(
+                final,
+                summaries,
+                allow_llm=allow_llm,
+            )
         except Exception as exc:
             logger.exception(
                 "持久化后处理异常（已抑制，避免破坏 generator 清理链）: %s", exc
             )
 
     async def _persist_after_graph_inner(
-        self, final: dict, summaries: list[ConversationSummary],
+        self,
+        final: dict,
+        summaries: list[ConversationSummary],
+        *,
+        allow_llm: bool = True,
     ) -> None:
         """Inner implementation of post-graph persistence.
 
@@ -2137,12 +2170,14 @@ class PlannerReActFlow(BaseFlow):
             dict_messages = []
 
         # Evaluate flush gate BEFORE Memory construction (uses raw_messages)
-        try:
-            await self._evaluate_flush_gate(
-                raw_messages, final.get("plan") or self.plan,
-            )
-        except Exception as exc:
-            logger.warning("flush gate 评估失败: %s", exc)
+        self._pending_flush_batch = None
+        if allow_llm:
+            try:
+                await self._evaluate_flush_gate(
+                    raw_messages, final.get("plan") or self.plan,
+                )
+            except Exception as exc:
+                logger.warning("flush gate 评估失败: %s", exc)
 
         if final.get("should_interrupt"):
             # Checkpointer has automatically saved full graph state for Command(resume=...).
@@ -2176,7 +2211,8 @@ class PlannerReActFlow(BaseFlow):
 
             # ConversationSummary 生成（容错，不阻塞）
             plan = final.get("plan") or self.plan
-            if (self._memory_config.summary_enabled
+            if (allow_llm
+                    and self._memory_config.summary_enabled
                     and plan
                     and len(plan.steps) >= self._memory_config.summary_min_steps):
                 try:
@@ -2190,10 +2226,11 @@ class PlannerReActFlow(BaseFlow):
                     logger.warning(f"生成对话摘要失败，不阻塞: {e}")
 
             # 上下文溢出检测
-            try:
-                await self._check_overflow(memory)
-            except Exception as e:
-                logger.warning(f"上下文溢出检测失败: {e}")
+            if allow_llm:
+                try:
+                    await self._check_overflow(memory)
+                except Exception as e:
+                    logger.warning(f"上下文溢出检测失败: {e}")
 
             # 正常完成：重置状态
             self.status = FlowStatus.IDLE
