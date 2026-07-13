@@ -46,6 +46,48 @@ services:
     networks:
       - actus-net
 
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SITE_REGION: ${MINIO_REGION:-us-east-1}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - actus-net
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_BUCKET_NAME: ${MINIO_BUCKET_NAME:-a2a-mcp}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
+        mc mb --ignore-existing --region "$${MINIO_REGION}" "local/$${MINIO_BUCKET_NAME}"
+    networks:
+      - actus-net
+
   api:
     build:
       context: ./api
@@ -65,6 +107,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       CONTAINER_TIMEZONE: ${TZ:-Asia/Shanghai}
@@ -77,11 +121,13 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: ${REDIS_PORT:-6379}
       REDIS_DB: ${REDIS_DB:-0}
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-      MINIO_REGION: ${MINIO_REGION:-}
-      MINIO_SECURE: ${MINIO_SECURE:-true}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT:-localhost:${MINIO_API_PORT:-9000}}"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_SECURE: ${MINIO_PUBLIC_SECURE:-false}
       MINIO_BUCKET_NAME: ${MINIO_BUCKET_NAME:-a2a-mcp}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required - set it in .env}  # ⚠️ 必须在 .env 中设置
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-actus-sandbox:latest}
@@ -235,6 +281,7 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  minio-data:
   api-data:
 
 networks:

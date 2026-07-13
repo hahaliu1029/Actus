@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 
 def _image_url_block(url: str, detail: str = "auto") -> dict:
@@ -30,7 +31,8 @@ async def select_image_transport(
 
     分支（spec §3）:
     - data: URL → profile None/accepts_image_base64 → 原样保留; 否则 text placeholder
-    - http(s) + accepts_image_url(或 profile None) → 保留 URL
+    - 非 loopback http(s) + accepts_image_url(或 profile None) → 保留 URL
+    - loopback http(s) → 仅 base64 或 placeholder，绝不把 URL 直接交给 LLM
     - 无可用 URL / accepts_image_url=False → accepts_image_base64 时拉 bytes 转 base64;
       拉取失败或禁 base64 → text placeholder（不回退 http URL，那会再触发 rewrite 崩）
     """
@@ -42,7 +44,18 @@ async def select_image_transport(
             return _image_url_block(display_url, detail)
         return _text_placeholder(filename)
 
-    if has_url and (profile is None or profile.accepts_image_url):
+    try:
+        parsed_url = urlsplit(display_url)
+        is_loopback_http = (
+            parsed_url.scheme.lower() in {"http", "https"}
+            and parsed_url.hostname in {"localhost", "127.0.0.1", "::1"}
+        )
+    except ValueError:
+        is_loopback_http = False
+
+    if has_url and not is_loopback_http and (
+        profile is None or profile.accepts_image_url
+    ):
         return _image_url_block(display_url, detail)
 
     # 无 URL / provider 禁 URL → base64 或 placeholder

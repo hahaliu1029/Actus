@@ -8,7 +8,7 @@ Content-Type image/* 校验。
 from __future__ import annotations
 
 import logging
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ class MinioFileViewImageResolver:
     def __init__(self, file_storage, allowlist_host: str) -> None:
         # file_storage: MinioFileStorage — 有 .bucket 属性 + async get_bytes(ref)
         self._file_storage = file_storage
-        self._allowlist_host = allowlist_host  # settings.minio_endpoint, e.g. "minio:9000"
+        self._allowlist_host = allowlist_host  # effective_minio_public_endpoint, e.g. "localhost:9000"
 
     async def load_image_bytes(self, display_url: str, *, max_bytes: int) -> bytes | None:
         # R1#P2-2: SSRF 硬门统一到入口——host 必须 == 配置 MinIO endpoint（storage-first
@@ -50,7 +50,7 @@ class MinioFileViewImageResolver:
             parsed = urlparse(url)
             if parsed.scheme not in ("http", "https"):
                 return None
-            path = parsed.path.lstrip("/")  # "{bucket}/{object...}"
+            path = unquote(parsed.path).lstrip("/")  # "{bucket}/{object...}"
             bucket = getattr(self._file_storage, "bucket", None)
             if bucket and path.startswith(f"{bucket}/"):
                 return path[len(bucket) + 1:]

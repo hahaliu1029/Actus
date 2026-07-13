@@ -1,5 +1,6 @@
 """B12 P1: MinioFileViewImageResolver storage-first + allowlist SSRF 门。"""
 import asyncio
+from unittest.mock import AsyncMock
 
 
 class _FakeStorage:
@@ -24,6 +25,38 @@ def test_storage_first_hit_returns_bytes() -> None:
     out = asyncio.run(resolver.load_image_bytes(
         "https://minio:9000/manus/images/a.png?X-Amz-Sig=abc", max_bytes=1024))
     assert out == b"PNGDATA"
+
+
+def test_public_endpoint_allowlist_uses_storage_first() -> None:
+    resolver = _make_resolver(
+        _FakeStorage({"images/a.png": b"PUBLIC-ENDPOINT-DATA"}),
+        allow="localhost:19000",
+    )
+    out = asyncio.run(resolver.load_image_bytes(
+        "http://localhost:19000/manus/images/a.png?X-Amz-Sig=abc",
+        max_bytes=1024,
+    ))
+    assert out == b"PUBLIC-ENDPOINT-DATA"
+
+
+def test_encoded_object_key_is_unquoted_for_storage_first() -> None:
+    original_key = "images/a.png?name#space 100%.png"
+    resolver = _make_resolver(
+        _FakeStorage({original_key: b"ENCODED-PATH-DATA"}),
+        allow="localhost:19000",
+    )
+    resolver._http_fallback = AsyncMock(
+        side_effect=AssertionError("encoded key must resolve through storage-first"),
+    )
+
+    out = asyncio.run(resolver.load_image_bytes(
+        "http://localhost:19000/manus/"
+        "images/a.png%3Fname%23space%20100%25.png",
+        max_bytes=1024,
+    ))
+
+    assert out == b"ENCODED-PATH-DATA"
+    resolver._http_fallback.assert_not_awaited()
 
 
 def test_storage_first_oversize_returns_none() -> None:

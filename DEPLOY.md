@@ -10,19 +10,18 @@ Compose 会启动或构建以下组件：
 
 - `postgres`：持久化会话、用户、文件元数据
 - `redis`：限流、状态、Embedding 缓存与部分运行时协调
+- `minio`：仅绑定 loopback 的本地对象存储
+- `minio-init`：幂等创建 API 使用的 `a2a-mcp` bucket
 - `sandbox-image`：仅用于构建沙箱镜像，不常驻运行
 - `api`：FastAPI 后端
 - `ui-app`：Next.js 运行时
 - `ui`：nginx 网关，对外暴露前端入口
 - `tunnel`：（可选，需显式启用 profile）autossh 反向隧道，将 API 暴露到云服务器
 
-Compose **不会** 启动 MinIO。你需要在外部提供一个可访问的 MinIO / S3 兼容服务，并提前创建 bucket。
-
 ## 1. 前置条件
 
 - Docker Engine + Docker Compose v2
 - 至少 6 GB Docker 可用内存
-- 可访问的 MinIO / S3 兼容对象存储
 - 可访问的 LLM 提供商 API
 
 ## 2. 配置环境变量
@@ -37,18 +36,27 @@ cp .env.example .env
 
 - `POSTGRES_PASSWORD`
 - `JWT_SECRET_KEY`
-- `MINIO_ENDPOINT`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
-- `MINIO_BUCKET_NAME`
 - `NEXT_PUBLIC_API_BASE_URL`
 
 补充说明：
 
 - `NEXT_PUBLIC_API_BASE_URL` 是**构建时注入**的前端 API 地址，必须是浏览器可访问的 URL
-- `MINIO_BUCKET_NAME` 对应的 bucket 需要事先存在
 - `SANDBOX_IMAGE` 默认是 `actus-sandbox:latest`
 - 如需调整浏览器接管能力，可额外配置 `SANDBOX_CHROME_ARGS`
+
+标准 Docker Compose 是本地开发拓扑：默认启动本地 MinIO，`minio-init` 会在 API
+启动前幂等创建 `a2a-mcp`。S3 API 为 `http://127.0.0.1:9000`，管理控制台为
+`http://127.0.0.1:9001`，二者仅绑定 loopback，凭据来自 `MINIO_ACCESS_KEY` /
+`MINIO_SECRET_KEY`。修改 `MINIO_API_PORT` 后，public endpoint 自动变为
+`localhost:<port>`；高级场景可设置 `MINIO_PUBLIC_ENDPOINT` /
+`MINIO_PUBLIC_SECURE`。根目录 `.env` 中旧的 `MINIO_ENDPOINT` 不控制标准 Compose；
+容器内 API 始终通过 `minio:9000` 访问本地服务。
+
+从远程对象存储切换到本地 MinIO 会得到新的空数据集，不自动迁移；旧附件仍保留在原
+远程 S3，需要另行规划数据迁移。Compose 固定的归档 MinIO release 镜像不作为生产基线。
+生产部署及远程 URL 消费者应使用部署者维护的远程 S3 或受保护的 TLS endpoint。
 
 ## 3. 启动全部服务
 
@@ -59,7 +67,7 @@ docker compose --env-file .env up -d --build
 首次启动时，后端会：
 
 - 自动执行 Alembic 迁移
-- 初始化 PostgreSQL / Redis / MinIO 客户端
+- 初始化 PostgreSQL / Redis / MinIO 客户端；`minio-init` 完成后才启动 API
 - 如果 `/app/data/config.yaml` 不存在，则创建默认运行时配置
 
 ## 4. 初始化管理员
@@ -147,6 +155,7 @@ docker compose down -v
 
 - `postgres-data`
 - `redis-data`
+- `minio-data`
 - `api-data`
 
 ## 9. 更新沙箱代码后的重建方式
@@ -172,6 +181,9 @@ docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
 # 生成 SSH 密钥并配置，详见 tunnel/README.md
 docker compose --profile tunnel up -d tunnel
 ```
+
+`tunnel` profile 只转发 API，不转发本地 MinIO。MCP 或其他远程 URL 直接拉取方需要
+能够访问单独配置的 remote/public endpoint。
 
 ## 11. 常见注意事项
 

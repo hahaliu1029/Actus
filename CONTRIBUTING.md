@@ -28,7 +28,6 @@
 - Node.js 22+（前端）
 - Docker + Docker Compose v2
 - PostgreSQL、Redis
-- 可访问的 MinIO / S3 兼容对象存储
 
 ## 开发方式建议
 
@@ -41,6 +40,17 @@ cp .env.example .env
 docker compose --env-file .env up -d --build
 ```
 
+标准 Docker Compose 是本地开发拓扑：默认启动仅绑定 loopback 的本地 MinIO，并在
+API 启动前幂等创建 `a2a-mcp`。S3 API 为 `http://127.0.0.1:9000`，管理控制台为
+`http://127.0.0.1:9001`，凭据来自 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`。修改
+`MINIO_API_PORT` 后，public endpoint 自动变为 `localhost:<port>`；高级场景可设置
+`MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_SECURE`。
+
+Compose 固定的归档 MinIO release 镜像不作为生产基线。生产部署及远程 URL 消费者
+应使用部署者维护的远程 S3 或受保护的 TLS endpoint。现有 `tunnel` profile 只转发
+API，不转发本地 MinIO；MCP 或其他远程 URL 直接拉取需要可访问的 remote/public
+endpoint。
+
 ### 方式二：本地运行前端或后端
 
 适合快速迭代某个子项目，但要注意前后端与 Compose 使用的配置来源不同。
@@ -52,11 +62,11 @@ docker compose --env-file .env up -d --build
 你至少需要 PostgreSQL、Redis，以及一个已经构建好的 `sandbox-image`。最简单做法是：
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres redis minio minio-init
 docker compose build sandbox-image
 ```
 
-MinIO/S3 仍需自行准备，Compose 不会启动它。
+这会复用标准 Compose 的本地 MinIO；宿主机直跑 API 时使用下面的 loopback 配置。
 
 ### 2. 配置本地后端环境
 
@@ -70,10 +80,13 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/ma
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 REDIS_DB=0
-MINIO_ENDPOINT=s3.example.com
-MINIO_ACCESS_KEY=replace-me
-MINIO_SECRET_KEY=replace-me
-MINIO_SECURE=true
+MINIO_ENDPOINT=localhost:9000
+MINIO_PUBLIC_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_REGION=us-east-1
+MINIO_SECURE=false
+MINIO_PUBLIC_SECURE=false
 MINIO_BUCKET_NAME=a2a-mcp
 JWT_SECRET_KEY=replace-with-a-strong-random-string
 SANDBOX_IMAGE=actus-sandbox:latest

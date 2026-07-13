@@ -119,10 +119,19 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
-          for i in $(seq 1 30); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
-          docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
-            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb -p local/a2a-mcp"
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/ready; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+          docker run --rm --network host --entrypoint /bin/sh \
+            minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
+            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb --ignore-existing --region us-east-1 local/a2a-mcp"
       - name: Pre-pull sandbox image
         run: docker pull actus-sandbox:latest || docker build -t actus-sandbox:latest sandbox/
       - name: Run coordinator E2E (flag-on)
@@ -282,6 +291,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate standard Compose MinIO config
+        shell: bash
+        run: |
+          set -euo pipefail
+          MINIO_API_PORT=19000 docker compose --env-file .env.example config -q
+          rendered="$(MINIO_API_PORT=19000 docker compose --env-file .env.example config)"
+          api_block="$(sed -n '/^  api:/,/^  minio:/p' <<<"$rendered")"
+          minio_block="$(sed -n '/^  minio:/,/^  minio-init:/p' <<<"$rendered")"
+          grep -Fq 'MINIO_PUBLIC_ENDPOINT: localhost:19000' <<<"$api_block"
+          grep -Fq 'host_ip: 127.0.0.1' <<<"$minio_block"
+          grep -Fq 'published: "19000"' <<<"$minio_block"
 
       - name: Build API image
         run: docker build -t actus-api:ci ./api

@@ -44,14 +44,24 @@
 ### 1. 启动基础依赖
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres redis minio minio-init
 docker compose build sandbox-image
 ```
 
 说明：
 
-- Compose 不会启动 MinIO，你需要单独准备对象存储
+- 标准 Docker Compose 默认启动本地 MinIO，并在 API 启动前幂等创建 `a2a-mcp`
 - `sandbox-image` 只是构建镜像；真正的会话沙箱由 API 运行时动态创建
+
+本地 MinIO 仅绑定 loopback：S3 API 为 `http://127.0.0.1:9000`，管理控制台为
+`http://127.0.0.1:9001`，凭据来自 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`。修改
+`MINIO_API_PORT` 后，public endpoint 自动变为 `localhost:<port>`；高级场景可设置
+`MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_SECURE`。
+
+标准 Compose 是本地开发拓扑，其固定的归档 MinIO release 镜像不作为生产基线。
+生产部署及远程 URL 消费者应使用部署者维护的远程 S3 或受保护的 TLS endpoint。
+现有 `tunnel` profile 只转发 API，不转发本地 MinIO；MCP 或其他远程 URL 直接拉取
+需要可访问的 remote/public endpoint。
 
 ### 2. 准备本地配置
 
@@ -72,11 +82,14 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/ma
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 REDIS_DB=0
-MINIO_ENDPOINT=s3.example.com
-MINIO_ACCESS_KEY=replace-me
-MINIO_SECRET_KEY=replace-me
-MINIO_SECURE=true
-MINIO_BUCKET_NAME=replace-me
+MINIO_ENDPOINT=localhost:9000
+MINIO_PUBLIC_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_REGION=us-east-1
+MINIO_SECURE=false
+MINIO_PUBLIC_SECURE=false
+MINIO_BUCKET_NAME=a2a-mcp
 JWT_SECRET_KEY=replace-with-a-strong-random-string
 SANDBOX_IMAGE=actus-sandbox:latest
 SANDBOX_NAME_PREFIX=actus-sb

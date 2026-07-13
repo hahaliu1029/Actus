@@ -376,6 +376,20 @@ class SkillGuideInjector:
 class AgentTaskRunner(TaskRunner):
     """基于Agent智能体的任务运行器"""
 
+    @staticmethod
+    def _create_file_view_image_resolver(file_storage, settings):
+        if file_storage is None:
+            return None
+
+        from app.infrastructure.external.file_view.image_bytes_resolver import (
+            MinioFileViewImageResolver,
+        )
+
+        return MinioFileViewImageResolver(
+            file_storage,
+            settings.effective_minio_public_endpoint,
+        )
+
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],
@@ -679,18 +693,12 @@ class AgentTaskRunner(TaskRunner):
         self._file_storage = file_storage
         # B12 P1: file_view 图片 provider 合规 resolver（composition root，
         # 镜像 :708 RedisRecallCache 的局部 infra import 先例；build_react_graph
-        # 消费 domain FileViewImageBytesResolver Protocol）。get_settings 走
-        # 模块级 import（:104，本 __init__ :560 已用）——不在函数内重复 import，
-        # 否则会把 get_settings 变成 __init__ 局部名，:560 的调用触发
-        # UnboundLocalError。
-        self._file_view_image_resolver = None
-        if file_storage is not None:
-            from app.infrastructure.external.file_view.image_bytes_resolver import (
-                MinioFileViewImageResolver,
-            )
-            self._file_view_image_resolver = MinioFileViewImageResolver(
-                file_storage, get_settings().minio_endpoint,
-            )
+        # 消费 domain FileViewImageBytesResolver Protocol）。allowlist 使用公开
+        # MinIO endpoint，与上传 File.filepath / presigned URL 的 host 保持一致。
+        self._file_view_image_resolver = self._create_file_view_image_resolver(
+            file_storage,
+            settings,
+        )
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
         self._browser = browser

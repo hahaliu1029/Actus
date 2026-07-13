@@ -19,6 +19,25 @@ class MinioStore:
         """构造函数：获取配置 + 初始化 client 占位"""
         self._settings: Settings = get_settings()
         self._client: Optional[Minio] = None
+        self._signing_client: Optional[Minio] = None
+
+    def _build_client(self, endpoint: str, secure: bool) -> Minio:
+        http_client = None
+        if secure:
+            import urllib3
+
+            http_client = urllib3.PoolManager(
+                cert_reqs="CERT_NONE",
+            )
+
+        return Minio(
+            endpoint=endpoint,
+            access_key=self._settings.minio_access_key,
+            secret_key=self._settings.minio_secret_key,
+            secure=secure,
+            region=self._settings.minio_region,
+            http_client=http_client,
+        )
 
     async def init(self) -> None:
         """创建 MinIO 客户端（Minio SDK 为同步客户端，但初始化本身很轻）"""
@@ -27,21 +46,23 @@ class MinioStore:
             return
 
         try:
-            http_client = None
-            if self._settings.minio_secure:
-                import urllib3
-                http_client = urllib3.PoolManager(
-                    cert_reqs="CERT_NONE",
+            internal_client = self._build_client(
+                self._settings.minio_endpoint,
+                self._settings.minio_secure,
+            )
+            if (
+                self.public_endpoint == self._settings.minio_endpoint
+                and self.public_secure == self._settings.minio_secure
+            ):
+                signing_client = internal_client
+            else:
+                signing_client = self._build_client(
+                    self.public_endpoint,
+                    self.public_secure,
                 )
 
-            self._client = Minio(
-                endpoint=self._settings.minio_endpoint,  # 例如: "s3.example.com"
-                access_key=self._settings.minio_access_key,
-                secret_key=self._settings.minio_secret_key,
-                secure=self._settings.minio_secure,  # True/False
-                region=getattr(self._settings, "minio_region", None),
-                http_client=http_client,
-            )
+            self._client = internal_client
+            self._signing_client = signing_client
             logger.info("MinIO 对象存储初始化成功")
         except Exception as e:
             logger.error(f"MinIO 对象存储初始化失败: {str(e)}")
@@ -49,8 +70,9 @@ class MinioStore:
 
     async def shutdown(self) -> None:
         """关闭 MinIO 客户端（SDK 无显式 close，释放引用即可）"""
-        if self._client is not None:
+        if self._client is not None or self._signing_client is not None:
             self._client = None
+            self._signing_client = None
             logger.info("关闭 MinIO 对象存储成功")
 
         get_minio.cache_clear()
@@ -61,6 +83,21 @@ class MinioStore:
         if self._client is None:
             raise RuntimeError("MinIO 未初始化，请调用 init() 完成初始化")
         return self._client
+
+    @property
+    def signing_client(self) -> Minio:
+        """只读属性：返回用于生成公开签名 URL 的 MinIO 客户端"""
+        if self._signing_client is None:
+            raise RuntimeError("MinIO 未初始化，请调用 init() 完成初始化")
+        return self._signing_client
+
+    @property
+    def public_endpoint(self) -> str:
+        return self._settings.effective_minio_public_endpoint
+
+    @property
+    def public_secure(self) -> bool:
+        return self._settings.effective_minio_public_secure
 
     async def _run_sync(self, fn, /, *args, **kwargs):
         return await anyio.to_thread.run_sync(partial(fn, *args, **kwargs))
@@ -109,7 +146,7 @@ class MinioStore:
     async def presigned_get_url(
         self, bucket_name: str, object_name: str, expiry_seconds: int = 3600
     ) -> str:
-        client = self.client
+        client = self.signing_client
         return await self._run_sync(
             client.presigned_get_object,
             bucket_name,

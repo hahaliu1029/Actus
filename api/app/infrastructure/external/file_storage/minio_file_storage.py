@@ -6,6 +6,7 @@ import os.path
 import uuid
 from datetime import datetime
 from typing import BinaryIO, Callable, Tuple
+from urllib.parse import quote
 
 from app.application.errors.exceptions import BadRequestError
 from app.domain.external.file_storage import FileStorage
@@ -127,10 +128,11 @@ class MinioFileStorage(FileStorage):
             logger.info(f"文件上传成功: {filename} (ID: {file_id})")
 
             # 5. 构建文件访问路径
-            settings = self.minio_store._settings
-            protocol = "https" if settings.minio_secure else "http"
+            protocol = "https" if self.minio_store.public_secure else "http"
+            public_path = quote(f"{self.bucket}/{object_name}", safe="/")
             filepath = (
-                f"{protocol}://{settings.minio_endpoint}/{self.bucket}/{object_name}"
+                f"{protocol}://{self.minio_store.public_endpoint}/"
+                f"{public_path}"
             )
 
             # 6. 确定多模态可用性

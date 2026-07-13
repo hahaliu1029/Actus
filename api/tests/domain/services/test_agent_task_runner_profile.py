@@ -1,6 +1,7 @@
 # api/tests/domain/services/test_agent_task_runner_profile.py
 import base64
 import io
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +27,30 @@ def _make_runner_with_profile(profile, storage):
     runner._image_url_map = {}
     runner._IMAGE_MIME_PREFIXES = ("image/",)
     return runner
+
+
+def test_file_view_resolver_uses_effective_public_endpoint() -> None:
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    storage = MagicMock()
+    settings = SimpleNamespace(
+        effective_minio_public_endpoint="localhost:19000",
+    )
+
+    resolver = AgentTaskRunner._create_file_view_image_resolver(storage, settings)
+
+    assert resolver._file_storage is storage
+    assert resolver._allowlist_host == "localhost:19000"
+
+
+def test_file_view_resolver_is_none_without_file_storage() -> None:
+    from app.domain.services.agent_task_runner import AgentTaskRunner
+
+    settings = SimpleNamespace(
+        effective_minio_public_endpoint="localhost:19000",
+    )
+
+    assert AgentTaskRunner._create_file_view_image_resolver(None, settings) is None
 
 
 async def test_kimi_attachment_builder_produces_base64_block() -> None:

@@ -9,6 +9,7 @@ from pydantic import (
     AliasChoices,
     AwareDatetime,
     Field,
+    StrictStr,
     field_validator,
     model_validator,
 )
@@ -83,6 +84,8 @@ class Settings(BaseSettings):
     minio_secret_key: str = ""
     minio_region: str | None = None
     minio_secure: bool = True
+    minio_public_endpoint: StrictStr | None = None
+    minio_public_secure: bool | None = None
     minio_bucket_name: str = "a2a-mcp"
 
     # Sandbox配置
@@ -429,6 +432,15 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
+    @field_validator("minio_public_endpoint", mode="before")
+    @classmethod
+    def _normalize_minio_public_endpoint(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
     @field_validator("memory_root_host")
     @classmethod
     def _host_root_must_be_absolute(cls, v: str) -> str:
@@ -452,6 +464,28 @@ class Settings(BaseSettings):
         if not v.startswith("/"):
             raise ValueError(f"{v!r} 必须是绝对路径（以 / 开头）")
         return v
+
+    @model_validator(mode="after")
+    def _public_minio_endpoint_requires_region(self) -> "Settings":
+        if self.minio_public_endpoint and (
+            self.minio_region is None or not self.minio_region.strip()
+        ):
+            raise ValueError(
+                "MINIO_REGION must be configured when MINIO_PUBLIC_ENDPOINT is set"
+            )
+        return self
+
+    @property
+    def effective_minio_public_endpoint(self) -> str:
+        return self.minio_public_endpoint or self.minio_endpoint
+
+    @property
+    def effective_minio_public_secure(self) -> bool:
+        if self.minio_public_endpoint is None:
+            return self.minio_secure
+        if self.minio_public_secure is not None:
+            return self.minio_public_secure
+        return self.minio_secure
 
     @model_validator(mode="after")
     def _reject_default_jwt_secret(self) -> "Settings":

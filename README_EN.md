@@ -84,7 +84,6 @@ For backend layering and runtime composition, see [项目架构.md](项目架构
 
 - Docker Engine + Docker Compose v2
 - At least 6 GB RAM available to Docker
-- A reachable MinIO / S3-compatible bucket that already exists
 - A valid LLM API key
 
 ### Start the stack
@@ -97,10 +96,8 @@ cp .env.example .env
 # Edit .env and provide at least:
 # POSTGRES_PASSWORD
 # JWT_SECRET_KEY
-# MINIO_ENDPOINT
 # MINIO_ACCESS_KEY
 # MINIO_SECRET_KEY
-# MINIO_BUCKET_NAME
 # NEXT_PUBLIC_API_BASE_URL
 
 docker compose --env-file .env up -d --build
@@ -113,6 +110,24 @@ After startup:
 
 - UI: `http://localhost`
 - API docs: `http://localhost:8000/docs`
+
+The standard Docker Compose stack is a local-development topology. It starts a
+loopback-only local MinIO and idempotently creates the `a2a-mcp` bucket before
+the API starts. The S3 API is `http://127.0.0.1:9000`, the console is
+`http://127.0.0.1:9001`, and credentials come from `MINIO_ACCESS_KEY` /
+`MINIO_SECRET_KEY`. Changing `MINIO_API_PORT` automatically changes the public
+endpoint to `localhost:<port>`; advanced deployments can override
+`MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_SECURE`. A root `.env` value for
+`MINIO_ENDPOINT` does not control the standard Docker Compose stack, whose API
+always uses `minio:9000` internally.
+
+Switching from remote storage to this local MinIO creates a new empty data set;
+there is no automatic migration, and existing attachments remain in the remote
+S3 service. The pinned archived MinIO release image is not a production baseline.
+Production deployments and remote URL consumers should use a deployer-managed
+remote S3 service or a protected TLS endpoint. The existing `tunnel` profile
+forwards only the API, not local MinIO; MCP and other direct remote URL fetchers
+need a reachable remote/public endpoint.
 
 ### Runtime config notes
 
@@ -147,6 +162,9 @@ npm run dev
 
 Local backend development does **not** use the same variables as the root Compose `.env`. `api/core/config.py` reads runtime settings from `api/.env`, for example:
 
+The remote S3 example below is for a host-run API or custom orchestration only;
+it is not used by standard Docker Compose.
+
 ```bash
 cd api
 cp config.yaml.example config.yaml
@@ -160,9 +178,12 @@ REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 REDIS_DB=0
 MINIO_ENDPOINT=s3.example.com
+MINIO_PUBLIC_ENDPOINT=s3.example.com
 MINIO_ACCESS_KEY=replace-me
 MINIO_SECRET_KEY=replace-me
+MINIO_REGION=us-east-1
 MINIO_SECURE=true
+MINIO_PUBLIC_SECURE=true
 MINIO_BUCKET_NAME=replace-me
 JWT_SECRET_KEY=replace-with-a-strong-random-string
 SANDBOX_IMAGE=actus-sandbox:latest
@@ -175,7 +196,8 @@ pip install -r requirements.txt
 bash dev.sh
 ```
 
-You will also need PostgreSQL, Redis, a built `sandbox-image`, and an accessible MinIO/S3 bucket.
+You will also need PostgreSQL, Redis, a built `sandbox-image`, and an accessible
+remote S3 / MinIO bucket for this host-run configuration.
 
 ## Tests
 

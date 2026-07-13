@@ -84,7 +84,6 @@ Actus 由三个核心运行时组成：
 
 - Docker Engine + Docker Compose v2
 - 至少 6 GB 可用内存
-- 一个可用且已创建 bucket 的 MinIO / S3 兼容对象存储
 - 一个可用的 LLM API Key（启动后在设置页填写，或预写入运行时配置）
 
 ### 启动步骤
@@ -97,10 +96,8 @@ cp .env.example .env
 # 编辑 .env，至少填写：
 # POSTGRES_PASSWORD
 # JWT_SECRET_KEY
-# MINIO_ENDPOINT
 # MINIO_ACCESS_KEY
 # MINIO_SECRET_KEY
-# MINIO_BUCKET_NAME
 # NEXT_PUBLIC_API_BASE_URL
 # 可选：如需覆盖默认 Python 包镜像，设置 PYTHON_PACKAGE_INDEX_URL
 
@@ -123,6 +120,17 @@ docker compose exec api python scripts/create_super_admin.py
 
 - 前端：`http://localhost`（默认 `UI_PORT=80`）
 - API 文档：`http://localhost:8000/docs`
+
+标准 Docker Compose 是本地开发拓扑：默认启动仅绑定 loopback 的本地 MinIO，API
+启动前会幂等创建 `a2a-mcp` bucket。S3 API 为 `http://127.0.0.1:9000`，管理控制台为
+`http://127.0.0.1:9001`，凭据来自 `.env` 的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`。
+修改 `MINIO_API_PORT` 后，对外 endpoint 会自动变为 `localhost:<port>`；只有需要覆盖
+主机名或 TLS 时才设置 `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_SECURE`。
+
+Compose 固定的归档 MinIO release 镜像用于可复现的本地开发，不作为生产基线。生产
+部署或需要远程 URL 消费者时，应由部署者维护远程 S3 或受保护的 TLS endpoint。现有
+`tunnel` profile 只转发 API，不转发本地 MinIO；MCP 或其他远程 URL 直接拉取方必须能
+访问上述 remote/public endpoint。
 
 ### 运行时配置说明
 
@@ -171,11 +179,14 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/ma
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 REDIS_DB=0
-MINIO_ENDPOINT=s3.example.com
-MINIO_ACCESS_KEY=replace-me
-MINIO_SECRET_KEY=replace-me
-MINIO_SECURE=true
-MINIO_BUCKET_NAME=replace-me
+MINIO_ENDPOINT=localhost:9000
+MINIO_PUBLIC_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_REGION=us-east-1
+MINIO_SECURE=false
+MINIO_PUBLIC_SECURE=false
+MINIO_BUCKET_NAME=a2a-mcp
 JWT_SECRET_KEY=replace-with-a-strong-random-string
 SANDBOX_IMAGE=actus-sandbox:latest
 SANDBOX_NAME_PREFIX=actus-sb
@@ -191,7 +202,7 @@ bash dev.sh
 
 - 启动 PostgreSQL、Redis
 - 预先构建 `sandbox-image`
-- 准备可访问的 MinIO/S3 bucket
+- 启动标准 Docker Compose 提供的本地 MinIO，或准备可访问的远程 S3 bucket
 
 更详细说明见 [api/README.md](api/README.md)。
 
