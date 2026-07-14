@@ -33,15 +33,31 @@ class _Supervisor:
         self.suspend_calls: list[dict] = []
         self.inflight_counts = inflight_counts
         self.inflight_count_calls: list[str] = []
+        self.sweep_now: datetime | None = None
+        self.global_reconcile_now: datetime | None = None
+
+    async def reconcile_global_background_memberships(
+        self,
+        *,
+        reconcile_now: datetime,
+    ) -> dict[str, int]:
+        self.global_reconcile_now = reconcile_now
+        return {"cleaned": 0, "repaired": 0, "skipped": 0}
 
     async def list_background_slot_user_ids(self) -> list[str]:
         return []
 
-    async def sweep_expired(self, *, user_id: str) -> list[str]:
+    async def sweep_expired(
+        self,
+        *,
+        user_id: str,
+        sweep_now: datetime,
+    ) -> list[str]:
         assert user_id == "user-1"
+        self.sweep_now = sweep_now
         return ["session-expired"]
 
-    async def terminate(self, **kwargs) -> None:
+    async def terminate_expired_background(self, **kwargs) -> None:
         self.terminate_calls.append(kwargs)
 
     async def suspend_idle(self, **kwargs) -> None:
@@ -64,7 +80,22 @@ class _Redis:
         return f"{self._last_activity_at:.6f}"
 
 
-async def test_sweep_expired_forwards_notification_emitter_to_terminate() -> None:
+class _TouchRedis:
+    def __init__(self) -> None:
+        self.hashes: dict[str, dict[str, str]] = {}
+
+    async def hset(self, key: str, *, mapping: dict[str, str]) -> None:
+        self.hashes.setdefault(key, {}).update(mapping)
+
+    async def expire(self, key: str, seconds: int) -> None:
+        assert key == "supervisor:hot:session-idle"
+        assert seconds == 300
+
+    async def hget(self, key: str, field: str) -> str | None:
+        return self.hashes.get(key, {}).get(field)
+
+
+async def test_sweep_expired_uses_same_timestamp_for_redis_and_pg_cas() -> None:
     supervisor = _Supervisor()
     emitter = object()
     watchdog = IdleWatchdog(
@@ -76,12 +107,13 @@ async def test_sweep_expired_forwards_notification_emitter_to_terminate() -> Non
 
     await watchdog._sweep_expired_once()
 
+    assert supervisor.sweep_now is not None
+    assert supervisor.global_reconcile_now == supervisor.sweep_now
     assert supervisor.terminate_calls == [
         {
             "session_id": "session-expired",
             "user_id": "user-1",
-            "terminal_reason": "watchdog_timeout",
-            "status": SessionStatus.TIMED_OUT,
+            "sweep_now": supervisor.sweep_now,
             "notification_emitter": emitter,
         }
     ]
@@ -111,6 +143,31 @@ async def test_scan_once_suspends_stale_running_background_session() -> None:
     assert supervisor.suspend_calls == [
         {"session_id": "session-idle", "user_id": "user-1"}
     ]
+
+
+async def test_heartbeat_touch_still_prevents_180_second_idle_suspend() -> None:
+    redis = _TouchRedis()
+    supervisor = _Supervisor()
+    watchdog = IdleWatchdog(
+        redis_client=redis,
+        supervisor=supervisor,
+        session_repository=_Repo(
+            [
+                BgSessionRow(
+                    session_id="session-idle",
+                    task_id="task-1",
+                    user_id="user-1",
+                    status=SessionStatus.RUNNING,
+                )
+            ]
+        ),
+        idle_timeout_seconds=180,
+    )
+
+    await watchdog.touch_activity(session_id="session-idle")
+    await watchdog._scan_once()
+
+    assert supervisor.suspend_calls == []
 
 
 @pytest.mark.parametrize("inflight_counts", [(1, 0), (-1, 1), (1, -1)])

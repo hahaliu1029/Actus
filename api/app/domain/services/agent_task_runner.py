@@ -469,6 +469,14 @@ class AgentTaskRunner(TaskRunner):
         # envelope publisher; default False preserves the legacy publisher
         # path for subagent_research children and roots.
         terminal_envelope_publisher_disabled: bool = False,
+        # Coordinator-step children delegate the complete terminal lifecycle
+        # (DB transition, terminal notification and mailbox envelope) to the
+        # outer CoordinatorChildRunner + supervisor chain.  This is separate
+        # from the legacy envelope-only gate above.
+        external_terminal_owner: bool = False,
+        # The outer CoordinatorChildRunner also owns heartbeat lifetime through
+        # post-processing/finalizers.  SPAWN_ACK remains inner-owned.
+        external_heartbeat_owner: bool = False,
         # PR-9b-A Task A8: lifespan-scoped ``_CoordinatorRuntimeDeps``
         # aggregator forwarded from AgentService → PlannerReActFlow.
         # Default ``None`` triggers the null-deps sentinel inside the
@@ -542,6 +550,8 @@ class AgentTaskRunner(TaskRunner):
         self._terminal_envelope_publisher_disabled: bool = (
             terminal_envelope_publisher_disabled
         )
+        self._external_terminal_owner: bool = external_terminal_owner
+        self._external_heartbeat_owner: bool = external_heartbeat_owner
         # codex r3 [R3-5, HIGH ARCH] — store only the LAST session row
         # fetched inside ``_is_mailbox_plane_child``. The predicate is
         # NOT cached: §11.6 rollback can change control_plane mid-run.
@@ -1034,6 +1044,11 @@ class AgentTaskRunner(TaskRunner):
             return
         from app.domain.models.lifecycle import is_terminal
         for lc in lifecycle_events:
+            if (
+                getattr(self, "_external_terminal_owner", False)
+                and is_terminal(lc.state)
+            ):
+                continue
             # INV-C7-5：emitter 侧 in-process best-effort 终态去重（权威去重在
             # 前端 reducer sticky；跨重启重复终态 wire 层允许）。progress 不去重。
             if is_terminal(lc.state):
@@ -1093,6 +1108,11 @@ class AgentTaskRunner(TaskRunner):
                 epoch=getattr(self, "_lifecycle_task_epoch", 0),
                 reason=reason, detail=detail,
             )
+            if (
+                getattr(self, "_external_terminal_owner", False)
+                and is_terminal(lc.state)
+            ):
+                return
             if is_terminal(lc.state):
                 key = (lc.lifecycle_type.value, lc.unit_id, lc.epoch)
                 emitted = getattr(self, "_lifecycle_terminal_emitted", None)
@@ -3591,7 +3611,6 @@ class AgentTaskRunner(TaskRunner):
         on cancel would convert every SSE disconnect into a permanent
         partial). See spec §3.3 + §3.5.
         """
-
         async def _terminal_op() -> bool:
             cost_handler = getattr(self, "_cost_callback_handler", None)
             if cost_handler is not None:
@@ -3623,6 +3642,18 @@ class AgentTaskRunner(TaskRunner):
                         # own internals — this only fires if the contract
                         # changes.
                         pass
+
+            # External ownership suppresses only terminal ownership effects.
+            # The cost drain above is still necessary inner cleanup and must
+            # finish before CoordinatorChildRunner publishes its terminal
+            # envelope.  DB terminal transition, completion callbacks,
+            # supervisor stop and inner terminal envelope remain outer-owned.
+            if getattr(self, "_external_terminal_owner", False):
+                logger.debug(
+                    "inner terminal lifecycle skipped for session=%s: external owner",
+                    self._session_id,
+                )
+                return False
 
             # Use a FRESH UoW from the factory: the shielded body may
             # outlive the caller's request scope, and self._uow may be in
@@ -4263,6 +4294,12 @@ class AgentTaskRunner(TaskRunner):
                 self._session_id,
             )
 
+        # Coordinator-step children keep SPAWN_ACK here but delegate heartbeat
+        # lifetime to CoordinatorChildRunner so liveness covers seed install and
+        # every finalizer after the inner task has completed.
+        if getattr(self, "_external_heartbeat_owner", False):
+            return
+
         # Start the heartbeat task. Idempotent w.r.t. multiple invoke calls
         # (e.g. ``__new__``-bypass tests that call invoke twice — we only
         # create the asyncio task on first wire).
@@ -4348,6 +4385,9 @@ class AgentTaskRunner(TaskRunner):
         """
         # codex r4 [R4-2, HIGH PERF] — unconditional heartbeat cleanup.
         await self._cleanup_heartbeat_task()
+
+        if getattr(self, "_external_terminal_owner", False):
+            return
 
         # [C2 PR-4 §8.5.1 r6 P0-1] coordinator_step children whose flag is set
         # publish their own terminal envelope via

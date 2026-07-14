@@ -660,6 +660,41 @@ async def test_late_inject_constructs_and_wires_budget_callback(monkeypatch):
     runner_factory.built.runner.set_budget_callback.assert_called_once_with(cb)
 
 
+async def test_zero_wallclock_limit_reaches_child_as_unlimited_budget(monkeypatch):
+    """Production starter wiring preserves zero so the child creates no watchdog."""
+    captured: dict = {}
+    _capturing_child_runner(monkeypatch, captured)
+
+    class _ZeroWallclockLimits(_FakeCoordinatorLimits):
+        max_wallclock_seconds_per_child: int = 0
+
+    runner_factory = _FakeRunnerFactory()
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+
+    starter = DefaultCoordinatorChildRunnerStarter(
+        runner_factory=runner_factory,
+        mailbox_publisher=MagicMock(),
+        mailbox_subscriber=MagicMock(),
+        envelope_factory=MagicMock(),
+        session_repository=_FakeSessionRepository(),
+        coordinator_envelope_store=MagicMock(),
+        cost_rollup_service=MagicMock(),
+        artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
+        coordinator_limits=_ZeroWallclockLimits(),
+        sandbox_lifecycle_service=_fake_lifecycle(),
+        resolve_child_runner_deps=_fake_resolve,
+    )
+
+    await _start_once(starter)
+
+    runner_budget = captured["ctor"]["budget"]
+    context_budget = runner_factory.call_args["child_permission_context"].budget
+    assert runner_budget is context_budget
+    assert runner_budget.max_wallclock_seconds == 0
+
+
 async def test_pricing_source_is_built_llm_identifying_params(monkeypatch):
     """[spec §5-10 R6#1 source-of-truth] get_price receives (model,
     provider_id) from the BUILT child llm's _identifying_params — NOT from

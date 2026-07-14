@@ -538,9 +538,10 @@ class TestCancelAckPersistTerminal:
         )
 
     async def test_supervisor_echo_short_circuits_before_persist(self) -> None:
-        """SUPERVISOR_ECHO short-circuits the entire side_effect path —
-        no persist, no destroy, just ack+mark_processed (existing R2-4
-        contract, preserved by PR-7).
+        """SUPERVISOR_ECHO skips persist and duplicate cleanup.
+
+        Task 4 may additionally run its independently row-guarded terminal CAS
+        when that port is wired; this legacy PR-7 context leaves the port None.
         """
         store = AsyncMock()
         store.persist_terminal = AsyncMock(return_value=None)
@@ -558,9 +559,11 @@ class TestCancelAckPersistTerminal:
         )
         outcome = await CancelAckHandler().handle(env, ctx)
 
-        # supervisor-echo outcome: ack=True, side_effect=None.
+        # supervisor-echo outcome: terminalize-only side_effect; persist and
+        # duplicate sandbox cleanup remain skipped.
         assert outcome.ack is True
-        assert outcome.side_effect is None
+        assert outcome.side_effect is not None
+        await outcome.side_effect()
         store.persist_terminal.assert_not_awaited()
         ctx.sandbox_lifecycle.destroy.assert_not_awaited()
 

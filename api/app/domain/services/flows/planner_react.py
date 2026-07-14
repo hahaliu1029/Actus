@@ -1751,10 +1751,18 @@ class PlannerReActFlow(BaseFlow):
         # D5: Create fresh watchdog + control per invoke/resume (timer resets).
         # Tracker + metrics persist on self (survive across invoke/resume).
         ec = self._execution_config
-        watchdog = ExecutionWatchdog(
-            total_timeout_seconds=ec.total_timeout_seconds,
-            idle_timeout_seconds=ec.idle_timeout_seconds,
-        )
+        # Coordinator children have an external heartbeat/terminal lifecycle
+        # owner. Running the ordinary graph-idle watchdog as well would treat
+        # a legitimately long child operation as a stalled graph. The child
+        # permission context is injected only by the coordinator starter chain
+        # and is therefore the stable child marker; Null coord deps alone also
+        # covers legacy and ordinary subagent flows and must not disable it.
+        watchdog = None
+        if self._child_permission_context is None:
+            watchdog = ExecutionWatchdog(
+                total_timeout_seconds=ec.total_timeout_seconds,
+                idle_timeout_seconds=ec.idle_timeout_seconds,
+            )
         control = ExecutionControl()
 
         cfg: dict = {
@@ -1868,7 +1876,7 @@ class PlannerReActFlow(BaseFlow):
         # PR-9b-A A5: parallel-subgraph runtime deps (always-live wiring;
         # flag at main_graph.py:695 gates ENTRY to _run_parallel_backend,
         # not WIRING). When _coord_deps is the NullCoordinatorRuntimeDeps
-        # sentinel (legacy tests + non-coordinator paths), the 19 cfg keys
+        # sentinel (legacy tests + non-coordinator paths), the coordinator cfg keys
         # are SKIPPED — INV-A10 guarantees zero side-effect ctors fire on
         # construction in that branch.
         if not isinstance(self._coord_deps, _NullCoordinatorRuntimeDeps):
@@ -1895,6 +1903,8 @@ class PlannerReActFlow(BaseFlow):
                 "artifact_storage": cd.artifact_storage,
                 "cost_rollup_service": cd.cost_rollup_service,
                 "coordinator_metrics_recorder": cd.coordinator_metrics_recorder,
+                "coordinator_wait_guard_factory": cd.coordinator_wait_guard_factory,
+                "coordinator_liveness_service": cd.coordinator_liveness_service,
                 "team_repository": cd.team_repository,      # [S4 §5] expander + teaching
                 "skill_repository": cd.skill_repository,    # [S4 §5/R7-1] slug→manifest resolve
             })

@@ -5,10 +5,30 @@ from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
     AppConfig,
+    ExecutionConfig,
     LLMConfig,
     MCPConfig,
     MemoryConfig,
 )
+
+
+def test_execution_config_total_timeout_defaults_to_unlimited() -> None:
+    assert ExecutionConfig().total_timeout_seconds == 0.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_execution_config_rejects_non_finite_total_timeout(value: float) -> None:
+    with pytest.raises(ValidationError):
+        ExecutionConfig(total_timeout_seconds=value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf"), 0.0, -1.0],
+)
+def test_execution_config_rejects_invalid_idle_timeout(value: float) -> None:
+    with pytest.raises(ValidationError):
+        ExecutionConfig(idle_timeout_seconds=value)
 
 
 def test_llm_config_has_context_overflow_default_values() -> None:

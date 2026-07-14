@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, List, Mapping, NamedTuple, Optional, Protocol
 
-from app.domain.models.event import BaseEvent
+from app.domain.models.event import BaseEvent, PendingExecutionEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
@@ -197,8 +197,38 @@ class SessionRepository(Protocol):
         *,
         expires_at: datetime,
         retry_budget_remaining: int,
+        expected_execution_revision: int,
+        background_reason: str,
+        pending_event: PendingExecutionEvent,
     ) -> int | None:
-        """Atomically promote and return the persisted retry budget."""
+        """CAS promote and return the new execution revision."""
+        ...
+
+    async def renew_auto_degrade_expiry_if_running(
+        self,
+        session_id: str,
+        *,
+        expires_at: datetime,
+    ) -> tuple[datetime, int] | None:
+        """Return authoritative non-decreasing expiry and execution revision."""
+        ...
+
+    async def resume_auto_degrade_to_foreground_if_running(
+        self,
+        session_id: str,
+        *,
+        expected_execution_revision: int,
+        pending_event: PendingExecutionEvent,
+    ) -> int | None:
+        """CAS reconnect and return the new execution revision."""
+
+    async def clear_pending_execution_event(
+        self,
+        session_id: str,
+        *,
+        execution_revision: int,
+    ) -> bool:
+        """Clear only the pending event produced by this exact revision."""
         ...
 
     async def claim_background_retry_from_suspend(
@@ -206,14 +236,15 @@ class SessionRepository(Protocol):
         session_id: str,
         *,
         expires_at,
-    ) -> int | None:
-        """Atomically claim a suspended background retry and return remaining budget."""
+    ) -> tuple[int, int] | None:
+        """Claim a retry, advance its attempt revision, and return both values."""
         ...
 
     async def rollback_background_retry_claim_if_active(
         self,
         session_id: str,
         *,
+        expected_execution_revision: int,
         retry_budget_remaining: int,
         expires_at: datetime | None,
         suspended_reason: str | None,
@@ -227,11 +258,24 @@ class SessionRepository(Protocol):
         status: SessionStatus,
         terminal_reason: str,
     ) -> bool:
-        """Atomically write terminal status, phase and reason.
+        """Atomically write terminal status, phase/reason and retire execution outbox.
 
         Returns True when this call performed the terminal transition and
         False when the row was already terminal/terminating.
         """
+        ...
+
+    async def update_to_terminal_if_background_expired(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+        *,
+        expires_at_lte: datetime,
+        expected_execution_revision: int | None = None,
+        pending_event: PendingExecutionEvent | None = None,
+    ) -> int | None:
+        """Atomically terminalize only a still-expired live background row."""
         ...
 
     async def update_terminal_reason(

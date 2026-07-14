@@ -48,7 +48,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.domain.models.mailbox_envelope import MailboxEnvelopeType
+from app.domain.models.mailbox_envelope import (
+    MailboxEnvelopeType,
+    ResultReadyOutcome,
+    ResultReadyPayload,
+)
 from app.domain.models.session import SessionStatus
 from app.domain.services.agent_task_runner import (
     _PENDING_TERMINAL_TASKS,
@@ -258,6 +262,393 @@ async def test_degraded_marker_also_precedes_result_ready() -> None:
     raise NotImplementedError(
         "degraded-marker-before-RESULT_READY lock deferred to PR-10 refactor"
     )
+
+
+async def test_outer_heartbeat_covers_blocked_finalizer_and_terminal_is_last(
+    monkeypatch,
+) -> None:
+    """The coordinator owner keeps finalizing heartbeats alive until publish.
+
+    The assertion observes the real publisher boundary: while the finalizer is
+    blocked, heartbeat payloads carry ``phase=finalizing``; after release the
+    RESULT_READY envelope is the final published lifecycle envelope.
+    """
+    import app.application.services.coordinator_child_runner as ccr_mod
+    from app.application.services.coordinator_child_runner import (
+        CoordinatorChildRunner,
+    )
+    from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
+
+    class _Listener:
+        def __init__(self, **_kwargs) -> None:
+            self.ready_event = asyncio.Event()
+
+        async def start(self) -> None:
+            self.ready_event.set()
+
+        async def shutdown(self, timeout: float) -> None:
+            del timeout
+
+    monkeypatch.setattr(ccr_mod, "CoordinatorChildCancelListener", _Listener)
+    original_init = ChildHeartbeatTask.__init__
+
+    def _fast_init(self, publisher, parent_session_id, child_session_id, **_kwargs):
+        original_init(
+            self, publisher, parent_session_id, child_session_id,
+            interval_seconds=0.01,
+        )
+
+    monkeypatch.setattr(ChildHeartbeatTask, "__init__", _fast_init)
+
+    published: list[Any] = []
+
+    class _Publisher:
+        async def publish(self, envelope: Any) -> None:
+            published.append(envelope)
+
+    entered_finalizer = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    runner = CoordinatorChildRunner(
+        cancel_event=asyncio.Event(),
+        inner_runner=MagicMock(),
+        publisher=_Publisher(),
+        parent_sandbox=MagicMock(),
+        child_sandbox=MagicMock(),
+        artifact_storage=MagicMock(),
+        parent_session_id="p1",
+        mailbox_subscriber=MagicMock(),
+    )
+    runner._inner_runner.invoke_until_done = AsyncMock(return_value="done")
+    runner._install_seed = AsyncMock()
+    runner._build_child_prompt = MagicMock(return_value="prompt")
+
+    async def _blocked_finalize(_run_id, _wu, child_id, _done):
+        entered_finalizer.set()
+        await release_finalizer.wait()
+        payload = ResultReadyPayload(
+            summary="done", outcome=ResultReadyOutcome.SUCCESS,
+        )
+        await runner._publish_result_ready(child_id, payload)
+        return payload
+
+    runner._finalize_success = _blocked_finalize
+    wu = MagicMock()
+    wu.phase = "write"
+    wu.shell_mode = False
+    wu.work_unit_id = "wu1"
+
+    run_task = asyncio.create_task(runner.run_work_unit(
+        coordinator_run_id="r1",
+        work_unit=wu,
+        child_session_id="c1",
+        spawn_manifest=MagicMock(),
+        cancel_event=runner._cancel_event,
+        root_session_id="p1",
+    ))
+    await asyncio.wait_for(entered_finalizer.wait(), timeout=0.5)
+    await asyncio.sleep(0.04)
+
+    heartbeats = [
+        envelope for envelope in published
+        if envelope.type == MailboxEnvelopeType.PROGRESS_UPDATE
+    ]
+    assert heartbeats
+    assert heartbeats[-1].payload["phase"] == "finalizing"
+
+    release_finalizer.set()
+    await asyncio.wait_for(run_task, timeout=0.5)
+    terminal_index = next(
+        i for i, envelope in enumerate(published)
+        if envelope.type == MailboxEnvelopeType.RESULT_READY
+    )
+    before = len(published)
+    await asyncio.sleep(0.03)
+
+    assert len(published) == before
+    assert terminal_index == len(published) - 1
+
+
+async def test_outer_heartbeat_stop_failure_does_not_mask_terminal_result(
+    monkeypatch,
+) -> None:
+    import app.application.services.coordinator_child_runner as ccr_mod
+    from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+    from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
+
+    class _Listener:
+        def __init__(self, **_kwargs) -> None:
+            self.ready_event = asyncio.Event()
+
+        async def start(self) -> None:
+            self.ready_event.set()
+
+        async def shutdown(self, timeout: float) -> None:
+            del timeout
+
+    monkeypatch.setattr(ccr_mod, "CoordinatorChildCancelListener", _Listener)
+
+    async def _raising_stop(self) -> None:
+        self._stopping.set()
+        raise RuntimeError("stop failed")
+
+    monkeypatch.setattr(ChildHeartbeatTask, "stop", _raising_stop)
+
+    publisher = AsyncMock()
+    runner = CoordinatorChildRunner(
+        cancel_event=asyncio.Event(),
+        inner_runner=MagicMock(),
+        publisher=publisher,
+        parent_sandbox=MagicMock(),
+        child_sandbox=MagicMock(),
+        artifact_storage=MagicMock(),
+        parent_session_id="p1",
+        mailbox_subscriber=MagicMock(),
+    )
+    runner._inner_runner.invoke_until_done = AsyncMock(return_value="done")
+    runner._install_seed = AsyncMock()
+    runner._build_child_prompt = MagicMock(return_value="prompt")
+    expected = ResultReadyPayload(
+        summary="done", outcome=ResultReadyOutcome.SUCCESS,
+    )
+    runner._finalize_success = AsyncMock(return_value=expected)
+    wu = MagicMock(phase="write", shell_mode=False, work_unit_id="wu1")
+
+    result = await runner.run_work_unit(
+        coordinator_run_id="r1",
+        work_unit=wu,
+        child_session_id="c1",
+        spawn_manifest=MagicMock(),
+        cancel_event=runner._cancel_event,
+        root_session_id="p1",
+    )
+
+    assert result is expected
+
+
+async def test_terminal_publish_failure_stops_outer_heartbeat_without_fallback(
+    monkeypatch,
+) -> None:
+    import app.application.services.coordinator_child_runner as ccr_mod
+    from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+
+    class _Listener:
+        def __init__(self, **_kwargs) -> None:
+            self.ready_event = asyncio.Event()
+
+        async def start(self) -> None:
+            self.ready_event.set()
+
+        async def shutdown(self, timeout: float) -> None:
+            del timeout
+
+    monkeypatch.setattr(ccr_mod, "CoordinatorChildCancelListener", _Listener)
+    terminal_attempts = 0
+
+    class _Publisher:
+        async def publish(self, envelope: Any) -> None:
+            nonlocal terminal_attempts
+            if envelope.type == MailboxEnvelopeType.RESULT_READY:
+                terminal_attempts += 1
+                raise RuntimeError("terminal down")
+
+    # Drive a real AgentTaskRunner terminal helper behind the adapter-shaped
+    # inner object. External ownership means it must leave the DB row RUNNING;
+    # if the outer publish then fails, no Supervisor handler consumed an
+    # envelope and therefore nobody is allowed to terminalize the row.
+    row_status = {"value": SessionStatus.RUNNING}
+    forbidden_uow_factory = MagicMock(
+        side_effect=AssertionError("external terminal owner touched DB")
+    )
+    raw_inner = object.__new__(AgentTaskRunner)
+    raw_inner._session_id = "c1"
+    raw_inner._external_terminal_owner = True
+    raw_inner._cost_callback_handler = None
+    raw_inner._uow_factory = forbidden_uow_factory
+
+    class _ExternalOwnerInner:
+        async def invoke_until_done(self, *, user_message: str) -> str:
+            del user_message
+            await raw_inner._set_terminal_status_with_notifications(
+                SessionStatus.COMPLETED, "natural"
+            )
+            return "done"
+
+    runner = CoordinatorChildRunner(
+        cancel_event=asyncio.Event(),
+        inner_runner=_ExternalOwnerInner(),
+        publisher=_Publisher(),
+        parent_sandbox=MagicMock(),
+        child_sandbox=MagicMock(),
+        artifact_storage=MagicMock(),
+        parent_session_id="p1",
+        mailbox_subscriber=MagicMock(),
+    )
+    runner._install_seed = AsyncMock()
+    runner._build_child_prompt = MagicMock(return_value="prompt")
+    wu = MagicMock()
+    wu.phase = "write"
+    wu.shell_mode = False
+    wu.work_unit_id = "wu1"
+
+    with pytest.raises(RuntimeError, match="terminal down"):
+        await runner.run_work_unit(
+            coordinator_run_id="r1",
+            work_unit=wu,
+            child_session_id="c1",
+            spawn_manifest=MagicMock(),
+            cancel_event=runner._cancel_event,
+            root_session_id="p1",
+        )
+
+    assert terminal_attempts == 1
+    assert row_status["value"] == SessionStatus.RUNNING
+    forbidden_uow_factory.assert_not_called()
+    assert runner._outer_heartbeat_task is None
+    assert runner._outer_heartbeat_handle is None
+
+
+async def test_external_task_cancellation_still_drains_outer_heartbeat(
+    monkeypatch,
+) -> None:
+    import app.application.services.coordinator_child_runner as ccr_mod
+    from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+
+    class _Listener:
+        def __init__(self, **_kwargs) -> None:
+            self.ready_event = asyncio.Event()
+
+        async def start(self) -> None:
+            self.ready_event.set()
+
+        async def shutdown(self, timeout: float) -> None:
+            del timeout
+
+    monkeypatch.setattr(ccr_mod, "CoordinatorChildCancelListener", _Listener)
+    entered_seed = asyncio.Event()
+    hold_seed = asyncio.Event()
+
+    async def _blocked_seed(_wu) -> None:
+        entered_seed.set()
+        await hold_seed.wait()
+
+    runner = CoordinatorChildRunner(
+        cancel_event=asyncio.Event(),
+        inner_runner=MagicMock(),
+        publisher=AsyncMock(),
+        parent_sandbox=MagicMock(),
+        child_sandbox=MagicMock(),
+        artifact_storage=MagicMock(),
+        parent_session_id="p1",
+        mailbox_subscriber=MagicMock(),
+    )
+    runner._inner_runner.invoke_until_done = AsyncMock(return_value="done")
+    runner._install_seed = _blocked_seed
+    wu = MagicMock()
+    wu.phase = "write"
+    wu.shell_mode = False
+
+    task = asyncio.create_task(runner.run_work_unit(
+        coordinator_run_id="r1",
+        work_unit=wu,
+        child_session_id="c1",
+        spawn_manifest=MagicMock(),
+        cancel_event=runner._cancel_event,
+        root_session_id="p1",
+    ))
+    await asyncio.wait_for(entered_seed.wait(), timeout=0.5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runner._outer_heartbeat_task is None
+    assert runner._outer_heartbeat_handle is None
+
+
+async def test_cancellation_during_shielded_heartbeat_cleanup_cancels_and_drains() -> None:
+    """External cancellation cannot orphan the shielded heartbeat handle."""
+    from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+
+    stop_called = asyncio.Event()
+    heartbeat_released = asyncio.Event()
+    handle_cancel_seen = asyncio.Event()
+    release_handle_cancel = asyncio.Event()
+    late_publish: list[str] = []
+
+    class _Heartbeat:
+        async def stop(self) -> None:
+            stop_called.set()
+
+    async def _heartbeat_loop() -> None:
+        try:
+            await heartbeat_released.wait()
+        except asyncio.CancelledError:
+            handle_cancel_seen.set()
+            await release_handle_cancel.wait()
+            raise
+        else:
+            late_publish.append("heartbeat")
+
+    runner = object.__new__(CoordinatorChildRunner)
+    runner._outer_heartbeat_task = _Heartbeat()
+    runner._outer_heartbeat_handle = asyncio.create_task(_heartbeat_loop())
+    heartbeat_handle = runner._outer_heartbeat_handle
+    cleanup = asyncio.create_task(runner._safe_outer_heartbeat_shutdown())
+
+    try:
+        await asyncio.wait_for(stop_called.wait(), timeout=0.1)
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        await asyncio.wait_for(handle_cancel_seen.wait(), timeout=0.1)
+        # Deliver a second cancellation while cleanup is draining the shielded
+        # handle; it must still finish reaping the handle before propagating.
+        cleanup.cancel()
+        release_handle_cancel.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+
+        assert heartbeat_handle.done()
+        assert heartbeat_handle.cancelled()
+        heartbeat_released.set()
+        await asyncio.sleep(0.02)
+        assert late_publish == []
+        assert runner._outer_heartbeat_task is None
+        assert runner._outer_heartbeat_handle is None
+    finally:
+        if not heartbeat_handle.done():
+            heartbeat_handle.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await heartbeat_handle
+
+
+async def test_outer_heartbeat_drain_timeout_does_not_mask_result(
+    monkeypatch,
+) -> None:
+    import app.application.services.coordinator_child_runner as ccr_mod
+    from app.application.services.coordinator_child_runner import CoordinatorChildRunner
+
+    monkeypatch.setattr(
+        ccr_mod, "_OUTER_HEARTBEAT_DRAIN_TIMEOUT_SECONDS", 0.01
+    )
+
+    class _Heartbeat:
+        async def stop(self) -> None:
+            return None
+
+    async def _stuck_heartbeat() -> None:
+        await asyncio.Event().wait()
+
+    runner = object.__new__(CoordinatorChildRunner)
+    runner._outer_heartbeat_task = _Heartbeat()
+    runner._outer_heartbeat_handle = asyncio.create_task(_stuck_heartbeat())
+    handle = runner._outer_heartbeat_handle
+
+    await runner._safe_outer_heartbeat_shutdown()
+
+    assert handle.done()
+    assert handle.cancelled()
+    assert runner._outer_heartbeat_task is None
+    assert runner._outer_heartbeat_handle is None
 
 
 # ---------------------------------------------------------------------------

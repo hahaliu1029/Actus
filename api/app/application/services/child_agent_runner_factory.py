@@ -20,11 +20,10 @@ Why the wrapper instead of extending AgentTaskRunner.__init__:
 
 Spec-anchored behavior:
 - ``tool_filter_preset == "coordinator_step"`` →
-  ``terminal_envelope_publisher_disabled = True``
-  (§8.5.1 r6 P0-1 — CoordinatorChildRunner is the sole terminal publisher
-   for this preset; runner staying silent prevents duplicate
-   RESULT_READY/CANCEL_ACK envelopes on the wire).
-- ``tool_filter_preset == "subagent_research"`` → disabled = False
+  ``external_terminal_owner = external_heartbeat_owner = True``
+  (CoordinatorChildRunner owns the full terminal + heartbeat lifecycle).
+  The legacy envelope-only disable flag remains True as defence in depth.
+- ``tool_filter_preset == "subagent_research"`` → all ownership flags False
   (default AgentTaskRunner publisher path remains in charge).
 - ``tool_filter_preset`` unknown → ``resolve_preset`` raises ``ValueError``;
   the factory propagates it (fail closed: silently defaulting to no filter
@@ -92,6 +91,8 @@ class ChildRunnerBuilder(Protocol):
         tool_filter: Optional[FrozenSet[str]],
         mailbox_publisher: Any,
         terminal_envelope_publisher_disabled: bool,
+        external_terminal_owner: bool,
+        external_heartbeat_owner: bool,
         sandbox: Any,
         browser: Any,
         user_id: str,
@@ -128,12 +129,17 @@ class BuiltChildRunner:
     ``terminal_envelope_publisher_disabled`` — mirror of the kwarg passed to
                                               the runner, kept on the wrapper
                                               for downstream assertion + audit
+    ``external_terminal_owner``             — outer runner owns every terminal
+                                              side effect, not only the envelope
+    ``external_heartbeat_owner``            — outer runner owns heartbeat lifetime
     """
 
     runner: Any
     cancel_event: asyncio.Event
     child_permission_context: Any
     terminal_envelope_publisher_disabled: bool
+    external_terminal_owner: bool
+    external_heartbeat_owner: bool
 
 
 class ChildAgentTaskRunnerFactory:
@@ -215,11 +221,15 @@ class ChildAgentTaskRunnerFactory:
             tool_filter, child_permission_context, tool_filter_preset
         )
         terminal_disabled = tool_filter_preset == COORDINATOR_STEP_PRESET
+        external_terminal_owner = tool_filter_preset == COORDINATOR_STEP_PRESET
+        external_heartbeat_owner = tool_filter_preset == COORDINATOR_STEP_PRESET
         raw_runner = self._runner_class(
             session_id=child_session_id,
             tool_filter=tool_filter,
             mailbox_publisher=self._mailbox_publisher,
             terminal_envelope_publisher_disabled=terminal_disabled,
+            external_terminal_owner=external_terminal_owner,
+            external_heartbeat_owner=external_heartbeat_owner,
             sandbox=sandbox,
             browser=browser,
             user_id=user_id,
@@ -229,10 +239,14 @@ class ChildAgentTaskRunnerFactory:
             runner=raw_runner, cancel_event=cancel_event, task_cls=self._task_cls,
             child_permission_context=child_permission_context,
             coordinator_metrics_recorder=coordinator_metrics_recorder,
+            external_terminal_owner=external_terminal_owner,
+            external_heartbeat_owner=external_heartbeat_owner,
         )
         return BuiltChildRunner(
             runner=adapter,
             cancel_event=cancel_event,
             child_permission_context=child_permission_context,
             terminal_envelope_publisher_disabled=terminal_disabled,
+            external_terminal_owner=external_terminal_owner,
+            external_heartbeat_owner=external_heartbeat_owner,
         )

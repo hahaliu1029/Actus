@@ -370,6 +370,19 @@ class ExecutionStatePayload(BaseModel):
         ]
     ] = None
     transition_reason: str = ""
+    execution_revision: int = Field(default=0, ge=0)
+
+
+class PendingExecutionEvent(BaseModel):
+    """Durable execution-state event awaiting successful stream append."""
+
+    payload: ExecutionStatePayload
+
+    @model_validator(mode="after")
+    def require_persisted_revision(self) -> "PendingExecutionEvent":
+        if self.payload.execution_revision < 1:
+            raise ValueError("pending execution event requires execution_revision >= 1")
+        return self
 
 
 class ExecutionStateChangedEvent(BaseEvent):

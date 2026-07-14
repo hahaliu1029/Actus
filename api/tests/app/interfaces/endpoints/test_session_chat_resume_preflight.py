@@ -78,6 +78,9 @@ class _PreflightFailingAgent:
         self._exc = exc
         self.preflight_calls = 0
 
+    async def get_session(self, session_id: str) -> None:
+        return None
+
     async def preflight_resume_tool_confirmation(self, **kwargs: Any):
         self.preflight_calls += 1
         raise self._exc
@@ -97,6 +100,10 @@ class _NoConflictSupervisor:
     @asynccontextmanager
     async def subscriber_scope(self, **kwargs: Any):
         yield _NoConflictScope()
+
+    @asynccontextmanager
+    async def mode_transition_fence(self, **kwargs: Any):
+        yield
 
 
 class _AllowSessionService:

@@ -87,6 +87,9 @@ class _StatefulAgentService:
     def __init__(self) -> None:
         self._events = _make_events()
 
+    async def get_session(self, session_id: str) -> None:
+        return None
+
     async def chat(self, **kwargs: Any) -> AsyncGenerator[BaseEvent, None]:
         import asyncio as _asyncio
         for e in self._events:
@@ -141,6 +144,10 @@ class _NoConflictSupervisor:
     @asynccontextmanager
     async def subscriber_scope(self, **kwargs: Any):
         yield _NoConflictScope()
+
+    @asynccontextmanager
+    async def mode_transition_fence(self, **kwargs: Any):
+        yield
 
 
 class _AllowSessionService:

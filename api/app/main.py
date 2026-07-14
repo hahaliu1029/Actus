@@ -744,6 +744,9 @@ async def lifespan(app: FastAPI):
             sandbox_lifecycle_service=deferred_lifecycle,
             coordinator_envelope_store=app.state.coordinator_envelope_store,
             cost_rollup_service=app.state.cost_rollup_service,
+            coordinator_liveness_service=getattr(
+                coord_deps, "coordinator_liveness_service", None,
+            ),
         )
         logger.info(
             "SupervisorRegistry 单例初始化完成 (C3 PR-6 — mailbox plane mandatory)"
@@ -1184,11 +1187,34 @@ async def lifespan(app: FastAPI):
         # lifespan分界点
         yield
     finally:
+        logger.info("Manus应用正在关闭")
         try:
-            logger.info("Manus应用正在关闭")
             idle_watchdog = getattr(app.state, "idle_watchdog", None)
             if idle_watchdog is not None:
                 await idle_watchdog.stop()
+        except Exception as e:
+            logger.warning(f"IdleWatchdog 关闭时出错: {e}")
+
+        # Task 8: detached disconnect workflows use AgentService, PostgreSQL
+        # and Redis; fence cleanup still needs Redis. Stop the producer above,
+        # then drain both sets before any of those dependencies are closed.
+        from app.domain.services.execution_supervisor import (
+            drain_mode_transition_fence_cleanups,
+        )
+        from app.interfaces.endpoints.session_routes import (
+            drain_auto_degrade_tasks,
+        )
+
+        try:
+            await drain_auto_degrade_tasks()
+        except Exception as e:
+            logger.warning(f"Auto-degrade 关闭清理时出错: {e}")
+        try:
+            await drain_mode_transition_fence_cleanups()
+        except Exception as e:
+            logger.warning(f"Mode transition fence 关闭清理时出错: {e}")
+
+        try:
             agent_svc = getattr(app.state, "agent_service", None)
             if agent_svc:
                 await asyncio.wait_for(agent_svc.shutdown(), timeout=30.0)

@@ -19,11 +19,11 @@ def _script() -> ScriptDirectory:
 
 
 def test_c41a_is_single_head() -> None:
-    # Head advances as later epics append migrations (currently D1a, which
-    # anchors c41a via down_revision — see tests/structure/test_d1a_migration_shape.py).
+    # Head advances as later epics append migrations (currently Task8, which
+    # anchors the existing chain via down_revision).
     # The durable invariant here is: exactly one head, chain unbroken.
     heads = _script().get_heads()
-    assert heads == ["d1a_add_extension_registry"], heads
+    assert heads == ["task8_exec_revision"], heads
 
 
 def test_c41a_down_revision_anchors_s3pr1() -> None:

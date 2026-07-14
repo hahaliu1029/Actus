@@ -1,43 +1,25 @@
 """Atomic Redis Lua quota for active subagent research probes per user.
 
-This module also exposes coordinator-scoped daily-cost + concurrency quotas
-used by C2 PR-6 §14.3 (#2 per-user daily cost cap, #3 per-user concurrency
-cap). Those methods deliberately use plain INCR/INCRBYFLOAT + conditional
-rollback rather than a Lua script (see "Coordinator quota v1 trade-off"
-below).
+This module also exposes coordinator-scoped daily-cost and concurrency
+quotas. Daily cost retains its INCRBYFLOAT + conditional rollback contract.
+Concurrency is a per-user sorted-set lease: member is coordinator_run_id and
+score is the crash-cleanup expiry epoch.
 
 Why atomic (probe quota only): a naive HLEN + HSET sequence (even
 pipelined) is not atomic — two concurrent acquires can both observe
 count=1 and both insert, yielding count=3 when max=2. Lua script runs
 server-side as a single atomic unit on Redis main thread.
 
-Coordinator quota v1 trade-off:
-  ``acquire_coordinator_daily_cost`` and ``acquire_coordinator_concurrency``
-  execute INCR(BYFLOAT) and a conditional rollback as two separate Redis
-  commands. This is NOT atomic — a concurrent acquire can briefly observe
-  the temporarily-overshoot counter before the rollback lands. We accept
-  this because (a) the rollback closes the window in O(ms), (b) the
-  coordinator concurrency cap is small (default 2), and (c) overshoot
-  tolerance for daily cost is bounded by a single in-flight call's
-  ``cost_usd``. If the cap is later raised or strict bounds are required,
-  promote to a Lua script.
+Coordinator concurrency Lua contracts:
+- acquire prunes expired members, refreshes the same run idempotently, then
+  enforces the cap before adding a new member;
+- renew refreshes only an existing, unexpired member and never reacquires;
+- release removes the exact run id and is naturally idempotent.
 
-Concurrency key TTL (codex round 3 P1-5):
-  ``acquire_coordinator_concurrency`` issues ``EXPIRE`` with
-  ``CONCURRENCY_TTL_SECONDS = 21600`` (6h) after every successful INCR. The
-  TTL is a crash-recovery ceiling, NOT a normal lifecycle — the happy
-  path releases the slot via ``release_coordinator_quotas`` (DECR) in
-  ``reducer_node.finally`` long before the TTL fires. The 6h ceiling
-  comfortably exceeds the longest reasonable coordinator run
-  (``MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN = 900`` + supervisor backstop
-  ``SUBAGENT_RESULT_READY_TIMEOUT_SECONDS = 600``) plus generous
-  manual-ops grace, so a pod that crashes between the INCR at dispatch and
-  the DECR at reducer cannot permanently leak the user's slot until ops
-  manually issues ``DECR`` / ``DEL``. EXPIRE failures are logged but do
-  NOT roll back the acquire (the slot is still held; worst case it
-  outlives a crash by the 6h window). EXPIRE on every acquire re-arms the
-  TTL — multiple concurrent acquires keep the most recent expiry, which
-  is fine since the counter is decremented on each release independently.
+The six-hour value is one crash-cleanup window, not a task wallclock.
+Long-running active runs periodically renew the same member and can therefore
+run beyond six hours. The outer run-scoped backend owner stops and drains the
+renew loop before exact release, so a late renew cannot recreate ownership.
 
 Lua behavior:
 1. Read all field/timestamp pairs from the hash (HGETALL).
@@ -50,12 +32,11 @@ Lua behavior:
    to refresh hash TTL. Return 1.
 
 TTL note: `PROBE_QUOTA_TTL_SECONDS = 900` (15 min) is the per-slot lease
-window — a deliberately loose ceiling so transient client crashes don't
-permanently leak slots. The graph-level watchdog (D5
-`total_timeout_seconds = 600`) caps any single probe run; the 300s gap
-absorbs scheduler / cleanup jitter. Callers MUST treat 15 min as the hard
-upper bound for a probe's lifetime; long-running probes should
-periodically re-acquire (refresh) or get a higher ttl by callers' choice.
+window — an independent crash-recovery ceiling so transient client crashes
+don't permanently leak slots. Root execution wallclock defaults to unlimited,
+so callers MUST treat this 15 min quota lease as its own hard upper bound;
+long-running probes should periodically re-acquire (refresh) or get a higher
+ttl by callers' choice.
 
 Failure modes:
 - Redis exception during eval → acquire returns False (fail closed).
@@ -68,19 +49,60 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import time
-from typing import Final
+from typing import Callable, Final
 
 from app.infrastructure.storage.redis import RedisClient
 
 logger = logging.getLogger(__name__)
 
 MAX_ACTIVE_PROBES_PER_USER_DEFAULT: Final[int] = 2
-PROBE_QUOTA_TTL_SECONDS: Final[int] = 900  # 15 min, exceeds D5 watchdog 600s
-# [codex R3 P1-5] 6h crash-recovery ceiling on the per-user concurrency
-# counter. See module docstring "Concurrency key TTL" for the full
-# rationale; the happy path releases via DECR in reducer_node.finally
-# long before the TTL fires.
+PROBE_QUOTA_TTL_SECONDS: Final[int] = 900  # 15 min crash-recovery lease
+# One crash-cleanup window for a coordinator run-id lease. Active runs renew.
 CONCURRENCY_TTL_SECONDS: Final[int] = 21600  # 6h
+
+ACQUIRE_COORDINATOR_CONCURRENCY_LUA: Final[str] = """
+local key = KEYS[1]
+local run_id = ARGV[1]
+local now = tonumber(ARGV[2])
+local cap = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+if redis.call('ZSCORE', key, run_id) then
+    redis.call('ZADD', key, now + ttl, run_id)
+    redis.call('EXPIRE', key, ttl)
+    return 1
+end
+if redis.call('ZCARD', key) >= cap then
+    return 0
+end
+redis.call('ZADD', key, now + ttl, run_id)
+redis.call('EXPIRE', key, ttl)
+return 1
+"""
+
+RENEW_COORDINATOR_CONCURRENCY_LUA: Final[str] = """
+local key = KEYS[1]
+local run_id = ARGV[1]
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+
+local expiry = redis.call('ZSCORE', key, run_id)
+if not expiry then
+    return 0
+end
+if tonumber(expiry) <= now then
+    redis.call('ZREM', key, run_id)
+    return 0
+end
+redis.call('ZADD', key, now + ttl, run_id)
+redis.call('EXPIRE', key, ttl)
+return 1
+"""
+
+RELEASE_COORDINATOR_CONCURRENCY_LUA: Final[str] = """
+return redis.call('ZREM', KEYS[1], ARGV[1])
+"""
 
 # Lua script: stale-cleanup + idempotent-refresh + count-check + insert, all atomic.
 ACQUIRE_PROBE_LUA: Final[str] = """
@@ -131,10 +153,12 @@ class ProbeQuotaService:
         redis_client: RedisClient,
         max_active: int = MAX_ACTIVE_PROBES_PER_USER_DEFAULT,
         ttl_seconds: int = PROBE_QUOTA_TTL_SECONDS,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._redis = redis_client
         self._max_active = max_active
         self._ttl_seconds = ttl_seconds
+        self._clock = clock
 
     @staticmethod
     def _key(user_id: str) -> str:
@@ -180,9 +204,8 @@ class ProbeQuotaService:
 
     # ── Coordinator quotas (§14.3 #2 / #3) ──────────────────────────────────
     #
-    # These methods are NOT idempotent — each caller's coordinator_run_id is
-    # unique. Callers MUST pair every successful acquire with
-    # ``release_coordinator_quotas`` inside a try/finally.
+    # Concurrency acquire/release are idempotent for the same run id. The
+    # run-scoped backend owner pairs successful acquire with exact release.
 
     @staticmethod
     def _daily_key(user_id: str) -> str:
@@ -199,24 +222,7 @@ class ProbeQuotaService:
 
     @staticmethod
     def _concurrency_key(user_id: str) -> str:
-        """Per-user concurrency counter key.
-
-        TTL behavior: ``acquire_coordinator_concurrency`` issues
-        ``EXPIRE key CONCURRENCY_TTL_SECONDS`` (6h) on every successful
-        INCR. The TTL exists solely as a crash-recovery ceiling — the
-        normal lifecycle releases via DECR in
-        ``release_coordinator_quotas`` (called from
-        ``reducer_node.finally``) long before the TTL fires. The 6h
-        ceiling deliberately exceeds the longest reasonable coordinator
-        run (``MAX_TOTAL_WALLCLOCK_SECONDS_PER_RUN = 900`` + supervisor
-        backstop ``SUBAGENT_RESULT_READY_TIMEOUT_SECONDS = 600`` + ops
-        grace) so a pod crash between dispatch and reducer cannot
-        permanently pin the user's slots.
-
-        If DECR drives the value below 0 due to a release-without-
-        acquire bug, that is an observability problem surfaced through
-        monitoring, not a hidden silent state.
-        """
+        """Per-user sorted set of run-id leases scored by expiry epoch."""
         return f"actus:coord:concurrent:{user_id}"
 
     async def acquire_coordinator_daily_cost(
@@ -272,78 +278,67 @@ class ProbeQuotaService:
         return True
 
     async def acquire_coordinator_concurrency(
-        self, *, user_id: str, cap: int
+        self, *, user_id: str, coordinator_run_id: str, cap: int
     ) -> bool:
-        """Reserve one concurrency slot against the user's cap.
-
-        Semantics: INCR then compare. If the new value strictly exceeds
-        ``cap``, roll back with DECR and return False. Reaching the cap
-        exactly is allowed (predicate is strict ``>``).
-
-        Fail-closed: any Redis error during the initial INCR → return
-        False.
-
-        [codex R3 P1-5] On successful acquire, refresh the concurrency
-        key with ``EXPIRE key CONCURRENCY_TTL_SECONDS`` (6h). This is a
-        crash-recovery ceiling, NOT a normal lifecycle (the happy path
-        releases via DECR in ``release_coordinator_quotas`` long before
-        the TTL fires). Without this, a pod that crashes between INCR
-        here and the matching DECR inside ``reducer_node.finally`` would
-        permanently leak the slot until ops issued a manual ``DECR`` /
-        ``DEL``. EXPIRE failure is logged but does NOT roll back the
-        acquire — the slot is still legitimately held, worst case it
-        outlives a crash by the 6h window.
-        """
-        key = self._concurrency_key(user_id)
-        client = self._redis.client
+        """Atomically acquire or idempotently refresh one run-id lease."""
         try:
-            new_val = await client.incr(key)
+            result = await self._redis.client.eval(
+                ACQUIRE_COORDINATOR_CONCURRENCY_LUA,
+                1,
+                self._concurrency_key(user_id),
+                coordinator_run_id,
+                str(self._clock()),
+                str(cap),
+                str(CONCURRENCY_TTL_SECONDS),
+            )
+            return bool(int(result))
         except Exception as exc:
             logger.warning(
                 "acquire_coordinator_concurrency failed (fail-closed): "
-                "user_id=%s err=%s",
-                user_id, exc,
+                "user_id=%s coordinator_run_id=%s err=%s",
+                user_id, coordinator_run_id, exc,
             )
             return False
 
-        if int(new_val) > cap:
-            try:
-                await client.decr(key)
-            except Exception as exc:
-                logger.warning(
-                    "acquire_coordinator_concurrency rollback failed "
-                    "(counter leak): user_id=%s err=%s",
-                    user_id, exc,
-                )
-            return False
-
-        # Crash-recovery TTL: re-arm the 6h ceiling on every successful
-        # acquire. Failure is non-fatal — slot is still held; worst case
-        # the key persists slightly beyond the TTL window.
+    async def renew_coordinator_concurrency(
+        self, *, user_id: str, coordinator_run_id: str,
+    ) -> bool:
+        """Refresh an existing live lease; never recreate a lost lease."""
         try:
-            await client.expire(key, CONCURRENCY_TTL_SECONDS)
+            result = await self._redis.client.eval(
+                RENEW_COORDINATOR_CONCURRENCY_LUA,
+                1,
+                self._concurrency_key(user_id),
+                coordinator_run_id,
+                str(self._clock()),
+                str(CONCURRENCY_TTL_SECONDS),
+            )
+            return bool(int(result))
         except Exception as exc:
             logger.warning(
-                "acquire_coordinator_concurrency: EXPIRE failed user=%s "
-                "— slot still acquired but may not auto-release on "
-                "pod crash before reducer DECR runs: %s",
-                user_id, exc,
+                "renew_coordinator_concurrency failed (fail-closed): "
+                "user_id=%s coordinator_run_id=%s err=%s",
+                user_id, coordinator_run_id, exc,
             )
-        return True
+            return False
 
     async def release_coordinator_quotas(
-        self, *, user_id: str, cost_usd: float = 0.0
+        self,
+        *,
+        user_id: str,
+        coordinator_run_id: str,
+        cost_usd: float = 0.0,
     ) -> None:
         """Release a coordinator quota reservation. Best-effort.
 
-        Always decrements the concurrency counter. If ``cost_usd > 0``,
+        Always removes the exact concurrency run-id member. If ``cost_usd > 0``,
         additionally rolls back that amount from the daily counter.
         Negative or zero ``cost_usd`` is treated as "no daily rollback
         desired" — the caller signals intent by passing the positive
         cost they previously reserved.
 
         Each Redis op is wrapped independently: if INCRBYFLOAT raises,
-        the DECR still runs (and vice versa). All errors are logged and
+        the exact ZREM still runs (and vice versa). All errors are logged and
         swallowed (matches the existing ``release`` pattern).
         """
         client = self._redis.client
@@ -357,10 +352,15 @@ class ProbeQuotaService:
                     user_id, cost_usd, exc,
                 )
         try:
-            await client.decr(self._concurrency_key(user_id))
+            await client.eval(
+                RELEASE_COORDINATOR_CONCURRENCY_LUA,
+                1,
+                self._concurrency_key(user_id),
+                coordinator_run_id,
+            )
         except Exception as exc:
             logger.warning(
-                "release_coordinator_quotas concurrency decr failed: "
-                "user_id=%s err=%s",
-                user_id, exc,
+                "release_coordinator_quotas concurrency zrem failed: "
+                "user_id=%s coordinator_run_id=%s err=%s",
+                user_id, coordinator_run_id, exc,
             )

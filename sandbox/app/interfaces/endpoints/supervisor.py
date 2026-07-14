@@ -103,6 +103,22 @@ async def extend_timeout(
 
 
 @router.post(
+    path="/reset-timeout",
+    response_model=Response[SupervisorTimeout],
+)
+async def reset_timeout(
+    request: TimeoutRequest,
+    supervisor_service: SupervisorService = Depends(get_supervisor_service),
+) -> Response[SupervisorTimeout]:
+    """把sandbox cleanup lease精确重置为指定或默认窗口。"""
+    result = await supervisor_service.reset_timeout(request.minutes)
+    return Response.success(
+        msg=f"超时销毁时间已重置, 所有服务与沙箱将在{result.timeout_minutes}分钟后销毁",
+        data=result,
+    )
+
+
+@router.post(
     path="/cancel-timeout",
     response_model=Response[SupervisorTimeout],
 )

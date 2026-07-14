@@ -2757,6 +2757,7 @@ class AgentService:
             last_progress_at=last_progress_at,
             is_alive=is_alive,
             cancellation_state=cancellation_state,
+            execution_revision=session.execution_revision,
         )
 
     async def _read_supervisor_hot_hash(self, session_id: str) -> dict[Any, Any]:
@@ -3937,18 +3938,18 @@ end
         if supervisor is None:
             raise ServiceUnavailableError("后台执行服务暂不可用，请稍后重试")
 
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+        if session.background_reason == "auto_degrade":
+            expires_at = supervisor.new_auto_degrade_cleanup_expiry()
+        else:
+            # Explicit background expiry is a caller-owned deadline, not a
+            # rolling cleanup lease. Preserve it across retry. Legacy rows
+            # without a persisted value keep the previous two-hour fallback.
+            expires_at = session.expires_at or (
+                datetime.now(timezone.utc) + timedelta(hours=2)
+            )
         original_retry_budget = session.retry_budget_remaining
         original_expires_at = session.expires_at
         original_suspended_reason = session.suspended_reason
-
-        async with self._uow_factory() as uow:
-            claimed_retry_budget = await uow.session.claim_background_retry_from_suspend(
-                session.id,
-                expires_at=expires_at,
-            )
-        if claimed_retry_budget is None:
-            raise ConflictError("后台任务状态已变化，请刷新后重试")
 
         from app.domain.errors.sandbox_lifecycle import (
             SandboxLifecycleError,
@@ -3957,29 +3958,90 @@ end
         )
 
         resume_user_id = str(session.user_id or user_id)
+        claimed_retry: tuple[int, int] | None = None
+        admission_rc: int | None = None
+        claim_rollback_attempted = False
         try:
-            admission_rc = await supervisor.resume(
-                session_id=session.id,
-                user_id=resume_user_id,
-                execution_mode="background",
-                expires_at=expires_at,
-                retry_budget_remaining=claimed_retry_budget,
-            )
-        except SupervisorContractError as exc:
-            await self._rollback_background_retry_claim(
-                session,
-                retry_budget_remaining=original_retry_budget,
-                expires_at=original_expires_at,
-                suspended_reason=original_suspended_reason,
-            )
-            raise ConflictError("后台执行名额已满，请稍后重试") from exc
-        except Exception:
-            await self._rollback_background_retry_claim(
-                session,
-                retry_budget_remaining=original_retry_budget,
-                expires_at=original_expires_at,
-                suspended_reason=original_suspended_reason,
-            )
+            async with supervisor.mode_transition_fence(session_id=session.id):
+                try:
+                    async with self._uow_factory() as uow:
+                        claimed_retry = (
+                            await uow.session.claim_background_retry_from_suspend(
+                                session.id,
+                                expires_at=expires_at,
+                            )
+                        )
+                        if claimed_retry is not None:
+                            await _commit_uow_if_real(uow)
+                except BaseException:
+                    if claimed_retry is not None:
+                        claim_rollback_attempted = True
+                        await self._rollback_background_retry_claim(
+                            session,
+                            expected_execution_revision=claimed_retry[1],
+                            retry_budget_remaining=original_retry_budget,
+                            expires_at=original_expires_at,
+                            suspended_reason=original_suspended_reason,
+                        )
+                    raise
+                if claimed_retry is None:
+                    raise ConflictError("后台任务状态已变化，请刷新后重试")
+                claimed_retry_budget, retry_execution_revision = claimed_retry
+
+                try:
+                    admission_rc = await supervisor.resume(
+                        session_id=session.id,
+                        user_id=resume_user_id,
+                        execution_mode="background",
+                        expires_at=expires_at,
+                        previous_expires_at=original_expires_at,
+                        retry_budget_remaining=claimed_retry_budget,
+                        expected_execution_revision=retry_execution_revision,
+                    )
+                except SupervisorContractError as exc:
+                    claim_rollback_attempted = True
+                    await self._rollback_background_retry_claim(
+                        session,
+                        expected_execution_revision=retry_execution_revision,
+                        retry_budget_remaining=original_retry_budget,
+                        expires_at=original_expires_at,
+                        suspended_reason=original_suspended_reason,
+                    )
+                    message = (
+                        "后台执行名额已满，请稍后重试"
+                        if exc.rejection_code in ("R1", "R2")
+                        else "后台任务状态已变化，请刷新后重试"
+                    )
+                    raise ConflictError(message) from exc
+                except BaseException:
+                    claim_rollback_attempted = True
+                    await self._rollback_background_retry_claim(
+                        session,
+                        expected_execution_revision=retry_execution_revision,
+                        retry_budget_remaining=original_retry_budget,
+                        expires_at=original_expires_at,
+                        suspended_reason=original_suspended_reason,
+                    )
+                    raise
+        except BaseException:
+            if claimed_retry is not None and not claim_rollback_attempted:
+                claim_rollback_attempted = True
+                rolled_back = await self._rollback_background_retry_claim(
+                    session,
+                    expected_execution_revision=claimed_retry[1],
+                    retry_budget_remaining=original_retry_budget,
+                    expires_at=original_expires_at,
+                    suspended_reason=original_suspended_reason,
+                )
+                if rolled_back:
+                    await self._rollback_background_resume_admission(
+                        session,
+                        user_id=resume_user_id,
+                        supervisor=supervisor,
+                        admission_rc=admission_rc,
+                        previous_expires_at=original_expires_at,
+                        expected_execution_revision=claimed_retry[1],
+                    )
             raise
 
         try:
@@ -4001,37 +4063,44 @@ end
                 user_id=resume_user_id,
                 supervisor=supervisor,
                 admission_rc=admission_rc,
+                expected_execution_revision=retry_execution_revision,
             )
             raise ConflictError("沙箱已终止，无法重试") from exc
         except SandboxLifecycleError as exc:
-            await self._rollback_background_retry_claim(
+            rolled_back = await self._rollback_background_retry_claim(
                 session,
+                expected_execution_revision=retry_execution_revision,
                 retry_budget_remaining=original_retry_budget,
                 expires_at=original_expires_at,
                 suspended_reason=original_suspended_reason,
             )
-            await self._rollback_background_resume_admission(
-                session,
-                user_id=resume_user_id,
-                supervisor=supervisor,
-                admission_rc=admission_rc,
-                previous_expires_at=original_expires_at,
-            )
+            if rolled_back:
+                await self._rollback_background_resume_admission(
+                    session,
+                    user_id=resume_user_id,
+                    supervisor=supervisor,
+                    admission_rc=admission_rc,
+                    previous_expires_at=original_expires_at,
+                    expected_execution_revision=retry_execution_revision,
+                )
             raise ConflictError("沙箱状态不支持重试") from exc
-        except Exception:
-            await self._rollback_background_retry_claim(
+        except BaseException:
+            rolled_back = await self._rollback_background_retry_claim(
                 session,
+                expected_execution_revision=retry_execution_revision,
                 retry_budget_remaining=original_retry_budget,
                 expires_at=original_expires_at,
                 suspended_reason=original_suspended_reason,
             )
-            await self._rollback_background_resume_admission(
-                session,
-                user_id=resume_user_id,
-                supervisor=supervisor,
-                admission_rc=admission_rc,
-                previous_expires_at=original_expires_at,
-            )
+            if rolled_back:
+                await self._rollback_background_resume_admission(
+                    session,
+                    user_id=resume_user_id,
+                    supervisor=supervisor,
+                    admission_rc=admission_rc,
+                    previous_expires_at=original_expires_at,
+                    expected_execution_revision=retry_execution_revision,
+                )
             # C3 PR-6 — legacy retired (spec §11.7). Subagent suspend owned
             # exclusively by MailboxSupervisor via destroy hook (M1).
             # _should_skip_mailbox_lifecycle reference satisfies AST CI gate
@@ -4039,7 +4108,10 @@ end
             # fallback. retry_from_suspend rollback only fires on root
             # sessions in practice (mailbox children cannot retry_from_suspend),
             # so the explicit guard is defense-in-depth.
-            if session.sandbox_binding.state == SandboxBindingState.SUSPENDED:
+            if (
+                rolled_back
+                and session.sandbox_binding.state == SandboxBindingState.SUSPENDED
+            ):
                 if _should_skip_mailbox_lifecycle(session):
                     logger.debug(
                         "retry_from_suspend rollback: skip suspend %s — mailbox plane",
@@ -4078,6 +4150,7 @@ end
         user_id: str,
         supervisor,
         admission_rc: int | None,
+        expected_execution_revision: int,
     ) -> None:
         try:
             await supervisor.terminate(
@@ -4134,6 +4207,7 @@ end
             user_id=user_id,
             supervisor=supervisor,
             admission_rc=admission_rc,
+            expected_execution_revision=expected_execution_revision,
         )
 
     async def _revoke_background_resume_admission(
@@ -4143,6 +4217,7 @@ end
         user_id: str,
         supervisor,
         admission_rc: int | None,
+        expected_execution_revision: int,
     ) -> None:
         if admission_rc is None:
             return
@@ -4151,6 +4226,7 @@ end
                 session_id=session.id,
                 user_id=user_id,
                 admission_rc=admission_rc,
+                expected_execution_revision=expected_execution_revision,
             )
         except Exception:
             logger.warning(
@@ -4167,6 +4243,7 @@ end
         supervisor,
         admission_rc: int | None,
         previous_expires_at: Optional[datetime],
+        expected_execution_revision: int,
     ) -> None:
         if admission_rc is None:
             return
@@ -4176,6 +4253,7 @@ end
                 user_id=user_id,
                 admission_rc=admission_rc,
                 previous_expires_at=previous_expires_at,
+                expected_execution_revision=expected_execution_revision,
             )
         except Exception:
             logger.warning(
@@ -4188,24 +4266,32 @@ end
         self,
         session: Session,
         *,
+        expected_execution_revision: int,
         retry_budget_remaining: int,
         expires_at: Optional[datetime],
         suspended_reason: Optional[str],
-    ) -> None:
+    ) -> bool:
         try:
             async with self._uow_factory() as uow:
-                await uow.session.rollback_background_retry_claim_if_active(
-                    session.id,
-                    retry_budget_remaining=retry_budget_remaining,
-                    expires_at=expires_at,
-                    suspended_reason=suspended_reason,
+                rolled_back = (
+                    await uow.session.rollback_background_retry_claim_if_active(
+                        session.id,
+                        expected_execution_revision=expected_execution_revision,
+                        retry_budget_remaining=retry_budget_remaining,
+                        expires_at=expires_at,
+                        suspended_reason=suspended_reason,
+                    )
                 )
+                if rolled_back:
+                    await _commit_uow_if_real(uow)
+                return rolled_back
         except Exception:
             logger.warning(
                 "retry_from_suspend rollback failed for session %s",
                 session.id,
                 exc_info=True,
             )
+            return False
 
     async def _rollback_resume_failed(
         self,

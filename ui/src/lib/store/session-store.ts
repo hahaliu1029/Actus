@@ -443,6 +443,17 @@ function supervisorSnapshotFromExecutionStateEvent(
     return base ?? null;
   }
 
+  const executionRevision =
+    typeof payload.execution_revision === "number" &&
+    Number.isInteger(payload.execution_revision) &&
+    payload.execution_revision >= 0
+      ? payload.execution_revision
+      : 0;
+  const baseRevision = base?.execution_revision ?? 0;
+  if (base && executionRevision <= baseRevision) {
+    return base ?? null;
+  }
+
   const rawBackgroundReason = payload.background_reason;
   const backgroundReason =
     rawBackgroundReason == null
@@ -457,6 +468,7 @@ function supervisorSnapshotFromExecutionStateEvent(
       : base?.retry_budget_remaining ?? 0;
 
   return {
+    execution_revision: executionRevision,
     execution_mode: executionMode,
     execution_phase: executionPhase,
     background_reason: backgroundReason,
@@ -496,6 +508,13 @@ function mergeSupervisorSnapshotByCursor(
 ): SupervisorSnapshot | null {
   if (!remoteSnapshot) {
     return localSnapshot ?? null;
+  }
+  const remoteRevision = remoteSnapshot.execution_revision ?? 0;
+  const localRevision = localSnapshot?.execution_revision ?? 0;
+  if (remoteRevision !== localRevision) {
+    return remoteRevision > localRevision
+      ? remoteSnapshot
+      : localSnapshot ?? null;
   }
   const localCursor =
     typeof localLastSeq === "number" && Number.isFinite(localLastSeq)
@@ -1793,6 +1812,7 @@ export const useSessionStore = create<SessionStore>()(
             ...current,
             status: normalizeSessionStatus(result.status),
             supervisor_snapshot: {
+              execution_revision: previousSnapshot?.execution_revision ?? 0,
               execution_mode: "background",
               execution_phase: "running",
               background_reason: previousSnapshot?.background_reason ?? null,

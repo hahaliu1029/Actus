@@ -370,7 +370,10 @@ SUBAGENT_SPAWN_ACK_TIMEOUT_SECONDS: int = 10
 SUBAGENT_SPAWN_SANDBOX_READY_TIMEOUT_SECONDS: int = 60
 SUBAGENT_PROGRESS_HEARTBEAT_INTERVAL_SECONDS: int = 15
 SUBAGENT_PROGRESS_STALE_AFTER_SECONDS: int = 90
-SUBAGENT_RESULT_READY_TIMEOUT_SECONDS: int = 600
+# Bound one mailbox publish operation below the supervisor stale window. This
+# is intentionally independent of Redis socket settings: it covers lock-owned
+# lifecycle writes even when a publisher implementation never returns.
+MAILBOX_PUBLISH_OPERATION_TIMEOUT_SECONDS: int = 30
 SUBAGENT_HANDOFF_REQUEST_TIMEOUT_SECONDS: int = 1800
 
 CHILD_CANCEL_ACK_TIMEOUT_MS: int = 30_000

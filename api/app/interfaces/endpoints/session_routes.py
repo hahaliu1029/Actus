@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import AsyncGenerator, Dict, Optional
 from urllib.parse import quote
 
@@ -104,11 +104,35 @@ SSE_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 _PENDING_AUTO_DEGRADE_TASKS: set[asyncio.Task[None]] = set()
+_AUTO_DEGRADE_SHUTDOWN_WAIT_SECONDS = 5.0
 
 
 def _track_auto_degrade_task(task: asyncio.Task[None]) -> None:
     _PENDING_AUTO_DEGRADE_TASKS.add(task)
     task.add_done_callback(_PENDING_AUTO_DEGRADE_TASKS.discard)
+
+
+async def drain_auto_degrade_tasks() -> None:
+    """Drain anchored disconnect workflows before Redis/DB clients close."""
+    tasks = list(_PENDING_AUTO_DEGRADE_TASKS)
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(
+        tasks,
+        timeout=_AUTO_DEGRADE_SHUTDOWN_WAIT_SECONDS,
+    )
+    for task in pending:
+        task.cancel()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for task, result in zip(tasks, results, strict=True):
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            logger.warning(
+                "auto-degrade task failed during shutdown: task=%s",
+                task.get_name(),
+                exc_info=(type(result), result, result.__traceback__),
+            )
 
 
 async def _do_auto_degrade(
@@ -118,45 +142,122 @@ async def _do_auto_degrade(
     supervisor: ExecutionSupervisor,
 ) -> None:
     try:
-        sess = await agent_service.get_session(session_id)
-        if (
-            sess is None
-            or sess.execution_mode != "foreground"
-            or sess.status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT)
-            or sess.execution_phase in ("terminating", "terminated")
-        ):
-            return
-
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
-        supervisor_user_id = str(sess.user_id or user_id)
-        try:
-            retry_budget_remaining = await supervisor.promote(
+        async with supervisor.mode_transition_fence(session_id=session_id):
+            if not await supervisor.can_auto_degrade_after_disconnect(
                 session_id=session_id,
-                user_id=supervisor_user_id,
-                expires_at=expires_at,
-            )
-        except SupervisorContractError:
-            logger.info("auto-degrade rejected for session %s", session_id)
-            return
-        if retry_budget_remaining is None:
-            logger.info("auto-degrade skipped stale session %s", session_id)
-            return
+            ):
+                return
+            sess = await agent_service.get_session(session_id)
+            if (
+                sess is None
+                or sess.execution_mode != "foreground"
+                or sess.status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT)
+                or sess.execution_phase in ("terminating", "terminated")
+            ):
+                return
 
-        await agent_service._emit_event(
-            session_id,
-            ExecutionStateChangedEvent(
-                payload=ExecutionStatePayload(
-                    execution_mode="background",
-                    execution_phase="running",
-                    transition_reason="auto_degrade_sse_disconnect",
-                    background_reason="auto_degrade",
+            expires_at = supervisor.new_auto_degrade_cleanup_expiry()
+            supervisor_user_id = str(sess.user_id or user_id)
+            try:
+                retry_budget_remaining = await supervisor.promote(
+                    session_id=session_id,
+                    user_id=supervisor_user_id,
                     expires_at=expires_at,
-                    retry_budget_remaining=retry_budget_remaining,
                 )
-            ),
-        )
+            except SupervisorContractError:
+                logger.info("auto-degrade rejected for session %s", session_id)
+                return
+            if retry_budget_remaining is None:
+                logger.info("auto-degrade skipped stale session %s", session_id)
+                return
+
+            if not await supervisor.can_auto_degrade_after_disconnect(
+                session_id=session_id,
+            ):
+                await supervisor.resume(
+                    session_id=session_id,
+                    user_id=supervisor_user_id,
+                    execution_mode="foreground",
+                )
+                await _flush_pending_execution_event(
+                    session_id=session_id,
+                    agent_service=agent_service,
+                    supervisor=supervisor,
+                )
+                return
+
+            await _flush_pending_execution_event(
+                session_id=session_id,
+                agent_service=agent_service,
+                supervisor=supervisor,
+            )
     except Exception:
         logger.exception("auto-degrade failed for session %s", session_id)
+
+
+async def _flush_pending_execution_event(
+    *,
+    session_id: str,
+    agent_service: AgentService,
+    supervisor: ExecutionSupervisor,
+) -> bool:
+    current = await agent_service.get_session(session_id)
+    if current is None or current.pending_execution_event is None:
+        return False
+    pending = current.pending_execution_event
+    message_id = await agent_service._emit_event(
+        session_id,
+        ExecutionStateChangedEvent(payload=pending.payload),
+    )
+    if message_id is None:
+        return False
+    return await supervisor.clear_pending_execution_event(
+        session_id=session_id,
+        execution_revision=pending.payload.execution_revision,
+    )
+
+
+async def _resume_auto_degrade_after_reconnect(
+    *,
+    session_id: str,
+    request_user_id: str,
+    agent_service: AgentService,
+    supervisor: ExecutionSupervisor,
+) -> None:
+    """Restore auto-degrade or retry stale projection cleanup after reconnect."""
+    async with supervisor.mode_transition_fence(session_id=session_id):
+        session = await agent_service.get_session(session_id)
+        if session is None or session.status != SessionStatus.RUNNING:
+            return
+        was_auto_degrade = (
+            session.execution_mode == "background"
+            and session.execution_phase == "running"
+            and session.background_reason == "auto_degrade"
+        )
+        is_foreground = (
+            session.execution_mode == "foreground"
+            and session.execution_phase == "running"
+        )
+        if not was_auto_degrade and not is_foreground:
+            # Explicit background sessions never auto-resume, but an earlier
+            # execution-state backlog emit may still have failed.  A legal SSE
+            # owner is a retry opportunity for every live pending revision.
+            await _flush_pending_execution_event(
+                session_id=session_id,
+                agent_service=agent_service,
+                supervisor=supervisor,
+            )
+            return
+        await supervisor.resume(
+            session_id=session_id,
+            user_id=str(session.user_id or request_user_id),
+            execution_mode="foreground",
+        )
+        await _flush_pending_execution_event(
+            session_id=session_id,
+            agent_service=agent_service,
+            supervisor=supervisor,
+        )
 
 
 async def _build_list_session_item(
@@ -442,6 +543,21 @@ async def chat(
         await lease.release()
         raise
 
+    cleanup_task: asyncio.Task[None] | None = None
+
+    async def cleanup_connection() -> None:
+        nonlocal cleanup_task
+
+        async def _cleanup() -> None:
+            try:
+                await subscriber_scope.__aexit__(None, None, None)
+            finally:
+                await lease.release()
+
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(_cleanup())
+        await asyncio.shield(cleanup_task)
+
     if scope.is_conflict:
         async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
             """定义事件生成器，用于配合EventSourceResponse生成流式响应数据"""
@@ -461,12 +577,20 @@ async def chat(
                     data=sse_event.to_sse_data_json(),
                 )
             finally:
-                try:
-                    await subscriber_scope.__aexit__(None, None, None)
-                finally:
-                    await lease.release()
+                await cleanup_connection()
 
         return EventSourceResponse(event_generator(), headers=SSE_HEADERS)
+
+    try:
+        await _resume_auto_degrade_after_reconnect(
+            session_id=session_id,
+            request_user_id=current_user.id,
+            agent_service=agent_service,
+            supervisor=supervisor,
+        )
+    except BaseException:
+        await cleanup_connection()
+        raise
 
     resume_state = None
     if request.tool_confirmation is not None:
@@ -478,34 +602,43 @@ async def chat(
                 tool_confirmation=request.tool_confirmation,
             )
         except BaseException:
-            try:
-                await subscriber_scope.__aexit__(None, None, None)
-            finally:
-                await lease.release()
+            await cleanup_connection()
             raise
 
-    auto_degrade_scheduled = False
+    disconnect_workflow_task: asyncio.Task[None] | None = None
 
-    def schedule_auto_degrade() -> None:
-        nonlocal auto_degrade_scheduled
-        if auto_degrade_scheduled:
-            return
-        auto_degrade_scheduled = True
-        task = asyncio.create_task(
-            _do_auto_degrade(
-                session_id,
-                current_user.id,
-                agent_service,
-                supervisor,
-            )
+    async def disconnect_workflow() -> None:
+        try:
+            await cleanup_connection()
+        except asyncio.CancelledError:
+            # Shutdown may cancel the outer workflow while the shielded scope
+            # cleanup is still running. Finish that cleanup before returning;
+            # auto-degrade itself may be skipped during process shutdown.
+            await cleanup_connection()
+            raise
+        await _do_auto_degrade(
+            session_id,
+            current_user.id,
+            agent_service,
+            supervisor,
         )
-        _track_auto_degrade_task(task)
+
+    def start_disconnect_workflow() -> asyncio.Task[None]:
+        nonlocal disconnect_workflow_task
+        if disconnect_workflow_task is None:
+            disconnect_workflow_task = asyncio.create_task(
+                disconnect_workflow(),
+                name=f"sse-disconnect-auto-degrade-{session_id}",
+            )
+            _track_auto_degrade_task(disconnect_workflow_task)
+        return disconnect_workflow_task
 
     async def handle_client_close(_message: dict[str, object]) -> None:
-        schedule_auto_degrade()
+        await asyncio.shield(start_disconnect_workflow())
 
     async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
         """定义事件生成器，用于配合EventSourceResponse生成流式响应数据"""
+        schedule_after_cleanup = False
         try:
             # 1.分派：tool_confirmation 走 drive（preflight 已拿 claim）；否则正常 chat
             if resume_state is not None:
@@ -544,13 +677,13 @@ async def chat(
             GeneratorExit,
             anyio.EndOfStream,
         ):
-            schedule_auto_degrade()
+            schedule_after_cleanup = True
             raise
         finally:
-            try:
-                await subscriber_scope.__aexit__(None, None, None)
-            finally:
-                await lease.release()
+            if schedule_after_cleanup:
+                await asyncio.shield(start_disconnect_workflow())
+            else:
+                await cleanup_connection()
 
     return EventSourceResponse(
         event_generator(),

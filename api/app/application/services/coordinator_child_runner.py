@@ -97,6 +97,7 @@ logger = logging.getLogger(__name__)
 # patch_manifest_ref instead. Margin under 64KB leaves room for the rest of the
 # envelope (summary, cost_summary, etc.) that also counts toward the cap.
 _MAX_INLINE_MANIFEST_BYTES = 48 * 1024
+_OUTER_HEARTBEAT_DRAIN_TIMEOUT_SECONDS = 2.0
 
 
 class _SeedInstallError(Exception):
@@ -367,6 +368,13 @@ class CoordinatorChildRunner:
         # [C2b budget D5] Monotonic stamp of inner-invoke start, for the
         # optional wallclock_elapsed_seconds evidence field.
         self._inner_invoke_started_monotonic: float | None = None
+        # Coordinator-step ownership: this heartbeat begins after the cancel
+        # listener is ready and remains live across seed install, the inner
+        # invocation and every finalizer.  The inner AgentTaskRunner is built
+        # with ``external_heartbeat_owner=True`` and therefore emits SPAWN_ACK
+        # but never creates a competing heartbeat loop.
+        self._outer_heartbeat_task: Any = None
+        self._outer_heartbeat_handle: asyncio.Task | None = None
 
     def attach_budget_callback(self, cb: Any) -> None:
         """[C2b budget D1] Keep a reference to the child's
@@ -432,6 +440,7 @@ class CoordinatorChildRunner:
         # consumer group is registered before the inner runner can produce
         # tool events the parent might try to cancel mid-flight.
         await listener.ready_event.wait()
+        await self._start_outer_heartbeat(child_session_id)
 
         # [r3 P1#2] §8.4 worker-start checkpoint (#1 in spec). If parent set
         # cancel_event BEFORE listener.start completed (the pre-subscribe race
@@ -445,13 +454,17 @@ class CoordinatorChildRunner:
             main_result: Any
             main_exc: BaseException | None = None
             try:
+                self._set_outer_heartbeat_phase("finalizing")
                 main_result = await self._finalize_by_stop_reason(
                     coordinator_run_id, work_unit, child_session_id,
                 )
             except BaseException as exc:  # noqa: BLE001 — re-raised after shutdown
                 main_exc = exc
             finally:
-                await self._safe_listener_shutdown(listener)
+                try:
+                    await self._safe_listener_shutdown(listener)
+                finally:
+                    await self._safe_outer_heartbeat_shutdown()
             if main_exc is not None:
                 raise main_exc
             return main_result
@@ -507,6 +520,7 @@ class CoordinatorChildRunner:
                             f"pre_scan_failed: {scan_exc}"
                         ) from scan_exc
             except _SeedInstallError as exc:
+                self._set_outer_heartbeat_phase("finalizing")
                 return await self._finalize_failed(
                     coordinator_run_id, work_unit, child_session_id, exc,
                 )
@@ -528,11 +542,11 @@ class CoordinatorChildRunner:
                         wd = start_wallclock_watchdog(
                             runner=self, max_wallclock_seconds=_max_wc,
                         )
-                    else:
-                        # [spec L8] Non-positive cap: production-unreachable
-                        # (env loader rejects), but direct construction can
-                        # hit it — honest DISABLED + WARNING beats a
-                        # trips-on-first-call cap=0 watchdog.
+                    elif _max_wc < 0:
+                        # Negative values are blocked by the env loader, but a
+                        # direct ChildBudget construction can still reach this
+                        # path. Keep it disabled and observable. Zero is the
+                        # valid unlimited default and stays silent.
                         logger.warning(
                             "CoordinatorChildRunner: max_wallclock_seconds=%s "
                             "non-positive — wallclock watchdog DISABLED for "
@@ -555,6 +569,9 @@ class CoordinatorChildRunner:
                     # outer except arms (and therefore before every finalizer).
                     if wd is not None:
                         wd.cancel()
+                    # From this point onward every exit is terminal
+                    # finalization owned by this outer runner.
+                    self._set_outer_heartbeat_phase("finalizing")
             except CancelledByEventError:
                 return await self._finalize_by_stop_reason(
                     coordinator_run_id, work_unit, child_session_id,
@@ -636,7 +653,10 @@ class CoordinatorChildRunner:
             # wallclock budget watchdog (LIVE since C2b budget wiring; D2
             # inner-finally above) is the upstream cancel that forces
             # invoke_until_done to terminate.
-            await self._safe_listener_shutdown(listener)
+            try:
+                await self._safe_listener_shutdown(listener)
+            finally:
+                await self._safe_outer_heartbeat_shutdown()
 
     # ---- Finalizer matrix ------------------------------------------------ #
 
@@ -1042,6 +1062,120 @@ class CoordinatorChildRunner:
                 exc_info=True,
             )
 
+    async def _start_outer_heartbeat(self, child_session_id: str) -> None:
+        """Start the coordinator-owned heartbeat after listener readiness."""
+        publisher = getattr(self, "_publisher", None)
+        if (
+            publisher is None
+            or getattr(self, "_outer_heartbeat_handle", None) is not None
+        ):
+            return
+        try:
+            from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
+
+            heartbeat = ChildHeartbeatTask(
+                publisher,
+                self._parent_session_id,
+                child_session_id,
+            )
+            self._outer_heartbeat_task = heartbeat
+            self._outer_heartbeat_handle = asyncio.create_task(
+                heartbeat.run(),
+                name=f"coordinator-heartbeat-{child_session_id}",
+            )
+        except Exception:
+            logger.warning(
+                "CoordinatorChildRunner: outer heartbeat start failed for child=%s",
+                child_session_id,
+                exc_info=True,
+            )
+
+    def _set_outer_heartbeat_phase(self, phase: str) -> None:
+        heartbeat = getattr(self, "_outer_heartbeat_task", None)
+        if heartbeat is None:
+            return
+        try:
+            heartbeat.set_phase(phase)
+        except Exception:
+            logger.warning(
+                "CoordinatorChildRunner: heartbeat phase update failed",
+                exc_info=True,
+            )
+
+    async def _safe_outer_heartbeat_shutdown(self) -> None:
+        """Stop and drain liveness without replacing the terminal outcome."""
+        heartbeat = getattr(self, "_outer_heartbeat_task", None)
+        handle = getattr(self, "_outer_heartbeat_handle", None)
+        if heartbeat is None or handle is None:
+            return
+
+        async def _cancel_and_drain() -> None:
+            """Consume handle completion despite repeated caller cancels."""
+            if not handle.done():
+                handle.cancel()
+            while True:
+                try:
+                    await asyncio.shield(handle)
+                except asyncio.CancelledError:
+                    if handle.done():
+                        return
+                    # A second cancellation of this cleanup task must not leave
+                    # the independently scheduled heartbeat orphaned.
+                    continue
+                except Exception:
+                    return
+                else:
+                    return
+
+        try:
+            await heartbeat.stop()
+            await asyncio.wait_for(
+                asyncio.shield(handle),
+                timeout=_OUTER_HEARTBEAT_DRAIN_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            # A heartbeat handle that independently ended cancelled is a
+            # liveness-cleanup failure and must not replace a successful
+            # terminal result.  Cancellation of THIS runner remains part of
+            # structured concurrency and must propagate.
+            current = asyncio.current_task()
+            if handle.cancelled() and not (
+                current is not None and current.cancelling()
+            ):
+                logger.warning(
+                    "CoordinatorChildRunner: outer heartbeat handle was cancelled"
+                )
+            else:
+                await _cancel_and_drain()
+                raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "CoordinatorChildRunner: outer heartbeat drain timed out; cancelling"
+            )
+            await _cancel_and_drain()
+        except Exception:
+            logger.warning(
+                "CoordinatorChildRunner: outer heartbeat stop/drain failed",
+                exc_info=True,
+            )
+            await _cancel_and_drain()
+        finally:
+            # Never lose ownership of a still-running background task. Identity
+            # checks also avoid clearing a replacement started by future reuse.
+            if handle.done():
+                if getattr(self, "_outer_heartbeat_task", None) is heartbeat:
+                    self._outer_heartbeat_task = None
+                if getattr(self, "_outer_heartbeat_handle", None) is handle:
+                    self._outer_heartbeat_handle = None
+
+    async def _publish_terminal_envelope(self, envelope: Any) -> None:
+        """Serialize terminal publish with heartbeat and close liveness."""
+        heartbeat = getattr(self, "_outer_heartbeat_task", None)
+        if heartbeat is None:
+            await self._publisher.publish(envelope)
+            return
+        await heartbeat.publish_terminal(lambda: self._publisher.publish(envelope))
+
     # ---- Publish helpers (single-source-of-truth wire boundary) --------- #
 
     # [r3 P1#4 DEFERRED to PR-7] terminal envelope_id is currently a fresh
@@ -1061,7 +1195,7 @@ class CoordinatorChildRunner:
             correlation_id=self._coordinator_run_id,
             payload=payload,
         )
-        await self._publisher.publish(envelope)
+        await self._publish_terminal_envelope(envelope)
 
     async def _publish_cancel_ack(
         self, child_id: str, payload: CancelAckPayload,
@@ -1072,7 +1206,7 @@ class CoordinatorChildRunner:
             correlation_id=self._coordinator_run_id,
             payload=payload,
         )
-        await self._publisher.publish(envelope)
+        await self._publish_terminal_envelope(envelope)
 
     # ---- Stub helpers (PR-4 minimal; full impl in PR-5/PR-6) ------------ #
 

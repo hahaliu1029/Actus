@@ -163,15 +163,6 @@ class ParallelSubgraphState(TypedDict, total=False):
     # something to read. ``Any`` keeps the application-layer type
     # (ReducerDiagnostics) out of the domain graph import surface.
     reducer_diagnostics: Optional[Any]  # PR-5
-    # [codex R2 P1-4] True iff ``_first_time_dispatch`` successfully
-    # acquired a per-user coordinator concurrency slot via
-    # ``probe_quota.acquire_coordinator_concurrency`` and that slot is
-    # still held when entering reducer_node. The rehydrate dispatch
-    # path (``_rehydrate_dispatch``) does NOT acquire — the slot is
-    # owned by the prior dispatch incarnation — so its Command leaves
-    # this False (default). reducer_node gates its quota release on
-    # this flag so the rehydrate path does not DECR below zero.
-    quota_acquired: bool
     # [C2b rollout WS1b §3.3] monotonic clock captured at the START of
     # _first_time_dispatch (before any I/O). Carried to the reducer to derive
     # run duration AND to gate run-level metrics so a crash+rehydrate (which
@@ -664,6 +655,7 @@ async def _first_time_dispatch(
     # be skipped (backward compatible).
     coordinator_limits = cfg.get("coordinator_limits")
     probe_quota = cfg.get("probe_quota")
+    wait_guard = cfg.get("coordinator_wait_guard")
     # ``session_repository`` is the explicit DI key for descendants count.
     # We deliberately do NOT fall back to ``session_service`` here: the
     # production ``SessionService.count_descendants`` is not a public API
@@ -685,8 +677,13 @@ async def _first_time_dispatch(
     # the descendants-cap rejection branch below to avoid quota leak.
     concurrency_acquired = False
     if probe_quota is not None and coordinator_limits is not None:
+        if wait_guard is None:
+            raise RuntimeError(
+                "coordinator quota requires coordinator_wait_guard ownership"
+            )
         concurrency_acquired = await probe_quota.acquire_coordinator_concurrency(
             user_id=user_id,
+            coordinator_run_id=coordinator_run_id,
             cap=coordinator_limits.max_concurrent_coordinator_runs_per_user,
         )
         if not concurrency_acquired:
@@ -712,12 +709,10 @@ async def _first_time_dispatch(
     # Everything below this point can raise (digest computation,
     # MinIO uploads, session creates, manifest uploads, subscribe,
     # runner starts, SPAWN_REQUEST publishes, orchestrator launch).
-    # Without this try/except, an exception AFTER the acquire above
-    # but BEFORE reducer_node runs would leak the concurrency slot
-    # forever (reducer_node is the sole release path on the happy
-    # path; if dispatch raises the subgraph state is discarded and
-    # reducer is never reached). Release on any exception so a
-    # downstream failure does not pin the user's slot until TTL.
+    # Without this try/except, an exception AFTER the acquire above but
+    # BEFORE ownership transfers to ``CoordinatorWaitGuard`` would leave
+    # the run-id lease occupied until the cleanup window. Release on any
+    # exception while dispatch still owns the lease.
     #
     # [codex R8 P2-1] We also track pre-created waiter consumer
     # groups in ``created_waiter_groups`` so the except-clause can
@@ -739,6 +734,17 @@ async def _first_time_dispatch(
     # ownership check.
     orchestrator_task = None
     orchestrator_group_created: Optional[tuple[str, str]] = None
+    liveness_service = cfg.get("coordinator_liveness_service")
+    registered_liveness_leases: list[object] = []
+    wait_guard_entered = False
+    quota_owner_transferred = False
+
+    async def _release_run_quota() -> None:
+        await probe_quota.release_coordinator_quotas(
+            user_id=user_id,
+            coordinator_run_id=coordinator_run_id,
+        )
+
     try:
         # 3) Descendants cap — DB count + projected delta. If concurrency was
         # acquired in step 2 but this rejects, release the concurrency slot to
@@ -928,6 +934,36 @@ async def _first_time_dispatch(
         )
         orchestrator_group_created = (orchestrator_stream_key, orchestrator_group)
 
+        # Task 6 startup barrier. Every row and every consumer group exists
+        # before any durable startup lease is registered. The parent idle
+        # watchdog pauses only after ALL child registrations succeed; runner
+        # tasks and SPAWN_REQUEST publishing remain strictly after the barrier.
+        if liveness_service is not None:
+            for wu in enriched_units:
+                child_sid = child_session_ids[wu.work_unit_id]
+                lease = await liveness_service.record_startup_lease(
+                    root_session_id=root_session_id,
+                    parent_session_id=parent_session_id,
+                    child_session_id=child_sid,
+                    coordinator_run_id=coordinator_run_id,
+                    work_unit_id=wu.work_unit_id,
+                )
+                registered_liveness_leases.append(lease)
+        if wait_guard is not None:
+            await wait_guard.enter_run(
+                state.get("step_id", "unknown"),
+                coordinator_run_id,
+                root_session_id=root_session_id,
+                parent_session_id=parent_session_id,
+                user_id=user_id,
+                child_session_ids=tuple(child_session_ids.values()),
+                release_quota=(
+                    _release_run_quota if concurrency_acquired else None
+                ),
+            )
+            wait_guard_entered = True
+            quota_owner_transferred = concurrency_acquired
+
         # Step 7 -- start N runner tasks.
         # r4 P1-2: pass ``parent_session_id`` so PR-4's runner finalizers
         # (``_publish_result_ready`` / ``_publish_cancel_ack``) can build envelopes
@@ -1055,6 +1091,30 @@ async def _first_time_dispatch(
                     exc_info=True,
                 )
 
+        for lease in registered_liveness_leases:
+            try:
+                await liveness_service.clear_if_matches(lease)
+            except BaseException:  # noqa: BLE001 — preserve original raise
+                logger.warning(
+                    "dispatch rollback: startup lease clear failed child=%s; "
+                    "original dispatch exception preserved",
+                    getattr(lease, "child_session_id", "unknown"),
+                    exc_info=True,
+                )
+
+        if wait_guard_entered:
+            try:
+                await wait_guard.resume_run(
+                    state.get("step_id", "unknown"), coordinator_run_id,
+                )
+            except BaseException:  # noqa: BLE001 — preserve original raise
+                logger.warning(
+                    "dispatch rollback: wait guard resume failed run=%s; "
+                    "original dispatch exception preserved",
+                    coordinator_run_id,
+                    exc_info=True,
+                )
+
         # [codex R2 P1-3] Release the slot we acquired so a downstream
         # failure (digest computation / MinIO upload / session create /
         # manifest upload / subscribe / runner start / SPAWN_REQUEST
@@ -1069,13 +1129,18 @@ async def _first_time_dispatch(
         # so CancelledError still aborts the task and ValueError still
         # reaches the caller.
         #
-        # NB: the Command(update={"quota_acquired": True, ...}) at the
-        # tail of this function never executes when we hit this except,
-        # so reducer_node.state["quota_acquired"] stays False and the
-        # reducer's finally won't double-release.
-        if concurrency_acquired and probe_quota is not None:
+        # Once ownership transfers to the run guard, resume_run performs the
+        # single release. Before transfer, this rollback path owns release.
+        if (
+            concurrency_acquired
+            and probe_quota is not None
+            and not quota_owner_transferred
+        ):
             try:
-                await probe_quota.release_coordinator_quotas(user_id=user_id)
+                await probe_quota.release_coordinator_quotas(
+                    user_id=user_id,
+                    coordinator_run_id=coordinator_run_id,
+                )
             except BaseException:  # noqa: BLE001 — see comment below
                 # [codex R3 P1-4] MUST catch ``BaseException``, not
                 # ``Exception``. On Py3.12 ``asyncio.CancelledError``
@@ -1091,8 +1156,8 @@ async def _first_time_dispatch(
                 # not a control-flow signal.
                 logger.exception(
                     "dispatch rollback: release_coordinator_quotas failed "
-                    "user=%s — manual cleanup may be needed (counter "
-                    "will leak until TTL); original dispatch exception "
+                    "user=%s — the run-id lease remains until the cleanup "
+                    "window; original dispatch exception "
                     "preserved via outer raise",
                     user_id,
                 )
@@ -1204,13 +1269,6 @@ async def _first_time_dispatch(
             "work_units": enriched_units,
             "child_session_ids": child_session_ids,
             "orchestrator_task": orchestrator_task,
-            # [codex R2 P1-4] Mark the slot as held so reducer_node knows
-            # to release it. Rehydrate dispatch (``_rehydrate_dispatch``)
-            # does NOT acquire and therefore does NOT set this flag, so
-            # reducer_node correctly skips release on the rehydrate path
-            # (which would otherwise DECR below zero / steal another
-            # incarnation's slot).
-            "quota_acquired": concurrency_acquired,
             "dispatch_started_monotonic": dispatch_started_monotonic,
         },
         goto=[
@@ -1381,6 +1439,11 @@ async def _build_pre_results_from_terminal(
     return pre_results
 
 
+@dataclass
+class _RehydrateQuotaHandoff:
+    transferred: bool = False
+
+
 async def _rehydrate_dispatch(
     state: ParallelSubgraphState,
     config: dict,
@@ -1388,6 +1451,83 @@ async def _rehydrate_dispatch(
     coordinator_run_id: str,
     work_units: list[WorkUnit],
     shell_replay_kill_ids: "frozenset[str] | set[str]" = frozenset(),
+) -> Command:
+    """Run rehydrate and own terminal-only pre-handoff quota cleanup."""
+    handoff = _RehydrateQuotaHandoff()
+    try:
+        return await _rehydrate_dispatch_impl(
+            state,
+            config,
+            existing,
+            coordinator_run_id,
+            work_units,
+            shell_replay_kill_ids,
+            quota_handoff=handoff,
+        )
+    except BaseException:
+        # A pending child may still be running on another pod and renewing this
+        # same run-id member. Never remove that shared ownership on a local
+        # rehydrate setup failure. Terminal-only failures have no live child
+        # owner, so release unless a local guard already owns the callback.
+        if (
+            existing.already_applied is not None
+            or existing.pending
+            or handoff.transferred
+        ):
+            raise
+
+        cfg = config["configurable"]
+        probe_quota = cfg.get("probe_quota")
+        wait_guard = cfg.get("coordinator_wait_guard")
+        user_id = state.get("user_id")
+        step_id = state.get("step_id", "unknown")
+        quota_owned_by_guard = False
+        if wait_guard is not None:
+            try:
+                quota_owned_by_guard = wait_guard.owns_quota_release(
+                    step_id, coordinator_run_id,
+                )
+                quota_owned_by_guard = (
+                    await wait_guard.resume_run(step_id, coordinator_run_id)
+                    or quota_owned_by_guard
+                )
+            except BaseException:  # noqa: BLE001 — preserve original error
+                logger.warning(
+                    "rehydrate fatal cleanup: wait guard resume failed run=%s; "
+                    "original error preserved",
+                    coordinator_run_id,
+                    exc_info=True,
+                )
+        if (
+            probe_quota is not None
+            and user_id is not None
+            and not quota_owned_by_guard
+        ):
+            try:
+                await probe_quota.release_coordinator_quotas(
+                    user_id=user_id,
+                    coordinator_run_id=coordinator_run_id,
+                )
+            except BaseException:  # noqa: BLE001 — preserve original error
+                logger.warning(
+                    "rehydrate fatal cleanup: exact quota release failed "
+                    "run=%s user=%s; original error preserved",
+                    coordinator_run_id,
+                    user_id,
+                    exc_info=True,
+                )
+        raise
+
+
+async def _rehydrate_dispatch_impl(
+    state: ParallelSubgraphState,
+    config: dict,
+    existing: "RehydrateResult",
+    coordinator_run_id: str,
+    work_units: list[WorkUnit],
+    shell_replay_kill_ids: "frozenset[str] | set[str]" = frozenset(),
+    *,
+    quota_handoff: _RehydrateQuotaHandoff,
 ) -> Command:
     """[C2 PR-7 §12] Resume dispatch from a prior coordinator run.
 
@@ -1399,8 +1539,9 @@ async def _rehydrate_dispatch(
         is success/rollback_partial/crash_mid_apply/in_progress_recent,
         skip worker_node + reducer entirely; main_graph reads the
         ``step_result_candidate`` and short-circuits its apply call
-        too. Avoids re-running a successful apply / re-attempting an
-        operator-blocked crash recovery.
+        too. Only terminal/manual-recovery statuses release this run's
+        quota. ``in_progress_recent`` means another live pod owns apply,
+        so its guard and quota must remain untouched.
 
       * Step 5 (UNEXPECTED CHILD): if a child row exists for a wu_id
         that's NOT in the current ``work_units`` (e.g. plan changed
@@ -1432,6 +1573,9 @@ async def _rehydrate_dispatch(
     cfg = config["configurable"]
     parent_session_id = state["parent_session_id"]
     root_session_id = state["root_session_id"]
+    probe_quota = cfg.get("probe_quota")
+    wait_guard = cfg.get("coordinator_wait_guard")
+    user_id = state.get("user_id")
 
     # Step 4: already_applied short-circuit (BEFORE any waiter subscribe /
     # publish work -- minimize side effects when the apply was already
@@ -1443,6 +1587,46 @@ async def _rehydrate_dispatch(
             "rehydrate: already_applied short-circuit run=%s status=%s audit=%d",
             coordinator_run_id, applied.status, applied.audit_id,
         )
+        quota_releasable = applied.status in {
+            "success",
+            "rollback_partial",
+            "crash_mid_apply",
+        }
+        if quota_releasable:
+            quota_owned_by_guard = False
+            if wait_guard is not None:
+                quota_owned_by_guard = await wait_guard.resume_run(
+                    state.get("step_id", "unknown"), coordinator_run_id,
+                )
+            if (
+                probe_quota is not None
+                and user_id is not None
+                and not quota_owned_by_guard
+            ):
+                try:
+                    await probe_quota.release_coordinator_quotas(
+                        user_id=user_id,
+                        coordinator_run_id=coordinator_run_id,
+                    )
+                except asyncio.CancelledError:
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling() > 0:
+                        raise
+                    logger.warning(
+                        "rehydrate: already-applied quota release was cancelled "
+                        "run=%s user=%s; terminal outcome preserved",
+                        coordinator_run_id,
+                        user_id,
+                        exc_info=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        "rehydrate: already-applied quota release failed "
+                        "run=%s user=%s; terminal outcome preserved",
+                        coordinator_run_id,
+                        user_id,
+                        exc_info=True,
+                    )
         return Command(
             update={
                 "coordinator_run_id": coordinator_run_id,
@@ -1642,14 +1826,127 @@ async def _rehydrate_dispatch(
 
     # Step 8: pre-subscribe waiter group + Send only for truly-pending.
     subscriber = cfg["mailbox_subscriber"]  # fail-fast on missing DI [r2 P1-2]
-    for wu_id in existing.pending:
-        child_sid = existing.child_session_ids[wu_id]
-        await subscriber.subscribe(
-            stream_key=f"actus:child:{root_session_id}:mailbox",
-            consumer_group=f"coordinator:waiter:{child_sid}",
-            consumer_name=f"waiter-{child_sid}",
-            start_id="0",
+    liveness_service = cfg.get("coordinator_liveness_service")
+    if probe_quota is not None and user_id is not None and wait_guard is None:
+        raise RuntimeError(
+            "rehydrated coordinator quota requires coordinator_wait_guard ownership"
         )
+
+    async def _release_rehydrated_run_quota() -> None:
+        await probe_quota.release_coordinator_quotas(
+            user_id=user_id,
+            coordinator_run_id=coordinator_run_id,
+        )
+
+    rehydrate_groups: list[tuple[str, str]] = []
+    registered_leases: list[object] = []
+    guard_entered = False
+    step_id = state.get("step_id", "unknown")
+    try:
+        # Global phase 1: every pending wait group is recoverable before any
+        # startup grace is refreshed. Existing groups are BUSYGROUP-idempotent.
+        for wu_id in existing.pending:
+            child_sid = existing.child_session_ids[wu_id]
+            stream_key = f"actus:child:{root_session_id}:mailbox"
+            consumer_group = f"coordinator:waiter:{child_sid}"
+            await subscriber.subscribe(
+                stream_key=stream_key,
+                consumer_group=consumer_group,
+                consumer_name=f"waiter-{child_sid}",
+                start_id="0",
+            )
+            rehydrate_groups.append((stream_key, consumer_group))
+
+        # Global phase 2: re-register only still-pending rows. This validates
+        # the current DB lineage and never starts/respawns a runner.
+        if liveness_service is not None:
+            for wu_id in existing.pending:
+                child_sid = existing.child_session_ids[wu_id]
+                lease = await liveness_service.record_startup_lease(
+                    root_session_id=root_session_id,
+                    parent_session_id=parent_session_id,
+                    child_session_id=child_sid,
+                    coordinator_run_id=coordinator_run_id,
+                    work_unit_id=wu_id,
+                )
+                registered_leases.append(lease)
+        if wait_guard is not None:
+            from app.application.services.coordinator_parent_execution_lease import (
+                CoordinatorParentPhase,
+            )
+            if existing.pending:
+                initial_phase = CoordinatorParentPhase.WAITING_CHILDREN
+                monitored_child_ids = tuple(
+                    existing.child_session_ids[wu_id]
+                    for wu_id in existing.pending
+                )
+            else:
+                # All children already have durable terminal envelopes. There
+                # is no child-wait phase, but reducer/apply still need a live
+                # parent execution lease owned by this backend scope.
+                initial_phase = CoordinatorParentPhase.REDUCING
+                monitored_child_ids = tuple(existing.child_session_ids.values())
+            await wait_guard.enter_run(
+                step_id,
+                coordinator_run_id,
+                root_session_id=root_session_id,
+                parent_session_id=parent_session_id,
+                user_id=user_id,
+                child_session_ids=monitored_child_ids,
+                phase=initial_phase,
+                release_quota=(
+                    _release_rehydrated_run_quota
+                    if probe_quota is not None and user_id is not None
+                    else None
+                ),
+            )
+            guard_entered = True
+            quota_handoff.transferred = wait_guard.owns_quota_release(
+                step_id, coordinator_run_id,
+            )
+            if (
+                probe_quota is not None
+                and user_id is not None
+                and not quota_handoff.transferred
+            ):
+                raise RuntimeError(
+                    "rehydrated coordinator quota ownership transfer failed"
+                )
+    except BaseException:
+        if liveness_service is not None:
+            for lease in registered_leases:
+                try:
+                    await liveness_service.clear_if_matches(lease)
+                except BaseException:  # noqa: BLE001 — preserve original error
+                    logger.warning(
+                        "rehydrate rollback: lease clear failed child=%s",
+                        getattr(lease, "child_session_id", "unknown"),
+                        exc_info=True,
+                    )
+        if guard_entered:
+            try:
+                await wait_guard.resume_run(
+                    step_id, coordinator_run_id,
+                )
+            except BaseException:  # noqa: BLE001 — preserve original error
+                logger.warning(
+                    "rehydrate rollback: wait guard resume failed run=%s",
+                    coordinator_run_id,
+                    exc_info=True,
+                )
+        for stream_key, consumer_group in rehydrate_groups:
+            try:
+                await subscriber.destroy_group(
+                    stream_key=stream_key,
+                    consumer_group=consumer_group,
+                )
+            except BaseException:  # noqa: BLE001 — preserve original error
+                logger.warning(
+                    "rehydrate rollback: destroy_group failed group=%s",
+                    consumer_group,
+                    exc_info=True,
+                )
+        raise
 
     _phase_by_wu_id = {wu.work_unit_id: wu.phase for wu in work_units}
     pending_sends = [
@@ -1793,29 +2090,6 @@ async def worker_node(state_per_send: dict, config: RunnableConfig) -> dict:
             summary="malformed terminal envelope (undecodable payload)",
             manifest_required=manifest_required,
         )]}
-    except asyncio.TimeoutError:
-        # [codex PR-2 R5 P0] The child never emitted a terminal within the
-        # waiter's window. A raise here would crash the whole ``Send`` fan-out
-        # superstep (only CoordinatorPathContractError is caught upstream in
-        # ``_run_parallel_backend``; executor_node has no retry policy), losing
-        # every sibling worker's result and stranding the run. Fail closed to a
-        # TIMED_OUT WorkerResult so the reducer's completeness invariant holds
-        # and one slow child (more likely for S2 shell-mode children) cannot
-        # kill the batch. (TIMED_OUT → reducer non-SUCCESS → no apply.)
-        logger.warning(
-            "worker_node: terminal wait timed out for wu=%s child=%s — "
-            "failing closed (TIMED_OUT)",
-            state_per_send["work_unit_id"],
-            state_per_send["child_session_id"],
-        )
-        return {"worker_results": [WorkerResult(
-            work_unit_id=state_per_send["work_unit_id"],
-            child_session_id=state_per_send["child_session_id"],
-            outcome=ResultReadyOutcome.TIMED_OUT,
-            summary="terminal envelope wait timed out",
-            manifest_required=manifest_required,
-        )]}
-
     # [r4 P1 fix] Propagate PR-4 wire-schema fields (patch_manifest /
     # needs_authorization_details / cost_summary / summary) into the
     # WorkerResult so PR-5 reducer + PR-6 cost aggregator have something to
@@ -1929,10 +2203,9 @@ async def reducer_node(
       present the reducer's §9.3 step 5 drift check fires; when absent
       drift detection is skipped (the applier's preflight still
       catches stale base_digest at apply time).
-    - ``config["configurable"]["probe_quota"]`` — optional. When present
-      and ``state["user_id"]`` is populated, the per-user coordinator
-      concurrency slot acquired by ``_first_time_dispatch`` is released
-      on reducer exit (try/finally — fires even on reducer exception).
+    The run-scoped ``CoordinatorWaitGuard`` owns quota release after the
+    entire backend (including apply/rollback) exits. The reducer only moves
+    the parent lease into the reducing phase and must not release early.
 
     Writes ``apply_plan`` / ``group_outcome`` / ``step_result_candidate``
     into the subgraph state via ``Command(update=...)`` and routes to
@@ -1940,28 +2213,20 @@ async def reducer_node(
     whether to invoke ``PatchApplier``.
     """
     cfg = config["configurable"]
+    coordinator_run_id = state.get("coordinator_run_id")
+    wait_guard = cfg.get("coordinator_wait_guard")
+    if wait_guard is not None and coordinator_run_id is not None:
+        from app.application.services.coordinator_parent_execution_lease import (
+            CoordinatorParentPhase,
+        )
+        wait_guard.set_phase(
+            state.get("step_id", "unknown"),
+            coordinator_run_id,
+            CoordinatorParentPhase.REDUCING,
+        )
     reducer = cfg["patch_reducer_service"]
     parent_sandbox = cfg.get("parent_sandbox")
-    # C2 PR-6 §14.3 #1 — release the user-concurrency slot acquired by
-    # ``_first_time_dispatch``. We deliberately release here (reducer
-    # exit) rather than dispatch tail so the slot stays reserved across
-    # the worker/reducer span, matching the spec's "active coordinator
-    # run" semantics. Best-effort: release failures are logged and
-    # swallowed so they don't mask the reducer return / exception.
-    #
-    # [codex R2 P1-4] Gate release on ``state["quota_acquired"]`` so the
-    # rehydrate dispatch path (which does NOT acquire — the slot is owned
-    # by the prior incarnation that crashed) does not DECR below zero.
-    # ``_first_time_dispatch`` sets the flag True via Command(update=...)
-    # when concurrency was acquired AND the dispatch body completed;
-    # ``_rehydrate_dispatch`` and the dispatch-body rollback path both
-    # leave it False (default per ``total=False`` TypedDict).
-    probe_quota = cfg.get("probe_quota")
-    user_id = state.get("user_id")
-    quota_acquired = state.get("quota_acquired", False)
-
     try:
-        coordinator_run_id = state.get("coordinator_run_id")
         if coordinator_run_id is None:
             # ``dispatch_node`` is responsible for filling this. A missing
             # value here means a topology bug — fail loudly via the step
@@ -2166,30 +2431,10 @@ async def reducer_node(
 
         return command
     finally:
-        if (
-            probe_quota is not None
-            and user_id is not None
-            and quota_acquired
-        ):
-            try:
-                await probe_quota.release_coordinator_quotas(user_id=user_id)
-            except BaseException:  # noqa: BLE001 — see comment below
-                # [codex R3 P1-4] Same invariant as the dispatch
-                # rollback path above: release failure inside ``finally``
-                # MUST NOT mask the original control-flow signal — be it
-                # a domain exception from ``reducer.reduce`` or a
-                # ``CancelledError`` from an upstream task-group cancel.
-                # An ``except Exception`` here would let
-                # ``CancelledError`` from a cancelled
-                # ``release_coordinator_quotas`` propagate, replacing the
-                # original exception (or, on the happy path, hijacking
-                # ``finally`` to abort an otherwise-returning node). Log
-                # + swallow on ANY exit.
-                logger.exception(
-                    "reducer_node: probe_quota release failed user=%s "
-                    "— continuing (original control flow preserved)",
-                    user_id,
-                )
+        # Quota ownership intentionally remains with the outer run-scoped
+        # guard through apply/rollback. Its step-scope cleanup first stops and
+        # drains renewals, then performs one exact run-id release.
+        pass
 
 
 # ── build ────────────────────────────────────────────────────────────────────

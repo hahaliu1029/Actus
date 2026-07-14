@@ -339,6 +339,7 @@ export type SupervisorExecutionPhase =
   | "terminated";
 
 export type SupervisorSnapshot = {
+  execution_revision: number;
   execution_mode: SupervisorExecutionMode;
   execution_phase: SupervisorExecutionPhase;
   background_reason?: "explicit" | "auto_degrade" | null;
@@ -352,6 +353,7 @@ export type SupervisorSnapshot = {
 };
 
 export type ExecutionStateChangedPayload = {
+  execution_revision: number;
   execution_mode: SupervisorExecutionMode;
   execution_phase: SupervisorExecutionPhase;
   background_reason?: SupervisorSnapshot["background_reason"];

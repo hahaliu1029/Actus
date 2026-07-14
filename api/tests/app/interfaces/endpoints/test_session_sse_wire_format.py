@@ -62,6 +62,9 @@ class _FakeLease:
 class _ChatAgentService:
     """重现 agent_service.chat() async generator 接口, yield 一条 R4 ToolEvent."""
 
+    async def get_session(self, session_id: str) -> None:
+        return None
+
     async def chat(
         self,
         **kwargs: Any,
@@ -95,6 +98,10 @@ class _NoConflictSupervisor:
     @asynccontextmanager
     async def subscriber_scope(self, **kwargs: Any):
         yield _NoConflictScope()
+
+    @asynccontextmanager
+    async def mode_transition_fence(self, **kwargs: Any):
+        yield
 
 
 class _AllowSessionService:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
+from app.domain.errors.supervisor import SupervisorContractError
 from app.domain.models.session import Session, SessionStatus
 from app.domain.services.execution_supervisor import ExecutionSupervisor
 from app.domain.services.session.default_state_machine import (
@@ -19,17 +21,21 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-def _build_supervisor() -> ExecutionSupervisor:
-    return ExecutionSupervisor(redis_client=object(), session_repository=object())
-
-
 class _RecordingRedis:
-    def __init__(self, *, hincrby_value: int = 1, fail_hset: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        hincrby_value: int = 1,
+        fail_hset: bool = False,
+        generation: int | None = None,
+    ) -> None:
         self.hincrby_value = hincrby_value
         self.fail_hset = fail_hset
+        self.generation = generation
         self.hincrby_calls: list[tuple[str, str, int]] = []
         self.expire_calls: list[tuple[str, int]] = []
         self.hset_calls: list[dict[str, object]] = []
+        self.hget_calls: list[tuple[str, str]] = []
         self.zadd_calls: list[tuple[str, dict[str, float]]] = []
 
     async def hincrby(self, key: str, field: str, amount: int) -> int:
@@ -54,6 +60,10 @@ class _RecordingRedis:
 
     async def zadd(self, key: str, mapping: dict[str, float]) -> None:
         self.zadd_calls.append((key, mapping))
+
+    async def hget(self, key: str, field: str) -> str | None:
+        self.hget_calls.append((key, field))
+        return None if self.generation is None else str(self.generation)
 
 
 class _BrokenRedis:
@@ -197,13 +207,15 @@ async def test_lua_admit_receives_activity_timestamp(monkeypatch) -> None:
         session_id="session-1",
         user_id="user-1",
         expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+        generation=7,
     )
 
     after = datetime.now(timezone.utc).timestamp()
     admit_args = calls[0]["args"]
-    assert len(admit_args) == 5
+    assert len(admit_args) == 9
     activity_at = float(admit_args[4])
     assert before <= activity_at <= after
+    assert admit_args[5:] == [7, 0, "v1|7|user-1", 86400]
 
 
 async def test_suspend_idle_cancels_live_task_with_supervisor_suspend(
@@ -272,14 +284,30 @@ async def test_resume_background_existing_slot_resets_inflight_counts(
 ) -> None:
     from datetime import datetime, timezone
 
-    repo = _Repo()
+    repo = _Repo(
+        Session(
+            id="session-3",
+            user_id="user-1",
+            status=SessionStatus.RUNNING,
+            execution_mode="background",
+            execution_phase="running",
+            execution_revision=7,
+        )
+    )
     redis = _RecordingRedis()
     supervisor = ExecutionSupervisor(redis_client=redis, session_repository=repo)
+    admit_calls: list[dict[str, object]] = []
 
     async def fake_admit(**kwargs) -> int:
+        admit_calls.append(kwargs)
         return 3
 
     monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+
+    async def fake_sync(**kwargs) -> int:
+        return 1
+
+    monkeypatch.setattr(supervisor, "_sync_background_expiry_to_redis", fake_sync)
 
     rc = await supervisor.resume(
         session_id="session-3",
@@ -287,9 +315,11 @@ async def test_resume_background_existing_slot_resets_inflight_counts(
         execution_mode="background",
         expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
         retry_budget_remaining=1,
+        expected_execution_revision=7,
     )
 
     assert rc == 3
+    assert admit_calls[0]["generation"] == 7
     assert redis.hset_calls == [
         {
             "key": "supervisor:hot:session-3",
@@ -308,7 +338,16 @@ async def test_resume_background_existing_slot_returns_rc_when_inflight_reset_fa
 ) -> None:
     from datetime import datetime, timezone
 
-    repo = _Repo()
+    repo = _Repo(
+        Session(
+            id="session-3",
+            user_id="user-1",
+            status=SessionStatus.RUNNING,
+            execution_mode="background",
+            execution_phase="running",
+            execution_revision=7,
+        )
+    )
     redis = _RecordingRedis(fail_hset=True)
     supervisor = ExecutionSupervisor(redis_client=redis, session_repository=repo)
 
@@ -317,12 +356,18 @@ async def test_resume_background_existing_slot_returns_rc_when_inflight_reset_fa
 
     monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
 
+    async def fake_sync(**kwargs) -> int:
+        return 1
+
+    monkeypatch.setattr(supervisor, "_sync_background_expiry_to_redis", fake_sync)
+
     rc = await supervisor.resume(
         session_id="session-3",
         user_id="user-1",
         execution_mode="background",
         expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
         retry_budget_remaining=1,
+        expected_execution_revision=7,
     )
 
     assert rc == 3
@@ -349,19 +394,404 @@ async def test_resume_background_does_not_patch_pg_after_retry_claim(
 
     monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
 
-    rc = await supervisor.resume(
+    with pytest.raises(SupervisorContractError, match="stale retry claim"):
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+            retry_budget_remaining=1,
+            expected_execution_revision=0,
+        )
+
+    assert repo.updates == []
+    assert repo._session is not None
+    assert repo._session.status == SessionStatus.COMPLETED
+    assert repo._session.execution_phase == "terminated"
+
+
+async def test_resume_background_rejects_stale_claim_before_redis_admission(
+    monkeypatch,
+) -> None:
+    repo = _Repo(
+        Session(
+            id="session-3",
+            user_id="user-1",
+            status=SessionStatus.RUNNING,
+            execution_mode="background",
+            execution_phase="suspended",
+            execution_revision=7,
+        )
+    )
+    supervisor = ExecutionSupervisor(redis_client=object(), session_repository=repo)
+    admit_calls: list[dict[str, object]] = []
+
+    async def fake_admit(**kwargs) -> int:
+        admit_calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+
+    with pytest.raises(SupervisorContractError, match="stale retry claim"):
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+            retry_budget_remaining=1,
+            expected_execution_revision=7,
+        )
+
+    assert admit_calls == []
+
+
+async def test_resume_background_post_admission_recheck_revokes_stale_generation(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    repo = _Repo(session)
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(), session_repository=repo
+    )
+    revoke_calls: list[dict[str, object]] = []
+
+    async def fake_admit(**kwargs) -> int:
+        session.execution_mode = "foreground"
+        session.execution_phase = "running"
+        session.execution_revision = 8
+        return 0
+
+    async def fake_revoke(**kwargs) -> int:
+        revoke_calls.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+    monkeypatch.setattr(supervisor, "_lua_revoke", fake_revoke)
+
+    with pytest.raises(SupervisorContractError, match="stale retry claim"):
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+            retry_budget_remaining=1,
+            expected_execution_revision=7,
+        )
+
+    assert revoke_calls == [
+        {
+            "session_id": "session-3",
+            "user_id": "user-1",
+            "reason": "resume_retry_stale",
+            "expected_generation": 7,
+            "allow_legacy": True,
+        }
+    ]
+
+
+class _PostAdmissionReadFailureRepo(_Repo):
+    def __init__(self, session: Session) -> None:
+        super().__init__(session)
+        self.read_count = 0
+
+    async def get_by_id(self, session_id: str) -> Session | None:
+        self.read_count += 1
+        if self.read_count == 2:
+            raise RuntimeError("post-admission PG read failed")
+        return await super().get_by_id(session_id)
+
+
+async def test_resume_background_revokes_new_slot_when_post_read_raises(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(),
+        session_repository=_PostAdmissionReadFailureRepo(session),
+    )
+    revoke_calls: list[dict[str, object]] = []
+
+    async def fake_admit(**kwargs) -> int:
+        return 0
+
+    async def fake_revoke(**kwargs) -> int:
+        revoke_calls.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+    monkeypatch.setattr(supervisor, "_lua_revoke", fake_revoke)
+
+    with pytest.raises(RuntimeError, match="post-admission PG read failed"):
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+            previous_expires_at=datetime(2026, 5, 11, tzinfo=timezone.utc),
+            retry_budget_remaining=1,
+            expected_execution_revision=7,
+        )
+
+    assert revoke_calls == [
+        {
+            "session_id": "session-3",
+            "user_id": "user-1",
+            "reason": "resume_retry_rollback",
+            "expected_generation": 7,
+            "allow_legacy": True,
+        }
+    ]
+
+
+async def test_resume_background_restores_existing_slot_when_sync_raises(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(),
+        session_repository=_Repo(session),
+    )
+    previous_expires_at = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    requested_expires_at = datetime(2026, 5, 12, tzinfo=timezone.utc)
+    sync_calls: list[dict[str, object]] = []
+
+    async def fake_admit(**kwargs) -> int:
+        return 3
+
+    async def fake_sync(**kwargs) -> int:
+        sync_calls.append(kwargs)
+        if len(sync_calls) == 1:
+            raise RuntimeError("expiry sync failed")
+        return 1
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+    monkeypatch.setattr(supervisor, "_sync_background_expiry_to_redis", fake_sync)
+
+    with pytest.raises(RuntimeError, match="expiry sync failed"):
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=requested_expires_at,
+            previous_expires_at=previous_expires_at,
+            retry_budget_remaining=1,
+            expected_execution_revision=7,
+        )
+
+    assert sync_calls == [
+        {
+            "session_id": "session-3",
+            "user_id": "user-1",
+            "expires_at": requested_expires_at,
+            "execution_revision": 7,
+        },
+        {
+            "session_id": "session-3",
+            "user_id": "user-1",
+            "expires_at": previous_expires_at,
+            "execution_revision": 7,
+        },
+    ]
+
+
+async def test_resume_background_reconciles_ambiguous_lua_cancel(
+    monkeypatch,
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(),
+        session_repository=_Repo(session),
+    )
+    previous_expires_at = datetime(2026, 5, 11, tzinfo=timezone.utc)
+    sync_calls: list[dict[str, object]] = []
+
+    async def fake_admit(**kwargs) -> int:
+        raise asyncio.CancelledError("ambiguous Lua result")
+
+    async def fake_sync(**kwargs) -> int:
+        sync_calls.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+    monkeypatch.setattr(supervisor, "_sync_background_expiry_to_redis", fake_sync)
+
+    with pytest.raises(asyncio.CancelledError, match="ambiguous Lua result"):
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+            previous_expires_at=previous_expires_at,
+            retry_budget_remaining=1,
+            expected_execution_revision=7,
+        )
+
+    assert sync_calls == [
+        {
+            "session_id": "session-3",
+            "user_id": "user-1",
+            "expires_at": previous_expires_at,
+            "execution_revision": 7,
+        }
+    ]
+
+
+@pytest.mark.parametrize("admission_rc", [0, 5])
+async def test_resume_background_accepts_new_or_matching_generation_slot(
+    monkeypatch,
+    admission_rc: int,
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(),
+        session_repository=_Repo(session),
+    )
+
+    async def fake_admit(**kwargs) -> int:
+        return admission_rc
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+
+    assert await supervisor.resume(
         session_id="session-3",
         user_id="user-1",
         execution_mode="background",
         expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
         retry_budget_remaining=1,
+        expected_execution_revision=7,
+    ) == admission_rc
+
+
+@pytest.mark.parametrize(
+    ("admission_rc", "expected_code", "error_type"),
+    [
+        (1, "R1", SupervisorContractError),
+        (2, "R2", SupervisorContractError),
+        (4, "R3", SupervisorContractError),
+        (8, None, RuntimeError),
+    ],
+)
+async def test_resume_background_classifies_admission_rejections(
+    monkeypatch,
+    admission_rc: int,
+    expected_code: str | None,
+    error_type: type[Exception],
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(),
+        session_repository=_Repo(session),
     )
 
-    assert rc == 0
-    assert repo.updates == []
-    assert repo._session is not None
-    assert repo._session.status == SessionStatus.COMPLETED
-    assert repo._session.execution_phase == "terminated"
+    async def fake_admit(**kwargs) -> int:
+        return admission_rc
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+
+    with pytest.raises(error_type) as error:
+        await supervisor.resume(
+            session_id="session-3",
+            user_id="user-1",
+            execution_mode="background",
+            expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+            retry_budget_remaining=1,
+            expected_execution_revision=7,
+        )
+
+    if expected_code is not None:
+        assert isinstance(error.value, SupervisorContractError)
+        assert error.value.rejection_code == expected_code
+
+
+@pytest.mark.parametrize("initial_rc", [6, 7])
+async def test_resume_background_authoritatively_repairs_legacy_admission_rc(
+    monkeypatch,
+    initial_rc: int,
+) -> None:
+    session = Session(
+        id="session-3",
+        user_id="user-1",
+        status=SessionStatus.RUNNING,
+        execution_mode="background",
+        execution_phase="running",
+        execution_revision=7,
+    )
+    supervisor = ExecutionSupervisor(
+        redis_client=_RecordingRedis(),
+        session_repository=_Repo(session),
+    )
+    admit_calls: list[dict[str, object]] = []
+    admission_results = iter((initial_rc, 3))
+    reset_calls: list[str] = []
+
+    async def fake_admit(**kwargs) -> int:
+        admit_calls.append(kwargs)
+        return next(admission_results)
+
+    async def fake_sync(**kwargs) -> int:
+        return 1
+
+    async def fake_reset(*, session_id: str) -> None:
+        reset_calls.append(session_id)
+
+    monkeypatch.setattr(supervisor, "_run_lua_admit", fake_admit)
+    monkeypatch.setattr(supervisor, "_sync_background_expiry_to_redis", fake_sync)
+    monkeypatch.setattr(supervisor, "_reset_inflight_counts", fake_reset)
+
+    assert await supervisor.resume(
+        session_id="session-3",
+        user_id="user-1",
+        execution_mode="background",
+        expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+        retry_budget_remaining=1,
+        expected_execution_revision=7,
+    ) == 3
+
+    assert len(admit_calls) == 2
+    assert admit_calls[1]["authoritative_repair"] is True
+    assert reset_calls == ["session-3"]
 
 
 async def test_rollback_background_resume_admission_revokes_new_slot(
@@ -369,8 +799,18 @@ async def test_rollback_background_resume_admission_revokes_new_slot(
 ) -> None:
     from datetime import datetime, timezone
 
-    supervisor = ExecutionSupervisor(redis_client=object(), session_repository=object())
-    revoke_calls: list[dict[str, str]] = []
+    repo = _Repo(
+        Session(
+            id="session-3",
+            user_id="user-1",
+            status=SessionStatus.RUNNING,
+            execution_mode="background",
+            execution_phase="suspended",
+            execution_revision=7,
+        )
+    )
+    supervisor = ExecutionSupervisor(redis_client=object(), session_repository=repo)
+    revoke_calls: list[dict[str, object]] = []
 
     async def fake_revoke(**kwargs) -> int:
         revoke_calls.append(kwargs)
@@ -383,6 +823,7 @@ async def test_rollback_background_resume_admission_revokes_new_slot(
         user_id="user-1",
         admission_rc=0,
         previous_expires_at=datetime(2026, 5, 12, tzinfo=timezone.utc),
+        expected_execution_revision=7,
     )
 
     assert revoke_calls == [
@@ -390,6 +831,8 @@ async def test_rollback_background_resume_admission_revokes_new_slot(
             "session_id": "session-3",
             "user_id": "user-1",
             "reason": "resume_retry_rollback",
+            "expected_generation": 7,
+            "allow_legacy": True,
         }
     ]
 
@@ -399,48 +842,57 @@ async def test_rollback_background_resume_admission_restores_existing_slot_expir
 ) -> None:
     from datetime import datetime, timezone
 
-    redis = _RecordingRedis()
-    supervisor = ExecutionSupervisor(redis_client=redis, session_repository=object())
+    supervisor = ExecutionSupervisor(redis_client=object(), session_repository=object())
     revoke_calls: list[dict[str, str]] = []
+    sync_calls: list[dict[str, object]] = []
 
     async def fake_revoke(**kwargs) -> int:
         revoke_calls.append(kwargs)
         return 1
 
+    async def fake_sync(**kwargs) -> int:
+        sync_calls.append(kwargs)
+        return 1
+
     monkeypatch.setattr(supervisor, "_lua_revoke", fake_revoke)
+    monkeypatch.setattr(supervisor, "_sync_background_expiry_to_redis", fake_sync)
     previous_expires_at = datetime(2026, 5, 12, tzinfo=timezone.utc)
-    old_score = previous_expires_at.timestamp()
 
     await supervisor.rollback_background_resume_admission(
         session_id="session-3",
         user_id="user-1",
         admission_rc=3,
         previous_expires_at=previous_expires_at,
+        expected_execution_revision=7,
     )
 
     assert revoke_calls == []
-    assert redis.hset_calls == [
+    assert sync_calls == [
         {
-            "key": "supervisor:user:user-1",
-            "field": "session-3",
-            "value": f"{old_score:.6f}",
-            "mapping": None,
+            "session_id": "session-3",
+            "user_id": "user-1",
+            "expires_at": previous_expires_at,
+            "execution_revision": 7,
         }
-    ]
-    assert redis.zadd_calls == [
-        ("supervisor:bg:user-1", {"session-3": old_score})
-    ]
-    assert redis.expire_calls == [
-        ("supervisor:user:user-1", 86400),
-        ("supervisor:bg:user-1", 86400),
     ]
 
 
 async def test_revoke_background_resume_admission_revokes_existing_slot(
     monkeypatch,
 ) -> None:
-    supervisor = ExecutionSupervisor(redis_client=object(), session_repository=object())
-    revoke_calls: list[dict[str, str]] = []
+    repo = _Repo(
+        Session(
+            id="session-3",
+            user_id="user-1",
+            status=SessionStatus.COMPLETED,
+            execution_mode="background",
+            execution_phase="terminated",
+            execution_revision=7,
+        )
+    )
+    redis = _RecordingRedis(generation=7)
+    supervisor = ExecutionSupervisor(redis_client=redis, session_repository=repo)
+    revoke_calls: list[dict[str, object]] = []
 
     async def fake_revoke(**kwargs) -> int:
         revoke_calls.append(kwargs)
@@ -452,6 +904,7 @@ async def test_revoke_background_resume_admission_revokes_existing_slot(
         session_id="session-3",
         user_id="user-1",
         admission_rc=3,
+        expected_execution_revision=7,
     )
 
     assert revoke_calls == [
@@ -459,18 +912,30 @@ async def test_revoke_background_resume_admission_revokes_existing_slot(
             "session_id": "session-3",
             "user_id": "user-1",
             "reason": "resume_retry_terminal",
+            "expected_generation": 7,
+            "allow_legacy": True,
         }
     ]
+    assert redis.hget_calls == []
 
 
 async def test_promote_revokes_slot_when_pg_guard_does_not_match(monkeypatch) -> None:
     from datetime import datetime, timezone
 
-    repo = _Repo()
+    repo = _Repo(
+        Session(
+            id="session-3",
+            user_id="user-1",
+            status=SessionStatus.RUNNING,
+            execution_mode="foreground",
+            execution_phase="running",
+            execution_revision=7,
+        )
+    )
     repo.promote_result = None
     supervisor = ExecutionSupervisor(redis_client=object(), session_repository=repo)
     admit_calls: list[dict[str, object]] = []
-    revoke_calls: list[dict[str, str]] = []
+    revoke_calls: list[dict[str, object]] = []
 
     async def fake_admit(**kwargs) -> int:
         admit_calls.append(kwargs)
@@ -490,21 +955,25 @@ async def test_promote_revokes_slot_when_pg_guard_does_not_match(monkeypatch) ->
     )
 
     assert retry_budget_remaining is None
-    assert admit_calls
-    assert repo.promote_calls == [
-        (
-            "session-3",
-            {
-                "expires_at": datetime(2026, 5, 12, tzinfo=timezone.utc),
-                "retry_budget_remaining": 3,
-            },
-        )
-    ]
+    assert admit_calls[0]["generation"] == 8
+    assert len(repo.promote_calls) == 1
+    promoted_session_id, promote_fields = repo.promote_calls[0]
+    assert promoted_session_id == "session-3"
+    assert promote_fields["expires_at"] == datetime(
+        2026, 5, 12, tzinfo=timezone.utc
+    )
+    assert promote_fields["retry_budget_remaining"] == 3
+    assert promote_fields["expected_execution_revision"] == 7
+    assert promote_fields["background_reason"] == "auto_degrade"
+    pending_event = promote_fields["pending_event"]
+    assert pending_event.payload.execution_revision == 8
     assert revoke_calls == [
         {
             "session_id": "session-3",
             "user_id": "user-1",
             "reason": "promote_stale",
+            "expected_generation": 8,
+            "allow_legacy": True,
         }
     ]
 
@@ -520,15 +989,16 @@ async def test_terminate_watchdog_timeout_emits_bg_failed_watchdog(
             execution_mode="background",
             execution_phase="running",
             was_background=True,
+            execution_revision=7,
         )
     )
     supervisor = ExecutionSupervisor(
-        redis_client=object(),
+        redis_client=_RecordingRedis(generation=7),
         session_repository=repo,
         session_state_machine=DefaultSessionStateMachine(uow_factory=lambda: None),
     )
     emitter = AsyncMock()
-    revoke_calls: list[dict[str, str]] = []
+    revoke_calls: list[dict[str, object]] = []
 
     async def fake_revoke(**kwargs) -> int:
         revoke_calls.append(kwargs)
@@ -557,6 +1027,8 @@ async def test_terminate_watchdog_timeout_emits_bg_failed_watchdog(
             "session_id": "session-expired",
             "user_id": "user-1",
             "reason": "watchdog_timeout",
+            "expected_generation": 7,
+            "allow_legacy": True,
         }
     ]
 
@@ -564,7 +1036,9 @@ async def test_terminate_watchdog_timeout_emits_bg_failed_watchdog(
 async def test_runner_session_complete_skips_revoke_for_supervisor_suspend(
     monkeypatch,
 ) -> None:
-    supervisor = _build_supervisor()
+    supervisor = ExecutionSupervisor(
+        redis_client=object(), session_repository=object()
+    )
     runner = object()
     supervisor._register_runner("session-1", runner)
     revoke_calls: list[dict[str, str]] = []
@@ -588,9 +1062,20 @@ async def test_runner_session_complete_skips_revoke_for_supervisor_suspend(
 async def test_runner_session_complete_revokes_for_terminal_reason(
     monkeypatch,
 ) -> None:
-    supervisor = _build_supervisor()
+    repo = _Repo(
+        Session(
+            id="session-2",
+            user_id="user-1",
+            status=SessionStatus.COMPLETED,
+            execution_mode="background",
+            execution_phase="terminated",
+            execution_revision=7,
+        )
+    )
+    redis = _RecordingRedis(generation=7)
+    supervisor = ExecutionSupervisor(redis_client=redis, session_repository=repo)
     supervisor._register_runner("session-2", object())
-    revoke_calls: list[dict[str, str]] = []
+    revoke_calls: list[dict[str, object]] = []
 
     async def fake_revoke(**kwargs) -> int:
         revoke_calls.append(kwargs)
@@ -605,6 +1090,15 @@ async def test_runner_session_complete_revokes_for_terminal_reason(
     )
 
     assert revoke_calls == [
-        {"session_id": "session-2", "user_id": "user-1", "reason": "user_cancel"}
+        {
+            "session_id": "session-2",
+            "user_id": "user-1",
+            "reason": "user_cancel",
+            "expected_generation": 7,
+            "allow_legacy": True,
+        }
+    ]
+    assert redis.hget_calls == [
+        ("supervisor:bg-generation:user-1", "session-2")
     ]
     assert "session-2" not in supervisor._runners

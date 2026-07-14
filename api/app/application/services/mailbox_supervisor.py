@@ -25,12 +25,20 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Protocol
 
 from redis.asyncio import Redis
 
+from app.application.services.coordinator_terminal_transition import (
+    CoordinatorTerminalCommand,
+    ExpectedCoordinatorLineage,
+)
+
 if TYPE_CHECKING:  # pragma: no cover — type-only to avoid runtime import cycle
     # [C2 PR-6 §14.4] CostRollupService is consumed by ``ResultReadyHandler``
     # via ``SupervisorContext.cost_rollup_service``. Kept under TYPE_CHECKING
     # so the supervisor module stays importable from the cost rollup module
     # if the rollup impl ever needs to grow supervisor-aware helpers.
     from app.application.services.cost_rollup_service import CostRollupService
+    from app.application.services.coordinator_liveness_lease_service import (
+        CoordinatorLivenessLeaseService,
+    )
     # [C2 PR-7 §12.4] coordinator_envelope_store — Optional in SupervisorContext.
     # Late import here keeps the application-layer module-load path lean and
     # mirrors the cost_rollup_service guard pattern.
@@ -64,6 +72,7 @@ from app.domain.models.mailbox_envelope import (
     MailboxEnvelope,
     MailboxEnvelopeType,
     ProducerRole,
+    ProgressKind,
     ResultReadyPayload,
 )
 from app.domain.models.session import DestroyReason
@@ -192,6 +201,14 @@ class SupervisorContext:
     # :meth:`MailboxSupervisor.__init__` (same pattern as
     # ``register_cancel_state``).
     clear_child_tracking: Optional[Callable[[str], None]] = None
+    # Task 4 terminal-ownership port. The typed command carries only expected
+    # envelope/context lineage; the composition adapter obtains authority via a
+    # locked row read and performs validation + SSM CAS in one short-lived UoW.
+    # Optional keeps legacy/direct-test contexts backward compatible; production
+    # always wires it.
+    terminalize_child: Optional[
+        Callable[[CoordinatorTerminalCommand], Awaitable[bool]]
+    ] = None
     # codex r6 [R6-2, HIGH CONTRACT] — supervisor-private side-table for
     # threading an explicit ``DestroyReason`` from orphan/poison cascades
     # to ``CancelRequestHandler._terminate_outcome``. Keyed by the
@@ -280,6 +297,9 @@ class SupervisorContext:
     # the cost-rollup or persist-terminal fetch, mirroring their independence).
     # A record failure MUST NOT abort destroy + audit; the handler swallows.
     subagent_run_repo: Optional[SubagentRunRepository] = None
+    # Task 6 durable coordinator-child liveness. Optional for legacy/direct
+    # tests; production composition always supplies the shared Redis service.
+    liveness_service: Optional["CoordinatorLivenessLeaseService"] = None
 
     def now(self) -> datetime:
         return datetime.now(tz=timezone.utc)
@@ -466,6 +486,157 @@ class _StubNonTerminalHandler:
 # ─── PR-4 terminal + cascade handlers (spec §7.3-§7.6 + §10.2 + §6.6) ─────────
 
 
+async def _terminalize_child_from_envelope(
+    envelope: MailboxEnvelope,
+    ctx: SupervisorContext,
+) -> bool:
+    """Apply the existing mapping only for an authoritative coordinator row.
+
+    This is the first load-bearing operation in terminal handler side effects.
+    Live legacy child terminals use the stable ``spawn:<child_id>`` correlation
+    contract and already own their row transition; that negative cheap gate
+    preserves their pre-Task4 cleanup/ACK path without adding a DB dependency.
+
+    Every other terminal is a coordinator candidate. The terminalizer owns the
+    locked row read, complete lineage revalidation, SSM CAS and commit in one
+    transaction. Missing/mismatched rows refuse only the new terminal DB write
+    and deliberately leave the pre-existing sandbox/tracking/callback cleanup
+    trust surface unchanged. Lock/read/CAS/commit failures propagate to
+    ``_handle_envelope``, retaining Redis PEL and tracking for retry.
+    """
+    terminalize = ctx.terminalize_child
+    if terminalize is None:
+        return False
+
+    # AgentTaskRunner is the sole live producer of legacy research/general
+    # terminal envelopes and fixes this correlation in its constructor. This is
+    # a negative gate only: every candidate allowed past it still needs the
+    # authoritative row checks below; payload/child-id alone never grant DB
+    # terminal authority.
+    if envelope.correlation_id == f"spawn:{envelope.child_session_id}":
+        return False
+
+    from app.application.services.child_terminal_reconciler import (
+        row_terminal_from_envelope,
+    )
+
+    payload = envelope.payload if isinstance(envelope.payload, dict) else {}
+    status, reason = row_terminal_from_envelope(envelope.type.value, payload)
+    transitioned = await terminalize(
+        CoordinatorTerminalCommand(
+            lineage=ExpectedCoordinatorLineage(
+                child_session_id=envelope.child_session_id,
+                parent_session_id=envelope.parent_session_id,
+                root_session_id=ctx.root_session_id,
+                coordinator_run_id=envelope.correlation_id,
+            ),
+            status=status,
+            reason=reason,
+        )
+    )
+    if transitioned:
+        return True
+
+    # A PEL replay after the first transition legitimately loses the SSM CAS.
+    # Verify the now-terminal row before allowing the replay to recreate the
+    # Redis tombstone. A mismatched/forged envelope remains a safe no-op.
+    if ctx.session_repo is None:
+        return False
+    row = await ctx.session_repo.get_by_id(envelope.child_session_id)
+    return bool(
+        row is not None
+        and row.id == envelope.child_session_id
+        and row.worker_type == "subagent"
+        and row.subagent_control_plane == "mailbox"
+        and row.tool_filter_preset == COORDINATOR_STEP_PRESET
+        and row.parent_session_id == envelope.parent_session_id
+        and envelope.parent_session_id == ctx.root_session_id
+        and row.root_session_id == ctx.root_session_id
+        and row.coordinator_run_id == envelope.correlation_id
+        and bool(row.work_unit_id)
+        and getattr(row.status, "value", row.status) in {"completed", "timed_out"}
+    )
+
+
+async def _mark_terminal_liveness(
+    envelope: MailboxEnvelope,
+    ctx: SupervisorContext,
+) -> None:
+    if await _terminalize_child_from_envelope(envelope, ctx):
+        if ctx.liveness_service is None:
+            return
+        # Load-bearing: failure retains the envelope in PEL and deliberately
+        # happens before sandbox/tracking cleanup. A replay re-verifies the
+        # terminal DB row above and retries this idempotent tombstone write.
+        await ctx.liveness_service.mark_terminal(envelope.child_session_id)
+
+
+async def _resolve_terminate_echo_correlation_id(
+    envelope: MailboxEnvelope,
+    ctx: SupervisorContext,
+) -> str:
+    """Resolve authoritative run lineage for an internal coordinator cascade.
+
+    Internal cascade requests deliberately keep their stable ``cascade:*``
+    correlation for request audit/idempotency. Their synthetic CANCEL_ACK echo,
+    however, is the terminal event consumed by Task 4 and must carry the current
+    coordinator run id. Legacy/non-coordinator rows retain the old echo contract.
+    """
+    is_internal_cascade = (
+        envelope.producer_role == ProducerRole.SUPERVISOR
+        and envelope.correlation_id.startswith("cascade:")
+    )
+    if not is_internal_cascade or ctx.terminalize_child is None:
+        return envelope.correlation_id
+
+    session_repo = ctx.session_repo
+    if session_repo is None:
+        raise RuntimeError(
+            "coordinator cascade echo requires authoritative session reader"
+        )
+    try:
+        row = await session_repo.get_by_id(envelope.child_session_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "coordinator cascade echo authoritative session read failed"
+        ) from exc
+
+    if row is None:
+        raise RuntimeError(
+            "coordinator cascade echo authoritative session row missing"
+        )
+
+    # Coordinator lineage columns are never populated for legacy/research
+    # children. Any surviving coordinator marker makes this a fail-closed
+    # candidate even if a concurrent control-plane/preset flip has occurred.
+    coordinator_candidate = (
+        getattr(row, "tool_filter_preset", None) == COORDINATOR_STEP_PRESET
+        or bool(getattr(row, "coordinator_run_id", None))
+        or bool(getattr(row, "work_unit_id", None))
+    )
+    if not coordinator_candidate:
+        return envelope.correlation_id
+
+    authoritative = (
+        getattr(row, "id", None) == envelope.child_session_id
+        and getattr(row, "worker_type", None) == "subagent"
+        and getattr(row, "subagent_control_plane", None) == "mailbox"
+        and getattr(row, "tool_filter_preset", None) == COORDINATOR_STEP_PRESET
+        and getattr(row, "parent_session_id", None) == envelope.parent_session_id
+        and envelope.parent_session_id == ctx.root_session_id
+        and getattr(row, "root_session_id", None) == ctx.root_session_id
+        and bool(getattr(row, "coordinator_run_id", None))
+        and bool(getattr(row, "work_unit_id", None))
+    )
+    if not authoritative:
+        raise RuntimeError(
+            "coordinator cascade echo authoritative lineage mismatch"
+        )
+    return str(row.coordinator_run_id)
+
+
 class ResultReadyHandler:
     """Spec §7.3 — terminal envelope → destroy with full failure classification.
 
@@ -475,8 +646,8 @@ class ResultReadyHandler:
        without side_effect (idempotency).
     2. ``upsert_processing`` stages the audit row (belt-and-suspenders;
        supervisor's outer ``_handle_envelope`` also upserts).
-    3. ``side_effect`` runs destroy() → on success: agent_service_callback
-       (ChildDoneEvent fanout) → mark_processed.
+    3. ``side_effect`` runs terminal-row CAS → destroy() → on success:
+       agent_service_callback (ChildDoneEvent fanout) → mark_processed.
 
     Destroy outcome classification:
       - clean return                  → callback + mark_processed (ACK)
@@ -522,6 +693,7 @@ class ResultReadyHandler:
         await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
 
         async def _side_effect() -> None:
+            await _mark_terminal_liveness(envelope, ctx)
             # [C2 PR-6 §14.4] cost rollup PROLOGUE — fires only for
             # ``coordinator_step`` children with a parent_session_id set.
             # Best-effort: a rollup failure MUST NOT abort the load-bearing
@@ -816,29 +988,28 @@ class CancelAckHandler:
     envelope arrived). Same 4-way destroy classification + side-effect-first
     ordering as ResultReady; only the ``DestroyReason`` differs.
 
-    codex r9b [R9b-2, HIGH CONTRACT] — supervisor-echo trust contract:
-    the handler short-circuits on ``producer_role=SUPERVISOR_ECHO``
-    without verifying the envelope's origin, by design. The contract is
-    a deliberate extension of the cross-root publisher trust (codex r3
-    [R3-1] — see ``MailboxSupervisor._handle_envelope`` for the parallel
-    rationale and the deferred PR-5/PR-6 acceptance-gate TODO):
+    codex r9b [R9b-2, HIGH CONTRACT] — supervisor-echo cleanup trust contract:
+    the handler short-circuits duplicate sandbox destroy + callback on
+    ``producer_role=SUPERVISOR_ECHO`` without verifying the envelope's origin,
+    by design. This trust applies only to the pre-existing cleanup surface.
+    Task 4's terminal DB write is a separate side effect and requires the
+    authoritative session-row guard in ``_terminalize_child_from_envelope``.
 
       Publisher contract — ``ProducerRole.SUPERVISOR_ECHO`` is reserved
       for the supervisor's own re-published CANCEL_ACK envelope after a
       TERMINATE cascade. No other publisher (child agent, sibling
       supervisor, ops tool, external publisher) is permitted to set
-      this producer_role. The supervisor trusts the wire field rather
-      than verifying the envelope's origin because cross-root +
-      ancestor-chain verification would require session-repo plumbing
-      into ``SupervisorContext`` (same plumbing budget called out in
-      R3-1) for a defence-in-depth check that the publisher contract is
-      supposed to make redundant.
+      this producer_role. The supervisor still trusts the wire field for
+      suppressing duplicate cleanup, but no longer grants terminal DB authority
+      from that field: production ``session_repo`` verifies child identity,
+      mailbox control plane, coordinator preset, and parent/root lineage first.
 
     A forged ``CHILD_AGENT``-published CANCEL_ACK with
     ``producer_role=SUPERVISOR_ECHO`` would short-circuit destroy +
     callback. The cross-root guard (parent_session_id check) catches
     misrouted envelopes from other supervisor scopes; within one root,
-    we trust the publishers participating in that root's mailbox. The
+    we trust the publishers participating in that root's mailbox only for the
+    duplicate-cleanup decision. The
     SUPERVISOR_ECHO short-circuit is load-bearing for the FORCE_TERMINATE
     flow: without it, every cascade's synthetic CANCEL_ACK re-fires
     destroy → wasted lifecycle work + duplicate telemetry on every
@@ -846,9 +1017,8 @@ class CancelAckHandler:
 
     Locked behaviour:
     ``tests/domain/services/test_mailbox_supervisor.py::TestCancelAckHandlerEchoTrust::test_supervisor_echo_short_circuit_is_trust_based``
-    asserts the desired behaviour under the trust contract (an envelope
-    presenting as SUPERVISOR_ECHO is honoured regardless of the rest of
-    the wire shape).
+    asserts that cleanup short-circuit. It does not grant or test an
+    unguarded terminal DB write.
     """
 
     async def handle(
@@ -881,17 +1051,23 @@ class CancelAckHandler:
             await ctx.audit_repo.upsert_processing(
                 envelope, processing_at=ctx.now()
             )
-            # ack=True + no side_effect — _handle_envelope writes
-            # mark_processed on the ack-only path (codex r1 F8 fix in the
-            # supervisor's outer loop). No destroy. No callback.
+            # The echo still owns the session-row terminal CAS. It skips
+            # destroy/callback because CancelRequestHandler already performed
+            # those operations before publishing this envelope. Keeping the CAS
+            # inside a side_effect preserves PEL retry + audit-before-XACK.
+            async def _terminalize_echo() -> None:
+                await _mark_terminal_liveness(envelope, ctx)
+
             return HandlerOutcome(
                 ack=True,
+                side_effect=_terminalize_echo,
                 audit_payload={"supervisor_echo": True},
             )
 
         await ctx.audit_repo.upsert_processing(envelope, processing_at=ctx.now())
 
         async def _side_effect() -> None:
+            await _mark_terminal_liveness(envelope, ctx)
             # [C2 PR-7 §12.4] persist terminal envelope PROLOGUE for CANCEL_ACK.
             # Same best-effort pattern as ResultReadyHandler; see that handler
             # for the full rationale. Unlike RESULT_READY this handler does
@@ -1300,12 +1476,15 @@ class CancelRequestHandler:
             # codex r3 [R3-7, HIGH CONTRACT] — hash the synthetic envelope_id
             # so a long upstream envelope_id doesn't overflow the audit
             # column's ``String(64)`` bound. See ``_synthetic_envelope_id``.
+            ack_correlation_id = await _resolve_terminate_echo_correlation_id(
+                envelope, ctx
+            )
             ack_env = MailboxEnvelope(
                 envelope_id=_synthetic_envelope_id("ack", envelope.envelope_id),
                 type=MailboxEnvelopeType.CANCEL_ACK,
                 parent_session_id=envelope.parent_session_id,
                 child_session_id=envelope.child_session_id,
-                correlation_id=envelope.correlation_id,
+                correlation_id=ack_correlation_id,
                 emitted_at=ctx.now(),
                 producer_role=ProducerRole.SUPERVISOR_ECHO,
                 payload=CancelAckPayload(
@@ -1921,16 +2100,17 @@ class MailboxSupervisor:
     async def run(self) -> None:
         try:
             await self._consumer.ensure_group()
-            # R2 P2.1 — signal readiness to SupervisorRegistry.spawn (if it's
-            # waiting via a ``_ready_event`` injection). Optional hook.
-            ready = getattr(self, "_ready_event", None)
-            if ready is not None:
-                ready.set()
             # PR-3b spec §5.6 — startup XAUTOCLAIM drains any PEL entries
             # left over by a dead consumer on the same root (min_idle_ms=0
             # claims everything regardless of idle time, because the previous
             # consumer is by definition no longer reading).
             await self._initial_xautoclaim()
+            await self._restore_coordinator_liveness_after_startup()
+            # Readiness means the consumer group, dead-consumer PEL claim and
+            # durable child-liveness recovery have all completed.
+            ready = getattr(self, "_ready_event", None)
+            if ready is not None:
+                ready.set()
             while not self._stopping.is_set():
                 try:
                     # C3 PR-5 spec §11.6 rollback runbook (codex r3 [HIGH
@@ -2460,8 +2640,44 @@ class MailboxSupervisor:
     async def _refresh_last_seen_if_child_origin(
         self, envelope: MailboxEnvelope
     ) -> None:
-        if self._is_child_origin(envelope):
-            self._last_seen_mono[envelope.child_session_id] = self._ctx.clock()
+        if not self._is_child_origin(envelope):
+            return
+        liveness = self._ctx.liveness_service
+        payload = envelope.payload if isinstance(envelope.payload, dict) else {}
+        kind = payload.get("kind")
+        kind_value = kind.value if hasattr(kind, "value") else kind
+        if (
+            liveness is not None
+            and envelope.type == MailboxEnvelopeType.PROGRESS_UPDATE
+            and kind_value == ProgressKind.HEARTBEAT.value
+        ):
+            accepted = await liveness.record_heartbeat(envelope)
+            if not accepted:
+                return
+            if envelope.child_session_id not in self._known_children:
+                self._known_children.append(envelope.child_session_id)
+        elif liveness is not None:
+            # A SPAWN_ACK or ordinary progress event can be the first event
+            # observed after dispatch. If the DB-authorized startup lease is
+            # already present, identify the child as coordinator-owned but do
+            # not turn this non-heartbeat event into fresh liveness. From this
+            # point orphan detection reads the durable Redis authority.
+            if envelope.child_session_id in self._known_children:
+                return
+            get_lease = getattr(liveness, "get_lease", None)
+            if get_lease is not None:
+                lease = await get_lease(envelope.child_session_id)
+                if lease is not None:
+                    if (
+                        lease.root_session_id == self._ctx.root_session_id
+                        and lease.parent_session_id == self._ctx.root_session_id
+                        and lease.child_session_id == envelope.child_session_id
+                    ):
+                        self._known_children.append(envelope.child_session_id)
+                    # A live-but-mismatched lease is not legacy. Fail closed
+                    # instead of granting it a local-clock liveness path.
+                    return
+        self._last_seen_mono[envelope.child_session_id] = self._ctx.clock()
 
     def get_last_seen(self, child_session_id: str) -> Optional[float]:
         """Public read accessor for the orphan-watch / cascade tick logic
@@ -2846,6 +3062,120 @@ class MailboxSupervisor:
             age_ms = max(0, redis_now_ms - entry_ms)
             self._last_seen_mono[child_id] = now_mono - (age_ms / 1000.0)
 
+    async def _restore_coordinator_liveness_after_startup(self) -> None:
+        """Recover RUNNING coordinator children without respawning runners."""
+        repo = self._ctx.session_repo
+        liveness = self._ctx.liveness_service
+        finder = (
+            getattr(repo, "find_running_mailbox_children_for_parent", None)
+            if repo is not None
+            else None
+        )
+        if liveness is None or finder is None:
+            await self._restore_last_seen_after_pod_restart()
+            return
+
+        rows = await finder(self._ctx.root_session_id)
+        now = self._ctx.clock()
+        redis_now_ms: int | None = None
+        restored: list[str] = []
+        for row in rows:
+            child_id = str(row.session_id)
+            run_id = getattr(row, "coordinator_run_id", None)
+            work_unit_id = getattr(row, "work_unit_id", None)
+            if not run_id or not work_unit_id:
+                continue
+            lease = await liveness.get_lease(child_id)
+            lease_matches = bool(
+                lease is not None
+                and lease.root_session_id == self._ctx.root_session_id
+                and lease.parent_session_id == self._ctx.root_session_id
+                and lease.child_session_id == child_id
+                and lease.coordinator_run_id == run_id
+                and lease.work_unit_id == work_unit_id
+            )
+            if not lease_matches:
+                try:
+                    # Durable lease is the first authority. If it is absent,
+                    # recover the latest trusted child-origin stream age;
+                    # only a child with neither source receives a fresh 90s
+                    # startup grace window.
+                    startup_age_seconds: float | None = None
+                    if lease is None:
+                        stream_key = MAILBOX_STREAM_KEY_TEMPLATE.format(
+                            root_session_id=self._ctx.root_session_id
+                        )
+                        entry_ms = await self._latest_child_origin_entry_ms(
+                            stream_key, child_id,
+                        )
+                        if entry_ms is not None:
+                            if redis_now_ms is None:
+                                redis_now_ms = await self._redis_server_now_ms()
+                            startup_age_seconds = max(
+                                0.0,
+                                (redis_now_ms - entry_ms) / 1_000.0,
+                            )
+                    lease = await liveness.record_startup_lease(
+                        root_session_id=self._ctx.root_session_id,
+                        parent_session_id=self._ctx.root_session_id,
+                        child_session_id=child_id,
+                        coordinator_run_id=str(run_id),
+                        work_unit_id=str(work_unit_id),
+                        last_seen_age_seconds=startup_age_seconds,
+                    )
+                except Exception as exc:
+                    from app.application.services.coordinator_liveness_lease_service import (
+                        CoordinatorLivenessLeaseRejected,
+                    )
+                    if not isinstance(exc, CoordinatorLivenessLeaseRejected):
+                        raise
+                    # A concurrent terminal handler may have installed its
+                    # tombstone after the RUNNING query. Do not invent a
+                    # runner or local liveness signal; that terminal envelope
+                    # remains in the stream/PEL and owns cleanup.
+                    logger.info(
+                        "coordinator startup lease registration lost race "
+                        "root=%s child=%s",
+                        self._ctx.root_session_id,
+                        child_id,
+                        exc_info=True,
+                    )
+                    continue
+            restored.append(child_id)
+            # Compatibility/read accessor only. Orphan authority below reads
+            # the durable lease and its exact age, not this startup timestamp.
+            self._last_seen_mono[child_id] = now
+        self._known_children = restored
+
+    async def _redis_server_now_ms(self) -> int:
+        """Return Redis TIME in milliseconds or fail closed.
+
+        Stream IDs and this timestamp share the same Redis clock. Application
+        wall/monotonic clocks must not participate in cross-pod recovery age.
+        """
+        value = await self._ctx.redis.time()
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError("Redis TIME must contain seconds and microseconds")
+
+        def parse_component(component: object, name: str) -> int:
+            if isinstance(component, bool):
+                raise TypeError(f"Redis TIME {name} must be an integer")
+            if isinstance(component, int):
+                return component
+            if isinstance(component, bytes):
+                component = component.decode("ascii")
+            if isinstance(component, str):
+                stripped = component.strip()
+                if stripped.isdigit():
+                    return int(stripped)
+            raise TypeError(f"Redis TIME {name} must be an integer")
+
+        seconds = parse_component(value[0], "seconds")
+        microseconds = parse_component(value[1], "microseconds")
+        if seconds < 0 or not 0 <= microseconds < 1_000_000:
+            raise ValueError("Redis TIME components are outside their valid range")
+        return seconds * 1_000 + microseconds // 1_000
+
     async def _latest_child_origin_entry_ms(
         self, stream_key: str, child_id: str
     ) -> Optional[int]:
@@ -2872,10 +3202,16 @@ class MailboxSupervisor:
                 )
             except Exception:
                 continue
+            payload = env.payload if isinstance(env.payload, dict) else {}
+            kind = payload.get("kind")
+            kind_value = kind.value if hasattr(kind, "value") else kind
             if (
-                env.child_session_id == child_id
-                and env.type in CHILD_TO_PARENT_TYPES
+                env.parent_session_id == self._ctx.root_session_id
+                and env.child_session_id == child_id
+                and env.type == MailboxEnvelopeType.PROGRESS_UPDATE
                 and env.producer_role == ProducerRole.CHILD_AGENT
+                and kind_value == ProgressKind.HEARTBEAT.value
+                and env.correlation_id == f"hb:{child_id}"
             ):
                 id_str = (
                     redis_id.decode()
@@ -2886,7 +3222,7 @@ class MailboxSupervisor:
                 try:
                     return int(ms_part)
                 except ValueError:
-                    return None
+                    continue
         return None
 
     # ──────────────────────────────────────────────────────────────────────
@@ -2957,6 +3293,10 @@ class MailboxSupervisor:
         """
         self._cancel_states.pop(child_id, None)
         self._last_seen_mono.pop(child_id, None)
+        try:
+            self._known_children.remove(child_id)
+        except ValueError:
+            pass
 
     async def _maybe_tick_cancel_check(self) -> None:
         """Spec §8.4 — promote stuck REQUEST_CANCEL → TERMINATE.
@@ -3076,10 +3416,23 @@ class MailboxSupervisor:
             return
         self._last_orphan_check_mono = now
 
-        for child_id, last_seen in list(self._last_seen_mono.items()):
-            stale_seconds = now - last_seen
-            if stale_seconds <= SUBAGENT_PROGRESS_STALE_AFTER_SECONDS:
-                continue
+        candidate_ids = list(dict.fromkeys(
+            [*self._last_seen_mono.keys(), *self._known_children]
+        ))
+        for child_id in candidate_ids:
+            liveness = self._ctx.liveness_service
+            if liveness is not None and child_id in self._known_children:
+                lease = await liveness.get_lease(child_id)
+                if not liveness.is_stale(lease):
+                    continue
+                stale_seconds = SUBAGENT_PROGRESS_STALE_AFTER_SECONDS
+            else:
+                last_seen = self._last_seen_mono.get(child_id)
+                if last_seen is None:
+                    continue
+                stale_seconds = now - last_seen
+                if stale_seconds <= SUBAGENT_PROGRESS_STALE_AFTER_SECONDS:
+                    continue
             try:
                 await self._ctx.telemetry.emit(
                     "mailbox.orphan_detected",
@@ -3129,6 +3482,10 @@ class MailboxSupervisor:
             # direct-kill fallback (reusing the
             # ``_cascade_destroy_overrides`` entry for ORPHAN_TIMEOUT).
             self._last_seen_mono.pop(child_id, None)
+            try:
+                self._known_children.remove(child_id)
+            except ValueError:
+                pass
 
     async def _check_should_stop_for_rollback(self) -> None:
         """C3 PR-5 (spec §11.6 rollback runbook + R1 P2.2 NULL-coalesce).

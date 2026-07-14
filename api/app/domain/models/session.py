@@ -5,7 +5,7 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .event import Event, PlanEvent
+from .event import Event, PendingExecutionEvent, PlanEvent
 from .file import File
 from .memory import Memory
 from .plan import Plan
@@ -158,6 +158,8 @@ class Session(BaseModel):
         Literal["bg_idle_timeout", "server_restart"] | None
     ) = None
     was_background: bool = False
+    execution_revision: int = Field(default=0, ge=0)
+    pending_execution_event: PendingExecutionEvent | None = None
     updated_at: datetime = Field(default_factory=datetime.now)  # 更新时间
     created_at: datetime = Field(default_factory=datetime.now)  # 创建时间
 

@@ -55,6 +55,9 @@ class _FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.strings.get(key)
 
+    async def hget(self, key: str, field: str) -> str | None:
+        return self.hashes.get(key, {}).get(field)
+
     async def eval(self, script: str, numkeys: int, *args: object) -> int:
         self.eval_calls.append((script, numkeys, args))
         if numkeys != 1:
@@ -375,3 +378,33 @@ async def test_owner_renew_uses_compare_and_expire_lua(
     assert args == (owner_key, "tab-1", 10)
     assert redis.expire_calls == []
     assert redis.strings[owner_key] == "tab-2"
+
+
+@pytest.mark.parametrize(
+    ("owner", "subscriber_count", "expected"),
+    [
+        (None, "0", True),
+        (None, None, True),
+        ("tab-new", "1", False),
+        ("tab-new", "0", False),
+        (None, "1", False),
+        ("tab-old", "1", False),
+    ],
+)
+async def test_auto_degrade_precheck_requires_no_owner_and_zero_subscribers(
+    owner: str | None,
+    subscriber_count: str | None,
+    expected: bool,
+) -> None:
+    redis = _FakeRedis()
+    if owner is not None:
+        redis.strings["supervisor:owner:session-1"] = owner
+    if subscriber_count is not None:
+        redis.hashes["supervisor:hot:session-1"] = {
+            "subscriber_count": subscriber_count,
+        }
+    supervisor = _build_supervisor(redis)
+
+    assert await supervisor.can_auto_degrade_after_disconnect(
+        session_id="session-1",
+    ) is expected

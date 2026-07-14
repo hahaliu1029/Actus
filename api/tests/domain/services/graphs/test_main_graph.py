@@ -122,6 +122,83 @@ class TestBuildMainGraph:
         assert graph is not None
 
 
+class TestParallelBackendWaitGuard:
+    async def test_guard_scope_wraps_entire_parallel_backend(self, monkeypatch):
+        from contextlib import asynccontextmanager
+
+        from app.domain.services.graphs import main_graph
+
+        events = []
+
+        class Guard:
+            @asynccontextmanager
+            async def step_scope(self, step_id):
+                events.append(("enter", step_id))
+                try:
+                    yield
+                finally:
+                    events.append(("exit", step_id))
+
+        async def fake_impl(state, config, step):
+            events.append(("impl", step.id))
+            return main_graph.ParallelBackendOutcome(success=True, summary="ok")
+
+        monkeypatch.setattr(main_graph, "_run_parallel_backend_impl", fake_impl)
+        step = MagicMock(id="step-1")
+
+        outcome = await main_graph._run_parallel_backend(
+            {}, {"configurable": {"coordinator_wait_guard": Guard()}}, step
+        )
+
+        assert outcome.success is True
+        assert events == [
+            ("enter", "step-1"),
+            ("impl", "step-1"),
+            ("exit", "step-1"),
+        ]
+
+    async def test_guard_scope_cleans_up_when_backend_raises(self, monkeypatch):
+        from contextlib import asynccontextmanager
+
+        from app.domain.services.graphs import main_graph
+
+        events = []
+
+        class Guard:
+            @asynccontextmanager
+            async def step_scope(self, step_id):
+                events.append(("enter", step_id))
+                try:
+                    yield
+                finally:
+                    events.append(("exit", step_id))
+
+        async def failing_impl(state, config, step):
+            raise RuntimeError("backend failed")
+
+        monkeypatch.setattr(main_graph, "_run_parallel_backend_impl", failing_impl)
+
+        with pytest.raises(RuntimeError, match="backend failed"):
+            await main_graph._run_parallel_backend(
+                {},
+                {"configurable": {"coordinator_wait_guard": Guard()}},
+                MagicMock(id="step-error"),
+            )
+
+        assert events == [("enter", "step-error"), ("exit", "step-error")]
+
+    async def test_missing_guard_preserves_legacy_call(self, monkeypatch):
+        from app.domain.services.graphs import main_graph
+
+        expected = main_graph.ParallelBackendOutcome(success=True, summary="legacy")
+        impl = AsyncMock(return_value=expected)
+        monkeypatch.setattr(main_graph, "_run_parallel_backend_impl", impl)
+        step = MagicMock(id="step-legacy")
+
+        assert await main_graph._run_parallel_backend({}, {}, step) is expected
+        impl.assert_awaited_once_with({}, {}, step)
+
+
 class TestMainGraphFlow:
     async def test_full_flow_produces_plan_and_done(self, mock_planner_llm):
         from app.domain.services.graphs.main_graph import build_main_graph

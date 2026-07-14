@@ -13,6 +13,7 @@ from app.domain.models.mailbox_envelope import (
     ResultReadyOutcome,
     ResultReadyPayload,
 )
+from app.domain.services.coordinator_limits import CoordinatorLimits
 
 
 class TestSpawnRequest:
@@ -34,9 +35,40 @@ class TestSpawnRequest:
         assert env.payload["coordinator_context"]["coordinator_run_id"] \
             == "p1:abcd1234abcd1234:a1"
         assert env.payload["coordinator_context"]["budget"]["max_tool_calls"] == 25
+        assert env.payload["coordinator_context"]["budget"]["max_wallclock_seconds"] == 0
+
+    def test_make_spawn_request_uses_injected_limits_for_default_budget(self) -> None:
+        f = CoordinatorEnvelopeFactory(
+            limits=CoordinatorLimits(
+                max_tool_calls_per_child=11,
+                max_token_cost_usd_per_child=1.25,
+                max_wallclock_seconds_per_child=10800,
+            )
+        )
+        env = f.make_spawn_request(
+            parent_session_id="p",
+            child_session_id="c",
+            correlation_id="cor",
+            coordinator_run_id="r",
+            work_unit_id="w",
+            spawn_manifest_ref="ref",
+            spawn_manifest_sha256="sha",
+        )
+
+        assert env.payload["coordinator_context"]["budget"] == {
+            "max_tool_calls": 11,
+            "max_token_cost_usd": 1.25,
+            "max_wallclock_seconds": 10800,
+        }
 
     def test_make_spawn_request_with_explicit_budget(self) -> None:
-        f = CoordinatorEnvelopeFactory()
+        f = CoordinatorEnvelopeFactory(
+            limits=CoordinatorLimits(
+                max_tool_calls_per_child=99,
+                max_token_cost_usd_per_child=9.9,
+                max_wallclock_seconds_per_child=999,
+            )
+        )
         budget = CoordinatorBudgetSnapshot(
             max_tool_calls=10, max_token_cost_usd=0.1, max_wallclock_seconds=60,
         )
@@ -46,7 +78,11 @@ class TestSpawnRequest:
             spawn_manifest_ref="ref", spawn_manifest_sha256="sha",
             budget=budget, task_prompt="explore",
         )
-        assert env.payload["coordinator_context"]["budget"]["max_tool_calls"] == 10
+        assert env.payload["coordinator_context"]["budget"] == {
+            "max_tool_calls": 10,
+            "max_token_cost_usd": 0.1,
+            "max_wallclock_seconds": 60,
+        }
         assert env.payload["task_prompt"] == "explore"
 
     def test_unique_envelope_ids(self) -> None:

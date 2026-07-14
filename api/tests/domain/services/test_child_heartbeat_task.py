@@ -12,10 +12,12 @@ import asyncio
 import pytest
 
 from app.domain.models.mailbox_envelope import (
+    MAILBOX_PUBLISH_OPERATION_TIMEOUT_SECONDS,
     MailboxEnvelopeType,
     ProducerRole,
     ProgressKind,
     ProgressVisibility,
+    SUBAGENT_PROGRESS_STALE_AFTER_SECONDS,
 )
 from app.domain.services.child_heartbeat_task import ChildHeartbeatTask
 
@@ -33,6 +35,14 @@ class _CapturingPublisher:
 
     async def publish(self, envelope) -> None:
         self.published.append(envelope)
+
+
+def test_default_publish_timeout_is_below_stale_window() -> None:
+    assert 0 < MAILBOX_PUBLISH_OPERATION_TIMEOUT_SECONDS
+    assert (
+        MAILBOX_PUBLISH_OPERATION_TIMEOUT_SECONDS
+        < SUBAGENT_PROGRESS_STALE_AFTER_SECONDS
+    )
 
 
 @pytest.mark.anyio
@@ -171,3 +181,142 @@ async def test_cancelled_error_propagates() -> None:
     task = asyncio.create_task(hb.run())
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=0.5)
+
+
+@pytest.mark.anyio
+async def test_terminal_publish_is_serialized_and_stops_future_heartbeats() -> None:
+    """Terminal publish owns the publisher lock and atomically closes liveness.
+
+    A heartbeat already waiting for the lock must observe the stop marker and
+    must not appear after the terminal event.
+    """
+    events: list[str] = []
+
+    class _BlockingPublisher:
+        async def publish(self, envelope) -> None:
+            events.append("heartbeat")
+
+    hb = ChildHeartbeatTask(
+        _BlockingPublisher(), "r", "c", interval_seconds=0.01,
+    )
+    task = asyncio.create_task(hb.run())
+    await asyncio.sleep(0.025)
+
+    async def _terminal_publish() -> str:
+        events.append("terminal")
+        await asyncio.sleep(0.02)
+        return "published"
+
+    assert await hb.publish_terminal(_terminal_publish) == "published"
+    await asyncio.wait_for(task, timeout=0.5)
+    before = list(events)
+    await asyncio.sleep(0.03)
+
+    assert events == before
+    assert events[-1] == "terminal"
+
+
+@pytest.mark.anyio
+async def test_hung_heartbeat_publish_times_out_and_loop_retries() -> None:
+    """A stuck mailbox operation must not own the lifecycle lock forever."""
+
+    class _NeverReturningPublisher:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+
+        async def publish(self, envelope) -> None:
+            del envelope
+            self.calls += 1
+            self.entered.set()
+            await asyncio.Event().wait()
+
+    publisher = _NeverReturningPublisher()
+    heartbeat = ChildHeartbeatTask(
+        publisher,
+        "root-1",
+        "child-1",
+        interval_seconds=0.005,
+        publish_timeout_seconds=0.02,
+    )
+    handle = asyncio.create_task(heartbeat.run())
+    try:
+        await asyncio.wait_for(publisher.entered.wait(), timeout=0.1)
+        await asyncio.sleep(0.055)
+
+        assert publisher.calls >= 2
+        await heartbeat.stop()
+        await asyncio.wait_for(handle, timeout=0.1)
+    finally:
+        if not handle.done():
+            handle.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await handle
+
+
+@pytest.mark.anyio
+async def test_hung_terminal_publish_is_bounded_and_stops_heartbeats() -> None:
+    """Queueing behind a hung heartbeat plus a hung terminal stays bounded."""
+
+    class _NeverReturningPublisher:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+
+        async def publish(self, envelope) -> None:
+            del envelope
+            self.calls += 1
+            self.entered.set()
+            await asyncio.Event().wait()
+
+    publisher = _NeverReturningPublisher()
+    heartbeat = ChildHeartbeatTask(
+        publisher,
+        "root-1",
+        "child-1",
+        interval_seconds=0.005,
+        publish_timeout_seconds=0.02,
+    )
+    handle = asyncio.create_task(heartbeat.run())
+    terminal_entered = asyncio.Event()
+
+    async def _never_returning_terminal() -> None:
+        terminal_entered.set()
+        await asyncio.Event().wait()
+
+    terminal_handle: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(publisher.entered.wait(), timeout=0.1)
+        terminal_handle = asyncio.create_task(
+            heartbeat.publish_terminal(_never_returning_terminal)
+        )
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(terminal_handle),
+                timeout=0.15,
+            )
+
+        assert terminal_entered.is_set()
+        assert terminal_handle.done()
+        await asyncio.wait_for(handle, timeout=0.1)
+        calls_after_terminal = publisher.calls
+        await asyncio.sleep(0.03)
+        assert publisher.calls == calls_after_terminal
+    finally:
+        for task in (terminal_handle, handle):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])
+def test_publish_timeout_must_be_finite_and_positive(timeout: float) -> None:
+    with pytest.raises(ValueError, match="publish_timeout_seconds"):
+        ChildHeartbeatTask(
+            _CapturingPublisher(),
+            "root-1",
+            "child-1",
+            publish_timeout_seconds=timeout,
+        )

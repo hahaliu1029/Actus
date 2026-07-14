@@ -148,7 +148,11 @@ async def test_child_wallclock_cap_via_async_watchdog(monkeypatch) -> None:
     assert captured_kwargs["max_wallclock_seconds"] == 1
     # Trip routed to the budget finalizer with the wallclock label.
     assert runner._stop_reason == StopReason.WALLCLOCK_BUDGET
-    publisher.publish.assert_awaited_once()
+    terminal_publishes = [
+        call for call in publisher.publish.await_args_list
+        if getattr(call.args[0], "type", None) == MailboxEnvelopeType.RESULT_READY
+    ]
+    assert len(terminal_publishes) == 1
     payload = envf.make_result_ready.call_args.kwargs["payload"]
     assert payload.outcome == ResultReadyOutcome.NEEDS_AUTHORIZATION
     assert payload.needs_authorization_details.reason == "budget_exhausted"
@@ -215,11 +219,10 @@ async def test_watchdog_cancelled_on_all_exit_paths(monkeypatch, exit_mode) -> N
     )
 
 
-async def test_non_positive_wallclock_skips_watchdog_with_warning(
+async def test_zero_wallclock_silently_skips_watchdog(
     monkeypatch, caplog,
 ) -> None:
-    """[spec L8 runner 半] max_wallclock_seconds <= 0 → watchdog skipped +
-    WARNING; the run itself completes normally."""
+    """0 means unlimited: skip the watchdog without warning."""
     _patch_listener_and_prompt(monkeypatch)
 
     wd_spy = MagicMock()
@@ -241,6 +244,39 @@ async def test_non_positive_wallclock_skips_watchdog_with_warning(
 
     wd_spy.assert_not_called()
     publisher.publish.assert_awaited_once()  # run completed + published
+    assert not [
+        r
+        for r in caplog.records
+        if "wallclock" in r.getMessage().lower()
+        and "disabled" in r.getMessage().lower()
+    ], f"zero must be silent; got {[r.getMessage() for r in caplog.records]}"
+
+
+async def test_negative_wallclock_skips_watchdog_with_warning(
+    monkeypatch, caplog,
+) -> None:
+    """Negative direct-construction values stay disabled and observable."""
+    _patch_listener_and_prompt(monkeypatch)
+
+    wd_spy = MagicMock()
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner."
+        "start_wallclock_watchdog",
+        wd_spy,
+    )
+    inner = MagicMock()
+    inner.invoke_until_done = AsyncMock(return_value=MagicMock(name="done"))
+    runner, ce, publisher, _ = _mk_runner(
+        inner_runner=inner, budget=_mk_budget(wallclock=-1),
+    )
+    with caplog.at_level(
+        logging.WARNING,
+        logger="app.application.services.coordinator_child_runner",
+    ):
+        await _run(runner, ce)
+
+    wd_spy.assert_not_called()
+    publisher.publish.assert_awaited_once()
     assert any(
         "wallclock" in r.getMessage().lower() and "disabled" in r.getMessage().lower()
         for r in caplog.records

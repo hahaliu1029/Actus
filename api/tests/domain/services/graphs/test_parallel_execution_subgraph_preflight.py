@@ -1,4 +1,4 @@
-"""[C2 PR-6 §14.3 #1] dispatch_node preflight cap + reducer quota-release tests.
+"""Dispatch preflight and run-scoped coordinator quota ownership tests.
 
 Covers:
 - ``_first_time_dispatch`` rejection paths for work_unit count cap,
@@ -6,12 +6,13 @@ Covers:
   concurrency-rollback-on-descendants-rejection ordering.
 - Backward-compat: missing ``coordinator_limits`` / ``probe_quota`` /
   ``session_repository`` keys must NOT raise (caps silently skipped).
-- ``reducer_node`` must release the user-concurrency slot acquired by
-  dispatch on both normal return and reducer raise (try/finally).
+- reducer must never release before apply/rollback; the outer step scope owns
+  stop/drain/exact-release on success, exception, and cancellation.
 """
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,6 +21,16 @@ from app.application.services.patch_reducer_service import (
     ReducerDiagnostics,
     ReducerOutput,
 )
+from app.application.services.coordinator_liveness_lease_service import (
+    CoordinatorChildLease,
+    CoordinatorLivenessLeaseService,
+)
+from app.application.services.coordinator_parent_execution_lease import (
+    CoordinatorParentPhase,
+)
+from app.application.services.coordinator_wait_guard import CoordinatorWaitGuard
+from app.application.services.coordinator_rehydrate_service import RehydrateResult
+from app.domain.models.session import Session, SessionStatus
 from app.domain.models.patch_apply_plan import GroupOutcome
 from app.domain.models.work_unit import (
     PathLease,
@@ -30,6 +41,7 @@ from app.domain.models.work_unit import (
 from app.domain.services.coordinator_limits import CoordinatorLimits
 from app.domain.services.graphs.parallel_execution_subgraph import (
     _first_time_dispatch,
+    _rehydrate_dispatch,
     reducer_node,
 )
 from app.domain.services.subagent_limits import MAX_DESCENDANTS_PER_ROOT
@@ -143,6 +155,7 @@ def _full_dispatch_config(
         cfg["coordinator_limits"] = coordinator_limits
     if probe_quota is not None:
         cfg["probe_quota"] = probe_quota
+        cfg["coordinator_wait_guard"] = CoordinatorWaitGuard()
     if session_repo is not None:
         cfg["session_repository"] = session_repo
     return {"configurable": cfg}
@@ -195,7 +208,7 @@ class TestPreflightCaps:
         assert "concurrency cap" in str(ei.value)
         assert "u1" in str(ei.value)
         probe_quota.acquire_coordinator_concurrency.assert_awaited_once_with(
-            user_id="u1", cap=2,
+            user_id="u1", coordinator_run_id="run1", cap=2,
         )
         # Failed-acquire path MUST NOT call release (rollback) — that would
         # decrement someone else's slot.
@@ -242,7 +255,7 @@ class TestPreflightCaps:
         # Concurrency was acquired then rolled back exactly once.
         probe_quota.acquire_coordinator_concurrency.assert_awaited_once()
         probe_quota.release_coordinator_quotas.assert_awaited_once_with(
-            user_id="u1",
+            user_id="u1", coordinator_run_id="run1",
         )
         # No downstream side effects.
         config["configurable"]["session_service"].create_session_with_parent.assert_not_called()
@@ -350,6 +363,311 @@ class TestPreflightCaps:
         probe_quota.release_coordinator_quotas.assert_not_awaited()
 
 
+class TestProductionDeadlineWiring:
+    async def test_dispatch_omits_fixed_orchestrator_timeout(self) -> None:
+        config = _full_dispatch_config(n_children=1)
+        units = _mk_work_units(1)
+
+        await _first_time_dispatch(_base_state(units), config, "run1", units)
+        await asyncio.sleep(0)
+
+        orchestrator = (
+            config["configurable"]["orchestrator_factory"].build.return_value
+        )
+        orchestrator.run.assert_awaited_once()
+        assert "timeout_seconds" not in orchestrator.run.await_args.kwargs
+
+
+class TestRunIdQuotaOwnership:
+    async def test_successful_dispatch_releases_only_at_outer_step_scope_exit(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        probe_quota.acquire_coordinator_concurrency = AsyncMock(return_value=True)
+        probe_quota.release_coordinator_quotas = AsyncMock()
+        limits = CoordinatorLimits(
+            max_work_units_per_run=5,
+            max_concurrent_coordinator_runs_per_user=2,
+        )
+        config = _full_dispatch_config(
+            coordinator_limits=limits,
+            probe_quota=probe_quota,
+            n_children=1,
+        )
+        guard = config["configurable"]["coordinator_wait_guard"]
+        units = _mk_work_units(1)
+
+        async with guard.step_scope("step-abc"):
+            await _first_time_dispatch(_base_state(units), config, "run1", units)
+            probe_quota.release_coordinator_quotas.assert_not_awaited()
+
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="run1",
+        )
+
+    async def test_rehydrate_uses_same_run_id_until_outer_scope_exit(self) -> None:
+        probe_quota = AsyncMock()
+        probe_quota.release_coordinator_quotas = AsyncMock()
+        config = _full_dispatch_config(probe_quota=probe_quota, n_children=1)
+        guard = config["configurable"]["coordinator_wait_guard"]
+        existing = RehydrateResult(
+            child_session_ids={"wu0": "c0"},
+            pending=["wu0"],
+            terminal={},
+        )
+        units = _mk_work_units(1)
+
+        async with guard.step_scope("step-abc"):
+            await _rehydrate_dispatch(
+                _base_state(units), config, existing, "original-run", units,
+            )
+            probe_quota.release_coordinator_quotas.assert_not_awaited()
+
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="original-run",
+        )
+
+
+class TestCoordinatorStartupLeaseOrdering:
+    async def test_real_pending_session_registers_with_real_liveness_service(
+        self,
+    ) -> None:
+        class _PendingSessionRepo:
+            def __init__(self, row: Session) -> None:
+                self.row = row
+
+            async def get_by_id(self, session_id: str) -> Session | None:
+                return self.row if self.row.id == session_id else None
+
+        class _StartupRedis:
+            def __init__(self) -> None:
+                self.hashes: dict[str, dict[str, str]] = {}
+
+            async def eval(self, script, numkeys, key, *args):  # noqa: ANN001
+                assert "coordinator-startup-cas-v1" in script
+                assert numkeys == 1
+                fields = (
+                    "root_session_id", "parent_session_id", "child_session_id",
+                    "coordinator_run_id", "work_unit_id", "last_seen_epoch", "phase",
+                )
+                self.hashes[key] = dict(zip(fields, map(str, args[:7]), strict=True))
+                return 1
+
+        row = Session(
+            id="c0",
+            parent_session_id="parent1",
+            root_session_id="root1",
+            worker_type="subagent",
+            depth=1,
+            subagent_control_plane="mailbox",
+            tool_filter_preset="coordinator_step",
+            coordinator_run_id="run1",
+            work_unit_id="wu0",
+            status=SessionStatus.PENDING,
+        )
+        redis = _StartupRedis()
+        liveness = CoordinatorLivenessLeaseService(
+            redis=redis,
+            session_repository=_PendingSessionRepo(row),  # type: ignore[arg-type]
+        )
+        config = _full_dispatch_config(n_children=1)
+        cfg = config["configurable"]
+        cfg["session_service"].create_session_with_parent = AsyncMock(
+            return_value=row,
+        )
+        cfg["coordinator_liveness_service"] = liveness
+        guard = MagicMock()
+        guard.enter_run = AsyncMock()
+        cfg["coordinator_wait_guard"] = guard
+        units = _mk_work_units(1)
+
+        await _first_time_dispatch(_base_state(units), config, "run1", units)
+
+        assert redis.hashes[
+            "coordinator:liveness:child:c0"
+        ]["coordinator_run_id"] == "run1"
+        cfg["child_runner_starter"].start.assert_awaited_once()
+
+    async def test_rows_groups_leases_guard_runners_then_publish(self) -> None:
+        events: list[str] = []
+        config = _full_dispatch_config(n_children=2)
+        cfg = config["configurable"]
+
+        async def create_child(**_kwargs):
+            index = sum(event.startswith("row:") for event in events)
+            events.append(f"row:{index}")
+            return _mk_session(f"c{index}")
+
+        async def subscribe(**kwargs):
+            events.append(f"group:{kwargs['consumer_group']}")
+
+        async def register(**kwargs):
+            events.append(f"lease:{kwargs['child_session_id']}")
+
+        async def start(**kwargs):
+            events.append(f"runner:{kwargs['child_session_id']}")
+
+        async def publish(envelope):
+            events.append(f"publish:{envelope.child_session_id}")
+
+        cfg["session_service"].create_session_with_parent = AsyncMock(
+            side_effect=create_child,
+        )
+        cfg["mailbox_subscriber"].subscribe = AsyncMock(side_effect=subscribe)
+        cfg["coordinator_liveness_service"] = SimpleNamespace(
+            record_startup_lease=AsyncMock(side_effect=register),
+            clear_if_matches=AsyncMock(),
+        )
+        guard = MagicMock()
+        guard.enter_run = AsyncMock(side_effect=(
+            lambda *_args, **_kwargs: events.append("guard")
+        ))
+        cfg["coordinator_wait_guard"] = guard
+        cfg["child_runner_starter"].start = AsyncMock(side_effect=start)
+        cfg["mailbox_publisher"].publish = AsyncMock(side_effect=publish)
+        units = _mk_work_units(2)
+
+        await _first_time_dispatch(_base_state(units), config, "run1", units)
+
+        positions = {
+            phase: [index for index, event in enumerate(events) if event.startswith(phase)]
+            for phase in ("row:", "group:", "lease:", "runner:", "publish:")
+        }
+        assert max(positions["row:"]) < min(positions["group:"])
+        assert max(positions["group:"]) < min(positions["lease:"])
+        assert max(positions["lease:"]) < events.index("guard")
+        assert events.index("guard") < min(positions["runner:"])
+        assert max(positions["runner:"]) < min(positions["publish:"])
+        guard.enter_run.assert_called_once_with(
+            "step-abc",
+            "run1",
+            root_session_id="root1",
+            parent_session_id="parent1",
+            user_id="u1",
+            child_session_ids=("c0", "c1"),
+            release_quota=None,
+        )
+
+    async def test_failure_clears_registered_leases_and_resumes_guard(self) -> None:
+        config = _full_dispatch_config(n_children=2)
+        cfg = config["configurable"]
+        leases = [
+            CoordinatorChildLease(
+                root_session_id="root1",
+                parent_session_id="parent1",
+                child_session_id=f"c{index}",
+                coordinator_run_id="run1",
+                work_unit_id=f"wu{index}",
+                last_seen_epoch=1.0,
+                phase="starting",
+            )
+            for index in range(2)
+        ]
+        liveness = SimpleNamespace(
+            record_startup_lease=AsyncMock(side_effect=leases),
+            clear_if_matches=AsyncMock(),
+        )
+        guard = MagicMock()
+        guard.enter_run = AsyncMock()
+        guard.resume_run = AsyncMock()
+        cfg["coordinator_liveness_service"] = liveness
+        cfg["coordinator_wait_guard"] = guard
+        cfg["mailbox_subscriber"].destroy_group = AsyncMock()
+        cfg["child_runner_starter"].start = AsyncMock(
+            side_effect=[None, RuntimeError("second runner failed")],
+        )
+        cfg["child_runner_starter"].request_stop_started = MagicMock()
+        units = _mk_work_units(2)
+
+        with pytest.raises(RuntimeError, match="second runner failed"):
+            await _first_time_dispatch(_base_state(units), config, "run1", units)
+
+        assert [
+            call.args[0] for call in liveness.clear_if_matches.await_args_list
+        ] == leases
+        guard.resume_run.assert_called_once_with("step-abc", "run1")
+
+    async def test_rehydrate_registers_pending_without_respawning_runner(self) -> None:
+        events: list[str] = []
+        config = _full_dispatch_config(n_children=1)
+        cfg = config["configurable"]
+        cfg["mailbox_subscriber"].subscribe = AsyncMock(
+            side_effect=lambda **_kwargs: events.append("group"),
+        )
+        cfg["coordinator_liveness_service"] = SimpleNamespace(
+            record_startup_lease=AsyncMock(
+                side_effect=lambda **_kwargs: events.append("lease"),
+            ),
+            clear_if_matches=AsyncMock(),
+        )
+        guard = MagicMock()
+        guard.enter_run = AsyncMock(side_effect=(
+            lambda *_args, **_kwargs: events.append("guard")
+        ))
+        cfg["coordinator_wait_guard"] = guard
+        existing = RehydrateResult(
+            child_session_ids={"wu0": "c0"},
+            pending=["wu0"],
+            terminal={},
+        )
+        units = _mk_work_units(1)
+
+        await _rehydrate_dispatch(
+            _base_state(units), config, existing, "run1", units,
+        )
+
+        assert events == ["group", "lease", "guard"]
+        cfg["child_runner_starter"].start.assert_not_awaited()
+        guard.enter_run.assert_called_once_with(
+            "step-abc",
+            "run1",
+            root_session_id="root1",
+            parent_session_id="parent1",
+            user_id="u1",
+            child_session_ids=("c0",),
+            phase=CoordinatorParentPhase.WAITING_CHILDREN,
+            release_quota=None,
+        )
+
+    async def test_rehydrate_failure_compare_deletes_only_registered_lease(
+        self,
+    ) -> None:
+        config = _full_dispatch_config(n_children=2)
+        cfg = config["configurable"]
+        lease = CoordinatorChildLease(
+            root_session_id="root1",
+            parent_session_id="parent1",
+            child_session_id="c0",
+            coordinator_run_id="run1",
+            work_unit_id="wu0",
+            last_seen_epoch=1.0,
+            phase="starting",
+        )
+        liveness = SimpleNamespace(
+            record_startup_lease=AsyncMock(
+                side_effect=[lease, RuntimeError("second lease failed")],
+            ),
+            clear_if_matches=AsyncMock(),
+        )
+        cfg["coordinator_liveness_service"] = liveness
+        cfg["mailbox_subscriber"].destroy_group = AsyncMock()
+        existing = RehydrateResult(
+            child_session_ids={"wu0": "c0", "wu1": "c1"},
+            pending=["wu0", "wu1"],
+            terminal={},
+        )
+        units = _mk_work_units(2)
+
+        with pytest.raises(RuntimeError, match="second lease failed"):
+            await _rehydrate_dispatch(
+                _base_state(units), config, existing, "run1", units,
+            )
+
+        liveness.clear_if_matches.assert_awaited_once_with(lease)
+        assert cfg["mailbox_subscriber"].destroy_group.await_count == 2
+        cfg["child_runner_starter"].start.assert_not_awaited()
+
+
 # ── [codex R8 P2-1] dispatch-rollback waiter group destroy ────────────────────
 
 
@@ -440,7 +758,7 @@ class TestDispatchRollbackWaiterGroupCleanup:
         # Concurrency slot was also released as part of rollback (Round 3
         # P1-3) — destroy_group cleanup is additive, not a replacement.
         probe_quota.release_coordinator_quotas.assert_awaited_once_with(
-            user_id="u1",
+            user_id="u1", coordinator_run_id="run1",
         )
 
     async def test_destroy_group_failure_during_rollback_does_not_mask_original(
@@ -566,9 +884,8 @@ class TestBackwardCompat:
             config["configurable"]["session_service"]
             .create_session_with_parent.await_count == 2
         )
-        # release_coordinator_quotas NOT called by dispatch — only by reducer
-        # on the happy path. Dispatch only rolls back on descendants-cap
-        # rejection.
+        # Successful dispatch transfers ownership to the wait guard; the outer
+        # step scope releases only after backend apply/rollback finishes.
         probe_quota.release_coordinator_quotas.assert_not_awaited()
 
 
@@ -586,14 +903,34 @@ def _wu(work_unit_id: str = "wu1") -> WorkUnit:
     )
 
 
-class TestReducerReleasesQuota:
-    async def test_reducer_normal_return_releases_quota(self) -> None:
-        """Happy path: reducer returns Command → probe_quota.release fires.
+class TestReducerKeepsQuotaForBackend:
+    async def test_reducer_does_not_release_before_backend_apply_finishes(
+        self,
+    ) -> None:
+        reducer = AsyncMock()
+        reducer.reduce = AsyncMock(return_value=ReducerOutput(
+            apply_plan=None,
+            group_outcome=GroupOutcome.SUCCESS,
+            step_result_candidate="ok",
+            diagnostics=ReducerDiagnostics(),
+        ))
+        probe_quota = AsyncMock()
+        probe_quota.release_coordinator_quotas = AsyncMock()
 
-        [codex R2 P1-4] State carries ``quota_acquired=True`` (set by
-        ``_first_time_dispatch`` on the first-time path) so the release
-        gate fires. The rehydrate path test below pins the inverse.
-        """
+        await reducer_node({
+            "coordinator_run_id": "r1",
+            "user_id": "u1",
+            "work_units": [_wu("wu1")],
+            "worker_results": [],
+        }, {"configurable": {
+            "patch_reducer_service": reducer,
+            "probe_quota": probe_quota,
+        }})
+
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+
+    async def test_reducer_normal_return_keeps_quota(self) -> None:
+        """Happy reducer return keeps the lease through backend apply."""
         reducer = AsyncMock()
         reducer.reduce = AsyncMock(return_value=ReducerOutput(
             apply_plan=None,
@@ -608,7 +945,6 @@ class TestReducerReleasesQuota:
             "user_id": "u1",
             "work_units": [_wu("wu1")],
             "worker_results": [],
-            "quota_acquired": True,
         }
         config = {"configurable": {
             "patch_reducer_service": reducer,
@@ -619,13 +955,10 @@ class TestReducerReleasesQuota:
 
         # Normal completion still returns the Command.
         assert cmd.update["group_outcome"] == GroupOutcome.SUCCESS
-        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
-            user_id="u1",
-        )
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
 
-    async def test_reducer_raise_still_releases_quota(self) -> None:
-        """Exception path: reducer raises → release still fires, then exc
-        propagates."""
+    async def test_reducer_raise_still_defers_release_to_backend_owner(self) -> None:
+        """Reducer exception propagates; outer step scope owns release."""
         reducer = AsyncMock()
         reducer.reduce = AsyncMock(side_effect=RuntimeError("reduce boom"))
         probe_quota = AsyncMock()
@@ -635,7 +968,6 @@ class TestReducerReleasesQuota:
             "user_id": "u1",
             "work_units": [_wu("wu1")],
             "worker_results": [],
-            "quota_acquired": True,
         }
         config = {"configurable": {
             "patch_reducer_service": reducer,
@@ -645,17 +977,9 @@ class TestReducerReleasesQuota:
         with pytest.raises(RuntimeError, match="reduce boom"):
             await reducer_node(state, config)
 
-        # release ran even though reduce raised.
-        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
-            user_id="u1",
-        )
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
 
-    async def test_reducer_release_failure_does_not_mask_normal_return(
-        self, caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """probe_quota.release_coordinator_quotas itself raising must NOT
-        mask the reducer's Command return. Failure is logged."""
-        import logging
+    async def test_reducer_never_invokes_release_callback(self) -> None:
 
         reducer = AsyncMock()
         reducer.reduce = AsyncMock(return_value=ReducerOutput(
@@ -673,26 +997,15 @@ class TestReducerReleasesQuota:
             "user_id": "u1",
             "work_units": [_wu("wu1")],
             "worker_results": [],
-            "quota_acquired": True,
         }
         config = {"configurable": {
             "patch_reducer_service": reducer,
             "probe_quota": probe_quota,
         }}
-        caplog.set_level(
-            logging.ERROR,
-            logger="app.domain.services.graphs.parallel_execution_subgraph",
-        )
-
         cmd = await reducer_node(state, config)
 
-        # Reducer's Command still returned normally.
         assert cmd.update["group_outcome"] == GroupOutcome.SUCCESS
-        # Failure logged at ERROR via logger.exception.
-        assert any(
-            "probe_quota release failed" in rec.message
-            for rec in caplog.records
-        ), f"expected probe_quota release fail log; got {[r.message for r in caplog.records]}"
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
 
     async def test_reducer_no_probe_quota_in_cfg_does_not_raise(self) -> None:
         """Backward compat: cfg without probe_quota → reducer flows normally
@@ -743,12 +1056,10 @@ class TestReducerReleasesQuota:
         assert cmd.update["group_outcome"] == GroupOutcome.SUCCESS
         probe_quota.release_coordinator_quotas.assert_not_awaited()
 
-    async def test_reducer_missing_coordinator_run_id_still_releases(
+    async def test_reducer_missing_coordinator_run_id_does_not_release(
         self,
     ) -> None:
-        """The early-return on missing coordinator_run_id must still release
-        the concurrency slot (otherwise a topology-bug session would leak
-        quota)."""
+        """Even topology-error cleanup remains owned by outer step scope."""
         reducer = AsyncMock()
         probe_quota = AsyncMock()
         probe_quota.release_coordinator_quotas = AsyncMock()
@@ -757,7 +1068,6 @@ class TestReducerReleasesQuota:
             "user_id": "u1",
             "work_units": [_wu("wu1")],
             "worker_results": [],
-            "quota_acquired": True,
         }
         config = {"configurable": {
             "patch_reducer_service": reducer,
@@ -767,21 +1077,15 @@ class TestReducerReleasesQuota:
         cmd = await reducer_node(state, config)
         assert "missing coordinator_run_id" in cmd.update["step_result_candidate"]
         reducer.reduce.assert_not_called()
-        # try/finally still runs after the early return.
-        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
-            user_id="u1",
-        )
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
 
     async def test_reducer_rehydrate_path_does_not_release_quota(
         self,
     ) -> None:
-        """[codex R2 P1-4 invariant] Rehydrate dispatch does NOT acquire
-        the concurrency slot — the slot is owned by the prior dispatch
-        incarnation that crashed. Therefore the reducer MUST NOT release
-        on the rehydrate path, otherwise a downstream DECR would push
-        the counter below zero or steal another incarnation's slot.
+        """Rehydrate resumes the same run-id lease under the outer step scope.
 
-        Simulated by ``quota_acquired=False`` (or missing) in state.
+        The reducer never releases it because backend apply/rollback still has
+        to finish before the wait guard may stop, drain, and release.
         """
         reducer = AsyncMock()
         reducer.reduce = AsyncMock(return_value=ReducerOutput(
@@ -792,15 +1096,11 @@ class TestReducerReleasesQuota:
         ))
         probe_quota = AsyncMock()
         probe_quota.release_coordinator_quotas = AsyncMock()
-        # Rehydrate path: ``_rehydrate_dispatch`` did NOT write
-        # quota_acquired into Command.update — TypedDict total=False
-        # leaves it absent, defaulting to False at .get(..., False).
         state = {
             "coordinator_run_id": "r1",
             "user_id": "u1",
             "work_units": [_wu("wu1")],
             "worker_results": [],
-            # NB: no "quota_acquired" key — simulates rehydrate path
         }
         config = {"configurable": {
             "patch_reducer_service": reducer,
@@ -811,38 +1111,5 @@ class TestReducerReleasesQuota:
 
         # Reducer still ran + returned its Command.
         assert cmd.update["group_outcome"] == GroupOutcome.SUCCESS
-        # Release MUST NOT have been called — quota_acquired was False.
-        probe_quota.release_coordinator_quotas.assert_not_awaited()
-
-    async def test_reducer_explicit_quota_acquired_false_skips_release(
-        self,
-    ) -> None:
-        """[codex R2 P1-4 invariant] Explicit ``quota_acquired=False`` in
-        state (e.g., dispatch-body rollback path that bailed before
-        Command(update=) fired) must also skip release. Pins the
-        boolean flag semantics independent of dict-key absence."""
-        reducer = AsyncMock()
-        reducer.reduce = AsyncMock(return_value=ReducerOutput(
-            apply_plan=None,
-            group_outcome=GroupOutcome.SUCCESS,
-            step_result_candidate="ok",
-            diagnostics=ReducerDiagnostics(),
-        ))
-        probe_quota = AsyncMock()
-        probe_quota.release_coordinator_quotas = AsyncMock()
-        state = {
-            "coordinator_run_id": "r1",
-            "user_id": "u1",
-            "work_units": [_wu("wu1")],
-            "worker_results": [],
-            "quota_acquired": False,
-        }
-        config = {"configurable": {
-            "patch_reducer_service": reducer,
-            "probe_quota": probe_quota,
-        }}
-
-        cmd = await reducer_node(state, config)
-
-        assert cmd.update["group_outcome"] == GroupOutcome.SUCCESS
+        # Release remains owned by the outer step scope.
         probe_quota.release_coordinator_quotas.assert_not_awaited()

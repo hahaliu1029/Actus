@@ -204,6 +204,7 @@ async def test_worker_node_passes_correct_child_and_root_to_waiter() -> None:
     kwargs = waiter.await_terminal.await_args.kwargs
     assert kwargs["child_session_id"] == "c1"
     assert kwargs["root_session_id"] == "root1"
+    assert "timeout" not in kwargs
 
 
 @pytest.mark.anyio

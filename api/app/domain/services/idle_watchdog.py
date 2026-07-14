@@ -130,18 +130,24 @@ class IdleWatchdog:
     async def _sweep_expired_once(self) -> None:
         if self._supervisor is None:
             return
+        sweep_now = datetime.now(timezone.utc)
+        await self._supervisor.reconcile_global_background_memberships(
+            reconcile_now=sweep_now,
+        )
         async with self._repo_context() as repo:
             user_ids = set(await repo.distinct_user_ids_with_running_bg())
         user_ids.update(await self._supervisor.list_background_slot_user_ids())
         for user_id in user_ids:
-            expired_session_ids = await self._supervisor.sweep_expired(user_id=user_id)
+            expired_session_ids = await self._supervisor.sweep_expired(
+                user_id=user_id,
+                sweep_now=sweep_now,
+            )
             for session_id in expired_session_ids:
                 try:
-                    await self._supervisor.terminate(
+                    await self._supervisor.terminate_expired_background(
                         session_id=session_id,
                         user_id=user_id,
-                        terminal_reason="watchdog_timeout",
-                        status=SessionStatus.TIMED_OUT,
+                        sweep_now=sweep_now,
                         notification_emitter=self._notification_emitter,
                     )
                 except Exception:

@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from app.domain.models.app_config import A2AConfig, AgentConfig, MCPConfig
 from app.domain.models.event import MessageEvent
+from app.domain.models.lifecycle import LifecycleEventKind
 from app.domain.models.session import SessionStatus
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.session.default_state_machine import (
@@ -85,6 +86,9 @@ class _NoopSandbox:
 class _NoopTool:
     manager = None
 
+    def connected_server_ids(self) -> tuple[str, ...]:
+        return ()
+
     async def initialize(self, *_args, **_kwargs) -> None:
         return None
 
@@ -139,6 +143,105 @@ def _build_runner(session_id: str = "session-cancel") -> AgentTaskRunner:
     runner._a2a_tool = _NoopTool()
     runner._skill_tool = _NoopTool()
     return runner
+
+
+@pytest.mark.parametrize(
+    ("status", "terminal_reason", "runner_exception"),
+    [
+        (SessionStatus.COMPLETED, "natural", False),       # done
+        (SessionStatus.COMPLETED, "natural", True),        # runner error
+        (SessionStatus.COMPLETED, "user_cancel", False),   # cancel
+        (SessionStatus.TIMED_OUT, "watchdog_timeout", False),  # timeout
+    ],
+)
+async def test_external_terminal_owner_suppresses_all_inner_terminal_side_effects(
+    status: SessionStatus,
+    terminal_reason: str,
+    runner_exception: bool,
+) -> None:
+    runner = _build_runner(f"external-{status.value}-{terminal_reason}")
+    runner._external_terminal_owner = True
+    runner._runner_exception_terminal = runner_exception
+    runner._memory_notification_emitter = AsyncMock()
+    runner._was_background = True
+    runner._maybe_stop_child_publisher = AsyncMock()
+    runner._maybe_stop_mailbox_supervisor = AsyncMock()
+
+    await runner._set_terminal_status_with_notifications(status, terminal_reason)
+
+    assert runner._uow.session.terminal_updates == []
+    runner._memory_notification_emitter.emit.assert_not_awaited()
+    runner._maybe_stop_child_publisher.assert_not_awaited()
+    runner._maybe_stop_mailbox_supervisor.assert_not_awaited()
+
+
+async def test_external_terminal_owner_keeps_cost_drain_and_tool_cleanup() -> None:
+    runner = _build_runner("external-cleanup")
+    runner._external_terminal_owner = True
+    cost_handler = MagicMock()
+    cost_handler.flush_pending = AsyncMock(
+        return_value=MagicMock(drained=True, persist_failures=0)
+    )
+    cost_handler.write_session_degraded_marker = AsyncMock()
+    runner._cost_callback_handler = cost_handler
+
+    await runner._set_terminal_status_with_notifications(
+        SessionStatus.COMPLETED, "natural"
+    )
+
+    cost_handler.flush_pending.assert_awaited_once_with(timeout=3.0)
+    assert runner._uow.session.terminal_updates == []
+
+    task = _DummyTask(cancel_reason="stop")
+    _prime_runner_for_loop_cancellation(runner, task)
+    runner._cleanup_tools = AsyncMock()
+    with pytest.raises(asyncio.CancelledError):
+        await runner.invoke(task)
+    runner._cleanup_tools.assert_awaited_once()
+
+
+async def test_external_terminal_owner_suppresses_terminal_lifecycle_event() -> None:
+    runner = _build_runner("external-lifecycle")
+    runner._external_terminal_owner = True
+    runner._lifecycle_runtime.lifecycle_events_enabled = True
+    runner._is_root_session = AsyncMock(return_value=True)
+    runner._put_and_add_event = AsyncMock()
+
+    await runner._emit_task_lifecycle(
+        _DummyTask(cancel_reason="stop"), LifecycleEventKind.COMPLETED,
+    )
+
+    runner._put_and_add_event.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("external_terminal_owner", "external_heartbeat_owner"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+async def test_independent_ownership_quadrants_control_db_and_notification(
+    external_terminal_owner: bool,
+    external_heartbeat_owner: bool,
+) -> None:
+    runner = _build_runner(
+        f"quadrant-{int(external_terminal_owner)}-"
+        f"{int(external_heartbeat_owner)}"
+    )
+    runner._external_terminal_owner = external_terminal_owner
+    runner._external_heartbeat_owner = external_heartbeat_owner
+    runner._memory_notification_emitter = AsyncMock()
+    runner._was_background = True
+
+    await runner._set_terminal_status_with_notifications(
+        SessionStatus.COMPLETED, "natural"
+    )
+
+    assert bool(runner._uow.session.terminal_updates) is (
+        not external_terminal_owner
+    )
+    if external_terminal_owner:
+        runner._memory_notification_emitter.emit.assert_not_awaited()
+    else:
+        runner._memory_notification_emitter.emit.assert_awaited_once()
 
 
 async def _cancel_flow(_message):
@@ -379,4 +482,48 @@ async def test_event_cancel_terminalizes_completed_natural_without_done_event() 
     ]
     # The runner's event-cancel arm must stay DoneEvent-free (mirror the
     # ChildScopeViolation arm — typed cancel propagation depends on it).
+    assert task.output_stream.events == []
+
+
+@pytest.mark.parametrize(
+    ("flow", "expected_exception", "needs_stash"),
+    [
+        (_scope_violation_flow, "ChildScopeViolation", True),
+        (_event_cancel_flow, "CancelledByEventError", False),
+    ],
+)
+async def test_external_owner_real_typed_invoke_skips_inner_terminal_but_cleans_up(
+    flow,
+    expected_exception: str,
+    needs_stash: bool,
+) -> None:
+    """Exercise the real invoke exception arms, not only the central helper."""
+    from app.domain.services.graphs.react_graph import CancelledByEventError
+    from app.domain.services.permission.child_scope_violation import (
+        ChildScopeViolation,
+    )
+
+    exception_type = {
+        "ChildScopeViolation": ChildScopeViolation,
+        "CancelledByEventError": CancelledByEventError,
+    }[expected_exception]
+    runner = _build_runner(f"external-typed-{expected_exception}")
+    runner._external_terminal_owner = True
+    runner._external_heartbeat_owner = True
+    runner._memory_notification_emitter = AsyncMock()
+    runner._was_background = True
+    runner._cleanup_tools = AsyncMock()
+    task = _DummyTask(cancel_reason="stop")
+    _prime_runner_for_loop_cancellation(runner, task)
+    runner._run_flow = flow
+    if needs_stash:
+        task.set_child_scope_violation = MagicMock()
+
+    with pytest.raises(exception_type):
+        await runner.invoke(task)
+
+    await asyncio.sleep(0)
+    assert runner._uow.session.terminal_updates == []
+    runner._memory_notification_emitter.emit.assert_not_awaited()
+    runner._cleanup_tools.assert_awaited_once()
     assert task.output_stream.events == []

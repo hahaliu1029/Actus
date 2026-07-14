@@ -45,12 +45,15 @@ def test_shared_runner_builder_constructs_full_child_runner_with_confirmation_of
     runner = builder(
         session_id="c1", tool_filter=frozenset({"file_write"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
+        external_terminal_owner=True, external_heartbeat_owner=True,
         sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     assert runner._agent_config.tool_confirmation.enabled is False
     assert parent_agent_config.tool_confirmation.enabled is True  # parent untouched
     assert runner._coord_deps_for_planner is None  # child is NOT a nested coordinator
+    assert runner._external_terminal_owner is True
+    assert runner._external_heartbeat_owner is True
     # B1 spec R2#1: child runner received the exact ToolRuntimeConfig from deps
     # (agent_task_runner stores tool_runtime or ToolRuntimeConfig(); a non-None
     # sentinel is kept by identity, so child/root flags can't drift).

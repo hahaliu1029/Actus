@@ -289,32 +289,29 @@ async def test_worker_node_malformed_terminal_envelope_fails_closed() -> None:
     assert wr.patch_manifest is None
 
 
-async def test_worker_node_terminal_wait_timeout_fails_closed() -> None:
-    """[codex PR-2 R5 P0] ``await_terminal`` raising ``asyncio.TimeoutError``
-    (the child never emitted a terminal within the 600s waiter window) must
-    fail-closed to a TIMED_OUT WorkerResult, never propagate.
+async def test_worker_node_terminal_wait_timeout_propagates_exact_error() -> None:
+    """Infrastructure/stale ``TimeoutError`` is not a synthetic child result.
 
-    A raise here crashes the whole LangGraph ``Send`` fan-out superstep — only
-    ``CoordinatorPathContractError`` is caught upstream in
-    ``_run_parallel_backend`` and ``executor_node`` has no retry policy — so it
-    would lose EVERY sibling worker's result and strand the run. S2 shell-mode
-    children do heavier work and are likelier to hit this. worker_node must
-    always produce a WorkerResult so the reducer's completeness invariant holds
-    and a single slow child cannot kill the batch.
+    Production terminal waits have no positive deadline. A ``TimeoutError``
+    therefore comes from subscriber/liveness/persistence infrastructure and
+    must remain retryable instead of being rewritten as child ``TIMED_OUT``.
     """
     import asyncio
 
+    timeout_error = asyncio.TimeoutError("stale Redis authority timed out")
+    envelope_store = MagicMock()
+    envelope_store.persist_terminal = AsyncMock()
     config = _config(artifact_storage=MagicMock())
+    config["configurable"]["coordinator_envelope_store"] = envelope_store
     config["configurable"]["terminal_waiter"].await_terminal = AsyncMock(
-        side_effect=asyncio.TimeoutError("no terminal after 600s")
+        side_effect=timeout_error,
     )
-    out = await worker_node(_send(manifest_required=True), config)
-    wr = out["worker_results"][0]
-    assert wr.outcome == ResultReadyOutcome.TIMED_OUT
-    assert wr.work_unit_id == "wu1"
-    assert wr.child_session_id == "c1"
-    assert wr.manifest_required is True
-    assert wr.patch_manifest is None
+
+    with pytest.raises(asyncio.TimeoutError) as caught:
+        await worker_node(_send(manifest_required=True), config)
+
+    assert caught.value is timeout_error
+    envelope_store.persist_terminal.assert_not_awaited()
 
 
 # ── codex PR-4 R1 P0: flag-flip kill-switch on the PENDING/worker_node path ──

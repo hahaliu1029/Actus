@@ -9,9 +9,11 @@ Provides:
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Hashable
 
 from app.domain.models.event import (
     BaseEvent,
@@ -43,13 +45,25 @@ class ExecutionWatchdog:
     Use ``status`` property for read-only snapshots.
     """
 
-    total_timeout_seconds: float = 600.0
+    total_timeout_seconds: float = 0.0
     idle_timeout_seconds: float = 120.0
 
     _start_time: float = field(default_factory=time.monotonic)
     _last_progress_time: float = field(default_factory=time.monotonic)
     _last_node: str | None = None
     _idle_warnings: int = 0
+    _idle_pause_keys: set[Hashable] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.total_timeout_seconds):
+            raise ValueError("total_timeout_seconds must be finite")
+        if self.total_timeout_seconds <= 0:
+            self.total_timeout_seconds = 0.0
+        if (
+            not math.isfinite(self.idle_timeout_seconds)
+            or self.idle_timeout_seconds <= 0
+        ):
+            raise ValueError("idle_timeout_seconds must be finite and > 0")
 
     def record_progress(self, node_name: str | None = None) -> None:
         """Called when a user-visible progress signal arrives."""
@@ -57,6 +71,24 @@ class ExecutionWatchdog:
         self._idle_warnings = 0
         if node_name:
             self._last_node = node_name
+
+    def pause_idle(self, key: Hashable) -> None:
+        """Pause idle evaluation for one structured lifecycle owner.
+
+        Keys form a set rather than a boolean so overlapping coordinator runs
+        cannot resume one another accidentally. Re-registering a key is
+        idempotent.
+        """
+        self._idle_pause_keys.add(key)
+
+    def resume_idle(self, key: Hashable) -> None:
+        """Release one idle-pause owner, resetting idle on the last release."""
+        if key not in self._idle_pause_keys:
+            return
+        self._idle_pause_keys.remove(key)
+        if not self._idle_pause_keys:
+            self._last_progress_time = time.monotonic()
+            self._idle_warnings = 0
 
     def _total_exceeded(self) -> bool:
         """Check if total_timeout has been exceeded.
@@ -73,11 +105,12 @@ class ExecutionWatchdog:
         Call once per timeout cycle (typically from idle TimeoutError branch).
         This method has side effects (increments ``_idle_warnings``).
         """
-        now = time.monotonic()
-        idle = now - self._last_progress_time
-
         if self._total_exceeded():
             return WatchdogVerdict.HARD_TERMINATE
+        if self._idle_pause_keys:
+            return WatchdogVerdict.HEALTHY
+        now = time.monotonic()
+        idle = now - self._last_progress_time
         if idle >= self.idle_timeout_seconds:
             self._idle_warnings += 1
             if self._idle_warnings >= 2:
@@ -96,11 +129,12 @@ class ExecutionWatchdog:
     @property
     def status(self) -> WatchdogVerdict:
         """Read-only health snapshot. No side effects."""
-        now = time.monotonic()
-        idle = now - self._last_progress_time
-
         if self._total_exceeded():
             return WatchdogVerdict.HARD_TERMINATE
+        if self._idle_pause_keys:
+            return WatchdogVerdict.HEALTHY
+        now = time.monotonic()
+        idle = now - self._last_progress_time
         if idle >= self.idle_timeout_seconds:
             if self._idle_warnings >= 2:
                 return WatchdogVerdict.HARD_TERMINATE
@@ -114,6 +148,8 @@ class ExecutionWatchdog:
 
     @property
     def idle_seconds(self) -> float:
+        if self._idle_pause_keys:
+            return 0.0
         return time.monotonic() - self._last_progress_time
 
     @property

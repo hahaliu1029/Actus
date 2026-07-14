@@ -103,6 +103,8 @@ def _build_runner(
     runner._heartbeat_handle = None
     runner._cached_session_for_publisher = None
     runner._spawn_correlation_id = f"spawn:{session_id}"
+    runner._external_terminal_owner = False
+    runner._external_heartbeat_owner = False
     return runner
 
 
@@ -221,6 +223,84 @@ async def test_spawn_publisher_emits_spawn_ack_and_starts_heartbeat() -> None:
         assert not runner._heartbeat_handle.done()
     finally:
         await runner._cleanup_heartbeat_task()
+
+
+@pytest.mark.anyio
+async def test_external_heartbeat_owner_keeps_spawn_ack_without_inner_heartbeat() -> None:
+    pub = _CapturingPublisher()
+    registry = _FakeRegistry()
+    runner = _build_runner(
+        session_id="c1",
+        session_row=_mailbox_child_row("c1"),
+        publisher=pub,
+        registry=registry,
+    )
+    runner._external_heartbeat_owner = True
+
+    await runner._maybe_spawn_child_publisher()
+
+    assert registry.spawn_calls == ["root-1"]
+    assert [e.type for e in pub.published] == [MailboxEnvelopeType.SPAWN_ACK]
+    assert runner._heartbeat_task is None
+    assert runner._heartbeat_handle is None
+
+
+@pytest.mark.anyio
+async def test_external_terminal_owner_never_publishes_inner_terminal() -> None:
+    pub = _CapturingPublisher()
+    runner = _build_runner(
+        session_id="c1",
+        session_row=_mailbox_child_row("c1"),
+        publisher=pub,
+        registry=_FakeRegistry(),
+    )
+    runner._external_terminal_owner = True
+
+    await runner._maybe_stop_child_publisher(
+        SessionStatus.COMPLETED, terminal_reason="natural"
+    )
+
+    assert pub.published == []
+
+
+@pytest.mark.parametrize(
+    ("external_terminal_owner", "external_heartbeat_owner"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+@pytest.mark.anyio
+async def test_independent_ownership_quadrants_control_inner_wire_lifecycle(
+    external_terminal_owner: bool,
+    external_heartbeat_owner: bool,
+) -> None:
+    """SPAWN_ACK remains inner-owned in all quadrants; heartbeat and terminal
+    envelope ownership are independently controlled by their respective flag.
+    """
+    pub = _CapturingPublisher()
+    runner = _build_runner(
+        session_id="quadrant-child",
+        session_row=_mailbox_child_row("quadrant-child"),
+        publisher=pub,
+        registry=_FakeRegistry(),
+    )
+    runner._external_terminal_owner = external_terminal_owner
+    runner._external_heartbeat_owner = external_heartbeat_owner
+
+    await runner._maybe_spawn_child_publisher()
+    await asyncio.sleep(0)
+    await runner._maybe_stop_child_publisher(
+        SessionStatus.COMPLETED, terminal_reason="natural"
+    )
+
+    types = [envelope.type for envelope in pub.published]
+    assert types.count(MailboxEnvelopeType.SPAWN_ACK) == 1
+    assert (MailboxEnvelopeType.PROGRESS_UPDATE in types) is (
+        not external_heartbeat_owner
+    )
+    assert (MailboxEnvelopeType.RESULT_READY in types) is (
+        not external_terminal_owner
+    )
+    assert runner._heartbeat_task is None
+    assert runner._heartbeat_handle is None
 
 
 @pytest.mark.anyio

@@ -23,6 +23,7 @@ from app.domain.models.mailbox_envelope import (
     ResultReadyPayload,
     SpawnRequestPayload,
 )
+from app.domain.services.coordinator_limits import CoordinatorLimits
 
 
 def _now_utc() -> datetime:
@@ -30,7 +31,10 @@ def _now_utc() -> datetime:
 
 
 class CoordinatorEnvelopeFactory:
-    """Centralised envelope assembly. Pure (no I/O); stateless instance."""
+    """Centralised envelope assembly. Pure (no I/O)."""
+
+    def __init__(self, limits: CoordinatorLimits | None = None) -> None:
+        self._limits = limits or CoordinatorLimits()
 
     def make_spawn_request(
         self,
@@ -53,10 +57,12 @@ class CoordinatorEnvelopeFactory:
             spawn_manifest_ref=spawn_manifest_ref,
             spawn_manifest_sha256=spawn_manifest_sha256,
             session_mode_revision=session_mode_revision,
-            budget=budget or CoordinatorBudgetSnapshot(
-                max_tool_calls=25,
-                max_token_cost_usd=0.5,
-                max_wallclock_seconds=300,
+            budget=budget
+            if budget is not None
+            else CoordinatorBudgetSnapshot(
+                max_tool_calls=self._limits.max_tool_calls_per_child,
+                max_token_cost_usd=self._limits.max_token_cost_usd_per_child,
+                max_wallclock_seconds=self._limits.max_wallclock_seconds_per_child,
             ),
         )
         payload = SpawnRequestPayload(

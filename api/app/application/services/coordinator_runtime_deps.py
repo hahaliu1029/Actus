@@ -1,13 +1,9 @@
 """[PR-9b-A] Lifespan-scoped coordinator runtime deps container.
 
-Aggregates **22 fields** (singletons). ``PlannerReActFlow._build_config()``
-projects **21 coordinator cfg keys**: the first 16 deps + 2 per-run keys
-(``cancel_event`` + the wrapped ``parent_sandbox``) + ``coordinator_metrics_recorder``
-(the 20th field, [C2b rollout WS1b] — the reducer reads it duck-typed for the
-run-level run_cost_usd / duration_seconds metrics) + ``team_repository`` +
-``skill_repository`` ([S4 §5] — read by the team expander (``_run_parallel_backend``)
-+ planner/updater teaching load; active only when ``ACTUS_C2_AGENT_TEAMS_ENABLED``
-+ a ``team_slug`` are set). NOT projected as cfg keys:
+Aggregates **24 fields** (singletons/factories). ``PlannerReActFlow._build_config()``
+projects **23 coordinator cfg keys**, including the two per-run values
+(``cancel_event`` + the wrapped ``parent_sandbox``), metrics/team dependencies,
+and ``coordinator_wait_guard_factory``. NOT projected as cfg keys:
 
 - ``coordinator_envelope_store`` — consumed only by ``SupervisorContext`` at
   ``_factory`` time.
@@ -66,8 +62,14 @@ class _CoordinatorRuntimeDeps:
     team_repository: object = None
     # [S4 §5/R7-1] SkillRepository | None. Needed by the expander to resolve
     # member skill slugs → Skill manifests for generated-name resolution (§13).
-    # Ordered LAST.
+    # Kept before the per-invoke wait-guard factory for constructor stability.
     skill_repository: object = None
+    # Per-invoke factory consumed by GraphEventBridge with that invoke's exact
+    # ExecutionWatchdog. Tail-defaulted for existing construction sites.
+    coordinator_wait_guard_factory: object = None
+    # Shared Redis/DB liveness authority consumed by dispatch, waiter and the
+    # mailbox supervisor composition root. Tail-defaulted for old constructors.
+    coordinator_liveness_service: object = None
 
 
 @dataclass(frozen=True)
@@ -118,3 +120,7 @@ class _NullCoordinatorRuntimeDeps:
     def team_repository(self) -> None: return None
     @property
     def skill_repository(self) -> None: return None
+    @property
+    def coordinator_wait_guard_factory(self) -> None: return None
+    @property
+    def coordinator_liveness_service(self) -> None: return None

@@ -29,6 +29,10 @@ from app.domain.services.execution_watchdog import (
 
 
 class TestExecutionWatchdog:
+    def test_default_total_timeout_is_disabled(self):
+        w = ExecutionWatchdog()
+        assert w.total_timeout_seconds == 0
+
     def test_initial_state_healthy(self):
         w = ExecutionWatchdog(total_timeout_seconds=60, idle_timeout_seconds=10)
         assert w.status == WatchdogVerdict.HEALTHY
@@ -99,7 +103,22 @@ class TestExecutionWatchdog:
 
     def test_total_timeout_negative_means_unlimited(self):
         w = ExecutionWatchdog(total_timeout_seconds=-1, idle_timeout_seconds=100)
+        assert w.total_timeout_seconds == 0
         assert w.check_total_only() is False
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf")]
+    )
+    def test_direct_constructor_rejects_non_finite_total(self, value):
+        with pytest.raises(ValueError, match="total_timeout_seconds"):
+            ExecutionWatchdog(total_timeout_seconds=value, idle_timeout_seconds=10)
+
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0]
+    )
+    def test_direct_constructor_rejects_invalid_idle(self, value):
+        with pytest.raises(ValueError, match="idle_timeout_seconds"):
+            ExecutionWatchdog(total_timeout_seconds=0, idle_timeout_seconds=value)
 
     def test_check_total_only_positive(self):
         """check_total_only returns True once total timeout elapses."""
@@ -126,6 +145,105 @@ class TestExecutionWatchdog:
         time.sleep(0.02)
         # idle is way below threshold (100s), but total IS exceeded.
         # evaluate() must check total first and return HARD_TERMINATE.
+        assert w.evaluate() == WatchdogVerdict.HARD_TERMINATE
+
+    def test_idle_pause_survives_three_hours_without_recovery(self, monkeypatch):
+        from app.domain.services import execution_watchdog as watchdog_module
+
+        now = 100.0
+        monkeypatch.setattr(watchdog_module.time, "monotonic", lambda: now)
+        w = ExecutionWatchdog(
+            total_timeout_seconds=0,
+            idle_timeout_seconds=300,
+            _start_time=now,
+            _last_progress_time=now,
+        )
+
+        w.pause_idle("coordinator:step-1:run-1")
+        now += 3 * 60 * 60
+
+        assert w.evaluate() == WatchdogVerdict.HEALTHY
+        assert w.status == WatchdogVerdict.HEALTHY
+        assert w.idle_seconds == 0
+
+    def test_idle_pause_keys_are_nested_and_idempotent(self, monkeypatch):
+        from app.domain.services import execution_watchdog as watchdog_module
+
+        now = 100.0
+        monkeypatch.setattr(watchdog_module.time, "monotonic", lambda: now)
+        w = ExecutionWatchdog(
+            total_timeout_seconds=0,
+            idle_timeout_seconds=10,
+            _start_time=now,
+            _last_progress_time=now,
+        )
+
+        w.pause_idle("run-a")
+        w.pause_idle("run-a")
+        w.pause_idle("run-b")
+        now += 100
+        w.resume_idle("unknown")
+        w.resume_idle("run-a")
+        assert w.evaluate() == WatchdogVerdict.HEALTHY
+        assert w.idle_seconds == 0
+
+        w.resume_idle("run-b")
+        assert w._last_progress_time == now
+        assert w._idle_warnings == 0
+        assert w.evaluate() == WatchdogVerdict.HEALTHY
+
+    def test_last_idle_resume_resets_warning_state(self, monkeypatch):
+        from app.domain.services import execution_watchdog as watchdog_module
+
+        now = 100.0
+        monkeypatch.setattr(watchdog_module.time, "monotonic", lambda: now)
+        w = ExecutionWatchdog(
+            total_timeout_seconds=0,
+            idle_timeout_seconds=10,
+            _start_time=now,
+            _last_progress_time=now,
+        )
+        now += 11
+        assert w.evaluate() == WatchdogVerdict.SOFT_RECOVER
+        w.pause_idle("run-a")
+        now += 3600
+        w.resume_idle("run-a")
+
+        assert w._last_progress_time == now
+        assert w._idle_warnings == 0
+        assert w.status == WatchdogVerdict.HEALTHY
+
+    def test_positive_total_timeout_still_fires_while_idle_paused(self, monkeypatch):
+        from app.domain.services import execution_watchdog as watchdog_module
+
+        now = 100.0
+        monkeypatch.setattr(watchdog_module.time, "monotonic", lambda: now)
+        w = ExecutionWatchdog(
+            total_timeout_seconds=60,
+            idle_timeout_seconds=10,
+            _start_time=now,
+            _last_progress_time=now,
+        )
+        w.pause_idle("run-a")
+        now += 61
+
+        assert w.evaluate() == WatchdogVerdict.HARD_TERMINATE
+        assert w.status == WatchdogVerdict.HARD_TERMINATE
+
+    def test_unpaused_idle_behavior_is_unchanged_with_fake_clock(self, monkeypatch):
+        from app.domain.services import execution_watchdog as watchdog_module
+
+        now = 100.0
+        monkeypatch.setattr(watchdog_module.time, "monotonic", lambda: now)
+        w = ExecutionWatchdog(
+            total_timeout_seconds=0,
+            idle_timeout_seconds=10,
+            _start_time=now,
+            _last_progress_time=now,
+        )
+        now += 11
+
+        assert w.evaluate() == WatchdogVerdict.SOFT_RECOVER
         assert w.evaluate() == WatchdogVerdict.HARD_TERMINATE
 
 

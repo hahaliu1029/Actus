@@ -53,6 +53,7 @@ function buildSession(overrides?: Partial<Session>): Session {
 }
 
 const backgroundSnapshot: SupervisorSnapshot = {
+  execution_revision: 0,
   execution_mode: "background",
   execution_phase: "running",
   background_reason: "explicit",
@@ -512,6 +513,7 @@ describe("session-store", () => {
               event_id: "evt-auto-degrade",
               seq: 10,
               payload: {
+                execution_revision: 0,
                 execution_mode: "background",
                 execution_phase: "running",
                 background_reason: "auto_degrade",

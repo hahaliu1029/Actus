@@ -73,9 +73,11 @@ async def test_run_parallel_backend_threads_group_lineage_into_apply() -> None:
             pass
 
         async def apply(self, plan, *, parent_sandbox, minio_client,
-                        cancel_event=None, lineage=None) -> ApplyOutcome:
+                        cancel_event=None, lineage=None,
+                        on_rollback=None) -> ApplyOutcome:
             captured_apply_kwargs["lineage"] = lineage
             captured_apply_kwargs["cancel_event"] = cancel_event
+            captured_apply_kwargs["on_rollback"] = on_rollback
             return ApplyOutcome(
                 status=ApplyStatus.SUCCESS,
                 applied_files=(), failed_at=None, rollback_status=None,
@@ -133,6 +135,7 @@ async def test_run_parallel_backend_threads_group_lineage_into_apply() -> None:
 
     # Sanity: the pre-existing cancel_event wiring is preserved alongside lineage.
     assert captured_apply_kwargs["cancel_event"] is cancel_event
+    assert captured_apply_kwargs["on_rollback"] is None
 
     # Apply succeeded → main_graph returns the success text (behavior unchanged).
     assert "应用成功" in out
@@ -177,8 +180,10 @@ async def test_run_parallel_backend_lineage_root_falls_back_to_parent() -> None:
             pass
 
         async def apply(self, plan, *, parent_sandbox, minio_client,
-                        cancel_event=None, lineage=None) -> ApplyOutcome:
+                        cancel_event=None, lineage=None,
+                        on_rollback=None) -> ApplyOutcome:
             captured_apply_kwargs["lineage"] = lineage
+            captured_apply_kwargs["on_rollback"] = on_rollback
             return ApplyOutcome(
                 status=ApplyStatus.SUCCESS,
                 applied_files=(), failed_at=None, rollback_status=None,
@@ -221,3 +226,4 @@ async def test_run_parallel_backend_lineage_root_falls_back_to_parent() -> None:
     assert isinstance(lineage, GroupLineageFields)
     assert lineage.parent_session_id == "solo-parent"
     assert lineage.root_session_id == "solo-parent"
+    assert captured_apply_kwargs["on_rollback"] is None

@@ -75,6 +75,10 @@ async def test_build_coordinator_step_disables_terminal_publisher() -> None:
     runner_class.assert_called_once()
     kw = runner_class.call_args.kwargs
     assert kw["terminal_envelope_publisher_disabled"] is True
+    assert kw["external_terminal_owner"] is True
+    assert kw["external_heartbeat_owner"] is True
+    assert built.external_terminal_owner is True
+    assert built.external_heartbeat_owner is True
     assert kw["session_id"] == "c1"
     assert kw["mailbox_publisher"] is publisher
 
@@ -102,6 +106,8 @@ async def test_build_subagent_research_keeps_default_publisher() -> None:
     )
     kw = runner_class.call_args.kwargs
     assert kw["terminal_envelope_publisher_disabled"] is False
+    assert kw["external_terminal_owner"] is False
+    assert kw["external_heartbeat_owner"] is False
 
 
 async def test_build_resolves_tool_filter_from_preset() -> None:
@@ -184,6 +190,8 @@ async def test_built_wrapper_carries_runtime_deps() -> None:
     assert built.cancel_event is ce
     assert built.child_permission_context is cctx
     assert built.terminal_envelope_publisher_disabled is True
+    assert built.external_terminal_owner is True
+    assert built.external_heartbeat_owner is True
 
     kw = runner_class.call_args.kwargs
     assert "cancel_event" not in kw
@@ -270,6 +278,10 @@ async def test_build_forwards_per_child_deps_and_wraps_in_adapter():
     assert kw["user_id"] == "u1"
     assert kw["cost_callback_handler"] is cost_handler
     assert kw["terminal_envelope_publisher_disabled"] is True
+    assert kw["external_terminal_owner"] is True
+    assert kw["external_heartbeat_owner"] is True
+    assert built.runner._external_terminal_owner is True
+    assert built.runner._external_heartbeat_owner is True
     # returned runner is the invoke-adapter, not the raw runner
     assert isinstance(built.runner, AgentTaskRunnerInvokeAdapter)
     raw_runner.set_coordinator_cancel_event.assert_called_once_with(ce)

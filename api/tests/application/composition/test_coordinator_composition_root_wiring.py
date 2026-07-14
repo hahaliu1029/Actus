@@ -19,8 +19,17 @@ fires), not WIRING (whether the dependencies are threaded through).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from app.application.services.coordinator_terminal_transition import (
+    CoordinatorTerminalCommand,
+    ExpectedCoordinatorLineage,
+)
+from app.domain.models.session import Session, SessionStatus
 from app.interfaces import service_dependencies
 from app.interfaces.service_dependencies import build_supervisor_registry
 
@@ -151,6 +160,136 @@ def test_registry_construction_succeeds_with_new_kwargs():
     assert service_dependencies._pr4_5_agent_service_callback is not None
 
 
+def test_registry_factory_reuses_exact_shared_liveness_service():
+    sentinel = MagicMock(name="shared_liveness_service")
+    redis_client = MagicMock()
+    redis_client.client = MagicMock()
+    fake_postgres = MagicMock()
+    fake_postgres.session_factory = MagicMock()
+    captured: dict[str, object] = {}
+
+    def _capture_context(ctx, **_kwargs):  # noqa: ANN001
+        captured["liveness_service"] = ctx.liveness_service
+        return MagicMock()
+
+    with patch(
+        "app.application.services.mailbox_supervisor.MailboxSupervisor",
+        side_effect=_capture_context,
+    ), patch(
+        "app.interfaces.service_dependencies.get_postgres",
+        return_value=fake_postgres,
+    ):
+        registry = build_supervisor_registry(
+            redis_client=redis_client,
+            publisher=MagicMock(),
+            sandbox_lifecycle_service=MagicMock(),
+            coordinator_envelope_store=MagicMock(),
+            cost_rollup_service=MagicMock(),
+            coordinator_liveness_service=sentinel,
+        )
+        registry._factory("root-liveness")
+
+    assert captured["liveness_service"] is sentinel
+
+
+@pytest.mark.anyio
+async def test_registry_factory_wires_real_ssm_terminalizer_port():
+    """Production locks, validates, writes and commits through one UoW."""
+    redis_client = MagicMock()
+    redis_client.client = MagicMock()
+    fake_postgres = MagicMock()
+    reader_db_session = MagicMock(name="reader_db_session")
+
+    class _ReaderSessionContext:
+        async def __aenter__(self):
+            return reader_db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fake_postgres.session_factory = lambda: _ReaderSessionContext()
+
+    session_repo = MagicMock(name="session_repo")
+
+    class _UoW:
+        def __init__(self) -> None:
+            self.session = session_repo
+            self.commit = AsyncMock()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    ssm = MagicMock()
+    ssm.terminate = AsyncMock(return_value=True)
+    authoritative_row = Session(
+        id="child-1",
+        parent_session_id="root-terminal",
+        root_session_id="root-terminal",
+        worker_type="subagent",
+        subagent_control_plane="mailbox",
+        tool_filter_preset="coordinator_step",
+        coordinator_run_id="run-1",
+        work_unit_id="wu-1",
+    )
+    session_repo.get_by_id_for_update = AsyncMock(return_value=authoritative_row)
+    uow = _UoW()
+    captured: dict[str, object] = {}
+
+    def _capture_context(ctx, **_kwargs):  # noqa: ANN001
+        captured["terminalizer"] = getattr(ctx, "terminalize_child", None)
+        captured["session_reader"] = getattr(ctx, "session_repo", None)
+        return MagicMock()
+
+    with patch(
+        "app.application.services.mailbox_supervisor.MailboxSupervisor",
+        side_effect=_capture_context,
+    ), patch(
+        "app.interfaces.service_dependencies.get_postgres",
+        return_value=fake_postgres,
+    ), patch(
+        "app.interfaces.service_dependencies.get_uow",
+        side_effect=lambda: uow,
+    ), patch(
+        "app.application.composition.graph_assembly.build_session_state_machine",
+        return_value=ssm,
+    ):
+        registry = build_supervisor_registry(
+            redis_client=redis_client,
+            publisher=MagicMock(),
+            sandbox_lifecycle_service=MagicMock(),
+            coordinator_envelope_store=MagicMock(),
+            cost_rollup_service=MagicMock(),
+        )
+        registry._factory("root-terminal")
+        terminalizer = captured["terminalizer"]
+        assert callable(terminalizer)
+        transitioned = await terminalizer(
+            CoordinatorTerminalCommand(
+                lineage=ExpectedCoordinatorLineage(
+                    child_session_id="child-1",
+                    parent_session_id="root-terminal",
+                    root_session_id="root-terminal",
+                    coordinator_run_id="run-1",
+                ),
+                status=SessionStatus.COMPLETED,
+                reason="natural",
+            )
+        )
+
+    session_repo.get_by_id_for_update.assert_awaited_once_with("child-1")
+    assert transitioned is True
+    ssm.terminate.assert_awaited_once_with(
+        "child-1",
+        SessionStatus.COMPLETED,
+        "natural",
+        session_repo=session_repo,
+    )
+    uow.commit.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Task A8 — INV-A1: lifespan composition smoke (no real I/O / no real lifespan)
 # ---------------------------------------------------------------------------
@@ -164,6 +303,376 @@ def test_registry_construction_succeeds_with_new_kwargs():
 # 1. After the helper runs, the four key app.state slots are populated.
 # 2. The ``_CoordinatorRuntimeDeps`` aggregator is the value threaded through
 #    to the live ``AgentTaskRunner`` construction path.
+
+
+class _OrphanClaimRedis:
+    def __init__(
+        self,
+        *,
+        publish_error: BaseException | None = None,
+        publish_errors: list[BaseException | None] | None = None,
+        cleanup_error: BaseException | None = None,
+        replace_owner_on_publish_error: bool = True,
+        quota_renew_result: int = 1,
+    ) -> None:
+        self.values: dict[str, str] = {}
+        self.orphan_keys: list[str] = []
+        self.deleted: list[str] = []
+        self.eval_calls: list[tuple[object, ...]] = []
+        self.publish_error = publish_error
+        self.publish_errors = list(publish_errors or [])
+        self.cleanup_error = cleanup_error
+        self.replace_owner_on_publish_error = replace_owner_on_publish_error
+        self.quota_renew_result = quota_renew_result
+        self.xadd_calls = 0
+
+    async def set(
+        self,
+        key: str,
+        value: str,
+        *,
+        nx: bool,
+        ex: int,
+    ) -> bool:
+        assert nx is True
+        assert ex > 0
+        if key in self.values:
+            return False
+        self.values[key] = str(value)
+        if key.startswith("coordinator:orphan-reconcile:"):
+            self.orphan_keys.append(key)
+        return True
+
+    async def xadd(self, *_args, **_kwargs) -> str:
+        self.xadd_calls += 1
+        error = (
+            self.publish_errors.pop(0)
+            if self.publish_errors
+            else self.publish_error
+        )
+        if error is not None:
+            if self.replace_owner_on_publish_error:
+                self.values[self.orphan_keys[-1]] = "replacement-owner"
+            raise error
+        return "1-0"
+
+    async def delete(self, key: str) -> int:
+        self.deleted.append(key)
+        return int(self.values.pop(key, None) is not None)
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        self.eval_calls.append((script, numkeys, *args))
+        if "ZSCORE" in script and "ZADD" in script:
+            assert numkeys == 1
+            return self.quota_renew_result
+        assert "coordinator-orphan-owner-compare-delete-v1" in script
+        assert numkeys == 1
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
+        key = str(args[0])
+        owner_token = str(args[1])
+        if self.values.get(key) != owner_token:
+            return 0
+        self.values.pop(key, None)
+        return 1
+
+
+def _build_runtime_deps_with_raw_redis(
+    raw_redis: object,
+    *,
+    app_state: SimpleNamespace | None = None,
+):
+    from app.interfaces.service_dependencies import (
+        build_coordinator_runtime_deps,
+    )
+
+    fake_redis = MagicMock()
+    fake_redis.client = raw_redis
+    fake_postgres = MagicMock()
+    fake_postgres.session_factory = MagicMock()
+
+    with patch(
+        "app.interfaces.service_dependencies.get_postgres",
+        return_value=fake_postgres,
+    ), patch(
+        "app.infrastructure.storage.postgres.get_postgres",
+        return_value=fake_postgres,
+    ), patch(
+        "app.interfaces.service_dependencies.get_minio",
+        return_value=MagicMock(),
+    ):
+        return build_coordinator_runtime_deps(
+            app_state=app_state or SimpleNamespace(),
+            redis_client=fake_redis,
+        )
+
+
+@pytest.mark.anyio
+async def test_parent_lease_renews_auto_degrade_through_shared_supervisor() -> None:
+    shared_supervisor = MagicMock()
+    shared_supervisor.renew_auto_degrade_expiry_if_running = AsyncMock(
+        return_value=True
+    )
+    app_state = SimpleNamespace(supervisor=shared_supervisor)
+    coord_deps = _build_runtime_deps_with_raw_redis(
+        _OrphanClaimRedis(),
+        app_state=app_state,
+    )
+    guard = coord_deps.coordinator_wait_guard_factory(watchdog=MagicMock())
+    handle = guard._parent_lease_factory(
+        root_session_id="root",
+        parent_session_id="parent",
+        coordinator_run_id="run",
+        step_id="step",
+        child_session_ids=("child-1",),
+        owner_alive=lambda: True,
+    )
+
+    await handle._renew_once()
+
+    shared_supervisor.renew_auto_degrade_expiry_if_running.assert_awaited_once_with(
+        session_id="parent",
+    )
+
+
+@pytest.mark.anyio
+async def test_parent_lease_renews_existing_quota_member_without_reacquire() -> None:
+    raw_redis = _OrphanClaimRedis()
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    guard = coord_deps.coordinator_wait_guard_factory(watchdog=MagicMock())
+    handle = guard._parent_lease_factory(
+        root_session_id="root",
+        parent_session_id="parent",
+        user_id="user",
+        coordinator_run_id="run",
+        step_id="step",
+        child_session_ids=("child-1",),
+        owner_alive=lambda: True,
+    )
+
+    await handle._renew_once()
+
+    quota_calls = [
+        call for call in raw_redis.eval_calls
+        if "ZSCORE" in str(call[0]) and "ZADD" in str(call[0])
+    ]
+    assert len(quota_calls) == 1
+    assert quota_calls[0][2:4] == (
+        "actus:coord:concurrent:user", "run",
+    )
+    assert "ZREMRANGEBYSCORE" not in str(quota_calls[0][0])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("renew_result", [1, 0])
+async def test_authorized_child_heartbeat_renews_same_run_without_reacquire(
+    renew_result: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.application.services.coordinator_liveness_lease_service import (
+        CoordinatorChildLease,
+    )
+
+    raw_redis = _OrphanClaimRedis(quota_renew_result=renew_result)
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    liveness = coord_deps.coordinator_liveness_service
+    lease = CoordinatorChildLease(
+        root_session_id="root",
+        parent_session_id="parent",
+        child_session_id="child-1",
+        coordinator_run_id="run",
+        work_unit_id="wu-1",
+        last_seen_epoch=1.0,
+        phase="in_tool",
+    )
+    authoritative_row = SimpleNamespace(
+        id="child-1",
+        user_id="user",
+        coordinator_run_id="run",
+        status=SessionStatus.RUNNING,
+    )
+
+    with patch.object(
+        type(liveness._sessions),
+        "get_by_id",
+        new=AsyncMock(return_value=authoritative_row),
+    ):
+        await liveness._callbacks[-1](lease)
+
+    quota_calls = [
+        call for call in raw_redis.eval_calls
+        if "ZSCORE" in str(call[0]) and "ZADD" in str(call[0])
+    ]
+    assert len(quota_calls) == 1
+    assert quota_calls[0][2:4] == (
+        "actus:coord:concurrent:user", "run",
+    )
+    assert "ZREMRANGEBYSCORE" not in str(quota_calls[0][0])
+    if renew_result == 0:
+        assert "heartbeat quota lease lost" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_child_heartbeat_does_not_renew_after_row_turns_terminal() -> None:
+    from app.application.services.coordinator_liveness_lease_service import (
+        CoordinatorChildLease,
+    )
+
+    raw_redis = _OrphanClaimRedis()
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    liveness = coord_deps.coordinator_liveness_service
+    lease = CoordinatorChildLease(
+        root_session_id="root",
+        parent_session_id="parent",
+        child_session_id="child-1",
+        coordinator_run_id="run",
+        work_unit_id="wu-1",
+        last_seen_epoch=1.0,
+        phase="in_tool",
+    )
+    terminal_row = SimpleNamespace(
+        id="child-1",
+        user_id="user",
+        coordinator_run_id="run",
+        status=SessionStatus.COMPLETED,
+    )
+
+    with patch.object(
+        type(liveness._sessions),
+        "get_by_id",
+        new=AsyncMock(return_value=terminal_row),
+    ):
+        await liveness._callbacks[-1](lease)
+
+    assert not [
+        call for call in raw_redis.eval_calls
+        if "ZSCORE" in str(call[0]) and "ZADD" in str(call[0])
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "first_error",
+    [RuntimeError("first child failed"), asyncio.CancelledError()],
+)
+async def test_parent_lease_orphan_adapter_retries_failed_child_and_keeps_siblings(
+    first_error: BaseException,
+) -> None:
+    from app.application.services.coordinator_parent_execution_lease import (
+        CoordinatorParentExecutionLease,
+    )
+
+    raw_redis = _OrphanClaimRedis(
+        publish_errors=[first_error, None, None],
+        replace_owner_on_publish_error=False,
+    )
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    watchdog = MagicMock()
+    guard = coord_deps.coordinator_wait_guard_factory(watchdog=watchdog)
+    handle = guard._parent_lease_factory(
+        root_session_id="root",
+        parent_session_id="parent",
+        coordinator_run_id="run",
+        step_id="step",
+        child_session_ids=("child-1", "child-2"),
+        owner_alive=lambda: True,
+    )
+
+    assert isinstance(handle, CoordinatorParentExecutionLease)
+    assert handle._liveness is coord_deps.coordinator_liveness_service
+    assert guard.watchdog is watchdog
+    assert handle._on_all_children_stale is not None
+
+    await handle._notify_all_children_stale_once()
+
+    # First child failed and released its owner claim; the second sibling was
+    # still reconciled successfully. A failed aggregate must remain retryable.
+    assert handle._all_stale_notified is False
+    assert raw_redis.xadd_calls == 2
+    assert len([
+        key for key in raw_redis.values
+        if key.startswith("coordinator:orphan-reconcile:")
+    ]) == 1
+
+    await handle._notify_all_children_stale_once()
+
+    # Retry publishes only the previously failed child. The successful child
+    # is suppressed by the real NX claim path, then the run becomes notified.
+    assert handle._all_stale_notified is True
+    assert raw_redis.xadd_calls == 3
+    assert len([
+        key for key in raw_redis.values
+        if key.startswith("coordinator:orphan-reconcile:")
+    ]) == 2
+
+
+@pytest.mark.anyio
+async def test_orphan_reconcile_uses_unique_opaque_owner_tokens() -> None:
+    raw_redis = _OrphanClaimRedis()
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    reconciler = coord_deps.terminal_waiter._orphan_reconciler
+
+    await reconciler(
+        child_session_id="child-1",
+        root_session_id="root-1",
+        coordinator_run_id="run-1",
+    )
+    await reconciler(
+        child_session_id="child-2",
+        root_session_id="root-1",
+        coordinator_run_id="run-1",
+    )
+
+    tokens = [raw_redis.values[key] for key in raw_redis.orphan_keys]
+    assert len(tokens) == 2
+    assert len(set(tokens)) == 2
+    assert all(token != "1" and len(token) >= 16 for token in tokens)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "publish_error",
+    [RuntimeError("publish failed"), asyncio.CancelledError()],
+)
+async def test_orphan_reconcile_old_owner_cannot_delete_replacement_claim(
+    publish_error: BaseException,
+) -> None:
+    raw_redis = _OrphanClaimRedis(publish_error=publish_error)
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    reconciler = coord_deps.terminal_waiter._orphan_reconciler
+
+    with pytest.raises(type(publish_error)) as caught:
+        await reconciler(
+            child_session_id="child-1",
+            root_session_id="root-1",
+            coordinator_run_id="run-1",
+        )
+
+    assert caught.value is publish_error
+    orphan_key = raw_redis.orphan_keys[0]
+    assert raw_redis.values[orphan_key] == "replacement-owner"
+    assert orphan_key not in raw_redis.deleted
+    assert len(raw_redis.eval_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_orphan_cleanup_error_does_not_mask_publish_error() -> None:
+    publish_error = RuntimeError("publish failed")
+    raw_redis = _OrphanClaimRedis(
+        publish_error=publish_error,
+        cleanup_error=RuntimeError("redis cleanup failed"),
+    )
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+
+    with pytest.raises(RuntimeError) as caught:
+        await coord_deps.terminal_waiter._orphan_reconciler(
+            child_session_id="child-1",
+            root_session_id="root-1",
+            coordinator_run_id="run-1",
+        )
+
+    assert caught.value is publish_error
+    assert len(raw_redis.eval_calls) == 1
 
 
 def test_lifespan_constructs_coordinator_singletons_exactly_once():
@@ -221,6 +730,15 @@ def test_lifespan_constructs_coordinator_singletons_exactly_once():
     )
     assert getattr(fake_state, "coord_deps", None) is not None, (
         "app.state.coord_deps not populated by composition root"
+    )
+    assert getattr(fake_state, "coordinator_liveness_service", None) is not None
+    assert (
+        coord_deps.coordinator_liveness_service
+        is fake_state.coordinator_liveness_service
+    )
+    assert (
+        coord_deps.terminal_waiter._liveness
+        is coord_deps.coordinator_liveness_service
     )
     # The returned coord_deps must be the value object aggregator.
     assert isinstance(coord_deps, _CoordinatorRuntimeDeps)

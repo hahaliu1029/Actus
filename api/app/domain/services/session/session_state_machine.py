@@ -9,11 +9,12 @@ tests/invariants/test_inv4_ssm_single_writer.py).
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Mapping, Optional
 
 from app.domain.models.session import SessionStatus
 from app.domain.repositories.session_repository import SessionRepository
-from app.domain.models.event import SessionModeChangedEvent
+from app.domain.models.event import PendingExecutionEvent, SessionModeChangedEvent
 from app.domain.services.session.mode_event import (
     ModeChangedEventSink,
     build_session_mode_changed_event,
@@ -112,6 +113,27 @@ class SessionStateMachine(ABC):
         row is already terminal OR its execution_phase is terminating/terminated;
         else ``True``. Does NOT open or commit a transaction (caller-owned).
         """
+
+    async def terminate_expired_background(
+        self,
+        session_id: str,
+        to: SessionStatus,
+        terminal_reason: str,
+        *,
+        expires_at_lte: datetime,
+        session_repo: SessionRepository,
+        expected_execution_revision: int | None = None,
+        pending_event: PendingExecutionEvent | None = None,
+    ) -> int | None:
+        """Caller-owned authoritative expiry CAS for watchdog termination."""
+        return await session_repo.update_to_terminal_if_background_expired(
+            session_id,
+            to,
+            terminal_reason,
+            expires_at_lte=expires_at_lte,
+            expected_execution_revision=expected_execution_revision,
+            pending_event=pending_event,
+        )
 
     async def emit_session_mode_changed(
         self,

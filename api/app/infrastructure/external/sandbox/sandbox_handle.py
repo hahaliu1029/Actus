@@ -44,6 +44,7 @@ SANDBOX_FORWARDED_METHODS: frozenset[str] = frozenset(
         "upload_file",
         "download_file",
         "ensure_sandbox",
+        "renew_timeout_lease",
         "get_browser",
         "snapshot_workspace",
         # [S2 PR-4 §3.2] shell quiesce before the POST snapshot scan.

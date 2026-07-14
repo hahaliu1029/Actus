@@ -1,6 +1,7 @@
 """Unit tests for _rehydrate_dispatch (PR-7 Task 7.5)."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,6 +12,11 @@ from app.application.services.coordinator_rehydrate_service import (
     RehydrateResult,
     TerminalEnvelopeRecord,
 )
+from app.application.services.coordinator_parent_execution_lease import (
+    CoordinatorParentExecutionLease,
+    CoordinatorParentPhase,
+)
+from app.application.services.coordinator_wait_guard import CoordinatorWaitGuard
 from app.domain.models.mailbox_envelope import ResultReadyOutcome
 from app.domain.models.work_unit import WorkUnit
 from app.domain.services.graphs.parallel_execution_subgraph import (
@@ -310,6 +316,9 @@ class TestBuildPreResults:
 class TestRehydrateDispatchBranches:
     async def test_already_applied_short_circuits_to_end(self) -> None:
         from langgraph.graph import END
+        probe_quota = AsyncMock()
+        config = _make_config()
+        config["configurable"]["probe_quota"] = probe_quota
         existing = RehydrateResult(
             child_session_ids={"wu1": "c1"},
             pending=[],
@@ -318,7 +327,7 @@ class TestRehydrateDispatchBranches:
         )
         cmd = await _rehydrate_dispatch(
             _make_state(),
-            _make_config(),
+            config,
             existing,
             "r1",
             [_make_wu("wu1")],
@@ -326,6 +335,150 @@ class TestRehydrateDispatchBranches:
         assert cmd.goto == END
         assert cmd.update["step_result_candidate"] == "ALREADY_APPLIED:success:42"
         assert cmd.update["group_outcome"] is None
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1",
+            coordinator_run_id="r1",
+        )
+        probe_quota.acquire_coordinator_concurrency.assert_not_awaited()
+
+    async def test_already_applied_release_failure_preserves_terminal_outcome(
+        self,
+    ) -> None:
+        from langgraph.graph import END
+
+        probe_quota = AsyncMock()
+        probe_quota.release_coordinator_quotas = AsyncMock(
+            side_effect=RuntimeError("redis unavailable")
+        )
+        config = _make_config()
+        config["configurable"]["probe_quota"] = probe_quota
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={},
+            already_applied=AlreadyAppliedInfo(status="success", audit_id=42),
+        )
+
+        cmd = await _rehydrate_dispatch(
+            _make_state(), config, existing, "r1", [_make_wu("wu1")]
+        )
+
+        assert cmd.goto == END
+        assert cmd.update["step_result_candidate"] == "ALREADY_APPLIED:success:42"
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1",
+            coordinator_run_id="r1",
+        )
+
+    async def test_already_applied_stops_guard_before_guard_owned_release(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        wait_guard = AsyncMock()
+        wait_guard.resume_run = AsyncMock(return_value=True)
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": wait_guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={},
+            already_applied=AlreadyAppliedInfo(status="success", audit_id=42),
+        )
+
+        await _rehydrate_dispatch(
+            _make_state(), config, existing, "r1", [_make_wu("wu1")]
+        )
+
+        wait_guard.resume_run.assert_awaited_once_with("s1", "r1")
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+
+    async def test_in_progress_recent_does_not_direct_release(self) -> None:
+        probe_quota = AsyncMock()
+        config = _make_config()
+        config["configurable"]["probe_quota"] = probe_quota
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={},
+            already_applied=AlreadyAppliedInfo(
+                status="in_progress_recent", audit_id=42,
+            ),
+        )
+
+        cmd = await _rehydrate_dispatch(
+            _make_state(), config, existing, "r1", [_make_wu("wu1")]
+        )
+
+        assert cmd.update["step_result_candidate"] == (
+            "ALREADY_APPLIED:in_progress_recent:42"
+        )
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+        probe_quota.acquire_coordinator_concurrency.assert_not_awaited()
+
+    async def test_in_progress_recent_does_not_touch_real_guard(self) -> None:
+        probe_quota = AsyncMock()
+
+        async def release_quota() -> None:
+            await probe_quota.release_coordinator_quotas(
+                user_id="u1", coordinator_run_id="r1",
+            )
+
+        guard = CoordinatorWaitGuard()
+        await guard.enter_run("s1", "r1", release_quota=release_quota)
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={},
+            already_applied=AlreadyAppliedInfo(
+                status="in_progress_recent", audit_id=42,
+            ),
+        )
+
+        await _rehydrate_dispatch(
+            _make_state(), config, existing, "r1", [_make_wu("wu1")]
+        )
+
+        assert "r1" in guard._runs_by_step["s1"]
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+
+        assert await guard.resume_run("s1", "r1") is True
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="r1",
+        )
+
+    async def test_unknown_already_applied_status_fails_closed_without_release(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        wait_guard = AsyncMock()
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": wait_guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={},
+            already_applied=AlreadyAppliedInfo(
+                status="future_status", audit_id=42,
+            ),
+        )
+
+        await _rehydrate_dispatch(
+            _make_state(), config, existing, "r1", [_make_wu("wu1")]
+        )
+
+        wait_guard.resume_run.assert_not_awaited()
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
 
     async def test_terminal_only_routes_to_reducer(self) -> None:
         existing = RehydrateResult(
@@ -351,6 +504,62 @@ class TestRehydrateDispatchBranches:
         assert cmd.goto == "reducer_node"
         assert len(cmd.update["worker_results"]) == 1
 
+    async def test_terminal_only_rehydrate_starts_real_reducing_parent_lease(
+        self,
+    ) -> None:
+        touched = AsyncMock()
+        handles: list[CoordinatorParentExecutionLease] = []
+
+        class LivenessMustNotBeRead:
+            async def get_lease(self, _child_id):
+                raise AssertionError("REDUCING must not depend on child liveness")
+
+            def is_stale(self, _lease):
+                raise AssertionError("REDUCING must not inspect child liveness")
+
+        def factory(**kwargs):
+            handle = CoordinatorParentExecutionLease(
+                liveness_service=LivenessMustNotBeRead(),
+                interval_seconds=60,
+                touch_parent_activity=touched,
+                **kwargs,
+            )
+            handles.append(handle)
+            return handle
+
+        guard = CoordinatorWaitGuard(parent_lease_factory=factory)
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={
+                "wu1": TerminalEnvelopeRecord(
+                    envelope_type="RESULT_READY",
+                    payload={"outcome": "success"},
+                    child_session_id="c1",
+                    received_at=datetime.now(timezone.utc),
+                ),
+            },
+        )
+        config = _make_config()
+        config["configurable"]["coordinator_wait_guard"] = guard
+
+        async with guard.step_scope("s1"):
+            cmd = await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1", [_make_wu("wu1")],
+            )
+            for _ in range(20):
+                if touched.await_count:
+                    break
+                await asyncio.sleep(0)
+            assert cmd.goto == "reducer_node"
+            assert len(handles) == 1
+            assert handles[0].phase is CoordinatorParentPhase.REDUCING
+            context = touched.await_args.args[0]
+            assert context.child_session_ids == ("c1",)
+            assert context.phase is CoordinatorParentPhase.REDUCING
+
+        assert handles[0].done
+
     async def test_pending_only_sends_to_workers(self) -> None:
         from langgraph.types import Send
         existing = RehydrateResult(
@@ -372,6 +581,36 @@ class TestRehydrateDispatchBranches:
         assert len(cmd.goto) == 2
         assert all(isinstance(s, Send) for s in cmd.goto)
         assert subscriber.subscribe.await_count == 2
+
+    async def test_startup_lease_failure_retains_quota_for_pending_child(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        liveness = AsyncMock()
+        liveness.record_startup_lease = AsyncMock(
+            side_effect=RuntimeError("lease registration failed")
+        )
+        guard = CoordinatorWaitGuard()
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_liveness_service": liveness,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=["wu1"],
+            terminal={},
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="lease registration failed"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1", [_make_wu("wu1")],
+            )
+
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+        assert guard._runs_by_step == {}
 
     async def test_mixed_terminal_and_pending(self) -> None:
         existing = RehydrateResult(
@@ -506,6 +745,204 @@ class TestRehydrateDispatchBranches:
                 "r1",
                 [_make_wu("wu1"), _make_wu("wu2")],
             )
+
+    async def test_missing_child_releases_before_guard_transfer(self) -> None:
+        probe_quota = AsyncMock()
+        guard = CoordinatorWaitGuard()
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={
+                "wu1": TerminalEnvelopeRecord(
+                    envelope_type="RESULT_READY",
+                    payload={"outcome": "success"},
+                    child_session_id="c1",
+                    received_at=datetime.now(timezone.utc),
+                ),
+            },
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="cannot resume run"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1",
+                [_make_wu("wu1"), _make_wu("wu2")],
+            )
+
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="r1",
+        )
+        assert guard._runs_by_step == {}
+
+    async def test_pending_missing_child_retains_shared_run_quota(self) -> None:
+        probe_quota = AsyncMock()
+        guard = CoordinatorWaitGuard()
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=["wu1"],
+            terminal={},
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="cannot resume run"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1",
+                [_make_wu("wu1"), _make_wu("wu2")],
+            )
+
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+
+    async def test_existing_guard_without_quota_callback_is_not_handoff(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        guard = CoordinatorWaitGuard()
+        await guard.enter_run("s1", "r1")
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=["wu1"],
+            terminal={},
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="quota ownership transfer failed"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1", [_make_wu("wu1")],
+            )
+
+        # A pending child may still be renewing this shared run-id quota from
+        # another backend, so local setup failure must not remove the member.
+        probe_quota.release_coordinator_quotas.assert_not_awaited()
+        assert guard._runs_by_step == {}
+
+    async def test_terminal_existing_guard_without_callback_releases_exactly(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        guard = CoordinatorWaitGuard()
+        await guard.enter_run("s1", "r1")
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={
+                "wu1": TerminalEnvelopeRecord(
+                    envelope_type="RESULT_READY",
+                    payload={"outcome": "success"},
+                    child_session_id="c1",
+                    received_at=datetime.now(timezone.utc),
+                ),
+            },
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="quota ownership transfer failed"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1", [_make_wu("wu1")],
+            )
+
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="r1",
+        )
+        assert guard._runs_by_step == {}
+
+    async def test_terminal_fatal_uses_existing_guard_release_only_once(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+
+        async def release_quota() -> None:
+            await probe_quota.release_coordinator_quotas(
+                user_id="u1", coordinator_run_id="r1",
+            )
+
+        guard = CoordinatorWaitGuard()
+        await guard.enter_run("s1", "r1", release_quota=release_quota)
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={
+                "wu1": TerminalEnvelopeRecord(
+                    envelope_type="RESULT_READY",
+                    payload={"outcome": "success"},
+                    child_session_id="c1",
+                    received_at=datetime.now(timezone.utc),
+                ),
+            },
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="cannot resume run"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1",
+                [_make_wu("wu1"), _make_wu("wu2")],
+            )
+
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="r1",
+        )
+        assert guard._runs_by_step == {}
+
+    async def test_terminal_only_release_failure_preserves_preflight_error(
+        self,
+    ) -> None:
+        probe_quota = AsyncMock()
+        probe_quota.release_coordinator_quotas = AsyncMock(
+            side_effect=RuntimeError("redis unavailable")
+        )
+        guard = CoordinatorWaitGuard()
+        config = _make_config()
+        config["configurable"].update({
+            "probe_quota": probe_quota,
+            "coordinator_wait_guard": guard,
+        })
+        existing = RehydrateResult(
+            child_session_ids={"wu1": "c1"},
+            pending=[],
+            terminal={
+                "wu1": TerminalEnvelopeRecord(
+                    envelope_type="RESULT_READY",
+                    payload={"outcome": "success"},
+                    child_session_id="c1",
+                    received_at=datetime.now(timezone.utc),
+                ),
+            },
+            already_applied=None,
+        )
+
+        with pytest.raises(RuntimeError, match="cannot resume run"):
+            await _rehydrate_dispatch(
+                _make_state(), config, existing, "r1",
+                [_make_wu("wu1"), _make_wu("wu2")],
+            )
+
+        probe_quota.release_coordinator_quotas.assert_awaited_once_with(
+            user_id="u1", coordinator_run_id="r1",
+        )
 
     async def test_limbo_child_raises_runtime_error(self) -> None:
         """[codex R4 P1] A wu_id with a child row that is NEITHER in

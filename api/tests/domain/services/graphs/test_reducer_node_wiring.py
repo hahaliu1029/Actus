@@ -81,6 +81,47 @@ async def test_reducer_node_threads_reducer_into_command() -> None:
     assert cmd.update["step_result_candidate"] == "ok"
 
 
+async def test_reducer_phase_is_set_before_reducer_side_effect() -> None:
+    from app.application.services.coordinator_parent_execution_lease import (
+        CoordinatorParentPhase,
+    )
+
+    events: list[str] = []
+    reducer = AsyncMock()
+
+    async def reduce(**_kwargs):
+        events.append("reduce")
+        return ReducerOutput(
+            apply_plan=None,
+            group_outcome=GroupOutcome.SUCCESS,
+            step_result_candidate="ok",
+            diagnostics=ReducerDiagnostics(),
+        )
+
+    reducer.reduce = AsyncMock(side_effect=reduce)
+    guard = MagicMock()
+    guard.set_phase.side_effect = lambda *_args: events.append("phase")
+    state = {
+        "step_id": "step-1",
+        "coordinator_run_id": "run-1",
+        "work_units": [_wu("wu1")],
+        "worker_results": [],
+    }
+
+    await reducer_node(
+        state,
+        {"configurable": {
+            "patch_reducer_service": reducer,
+            "coordinator_wait_guard": guard,
+        }},
+    )
+
+    assert events[:2] == ["phase", "reduce"]
+    guard.set_phase.assert_called_once_with(
+        "step-1", "run-1", CoordinatorParentPhase.REDUCING,
+    )
+
+
 async def test_reducer_node_passes_parent_sandbox_when_present() -> None:
     """Optional parent_sandbox in config flows through to reduce()."""
     reducer = AsyncMock()

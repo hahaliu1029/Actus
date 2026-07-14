@@ -13,7 +13,15 @@ import asyncio
 import logging
 from typing import Any, AsyncGenerator
 
-from app.domain.models.event import BaseEvent, HealthEvent, HealthStatus
+from app.domain.models.event import (
+    BaseEvent,
+    ControlAction,
+    ControlEvent,
+    HealthEvent,
+    HealthStatus,
+    ToolConfirmationEvent,
+    WaitEvent,
+)
 from app.domain.services.execution_watchdog import (
     ExecutionControl,
     ExecutionWatchdog,
@@ -22,6 +30,16 @@ from app.domain.services.execution_watchdog import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_hitl_control_event(event: BaseEvent) -> bool:
+    """Whether consumers stop immediately so graph interrupt state must drain."""
+    if isinstance(event, (WaitEvent, ToolConfirmationEvent)):
+        return True
+    return (
+        isinstance(event, ControlEvent)
+        and event.action == ControlAction.REQUESTED
+    )
 
 
 class GraphEventBridge:
@@ -84,6 +102,19 @@ class GraphEventBridge:
         configurable = merged_config.get("configurable", {})
         watchdog: ExecutionWatchdog | None = configurable.get("execution_watchdog")
         control: ExecutionControl | None = configurable.get("execution_control")
+        wait_guard_factory = configurable.get("coordinator_wait_guard_factory")
+        if (
+            watchdog is not None
+            and configurable.get("coordinator_wait_guard") is None
+            and callable(wait_guard_factory)
+        ):
+            # The composition root supplies an opaque application-layer
+            # factory. Keeping construction here makes the guard share this
+            # invoke's exact watchdog without importing application code into
+            # the domain graph layer.
+            configurable["coordinator_wait_guard"] = wait_guard_factory(
+                watchdog=watchdog
+            )
 
         async def _drive_graph() -> None:
             """Run the graph and forward state-path events to the queue."""
@@ -130,6 +161,7 @@ class GraphEventBridge:
         #   neither → GeneratorExit from caller cleanup (e.g. WaitEvent)
         _sentinel_exit = False
         _watchdog_terminated = False
+        _last_yield_requires_hitl_drain = False
 
         def _emit_terminating() -> HealthEvent:
             """Build the HealthEvent(TERMINATING) payload."""
@@ -172,6 +204,7 @@ class GraphEventBridge:
                                 watchdog.last_node,
                                 configurable.get("session_id", "?"),
                             )
+                            _last_yield_requires_hitl_drain = False
                             yield HealthEvent(
                                 status=HealthStatus.DEGRADED,
                                 reason="Agent 似乎遇到了困难，正在尝试恢复...",
@@ -201,6 +234,7 @@ class GraphEventBridge:
                                 control.should_terminate = True
                             task.cancel()
                             _watchdog_terminated = True
+                            _last_yield_requires_hitl_drain = False
                             yield _emit_terminating()
                             break
                         else:
@@ -234,22 +268,48 @@ class GraphEventBridge:
                     _watchdog_terminated = True
                     # Yield the triggering event first so the frontend sees
                     # it before the termination notice.
+                    _last_yield_requires_hitl_drain = _is_hitl_control_event(event)
                     yield event
+                    _last_yield_requires_hitl_drain = False
                     yield _emit_terminating()
                     break
 
+                _last_yield_requires_hitl_drain = _is_hitl_control_event(event)
                 yield event
+                _last_yield_requires_hitl_drain = False
         finally:
             if _sentinel_exit and not _watchdog_terminated:
                 # Normal finish: task should complete cleanly.
                 await task
-            else:
+            elif _last_yield_requires_hitl_drain and not _watchdog_terminated:
+                # The live consumer returns immediately on WaitEvent,
+                # ToolConfirmationEvent, or takeover REQUESTED. In all three
+                # paths the real LangGraph then naturally completes its
+                # interrupt node and persists should_interrupt/checkpoint
+                # state. Drain that bounded graph transition instead of
+                # cancelling it. No task-wide timeout belongs here.
                 try:
                     await task
-                except (Exception, asyncio.CancelledError):
+                except Exception:
+                    logger.warning(
+                        "GraphEventBridge: suppressed _drive_graph error during "
+                        "HITL state drain (error already logged above)"
+                    )
+            else:
+                # Ordinary early consumer shutdown must not wait indefinitely
+                # for a graph still blocked in a node. HARD_TERMINATE already
+                # cancels the task; task.cancel() is idempotent in that path.
+                if not task.done():
+                    task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    # Expected for explicit bridge cleanup / HARD_TERMINATE.
+                    pass
+                except Exception:
                     # Suppress _drive_graph exceptions during cleanup.
                     # Three scenarios:
-                    # 1. WaitEvent cleanup (GeneratorExit from caller): interrupt() errors suppressed.
+                    # 1. Ordinary GeneratorExit from caller cleanup.
                     # 2. HARD_TERMINATE: we cancelled the task, CancelledError expected.
                     # 3. Other non-normal exits: already logged by _drive_graph's except.
                     # Without this suppression, errors propagate to agent_task_runner's

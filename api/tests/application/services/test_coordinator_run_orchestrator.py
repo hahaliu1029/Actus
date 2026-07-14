@@ -343,6 +343,80 @@ class TestSiblingCancelFanOut:
 class TestObserverExitConditions:
     """Observer terminates cleanly under various conditions."""
 
+    @pytest.mark.parametrize(
+        ("observer_group_precreated", "expected_destroy_count"),
+        [(False, 0), (True, 1)],
+    )
+    async def test_empty_pending_returns_without_waiting_or_subscribing(
+        self,
+        observer_group_precreated: bool,
+        expected_destroy_count: int,
+    ) -> None:
+        publisher = AsyncMock()
+        subscriber = _FakeSubscriber([], exhaust_then_return=False)
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+
+        await asyncio.wait_for(
+            orch.run(
+                coordinator_run_id="r1",
+                root_session_id="root1",
+                work_units_pending=[],
+                child_session_ids={},
+                cancel_event=asyncio.Event(),
+                observer_group_precreated=observer_group_precreated,
+            ),
+            timeout=0.1,
+        )
+
+        assert subscriber.subscribe_calls == []
+        assert len(subscriber.destroy_group_calls) == expected_destroy_count
+        publisher.publish.assert_not_awaited()
+
+    async def test_default_none_waits_without_fixed_deadline(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The public default reaches asyncio.wait as None and emits no cancel."""
+        publisher = AsyncMock()
+        env = _result_ready_env(
+            ResultReadyOutcome.SUCCESS, child_session_id="c1",
+        )
+        subscriber = _FakeSubscriber([env], delay_between=0.02)
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+        observed_timeouts: list[float | None] = []
+        real_wait = asyncio.wait
+
+        async def recording_wait(tasks, *, timeout, return_when):
+            observed_timeouts.append(timeout)
+            return await real_wait(
+                tasks, timeout=timeout, return_when=return_when,
+            )
+
+        monkeypatch.setattr(
+            "app.application.services.coordinator_run_orchestrator.asyncio.wait",
+            recording_wait,
+        )
+
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1"],
+            child_session_ids={"wu1": "c1"},
+            cancel_event=asyncio.Event(),
+        )
+
+        assert observed_timeouts == [None]
+        publisher.publish.assert_not_awaited()
+
     async def test_all_pending_resolved_returns_naturally(self) -> None:
         publisher = AsyncMock()
         env1 = _result_ready_env(ResultReadyOutcome.SUCCESS, child_session_id="c1")
@@ -445,7 +519,112 @@ class TestRunLevelBudgetCaps:
         }
         assert reasons == {"run_total_wallclock_budget_exceeded"}
 
-    async def test_timeout_with_no_terminal_no_cancel(self) -> None:
+    @pytest.mark.parametrize(
+        "limits",
+        [
+            pytest.param(CoordinatorLimits(), id="default-zero"),
+            pytest.param(
+                CoordinatorLimits(max_total_wallclock_seconds_per_run=0),
+                id="explicit-zero",
+            ),
+        ],
+    )
+    async def test_zero_total_wallclock_is_unlimited_and_preserves_parent_cancel(
+        self, limits: CoordinatorLimits
+    ) -> None:
+        publisher = AsyncMock()
+        subscriber = _FakeSubscriber([], exhaust_then_return=False)
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1",
+            coordinator_run_id="r1",
+            coordinator_limits=limits,
+        )
+        cancel_event = asyncio.Event()
+
+        async def fire_parent_cancel() -> None:
+            await asyncio.sleep(0.02)
+            cancel_event.set()
+
+        fire_task = asyncio.create_task(fire_parent_cancel())
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1", "wu2"],
+            child_session_ids={"wu1": "c1", "wu2": "c2"},
+            cancel_event=cancel_event,
+            timeout_seconds=1.0,
+        )
+        await fire_task
+
+        assert publisher.publish.await_count == 2
+        reasons = {
+            call.args[0].payload["reason"]
+            for call in publisher.publish.await_args_list
+        }
+        assert reasons == {"parent_cancel"}
+
+    async def test_explicit_zero_deadline_is_unlimited(self) -> None:
+        publisher = AsyncMock()
+        subscriber = _FakeSubscriber([], exhaust_then_return=False)
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+        cancel_event = asyncio.Event()
+
+        async def fire_parent_cancel() -> None:
+            await asyncio.sleep(0.02)
+            cancel_event.set()
+
+        fire_task = asyncio.create_task(fire_parent_cancel())
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1"],
+            child_session_ids={"wu1": "c1"},
+            cancel_event=cancel_event,
+            timeout_seconds=0,
+        )
+        await fire_task
+
+        publisher.publish.assert_awaited_once()
+        assert publisher.publish.await_args.args[0].payload["reason"] == "parent_cancel"
+
+    @pytest.mark.parametrize(
+        "invalid_timeout",
+        [-1, float("nan"), float("inf"), float("-inf")],
+    )
+    async def test_invalid_explicit_deadline_rejected_before_subscribe(
+        self, invalid_timeout: float,
+    ) -> None:
+        publisher = AsyncMock()
+        subscriber = _FakeSubscriber([], exhaust_then_return=False)
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            await orch.run(
+                coordinator_run_id="r1",
+                root_session_id="root1",
+                work_units_pending=["wu1"],
+                child_session_ids={"wu1": "c1"},
+                cancel_event=asyncio.Event(),
+                timeout_seconds=invalid_timeout,
+            )
+
+        assert subscriber.subscribe_calls == []
+        publisher.publish.assert_not_awaited()
+
+    async def test_explicit_positive_deadline_cancels_pending(self) -> None:
         publisher = AsyncMock()
         subscriber = _FakeSubscriber([], exhaust_then_return=False)
         orch = CoordinatorRunOrchestrator(
@@ -461,7 +640,63 @@ class TestRunLevelBudgetCaps:
             child_session_ids={"wu1": "c1"},
             cancel_event=cancel_event, timeout_seconds=0.05,
         )
-        publisher.publish.assert_not_called()
+        publisher.publish.assert_awaited_once()
+        envelope = publisher.publish.await_args.args[0]
+        assert envelope.child_session_id == "c1"
+        assert envelope.payload["reason"] == "run_total_wallclock_budget_exceeded"
+
+    async def test_terminal_observed_at_deadline_is_not_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A terminal removed from pending wins an equal-tick deadline race."""
+        publisher = AsyncMock()
+        terminal_observed = asyncio.Event()
+        env = _result_ready_env(
+            ResultReadyOutcome.SUCCESS, child_session_id="c1",
+        )
+
+        class _TerminalThenBlockSubscriber(_FakeSubscriber):
+            async def consume(self, *, predicate, **_kwargs):
+                env_dict = self._dicts[0]
+                if await predicate(env_dict):
+                    yield env_dict
+                # The generator resumes only after _observe_loop has processed
+                # the yielded terminal and discarded wu1 from pending.
+                terminal_observed.set()
+                await asyncio.Event().wait()
+
+        subscriber = _TerminalThenBlockSubscriber([env])
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            mailbox_subscriber=subscriber,
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+
+        async def deadline_after_terminal(tasks, *, timeout, return_when):
+            assert timeout == 1.0
+            assert return_when is asyncio.FIRST_COMPLETED
+            await terminal_observed.wait()
+            return set(), set(tasks)
+
+        monkeypatch.setattr(
+            "app.application.services.coordinator_run_orchestrator.asyncio.wait",
+            deadline_after_terminal,
+        )
+
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1", "wu2"],
+            child_session_ids={"wu1": "c1", "wu2": "c2"},
+            cancel_event=asyncio.Event(),
+            timeout_seconds=1.0,
+        )
+
+        publisher.publish.assert_awaited_once()
+        envelope = publisher.publish.await_args.args[0]
+        assert envelope.child_session_id == "c2"
+        assert envelope.payload["reason"] == "run_total_wallclock_budget_exceeded"
 
 
 class TestParentCancelStillWorksWithSubscriber:
@@ -588,6 +823,63 @@ class TestSubscriberOptionalForPR3Compat:
             cancel_event=cancel_event, timeout_seconds=1.0,
         )
         assert publisher.publish.await_count == 1
+
+    async def test_empty_pending_default_none_returns_immediately(self) -> None:
+        publisher = AsyncMock()
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+
+        await asyncio.wait_for(
+            orch.run(
+                coordinator_run_id="r1",
+                root_session_id="root1",
+                work_units_pending=[],
+                child_session_ids={},
+                cancel_event=asyncio.Event(),
+            ),
+            timeout=0.1,
+        )
+
+        publisher.publish.assert_not_awaited()
+
+    async def test_default_none_awaits_parent_cancel_without_wait_for(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        publisher = AsyncMock()
+        orch = CoordinatorRunOrchestrator(
+            publisher=publisher,
+            envelope_factory=CoordinatorEnvelopeFactory(),
+            parent_session_id="p1", coordinator_run_id="r1",
+        )
+        cancel_event = asyncio.Event()
+
+        async def forbidden_wait_for(*_args, **_kwargs):
+            raise AssertionError("timeout=None must await cancel_event directly")
+
+        async def fire_cancel() -> None:
+            await asyncio.sleep(0.02)
+            cancel_event.set()
+
+        monkeypatch.setattr(
+            "app.application.services.coordinator_run_orchestrator."
+            "asyncio.wait_for",
+            forbidden_wait_for,
+        )
+        fire_task = asyncio.create_task(fire_cancel())
+
+        await orch.run(
+            coordinator_run_id="r1",
+            root_session_id="root1",
+            work_units_pending=["wu1"],
+            child_session_ids={"wu1": "c1"},
+            cancel_event=cancel_event,
+        )
+        await fire_task
+
+        publisher.publish.assert_awaited_once()
 
 
 class TestPublishDedup:

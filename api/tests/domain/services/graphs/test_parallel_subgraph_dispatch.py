@@ -10,6 +10,7 @@ import hashlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from app.application.services.coordinator_wait_guard import CoordinatorWaitGuard
 from app.domain.models.path_validation import CoordinatorPathContractError
 from app.domain.models.work_unit import ProposedPath, ProposedTree, WorkUnitRequest
 from app.domain.services.graphs.parallel_execution_subgraph import (
@@ -665,6 +666,7 @@ def _config_with_quota_and_third_start_failing(call_log: list) -> dict:
         side_effect=lambda **kw: call_log.append(("release",)),
     )
     cfg["probe_quota"] = pq
+    cfg["coordinator_wait_guard"] = CoordinatorWaitGuard()
     limits = MagicMock()
     limits.max_work_units_per_run = 5
     limits.max_concurrent_coordinator_runs_per_user = 2

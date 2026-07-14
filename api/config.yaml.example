@@ -14,7 +14,7 @@ llm_config:
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
   # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
   # supports_pdf_input: false             # 是否支持原生 PDF 文件输入（需要模型支持，如 gpt-4o）
-  # timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）。0 表示关闭 wait_for 包装（仅调试用）；其它值会被 adapter 的 _agenerate/_astream 包成 asyncio.wait_for，超时抛 ServerRequestsError 让 LangGraph RetryPolicy 接管重试。代码默认 120s；长上下文/多模态/复杂推理场景推荐 300s，配合下方 agent_config.execution 的 idle/total 超时同步调整。同时作为 httpx read/write/pool 阶段上限。
+  # timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）。0 表示关闭 wait_for 包装（仅调试用）；其它值会被 adapter 的 _agenerate/_astream 包成 asyncio.wait_for，超时抛 ServerRequestsError 让 LangGraph RetryPolicy 接管重试。代码默认 120s；长上下文/多模态/复杂推理场景推荐 300s。它是单次 operation timeout，与 root total deadline 独立；同时作为 httpx read/write/pool 阶段上限。
   # connect_timeout_seconds: 60.0         # D5.2: httpx connect 阶段（TCP+TLS 握手）专用超时（秒）。与 timeout_seconds 独立是因为 OpenAI SDK 默认只给 connect 5s，跨境慢网/连接池复用失效/DNS 漂移等场景下 TLS 握手会直接被 5s 砍掉，提 timeout_seconds 毫无作用（外层 asyncio.wait_for 根本来不及生效就被 httpcore.ConnectTimeout 冒出来）。代码默认 60s，上界 300s 留给极端环境；真正死端点仍能在 1 分钟内快速失败。
   # context_overflow_guard_enabled: false  # 开启上下文超限治理
   # token_estimator: hybrid               # token 估算策略: char(最快) / hybrid(推荐) / provider_api(需安装 tiktoken)
@@ -31,7 +31,7 @@ llm_config:
 #   model_name: gpt-5.4
 #   temperature: 0.7
 #   max_tokens: 8192
-#   timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）。api_type=auto 时注意 primary+fallback 总预算 > 200s 会触发 budget warning（代码默认 600s watchdog / 3 graph retries）。若设 300s 需同步把 agent_config.execution.total_timeout_seconds 拉到 900s+
+#   timeout_seconds: 300.0                # D5.1: 单次 LLM 调用硬超时（秒）；primary/fallback 各自遵守该 operation timeout，与 root total deadline 独立
 #   api_type: auto
 #   supports_response_format: true
 
@@ -141,7 +141,7 @@ agent_config:
     # recall_cache_ttl_seconds: 86400  # session 级召回缓存 TTL
     # recall_query_max_chars: 2000     # query 素材总长上限
   # execution:                        # 执行健康监控（ExecutionWatchdog 双层超时）
-  #   total_timeout_seconds: 900.0    # 整图执行总超时（秒）。代码默认 600s；配合 llm_config.timeout_seconds=300s 时建议 900s（300 x 3 graph retries）
+  #   total_timeout_seconds: 0.0      # root 整图总 deadline（秒）。0=无限制（代码默认）；正数=显式 deadline，与单次 LLM operation timeout 独立
   #   idle_timeout_seconds: 300.0     # 空闲无进度事件超时（秒）。代码默认 120s；非流式 LLM 调用需 >= llm_config.timeout_seconds，否则 watchdog 会先触发
   #   max_same_tool_failures: 3       # 同签名工具最大连续失败数
 

@@ -136,6 +136,127 @@ class TestGraphEventBridge:
         # Should NOT raise — cleanup suppressed the RuntimeError
         # (If it raised, agent_task_runner's except handler would overwrite WAITING)
 
+    async def test_wait_event_early_close_drains_interrupt_state(self):
+        """HITL close must let the graph publish its interrupt state first."""
+        import asyncio
+
+        from app.domain.models.event import WaitEvent
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        settled = asyncio.Event()
+        release = asyncio.Event()
+
+        class GatedInterruptGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                await config["configurable"]["event_queue"].put(WaitEvent())
+                await release.wait()
+                settled.set()
+                yield {
+                    "executor_node": {
+                        "events": [],
+                        "should_interrupt": True,
+                        "flow_status": "executing",
+                    }
+                }
+
+        bridge = GraphEventBridge()
+        generator = bridge.run(
+            GatedInterruptGraph(),
+            {},
+            config={"configurable": {"execution_watchdog": None}},
+        )
+        assert isinstance(await anext(generator), WaitEvent)
+
+        close_task = asyncio.create_task(generator.aclose())
+        close_turn = asyncio.Event()
+        asyncio.get_running_loop().call_soon(close_turn.set)
+        await close_turn.wait()
+        assert close_task.done() is False
+
+        release.set()
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+        assert settled.is_set()
+        assert bridge.final_state["should_interrupt"] is True
+        assert bridge.was_interrupted is True
+
+    async def test_cancelling_hitl_close_propagates_and_cleans_graph_task(self):
+        """Parent cancellation during HITL drain must not be swallowed."""
+        import asyncio
+
+        from app.domain.models.event import WaitEvent
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        graph_cancelled = asyncio.Event()
+        graph_task = None
+
+        class BlockingInterruptGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                nonlocal graph_task
+                graph_task = asyncio.current_task()
+                await config["configurable"]["event_queue"].put(WaitEvent())
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    graph_cancelled.set()
+                    raise
+                yield {"node": {"events": []}}  # pragma: no cover
+
+        bridge = GraphEventBridge()
+        generator = bridge.run(
+            BlockingInterruptGraph(),
+            {},
+            config={"configurable": {"execution_watchdog": None}},
+        )
+        assert isinstance(await anext(generator), WaitEvent)
+
+        close_task = asyncio.create_task(generator.aclose())
+        close_turn = asyncio.Event()
+        asyncio.get_running_loop().call_soon(close_turn.set)
+        await close_turn.wait()
+        assert close_task.done() is False
+
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        assert graph_cancelled.is_set()
+        assert graph_task is not None
+        assert graph_task.done()
+        assert graph_task.cancelled()
+
+    def test_hitl_control_event_classification_is_typed(self):
+        from app.domain.models.event import (
+            ControlAction,
+            ControlEvent,
+            ControlScope,
+            ToolConfirmationEvent,
+            WaitEvent,
+        )
+        from app.domain.services.graphs.event_bridge import _is_hitl_control_event
+
+        confirmation = ToolConfirmationEvent(
+            tool_call_id="tc-1",
+            tool_name="shell_execute",
+            tool_args={},
+            risk_level="high",
+            risk_reason="test",
+            matched_patterns=[],
+            timeout_seconds=300,
+        )
+
+        assert _is_hitl_control_event(WaitEvent()) is True
+        assert _is_hitl_control_event(confirmation) is True
+        assert _is_hitl_control_event(
+            ControlEvent(action=ControlAction.REQUESTED, scope=ControlScope.SHELL)
+        ) is True
+        assert _is_hitl_control_event(
+            ControlEvent(action=ControlAction.STARTED)
+        ) is False
+        assert _is_hitl_control_event(
+            MessageEvent(role="assistant", message="ordinary")
+        ) is False
+
     async def test_normal_exit_propagates_drive_graph_error(self):
         """In normal (non-cleanup) path, _drive_graph errors should propagate."""
         from app.domain.services.graphs.event_bridge import GraphEventBridge
@@ -149,6 +270,54 @@ class TestGraphEventBridge:
         with pytest.raises(RuntimeError, match="graph execution failed"):
             async for _ in bridge.run(ErrorGraph(), {}):
                 pass
+
+    async def test_watchdog_none_early_close_cancels_live_graph_task(self):
+        """Closing after a queue event must not wait forever for a silent graph."""
+        import asyncio
+        from contextlib import suppress
+
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        cancelled = asyncio.Event()
+        graph_task = None
+
+        class EventThenForeverGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                nonlocal graph_task
+                graph_task = asyncio.current_task()
+                await config["configurable"]["event_queue"].put(
+                    MessageEvent(role="assistant", message="first")
+                )
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                yield {"node": {"events": []}}  # pragma: no cover
+
+        bridge = GraphEventBridge()
+        generator = bridge.run(
+            EventThenForeverGraph(),
+            {},
+            config={"configurable": {"execution_watchdog": None}},
+        )
+        first = await anext(generator)
+        assert isinstance(first, MessageEvent)
+
+        close_task = asyncio.create_task(generator.aclose())
+        try:
+            # Shield prevents the test timeout itself from cancelling the
+            # bridge and hiding a missing production-side task.cancel().
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=0.1)
+        finally:
+            if not close_task.done():
+                close_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await close_task
+
+        assert cancelled.is_set()
+        assert graph_task is not None
+        assert graph_task.done()
 
     async def test_was_interrupted_with_checkpointer(self):
         """was_interrupted should be True when graph has pending next nodes."""
@@ -397,3 +566,66 @@ class TestGraphEventBridgeWatchdog:
         assert control.should_terminate is False
         # Normal event flowed through
         assert any(isinstance(e, MessageEvent) for e in events)
+
+    async def test_wait_guard_uses_the_same_watchdog_and_reaches_graph_config(self):
+        from unittest.mock import MagicMock
+
+        from app.application.services.coordinator_wait_guard import CoordinatorWaitGuard
+        from app.domain.services.execution_watchdog import ExecutionWatchdog
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        watchdog = ExecutionWatchdog(total_timeout_seconds=0, idle_timeout_seconds=10)
+        factory = MagicMock(side_effect=CoordinatorWaitGuard)
+        captured = {}
+
+        class CapturingGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                captured.update(config["configurable"])
+                yield {"node": {"events": []}}
+
+        config = {
+            "configurable": {
+                "execution_watchdog": watchdog,
+                "coordinator_wait_guard_factory": factory,
+            }
+        }
+        bridge = GraphEventBridge()
+        async for _ in bridge.run(CapturingGraph(), {}, config=config):
+            pass
+
+        guard = captured["coordinator_wait_guard"]
+        assert isinstance(guard, CoordinatorWaitGuard)
+        assert guard.watchdog is watchdog
+        factory.assert_called_once_with(watchdog=watchdog)
+
+    async def test_none_watchdog_does_not_create_wait_guard_or_start_monitor(self):
+        from unittest.mock import MagicMock
+
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        factory = MagicMock(side_effect=AssertionError("must not create guard"))
+        captured = {}
+
+        class QuickGraph:
+            async def astream(self, input_state, config=None, **kwargs):
+                captured.update(config["configurable"])
+                yield {
+                    "node": {
+                        "events": [MessageEvent(role="assistant", message="ok")]
+                    }
+                }
+
+        config = {
+            "configurable": {
+                "execution_watchdog": None,
+                "coordinator_wait_guard_factory": factory,
+            }
+        }
+        bridge = GraphEventBridge()
+        events = []
+        async for event in bridge.run(QuickGraph(), {}, config=config):
+            events.append(event)
+
+        factory.assert_not_called()
+        assert "coordinator_wait_guard" not in captured
+        assert len(events) == 1

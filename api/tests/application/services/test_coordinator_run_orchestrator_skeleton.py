@@ -1,7 +1,7 @@
 """C2 PR-3 §11.1/§11.5 — CoordinatorRunOrchestrator skeleton tests.
 
 Verifies the parent-cancel path:
-- timeout returns silently (no publish, no raise)
+- positive deadline publishes CANCEL_REQUEST for pending work units
 - cancel_event set → CANCEL_REQUEST published × pending work_units
 - missing child_session_id skipped
 - per-envelope publish failure logged + swallowed (rest still fire)
@@ -22,7 +22,7 @@ from app.domain.models.mailbox_envelope import MailboxEnvelopeType
 
 
 @pytest.mark.anyio
-async def test_timeout_silently_returns_no_publish() -> None:
+async def test_positive_deadline_cancels_pending() -> None:
     publisher = AsyncMock()
     orch = CoordinatorRunOrchestrator(
         publisher=publisher,
@@ -35,7 +35,10 @@ async def test_timeout_silently_returns_no_publish() -> None:
         work_units_pending=["wu1"], child_session_ids={"wu1": "c1"},
         cancel_event=ce, timeout_seconds=0.05,
     )
-    publisher.publish.assert_not_called()
+    publisher.publish.assert_awaited_once()
+    envelope = publisher.publish.await_args.args[0]
+    assert envelope.child_session_id == "c1"
+    assert envelope.payload["reason"] == "run_total_wallclock_budget_exceeded"
 
 
 @pytest.mark.anyio

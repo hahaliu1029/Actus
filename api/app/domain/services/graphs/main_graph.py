@@ -90,6 +90,18 @@ class ParallelBackendOutcome:
 async def _run_parallel_backend(
     state: Any, config: Any, step: Any
 ) -> ParallelBackendOutcome:
+    """Wrap one coordinator step in its structured wait lifecycle scope."""
+    cfg = (config.get("configurable") or {}) if config else {}
+    wait_guard = cfg.get("coordinator_wait_guard")
+    if wait_guard is None:
+        return await _run_parallel_backend_impl(state, config, step)
+    async with wait_guard.step_scope(step.id):
+        return await _run_parallel_backend_impl(state, config, step)
+
+
+async def _run_parallel_backend_impl(
+    state: Any, config: Any, step: Any
+) -> ParallelBackendOutcome:
     """C2 PR-3 §7.2 — invoke parallel_execution_subgraph for a coordinator step.
 
     The subgraph's ``dispatch_node`` is responsible for ``coordinator_run_id``
@@ -405,12 +417,32 @@ async def _run_parallel_backend(
         root_session_id=root_session_id,
         parent_session_id=parent_session_id,
     )
+    wait_guard = cfg.get("coordinator_wait_guard")
+    if wait_guard is not None:
+        from app.application.services.coordinator_parent_execution_lease import (
+            CoordinatorParentPhase,
+        )
+        wait_guard.set_phase(
+            step.id,
+            apply_plan.coordinator_run_id,
+            CoordinatorParentPhase.APPLYING,
+        )
+
+        def _enter_rollback_phase() -> None:
+            wait_guard.set_phase(
+                step.id,
+                apply_plan.coordinator_run_id,
+                CoordinatorParentPhase.ROLLBACK,
+            )
+    else:
+        _enter_rollback_phase = None
     apply_outcome = await applier.apply(
         apply_plan,
         parent_sandbox=parent_sandbox,
         minio_client=minio,
         cancel_event=cfg.get("cancel_event"),
         lineage=lineage,
+        on_rollback=_enter_rollback_phase,
     )
     if apply_outcome.status == ApplyStatus.SUCCESS:
         return ParallelBackendOutcome(

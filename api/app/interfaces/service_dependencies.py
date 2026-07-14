@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -96,10 +97,14 @@ from starlette.requests import HTTPConnection
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# D5.1: combined (primary + fallback) threshold above which fallback-path
-# worst case may saturate ExecutionConfig.total_timeout_seconds (default 600s).
-# Derived as: total_timeout_seconds_default / graph_retry_count = 600 / 3 = 200.
-_FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS: float = 200.0
+_ORPHAN_OWNER_COMPARE_DELETE_SCRIPT = """
+-- coordinator-orphan-owner-compare-delete-v1
+local key = KEYS[1]
+if redis.call('GET', key) ~= ARGV[1] then
+  return 0
+end
+return redis.call('DEL', key)
+"""
 
 # --- Config cache (D2) ---
 _config_cache: "AppConfig | None" = None
@@ -473,23 +478,6 @@ def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> Ba
         if llm_config.api_type == "responses":
             llm = responses
         elif llm_config.api_type == "auto":
-            # D5.1 budget warning heuristic: if primary + fallback combined
-            # budget is large, fallback path worst case may approach or
-            # exceed D5 ExecutionWatchdog total_timeout_seconds. Log warning
-            # (non-hard) so operators see it during config load.
-            combined = timeout_seconds * 2
-            if combined > _FALLBACK_BUDGET_WARNING_THRESHOLD_SECONDS:
-                logger.warning(
-                    "[D5.1 budget warning] ActusFallbackChatModel with "
-                    "timeout_seconds=%.0fs may approach D5 ExecutionWatchdog "
-                    "total_timeout_seconds budget. Fallback worst case = "
-                    "%.0fs x 3 graph retries = %.0fs. Consider lowering "
-                    "timeout_seconds or raising "
-                    "ExecutionConfig.total_timeout_seconds.",
-                    timeout_seconds,
-                    combined,
-                    combined * 3,
-                )
             llm = ActusFallbackChatModel(
                 primary=chat, fallback=responses, profile=profile,
             )
@@ -661,6 +649,7 @@ def build_supervisor_registry(
     sandbox_lifecycle_service: object,
     coordinator_envelope_store: CoordinatorResultEnvelopeStoreRepository,
     cost_rollup_service: CostRollupService,
+    coordinator_liveness_service: object | None = None,
 ) -> "SupervisorRegistry":
     """C3 PR-3c — construct the per-pod :class:`SupervisorRegistry` singleton.
 
@@ -732,6 +721,13 @@ def build_supervisor_registry(
         MailboxSupervisor,
         SupervisorContext,
     )
+    from app.application.composition.graph_assembly import (
+        build_session_state_machine,
+    )
+    from app.application.services.coordinator_terminal_transition import (
+        CoordinatorTerminalCommand,
+        terminalize_authoritative_coordinator_child,
+    )
     from app.application.services.supervisor_registry import SupervisorRegistry
     from app.infrastructure.repositories.db_mailbox_envelope_audit_repository import (
         DbMailboxEnvelopeAuditRepository,
@@ -795,6 +791,22 @@ def build_supervisor_registry(
     # (the Protocol is duck-typed at runtime so partial impl is fine,
     # but the cast keeps mypy happy).
     pg_session_factory = get_postgres().session_factory
+    terminal_state_machine = build_session_state_machine(uow_factory=get_uow)
+
+    async def _terminalize_child(
+        command: CoordinatorTerminalCommand,
+    ) -> bool:
+        """Composition adapter: authoritative Supervisor terminal CAS.
+
+        ``MailboxSupervisor`` stays application-layer and sees only this
+        callable port. The locked authority read, validation, CAS and commit
+        share the same composition-owned UoW.
+        """
+        return await terminalize_authoritative_coordinator_child(
+            command,
+            state_machine=terminal_state_machine,
+            uow_factory=get_uow,
+        )
 
     class _SupervisorSessionRepoAdapter:
         __slots__ = ("_session_factory",)
@@ -830,9 +842,29 @@ def build_supervisor_registry(
                     limit=limit,
                 )
 
+        async def find_running_mailbox_children_for_parent(
+            self, parent_session_id: str,
+        ):
+            from app.infrastructure.repositories.db_session_repository import (
+                DBSessionRepository,
+            )
+            async with self._session_factory() as db_session:
+                repo = DBSessionRepository(db_session=db_session)
+                return await repo.find_running_mailbox_children_for_parent(
+                    parent_session_id,
+                )
+
     supervisor_session_repo = _SupervisorSessionRepoAdapter(
         session_factory=pg_session_factory,
     )
+    if coordinator_liveness_service is None:
+        from app.application.services.coordinator_liveness_lease_service import (
+            CoordinatorLivenessLeaseService,
+        )
+        coordinator_liveness_service = CoordinatorLivenessLeaseService(
+            redis=raw_redis,
+            session_repository=supervisor_session_repo,  # type: ignore[arg-type]
+        )
 
     # [C4.1a §5.1] repo-or-None：flag OFF → None（不构造 → 两 seat 门跳过 → INV-0）。
     # repo stateless → 建一次复用（match supervisor_session_repo）。
@@ -885,9 +917,10 @@ def build_supervisor_registry(
             # happens before the supervisor consumer loop starts).
             agent_service_callback=_pr4_5_agent_service_callback,
             telemetry=telemetry_adapter,
-            # C3 PR-5 (spec §11.6) — session reader for the rollback
-            # stop check. Adapter holds session_factory and opens a
-            # short-lived AsyncSession per query.
+            terminalize_child=_terminalize_child,
+            # C3 PR-5 / Task 4 — authoritative session reader shared by the
+            # rollback stop check and terminal-ownership row guard. Adapter
+            # opens a short-lived AsyncSession per query.
             session_repo=supervisor_session_repo,  # type: ignore[arg-type]
             # PR-9b-A4 (INV-A1 / INV-A2) — coordinator ports wired at the
             # composition root. Wiring is always-live; the feature flag
@@ -901,6 +934,7 @@ def build_supervisor_registry(
             # in the outer scope; None on flag-OFF → ResultReadyHandler's third
             # PROLOGUE gate skips → byte-identical, INV-C4.1-1).
             subagent_run_repo=subagent_run_repo,
+            liveness_service=coordinator_liveness_service,  # type: ignore[arg-type]
         )
         return MailboxSupervisor(
             ctx,
@@ -969,7 +1003,8 @@ def _make_shared_child_runner_builder(
     def _build(
         *, session_id, tool_filter, mailbox_publisher,
         terminal_envelope_publisher_disabled, sandbox, browser, user_id,
-        cost_callback_handler,
+        cost_callback_handler, external_terminal_owner=False,
+        external_heartbeat_owner=False,
     ):
         deps = resolve_child_runner_deps()  # live, post-lifespan
         child_agent_config = _cache.get("child_agent_config")
@@ -1036,6 +1071,8 @@ def _make_shared_child_runner_builder(
             tool_filter=tool_filter,
             mailbox_publisher=mailbox_publisher,
             terminal_envelope_publisher_disabled=terminal_envelope_publisher_disabled,
+            external_terminal_owner=external_terminal_owner,
+            external_heartbeat_owner=external_heartbeat_owner,
             coord_deps=None,  # child is NOT a nested coordinator
             session_state_machine=deps.session_state_machine,
             tool_runtime=deps.tool_runtime,
@@ -1111,12 +1148,16 @@ def build_coordinator_runtime_deps(
     from app.application.services.coordinator_rehydrate_service import (
         CoordinatorRehydrateService,
     )
+    from app.application.services.coordinator_parent_execution_lease import (
+        CoordinatorParentExecutionLease,
+    )
     from app.application.services.coordinator_runtime_deps import (
         _CoordinatorRuntimeDeps,
     )
     from app.application.services.coordinator_terminal_envelope_waiter import (
         CoordinatorTerminalEnvelopeWaiter,
     )
+    from app.application.services.coordinator_wait_guard import CoordinatorWaitGuard
     from app.application.services.db_cost_rollup_service import (
         DbCostRollupService,
     )
@@ -1158,18 +1199,18 @@ def build_coordinator_runtime_deps(
     #      because outer graph owns checkpoint). ─────────────────────────────
     parallel_execution_subgraph = build_parallel_execution_subgraph()
 
-    # ── 2. CoordinatorEnvelopeFactory — pure, stateless. ────────────────────
-    envelope_factory = CoordinatorEnvelopeFactory()
+    # ── 2. Coordinator limits + envelope factory — one shared budget source. ─
+    coordinator_limits = load_coordinator_limits_from_env()
+    envelope_factory = CoordinatorEnvelopeFactory(limits=coordinator_limits)
 
     # ── 3. Mailbox publisher / subscriber — share the raw Redis client with
     #      the supervisor registry's publisher (single transport wire). ─────
     mailbox_publisher = RedisMailboxPublisher(raw_redis)
     mailbox_subscriber = RedisMailboxSubscriber(raw_redis)
 
-    # ── 4. CoordinatorTerminalEnvelopeWaiter — pure wrapper over subscriber. ─
-    terminal_waiter = CoordinatorTerminalEnvelopeWaiter(
-        subscriber=mailbox_subscriber,
-    )
+    # ── 4. CoordinatorTerminalEnvelopeWaiter is assembled after the shared
+    #      liveness/session ports below so its terminal-vs-stale race uses the
+    #      same authority as dispatch and MailboxSupervisor. ────────────────
 
     # ── 5. Repositories (DB-backed, short-session pattern). ─────────────────
     coordinator_envelope_store = DbCoordinatorResultEnvelopeStoreRepository(
@@ -1261,6 +1302,174 @@ def build_coordinator_runtime_deps(
 
     session_repository_adapter = _CoordinatorSessionRepoAdapter(pg_session_factory)
 
+    # Build quota before liveness so the heartbeat callback has no latent
+    # unbound-closure window during composition.
+    probe_quota = ProbeQuotaService(redis_client=redis_client)
+
+    async def _renew_quota_from_child_heartbeat(lease) -> None:  # noqa: ANN001
+        # ``record_heartbeat`` invokes callbacks only after schema validation,
+        # DB lineage authorization, and the Redis refresh CAS. Re-read the
+        # authoritative child row for its user identity rather than trusting
+        # an envelope or a non-persisted lease field.
+        from app.domain.models.session import SessionStatus
+
+        row = await session_repository_adapter.get_by_id(
+            lease.child_session_id
+        )
+        if (
+            row is None
+            or row.id != lease.child_session_id
+            or row.coordinator_run_id != lease.coordinator_run_id
+            or row.status is not SessionStatus.RUNNING
+            or not isinstance(row.user_id, str)
+            or not row.user_id.strip()
+        ):
+            logger.warning(
+                "coordinator heartbeat quota renew skipped: authoritative "
+                "child identity missing or changed child=%s run=%s",
+                lease.child_session_id,
+                lease.coordinator_run_id,
+            )
+            return
+        renewed = await probe_quota.renew_coordinator_concurrency(
+            user_id=row.user_id,
+            coordinator_run_id=lease.coordinator_run_id,
+        )
+        if not renewed:
+            # Never call acquire here: a missing/expired member means this
+            # heartbeat no longer owns quota and must not resurrect it.
+            logger.warning(
+                "coordinator heartbeat quota lease lost user=%s run=%s "
+                "child=%s",
+                row.user_id,
+                lease.coordinator_run_id,
+                lease.child_session_id,
+            )
+
+    # Shared Task 6 liveness authority. A DB-authorized child heartbeat also
+    # renews the existing same-run quota member; child sandbox renewal remains
+    # a separate owner-scoped concern.
+    from app.application.services.coordinator_liveness_lease_service import (
+        COORDINATOR_CHILD_LEASE_TTL_SECONDS,
+        CoordinatorLivenessLeaseService,
+    )
+    coordinator_liveness_service = CoordinatorLivenessLeaseService(
+        redis=raw_redis,
+        session_repository=session_repository_adapter,  # type: ignore[arg-type]
+        renew_quota=_renew_quota_from_child_heartbeat,
+    )
+
+    async def _read_persisted_terminal_for_waiter(
+        *,
+        child_session_id: str,
+        root_session_id: str,
+        coordinator_run_id: str | None,
+    ):
+        if coordinator_run_id is None:
+            return None
+        from datetime import datetime, timezone
+        from app.domain.models.mailbox_envelope import (
+            MailboxEnvelope,
+            MailboxEnvelopeType,
+            ProducerRole,
+        )
+
+        rows = await coordinator_envelope_store.find_terminal_envelopes_by_run(
+            coordinator_run_id,
+        )
+        for row in rows:
+            if row.child_session_id != child_session_id:
+                continue
+            envelope_type = MailboxEnvelopeType(row.envelope_type)
+            raw_payload = dict(row.payload or {})
+            if envelope_type == MailboxEnvelopeType.RESULT_READY:
+                allowed = {
+                    "outcome", "patch_manifest", "patch_manifest_ref",
+                    "cost_summary", "needs_authorization_details",
+                }
+                payload = {
+                    key: value for key, value in raw_payload.items()
+                    if key in allowed
+                }
+                payload.setdefault("summary", "persisted terminal result")
+            else:
+                payload = {
+                    "final_state": raw_payload.get("final_state", "cancelled")
+                }
+            digest = hashlib.sha256(
+                f"{coordinator_run_id}|{child_session_id}|{row.envelope_type}".encode()
+            ).hexdigest()[:32]
+            return MailboxEnvelope(
+                envelope_id=f"persisted:{digest}",
+                type=envelope_type,
+                parent_session_id=root_session_id,
+                child_session_id=child_session_id,
+                correlation_id=coordinator_run_id,
+                emitted_at=getattr(row, "received_at", None)
+                or datetime.now(timezone.utc),
+                producer_role=ProducerRole.CHILD_AGENT,
+                payload=payload,
+            )
+        return None
+
+    async def _reconcile_stale_waiter_child(
+        *,
+        child_session_id: str,
+        root_session_id: str,
+        coordinator_run_id: str | None,
+    ) -> None:
+        if coordinator_run_id is None:
+            raise RuntimeError("stale coordinator waiter requires run id")
+        from app.domain.models.mailbox_envelope import CancelPolicy
+
+        digest = hashlib.sha256(
+            f"{root_session_id}|{coordinator_run_id}|{child_session_id}".encode()
+        ).hexdigest()
+        dedup_key = f"coordinator:orphan-reconcile:{digest}"
+        owner_token = uuid.uuid4().hex
+        claimed = await raw_redis.set(
+            dedup_key,
+            owner_token,
+            nx=True,
+            ex=COORDINATOR_CHILD_LEASE_TTL_SECONDS,
+        )
+        if not claimed:
+            return
+        try:
+            await mailbox_publisher.publish(
+                envelope_factory.make_cancel_request(
+                    parent_session_id=root_session_id,
+                    child_session_id=child_session_id,
+                    correlation_id=coordinator_run_id,
+                    reason="orphan_timeout",
+                    policy=CancelPolicy.TERMINATE,
+                )
+            )
+        except BaseException:
+            # A failed publish must be retryable by the next stale observer.
+            # The claim may have expired and been replaced while publish was
+            # in flight; only its exact owner may remove it.
+            try:
+                await raw_redis.eval(
+                    _ORPHAN_OWNER_COMPARE_DELETE_SCRIPT,
+                    1,
+                    dedup_key,
+                    owner_token,
+                )
+            except BaseException:
+                logger.exception(
+                    "failed to compare-delete orphan reconcile claim key=%s",
+                    dedup_key,
+                )
+            raise
+
+    terminal_waiter = CoordinatorTerminalEnvelopeWaiter(
+        subscriber=mailbox_subscriber,
+        liveness_service=coordinator_liveness_service,
+        orphan_reconciler=_reconcile_stale_waiter_child,
+        persisted_terminal_reader=_read_persisted_terminal_for_waiter,
+    )
+
     # ── 6. CoordinatorRehydrateService — wraps repo + envelope_store + audit. ─
     rehydrate_service = CoordinatorRehydrateService(
         session_repository=session_repository_adapter,
@@ -1269,10 +1478,7 @@ def build_coordinator_runtime_deps(
         publisher=mailbox_publisher,
     )
 
-    # ── 7a. CoordinatorLimits (env-overridable singleton). ──────────────────
-    coordinator_limits = load_coordinator_limits_from_env()
-
-    # ── 7b. CoordinatorRunOrchestrator factory — per-run wrapper around the
+    # ── 7. CoordinatorRunOrchestrator factory — per-run wrapper around the
     #      lifespan-scoped publisher + envelope_factory + subscriber.
     #      Per spec §11.3-§11.4, one orchestrator is constructed per
     #      coordinator run; the *factory* captures the lifespan deps.
@@ -1362,8 +1568,7 @@ def build_coordinator_runtime_deps(
         subagent_limits=get_subagent_limits(),
     )
 
-    # ── 9. ProbeQuotaService — Redis-backed per-user active-probe quota. ────
-    probe_quota = ProbeQuotaService(redis_client=redis_client)
+    # ── 9. ProbeQuotaService was constructed above for liveness callback use.
 
     # ── 10b. CoordinatorMetrics — C2b budget D10 instrument bundle. ─────────
     #      OtelMeter() defaults to get_meter("actus"): a no-op proxy before
@@ -1492,6 +1697,7 @@ def build_coordinator_runtime_deps(
     app_state.coordinator_mailbox_publisher = mailbox_publisher
     app_state.coordinator_mailbox_subscriber = mailbox_subscriber
     app_state.coordinator_terminal_waiter = terminal_waiter
+    app_state.coordinator_liveness_service = coordinator_liveness_service
     app_state.coordinator_envelope_store = coordinator_envelope_store
     app_state.coordinator_apply_audit_repo = coordinator_apply_audit_repo
     app_state.coordinator_session_repository = session_repository_adapter
@@ -1512,6 +1718,109 @@ def build_coordinator_runtime_deps(
     # (planner_react._build_config) never imports infrastructure to wrap it.
     def _parent_sandbox_adapter_factory(handle):  # noqa: ANN001, ANN202
         return ParentSandboxAdapter(handle)
+
+    def _parent_execution_lease_factory(**kwargs):  # noqa: ANN003, ANN202
+        # Task 7 wires durable child liveness plus the existing parent
+        # supervisor-activity touch. Task 8-10 supply auto-degrade/sandbox/
+        # quota renew callbacks without changing this fixed factory surface.
+        async def _touch_parent_activity(context) -> None:  # noqa: ANN001
+            # ``build_coordinator_runtime_deps`` runs before IdleWatchdog is
+            # attached during lifespan. Resolve it lazily at tick time, then
+            # reuse its existing supervisor hot-hash touch contract.
+            idle_watchdog = getattr(app_state, "idle_watchdog", None)
+            if idle_watchdog is not None:
+                await idle_watchdog.touch_activity(
+                    session_id=context.parent_session_id,
+                )
+
+        async def _renew_auto_degrade(context) -> None:  # noqa: ANN001
+            # The shared ExecutionSupervisor is attached after AgentService is
+            # built, so resolve it lazily on every lease tick. Its PG CAS is
+            # authoritative; Redis expiry is synchronized only after commit.
+            supervisor = getattr(app_state, "supervisor", None)
+            if supervisor is not None:
+                await supervisor.renew_auto_degrade_expiry_if_running(
+                    session_id=context.parent_session_id,
+                )
+
+        async def _renew_quota(context) -> None:  # noqa: ANN001
+            if context.user_id is None:
+                logger.warning(
+                    "coordinator quota renew skipped: missing user_id run=%s",
+                    context.coordinator_run_id,
+                )
+                return
+            renewed = await probe_quota.renew_coordinator_concurrency(
+                user_id=context.user_id,
+                coordinator_run_id=context.coordinator_run_id,
+            )
+            if not renewed:
+                # A lost/expired member is never silently re-acquired. The
+                # backend can continue to its terminal cleanup while ops retain
+                # a visible signal that concurrency ownership was lost.
+                logger.warning(
+                    "coordinator quota lease lost user=%s run=%s",
+                    context.user_id,
+                    context.coordinator_run_id,
+                )
+
+        async def _reconcile_all_children_stale(context) -> None:  # noqa: ANN001
+            # Reuse the same idempotent, owner-token-protected orphan path as
+            # the terminal waiter. One broken child must not prevent siblings
+            # from being reconciled; aggregate failures keep the parent lease
+            # retryable while successful siblings remain protected by NX.
+            failures: list[tuple[str, BaseException]] = []
+            for child_session_id in context.child_session_ids:
+                try:
+                    await _reconcile_stale_waiter_child(
+                        child_session_id=child_session_id,
+                        root_session_id=context.root_session_id,
+                        coordinator_run_id=context.coordinator_run_id,
+                    )
+                except asyncio.CancelledError as exc:
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling() > 0:
+                        raise
+                    failures.append((child_session_id, exc))
+                    logger.warning(
+                        "coordinator all-stale orphan reconciliation failed "
+                        "root=%s run=%s child=%s; continuing siblings",
+                        context.root_session_id,
+                        context.coordinator_run_id,
+                        child_session_id,
+                        exc_info=True,
+                    )
+                except Exception as exc:
+                    failures.append((child_session_id, exc))
+                    logger.warning(
+                        "coordinator all-stale orphan reconciliation failed "
+                        "root=%s run=%s child=%s; continuing siblings",
+                        context.root_session_id,
+                        context.coordinator_run_id,
+                        child_session_id,
+                        exc_info=True,
+                    )
+            if failures:
+                failed_children = ",".join(child_id for child_id, _ in failures)
+                raise RuntimeError(
+                    "coordinator all-stale orphan reconciliation failed for "
+                    f"children: {failed_children}"
+                ) from failures[0][1]
+
+        return CoordinatorParentExecutionLease(
+            liveness_service=coordinator_liveness_service,
+            touch_parent_activity=_touch_parent_activity,
+            renew_auto_degrade=_renew_auto_degrade,
+            renew_quota=_renew_quota,
+            on_all_children_stale=_reconcile_all_children_stale,
+            **kwargs,
+        )
+
+    def _coordinator_wait_guard_factory(*, watchdog=None):  # noqa: ANN001, ANN202
+        return CoordinatorWaitGuard(
+            watchdog=watchdog,
+            parent_lease_factory=_parent_execution_lease_factory,
+        )
 
     # ── 17. Assemble the immutable _CoordinatorRuntimeDeps value object. ────
     coord_deps = _CoordinatorRuntimeDeps(
@@ -1543,6 +1852,8 @@ def build_coordinator_runtime_deps(
         # ACTUS_C2_AGENT_TEAMS_ENABLED + a team_slug are set (flag-gated, INV-0).
         team_repository=FileTeamRepository(Path(settings.skills_root_dir).parent / "teams"),
         skill_repository=FileSkillRepository(settings.skills_root_dir),
+        coordinator_wait_guard_factory=_coordinator_wait_guard_factory,
+        coordinator_liveness_service=coordinator_liveness_service,
     )
     app_state.coord_deps = coord_deps
     return coord_deps

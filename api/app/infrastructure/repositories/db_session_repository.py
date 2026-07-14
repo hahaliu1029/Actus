@@ -524,33 +524,103 @@ class DBSessionRepository(SessionRepository):
         *,
         expires_at: datetime,
         retry_budget_remaining: int,
+        expected_execution_revision: int,
+        background_reason: str,
+        pending_event,
     ) -> int | None:
         result = await self.db_session.execute(
             update(SessionModel)
             .where(SessionModel.id == session_id)
             .where(SessionModel.status == SessionStatus.RUNNING.value)
             .where(SessionModel.execution_mode == "foreground")
+            .where(SessionModel.execution_revision == expected_execution_revision)
             .where(SessionModel.execution_phase.in_(("running", "recovering", "idle")))
             .values(
                 execution_mode="background",
-                background_reason="auto_degrade",
+                background_reason=background_reason,
                 expires_at=expires_at,
                 execution_phase="running",
                 suspended_reason=None,
                 was_background=True,
                 retry_budget_remaining=retry_budget_remaining,
                 last_activity_at=func.now(),
+                execution_revision=SessionModel.execution_revision + 1,
+                pending_execution_event=pending_event.model_dump(mode="json"),
             )
-            .returning(SessionModel.retry_budget_remaining)
+            .returning(SessionModel.execution_revision)
         )
         return result.scalar_one_or_none()
+
+    async def renew_auto_degrade_expiry_if_running(
+        self,
+        session_id: str,
+        *,
+        expires_at: datetime,
+    ) -> tuple[datetime, int] | None:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase == "running")
+            .where(SessionModel.background_reason == "auto_degrade")
+            .values(expires_at=func.greatest(SessionModel.expires_at, expires_at))
+            .returning(SessionModel.expires_at, SessionModel.execution_revision)
+        )
+        row = result.one_or_none()
+        if row is None:
+            return None
+        return (row.expires_at, row.execution_revision)
+
+    async def resume_auto_degrade_to_foreground_if_running(
+        self,
+        session_id: str,
+        *,
+        expected_execution_revision: int,
+        pending_event,
+    ) -> int | None:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase == "running")
+            .where(SessionModel.background_reason == "auto_degrade")
+            .where(SessionModel.execution_revision == expected_execution_revision)
+            .values(
+                execution_mode="foreground",
+                background_reason=None,
+                expires_at=None,
+                suspended_reason=None,
+                last_activity_at=func.now(),
+                execution_revision=SessionModel.execution_revision + 1,
+                pending_execution_event=pending_event.model_dump(mode="json"),
+            )
+            .returning(SessionModel.execution_revision)
+        )
+        return result.scalar_one_or_none()
+
+    async def clear_pending_execution_event(
+        self,
+        session_id: str,
+        *,
+        execution_revision: int,
+    ) -> bool:
+        result = await self.db_session.execute(
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.execution_revision == execution_revision)
+            .where(SessionModel.pending_execution_event.is_not(None))
+            .values(pending_execution_event=None)
+        )
+        return bool(result.rowcount)
 
     async def claim_background_retry_from_suspend(
         self,
         session_id: str,
         *,
         expires_at: datetime,
-    ) -> int | None:
+    ) -> tuple[int, int] | None:
         result = await self.db_session.execute(
             update(SessionModel)
             .where(SessionModel.id == session_id)
@@ -571,16 +641,25 @@ class DBSessionRepository(SessionRepository):
                 suspended_reason=None,
                 expires_at=expires_at,
                 retry_budget_remaining=SessionModel.retry_budget_remaining - 1,
+                execution_revision=SessionModel.execution_revision + 1,
+                pending_execution_event=None,
                 last_activity_at=func.now(),
             )
-            .returning(SessionModel.retry_budget_remaining)
+            .returning(
+                SessionModel.retry_budget_remaining,
+                SessionModel.execution_revision,
+            )
         )
-        return result.scalar_one_or_none()
+        row = result.one_or_none()
+        if row is None:
+            return None
+        return (int(row.retry_budget_remaining), int(row.execution_revision))
 
     async def rollback_background_retry_claim_if_active(
         self,
         session_id: str,
         *,
+        expected_execution_revision: int,
         retry_budget_remaining: int,
         expires_at: datetime | None,
         suspended_reason: str | None,
@@ -591,6 +670,9 @@ class DBSessionRepository(SessionRepository):
             .where(SessionModel.status == SessionStatus.RUNNING.value)
             .where(SessionModel.execution_mode == "background")
             .where(SessionModel.execution_phase == "running")
+            .where(
+                SessionModel.execution_revision == expected_execution_revision
+            )
             .values(
                 execution_phase="suspended",
                 suspended_reason=suspended_reason,
@@ -626,6 +708,8 @@ class DBSessionRepository(SessionRepository):
                 completed_at=now,
                 terminal_reason=terminal_reason,
                 execution_phase="terminated",
+                execution_revision=SessionModel.execution_revision + 1,
+                pending_execution_event=None,
                 last_activity_at=now,
                 updated_at=now,
             )
@@ -646,6 +730,57 @@ class DBSessionRepository(SessionRepository):
                 return False
             raise ValueError(f"会话[{session_id}]终态写入失败，请重试")
         return True
+
+    async def update_to_terminal_if_background_expired(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        terminal_reason: str,
+        *,
+        expires_at_lte: datetime,
+        expected_execution_revision: int | None = None,
+        pending_event=None,
+    ) -> int | None:
+        if status not in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT):
+            raise ValueError(f"non-terminal status: {status}")
+        now = datetime.now()
+        statement = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .where(SessionModel.status == SessionStatus.RUNNING.value)
+            .where(SessionModel.execution_mode == "background")
+            .where(SessionModel.execution_phase.in_(("running", "suspended")))
+            .where(SessionModel.expires_at.is_not(None))
+            .where(SessionModel.expires_at <= expires_at_lte)
+        )
+        if expected_execution_revision is not None:
+            statement = statement.where(
+                SessionModel.execution_revision == expected_execution_revision
+            )
+        values = dict(
+                status=status.value,
+                mode_revision=SessionModel.mode_revision + 1,
+                completed_at=now,
+                terminal_reason=terminal_reason,
+                execution_phase="terminated",
+                last_activity_at=now,
+                updated_at=now,
+                execution_revision=SessionModel.execution_revision + 1,
+                # Watchdog termination is already exposed by the durable
+                # terminal status/notification path.  It has no AgentService
+                # emitter, so carrying an execution-state outbox here would be
+                # unreachable.  Also discard an older mode event superseded by
+                # this terminal transition.
+                pending_execution_event=(
+                    pending_event.model_dump(mode="json")
+                    if pending_event is not None
+                    else None
+                ),
+        )
+        result = await self.db_session.execute(
+            statement.values(**values).returning(SessionModel.execution_revision)
+        )
+        return result.scalar_one_or_none()
 
     async def update_terminal_reason(
         self,

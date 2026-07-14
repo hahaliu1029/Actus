@@ -84,9 +84,12 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+
+from redis.exceptions import LockError, LockNotOwnedError
 
 
 _FAILED_REASON_MAX = 256
@@ -94,6 +97,13 @@ _FAILED_REASON_MAX = 256
 table. Mirror of ``coordinator_apply_audit.failed_reason String(256)``.
 Truncate at the applier boundary so DB inserts never raise from an
 oversized exception traceback masking the real apply outcome."""
+
+_APPLY_LOCK_TTL_SECONDS = 600.0
+
+
+def coordinator_apply_lock_key(coordinator_run_id: str) -> str:
+    """Canonical Redis key shared by apply and rehydrate lock probing."""
+    return f"coordinator:apply:{coordinator_run_id}"
 
 
 def _compute_plan_hash(plan: "PatchApplyPlan") -> str:
@@ -192,6 +202,7 @@ class ApplyStatus(StrEnum):
     WRITE_IO_ERROR = "write_io_error"
     ROLLBACK_PARTIAL = "rollback_partial"
     APPLY_ABORTED = "apply_aborted"
+    APPLY_LOCK_LOST = "apply_lock_lost"
     TARGET_SPECIAL_FILE = "target_special_file"
     PARENT_NOT_REGULAR = "parent_not_regular"
 
@@ -231,6 +242,8 @@ class ApplyOutcome:
 # of the runtime import graph (it lives in domain/models/event.py and
 # pulls in pydantic at import time).
 _EmitEventCallable = Callable[[Any], Awaitable[None]]
+_RollbackPhaseCallback = Callable[[], None]
+_LeaseSleepCallable = Callable[[float], Awaitable[None]]
 
 
 class PatchApplier:
@@ -258,11 +271,17 @@ class PatchApplier:
         audit_repo: "CoordinatorApplyAuditRepository",
         redis: Any,
         emit_event: _EmitEventCallable,
+        apply_lock_ttl_seconds: float = _APPLY_LOCK_TTL_SECONDS,
+        lease_sleep: _LeaseSleepCallable = asyncio.sleep,
     ) -> None:
+        if apply_lock_ttl_seconds <= 0:
+            raise ValueError("apply_lock_ttl_seconds must be > 0")
         self._snapshot_store = snapshot_store
         self._audit_repo = audit_repo
         self._redis = redis
         self._emit_event = emit_event
+        self._apply_lock_ttl_seconds = float(apply_lock_ttl_seconds)
+        self._lease_sleep = lease_sleep
 
     async def apply(
         self,
@@ -272,13 +291,14 @@ class PatchApplier:
         minio_client: "ArtifactStoragePort",
         cancel_event: Optional[asyncio.Event] = None,
         lineage: Optional["GroupLineageFields"] = None,
+        on_rollback: Optional[_RollbackPhaseCallback] = None,
     ) -> ApplyOutcome:
         """Apply ``plan`` to ``parent_sandbox``; return ``ApplyOutcome``.
 
-        Holds a Redis lock for the duration. ``timeout=600`` is the
-        lock's auto-expire TTL (Redis releases it after 10 minutes if
-        our pod hangs); ``blocking=False`` means we fail-fast if another
-        apply is in flight for the same run_id (idempotency guard).
+        Holds an owner-token Redis lease for the duration. ``timeout=600``
+        is only the crash-cleanup window: a background task renews the same
+        owner every TTL/3, so it is not an apply wallclock. ``blocking=False``
+        still fails fast if another owner is applying the same run.
 
         [PR-9b-B INV-B4] ``lineage`` carries the group-level
         ``root_session_id`` / ``parent_session_id`` so the emitted
@@ -290,13 +310,129 @@ class PatchApplier:
         apply event because apply is a group-level operation.
         """
         started_at = time.time()
-        lock_key = f"coordinator:apply:{plan.coordinator_run_id}"
-        async with self._redis.lock(
-            lock_key, blocking=False, timeout=600,
-        ):
+        lock_key = coordinator_apply_lock_key(plan.coordinator_run_id)
+        lock = self._redis.lock(
+            lock_key,
+            blocking=False,
+            timeout=self._apply_lock_ttl_seconds,
+        )
+        owner_token = uuid.uuid4().hex
+        acquired = await lock.acquire(blocking=False, token=owner_token)
+        if not acquired:
+            raise LockError(f"apply lock already held: {lock_key}")
+
+        lock_lost = asyncio.Event()
+        renew_task = asyncio.create_task(
+            self._renew_apply_lock(
+                lock,
+                lock_lost,
+                coordinator_run_id=plan.coordinator_run_id,
+            ),
+            name=f"apply-lock-renew:{plan.coordinator_run_id}",
+        )
+        try:
             return await self._apply_locked(
                 plan, parent_sandbox, minio_client, cancel_event, started_at,
+                apply_lock=lock,
+                lock_lost=lock_lost,
                 lineage=lineage,
+                on_rollback=on_rollback,
+            )
+        finally:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+            await self._release_apply_lock_if_owned(
+                lock,
+                coordinator_run_id=plan.coordinator_run_id,
+            )
+
+    async def _renew_apply_lock(
+        self,
+        lock: Any,
+        lock_lost: asyncio.Event,
+        *,
+        coordinator_run_id: str,
+    ) -> None:
+        """Renew only the currently-owned token; never reacquire a lost lock."""
+        renew_interval = self._apply_lock_ttl_seconds / 3
+        while not lock_lost.is_set():
+            await self._lease_sleep(renew_interval)
+            if lock_lost.is_set():
+                return
+            try:
+                if not await lock.owned():
+                    lock_lost.set()
+                    logger.error(
+                        "PatchApplier apply lock owner lost run=%s",
+                        coordinator_run_id,
+                    )
+                    return
+                extended = await lock.extend(
+                    self._apply_lock_ttl_seconds,
+                    replace_ttl=True,
+                )
+                if not extended:
+                    lock_lost.set()
+                    logger.error(
+                        "PatchApplier apply lock renewal rejected run=%s",
+                        coordinator_run_id,
+                    )
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                lock_lost.set()
+                logger.exception(
+                    "PatchApplier apply lock renewal failed run=%s",
+                    coordinator_run_id,
+                )
+                return
+
+    async def _apply_lock_is_owned(
+        self,
+        lock: Any,
+        lock_lost: asyncio.Event,
+        *,
+        coordinator_run_id: str,
+    ) -> bool:
+        """Fail closed when ownership cannot be verified at a write boundary."""
+        if lock_lost.is_set():
+            return False
+        try:
+            owned = bool(await lock.owned())
+        except Exception:
+            logger.exception(
+                "PatchApplier apply lock ownership probe failed run=%s",
+                coordinator_run_id,
+            )
+            owned = False
+        if not owned:
+            lock_lost.set()
+        return owned
+
+    async def _release_apply_lock_if_owned(
+        self,
+        lock: Any,
+        *,
+        coordinator_run_id: str,
+    ) -> None:
+        """Best-effort compare-owner release; never mask the apply outcome."""
+        try:
+            if not await lock.owned():
+                return
+            await lock.release()
+        except LockNotOwnedError:
+            logger.warning(
+                "PatchApplier apply lock changed owner before release run=%s",
+                coordinator_run_id,
+            )
+        except Exception:
+            logger.exception(
+                "PatchApplier apply lock release failed run=%s",
+                coordinator_run_id,
             )
 
     async def _apply_locked(
@@ -307,7 +443,10 @@ class PatchApplier:
         cancel_event: Optional[asyncio.Event],
         started_at: float,
         *,
+        apply_lock: Any,
+        lock_lost: asyncio.Event,
         lineage: Optional["GroupLineageFields"] = None,
+        on_rollback: Optional[_RollbackPhaseCallback] = None,
     ) -> ApplyOutcome:
         # ── Step 2: cancel-before-write fast-path ────────────────────────
         # Nothing has been written, no audit row exists — return cleanly
@@ -417,6 +556,22 @@ class PatchApplier:
                     # Snapshot AFTER digest match — saves wasted
                     # snapshot write on the abort path.
                     orig = await parent_sandbox.read_file(e.path)
+                    if not await self._apply_lock_is_owned(
+                        apply_lock,
+                        lock_lost,
+                        coordinator_run_id=plan.coordinator_run_id,
+                    ):
+                        return await self._finish_apply_lock_lost(
+                            audit_id=audit_id,
+                            failed_path=e.path,
+                            applied=[],
+                            snapshots=snapshots,
+                            parent_sandbox=parent_sandbox,
+                            plan=plan,
+                            started_at=started_at,
+                            lineage=lineage,
+                            on_rollback=on_rollback,
+                        )
                     snap = await self._snapshot_store.save(
                         coordinator_run_id=plan.coordinator_run_id,
                         path=e.path,
@@ -424,6 +579,22 @@ class PatchApplier:
                         original_digest=e.base_digest,
                     )
                     snapshots.append(snap)
+                    if not await self._apply_lock_is_owned(
+                        apply_lock,
+                        lock_lost,
+                        coordinator_run_id=plan.coordinator_run_id,
+                    ):
+                        return await self._finish_apply_lock_lost(
+                            audit_id=audit_id,
+                            failed_path=e.path,
+                            applied=[],
+                            snapshots=snapshots,
+                            parent_sandbox=parent_sandbox,
+                            plan=plan,
+                            started_at=started_at,
+                            lineage=lineage,
+                            on_rollback=on_rollback,
+                        )
                 elif e.op == "add":
                     # [S2 PR-4 §3.4 R4-H] kind invariant: an add target MUST be
                     # missing. check_path (lstat, no symlink follow) replaces the
@@ -477,10 +648,29 @@ class PatchApplier:
         # ── Step 4: actual apply ─────────────────────────────────────────
         applied: list[AppliedFileRecord] = []
         for e in plan.files:
+            # Lease loss outranks a simultaneous cooperative cancel: a lost
+            # distributed owner is an independent safety diagnosis and must
+            # stop the next filesystem write.
+            if not await self._apply_lock_is_owned(
+                apply_lock,
+                lock_lost,
+                coordinator_run_id=plan.coordinator_run_id,
+            ):
+                return await self._finish_apply_lock_lost(
+                    audit_id=audit_id,
+                    failed_path=e.path,
+                    applied=applied,
+                    snapshots=snapshots,
+                    parent_sandbox=parent_sandbox,
+                    plan=plan,
+                    started_at=started_at,
+                    lineage=lineage,
+                    on_rollback=on_rollback,
+                )
             # Per-entry cancel check (rollback any writes already in flight).
             if cancel_event is not None and cancel_event.is_set():
-                rb, rb_failed = await self._rollback(
-                    applied, snapshots, parent_sandbox, plan,
+                rb, rb_failed = await self._rollback_with_phase(
+                    applied, snapshots, parent_sandbox, plan, on_rollback,
                 )
                 final_status = (
                     ApplyStatus.ROLLBACK_PARTIAL
@@ -501,6 +691,23 @@ class PatchApplier:
             try:
                 if e.op == "delete":
                     await parent_sandbox.delete_file(e.path)
+                    applied.append(AppliedFileRecord(path=e.path, op=e.op))
+                    if not await self._apply_lock_is_owned(
+                        apply_lock,
+                        lock_lost,
+                        coordinator_run_id=plan.coordinator_run_id,
+                    ):
+                        return await self._finish_apply_lock_lost(
+                            audit_id=audit_id,
+                            failed_path=e.path,
+                            applied=applied,
+                            snapshots=snapshots,
+                            parent_sandbox=parent_sandbox,
+                            plan=plan,
+                            started_at=started_at,
+                            lineage=lineage,
+                            on_rollback=on_rollback,
+                        )
                 else:  # add or modify
                     try:
                         content = await minio_client.get_bytes(e.content_ref)
@@ -508,8 +715,8 @@ class PatchApplier:
                         # Distinguish minio fetch from sandbox write
                         # failures so operators can debug the right
                         # subsystem.
-                        rb, rb_failed = await self._rollback(
-                            applied, snapshots, parent_sandbox, plan,
+                        rb, rb_failed = await self._rollback_with_phase(
+                            applied, snapshots, parent_sandbox, plan, on_rollback,
                         )
                         final_status = (
                             ApplyStatus.ROLLBACK_PARTIAL
@@ -530,6 +737,22 @@ class PatchApplier:
                             rollback_status=rb,
                             rollback_failed_paths=rb_failed,
                         )
+                    if not await self._apply_lock_is_owned(
+                        apply_lock,
+                        lock_lost,
+                        coordinator_run_id=plan.coordinator_run_id,
+                    ):
+                        return await self._finish_apply_lock_lost(
+                            audit_id=audit_id,
+                            failed_path=e.path,
+                            applied=applied,
+                            snapshots=snapshots,
+                            parent_sandbox=parent_sandbox,
+                            plan=plan,
+                            started_at=started_at,
+                            lineage=lineage,
+                            on_rollback=on_rollback,
+                        )
                     # [codex R5 P1] Verify the actual blob size matches
                     # the manifest's declared ``content_size``. The
                     # post-write digest check (read-from-sandbox)
@@ -541,8 +764,8 @@ class PatchApplier:
                         e.content_size is not None
                         and len(content) != e.content_size
                     ):
-                        rb, rb_failed = await self._rollback(
-                            applied, snapshots, parent_sandbox, plan,
+                        rb, rb_failed = await self._rollback_with_phase(
+                            applied, snapshots, parent_sandbox, plan, on_rollback,
                         )
                         final_status = (
                             ApplyStatus.ROLLBACK_PARTIAL
@@ -575,8 +798,8 @@ class PatchApplier:
                     # of the NEXT loop iteration — too late if this is
                     # the last entry.
                     if cancel_event is not None and cancel_event.is_set():
-                        rb, rb_failed = await self._rollback(
-                            applied, snapshots, parent_sandbox, plan,
+                        rb, rb_failed = await self._rollback_with_phase(
+                            applied, snapshots, parent_sandbox, plan, on_rollback,
                         )
                         final_status = (
                             ApplyStatus.ROLLBACK_PARTIAL
@@ -595,6 +818,26 @@ class PatchApplier:
                             rollback_failed_paths=rb_failed,
                         )
                     await parent_sandbox.atomic_write_file(e.path, content)
+                    # The write completed before the await returned. Record it
+                    # before probing ownership so a loss at this boundary rolls
+                    # back this file as well as earlier ones.
+                    applied.append(AppliedFileRecord(path=e.path, op=e.op))
+                    if not await self._apply_lock_is_owned(
+                        apply_lock,
+                        lock_lost,
+                        coordinator_run_id=plan.coordinator_run_id,
+                    ):
+                        return await self._finish_apply_lock_lost(
+                            audit_id=audit_id,
+                            failed_path=e.path,
+                            applied=applied,
+                            snapshots=snapshots,
+                            parent_sandbox=parent_sandbox,
+                            plan=plan,
+                            started_at=started_at,
+                            lineage=lineage,
+                            on_rollback=on_rollback,
+                        )
                     # Post-write digest verify: read the file back from the
                     # sandbox and compare. The previous version hashed the
                     # bytes we just sent, which only confirms our local
@@ -603,14 +846,25 @@ class PatchApplier:
                     # RPC per entry but is the only correct way to catch
                     # sandbox-side write defects ([codex R1 P1#1]).
                     actual = await parent_sandbox.compute_digest(e.path)
-                    if actual != e.new_digest:
-                        # Record this entry as applied so _rollback can
-                        # undo it alongside any prior successful entries.
-                        applied.append(
-                            AppliedFileRecord(path=e.path, op=e.op),
+                    if not await self._apply_lock_is_owned(
+                        apply_lock,
+                        lock_lost,
+                        coordinator_run_id=plan.coordinator_run_id,
+                    ):
+                        return await self._finish_apply_lock_lost(
+                            audit_id=audit_id,
+                            failed_path=e.path,
+                            applied=applied,
+                            snapshots=snapshots,
+                            parent_sandbox=parent_sandbox,
+                            plan=plan,
+                            started_at=started_at,
+                            lineage=lineage,
+                            on_rollback=on_rollback,
                         )
-                        rb, rb_failed = await self._rollback(
-                            applied, snapshots, parent_sandbox, plan,
+                    if actual != e.new_digest:
+                        rb, rb_failed = await self._rollback_with_phase(
+                            applied, snapshots, parent_sandbox, plan, on_rollback,
                         )
                         final_status = (
                             ApplyStatus.ROLLBACK_PARTIAL
@@ -633,7 +887,6 @@ class PatchApplier:
                             rollback_status=rb,
                             rollback_failed_paths=rb_failed,
                         )
-                applied.append(AppliedFileRecord(path=e.path, op=e.op))
             except Exception as exc:
                 # Any other failure in the apply loop (sandbox RPC, OS
                 # error, etc.). Rollback the already-completed entries
@@ -673,8 +926,8 @@ class PatchApplier:
                 # restore write fails on a file the apply write never
                 # actually touched (typical case: 4xx-class RPC failure
                 # before any byte hit the sandbox).
-                rb, rb_failed = await self._rollback(
-                    applied, snapshots, parent_sandbox, plan,
+                rb, rb_failed = await self._rollback_with_phase(
+                    applied, snapshots, parent_sandbox, plan, on_rollback,
                 )
                 final_status = (
                     ApplyStatus.ROLLBACK_PARTIAL
@@ -707,6 +960,34 @@ class PatchApplier:
         )
 
     # ── helpers ──────────────────────────────────────────────────────────
+
+    async def _rollback_with_phase(
+        self,
+        applied: list[AppliedFileRecord],
+        snapshots: list["FileSnapshot"],
+        parent_sandbox: "ParentSandboxPort",
+        plan: "PatchApplyPlan",
+        on_rollback: Optional[_RollbackPhaseCallback],
+    ) -> "tuple[str, list[str]]":
+        """Announce rollback before its first side effect, then always undo."""
+        if on_rollback is not None:
+            try:
+                on_rollback()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "PatchApplier rollback phase callback failed run=%s; "
+                    "rollback continues",
+                    plan.coordinator_run_id,
+                    exc_info=True,
+                )
+            except Exception:
+                logger.warning(
+                    "PatchApplier rollback phase callback failed run=%s; "
+                    "rollback continues",
+                    plan.coordinator_run_id,
+                    exc_info=True,
+                )
+        return await self._rollback(applied, snapshots, parent_sandbox, plan)
 
     async def _rollback(
         self,

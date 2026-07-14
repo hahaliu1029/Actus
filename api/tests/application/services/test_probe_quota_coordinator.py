@@ -1,15 +1,12 @@
 """Tests for ProbeQuotaService coordinator daily-cost + concurrency methods.
 
 Coverage:
-- §14.3 #2 — per-user daily cost cap (acquire_coordinator_daily_cost)
-- §14.3 #3 — per-user concurrency cap (acquire_coordinator_concurrency)
-- release_coordinator_quotas — combined rollback (best-effort)
+- per-user daily cost cap and rollback;
+- run-id ZSET acquire/renew/release service contracts;
+- fail-closed acquire/renew and best-effort exact release.
 
-These are SERVICE-LEVEL unit tests with mocks. The v1 implementation uses
-two non-atomic Redis ops (INCR then conditional DECR rollback) rather than
-a Lua script — the rollback closes the over-cap window in O(ms) and the
-coordinator concurrency cap is small (2). Real-Redis race tests are out
-of scope for this layer.
+These are mock-level adapter tests. Stateful lease semantics live in
+``test_probe_quota_coordinator_lease.py``.
 """
 from __future__ import annotations
 
@@ -44,6 +41,7 @@ def mock_redis() -> MagicMock:
     redis.client.incr = AsyncMock()
     redis.client.decr = AsyncMock()
     redis.client.expire = AsyncMock()
+    redis.client.eval = AsyncMock()
     return redis
 
 
@@ -198,50 +196,51 @@ class TestCoordinatorConcurrency:
     async def test_acquire_concurrency_under_cap(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """new_val <= cap → True; no rollback."""
-        mock_redis.client.incr.return_value = 1
+        """Lua accepts a new run-id member."""
+        mock_redis.client.eval.return_value = 1
 
         ok = await quota_service.acquire_coordinator_concurrency(
-            user_id="u-1", cap=2
+            user_id="u-1", coordinator_run_id="run-1", cap=2
         )
 
         assert ok is True
-        mock_redis.client.incr.assert_called_once_with("actus:coord:concurrent:u-1")
-        mock_redis.client.decr.assert_not_called()
+        assert mock_redis.client.eval.await_args.args[2:4] == (
+            "actus:coord:concurrent:u-1", "run-1",
+        )
 
     async def test_acquire_concurrency_at_cap_allowed(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """new_val == cap → True (predicate is strict `>` like daily cost)."""
-        mock_redis.client.incr.return_value = 2
+        """Lua result is authoritative at the cap boundary."""
+        mock_redis.client.eval.return_value = 1
 
         ok = await quota_service.acquire_coordinator_concurrency(
-            user_id="u-1", cap=2
+            user_id="u-1", coordinator_run_id="run-2", cap=2
         )
 
         assert ok is True
-        mock_redis.client.decr.assert_not_called()
 
     async def test_acquire_concurrency_exceeds_cap_rejected(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """new_val > cap → False; DECR rollback."""
-        mock_redis.client.incr.return_value = 3  # over cap 2
+        """Lua rejects a new member when the pruned ZSET is at cap."""
+        mock_redis.client.eval.return_value = 0
 
         ok = await quota_service.acquire_coordinator_concurrency(
-            user_id="u-1", cap=2
+            user_id="u-1", coordinator_run_id="run-3", cap=2
         )
 
         assert ok is False
-        mock_redis.client.decr.assert_called_once_with("actus:coord:concurrent:u-1")
 
     async def test_acquire_concurrency_redis_error_fail_closed(self) -> None:
-        """[fail-closed] If INCR raises, return False — do NOT raise."""
+        """[fail-closed] If EVAL raises, return False — do NOT raise."""
         redis_client = MagicMock()
         redis_client.client = MagicMock()
-        redis_client.client.incr = AsyncMock(side_effect=RuntimeError("redis down"))
+        redis_client.client.eval = AsyncMock(side_effect=RuntimeError("redis down"))
         svc = ProbeQuotaService(redis_client)
-        result = await svc.acquire_coordinator_concurrency(user_id="u1", cap=2)
+        result = await svc.acquire_coordinator_concurrency(
+            user_id="u1", coordinator_run_id="run", cap=2,
+        )
         assert result is False
 
     # ── Crash-recovery TTL (codex round 3 P1-5) ─────────────────────────
@@ -249,90 +248,63 @@ class TestCoordinatorConcurrency:
     async def test_acquire_concurrency_sets_ttl_for_crash_recovery(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """[Round 3 P1-5] Concurrency key MUST get an EXPIRE on successful
-        acquire so a pod that crashes between dispatch INCR and reducer
-        DECR doesn't permanently leak the slot.
-
-        The TTL is the 6h crash-recovery ceiling
-        (``CONCURRENCY_TTL_SECONDS``) — comfortably exceeds the longest
-        reasonable coordinator run (900s + 600s backstop + ops grace).
-        """
+        """Acquire passes the six-hour one-shot cleanup window to Lua."""
         from app.infrastructure.cache.probe_quota import (
             CONCURRENCY_TTL_SECONDS,
         )
 
-        mock_redis.client.incr.return_value = 1  # under cap
+        mock_redis.client.eval.return_value = 1
 
         ok = await quota_service.acquire_coordinator_concurrency(
-            user_id="u-1", cap=2
+            user_id="u-1", coordinator_run_id="run-1", cap=2
         )
 
         assert ok is True
-        mock_redis.client.expire.assert_awaited_once_with(
-            "actus:coord:concurrent:u-1", CONCURRENCY_TTL_SECONDS
+        assert mock_redis.client.eval.await_args.args[-1] == str(
+            CONCURRENCY_TTL_SECONDS
         )
         assert CONCURRENCY_TTL_SECONDS == 21600  # 6h = 21600s
-        # TTL is a CEILING, not a normal lifecycle — must comfortably
-        # exceed any single coordinator run.
-        assert CONCURRENCY_TTL_SECONDS > 3600  # at least 1h ceiling
+        assert CONCURRENCY_TTL_SECONDS > 3600
 
-    async def test_acquire_concurrency_no_ttl_on_rejection(
+    async def test_acquire_concurrency_rejection_uses_single_atomic_eval(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """When the acquire is rejected (over cap), the rollback DECR
-        runs but EXPIRE MUST NOT be called — the key is decremented back
-        to its prior level, not "extended for 6h".
-        """
-        mock_redis.client.incr.return_value = 3  # over cap 2
+        """A rejected acquire has no client-side rollback command."""
+        mock_redis.client.eval.return_value = 0
 
         ok = await quota_service.acquire_coordinator_concurrency(
-            user_id="u-1", cap=2
+            user_id="u-1", coordinator_run_id="run-3", cap=2
         )
 
         assert ok is False
-        mock_redis.client.decr.assert_awaited_once_with(
-            "actus:coord:concurrent:u-1"
-        )
         mock_redis.client.expire.assert_not_called()
 
-    async def test_acquire_concurrency_expire_failure_does_not_fail_acquire(
+    async def test_acquire_concurrency_eval_failure_is_observable_and_closed(
         self,
         quota_service: ProbeQuotaService,
         mock_redis: MagicMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """EXPIRE failure is observability — the slot is still legitimately
-        held by the INCR. The acquire MUST still return True; rolling back
-        the INCR would be a worse failure mode (lose a real slot to a
-        transient EXPIRE blip).
-
-        [Round 4 P2-2] Pin the WARNING log so a future refactor that
-        silently drops the observability signal trips the test instead of
-        landing dark in production.
-        """
+        """Atomic EVAL failure logs and rejects instead of bypassing cap."""
         import logging
 
-        mock_redis.client.incr.return_value = 1
-        mock_redis.client.expire.side_effect = RuntimeError("ttl set fail")
+        mock_redis.client.eval.side_effect = RuntimeError("eval failed")
 
         with caplog.at_level(
             logging.WARNING, logger="app.infrastructure.cache.probe_quota"
         ):
             ok = await quota_service.acquire_coordinator_concurrency(
-                user_id="u-1", cap=2
+                user_id="u-1", coordinator_run_id="run-1", cap=2
             )
 
-        assert ok is True
-        # INCR still happened; DECR did NOT (we still hold the slot).
-        mock_redis.client.decr.assert_not_called()
-        # The EXPIRE failure must surface in logs at WARNING so ops can
-        # detect a Redis transient that compromises crash-recovery TTL.
+        assert ok is False
         matching = [
             r for r in caplog.records
-            if r.levelno == logging.WARNING and "EXPIRE" in r.getMessage()
+            if r.levelno == logging.WARNING
+            and "acquire_coordinator_concurrency" in r.getMessage()
         ]
         assert matching, (
-            "expected a WARNING log mentioning EXPIRE failure; got: "
+            "expected a WARNING log mentioning acquire failure; got: "
             f"{[r.getMessage() for r in caplog.records]}"
         )
 
@@ -344,9 +316,9 @@ class TestRelease:
     async def test_release_with_cost_decrements_both(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """cost > 0 → INCRBYFLOAT(-cost) on daily key AND DECR concurrency."""
+        """cost rollback and exact run-id ZREM are independent operations."""
         await quota_service.release_coordinator_quotas(
-            user_id="u-1", cost_usd=12.5
+            user_id="u-1", coordinator_run_id="run-1", cost_usd=12.5
         )
 
         today = _dt.datetime.now(_dt.UTC).date().isoformat()
@@ -354,27 +326,31 @@ class TestRelease:
         conc_key = "actus:coord:concurrent:u-1"
 
         mock_redis.client.incrbyfloat.assert_called_once_with(daily_key, -12.5)
-        mock_redis.client.decr.assert_called_once_with(conc_key)
+        assert mock_redis.client.eval.await_args.args[2:] == (conc_key, "run-1")
 
-    async def test_release_zero_cost_only_decrements_concurrency(
+    async def test_release_zero_cost_only_removes_run_member(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """cost == 0 → skip daily INCRBYFLOAT; DECR concurrency only."""
+        """cost == 0 skips daily rollback and still removes the run member."""
         await quota_service.release_coordinator_quotas(
-            user_id="u-1", cost_usd=0.0
+            user_id="u-1", coordinator_run_id="run-1", cost_usd=0.0
         )
 
         mock_redis.client.incrbyfloat.assert_not_called()
-        mock_redis.client.decr.assert_called_once_with("actus:coord:concurrent:u-1")
+        assert mock_redis.client.eval.await_args.args[2:] == (
+            "actus:coord:concurrent:u-1", "run-1",
+        )
 
-    async def test_release_default_cost_only_decrements_concurrency(
+    async def test_release_default_cost_only_removes_run_member(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
         """Default cost_usd=0.0 → no daily rollback."""
-        await quota_service.release_coordinator_quotas(user_id="u-1")
+        await quota_service.release_coordinator_quotas(
+            user_id="u-1", coordinator_run_id="run-1",
+        )
 
         mock_redis.client.incrbyfloat.assert_not_called()
-        mock_redis.client.decr.assert_called_once()
+        mock_redis.client.eval.assert_awaited_once()
 
     async def test_release_swallows_redis_error_on_incrbyfloat(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
@@ -384,18 +360,18 @@ class TestRelease:
 
         # Must NOT raise.
         await quota_service.release_coordinator_quotas(
-            user_id="u-1", cost_usd=10.0
+            user_id="u-1", coordinator_run_id="run-1", cost_usd=10.0
         )
 
-    async def test_release_swallows_redis_error_on_decr(
+    async def test_release_swallows_redis_error_on_zrem(
         self, quota_service: ProbeQuotaService, mock_redis: MagicMock
     ) -> None:
-        """Concurrency DECR failure must NOT raise."""
-        mock_redis.client.decr.side_effect = Exception("Redis down")
+        """Concurrency ZREM failure must NOT raise."""
+        mock_redis.client.eval.side_effect = Exception("Redis down")
 
         # Must NOT raise.
         await quota_service.release_coordinator_quotas(
-            user_id="u-1", cost_usd=0.0
+            user_id="u-1", coordinator_run_id="run-1", cost_usd=0.0
         )
 
     async def test_release_negative_cost_is_treated_as_no_daily_rollback(
@@ -407,11 +383,11 @@ class TestRelease:
         when a daily rollback is desired.
         """
         await quota_service.release_coordinator_quotas(
-            user_id="u-1", cost_usd=-5.0
+            user_id="u-1", coordinator_run_id="run-1", cost_usd=-5.0
         )
 
         mock_redis.client.incrbyfloat.assert_not_called()
-        mock_redis.client.decr.assert_called_once()
+        mock_redis.client.eval.assert_awaited_once()
 
 
 # ── Key derivation ────────────────────────────────────────────────────────────

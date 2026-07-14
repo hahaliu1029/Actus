@@ -593,6 +593,14 @@ class DockerSandbox(Sandbox):
             f"在经过{max_retries}次尝试后仍无法确认Sandbox Supervisor状态信息"
         )
 
+    async def renew_timeout_lease(self, minutes: Optional[int] = None) -> None:
+        """精确重置sandbox cleanup lease，不取得destroy ownership。"""
+        response = await self.client.post(
+            f"{self._base_url}/api/supervisor/reset-timeout",
+            json={"minutes": minutes},
+        )
+        response.raise_for_status()
+
     async def read_file(
         self,
         filepath: str,

@@ -52,10 +52,37 @@ class _NoopAsyncCM:
     just needs the with-block to enter and exit without exception.
     """
 
+    def __init__(self) -> None:
+        self.token: str | None = None
+        self.release_calls = 0
+
+    async def acquire(
+        self, *, blocking: bool = False, token: str | None = None,
+    ) -> bool:
+        assert blocking is False
+        self.token = token
+        return True
+
+    async def owned(self) -> bool:
+        return self.token is not None
+
+    async def extend(
+        self, additional_time: float, *, replace_ttl: bool = False,
+    ) -> bool:
+        assert additional_time > 0
+        assert replace_ttl is True
+        return True
+
+    async def release(self) -> None:
+        self.release_calls += 1
+        self.token = None
+
     async def __aenter__(self) -> "_NoopAsyncCM":
+        self.token = "legacy-context-owner"
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        self.token = None
         return None
 
 
@@ -192,6 +219,51 @@ def _add_plan() -> PatchApplyPlan:
         file_count=1,
         source_work_unit_ids=("wu1",),
     )
+
+
+async def test_rollback_phase_callback_runs_before_rollback_side_effect(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+) -> None:
+    events: list[str] = []
+
+    def on_rollback() -> None:
+        events.append("phase")
+
+    async def rollback(*_args):
+        events.append("rollback")
+        return "complete", []
+
+    applier._rollback = AsyncMock(side_effect=rollback)  # type: ignore[method-assign]
+    await applier._rollback_with_phase(
+        [], [], parent_sandbox, _add_plan(), on_rollback,
+    )
+
+    assert events == ["phase", "rollback"]
+
+
+@pytest.mark.parametrize(
+    "callback_error",
+    [RuntimeError("phase failed"), asyncio.CancelledError()],
+)
+async def test_rollback_phase_callback_error_never_blocks_real_rollback(
+    applier: PatchApplier,
+    parent_sandbox: MagicMock,
+    callback_error: BaseException,
+    caplog,
+) -> None:
+    def on_rollback() -> None:
+        raise callback_error
+
+    applier._rollback = AsyncMock(return_value=("complete", []))  # type: ignore[method-assign]
+
+    result = await applier._rollback_with_phase(
+        [], [], parent_sandbox, _add_plan(), on_rollback,
+    )
+
+    assert result == ("complete", [])
+    applier._rollback.assert_awaited_once()
+    assert "rollback phase callback failed" in caplog.text
 
 
 # ─── Happy path ──────────────────────────────────────────────────────────────
@@ -926,6 +998,379 @@ async def test_add_over_regular_target_is_file_exists_via_check_path(
     parent_sandbox.check_path.assert_awaited_once_with("d/new.py")
     parent_sandbox.exists.assert_not_called()  # add no longer consults exists()
     parent_sandbox.atomic_write_file.assert_not_called()
+
+
+# ─── Task 11: owner-scoped rolling apply-lock lease ──────────────────────────
+
+
+class _LeaseState:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.owner: str | None = None
+        self.expires_at = 0.0
+
+
+class _OwnerLeaseLock:
+    def __init__(
+        self,
+        state: _LeaseState,
+        *,
+        timeout: float,
+        fail_renew_owned: bool = False,
+        fail_extend: str | None = None,
+        renew_failed: asyncio.Event | None = None,
+    ) -> None:
+        self.state = state
+        self.timeout = timeout
+        self.local_token: str | None = None
+        self.fail_renew_owned = fail_renew_owned
+        self.fail_extend = fail_extend
+        self.renew_failed = renew_failed
+        self.owned_calls = 0
+        self.extend_calls = 0
+        self.release_calls = 0
+
+    async def acquire(
+        self, *, blocking: bool = False, token: str | None = None,
+    ) -> bool:
+        assert blocking is False
+        assert token
+        if self.state.owner is not None and self.state.now < self.state.expires_at:
+            return False
+        self.local_token = token
+        self.state.owner = token
+        self.state.expires_at = self.state.now + self.timeout
+        return True
+
+    async def owned(self) -> bool:
+        self.owned_calls += 1
+        # The blocked preflight in the failure tests makes the renew loop the
+        # first caller of owned(). This models either a compare-owner miss or
+        # a Redis read failure without relying on wall-clock sleeps.
+        if self.fail_renew_owned and self.owned_calls == 1:
+            if self.renew_failed is not None:
+                self.renew_failed.set()
+            return False
+        return (
+            self.local_token is not None
+            and self.state.owner == self.local_token
+            and self.state.now < self.state.expires_at
+        )
+
+    async def extend(
+        self, additional_time: float, *, replace_ttl: bool = False,
+    ) -> bool:
+        self.extend_calls += 1
+        assert replace_ttl is True
+        assert additional_time == self.timeout
+        if self.fail_extend is not None:
+            if self.renew_failed is not None:
+                self.renew_failed.set()
+            if self.fail_extend == "raise":
+                raise RuntimeError("redis unavailable during extend")
+            return False
+        if not await self.owned():
+            return False
+        self.state.expires_at = self.state.now + additional_time
+        return True
+
+    async def release(self) -> None:
+        from redis.exceptions import LockNotOwnedError
+
+        self.release_calls += 1
+        if not await self.owned():
+            raise LockNotOwnedError("replacement owner holds apply lock")
+        self.state.owner = None
+        self.local_token = None
+
+    def replace_owner(self, token: str = "replacement-owner") -> None:
+        self.state.owner = token
+        self.state.expires_at = self.state.now + self.timeout
+
+
+class _OwnerLeaseRedis:
+    def __init__(self, lock: _OwnerLeaseLock) -> None:
+        self._lock = lock
+        self.keys: list[str] = []
+
+    def lock(
+        self, key: str, *, blocking: bool, timeout: float,
+    ) -> _OwnerLeaseLock:
+        assert blocking is False
+        assert timeout == self._lock.timeout
+        self.keys.append(key)
+        return self._lock
+
+
+def _two_add_plan() -> PatchApplyPlan:
+    return PatchApplyPlan(
+        coordinator_run_id="r1",
+        files=(
+            FilePatchEntry(
+                path="d/a.py", op="add", new_digest=_NEW_DIGEST,
+                content_ref="ref-a", content_size=len(_NEW_CONTENT),
+            ),
+            FilePatchEntry(
+                path="d/b.py", op="add", new_digest=_NEW_DIGEST,
+                content_ref="ref-b", content_size=len(_NEW_CONTENT),
+            ),
+        ),
+        total_size_bytes=2 * len(_NEW_CONTENT),
+        file_count=2,
+        source_work_unit_ids=("wu1",),
+    )
+
+
+def _lease_applier(
+    *,
+    lock: _OwnerLeaseLock,
+    snapshot_store: MagicMock,
+    audit_repo: MagicMock,
+    emit_event: AsyncMock,
+    lease_sleep,
+) -> PatchApplier:
+    return PatchApplier(
+        snapshot_store=snapshot_store,
+        audit_repo=audit_repo,
+        redis=_OwnerLeaseRedis(lock),
+        emit_event=emit_event,
+        apply_lock_ttl_seconds=lock.timeout,
+        lease_sleep=lease_sleep,
+    )
+
+
+async def test_apply_lock_renews_past_600_seconds_of_fake_time(
+    snapshot_store: MagicMock,
+    audit_repo: MagicMock,
+    emit_event: AsyncMock,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    state = _LeaseState()
+    lock = _OwnerLeaseLock(state, timeout=600.0)
+    crossed_600 = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        assert delay == 200.0
+        state.now += delay
+        if state.now > 600:
+            crossed_600.set()
+        await asyncio.sleep(0)
+
+    async def delayed_check(_path: str) -> SandboxPathCheck:
+        await crossed_600.wait()
+        return SandboxPathCheck(exists=False, kind="missing")
+
+    parent_sandbox.check_path = AsyncMock(side_effect=delayed_check)
+    parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)
+    applier = _lease_applier(
+        lock=lock,
+        snapshot_store=snapshot_store,
+        audit_repo=audit_repo,
+        emit_event=emit_event,
+        lease_sleep=fake_sleep,
+    )
+
+    outcome = await applier.apply(
+        _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+
+    assert state.now > 600
+    assert lock.extend_calls >= 4
+    assert outcome.status is ApplyStatus.SUCCESS
+    assert lock.release_calls == 1
+
+
+@pytest.mark.parametrize("failure", ["owned", "extend_false", "extend_raise"])
+async def test_apply_lock_renew_failure_stops_before_first_write(
+    failure: str,
+    snapshot_store: MagicMock,
+    audit_repo: MagicMock,
+    emit_event: AsyncMock,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    state = _LeaseState()
+    renew_failed = asyncio.Event()
+    lock = _OwnerLeaseLock(
+        state,
+        timeout=600.0,
+        fail_renew_owned=failure == "owned",
+        fail_extend=(
+            "return_false" if failure == "extend_false"
+            else "raise" if failure == "extend_raise"
+            else None
+        ),
+        renew_failed=renew_failed,
+    )
+
+    async def immediate_sleep(_delay: float) -> None:
+        await asyncio.sleep(0)
+
+    async def delayed_check(_path: str) -> SandboxPathCheck:
+        await renew_failed.wait()
+        return SandboxPathCheck(exists=False, kind="missing")
+
+    parent_sandbox.check_path = AsyncMock(side_effect=delayed_check)
+    parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)
+    applier = _lease_applier(
+        lock=lock,
+        snapshot_store=snapshot_store,
+        audit_repo=audit_repo,
+        emit_event=emit_event,
+        lease_sleep=immediate_sleep,
+    )
+
+    outcome = await applier.apply(
+        _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+
+    assert outcome.status is ApplyStatus.APPLY_LOCK_LOST
+    assert outcome.failed_at is not None
+    assert outcome.failed_at.reason == "apply_lock_lost"
+    parent_sandbox.atomic_write_file.assert_not_awaited()
+    assert audit_repo.update_terminal.await_args.kwargs["status"] == "apply_lock_lost"
+
+
+async def test_apply_lock_loss_after_fetch_rolls_back_prior_write_and_skips_next(
+    snapshot_store: MagicMock,
+    audit_repo: MagicMock,
+    emit_event: AsyncMock,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    state = _LeaseState()
+    lock = _OwnerLeaseLock(state, timeout=600.0)
+    never = asyncio.Event()
+
+    async def dormant_sleep(_delay: float) -> None:
+        await never.wait()
+
+    fetch_count = 0
+
+    async def fetch(_ref: str) -> bytes:
+        nonlocal fetch_count
+        fetch_count += 1
+        if fetch_count == 2:
+            lock.replace_owner()
+        return _NEW_CONTENT
+
+    minio.get_bytes = AsyncMock(side_effect=fetch)
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=False, kind="missing"),
+    )
+    parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)
+    applier = _lease_applier(
+        lock=lock,
+        snapshot_store=snapshot_store,
+        audit_repo=audit_repo,
+        emit_event=emit_event,
+        lease_sleep=dormant_sleep,
+    )
+
+    outcome = await applier.apply(
+        _two_add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+
+    assert outcome.status is ApplyStatus.APPLY_LOCK_LOST
+    assert outcome.rollback_status == "complete"
+    parent_sandbox.atomic_write_file.assert_awaited_once_with(
+        "d/a.py", _NEW_CONTENT,
+    )
+    parent_sandbox.delete_file.assert_awaited_once_with("d/a.py")
+    assert state.owner == "replacement-owner"
+    assert lock.release_calls == 0
+
+
+async def test_apply_lock_loss_after_write_rolls_back_that_write(
+    snapshot_store: MagicMock,
+    audit_repo: MagicMock,
+    emit_event: AsyncMock,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    state = _LeaseState()
+    lock = _OwnerLeaseLock(state, timeout=600.0)
+    never = asyncio.Event()
+
+    async def dormant_sleep(_delay: float) -> None:
+        await never.wait()
+
+    async def write_then_replace(_path: str, _content: bytes) -> None:
+        lock.replace_owner()
+
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=False, kind="missing"),
+    )
+    parent_sandbox.atomic_write_file = AsyncMock(side_effect=write_then_replace)
+    parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)
+    applier = _lease_applier(
+        lock=lock,
+        snapshot_store=snapshot_store,
+        audit_repo=audit_repo,
+        emit_event=emit_event,
+        lease_sleep=dormant_sleep,
+    )
+
+    outcome = await applier.apply(
+        _add_plan(), parent_sandbox=parent_sandbox, minio_client=minio,
+    )
+
+    assert outcome.status is ApplyStatus.APPLY_LOCK_LOST
+    assert outcome.rollback_status == "complete"
+    parent_sandbox.delete_file.assert_awaited_once_with("d/new.py")
+    assert state.owner == "replacement-owner"
+    assert lock.release_calls == 0
+
+
+async def test_cancel_and_lock_loss_prefers_lock_lost_and_rolls_back_once(
+    snapshot_store: MagicMock,
+    audit_repo: MagicMock,
+    emit_event: AsyncMock,
+    parent_sandbox: MagicMock,
+    minio: MagicMock,
+) -> None:
+    state = _LeaseState()
+    lock = _OwnerLeaseLock(state, timeout=600.0)
+    never = asyncio.Event()
+    cancel = asyncio.Event()
+    rollback_phases = 0
+
+    async def dormant_sleep(_delay: float) -> None:
+        await never.wait()
+
+    async def write_then_race(_path: str, _content: bytes) -> None:
+        cancel.set()
+        lock.replace_owner()
+
+    def on_rollback() -> None:
+        nonlocal rollback_phases
+        rollback_phases += 1
+
+    parent_sandbox.check_path = AsyncMock(
+        return_value=SandboxPathCheck(exists=False, kind="missing"),
+    )
+    parent_sandbox.atomic_write_file = AsyncMock(side_effect=write_then_race)
+    parent_sandbox.compute_digest = AsyncMock(return_value=_NEW_DIGEST)
+    applier = _lease_applier(
+        lock=lock,
+        snapshot_store=snapshot_store,
+        audit_repo=audit_repo,
+        emit_event=emit_event,
+        lease_sleep=dormant_sleep,
+    )
+
+    outcome = await applier.apply(
+        _add_plan(),
+        parent_sandbox=parent_sandbox,
+        minio_client=minio,
+        cancel_event=cancel,
+        on_rollback=on_rollback,
+    )
+
+    assert outcome.status is ApplyStatus.APPLY_LOCK_LOST
+    assert rollback_phases == 1
+    parent_sandbox.delete_file.assert_awaited_once_with("d/new.py")
 
 
 async def test_symlink_modify_target_is_parent_not_regular(

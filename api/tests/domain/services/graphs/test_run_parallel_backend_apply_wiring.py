@@ -161,6 +161,59 @@ async def test_success_with_applier_returns_success_text() -> None:
     assert "2 个文件" in out
 
 
+async def test_apply_and_rollback_phases_precede_real_side_effects() -> None:
+    from contextlib import asynccontextmanager
+
+    from app.application.services.coordinator_parent_execution_lease import (
+        CoordinatorParentPhase,
+    )
+
+    events: list[str] = []
+
+    class Guard:
+        @asynccontextmanager
+        async def step_scope(self, _step_id):
+            yield
+
+        def set_phase(self, _step_id, _run_id, phase):
+            events.append(phase.value)
+
+    async def apply(*_args, **kwargs):
+        events.append("apply-side-effect")
+        kwargs["on_rollback"]()
+        events.append("rollback-side-effect")
+        return ApplyOutcome(
+            status=ApplyStatus.APPLY_ABORTED,
+            applied_files=(),
+            failed_at=None,
+            rollback_status="complete",
+            diagnostics=ApplyDiagnostics(duration_ms=1),
+        )
+
+    applier = MagicMock()
+    applier.apply = AsyncMock(side_effect=apply)
+    config = {"configurable": {
+        "parallel_execution_subgraph": _subgraph_with_final({
+            "group_outcome": GroupOutcome.SUCCESS,
+            "apply_plan": _plan(),
+            "step_result_candidate": "reducer-text",
+        }),
+        "patch_applier": applier,
+        "parent_sandbox": AsyncMock(),
+        "artifact_storage": AsyncMock(),
+        "coordinator_wait_guard": Guard(),
+    }}
+
+    await _run_parallel_backend(_state(), config, _step())
+
+    assert events == [
+        CoordinatorParentPhase.APPLYING.value,
+        "apply-side-effect",
+        CoordinatorParentPhase.ROLLBACK.value,
+        "rollback-side-effect",
+    ]
+
+
 async def test_apply_rollback_partial_surfaces_failed_path() -> None:
     subgraph = _subgraph_with_final({
         "group_outcome": GroupOutcome.SUCCESS,

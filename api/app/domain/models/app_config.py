@@ -255,7 +255,9 @@ class ToolConfirmationConfig(BaseModel):
 class ExecutionConfig(BaseModel):
     """执行健康监控配置"""
 
-    total_timeout_seconds: float = Field(default=600.0, ge=0, description="总执行超时秒数（0=无限制）")
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    total_timeout_seconds: float = Field(default=0.0, ge=0, description="总执行超时秒数（0=无限制）")
     idle_timeout_seconds: float = Field(default=120.0, ge=10, description="idle 无输出超时秒数")
     max_same_tool_failures: int = Field(default=3, ge=1, le=20, description="同签名工具最大连续失败数")
 

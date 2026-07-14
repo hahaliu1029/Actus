@@ -430,7 +430,11 @@ async def test_run_parallel_backend_constructs_applier_from_deps_with_emit() -> 
             captured_kwargs.update(kwargs)
 
         async def apply(self, plan, *, parent_sandbox, minio_client,
-                        cancel_event=None, lineage=None) -> ApplyOutcome:
+                        cancel_event=None, lineage=None,
+                        on_rollback=None) -> ApplyOutcome:
+            captured_kwargs["apply_on_rollback"] = on_rollback
+            if on_rollback is not None:
+                on_rollback()
             # Smoke the emit closure to confirm it dispatches into the
             # active per-stream queue.
             await captured_kwargs["emit_event"]("emit-from-applier")
@@ -480,6 +484,7 @@ async def test_run_parallel_backend_constructs_applier_from_deps_with_emit() -> 
     assert captured_kwargs["redis"] is deps.redis
     emit = captured_kwargs["emit_event"]
     assert inspect.iscoroutinefunction(emit)
+    assert "apply_on_rollback" in captured_kwargs
 
     # Closure dispatched into the per-stream queue (smoke fire from fake).
     assert event_queue.get_nowait() == "emit-from-applier"

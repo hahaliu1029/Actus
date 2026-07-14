@@ -230,6 +230,16 @@ class SessionModel(Base):
         default=False,
         server_default="false",
     )
+    execution_revision: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    pending_execution_event: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=None,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
@@ -286,12 +296,13 @@ class SessionModel(Base):
                     "updated_at",
                     "created_at",
                     "sandbox_binding",
+                    "pending_execution_event",
                 },
             ),
             # 2.复杂字段: 使用BaseModel提供的json字典转换格式
             **session.model_dump(
                 mode="json",
-                include={"memories", "files", "events"},
+                include={"memories", "files", "events", "pending_execution_event"},
             ),
         )
         # PR-4 contract: parent_session_id is the sole lineage source. Derive
@@ -330,6 +341,7 @@ class SessionModel(Base):
                 "updated_at",
                 "created_at",
                 "sandbox_binding",
+                "pending_execution_event",
                 "status",  # A4-1 §4: status transitions go only through SSM-owned repo mutators
             },
         )
@@ -337,7 +349,7 @@ class SessionModel(Base):
         # 2.复杂字段: JSON模式（排除 memories，由专用方法管理）
         json_data = session.model_dump(
             mode="json",
-            include={"files", "events"},
+            include={"files", "events", "pending_execution_event"},
         )
 
         # 3.合并更新

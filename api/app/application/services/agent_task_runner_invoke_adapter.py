@@ -53,6 +53,8 @@ class AgentTaskRunnerInvokeAdapter:
         task_cls: Any,
         child_permission_context: Any = None,
         coordinator_metrics_recorder: Any = None,
+        external_terminal_owner: bool = False,
+        external_heartbeat_owner: bool = False,
     ) -> None:
         self._runner = runner
         self._cancel_event = cancel_event
@@ -62,6 +64,11 @@ class AgentTaskRunnerInvokeAdapter:
         # non-coordinator adapter uses (subagent research) → _drain no-ops.
         self._child_permission_context = child_permission_context
         self._coordinator_metrics_recorder = coordinator_metrics_recorder
+        # Ownership mirrors are intentionally independent.  The raw runner
+        # enforces them; keeping the values on the adapter makes the complete
+        # factory → adapter → runner construction chain auditable.
+        self._external_terminal_owner = external_terminal_owner
+        self._external_heartbeat_owner = external_heartbeat_owner
         # Wire the coordinator cancel_event into the child flow so react_graph
         # cancel checkpoints observe it (child has coord_deps=None → its own
         # prime no-ops, so this injection survives). §5.1.1 INV-F1.11.

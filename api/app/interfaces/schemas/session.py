@@ -33,6 +33,7 @@ class SupervisorSnapshot(BaseModel):
     last_progress_at: Optional[datetime] = None
     is_alive: bool
     cancellation_state: Literal["none", "cancelling", "cancelled"] = "none"
+    execution_revision: int = Field(default=0, ge=0)
 
 
 class ListSessionItem(BaseModel):

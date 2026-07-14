@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.coordinator_liveness_lease_service import (
+    CoordinatorChildLease,
+)
 from app.application.services.mailbox_supervisor import (
     HandlerOutcome,
     MailboxSupervisor,
+    ResultReadyHandler,
     SupervisorContext,
 )
 from app.domain.models.mailbox_envelope import (
@@ -97,6 +103,372 @@ class _StubTelemetry:
 
     async def emit(self, name: str, data: dict) -> None:
         self.emitted.append((name, data))
+
+
+@pytest.mark.anyio
+async def test_startup_restore_registers_running_children_without_respawn(
+    supervisor_ctx,
+) -> None:
+    row = SimpleNamespace(
+        session_id="child-restore",
+        coordinator_run_id="run-restore",
+        work_unit_id="wu-restore",
+    )
+    supervisor_ctx.session_repo = SimpleNamespace(
+        find_running_mailbox_children_for_parent=AsyncMock(return_value=[row]),
+    )
+    lease = CoordinatorChildLease(
+        root_session_id="root-1",
+        parent_session_id="root-1",
+        child_session_id="child-restore",
+        coordinator_run_id="run-restore",
+        work_unit_id="wu-restore",
+        last_seen_epoch=1.0,
+        phase="starting",
+    )
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=lease),
+        is_stale=MagicMock(return_value=False),
+        record_startup_lease=AsyncMock(),
+        record_heartbeat=AsyncMock(),
+        mark_terminal=AsyncMock(),
+    )
+    supervisor_ctx.liveness_service = liveness
+    sup = MailboxSupervisor(supervisor_ctx)
+
+    await sup._restore_coordinator_liveness_after_startup()  # noqa: SLF001
+
+    assert sup._known_children == ["child-restore"]  # noqa: SLF001
+    liveness.record_startup_lease.assert_not_awaited()
+    assert not hasattr(supervisor_ctx, "child_runner_starter")
+
+
+@pytest.mark.anyio
+async def test_startup_restore_missing_lease_gets_full_startup_grace(
+    supervisor_ctx,
+) -> None:
+    row = SimpleNamespace(
+        session_id="child-missing",
+        coordinator_run_id="run-missing",
+        work_unit_id="wu-missing",
+    )
+    supervisor_ctx.session_repo = SimpleNamespace(
+        find_running_mailbox_children_for_parent=AsyncMock(return_value=[row]),
+    )
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=None),
+        is_stale=MagicMock(),
+        record_startup_lease=AsyncMock(return_value=SimpleNamespace()),
+        record_heartbeat=AsyncMock(),
+        mark_terminal=AsyncMock(),
+    )
+    supervisor_ctx.liveness_service = liveness
+    sup = MailboxSupervisor(supervisor_ctx)
+
+    await sup._restore_coordinator_liveness_after_startup()  # noqa: SLF001
+
+    liveness.record_startup_lease.assert_awaited_once_with(
+        root_session_id="root-1",
+        parent_session_id="root-1",
+        child_session_id="child-missing",
+        coordinator_run_id="run-missing",
+        work_unit_id="wu-missing",
+        last_seen_age_seconds=None,
+    )
+    assert sup.get_last_seen("child-missing") is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("application_clock", [-1_000_000.0, 1_000_000.0])
+async def test_startup_restore_uses_redis_time_stream_age_across_clock_offsets(
+    supervisor_ctx,
+    application_clock: float,
+) -> None:
+    row = SimpleNamespace(
+        session_id="child-history",
+        coordinator_run_id="run-history",
+        work_unit_id="wu-history",
+    )
+    supervisor_ctx.session_repo = SimpleNamespace(
+        find_running_mailbox_children_for_parent=AsyncMock(return_value=[row]),
+    )
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=None),
+        record_startup_lease=AsyncMock(return_value=SimpleNamespace()),
+    )
+    supervisor_ctx.liveness_service = liveness
+    supervisor_ctx.clock = lambda: application_clock
+    supervisor_ctx.redis.time = AsyncMock(
+        return_value=(1_720_000_095, 623_000),
+    )
+    sup = MailboxSupervisor(supervisor_ctx)
+    sup._latest_child_origin_entry_ms = AsyncMock(  # type: ignore[method-assign]
+        return_value=1_720_000_000_123,
+    )
+
+    await sup._restore_coordinator_liveness_after_startup()  # noqa: SLF001
+
+    liveness.record_startup_lease.assert_awaited_once_with(
+        root_session_id="root-1",
+        parent_session_id="root-1",
+        child_session_id="child-history",
+        coordinator_run_id="run-history",
+        work_unit_id="wu-history",
+        last_seen_age_seconds=95.5,
+    )
+
+
+@pytest.mark.anyio
+async def test_startup_restore_propagates_redis_time_failure_for_stream_age(
+    supervisor_ctx,
+) -> None:
+    row = SimpleNamespace(
+        session_id="child-history",
+        coordinator_run_id="run-history",
+        work_unit_id="wu-history",
+    )
+    supervisor_ctx.session_repo = SimpleNamespace(
+        find_running_mailbox_children_for_parent=AsyncMock(return_value=[row]),
+    )
+    supervisor_ctx.liveness_service = SimpleNamespace(
+        get_lease=AsyncMock(return_value=None),
+        record_startup_lease=AsyncMock(return_value=SimpleNamespace()),
+    )
+    supervisor_ctx.redis.time = AsyncMock(
+        side_effect=ConnectionError("redis TIME unavailable"),
+    )
+    sup = MailboxSupervisor(supervisor_ctx)
+    sup._latest_child_origin_entry_ms = AsyncMock(  # type: ignore[method-assign]
+        return_value=1_720_000_000_123,
+    )
+
+    with pytest.raises(ConnectionError, match="redis TIME unavailable"):
+        await sup._restore_coordinator_liveness_after_startup()  # noqa: SLF001
+
+
+@pytest.mark.anyio
+async def test_startup_restore_clamps_future_stream_id_to_zero_age(
+    supervisor_ctx,
+) -> None:
+    row = SimpleNamespace(
+        session_id="child-future",
+        coordinator_run_id="run-future",
+        work_unit_id="wu-future",
+    )
+    supervisor_ctx.session_repo = SimpleNamespace(
+        find_running_mailbox_children_for_parent=AsyncMock(return_value=[row]),
+    )
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=None),
+        record_startup_lease=AsyncMock(return_value=SimpleNamespace()),
+    )
+    supervisor_ctx.liveness_service = liveness
+    supervisor_ctx.redis.time = AsyncMock(return_value=(1_000, 0))
+    sup = MailboxSupervisor(supervisor_ctx)
+    sup._latest_child_origin_entry_ms = AsyncMock(  # type: ignore[method-assign]
+        return_value=1_000_001,
+    )
+
+    await sup._restore_coordinator_liveness_after_startup()  # noqa: SLF001
+
+    assert liveness.record_startup_lease.await_args.kwargs[
+        "last_seen_age_seconds"
+    ] == 0.0
+
+
+@pytest.mark.anyio
+async def test_stream_fallback_skips_newer_untrusted_entries_for_older_heartbeat(
+    supervisor_ctx,
+    fake_redis,
+) -> None:
+    stream_key = "actus:child:root-1:mailbox"
+    valid = _env().model_copy(update={
+        "correlation_id": "hb:child-1",
+        "emitted_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+    })
+    valid_id = await fake_redis.xadd(
+        stream_key,
+        {"envelope": valid.model_dump_json()},
+        id="1720000000000-0",
+    )
+    newer_untrusted = [
+        _env(t=MailboxEnvelopeType.RESULT_READY).model_copy(update={
+            "correlation_id": "run-1",
+        }),
+        _env(parent_session_id="other-root").model_copy(update={
+            "correlation_id": "hb:child-1",
+        }),
+        _env(producer_role=ProducerRole.PARENT_AGENT).model_copy(update={
+            "correlation_id": "hb:child-1",
+        }),
+        _env().model_copy(update={"correlation_id": "run-1"}),
+    ]
+    for index, envelope in enumerate(newer_untrusted, start=1):
+        await fake_redis.xadd(
+            stream_key,
+            {"envelope": envelope.model_dump_json()},
+            id=f"{1720000000000 + index}-0",
+        )
+    sup = MailboxSupervisor(supervisor_ctx)
+
+    restored_ms = await sup._latest_child_origin_entry_ms(  # noqa: SLF001
+        stream_key,
+        "child-1",
+    )
+
+    raw_id = valid_id.decode() if isinstance(valid_id, bytes) else valid_id
+    assert restored_ms == int(raw_id.split("-", 1)[0])
+
+
+@pytest.mark.anyio
+async def test_stale_restored_lease_reuses_existing_orphan_cascade(
+    supervisor_ctx,
+) -> None:
+    lease = CoordinatorChildLease(
+        root_session_id="root-1",
+        parent_session_id="root-1",
+        child_session_id="child-stale",
+        coordinator_run_id="run-stale",
+        work_unit_id="wu-stale",
+        last_seen_epoch=1.0,
+        phase="running",
+    )
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=lease),
+        is_stale=MagicMock(return_value=True),
+        record_startup_lease=AsyncMock(),
+        record_heartbeat=AsyncMock(),
+        mark_terminal=AsyncMock(),
+    )
+    supervisor_ctx.liveness_service = liveness
+    sup = MailboxSupervisor(supervisor_ctx)
+    sup._known_children = ["child-stale"]  # noqa: SLF001
+    sup._last_orphan_check_mono = -100.0  # noqa: SLF001
+    sup._emit_cascade_terminate = AsyncMock()  # type: ignore[method-assign]
+
+    await sup._maybe_tick_check_orphans()  # noqa: SLF001
+
+    sup._emit_cascade_terminate.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_rejected_coordinator_heartbeat_does_not_extend_local_liveness(
+    supervisor_ctx,
+) -> None:
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(),
+        record_heartbeat=AsyncMock(return_value=False),
+    )
+    supervisor_ctx.liveness_service = liveness
+    sup = MailboxSupervisor(supervisor_ctx)
+    envelope = _env(payload={"kind": "heartbeat", "visibility": "hidden"})
+
+    await sup._refresh_last_seen_if_child_origin(envelope)  # noqa: SLF001
+
+    assert sup.get_last_seen("child-1") is None
+    assert sup._known_children == []  # noqa: SLF001
+    liveness.get_lease.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_first_coordinator_heartbeat_tracks_child_only_after_durable_acceptance(
+    supervisor_ctx,
+) -> None:
+    liveness = SimpleNamespace(record_heartbeat=AsyncMock(return_value=True))
+    supervisor_ctx.liveness_service = liveness
+    supervisor_ctx.clock = lambda: 123.0
+    sup = MailboxSupervisor(supervisor_ctx)
+    envelope = _env(payload={"kind": "heartbeat", "visibility": "hidden"})
+
+    await sup._refresh_last_seen_if_child_origin(envelope)  # noqa: SLF001
+
+    liveness.record_heartbeat.assert_awaited_once_with(envelope)
+    assert sup.get_last_seen("child-1") == 123.0
+    assert sup._known_children == ["child-1"]  # noqa: SLF001
+
+
+@pytest.mark.anyio
+async def test_first_nonheartbeat_coordinator_event_switches_to_durable_authority(
+    supervisor_ctx,
+) -> None:
+    lease = CoordinatorChildLease(
+        root_session_id="root-1",
+        parent_session_id="root-1",
+        child_session_id="child-1",
+        coordinator_run_id="run-1",
+        work_unit_id="wu-1",
+        last_seen_epoch=1.0,
+        phase="starting",
+        authority_age_seconds=0.0,
+    )
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=lease),
+        is_stale=MagicMock(return_value=False),
+        record_heartbeat=AsyncMock(),
+    )
+    supervisor_ctx.liveness_service = liveness
+    supervisor_ctx.clock = lambda: 123.0
+    sup = MailboxSupervisor(supervisor_ctx)
+    envelope = _env(
+        payload={"kind": "tool_started", "visibility": "hidden"},
+    )
+
+    await sup._refresh_last_seen_if_child_origin(envelope)  # noqa: SLF001
+
+    assert sup._known_children == ["child-1"]  # noqa: SLF001
+    assert sup.get_last_seen("child-1") is None
+    liveness.record_heartbeat.assert_not_awaited()
+
+    sup._last_orphan_check_mono = 0.0  # noqa: SLF001
+    sup._emit_cascade_terminate = AsyncMock()  # type: ignore[method-assign]
+    await sup._maybe_tick_check_orphans()  # noqa: SLF001
+
+    liveness.is_stale.assert_called_once_with(lease)
+    sup._emit_cascade_terminate.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_first_nonheartbeat_legacy_event_keeps_local_liveness_fallback(
+    supervisor_ctx,
+) -> None:
+    liveness = SimpleNamespace(
+        get_lease=AsyncMock(return_value=None),
+        record_heartbeat=AsyncMock(),
+    )
+    supervisor_ctx.liveness_service = liveness
+    supervisor_ctx.clock = lambda: 123.0
+    sup = MailboxSupervisor(supervisor_ctx)
+    envelope = _env(
+        payload={"kind": "tool_started", "visibility": "hidden"},
+    )
+
+    await sup._refresh_last_seen_if_child_origin(envelope)  # noqa: SLF001
+
+    liveness.get_lease.assert_awaited_once_with("child-1")
+    assert sup._known_children == []  # noqa: SLF001
+    assert sup.get_last_seen("child-1") == 123.0
+
+
+@pytest.mark.anyio
+async def test_terminal_tombstone_failure_keeps_tracking_and_pel_side_effect(
+    supervisor_ctx,
+    stub_lifecycle,
+) -> None:
+    supervisor_ctx.terminalize_child = AsyncMock(return_value=True)
+    supervisor_ctx.liveness_service = SimpleNamespace(
+        mark_terminal=AsyncMock(side_effect=RuntimeError("redis down")),
+    )
+    sup = MailboxSupervisor(supervisor_ctx)
+    sup._last_seen_mono["child-1"] = 1.0  # noqa: SLF001
+    outcome = await ResultReadyHandler().handle(
+        _env(t=MailboxEnvelopeType.RESULT_READY), supervisor_ctx,
+    )
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await outcome.side_effect()
+
+    assert sup.get_last_seen("child-1") == 1.0
+    assert stub_lifecycle.destroy_calls == []
 
 
 def _env(
@@ -1420,7 +1792,7 @@ class TestClockRecovery:
                 eid="01HSPYU0Q00000000000000001",
                 producer_role=ProducerRole.CHILD_AGENT,
                 child_session_id="child-1",
-            )
+            ).model_copy(update={"correlation_id": "hb:child-1"})
         )
 
         sup = MailboxSupervisor(
@@ -2163,10 +2535,12 @@ class TestCancelAckHandlerDestroyClassification:
             payload={"final_state": "force_terminated"},
         )
         outcome = await handler.handle(env, supervisor_ctx)
-        # ack=True + no side_effect — _handle_envelope writes
-        # mark_processed on the ack-only path.
+        # ack=True + terminalize-only side_effect. Production runs its
+        # independently row-guarded CAS; this legacy context has no terminalizer
+        # port, so awaiting it is a no-op. Duplicate destroy/callback stay skipped.
         assert outcome.ack is True
-        assert outcome.side_effect is None
+        assert outcome.side_effect is not None
+        await outcome.side_effect()
         assert outcome.audit_payload == {"supervisor_echo": True}
         # The destroy must NOT fire — terminal handler already destroyed
         # the child on the originating TERMINATE side_effect.
@@ -2216,21 +2590,17 @@ class TestCancelAckHandlerDestroyClassification:
 
 
 class TestCancelAckHandlerEchoTrust:
-    """codex r9b [R9b-2, HIGH CONTRACT] — make the SUPERVISOR_ECHO trust
-    contract explicit (see ``CancelAckHandler`` docstring for the full
-    rationale).
+    """codex r9b [R9b-2, HIGH CONTRACT] — make the SUPERVISOR_ECHO cleanup
+    trust contract explicit (see ``CancelAckHandler`` for the full rationale).
 
     The supervisor-echo short-circuit (R2-4) is load-bearing for the
-    FORCE_TERMINATE flow but trusts the wire ``producer_role`` field
-    rather than verifying the envelope's origin. The trust contract is
-    intentional and parallel to the cross-root publisher trust
-    (codex r3 [R3-1]) — the publisher contract reserves
-    ``ProducerRole.SUPERVISOR_ECHO`` for the supervisor itself, and
-    cross-root verification is deferred to PR-5/PR-6 acceptance.
+    FORCE_TERMINATE flow and still trusts the wire ``producer_role`` for the
+    narrow decision to suppress duplicate destroy/callback. Task 4 terminal DB
+    authority is not covered by that trust: when the port is wired, the
+    application helper independently verifies the authoritative session row.
 
-    This test locks the behaviour so that a future change adding
-    defensive origin verification has to flip an explicit assertion and
-    that decision is reviewed against the trust contract.
+    This test locks only the duplicate-cleanup behaviour so a future origin
+    verification change has to flip an explicit assertion.
     """
 
     @pytest.mark.anyio
@@ -2245,9 +2615,8 @@ class TestCancelAckHandlerEchoTrust:
         A forged envelope presenting ``producer_role=SUPERVISOR_ECHO``
         with an arbitrary envelope_id (one that does NOT match the
         supervisor's synthetic ``ack:{hash}`` pattern) IS still honoured.
-        This documents the trust assumption — defensive origin
-        verification is intentionally deferred to PR-5/PR-6 alongside
-        cross-root ``child_session_id`` verification.
+        This documents the cleanup trust assumption; it does not bypass the
+        separate row guard for Task 4 terminal DB ownership.
         """
         from app.application.services.mailbox_supervisor import (
             CancelAckHandler,
@@ -2264,11 +2633,13 @@ class TestCancelAckHandlerEchoTrust:
             payload={"final_state": "force_terminated"},
         )
         outcome = await handler.handle(env, supervisor_ctx)
-        # Trust contract: SUPERVISOR_ECHO short-circuits regardless of
-        # envelope_id shape. ack=True + no side_effect; no destroy; no
-        # agent callback.
+        # Cleanup trust contract: SUPERVISOR_ECHO short-circuits duplicate
+        # destroy/callback regardless of envelope_id shape. This legacy context
+        # has no terminalizer port, so the side_effect is a no-op; production
+        # performs a separately row-guarded terminal CAS.
         assert outcome.ack is True
-        assert outcome.side_effect is None
+        assert outcome.side_effect is not None
+        await outcome.side_effect()
         assert outcome.audit_payload == {"supervisor_echo": True}
         assert stub_lifecycle.destroy_calls == []
         assert stub_agent_callback.received == []

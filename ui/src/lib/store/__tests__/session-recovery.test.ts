@@ -381,6 +381,7 @@ describe("recoverSession", () => {
 
     it("fetchSessionById keeps local cursor but trusts remote supervisor snapshot", async () => {
     const localSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "auto_degrade",
@@ -393,6 +394,7 @@ describe("recoverSession", () => {
       cancellation_state: "none",
     };
     const staleRemoteSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "foreground",
       execution_phase: "running",
       background_reason: null,
@@ -574,6 +576,7 @@ describe("recoverSession", () => {
 
   it("updates cursor and supervisor snapshot on zero-event reconnect", async () => {
     const supervisorSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "explicit",
@@ -621,6 +624,7 @@ describe("recoverSession", () => {
 
   it("keeps newer local supervisor snapshot when zero-event reconnect returns a stale cursor", async () => {
     const localSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "auto_degrade",
@@ -633,6 +637,7 @@ describe("recoverSession", () => {
       cancellation_state: "none",
     };
     const staleRemoteSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "foreground",
       execution_phase: "running",
       background_reason: null,
@@ -695,6 +700,7 @@ describe("recoverSession", () => {
           created_at: "2026-05-11T08:00:00Z",
           seq: 12,
           payload: {
+            execution_revision: 1,
             execution_mode: "background",
             execution_phase: "running",
             background_reason: "auto_degrade",
@@ -711,6 +717,7 @@ describe("recoverSession", () => {
     expect(session.status).toBe("running");
     expect(session.last_seq).toBe(12);
     expect(session.supervisor_snapshot).toMatchObject({
+      execution_revision: 1,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "auto_degrade",
@@ -718,6 +725,196 @@ describe("recoverSession", () => {
       retry_budget_remaining: 2,
       suspended_reason: null,
       terminal_reason: null,
+    });
+  });
+
+  it("ignores an older background execution event after a newer foreground transition", () => {
+    const foregroundSnapshot: SupervisorSnapshot = {
+      execution_revision: 2,
+      execution_mode: "foreground",
+      execution_phase: "running",
+      background_reason: null,
+      expires_at: null,
+      retry_budget_remaining: 2,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:01:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+
+    const session = __test_applySSEToSession(
+      {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 13,
+        supervisor_snapshot: foregroundSnapshot,
+        events: [],
+      },
+      {
+        type: "execution_state_changed",
+        data: {
+          event_id: "1000-14",
+          created_at: "2026-05-11T08:02:00Z",
+          seq: 14,
+          payload: {
+            execution_revision: 1,
+            execution_mode: "background",
+            execution_phase: "running",
+            background_reason: "auto_degrade",
+            transition_reason: "auto_degrade_sse_disconnect",
+            expires_at: "2026-05-11T08:30:00Z",
+            retry_budget_remaining: 2,
+            suspended_reason: null,
+            terminal_reason: null,
+          },
+        },
+      },
+    );
+
+    expect(session.supervisor_snapshot).toEqual(foregroundSnapshot);
+    expect(session.last_seq).toBe(14);
+  });
+
+  it("keeps an authoritative suspended snapshot when a stale event has the same revision", () => {
+    const suspendedSnapshot: SupervisorSnapshot = {
+      execution_revision: 1,
+      execution_mode: "background",
+      execution_phase: "suspended",
+      background_reason: "auto_degrade",
+      expires_at: null,
+      retry_budget_remaining: 0,
+      suspended_reason: "retry_budget_exhausted",
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:01:00Z",
+      is_alive: false,
+      cancellation_state: "none",
+    };
+
+    const session = __test_applySSEToSession(
+      {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 13,
+        supervisor_snapshot: suspendedSnapshot,
+        events: [],
+      },
+      {
+        type: "execution_state_changed",
+        data: {
+          event_id: "1000-14",
+          created_at: "2026-05-11T08:02:00Z",
+          seq: 14,
+          payload: {
+            execution_revision: 1,
+            execution_mode: "background",
+            execution_phase: "running",
+            background_reason: "auto_degrade",
+            transition_reason: "auto_degrade_sse_disconnect",
+            expires_at: "2026-05-11T08:30:00Z",
+            retry_budget_remaining: 2,
+            suspended_reason: null,
+            terminal_reason: null,
+          },
+        },
+      },
+    );
+
+    expect(session.supervisor_snapshot).toEqual(suspendedSnapshot);
+    expect(session.last_seq).toBe(14);
+  });
+
+  it("folds a legacy execution event when no supervisor snapshot exists", () => {
+    const session = __test_applySSEToSession(
+      {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        supervisor_snapshot: null,
+        events: [],
+      },
+      {
+        type: "execution_state_changed",
+        data: {
+          event_id: "1000-8",
+          created_at: "2026-05-11T08:00:00Z",
+          seq: 8,
+          payload: {
+            execution_mode: "background",
+            execution_phase: "running",
+            background_reason: "explicit",
+            expires_at: null,
+            retry_budget_remaining: 3,
+            suspended_reason: null,
+            terminal_reason: null,
+          },
+        },
+      },
+    );
+
+    expect(session.supervisor_snapshot).toMatchObject({
+      execution_revision: 0,
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "explicit",
+    });
+  });
+
+  it("lets a higher-revision execution event replace an authoritative snapshot", () => {
+    const suspendedSnapshot: SupervisorSnapshot = {
+      execution_revision: 1,
+      execution_mode: "background",
+      execution_phase: "suspended",
+      background_reason: "auto_degrade",
+      expires_at: null,
+      retry_budget_remaining: 0,
+      suspended_reason: "retry_budget_exhausted",
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:01:00Z",
+      is_alive: false,
+      cancellation_state: "none",
+    };
+
+    const session = __test_applySSEToSession(
+      {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 13,
+        supervisor_snapshot: suspendedSnapshot,
+        events: [],
+      },
+      {
+        type: "execution_state_changed",
+        data: {
+          event_id: "1000-14",
+          created_at: "2026-05-11T08:02:00Z",
+          seq: 14,
+          payload: {
+            execution_revision: 2,
+            execution_mode: "background",
+            execution_phase: "running",
+            background_reason: "explicit",
+            transition_reason: "explicit_retry",
+            expires_at: null,
+            retry_budget_remaining: 2,
+            suspended_reason: null,
+            terminal_reason: null,
+          },
+        },
+      },
+    );
+
+    expect(session.supervisor_snapshot).toMatchObject({
+      execution_revision: 2,
+      execution_mode: "background",
+      execution_phase: "running",
+      background_reason: "explicit",
+      retry_budget_remaining: 2,
+      suspended_reason: null,
     });
   });
 
@@ -748,6 +945,7 @@ describe("recoverSession", () => {
             created_at: "2026-05-11T08:00:00Z",
             seq: 12,
             payload: {
+              execution_revision: 1,
               execution_mode: "background",
               execution_phase: "running",
               background_reason: "auto_degrade",
@@ -772,6 +970,7 @@ describe("recoverSession", () => {
     expect(session?.status).toBe("running");
     expect(session?.last_seq).toBe(12);
     expect(session?.supervisor_snapshot).toMatchObject({
+      execution_revision: 1,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "auto_degrade",
@@ -782,8 +981,144 @@ describe("recoverSession", () => {
     });
   });
 
+  it("treats the remote supervisor snapshot revision as a lower bound for recovered events", async () => {
+    const foregroundSnapshot: SupervisorSnapshot = {
+      execution_revision: 4,
+      execution_mode: "foreground",
+      execution_phase: "running",
+      background_reason: null,
+      expires_at: null,
+      retry_budget_remaining: 1,
+      suspended_reason: null,
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:04:00Z",
+      is_alive: true,
+      cancellation_state: "none",
+    };
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        supervisor_snapshot: null,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-7", seq: 7 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        {
+          event: "execution_state_changed",
+          data: {
+            event_id: "1000-12",
+            created_at: "2026-05-11T08:03:00Z",
+            seq: 12,
+            payload: {
+              execution_revision: 3,
+              execution_mode: "background",
+              execution_phase: "running",
+              background_reason: "auto_degrade",
+              transition_reason: "auto_degrade_sse_disconnect",
+              expires_at: "2026-05-11T08:30:00Z",
+              retry_budget_remaining: 1,
+              suspended_reason: null,
+              terminal_reason: null,
+            },
+          },
+        },
+      ],
+      session_status: "running",
+      has_more: false,
+      last_seq: 12,
+      supervisor_snapshot: foregroundSnapshot,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    expect(useSessionStore.getState().currentSession?.supervisor_snapshot).toEqual(
+      foregroundSnapshot,
+    );
+  });
+
+  it("keeps an authoritative snapshot over a same-revision recovered event", async () => {
+    const suspendedSnapshot: SupervisorSnapshot = {
+      execution_revision: 1,
+      execution_mode: "background",
+      execution_phase: "suspended",
+      background_reason: "auto_degrade",
+      expires_at: null,
+      retry_budget_remaining: 0,
+      suspended_reason: "retry_budget_exhausted",
+      terminal_reason: null,
+      last_progress_at: "2026-05-11T08:04:00Z",
+      is_alive: false,
+      cancellation_state: "none",
+    };
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      currentSession: {
+        session_id: "s1",
+        title: "test",
+        status: "running",
+        last_seq: 7,
+        supervisor_snapshot: null,
+        events: [
+          { event: "message", data: { role: "assistant", event_id: "1000-7", seq: 7 } },
+        ],
+      },
+      isChatting: false,
+      chatSessionId: null,
+      chatAbort: null,
+    });
+    const { sessionApi } = await import("../../api/session");
+    (sessionApi.getEventsSince as ReturnType<typeof vi.fn>).mockResolvedValue({
+      events: [
+        {
+          event: "execution_state_changed",
+          data: {
+            event_id: "1000-12",
+            created_at: "2026-05-11T08:03:00Z",
+            seq: 12,
+            payload: {
+              execution_revision: 1,
+              execution_mode: "background",
+              execution_phase: "running",
+              background_reason: "auto_degrade",
+              transition_reason: "auto_degrade_sse_disconnect",
+              expires_at: "2026-05-11T08:30:00Z",
+              retry_budget_remaining: 1,
+              suspended_reason: null,
+              terminal_reason: null,
+            },
+          },
+        },
+      ],
+      session_status: "running",
+      has_more: false,
+      last_seq: 12,
+      supervisor_snapshot: suspendedSnapshot,
+    });
+
+    await useSessionStore.getState().recoverSession("s1");
+
+    const session = useSessionStore.getState().currentSession;
+    expect(session?.supervisor_snapshot).toEqual(suspendedSnapshot);
+    expect(session?.last_seq).toBe(12);
+    const eventIds = session?.events.map((event) => event.data?.event_id);
+    expect(eventIds).toHaveLength(2);
+    expect(eventIds).toEqual(expect.arrayContaining(["1000-7", "1000-12"]));
+  });
+
   it("keeps newer local supervisor snapshot when recovered events do not advance cursor", async () => {
     const localSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "auto_degrade",
@@ -796,6 +1131,7 @@ describe("recoverSession", () => {
       cancellation_state: "none",
     };
     const staleRemoteSnapshot: SupervisorSnapshot = {
+      execution_revision: 0,
       execution_mode: "foreground",
       execution_phase: "running",
       background_reason: null,
@@ -933,6 +1269,7 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
         created_at: "2026-05-11T08:00:00Z",
         seq: 12,
         payload: {
+          execution_revision: 1,
           execution_mode: "background",
           execution_phase: "running",
           background_reason: "auto_degrade",
@@ -947,6 +1284,7 @@ describe("stream disconnect recovery with streamConnected + sawTerminalEvent", (
 
     const state = useSessionStore.getState();
     expect(state.currentSession?.supervisor_snapshot).toMatchObject({
+      execution_revision: 1,
       execution_mode: "background",
       execution_phase: "running",
       background_reason: "auto_degrade",

@@ -52,6 +52,9 @@ class FakeSandbox:
     async def exec_command(self, *args, **kwargs):
         return MagicMock(success=True)
 
+    async def renew_timeout_lease(self, minutes=None) -> None:
+        self.renewed_timeout_minutes = minutes
+
     async def destroy(self) -> bool:
         return True
 
@@ -84,6 +87,15 @@ async def test_matching_generation_succeeds() -> None:
     handle, _ = _make_handle(generation=1)
     result = await handle.read_file("/test")
     assert result.success
+
+
+async def test_timeout_lease_renewal_is_generation_checked_and_forwarded() -> None:
+    handle, _ = _make_handle(generation=1)
+
+    await handle.renew_timeout_lease(7)
+
+    assert "renew_timeout_lease" in SANDBOX_FORWARDED_METHODS
+    assert handle._sandbox.renewed_timeout_minutes == 7
 
 
 # ── Release ──
@@ -189,6 +201,7 @@ def test_forwarded_methods_exact_set() -> None:
         "upload_file",
         "download_file",
         "ensure_sandbox",
+        "renew_timeout_lease",
         "get_browser",
         "snapshot_workspace",
         "kill_all_shell_sessions",

@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Awaitable, Callable, Literal, Optional, TypeVar
 
 
 logger = logging.getLogger(__name__)
@@ -33,11 +34,13 @@ from app.domain.models.mailbox_envelope import (
     ProgressKind,
     ProgressUpdatePayload,
     ProgressVisibility,
+    MAILBOX_PUBLISH_OPERATION_TIMEOUT_SECONDS,
     SUBAGENT_PROGRESS_HEARTBEAT_INTERVAL_SECONDS,
 )
 
 
 _Phase = Literal["idle", "in_tool", "finalizing"]
+_T = TypeVar("_T")
 
 
 class ChildHeartbeatTask:
@@ -65,12 +68,21 @@ class ChildHeartbeatTask:
         child_session_id: str,
         *,
         interval_seconds: float = SUBAGENT_PROGRESS_HEARTBEAT_INTERVAL_SECONDS,
+        publish_timeout_seconds: float = MAILBOX_PUBLISH_OPERATION_TIMEOUT_SECONDS,
     ) -> None:
+        if not math.isfinite(publish_timeout_seconds) or publish_timeout_seconds <= 0:
+            raise ValueError("publish_timeout_seconds must be finite and positive")
         self._publisher = publisher
         self._parent = parent_session_id
         self._child = child_session_id
         self._interval = interval_seconds
+        self._publish_timeout = publish_timeout_seconds
         self._stopping = asyncio.Event()
+        # Serialize heartbeat and terminal publishes.  The terminal owner uses
+        # ``publish_terminal`` to publish-and-close atomically: a heartbeat
+        # already queued on this lock re-checks ``_stopping`` and therefore can
+        # never land after the terminal envelope.
+        self._publish_lock = asyncio.Lock()
         self._phase: Optional[_Phase] = "idle"
         self._tool_call_id: Optional[str] = None
         # Stable per-child correlation id so the supervisor / audit table can
@@ -142,20 +154,47 @@ class ChildHeartbeatTask:
         """Signal the run loop to exit. Idempotent."""
         self._stopping.set()
 
+    async def publish_terminal(
+        self,
+        publish: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        """Run one terminal publish as the final serialized lifecycle write.
+
+        Liveness remains active while a terminal publisher waits for the lock.
+        Once it owns the boundary, success, failure, and cancellation all close
+        the heartbeat loop before releasing the lock, so no queued heartbeat can
+        appear after the terminal attempt.
+        """
+        async with self._publish_lock:
+            try:
+                return await asyncio.wait_for(
+                    publish(), timeout=self._publish_timeout
+                )
+            finally:
+                self._stopping.set()
+
     async def _publish_heartbeat(self) -> None:
-        envelope = MailboxEnvelope(
-            envelope_id=str(uuid.uuid4()),
-            type=MailboxEnvelopeType.PROGRESS_UPDATE,
-            parent_session_id=self._parent,
-            child_session_id=self._child,
-            correlation_id=self._correlation_id,
-            emitted_at=datetime.now(tz=timezone.utc),
-            producer_role=ProducerRole.CHILD_AGENT,
-            payload=ProgressUpdatePayload(
-                kind=ProgressKind.HEARTBEAT,
-                visibility=ProgressVisibility.HIDDEN,
-                phase=self._phase,
-                tool_call_id=self._tool_call_id,
-            ).model_dump(mode="json"),
-        )
-        await self._publisher.publish(envelope)
+        async with self._publish_lock:
+            # A terminal publish may have closed liveness while this iteration
+            # was queued on the publisher lock.
+            if self._stopping.is_set():
+                return
+            envelope = MailboxEnvelope(
+                envelope_id=str(uuid.uuid4()),
+                type=MailboxEnvelopeType.PROGRESS_UPDATE,
+                parent_session_id=self._parent,
+                child_session_id=self._child,
+                correlation_id=self._correlation_id,
+                emitted_at=datetime.now(tz=timezone.utc),
+                producer_role=ProducerRole.CHILD_AGENT,
+                payload=ProgressUpdatePayload(
+                    kind=ProgressKind.HEARTBEAT,
+                    visibility=ProgressVisibility.HIDDEN,
+                    phase=self._phase,
+                    tool_call_id=self._tool_call_id,
+                ).model_dump(mode="json"),
+            )
+            await asyncio.wait_for(
+                self._publisher.publish(envelope),
+                timeout=self._publish_timeout,
+            )

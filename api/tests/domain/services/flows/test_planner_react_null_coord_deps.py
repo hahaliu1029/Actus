@@ -1,5 +1,5 @@
 """PR-9b-A INV-A10 — _NullCoordinatorRuntimeDeps must trigger ZERO side-effect
-real-ctor calls AND _build_config must SKIP the 18 coord keys.
+real-ctor calls AND _build_config must SKIP all coordinator config keys.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ COORD_KEYS = {
     "probe_quota", "coordinator_limits", "session_repository",
     "cancel_event", "patch_reducer_service", "patch_applier_deps",
     "parent_sandbox", "artifact_storage", "cost_rollup_service",
+    "coordinator_wait_guard_factory",
+    "coordinator_liveness_service",
 }
 
 
@@ -85,3 +87,25 @@ def test_build_config_omits_coord_keys_when_null_deps():
     assert intersection == set(), (
         f"null deps must SKIP coord keys; found injected: {intersection}"
     )
+
+
+def test_ordinary_null_deps_flow_still_creates_watchdog():
+    """Null deps alone does not mean coordinator child (legacy/subagent path)."""
+    from app.domain.services.execution_watchdog import ExecutionWatchdog
+
+    flow = _make_default_flow()
+    cfg = flow._build_config()
+
+    assert isinstance(cfg["configurable"]["execution_watchdog"], ExecutionWatchdog)
+
+
+def test_coordinator_child_permission_context_disables_graph_watchdog():
+    """The child-scope context is the production coordinator-child marker."""
+    from app.domain.services.execution_watchdog import ExecutionControl
+
+    flow = _make_default_flow()
+    flow.set_child_permission_context(MagicMock(name="child_permission_context"))
+    cfg = flow._build_config()
+
+    assert cfg["configurable"]["execution_watchdog"] is None
+    assert isinstance(cfg["configurable"]["execution_control"], ExecutionControl)

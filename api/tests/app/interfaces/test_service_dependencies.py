@@ -443,11 +443,10 @@ class TestBuildConfigSnapshotVisionFallbackTimeout:
         assert snap.vision_fallback_model.timeout_seconds == 180.0
 
 
-class TestBuildLlmBudgetWarning:
-    """D5.1: _build_llm logs a budget warning when api_type=auto and
-    primary + fallback timeout > 200s (heuristic, not hard error)."""
+class TestBuildLlmBudgetIndependence:
+    """Fallback per-call timeouts are independent from an unlimited root run."""
 
-    def test_warning_logged_when_auto_and_over_threshold(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_no_budget_warning_with_default_timeout(self, caplog: pytest.LogCaptureFixture) -> None:
         from app.domain.models.app_config import LLMConfig
         from app.interfaces.service_dependencies import _build_llm, _llm_cache
 
@@ -457,7 +456,6 @@ class TestBuildLlmBudgetWarning:
             api_key="k",
             model_name="m",
             api_type="auto",
-            timeout_seconds=150.0,  # 150 + 150 = 300 > 200 threshold
         )
         with caplog.at_level(logging.WARNING, logger="app.interfaces.service_dependencies"):
             _build_llm(cfg)
@@ -465,10 +463,9 @@ class TestBuildLlmBudgetWarning:
         warning_messages = [
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
-        assert any(
-            "D5.1 budget warning" in msg or "over-budget" in msg or "budget" in msg
-            for msg in warning_messages
-        ), f"Expected budget warning log, got: {warning_messages}"
+        assert not any("budget" in msg for msg in warning_messages), (
+            f"Unexpected root-budget warning: {warning_messages}"
+        )
 
     def test_no_warning_when_auto_and_under_threshold(self, caplog: pytest.LogCaptureFixture) -> None:
         from app.domain.models.app_config import LLMConfig

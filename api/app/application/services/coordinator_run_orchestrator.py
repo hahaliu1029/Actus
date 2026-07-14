@@ -5,7 +5,7 @@ PR-6 fleshes out the PR-3 skeleton with:
     the 5-case invariant matrix that decides whether one work-unit's terminal
     envelope should fan out CANCEL_REQUEST to its remaining siblings.
   - Observer + cancel-watcher concurrent loops driven by ``asyncio.wait``
-    with ``FIRST_COMPLETED`` semantics, gated by ``timeout_seconds``.
+    with ``FIRST_COMPLETED`` semantics and an optional explicit deadline.
   - RESULT_READY / CANCEL_ACK observation via an injected
     ``MailboxSubscriber`` port; envelopes arrive as Redis wire dicts and
     are re-validated through ``MailboxEnvelope.model_validate`` so the
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from typing import Any, Awaitable, Callable, Optional
 
 from app.application.services.coordinator_envelope_factory import (
@@ -39,6 +40,17 @@ from app.domain.models.mailbox_envelope import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_timeout_seconds(timeout_seconds: float | None) -> float | None:
+    """Return a finite positive deadline, or ``None`` for unlimited."""
+    if timeout_seconds is None or timeout_seconds == 0:
+        return None
+    if timeout_seconds < 0 or not math.isfinite(timeout_seconds):
+        raise ValueError(
+            "timeout_seconds must be None, zero, or a finite positive number"
+        )
+    return float(timeout_seconds)
 
 
 # ── Sibling-cancel predicate (spec §11.8 r15) ────────────────────────────────
@@ -196,9 +208,11 @@ class CoordinatorRunOrchestrator:
         cancelled with ``reason=f"sibling_terminal_{outcome.value}"``.
       - A second ``cancel_watcher`` task awaits ``cancel_event``; on fire it
         cancels all remaining pending with ``reason="parent_cancel"``.
-      - Both tasks run under ``asyncio.wait(..., timeout=timeout_seconds,
-        return_when=FIRST_COMPLETED)`` and the loser is cancelled + drained
-        via ``gather(return_exceptions=True)``.
+      - Both tasks run under ``asyncio.wait(...,
+        timeout=effective_timeout, return_when=FIRST_COMPLETED)``. The timeout
+        defaults to ``None``; a configured positive run wallclock cap or an
+        explicit positive caller deadline enables it. The loser is cancelled
+        + drained via ``gather(return_exceptions=True)``.
       - ``_published`` set + ``_publish_lock`` ensure single-publish-per-wu
         across the two paths (spec §11.5).
     """
@@ -250,8 +264,14 @@ class CoordinatorRunOrchestrator:
         self._max_total_token_cost_usd_per_run = getattr(
             coordinator_limits, "max_total_token_cost_usd_per_run", None
         )
-        self._max_total_wallclock_seconds_per_run = getattr(
+        configured_run_wallclock = getattr(
             coordinator_limits, "max_total_wallclock_seconds_per_run", None
+        )
+        self._max_total_wallclock_seconds_per_run = (
+            configured_run_wallclock
+            if configured_run_wallclock is not None
+            and configured_run_wallclock > 0
+            else None
         )
 
     async def _get_current_run_cost_usd(
@@ -295,28 +315,48 @@ class CoordinatorRunOrchestrator:
         work_units_pending: list[str],
         child_session_ids: dict[str, str],
         cancel_event: asyncio.Event,
-        timeout_seconds: float = 600.0,
+        timeout_seconds: float | None = None,
         observer_group_precreated: bool = False,
     ) -> None:
         """Drive the coordinator run loop.
 
-        - ``subscriber is None`` → PR-3 parent-cancel-only path (preserved
-          verbatim, including "all-failed → raise RuntimeError" semantics).
+        - ``subscriber is None`` → PR-3 parent-cancel-only path (including
+          "all-failed → raise RuntimeError" semantics for parent cancel).
         - ``subscriber is set`` → PR-6 observer + cancel_watcher concurrent
-          loops gated by ``timeout_seconds``.
+          loops. ``timeout_seconds`` None/zero waits without a fixed deadline;
+          callers may opt into a finite positive timeout. Invalid negative or
+          non-finite values are rejected before any subscription side effect.
 
         ``observer_group_precreated`` (finish-core §5.4 G4-min): when True,
         ``dispatch_node`` already created the observer consumer group
         SYNCHRONOUSLY before any child task launched, so ``_run_with_observer``
         must NOT subscribe again. Only forwarded to the observer path.
         """
+        normalized_timeout = _normalize_timeout_seconds(timeout_seconds)
+
+        # Empty runs are valid at the preflight boundary and have nothing to
+        # observe or cancel. Do not create a subscription or background task.
+        # When dispatch already hoisted the observer group, normal ownership
+        # has transferred to this orchestrator, so it must still tear it down.
+        if not work_units_pending:
+            if self._subscriber is not None and observer_group_precreated:
+                await self._destroy_observer_group(
+                    subscriber=self._subscriber,
+                    stream_key=MAILBOX_STREAM_KEY_TEMPLATE.format(
+                        root_session_id=root_session_id,
+                    ),
+                    consumer_group=f"coordinator:{coordinator_run_id}",
+                    coordinator_run_id=coordinator_run_id,
+                )
+            return
+
         if self._subscriber is None:
             await self._run_parent_cancel_only(
                 coordinator_run_id=coordinator_run_id,
                 work_units_pending=work_units_pending,
                 child_session_ids=child_session_ids,
                 cancel_event=cancel_event,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=normalized_timeout,
             )
             return
 
@@ -326,7 +366,7 @@ class CoordinatorRunOrchestrator:
             work_units_pending=work_units_pending,
             child_session_ids=child_session_ids,
             cancel_event=cancel_event,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=normalized_timeout,
             observer_group_precreated=observer_group_precreated,
         )
 
@@ -339,26 +379,38 @@ class CoordinatorRunOrchestrator:
         work_units_pending: list[str],
         child_session_ids: dict[str, str],
         cancel_event: asyncio.Event,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
     ) -> None:
         """PR-3 parent-cancel loop.
 
         Wait for ``cancel_event``; on set, publish CANCEL_REQUEST × all
-        pending. Timeout → log + return (orchestrator finishes; child
-        finalizers report outcome). Per-envelope publish failure is logged
-        + swallowed so a single broken child does not stop CANCEL fan-out
-        to the rest. If *every* publish fails, raise so the caller's
-        done-callback sees the failure instead of silently losing the
-        parent cancel.
+        pending. With no timeout, await the event directly. A positive
+        deadline publishes the same run-deadline cancellation used by the
+        observer path. Per-envelope parent-cancel publish failure is logged +
+        swallowed so a single broken child does not stop fan-out to the rest.
+        If *every* parent-cancel publish fails, raise so the caller's
+        done-callback sees the failure instead of silently losing it.
         """
-        try:
-            await asyncio.wait_for(cancel_event.wait(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            logger.info(
-                "CoordinatorRunOrchestrator: timeout (no cancel) for %s",
-                coordinator_run_id,
-            )
-            return
+        if timeout_seconds is None:
+            await cancel_event.wait()
+        else:
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(), timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "CoordinatorRunOrchestrator: explicit run deadline "
+                    "exceeded run=%s timeout=%s",
+                    coordinator_run_id, timeout_seconds,
+                )
+                await self._publish_cancel_to_pending(
+                    wu_ids=list(work_units_pending),
+                    child_session_ids=child_session_ids,
+                    coordinator_run_id=coordinator_run_id,
+                    reason="run_total_wallclock_budget_exceeded",
+                )
+                return
 
         attempted = 0
         succeeded = 0
@@ -401,7 +453,7 @@ class CoordinatorRunOrchestrator:
         work_units_pending: list[str],
         child_session_ids: dict[str, str],
         cancel_event: asyncio.Event,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
         observer_group_precreated: bool = False,
     ) -> None:
         # Mutable working copy: observer + watcher both narrow ``pending``
@@ -486,7 +538,7 @@ class CoordinatorRunOrchestrator:
                 timeout=effective_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if not done:
+            if effective_timeout is not None and not done:
                 if self._max_total_wallclock_seconds_per_run is not None:
                     logger.info(
                         "CoordinatorRunOrchestrator: run wallclock budget "
@@ -494,18 +546,18 @@ class CoordinatorRunOrchestrator:
                         coordinator_run_id,
                         self._max_total_wallclock_seconds_per_run,
                     )
-                    await self._publish_cancel_to_pending(
-                        wu_ids=sorted(pending),
-                        child_session_ids=child_session_ids,
-                        coordinator_run_id=coordinator_run_id,
-                        reason="run_total_wallclock_budget_exceeded",
-                    )
                 else:
                     logger.info(
-                        "CoordinatorRunOrchestrator: timeout (no terminal, no cancel)"
-                        " run=%s",
-                        coordinator_run_id,
+                        "CoordinatorRunOrchestrator: explicit run deadline "
+                        "exceeded run=%s timeout=%s",
+                        coordinator_run_id, effective_timeout,
                     )
+                await self._publish_cancel_to_pending(
+                    wu_ids=sorted(pending),
+                    child_session_ids=child_session_ids,
+                    coordinator_run_id=coordinator_run_id,
+                    reason="run_total_wallclock_budget_exceeded",
+                )
         finally:
             # Cancel whichever task hasn't completed + drain exceptions so
             # CancelledError doesn't escape the orchestrator.
@@ -541,19 +593,34 @@ class CoordinatorRunOrchestrator:
             # post-gather exception inspection so log ordering is:
             # task errors logged FIRST, then group destroy attempt.
             if subscribed:
-                try:
-                    await subscriber.destroy_group(
-                        stream_key=stream_key,
-                        consumer_group=consumer_group,
-                    )
-                except Exception:
-                    logger.warning(
-                        "CoordinatorRunOrchestrator: destroy_group failed"
-                        " run=%s group=%s — dead group may accumulate"
-                        " in Redis",
-                        coordinator_run_id, consumer_group,
-                        exc_info=True,
-                    )
+                await self._destroy_observer_group(
+                    subscriber=subscriber,
+                    stream_key=stream_key,
+                    consumer_group=consumer_group,
+                    coordinator_run_id=coordinator_run_id,
+                )
+
+    async def _destroy_observer_group(
+        self,
+        *,
+        subscriber: MailboxSubscriber,
+        stream_key: str,
+        consumer_group: str,
+        coordinator_run_id: str,
+    ) -> None:
+        """Best-effort, idempotent teardown for the per-run observer group."""
+        try:
+            await subscriber.destroy_group(
+                stream_key=stream_key,
+                consumer_group=consumer_group,
+            )
+        except Exception:
+            logger.warning(
+                "CoordinatorRunOrchestrator: destroy_group failed"
+                " run=%s group=%s — dead group may accumulate in Redis",
+                coordinator_run_id, consumer_group,
+                exc_info=True,
+            )
 
     async def _observe_loop(
         self,
