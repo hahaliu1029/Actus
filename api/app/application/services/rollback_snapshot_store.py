@@ -108,6 +108,7 @@ class RollbackSnapshotStore(Protocol):
         path: str,
         content: bytes,
         original_digest: str,
+        attempt_token: str | None = None,
     ) -> FileSnapshot: ...
     async def discard(
         self, coordinator_run_id: str, snapshots: Iterable[FileSnapshot],
@@ -130,6 +131,7 @@ class LocalFSRollbackSnapshotStore(RollbackSnapshotStore):
         path: str,
         content: bytes,
         original_digest: str,
+        attempt_token: str | None = None,
     ) -> FileSnapshot:
         """Snapshot ``content`` to disk; return an opaque ``FileSnapshot``.
 
@@ -156,6 +158,17 @@ class LocalFSRollbackSnapshotStore(RollbackSnapshotStore):
         # NAME_MAX regardless of how deep the manifest path goes.
         safe = hashlib.sha256(path.encode("utf-8")).hexdigest()
         target_dir = os.path.join(self._base, coordinator_run_id)
+        if attempt_token is not None:
+            if not isinstance(attempt_token, str) or not attempt_token:
+                raise ValueError("attempt_token must be a non-empty string")
+            # The directory, not just the filename, is attempt-scoped. An old
+            # owner may lose its lease between replacement-owner mkdir/write;
+            # cleaning only its own subdirectory cannot remove the replacement
+            # directory in that window.
+            token_hash = hashlib.sha256(
+                attempt_token.encode("utf-8"),
+            ).hexdigest()[:32]
+            target_dir = os.path.join(target_dir, token_hash)
         await asyncio.to_thread(os.makedirs, target_dir, exist_ok=True)
         snap_path = os.path.join(target_dir, safe)
         await asyncio.to_thread(_write_bytes, snap_path, content)
@@ -188,6 +201,7 @@ class LocalFSRollbackSnapshotStore(RollbackSnapshotStore):
         ``rmdir`` outside the snapshot base.
         """
         _validate_run_id_segment(coordinator_run_id)
+        snapshots = tuple(snapshots)
         for snap in snapshots:
             try:
                 await asyncio.to_thread(os.remove, snap.snapshot_path)
@@ -195,7 +209,32 @@ class LocalFSRollbackSnapshotStore(RollbackSnapshotStore):
                 # Already cleaned up by a prior discard or operator
                 # cleanup — idempotent by design.
                 pass
-        run_dir = os.path.join(self._base, coordinator_run_id)
+        run_dir = os.path.realpath(
+            os.path.join(self._base, coordinator_run_id),
+        )
+        # Attempt-scoped directories are safe to remove independently. Only a
+        # direct child of the validated run directory is eligible, so an
+        # untrusted/forged FileSnapshot cannot direct rmdir elsewhere.
+        attempt_dirs = {
+            os.path.realpath(os.path.dirname(snap.snapshot_path))
+            for snap in snapshots
+        }
+        attempt_scoped = False
+        for attempt_dir in attempt_dirs:
+            if (
+                attempt_dir != run_dir
+                and os.path.dirname(attempt_dir) == run_dir
+            ):
+                attempt_scoped = True
+                try:
+                    await asyncio.to_thread(os.rmdir, attempt_dir)
+                except OSError:
+                    pass
+        if attempt_scoped:
+            # The run directory is a shared stable container across owner
+            # attempts. Removing it can race a replacement attempt between its
+            # parent/child mkdir calls, so attempt cleanup must stop here.
+            return
         try:
             await asyncio.to_thread(os.rmdir, run_dir)
         except OSError:

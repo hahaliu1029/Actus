@@ -5,6 +5,8 @@ HEXISTS idempotency, HSET+EXPIRE ordering, fakeredis or live Redis) is
 tracked as a follow-up integration test — see PR-3 self-review notes.
 """
 import asyncio
+from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -109,6 +111,142 @@ async def test_release_calls_hdel(quota_service, mock_redis):
     )
 
 
+async def test_renew_refreshes_only_existing_live_probe(quota_service, mock_redis):
+    mock_redis.client.eval.return_value = 1
+
+    renewed = await quota_service.renew(user_id="u-1", probe_run_id="p-1")
+
+    assert renewed is True
+    call_args = mock_redis.client.eval.call_args.args
+    assert "HGET" in call_args[0]
+    assert "HSET" in call_args[0]
+    assert call_args[2:4] == ("actus:active_probes:u-1", "p-1")
+
+
+async def test_renew_never_reacquires_missing_or_expired_probe(
+    quota_service, mock_redis
+):
+    mock_redis.client.eval.return_value = 0
+
+    renewed = await quota_service.renew(user_id="u-1", probe_run_id="p-1")
+
+    assert renewed is False
+    script = mock_redis.client.eval.call_args.args[0]
+    assert "HLEN" not in script
+    assert "HSET" in script
+
+
+async def test_renew_redis_exception_fails_closed(quota_service, mock_redis):
+    mock_redis.client.eval.side_effect = RuntimeError("redis down")
+
+    assert await quota_service.renew(user_id="u-1", probe_run_id="p-1") is False
+
+
+@dataclass
+class _Clock:
+    value: float = 1_000.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+@dataclass
+class _ProbeLeaseRedis:
+    """Semantic fake for ordinary probe acquire/renew/release Lua."""
+
+    clock: _Clock
+    members: dict[str, dict[str, float]] = field(default_factory=dict)
+    key_expiry: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def client(self) -> "_ProbeLeaseRedis":
+        return self
+
+    def _expire_key_if_due(self, key: str, now: float) -> None:
+        if self.key_expiry.get(key, float("inf")) <= now:
+            self.members.pop(key, None)
+            self.key_expiry.pop(key, None)
+
+    async def eval(
+        self, script: str, numkeys: int, key: str, *args: Any,
+    ) -> int:
+        assert numkeys == 1
+        probe_id = str(args[0])
+        now = float(args[1])
+        self._expire_key_if_due(key, now)
+        members = self.members.setdefault(key, {})
+
+        if "HGETALL" in script:
+            cap = int(args[2])
+            ttl = float(args[3])
+            cutoff = now - ttl
+            self.members[key] = members = {
+                member: timestamp
+                for member, timestamp in members.items()
+                if timestamp >= cutoff
+            }
+            if probe_id not in members and len(members) >= cap:
+                return 0
+            members[probe_id] = now
+            self.key_expiry[key] = now + ttl
+            return 1
+
+        if "HGET" in script:
+            ttl = float(args[2])
+            timestamp = members.get(probe_id)
+            if timestamp is None or timestamp < now - ttl:
+                members.pop(probe_id, None)
+                return 0
+            members[probe_id] = now
+            self.key_expiry[key] = now + ttl
+            return 1
+
+        raise AssertionError("unexpected ordinary probe quota script")
+
+    async def hdel(self, key: str, probe_id: str) -> int:
+        return int(self.members.setdefault(key, {}).pop(probe_id, None) is not None)
+
+
+async def test_continuous_ordinary_probe_renew_crosses_original_ttl() -> None:
+    clock = _Clock()
+    redis = _ProbeLeaseRedis(clock)
+    service = ProbeQuotaService(
+        redis_client=redis,
+        max_active=1,
+        ttl_seconds=9,
+        clock=clock,
+    )
+    key = service._key("user")
+
+    assert await service.acquire("user", "long-probe")
+    for _ in range(6):
+        clock.advance(service.renew_interval_seconds)
+        assert await service.renew("user", "long-probe")
+
+    assert clock.value > 1_000 + 9
+    assert set(redis.members[key]) == {"long-probe"}
+    assert not await service.acquire("user", "other-probe")
+
+
+async def test_ordinary_probe_renew_after_expiry_never_reacquires() -> None:
+    clock = _Clock()
+    redis = _ProbeLeaseRedis(clock)
+    service = ProbeQuotaService(
+        redis_client=redis,
+        max_active=1,
+        ttl_seconds=9,
+        clock=clock,
+    )
+
+    assert await service.acquire("user", "expired-probe")
+    clock.advance(9)
+    assert not await service.renew("user", "expired-probe")
+    assert redis.members.get(service._key("user"), {}) == {}
+
+
 async def test_acquire_stale_entry_cleaned_then_acquires(quota_service, mock_redis):
     """Stale entry cleanup is verified by Lua logic; service-level contract:
     when Lua returns 1, the service propagates success regardless of any
@@ -172,3 +310,10 @@ async def test_constants_match_documented_defaults():
     """Sanity: defaults match the documented contract (DI overrideable)."""
     assert MAX_ACTIVE_PROBES_PER_USER_DEFAULT == 2
     assert PROBE_QUOTA_TTL_SECONDS == 900  # 15 min (>D5 watchdog 600s)
+    assert quota_service_renew_interval() == 300
+
+
+def quota_service_renew_interval() -> float:
+    redis = MagicMock()
+    redis.client = MagicMock()
+    return ProbeQuotaService(redis_client=redis).renew_interval_seconds

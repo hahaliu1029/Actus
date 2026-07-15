@@ -561,6 +561,15 @@ async def lifespan(app: FastAPI):
         _pending_lifecycle_ref: dict[str, object] = {}
 
         class _DeferredLifecycle:
+            async def acquire(self, session_id: str):
+                svc = _pending_lifecycle_ref.get("svc")
+                if svc is None:
+                    raise RuntimeError(
+                        "coordinator sandbox acquire before "
+                        "SandboxLifecycleService ready — composition order bug"
+                    )
+                return await svc.acquire(session_id)
+
             async def destroy(self, session_id: str, reason) -> None:
                 svc = _pending_lifecycle_ref.get("svc")
                 if svc is None:

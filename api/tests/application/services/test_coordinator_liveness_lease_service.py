@@ -344,6 +344,7 @@ def _service(
     clock: _Clock | None = None,
     touch_parent: AsyncMock | None = None,
     renew_child_sandbox: AsyncMock | None = None,
+    renew_ordinary_sandboxes: AsyncMock | None = None,
     renew_quota: AsyncMock | None = None,
     sleep: AsyncMock | None = None,
     **config: Any,
@@ -359,6 +360,7 @@ def _service(
         sleep=sleep or AsyncMock(),
         touch_parent=touch_parent,
         renew_child_sandbox=renew_child_sandbox,
+        renew_ordinary_sandboxes=renew_ordinary_sandboxes,
         renew_quota=renew_quota,
         **config,
     )
@@ -865,6 +867,63 @@ async def test_heartbeat_requires_existing_startup_lease() -> None:
 
     assert await service.record_heartbeat(_heartbeat()) is False
     assert redis.hashes == {}
+
+
+async def test_ordinary_mailbox_research_heartbeat_is_not_coordinator_applicable() -> None:
+    row = _row(
+        tool_filter_preset="subagent_research",
+        coordinator_run_id=None,
+        work_unit_id=None,
+    )
+    service, redis, repo, _ = _service(row=row)
+
+    assert await service.record_heartbeat(_heartbeat()) is None
+    assert repo.lookups == ["child-1"]
+    assert redis.hashes == {}
+
+
+async def test_ordinary_research_heartbeat_renews_its_sandbox_owners() -> None:
+    row = _row(
+        tool_filter_preset="subagent_research",
+        coordinator_run_id=None,
+        work_unit_id=None,
+    )
+    renew = AsyncMock()
+    service, _, _, _ = _service(
+        row=row,
+        renew_ordinary_sandboxes=renew,
+    )
+
+    assert await service.record_heartbeat(_heartbeat()) is None
+    renew.assert_awaited_once_with(row)
+
+
+async def test_ordinary_sandbox_renew_failure_keeps_heartbeat_alive() -> None:
+    row = _row(
+        tool_filter_preset="subagent_research",
+        coordinator_run_id=None,
+        work_unit_id=None,
+    )
+    renew = AsyncMock(side_effect=RuntimeError("sandbox API unavailable"))
+    service, _, _, _ = _service(
+        row=row,
+        renew_ordinary_sandboxes=renew,
+    )
+
+    assert await service.record_heartbeat(_heartbeat()) is None
+
+
+async def test_ordinary_mailbox_heartbeat_with_wrong_parent_is_rejected() -> None:
+    row = _row(
+        tool_filter_preset="subagent_research",
+        coordinator_run_id=None,
+        work_unit_id=None,
+    )
+    service, _, _, _ = _service(row=row)
+
+    assert await service.record_heartbeat(
+        _heartbeat(parent_session_id="forged-parent"),
+    ) is False
 
 
 async def test_heartbeat_rejects_missing_authoritative_db_row() -> None:

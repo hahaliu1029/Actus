@@ -24,7 +24,12 @@ def mock_deps():
         "summary_llm": MagicMock(),
         "classifier": MagicMock(),
         "sandbox_lifecycle_service": MagicMock(),
-        "quota_service": MagicMock(),
+        "quota_service": MagicMock(
+            acquire=AsyncMock(),
+            renew=AsyncMock(return_value=True),
+            release=AsyncMock(),
+            renew_interval_seconds=300.0,
+        ),
     }
 
 
@@ -51,6 +56,58 @@ async def test_service_constructor_accepts_required_deps(mock_deps):
     svc = SubagentResearchService(**mock_deps)
     assert svc._session_service is mock_deps["session_service"]
     assert svc._quota_service is mock_deps["quota_service"]
+
+
+async def test_probe_quota_lease_renews_until_stopped(mock_deps):
+    svc = SubagentResearchService(
+        **mock_deps,
+        probe_quota_renew_interval_seconds=0.001,
+    )
+    stopped = asyncio.Event()
+    task = asyncio.create_task(
+        svc._renew_probe_quota_lease(
+            user_id="u-1",
+            probe_run_id="p-1",
+            stopped=stopped,
+        )
+    )
+
+    for _ in range(100):
+        if mock_deps["quota_service"].renew.await_count >= 2:
+            break
+        await asyncio.sleep(0.001)
+    stopped.set()
+    await task
+
+    assert mock_deps["quota_service"].renew.await_count >= 2
+    mock_deps["quota_service"].renew.assert_awaited_with("u-1", "p-1")
+
+
+async def test_probe_quota_lease_loss_is_observable_but_not_a_task_deadline(
+    mock_deps, caplog
+):
+    mock_deps["quota_service"].renew.return_value = False
+    svc = SubagentResearchService(
+        **mock_deps,
+        probe_quota_renew_interval_seconds=0.001,
+    )
+    stopped = asyncio.Event()
+    task = asyncio.create_task(
+        svc._renew_probe_quota_lease(
+            user_id="u-1",
+            probe_run_id="p-1",
+            stopped=stopped,
+        )
+    )
+
+    for _ in range(100):
+        if mock_deps["quota_service"].renew.await_count:
+            break
+        await asyncio.sleep(0)
+    stopped.set()
+    await task
+
+    assert "probe quota lease lost" in caplog.text
 
 
 # ---------- Task 18b: _consume_child ----------

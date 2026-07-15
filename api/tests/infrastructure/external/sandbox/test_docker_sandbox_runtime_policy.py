@@ -167,7 +167,7 @@ def test_inv0_off_path_matches_captured_baseline(captured_kwargs, monkeypatch):
         "detach": True,
         "remove": True,
         "environment": {
-            "SERVICE_TIMEOUT_MINUTES": 60,
+            "SERVER_TIMEOUT_MINUTES": 60,
             "CHROME_ARGS": "",
             "HTTPS_PROXY": None,
             "HTTP_PROXY": None,

@@ -402,6 +402,11 @@ class PlannerReActFlow(BaseFlow):
         # via the invoke-adapter. _build_config injects it (+ the SSM) into the
         # child graph cfg so react_graph's tool_node child-scope guard fires.
         self._child_permission_context = None
+        # Mailbox-plane research children emit an independent heartbeat and
+        # are orphan-checked by MailboxSupervisor. Their graph can be quiet
+        # during a legitimate long tool/LLM operation, so the graph-idle timer
+        # is not an additional wallclock owner for those runs.
+        self._mailbox_liveness_managed = False
         # [C2b budget §3-5] Child-only BudgetEnforcementCallback. None for
         # root/parent flows; set by AgentTaskRunner.set_budget_callback via the
         # starter→adapter→runner chain. _build_config appends it to
@@ -424,6 +429,10 @@ class PlannerReActFlow(BaseFlow):
         _build_config threads it (+ the SSM) into the child graph cfg for the
         tool_node child-scope guard."""
         self._child_permission_context = cpc
+
+    def set_mailbox_liveness_managed(self) -> None:
+        """Declare that mailbox heartbeat/orphan lifecycle owns liveness."""
+        self._mailbox_liveness_managed = True
 
     def set_budget_callback(self, cb) -> None:
         """[C2b budget §3-5] External seam (mirror set_cancel_event): the
@@ -1758,7 +1767,10 @@ class PlannerReActFlow(BaseFlow):
         # and is therefore the stable child marker; Null coord deps alone also
         # covers legacy and ordinary subagent flows and must not disable it.
         watchdog = None
-        if self._child_permission_context is None:
+        if (
+            self._child_permission_context is None
+            and not self._mailbox_liveness_managed
+        ):
             watchdog = ExecutionWatchdog(
                 total_timeout_seconds=ec.total_timeout_seconds,
                 idle_timeout_seconds=ec.idle_timeout_seconds,

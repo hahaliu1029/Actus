@@ -198,6 +198,7 @@ class CoordinatorLivenessLeaseRejected(ValueError):
 
 
 LeaseRenewCallback = Callable[[CoordinatorChildLease], Awaitable[None]]
+OrdinarySandboxRenewCallback = Callable[[Session], Awaitable[None]]
 
 
 class CoordinatorLivenessLeaseService:
@@ -217,6 +218,7 @@ class CoordinatorLivenessLeaseService:
         touch_parent: LeaseRenewCallback | None = None,
         renew_child_sandbox: LeaseRenewCallback | None = None,
         renew_quota: LeaseRenewCallback | None = None,
+        renew_ordinary_sandboxes: OrdinarySandboxRenewCallback | None = None,
     ) -> None:
         self._validate_positive_finite(
             stale_after_seconds, "stale_after_seconds"
@@ -247,6 +249,7 @@ class CoordinatorLivenessLeaseService:
             for callback in (touch_parent, renew_child_sandbox, renew_quota)
             if callback is not None
         )
+        self._renew_ordinary_sandboxes = renew_ordinary_sandboxes
 
         # A monotonic projection prevents a backwards wall-clock adjustment
         # from making a lease immortal.  Per-child observations reset the
@@ -377,8 +380,13 @@ class CoordinatorLivenessLeaseService:
 
     async def record_heartbeat(
         self, envelope: MailboxEnvelope | Mapping[str, Any]
-    ) -> bool:
+    ) -> bool | None:
         """Refresh a lease for one schema-valid, DB-authorized heartbeat.
+
+        ``None`` means this is an authoritative ordinary mailbox research
+        child, for which coordinator Redis liveness is not applicable; the
+        mailbox supervisor may refresh its legacy process-local observation.
+        ``False`` always means rejected and must never fall back locally.
 
         ``correlation_id`` must use the canonical ``hb:<child>`` wire identity;
         it is not treated as run identity. Run/work-unit authority comes from
@@ -409,6 +417,22 @@ class CoordinatorLivenessLeaseService:
 
         current = await self.get_lease(parsed.child_session_id)
         if current is None:
+            row = await self._sessions.get_by_id(parsed.child_session_id)
+            if self._row_is_ordinary_mailbox_child(row, parsed):
+                callback = self._renew_ordinary_sandboxes
+                if callback is not None:
+                    try:
+                        await callback(row)
+                    except Exception:
+                        # Redis/local liveness remains authoritative. Sandbox
+                        # lease renewal is observable but best-effort, matching
+                        # coordinator peripheral callback semantics.
+                        logger.warning(
+                            "ordinary research sandbox renew failed child=%s",
+                            parsed.child_session_id,
+                            exc_info=True,
+                        )
+                return None
             return False
         if (
             parsed.child_session_id != current.child_session_id
@@ -444,6 +468,24 @@ class CoordinatorLivenessLeaseService:
             return False
         await self._run_callbacks(refreshed)
         return True
+
+    @staticmethod
+    def _row_is_ordinary_mailbox_child(
+        row: Session | None,
+        heartbeat: MailboxEnvelope,
+    ) -> bool:
+        return bool(
+            row is not None
+            and row.id == heartbeat.child_session_id
+            and isinstance(row.status, SessionStatus)
+            and row.status is SessionStatus.RUNNING
+            and row.worker_type == "subagent"
+            and row.subagent_control_plane == "mailbox"
+            and row.tool_filter_preset == "subagent_research"
+            and row.parent_session_id == heartbeat.parent_session_id
+            and row.coordinator_run_id is None
+            and row.work_unit_id is None
+        )
 
     @staticmethod
     def _row_matches_lease(

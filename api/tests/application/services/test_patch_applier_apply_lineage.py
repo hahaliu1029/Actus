@@ -40,6 +40,29 @@ def anyio_backend() -> str:
 
 
 class _NoopAsyncCM:
+    def __init__(self) -> None:
+        self.token: str | None = None
+
+    async def acquire(
+        self, *, blocking: bool = False, token: str | None = None,
+    ) -> bool:
+        assert blocking is False
+        self.token = token
+        return True
+
+    async def owned(self) -> bool:
+        return self.token is not None
+
+    async def extend(
+        self, additional_time: float, *, replace_ttl: bool = False,
+    ) -> bool:
+        assert additional_time > 0
+        assert replace_ttl is True
+        return True
+
+    async def release(self) -> None:
+        self.token = None
+
     async def __aenter__(self) -> None:
         return None
 
@@ -87,6 +110,8 @@ def audit_repo() -> MagicMock:
 def redis_mock() -> MagicMock:
     r = MagicMock()
     r.lock = MagicMock(return_value=_NoopAsyncCM())
+    r.eval = AsyncMock(return_value=1)
+    r.delete = AsyncMock(return_value=1)
     return r
 
 

@@ -195,3 +195,27 @@ async def test_save_overwrite_same_path_same_run(tmp_path) -> None:
     )
     assert snap1.snapshot_path == snap2.snapshot_path
     assert await store.load(snap2) == b"second"
+
+
+async def test_attempt_tokens_isolate_same_run_path_cleanup(tmp_path) -> None:
+    store = LocalFSRollbackSnapshotStore(base_dir=str(tmp_path))
+    old = await store.save(
+        coordinator_run_id="r1", path="x.py", content=b"old",
+        original_digest=_SHA_A, attempt_token="owner-old",
+    )
+    replacement = await store.save(
+        coordinator_run_id="r1", path="x.py", content=b"replacement",
+        original_digest=_SHA_A, attempt_token="owner-new",
+    )
+
+    assert old.snapshot_path != replacement.snapshot_path
+    assert os.path.dirname(old.snapshot_path) != os.path.dirname(
+        replacement.snapshot_path,
+    )
+    assert os.path.basename(
+        os.path.dirname(os.path.dirname(old.snapshot_path)),
+    ) == "r1"
+    await store.discard("r1", [old])
+
+    assert await store.load(replacement) == b"replacement"
+    assert os.path.isdir(tmp_path / "r1")

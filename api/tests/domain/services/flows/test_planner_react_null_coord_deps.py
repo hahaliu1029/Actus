@@ -109,3 +109,13 @@ def test_coordinator_child_permission_context_disables_graph_watchdog():
 
     assert cfg["configurable"]["execution_watchdog"] is None
     assert isinstance(cfg["configurable"]["execution_control"], ExecutionControl)
+
+
+def test_mailbox_managed_research_child_disables_graph_watchdog():
+    """Mailbox heartbeat/orphan ownership replaces the graph idle timer."""
+    flow = _make_default_flow()
+    flow.set_mailbox_liveness_managed()
+
+    cfg = flow._build_config()
+
+    assert cfg["configurable"]["execution_watchdog"] is None

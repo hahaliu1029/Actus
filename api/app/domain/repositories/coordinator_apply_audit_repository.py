@@ -15,7 +15,8 @@ Three methods:
   ``digest_drift`` / ``file_missing`` / ``file_exists`` /
   ``target_special_file`` /
   ``post_write_digest_mismatch`` / ``minio_fetch_failed`` /
-  ``write_io_error`` / ``apply_aborted`` / ``rollback_partial``).
+  ``write_io_error`` / ``apply_aborted`` / ``apply_lock_lost`` /
+  ``rollback_partial`` / ``crash_mid_apply``).
 - ``find_latest_for_run`` is the rehydrate path (PR-7) + SSE replay
   hook (PR-8).
 
@@ -76,8 +77,12 @@ class CoordinatorApplyAuditRepository(ABC):
         applied_files: Optional[list[dict[str, Any]]] = None,
         diagnostics: Optional[dict[str, Any]] = None,
         duration_ms: int = 0,
-    ) -> None:
-        """Update the audit row to a terminal status.
+    ) -> bool:
+        """CAS ``in_progress`` to a terminal status.
+
+        Returns ``True`` only when this call won the first-terminal transition.
+        Missing rows and already-terminal rows return ``False``; terminal
+        outcomes are immutable and cannot overwrite each other.
 
         ``applied_files`` is the list of ``{"path": ..., "op": ...}``
         dicts the applier successfully wrote (used for replay on

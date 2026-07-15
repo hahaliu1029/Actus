@@ -2652,10 +2652,15 @@ class MailboxSupervisor:
             and kind_value == ProgressKind.HEARTBEAT.value
         ):
             accepted = await liveness.record_heartbeat(envelope)
-            if not accepted:
+            if accepted is False:
                 return
-            if envelope.child_session_id not in self._known_children:
+            if accepted is True and (
+                envelope.child_session_id not in self._known_children
+            ):
                 self._known_children.append(envelope.child_session_id)
+            elif accepted is not None:
+                # Unknown/invalid disposition is not a safe legacy fallback.
+                return
         elif liveness is not None:
             # A SPAWN_ACK or ordinary progress event can be the first event
             # observed after dispatch. If the DB-authorized startup lease is
