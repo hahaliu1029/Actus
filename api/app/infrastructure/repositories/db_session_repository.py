@@ -19,7 +19,7 @@ from app.domain.repositories.session_repository import (
 from app.infrastructure.models import SessionModel
 from pydantic import ValidationError
 import sqlalchemy as sa
-from sqlalchemy import cast, delete, func, select, update
+from sqlalchemy import cast, delete, func, not_, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -194,6 +194,36 @@ class DBSessionRepository(SessionRepository):
         # 3.检查是否新增成功
         if result.rowcount == 0:
             raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def add_file_if_absent(self, session_id: str, file: File) -> None:
+        """按 file.id 幂等的会话文件关联写（SPM DD-20/R5#B2；仅 flusher 使用——
+        legacy add_file 保持无条件追加，always 路径行为不变 INV-SPM-2）"""
+        file_data = file.model_dump(mode="json")
+        stmt = (
+            update(SessionModel)
+            .where(
+                SessionModel.id == session_id,
+                not_(
+                    func.coalesce(SessionModel.files, cast([], JSONB)).contains(
+                        cast([{"id": file.id}], JSONB)
+                    )
+                ),
+            )
+            .values(
+                files=func.coalesce(SessionModel.files, cast([], JSONB))
+                + cast([file_data], JSONB),
+            )
+        )
+        result = await self.db_session.execute(stmt)
+        if result.rowcount == 0:
+            # 歧义消解：已存在（幂等 no-op）vs 会话不存在（保持既有 ValueError 合同）
+            exists = await self.db_session.scalar(
+                select(func.count())
+                .select_from(SessionModel)
+                .where(SessionModel.id == session_id)
+            )
+            if not exists:
+                raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
 
     async def remove_file(self, session_id: str, file_id: str) -> None:
         """移除会话中的指定文件"""

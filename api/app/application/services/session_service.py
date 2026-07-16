@@ -48,6 +48,10 @@ class SessionService:
         subagent_limits: Optional["SubagentLimitsConfig"] = None,
         settings: Optional["Settings"] = None,
         mailbox_flag_reader: Optional[Callable[[], bool]] = None,
+        # SPM PR-1c Task 17: provision-flow metrics singleton
+        # (app.state.sandbox_provision_metrics). None → the vnc/takeover
+        # trigger three-classification records are no-op'd (tests / legacy).
+        sandbox_provision_metrics: object | None = None,
     ) -> None:
         """构造函数，完成会话服务初始化
 
@@ -82,6 +86,26 @@ class SessionService:
         # them. Do NOT add new readers — the rollback path is gone.
         self._settings = settings
         self._mailbox_flag_reader = mailbox_flag_reader
+        # SPM PR-1c Task 17: provision metrics for vnc/takeover trigger surfaces.
+        self._provision_metrics = sandbox_provision_metrics
+
+    def _record_provision(self, *, trigger: str, outcome: str) -> None:
+        """SPM Task 17 — non-provisioner trigger three-classification emit
+        (spec §5.2d). No-op when no metrics sink is injected. Side-effect-only:
+        a metrics hiccup must never mask the real vnc/takeover error."""
+        metrics = getattr(self, "_provision_metrics", None)
+        if metrics is None:
+            return
+        try:
+            from core.config import get_settings
+
+            metrics.record_provision(
+                mode=get_settings().sandbox_provision_mode,
+                trigger=trigger,
+                outcome=outcome,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("session_service provision metric emit failed", exc_info=True)
 
     async def create_session(self, user_id: str) -> Session:
         """创建一个空白的新任务会话"""
@@ -593,12 +617,23 @@ class SessionService:
         # 把 `user_id`（请求者身份）透传给 bind_new——否则管理员打开他人 VNC
         # 会把自己的 memory 挂进 session owner 的 sandbox。让 bind_new 走内部
         # 的 session.user_id 回退拿到真正的 session owner。
+        # SPM PR-1c Task 17 (§5.2d): non-provisioner trigger three-classification.
+        # The acquire→bind_new/resume branching is NORMAL routing (not failure);
+        # only exceptions that ESCAPE it count as failed/cancelled.
         try:
-            handle = await self._lifecycle.acquire(session_id)
-        except SessionUnboundError:
-            handle = await self._lifecycle.bind_new(session_id)
-        except SessionSuspendedError:
-            handle = await self._lifecycle.resume(session_id)
+            try:
+                handle = await self._lifecycle.acquire(session_id)
+            except SessionUnboundError:
+                handle = await self._lifecycle.bind_new(session_id)
+            except SessionSuspendedError:
+                handle = await self._lifecycle.resume(session_id)
+        except asyncio.CancelledError:
+            self._record_provision(trigger="vnc", outcome="cancelled")
+            raise
+        except Exception:
+            self._record_provision(trigger="vnc", outcome="failed")
+            raise
+        self._record_provision(trigger="vnc", outcome="ok")
 
         return handle.vnc_url
 
@@ -620,12 +655,21 @@ class SessionService:
         # 获取或创建沙箱
         # 同 get_vnc_url：admin takeover 不能用 requester user_id，
         # 交给 bind_new 内部的 session.user_id 回退。
+        # SPM PR-1c Task 17 (§5.2d): trigger="takeover" three-classification.
         try:
-            handle = await self._lifecycle.acquire(session_id)
-        except SessionUnboundError:
-            handle = await self._lifecycle.bind_new(session_id)
-        except SessionSuspendedError:
-            handle = await self._lifecycle.resume(session_id)
+            try:
+                handle = await self._lifecycle.acquire(session_id)
+            except SessionUnboundError:
+                handle = await self._lifecycle.bind_new(session_id)
+            except SessionSuspendedError:
+                handle = await self._lifecycle.resume(session_id)
+        except asyncio.CancelledError:
+            self._record_provision(trigger="takeover", outcome="cancelled")
+            raise
+        except Exception:
+            self._record_provision(trigger="takeover", outcome="failed")
+            raise
+        self._record_provision(trigger="takeover", outcome="ok")
 
         shell_session_id = f"takeover_{session_id}_{takeover_id}"
         probe_result = await handle.read_shell_output(

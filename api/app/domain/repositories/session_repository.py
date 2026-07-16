@@ -298,6 +298,13 @@ class SessionRepository(Protocol):
         """往会话中新增文件"""
         ...
 
+    async def add_file_if_absent(self, session_id: str, file: File) -> None:
+        """按 file.id 幂等的会话文件关联写（SPM DD-20/R5#B2；仅 flusher 使用）。
+
+        legacy ``add_file`` 保持无条件追加，always 路径行为不变（INV-SPM-2）。
+        """
+        ...
+
     async def remove_file(self, session_id: str, file_id: str) -> None:
         """根据传递的会话id+文件id移除文件"""
         ...

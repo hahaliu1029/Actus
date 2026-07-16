@@ -101,6 +101,16 @@ class TestEagerSandboxAccessor:
         await acc.release_owned()  # idempotent
         assert h.release_calls == 1
 
+    async def test_release_owned_quiet_when_handle_has_no_release(self) -> None:
+        """SPM Task 17 fix #3: the AgentService no-lifecycle test fallback wraps a
+        raw sandbox object with NO ``release()``. ``release_owned`` must clear the
+        handle quietly (hasattr guard) — no AttributeError, no misleading warning."""
+        h = SimpleNamespace(id="raw")  # no release() attribute
+        acc = EagerSandboxAccessor(h)
+        await acc.release_owned()  # must not raise
+        assert acc.peek() is None  # cleared → terminal, idempotent
+        await acc.release_owned()  # second call is a no-op
+
 
 # ── EagerBrowserAccessor ────────────────────────────────────────────────────
 

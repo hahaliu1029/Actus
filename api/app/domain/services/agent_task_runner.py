@@ -15,6 +15,13 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, BinaryIO, Callable, Dict,
 if TYPE_CHECKING:
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.provider_profiles import ProviderProfile  # A7 Task 2.7
+    # SPM PR-1c Task 15: typed under TYPE_CHECKING so the domain runner never
+    # imports the application layer at runtime (no domain→application cycle).
+    from app.application.services.sandbox_attachment_flush import (
+        SandboxAttachmentFlusher,
+    )
+    from app.application.services.sandbox_provisioner import SandboxProvisioner
+    from app.domain.external.sandbox import SandboxHandle
 
 from langchain_core.language_models import BaseChatModel
 
@@ -420,6 +427,12 @@ class AgentTaskRunner(TaskRunner):
         supports_vision: bool = True,  # 模型是否支持视觉/多模态
         supports_pdf_input: bool = False,  # 是否支持原生 PDF 文件输入
         file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
+        # SPM PR-1c Task 17: on_demand deferred file_view processor. Mutually
+        # exclusive with ``file_processor_lookup`` (always → lookup, on_demand →
+        # factory, off → both None). ``file_processor_factory(handle)`` builds the
+        # FileProcessorRegistry lazily once a sandbox is provisioned; threaded into
+        # ``create_native_tools`` alongside the lookup (registration = either non-None).
+        file_processor_factory: object | None = None,
         memory_flusher: MemoryFlusher | None = None,  # 记忆刷写调度器
         memory_embedding_provider=None,  # C6: 记忆向量化 provider
         memory_session_factory=None,  # C6: 记忆 DB session 工厂
@@ -487,6 +500,13 @@ class AgentTaskRunner(TaskRunner):
         retry_lifecycle_context: Any = None,  # C7 §5: RetryLifecycleContext | None（仅 retry_from_suspend 路径传入）
         lifecycle_task_epoch: int = 0,  # C7 §5: _create_task 从 session.retry_budget_remaining 持久派生（R10#A3）
         extension_admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 全走旧路径零调用）
+        # SPM PR-1c Task 15: on_demand attachment routing. All keyword + defaulted
+        # so always-mode callers are unchanged (Task 17 wires the real values).
+        # `sandbox_provisioner` is needed so an incremental-flush failure can
+        # `mark_hooks_dirty()` → the next provision full-retransfer backstops the miss.
+        attachment_flusher: "SandboxAttachmentFlusher | None" = None,
+        sandbox_provision_mode: str = "always",
+        sandbox_provisioner: "SandboxProvisioner | None" = None,
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         # Phase 1 minimal subagent: optional tool-name allowlist.
@@ -606,6 +626,16 @@ class AgentTaskRunner(TaskRunner):
         self._memory_gate_batch_cap = memory_gate_batch_cap
         self._memory_notification_emitter = memory_notification_emitter
         self._file_processor_lookup = file_processor_lookup
+        # SPM PR-1c Task 17: mutual-exclusion contract (Task 9 froze the
+        # _make_file_view_tools assert; enforce it here at ctor time too so a
+        # mis-wired assembly fails fast rather than at first file_view).
+        assert not (
+            file_processor_lookup is not None and file_processor_factory is not None
+        ), (
+            "AgentTaskRunner: file_processor_lookup and file_processor_factory "
+            "are mutually exclusive"
+        )
+        self._file_processor_factory = file_processor_factory
         self._agent_config = agent_config
         self._tool_runtime = tool_runtime or ToolRuntimeConfig()
         self._llm = llm
@@ -615,6 +645,10 @@ class AgentTaskRunner(TaskRunner):
         self._user_id = user_id
         # self._session_repository = session_repository
         self._sandbox_accessor = sandbox_accessor
+        # SPM PR-1c Task 15: on_demand attachment routing (always-mode: all None/"always").
+        self._attachment_flusher = attachment_flusher
+        self._sandbox_provision_mode = sandbox_provision_mode
+        self._sandbox_provisioner = sandbox_provisioner
         self._mcp_config = mcp_config
         self._mcp_tool = MCPTool()
         self._a2a_config = a2a_config
@@ -628,6 +662,9 @@ class AgentTaskRunner(TaskRunner):
             skills_root_dir=settings.skills_root_dir,
             sandbox_skill_root=settings.skill_sandbox_bundle_root,
             admission_port=self._admission_port,  # D1a §4.1: off=None
+            # SPM Task 16: on_demand → deferred sync (startup seq no-ops fast;
+            # start_deferred_sync(handle) is wired as provision hook ② in Task 17).
+            deferred=(self._sandbox_provision_mode == "on_demand"),
         )
         self._skill_tool = SkillTool(
             sandbox_accessor=self._sandbox_accessor,
@@ -809,6 +846,7 @@ class AgentTaskRunner(TaskRunner):
             supports_vision=supports_vision,
             supports_pdf_input=supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
+            file_processor_factory=file_processor_factory,  # SPM Task 17: on_demand deferred
             memory_embedding_provider=self._memory_embedding_provider,
             memory_session_factory=self._memory_session_factory,
             memory_repo_factory=self._memory_repo_factory,
@@ -841,6 +879,16 @@ class AgentTaskRunner(TaskRunner):
             permission_engine=self._permission_engine,
             session_state_machine=self._session_state_machine,
             policy_snapshot_sink=self._policy_snapshot_sink,
+            # SPM Task 18 (INV-SPM-13): on_demand provisioning binds an
+            # idle-suppression guard onto the flow's per-invoke ExecutionWatchdog
+            # so a slow container cold-start is not misread as a stalled graph.
+            # Pass the bind callback ONLY when a provisioner is present; always-
+            # mode has none → no callback, watchdog behaves exactly as before.
+            **(
+                {"on_execution_watchdog": self._bind_provision_idle_guard}
+                if self._sandbox_provisioner is not None
+                else {}
+            ),
             # PR-9b-A Task A8 — forward the lifespan-scoped coord deps to
             # PlannerReActFlow. When None, the planner's default
             # ``_NullCoordinatorRuntimeDeps`` kicks in (legacy/test path).
@@ -850,6 +898,22 @@ class AgentTaskRunner(TaskRunner):
                 else {}
             ),
         )
+
+    def _bind_provision_idle_guard(self, watchdog) -> None:
+        """SPM Task 18 (INV-SPM-13): flow callback — bind an idle-suppression
+        guard onto the just-created per-invoke ExecutionWatchdog so a slow
+        on_demand container cold-start (create + post-provision hooks) does not
+        trip the graph-idle timeout. The provisioner pauses idle evaluation for
+        the duration of each provision attempt via this guard's structured owner
+        key. Only wired when a provisioner exists (always-mode never calls this).
+
+        Local import keeps the domain runner free of a module-level
+        domain→application dependency (mirrors the Task 15 TYPE_CHECKING intent
+        and the tool_event_envelope_v1 local-import precedent)."""
+        from app.application.services.sandbox_provisioner import _WatchdogIdleGuard
+
+        key = ("sandbox_provision", self._session_id)
+        self._sandbox_provisioner.bind_idle_guard(_WatchdogIdleGuard(watchdog, key))
 
     @property
     def session_id(self) -> str:
@@ -1260,6 +1324,77 @@ class AgentTaskRunner(TaskRunner):
                 return file
         except Exception as e:
             logger.exception(f"AgentTaskRunner同步文件[{file_id}]失败: {str(e)}")
+
+    async def start_deferred_skill_sync(self, handle: "SandboxHandle") -> None:
+        """SPM PR-1c Task 17 — provision hook ② target (on_demand only).
+
+        Registered by ``AgentService._create_task`` AFTER runner construction via
+        ``provisioner.add_hook(lambda h: runner.start_deferred_skill_sync(h),
+        trigger="skill_sync")``. Delegates to the bundle-sync manager's deferred
+        startup replay against the CONCRETE provisioned handle (anti-deadlock: the
+        manager binds ``h`` before any sandbox op so it never re-enters the
+        inflight provision). None-guard: no manager (off / __new__-bypass tests) →
+        no-op. Always mode never registers this hook.
+        """
+        mgr = getattr(self, "_skill_bundle_sync", None)
+        if mgr is None:
+            return
+        await mgr.start_deferred_sync(handle)
+
+    async def _route_message_attachments(self, event: MessageEvent) -> None:
+        """SPM PR-1c Task 15：按供给档分叉 MessageEvent 附件处理。
+
+        - always：走 legacy ``_sync_message_attachments_to_sandbox``（INV-SPM-2，
+          可观察行为一字不变）。
+        - on_demand：沙箱已 ready → 本 run 增量 flush（best-effort；失败不阻塞消息
+          路径，但 ``mark_hooks_dirty()`` 使下次 provision 全量幂等重传兜住漏传）；
+          未 provision → 沙箱侧跳过（附件已持久化在 MessageEvent，provision hook ①
+          全量重传兜底）。随后按 id 从 DB hydrate id-only File 元数据供 vision 组装
+          （纯 DB，零沙箱触碰）。
+        """
+        if self._sandbox_provision_mode == "on_demand":
+            handle = self._sandbox_accessor.peek()
+            if handle is not None and self._attachment_flusher is not None:
+                try:
+                    await self._attachment_flusher.flush_incremental(
+                        self._session_id,
+                        handle,
+                        [f.id for f in (event.attachments or [])],
+                    )
+                except Exception:
+                    logger.warning(
+                        "incremental attachment flush failed; marking hooks dirty",
+                        exc_info=True,
+                    )
+                    if self._sandbox_provisioner is not None:
+                        self._sandbox_provisioner.mark_hooks_dirty()
+            # 未 provision → 沙箱侧跳过；provision hook ① 全量重传兜底。
+            # vision：producer 侧 MessageEvent 附件只带 id（agent_service.py 区域），
+            # MIME 缺失会让 _build_image_blocks 静默丢图 → 进 vision 前按 id hydrate。
+            await self._hydrate_id_only_attachments_for_vision(event)
+        else:
+            await self._sync_message_attachments_to_sandbox(event)  # always：legacy 原样
+
+    async def _hydrate_id_only_attachments_for_vision(
+        self, event: MessageEvent
+    ) -> None:
+        """on_demand/off：进 vision 组装前按 id 从 ``uow.file.get_by_id`` hydrate
+        id-only File 附件（补全 MIME/尺寸元数据）——纯 DB、零沙箱触碰。行不存在
+        （已删除）→ 静默剔除（避免残缺附件进 vision）。always 分支经 legacy 同步天然
+        hydrate，不走此路径。"""
+        if not event.attachments:
+            return
+        hydrated: List[File] = []
+        async with self._uow:
+            for att in event.attachments:
+                if not isinstance(att, File):
+                    hydrated.append(att)
+                    continue
+                full = await self._uow.file.get_by_id(att.id)
+                if full is not None:
+                    hydrated.append(full)
+                # else：行已删除 → 静默剔除
+        event.attachments = hydrated
 
     async def _sync_message_attachments_to_sandbox(self, event: MessageEvent) -> None:
         """将消息事件中的附件同步到沙箱中"""
@@ -1955,6 +2090,8 @@ class AgentTaskRunner(TaskRunner):
             browser_accessor=self._browser_accessor,
             search_engine=self._search_engine,
             file_processor_lookup=self._file_processor_lookup,
+            # SPM Task 17: getattr defense for __new__-bypass runner tests.
+            file_processor_factory=getattr(self, "_file_processor_factory", None),
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
@@ -2451,6 +2588,8 @@ class AgentTaskRunner(TaskRunner):
                 browser_accessor=self._browser_accessor,
                 search_engine=self._search_engine,
                 file_processor_lookup=self._file_processor_lookup,
+                # SPM Task 17: getattr defense for __new__-bypass runner tests.
+                file_processor_factory=getattr(self, "_file_processor_factory", None),
                 supports_vision=self._supports_vision,
                 supports_pdf_input=self._supports_pdf_input,
                 # codex fix P0 round-2：step graph 每次 rebuild 都要带守卫，
@@ -4554,8 +4693,16 @@ class AgentTaskRunner(TaskRunner):
 
             # 2.确保沙箱、mcp、a2a均初始化完成
             logger.info(f"AgentTaskRunner任务处理开始")
-            sandbox = await self._sandbox_accessor.get()
-            await sandbox.ensure_sandbox()
+            # SPM PR-1c Task 17 (要点3): entry readiness recheck is PEEK-based so
+            # on_demand does NOT force-provision at run start — a pure-chat run
+            # must create ZERO containers (G1). ``peek()`` returns the ready
+            # handle in always mode (Eager peek is identity) → ensure runs
+            # exactly as before; in on_demand it returns None until the first
+            # sandbox tool call triggers provision → recheck is skipped. Both
+            # modes share the same semantics (provision-if-provisioned).
+            handle = self._sandbox_accessor.peek()
+            if handle is not None:
+                await handle.ensure_sandbox()
             # PR-9b-A audit round-1 P1 (Fix 3 / INV-A6) — prime the planner's
             # per-run cancel_event so ``PlannerReActFlow._build_config()``
             # injects a real ``asyncio.Event`` (not ``None``) into the 18-key
@@ -4749,7 +4896,7 @@ class AgentTaskRunner(TaskRunner):
                         image_content_blocks: list[dict] = []
                         if isinstance(event, MessageEvent):
                             message = event.message or ""
-                            await self._sync_message_attachments_to_sandbox(event)
+                            await self._route_message_attachments(event)
                             # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
                             logger.debug(
                                 "before _build_image_blocks: attachments count=%d, types=%s, mimes=%s",

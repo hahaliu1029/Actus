@@ -508,6 +508,14 @@ async def test_start_provisions_child_sandbox_and_cost_handler(monkeypatch):
     bk = runner_factory.build.call_args.kwargs
     assert bk["user_id"] == "user-1"
     assert "sandbox_accessor" in bk and "browser_accessor" in bk and "cost_callback_handler" in bk
+    # INV-SPM-8: the child is ALWAYS eager — the bare bind_new handle is wrapped in
+    # an EagerSandboxAccessor (zero-provision get()), NEVER an on_demand accessor.
+    # Type-pin + identity-pin so a future on_demand slip on the child path turns red.
+    from app.application.services.sandbox_accessors import EagerSandboxAccessor
+
+    child_handle = lifecycle.bind_new.return_value
+    assert isinstance(bk["sandbox_accessor"], EagerSandboxAccessor)
+    assert bk["sandbox_accessor"].peek() is child_handle
     assert captured["ctor"].get("child_sandbox") is not None  # A1: child_sandbox Port threaded
     # A1: the child gets its OWN sandbox port, never the parent's handle.
     assert captured["ctor"]["child_sandbox"] is not captured["ctor"]["parent_sandbox"]
@@ -1117,3 +1125,121 @@ def test_resolve_child_llm_price_finds_glm_5_2() -> None:
     price = _resolve_child_llm_price(llm)
     assert price is not None
     assert price["input"] > 0 and price["output"] > 0
+
+
+# ── SPM PR-1c Task 17: child_spawn trigger three-classification (§5.2d) ──
+
+
+class _RecMetrics:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, str]] = []
+
+    def record_provision(
+        self, *, mode, trigger, outcome, latency_seconds=None, latency=None
+    ) -> None:
+        self.records.append((mode, trigger, outcome))
+
+    def last(self, *, trigger: str):
+        for mode, trg, outcome in reversed(self.records):
+            if trg == trigger:
+                return outcome
+        return None
+
+
+def _make_starter_with_metrics(lifecycle, metrics):
+    from unittest.mock import AsyncMock
+
+    from app.application.services.coordinator_child_runner_starter import (
+        DefaultCoordinatorChildRunnerStarter,
+    )
+
+    envelope_factory = MagicMock()
+    envelope_factory.make_result_ready = MagicMock(return_value="ENVELOPE")
+    publisher = MagicMock()
+    publisher.publish = AsyncMock()
+    return DefaultCoordinatorChildRunnerStarter(
+        runner_factory=_FakeRunnerFactory(),
+        mailbox_publisher=publisher,
+        mailbox_subscriber=MagicMock(),
+        envelope_factory=envelope_factory,
+        session_repository=_FakeSessionRepository(),
+        coordinator_envelope_store=MagicMock(),
+        cost_rollup_service=MagicMock(),
+        artifact_storage=_FakeArtifactStorage(_manifest_bytes()),
+        coordinator_limits=_FakeCoordinatorLimits(),
+        sandbox_lifecycle_service=lifecycle,
+        resolve_child_runner_deps=_fake_resolve,
+        sandbox_provision_metrics=metrics,
+    )
+
+
+async def _start_child(starter):
+    await starter.start(
+        coordinator_run_id="run-1",
+        work_unit=_FakeWorkUnit("wu-1"),
+        child_session_id="child-1",
+        spawn_manifest_ref="ref-1",
+        cancel_event=asyncio.Event(),
+        root_session_id="root-1",
+        parent_session_id="parent-1",
+        parent_sandbox=MagicMock(),
+        user_id="user-1",
+    )
+
+
+async def test_starter_ctor_accepts_optional_provision_metrics():
+    starter = _make_starter()
+    assert starter._provision_metrics is None
+
+
+async def test_child_spawn_records_failed_on_bind_error():
+    from unittest.mock import AsyncMock
+
+    metrics = _RecMetrics()
+    lifecycle = _fake_lifecycle()
+    lifecycle.bind_new = AsyncMock(side_effect=RuntimeError("bind boom"))
+    starter = _make_starter_with_metrics(lifecycle, metrics)
+    # RuntimeError → leak-guard publishes FAILED + swallows → start() does NOT raise
+    await _start_child(starter)
+    assert metrics.last(trigger="child_spawn") == "failed"
+
+
+async def test_child_spawn_records_cancelled_on_bind_cancel():
+    from unittest.mock import AsyncMock
+
+    metrics = _RecMetrics()
+    lifecycle = _fake_lifecycle()
+    lifecycle.bind_new = AsyncMock(side_effect=asyncio.CancelledError())
+    starter = _make_starter_with_metrics(lifecycle, metrics)
+    # CancelledError → leak-guard publishes FAILED then re-raises the cancel
+    with pytest.raises(asyncio.CancelledError):
+        await _start_child(starter)
+    assert metrics.last(trigger="child_spawn") == "cancelled"
+
+
+async def test_child_spawn_records_ok_on_success(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    metrics = _RecMetrics()
+    lifecycle = _fake_lifecycle()
+
+    class _NoopChildRunner:
+        def __init__(self, **kwargs):
+            ...
+
+        def attach_budget_callback(self, cb) -> None:
+            ...
+
+        async def run_work_unit(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "app.application.services.coordinator_child_runner_starter.CoordinatorChildRunner",
+        _NoopChildRunner,
+    )
+    runner_factory = MagicMock()
+    runner_factory.build = AsyncMock(return_value=MagicMock())
+    starter = _make_starter_with_metrics(lifecycle, metrics)
+    starter._runner_factory = runner_factory
+    await _start_child(starter)
+    assert metrics.last(trigger="child_spawn") == "ok"

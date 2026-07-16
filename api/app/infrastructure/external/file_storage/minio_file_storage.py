@@ -175,6 +175,18 @@ class MinioFileStorage(FileStorage):
             if not file:
                 raise ValueError(f"该文件不存在, 文件id: {file_id}")
 
+            # SPM r24/R24-CLASS1: the read-UoW `__aexit__` empty-transaction commit
+            # swallows CancelledError WITHOUT uncancel() (db_uow.py:71), so a cancel
+            # landing on that commit leaves `cancelling() > 0`. This is the nested
+            # read-UoW closure point for the attachment-flush provision hook: honor a
+            # swallowed cancel HERE (after the read-UoW, before the external MinIO
+            # I/O) so a cancelled provision does not waste the download and is
+            # correctly classified as `cancelled`, not `failed`. Safe for every
+            # caller — a no-op when no cancel is pending.
+            _t = asyncio.current_task()
+            if _t is not None and _t.cancelling() > 0:
+                raise asyncio.CancelledError()
+
             # 2.使用MinioStore下载文件
             response = await self.minio_store.download_fileobj(
                 bucket_name=self.bucket,

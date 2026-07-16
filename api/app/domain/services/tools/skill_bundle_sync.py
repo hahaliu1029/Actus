@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from app.domain.external.sandbox import SandboxAccessor
+from app.domain.external.sandbox import SandboxAccessor, SandboxHandle
 from app.domain.models.extension_governance import SyncOutcome
 from app.domain.models.skill import Skill, SkillRuntimeType
 from app.domain.services.extension_admission_gates import (
@@ -56,6 +56,7 @@ class SkillBundleSyncManager:
         sandbox_skill_root: str,
         background_concurrency: int = DEFAULT_BACKGROUND_CONCURRENCY,
         admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 旧路径零调用）
+        deferred: bool = False,  # SPM Task 16: on_demand 档懒同步（default False = always 字节等价）
     ) -> None:
         self._sandbox_accessor = sandbox_accessor
         self._skills_root_dir = Path(skills_root_dir)
@@ -69,6 +70,15 @@ class SkillBundleSyncManager:
         self._background_task: asyncio.Task[None] | None = None
         self._background_skills: list[Skill] = []
         self._file_listings: dict[str, list[str]] = {}
+        # SPM Task 16: deferred (on_demand) mode. When True, prepare_startup_sync
+        # only STORES the intent (zero create_task); the real task creation +
+        # background start happen in start_deferred_sync(handle), wired as
+        # provision hook ② (Task 17). All fields inert on the always path.
+        self._deferred = bool(deferred)
+        self._bound_handle: SandboxHandle | None = None  # concrete handle (anti-deadlock)
+        self._deferred_started = False  # start_deferred_sync idempotency guard
+        self._stored_skill_pool: list[Skill] = []
+        self._stored_initial_selected: list[Skill] = []
 
     async def prepare_startup_sync(
         self,
@@ -79,8 +89,32 @@ class SkillBundleSyncManager:
 
         Initial selected skills are synchronized in foreground (blocking).
         Remaining syncable skills are prepared for background sync.
+
+        SPM Task 16: in deferred (on_demand) mode this STORES the intent only —
+        zero ``asyncio.create_task`` — because the sandbox is not yet provisioned.
+        The real task creation runs in ``start_deferred_sync(handle)`` (provision
+        hook ②). Always mode is byte-equivalent to before (INV-SPM-2).
         """
         self._skill_pool = {skill.id: skill for skill in skill_pool}
+
+        if self._deferred:
+            self._stored_skill_pool = list(skill_pool)
+            self._stored_initial_selected = list(initial_selected)
+            return
+
+        self._create_startup_tasks(skill_pool, initial_selected)
+
+    def _create_startup_tasks(
+        self,
+        skill_pool: list[Skill],
+        initial_selected: list[Skill],
+    ) -> None:
+        """Foreground/background split of the startup sync (eager body).
+
+        Shared by the always path (``prepare_startup_sync``) and the deferred
+        path (``start_deferred_sync``). Assumes ``self._skill_pool`` is already
+        populated by the caller.
+        """
         selected_ids = {skill.id for skill in initial_selected}
 
         self._initial_tasks = []
@@ -105,10 +139,60 @@ class SkillBundleSyncManager:
                 logger.warning("前台Skill bundle同步任务异常: %s", str(result))
 
     def start_background_sync(self) -> None:
-        """Start background synchronization for remaining skills."""
+        """Start background synchronization for remaining skills.
+
+        SPM Task 16: in deferred mode, the startup-sequence call (runner :4785)
+        arrives BEFORE the sandbox is provisioned, so it is a no-op — the real
+        background start happens inside ``start_deferred_sync`` (which always
+        starts the sweep, mirroring the always sequence). Always mode is
+        byte-equivalent to before.
+        """
+        if self._deferred and not self._deferred_started:
+            # No-op until the sandbox is provisioned: start_deferred_sync always
+            # starts the background sweep at the end (mirrors the always
+            # sequence), so no pending flag is needed here.
+            return
+        self._start_background_sync_impl()
+
+    def _start_background_sync_impl(self) -> None:
         if self._background_task or not self._background_skills:
             return
         self._background_task = asyncio.create_task(self._run_background_sync())
+
+    async def start_deferred_sync(self, handle: SandboxHandle) -> None:
+        """SPM Task 16 (provision hook ②): run the stored startup sync using a
+        CONCRETE handle.
+
+        CRUX — anti-deadlock: this runs INSIDE ``provisioner._provision_once()``
+        while the binding is not yet ACTIVE. Any path that did
+        ``await self._sandbox_accessor.get()`` here would re-enter (join) the
+        same inflight provision task and DEADLOCK. We therefore bind the concrete
+        ``handle`` first; every sandbox upload/marker op then prefers it (see
+        ``_acquire_sandbox``). Background tasks that run after the binding is
+        ready would also fast-return from the accessor, but they too keep using
+        the bound handle here.
+
+        Idempotent: a second call is a no-op. Never raises lifecycle errors
+        (``SessionSuspendedError`` / ``SessionFinalizedError``); a cooperative
+        ``CancelledError`` still propagates. Sync failures follow the manager's
+        existing log/degrade style (``await_initial_sync`` gathers with
+        ``return_exceptions``; ``_sync_skill`` swallows and marks failed), so the
+        provision hook wrapper never sees a ``SessionSuspendedError`` /
+        ``SessionFinalizedError`` leak out of here.
+        """
+        if self._deferred_started:
+            return
+        self._deferred_started = True
+        # bind_ready_handle: record the concrete handle so sandbox ops use it
+        # directly instead of joining the inflight provision (see docstring).
+        self._bound_handle = handle
+        # Now replay the prepare that deferred mode only stored, then really
+        # start the background sweep (mirrors always: prepare → await → background).
+        self._create_startup_tasks(
+            self._stored_skill_pool, self._stored_initial_selected
+        )
+        await self.await_initial_sync()
+        self._start_background_sync_impl()
 
     def get_file_listing(self, skill_id: str) -> list[str] | None:
         """Return cached file listing for a skill, or None if not cached.
@@ -174,6 +258,34 @@ class SkillBundleSyncManager:
         self._background_task = None
         self._initial_tasks = []
         self._background_skills = []
+
+    async def _acquire_sandbox(self) -> SandboxHandle:
+        """Return the sandbox handle to operate on.
+
+        SPM Task 16: deferred (on_demand) mode binds a CONCRETE handle in
+        ``start_deferred_sync`` (which runs INSIDE ``provisioner._provision_once``
+        before the binding is ACTIVE). Calling ``self._sandbox_accessor.get()``
+        there would re-enter the same inflight provision task and DEADLOCK, so we
+        prefer the bound handle. Always mode leaves ``_bound_handle=None`` → the
+        exact legacy ``accessor.get()`` call (INV-SPM-2 byte equivalence).
+        """
+        if self._bound_handle is not None:
+            return self._bound_handle
+        # SPM Task 17 fix #1(b) — belt-and-braces anti-deadlock guard. A
+        # manager-spawned sync task is only ever created AFTER
+        # ``start_deferred_sync`` bound a concrete handle (deferred mode) or is
+        # never deferred at all (always mode). Reaching here with
+        # ``deferred and _bound_handle is None`` means a sync op ran before
+        # provision bound the handle — the exact ordering that deadlocked
+        # (re-entering the inflight provision via ``accessor.get()``). Fail LOUD
+        # instead of silently deadlocking; a future ordering regression surfaces
+        # as an error, not a hang. Always mode keeps the byte-identical
+        # ``accessor.get()`` path (INV-SPM-2).
+        if self._deferred:
+            raise RuntimeError(
+                "deferred skill sync used before provision bound a handle"
+            )
+        return await self._sandbox_accessor.get()
 
     def _ensure_sync_task(self, skill: Skill) -> asyncio.Task[str | None]:
         state = self._sync_states.get(skill.id)
@@ -329,7 +441,8 @@ class SkillBundleSyncManager:
             raise RuntimeError(f"Skill[{skill.id}] bundle为空，无法同步")
 
         # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
-        sandbox = await self._sandbox_accessor.get()
+        # SPM Task 16: prefer the bound handle in deferred mode (anti-deadlock).
+        sandbox = await self._acquire_sandbox()
         for source_path in files:
             rel_path = source_path.relative_to(bundle_dir).as_posix()
             target_path = f"{sandbox_skill_dir}/{rel_path}"
@@ -404,7 +517,8 @@ class SkillBundleSyncManager:
 
     async def _read_marker_version(self, marker_path: str) -> str:
         # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
-        sandbox = await self._sandbox_accessor.get()
+        # SPM Task 16: prefer the bound handle in deferred mode (anti-deadlock).
+        sandbox = await self._acquire_sandbox()
         exists_result = await sandbox.check_file_exists(marker_path)
         if not exists_result.success:
             return ""

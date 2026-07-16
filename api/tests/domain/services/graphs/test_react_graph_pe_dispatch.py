@@ -2140,3 +2140,113 @@ class TestNativeMixedBatchFailClosed:
         assert "SSM_UNAVAILABLE" in content or "unavailable" in content.lower(), (
             f"content must surface the [SSM_UNAVAILABLE] fail-closed error, got {content!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# SPM Task 19 (INV-SPM-12): PE Denied / Ask never touch the sandbox accessor
+# ---------------------------------------------------------------------------
+#
+# on_demand mode: a sandbox-facing tool (shell_execute / file_write / ...) lazily
+# provisions on the FIRST ``await sandbox_accessor.get()`` inside its body
+# (langchain_tools shell factory: ``sandbox = await sandbox_accessor.get()``).
+# INV-SPM-12 requires pe.evaluate to PRECEDE the tool execution thunk, so a
+# Denied policy (body never runs) and an Ask policy (paused at the confirmation
+# interrupt before the body) both provision ZERO sandboxes.
+#
+# We model the accessor as a counting double routed through a real
+# ``shell_execute`` whose body awaits ``accessor.get()``. The command is benign
+# so the shell AST gate passes (allowed=True) and control reaches pe.evaluate;
+# the recorded ``fake_pe.calls`` proves PE — not the AST gate — produced the
+# outcome, so the "evaluate precedes the thunk" ordering is what is under test.
+
+
+class _CountingAccessor:
+    """SandboxAccessor test double whose ``get()`` is the on_demand provision
+    trigger. Counting the calls lets a test assert that a Denied / Ask outcome
+    performs ZERO provisioning (INV-SPM-12). Mirrors the SandboxAccessor protocol
+    (get / peek / release_owned)."""
+
+    def __init__(self, handle: object) -> None:
+        self._handle = handle
+        self.gets = 0
+
+    async def get(self) -> object:
+        self.gets += 1
+        return self._handle
+
+    def peek(self) -> object | None:
+        return self._handle
+
+    async def release_owned(self) -> None:
+        return None
+
+
+def _build_tool_node_fn_with_accessor(counting: _CountingAccessor):
+    """Build tool_node with a real ``shell_execute`` whose body pulls the sandbox
+    handle lazily via ``await counting.get()`` (mirrors the on_demand
+    langchain_tools shell factory). The body only runs on the AllowSuccess path;
+    Denied / Ask never reach it → ``counting.gets`` stays 0."""
+    from langchain_core.tools import tool as lc_tool
+
+    from app.domain.services.graphs.react_graph import build_react_graph
+
+    @lc_tool
+    async def shell_execute(command: str) -> str:
+        """Run a shell command (provisions the sandbox on first use)."""
+        await counting.get()  # on_demand: the FIRST get() triggers provisioning
+        return "ok"
+
+    stub_llm = AsyncMock()
+    stub_llm.ainvoke = AsyncMock(
+        return_value=AIMessage(content='{"success":true,"result":"done","attachments":[]}')
+    )
+    stub_llm.bind_tools = MagicMock(return_value=stub_llm)
+    graph = build_react_graph(stub_llm, [shell_execute])
+    return graph.nodes["tool_node"].bound.afunc
+
+
+class TestProvisionRespectsApproval:
+    """INV-SPM-12: pe.evaluate precedes the tool execution thunk, so Denied /
+    Ask-pending branches provision ZERO sandboxes (the counting accessor's
+    ``get()`` — the on_demand provision trigger — is never called)."""
+
+    async def test_denied_tool_never_touches_accessor(self):
+        """Denied policy → tool body (accessor.get()) never runs → zero provision."""
+        counting = _CountingAccessor(handle=object())
+        tool_node_fn = _build_tool_node_fn_with_accessor(counting)
+        fake_pe = FakeRecordingPE()
+        fake_pe.next_outcome = "deny"
+        fake_ssm = _make_fake_ssm()
+
+        state = _make_state("shell_execute", {"command": "echo hi"})
+        config = _make_config(fake_pe, fake_ssm)
+
+        await tool_node_fn(state, config)
+
+        # PE (not the AST gate) produced the outcome, and it precedes the thunk.
+        assert len(fake_pe.calls) == 1, "pe.evaluate must run before the tool thunk"
+        assert counting.gets == 0, "Denied branch must NOT provision the sandbox"
+
+    async def test_ask_pending_never_touches_accessor(self):
+        """Ask policy → paused at the confirmation interrupt → zero provision."""
+        from langgraph.types import Command
+
+        counting = _CountingAccessor(handle=object())
+        tool_node_fn = _build_tool_node_fn_with_accessor(counting)
+        fake_pe = FakeRecordingPE()
+        fake_pe.next_outcome = "ask"
+        fake_ssm = _make_fake_ssm()
+
+        state = _make_state("shell_execute", {"command": "echo hi"})
+        config = _make_config(fake_pe, fake_ssm)
+
+        result = await tool_node_fn(state, config)
+
+        assert len(fake_pe.calls) == 1, "pe.evaluate must run before the tool thunk"
+        # Ask pauses at the confirmation interrupt (routes to interrupt_helper),
+        # never reaching the tool body.
+        assert isinstance(result, Command)
+        assert result.goto == "interrupt_helper", (
+            f"Ask must pause at interrupt_helper, got goto={result.goto!r}"
+        )
+        assert counting.gets == 0, "Ask-pending branch must NOT provision the sandbox"

@@ -203,6 +203,7 @@ class DefaultCoordinatorChildRunnerStarter:
         resolve_child_runner_deps: Any = None,  # () -> ChildRunnerSharedDeps; lazy (supervisor+uow for cost handler). Default None is INTENTIONAL: F1.7 build_coordinator_runtime_deps constructs this starter with None for the 2-kwarg comp-root test callers that never dispatch a child (so .start()/_resolve_child_runner_deps() is never reached). A real dispatch path is always wired by F1.7 -- do NOT add a hard __init__ guard (it would break those callers).
         coordinator_metrics: Any = None,  # [C2b budget D10] CoordinatorMetrics | None — threaded into each CoordinatorChildRunner for the budget finalizer's best-effort exhaustion counter.
         coordinator_metrics_recorder: Any = None,  # [C2b rollout WS1b] CoordinatorMetricsRecorder | None — forwarded to factory.build → adapter for the per-child tool_calls metric.
+        sandbox_provision_metrics: Any = None,  # SPM PR-1c Task 17 — provision-flow metrics singleton for the child_spawn trigger three-classification (None → no-op in tests).
     ) -> None:
         self._runner_factory = runner_factory
         self._mailbox_publisher = mailbox_publisher
@@ -217,6 +218,7 @@ class DefaultCoordinatorChildRunnerStarter:
         self._resolve_child_runner_deps = resolve_child_runner_deps
         self._coordinator_metrics = coordinator_metrics
         self._coordinator_metrics_recorder = coordinator_metrics_recorder
+        self._provision_metrics = sandbox_provision_metrics  # SPM Task 17
         self._active_tasks: dict[str, asyncio.Task] = {}
         # [C2b budget §3-9 R3#1] child_session_id → CoordinatorChildRunner for
         # dispatch-rollback stop. Reaped in _on_task_done alongside
@@ -224,6 +226,24 @@ class DefaultCoordinatorChildRunnerStarter:
         # shared by concurrent runs, so rollback stop MUST be scoped by
         # explicit ids (request_stop_started), never "stop everything".
         self._active_runners: dict[str, Any] = {}
+
+    def _record_provision(self, *, trigger: str, outcome: str) -> None:
+        """SPM Task 17 (§5.2d) — child_spawn trigger three-classification emit.
+        No-op when no metrics sink is injected. Side-effect-only: a metrics
+        hiccup must never mask the real bind_new error."""
+        metrics = getattr(self, "_provision_metrics", None)
+        if metrics is None:
+            return
+        try:
+            from core.config import get_settings
+
+            metrics.record_provision(
+                mode=get_settings().sandbox_provision_mode,
+                trigger=trigger,
+                outcome=outcome,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("child_spawn provision metric emit failed", exc_info=True)
 
     async def start(
         self,
@@ -302,9 +322,20 @@ class DefaultCoordinatorChildRunnerStarter:
         # propagate to dispatch loudly — there is no sandbox to reap yet.
         try:
             # 5. Provision the per-child sandbox (A1) + browser + cost handler.
-            child_handle = await self._sandbox_lifecycle_service.bind_new(
-                child_session_id, user_id=user_id
-            )
+            # SPM PR-1c Task 17 (§5.2d): child_spawn trigger three-classification
+            # around the bind. Nested try so the outer leak-guard still owns the
+            # FAILED-envelope / re-raise cleanup for cancel/interrupt/exception.
+            try:
+                child_handle = await self._sandbox_lifecycle_service.bind_new(
+                    child_session_id, user_id=user_id
+                )
+            except asyncio.CancelledError:
+                self._record_provision(trigger="child_spawn", outcome="cancelled")
+                raise
+            except Exception:
+                self._record_provision(trigger="child_spawn", outcome="failed")
+                raise
+            self._record_provision(trigger="child_spawn", outcome="ok")
             child_browser = await child_handle.get_browser()
             child_sandbox_port = ParentSandboxAdapter(child_handle)
             _shared = self._resolve_child_runner_deps()  # lazy resolve (post-lifespan)

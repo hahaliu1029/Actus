@@ -684,3 +684,66 @@ async def test_cleanup_clears_all_five_fields() -> None:
     assert skill_tool._tool_bindings == {}
     assert skill_tool._tool_name_index == {}
     assert skill_tool._tools_cache == []
+
+
+# ── SPM Task 17 fix #1(a): _invoke_native provisions sandbox BEFORE ensure_ready ──
+
+
+class _OrderRecordingAccessor:
+    """Spy accessor recording the ORDER of get() vs the manager's
+    ensure_ready_for_invoke so the anti-deadlock hoist is locked."""
+
+    def __init__(self, sandbox, order: list[str]) -> None:
+        self._sandbox = sandbox
+        self._order = order
+
+    async def get(self):
+        self._order.append("get")
+        return self._sandbox
+
+    def peek(self):
+        return self._sandbox
+
+    async def release_owned(self) -> None:
+        return None
+
+
+class _OrderRecordingManager:
+    def __init__(self, order: list[str], ready_dir: str | None = None) -> None:
+        self._order = order
+        self.ready_dir = ready_dir
+        self.calls: list[str] = []
+
+    async def ensure_ready_for_invoke(self, skill_id, *, skill=None):
+        self._order.append("ensure")
+        self.calls.append(skill_id)
+        return self.ready_dir, None
+
+
+async def test_invoke_native_provisions_sandbox_before_ensure_ready() -> None:
+    """fix #1(a): the concrete handle is pulled (provision, incl. on_demand hook ②
+    binding) BEFORE ensure_ready_for_invoke — otherwise the deferred sync task
+    would re-enter the inflight provision and deadlock."""
+    order: list[str] = []
+    sandbox = _FakeSandbox()
+    accessor = _OrderRecordingAccessor(sandbox, order)
+    manager = _OrderRecordingManager(order, ready_dir="/home/ubuntu/workspace")
+    skill = _build_native_skill(
+        skill_id="pptx--1234abcd",
+        slug="pptx",
+        entry={"command": "python scripts/run.py", "exec_dir": "/home/ubuntu/workspace"},
+    )
+    skill_tool = SkillTool(
+        sandbox_accessor=accessor,
+        mcp_tool=_FakeMCPTool(),
+        a2a_tool=_FakeA2ATool(),
+        bundle_sync_manager=manager,
+    )
+    await skill_tool.initialize([skill])
+    function_name = skill_tool.get_tools()[0]["function"]["name"]
+    await skill_tool.invoke(function_name, topic="deck")
+
+    assert manager.calls == ["pptx--1234abcd"]
+    assert order[0] == "get"  # provision first
+    assert "ensure" in order
+    assert order.index("get") < order.index("ensure")

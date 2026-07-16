@@ -357,3 +357,51 @@ def test_file_view_document_preview_flag_on() -> None:
     result = _invoke_pdf(document_preview_enabled=True)
     assert result.artifact.data.document_preview is not None
     assert result.artifact.data.document_preview.filename == "r.pdf"
+
+
+# --------------------------------------------------------------------------- #
+# SPM Task 17 fix #2: factory-path _fp_cache keeps AT MOST one generation
+# --------------------------------------------------------------------------- #
+
+
+def test_file_view_factory_cache_keeps_one_generation() -> None:
+    """A regenerated handle must not leave the stale generation's lookup pinned:
+    the factory cache clears before inserting a new generation, so returning to
+    an earlier generation REBUILDS (proving the old entry was evicted) and the
+    cache never grows unbounded across generations."""
+    from app.domain.services.tools.langchain_tools import _make_file_view_tools
+
+    sandbox = _make_sandbox_mock()
+    calls = {"n": 0}
+
+    def factory(handle):
+        calls["n"] += 1
+        return _FakeLookup()
+
+    tools = _make_file_view_tools(
+        EagerSandboxAccessor(sandbox),
+        file_processor_factory=factory,
+        supports_vision=True,
+    )
+    fv = tools[0]
+
+    def _call():
+        return asyncio.run(fv.ainvoke({
+            "id": "c", "name": "file_view",
+            "args": {"filepath": "/home/ubuntu/a.png"}, "type": "tool_call",
+        }))
+
+    sandbox.generation = 1
+    _call()
+    assert calls["n"] == 1  # gen1 built lazily
+
+    _call()
+    assert calls["n"] == 1  # same gen → cache hit, no rebuild
+
+    sandbox.generation = 2
+    _call()
+    assert calls["n"] == 2  # new gen → rebuild (+ evicts gen1)
+
+    sandbox.generation = 1
+    _call()
+    assert calls["n"] == 3  # gen1 was evicted by clear() → rebuilt (fix #2)

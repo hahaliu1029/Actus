@@ -131,3 +131,111 @@ class TestCreateSessionWithParent:
         assert len(children) == 3
         assert all(c.parent_session_id == "parent-1" for c in children)
         assert uow.session.save.await_count == 3
+
+
+# ── SPM PR-1c Task 17: vnc / takeover trigger three-classification (§5.2d) ──
+
+import asyncio  # noqa: E402
+
+from app.domain.errors.sandbox_lifecycle import SessionUnboundError  # noqa: E402
+
+
+class _RecMetrics:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, str]] = []  # (mode, trigger, outcome)
+
+    def record_provision(
+        self, *, mode, trigger, outcome, latency_seconds=None, latency=None
+    ) -> None:
+        self.records.append((mode, trigger, outcome))
+
+    def last(self, *, trigger: str):
+        for mode, trg, outcome in reversed(self.records):
+            if trg == trigger:
+                return outcome
+        return None
+
+
+class _TakeoverHandle:
+    vnc_url = "ws://sbx:5901"
+
+    async def read_shell_output(self, *, session_id, console=False):
+        return MagicMock(success=True, data={"output": "", "console": ""})
+
+
+class _VncLifecycle:
+    """acquire → UNBOUND (fresh) → bind_new; bind_new/resume raise on demand."""
+
+    def __init__(self) -> None:
+        self.bind_exc: BaseException | None = None
+        self.handle = _TakeoverHandle()
+
+    async def acquire(self, session_id):
+        raise SessionUnboundError(session_id)
+
+    async def bind_new(self, session_id, *, user_id=None):
+        if self.bind_exc is not None:
+            raise self.bind_exc
+        return self.handle
+
+    async def resume(self, session_id):
+        return self.handle
+
+
+def _vnc_service(lifecycle, metrics):
+    session = Session(id="s-1", user_id="u-1")
+    uow = MagicMock()
+    uow.__aenter__ = AsyncMock(return_value=uow)
+    uow.__aexit__ = AsyncMock(return_value=None)
+    uow.session = MagicMock()
+    uow.session.get_by_id = AsyncMock(return_value=session)
+    return SessionService(
+        uow_factory=lambda: uow,
+        sandbox_lifecycle_service=lifecycle,
+        sandbox_provision_metrics=metrics,
+    )
+
+
+class TestVncTakeoverTriggerClassification:
+    async def test_vnc_records_ok(self) -> None:
+        metrics = _RecMetrics()
+        svc = _vnc_service(_VncLifecycle(), metrics)
+        url = await svc.get_vnc_url("s-1", "u-1")
+        assert url == "ws://sbx:5901"
+        assert metrics.last(trigger="vnc") == "ok"
+
+    async def test_vnc_records_failed(self) -> None:
+        metrics = _RecMetrics()
+        lifecycle = _VncLifecycle()
+        lifecycle.bind_exc = RuntimeError("boom")
+        svc = _vnc_service(lifecycle, metrics)
+        with pytest.raises(RuntimeError):
+            await svc.get_vnc_url("s-1", "u-1")
+        assert metrics.last(trigger="vnc") == "failed"
+
+    async def test_vnc_records_cancelled(self) -> None:
+        metrics = _RecMetrics()
+        lifecycle = _VncLifecycle()
+        lifecycle.bind_exc = asyncio.CancelledError()
+        svc = _vnc_service(lifecycle, metrics)
+        with pytest.raises(asyncio.CancelledError):
+            await svc.get_vnc_url("s-1", "u-1")
+        assert metrics.last(trigger="vnc") == "cancelled"
+
+    async def test_takeover_records_failed(self) -> None:
+        metrics = _RecMetrics()
+        lifecycle = _VncLifecycle()
+        lifecycle.bind_exc = RuntimeError("boom")
+        svc = _vnc_service(lifecycle, metrics)
+        with pytest.raises(RuntimeError):
+            await svc.ensure_takeover_shell_session("s-1", "tk-1", "u-1")
+        assert metrics.last(trigger="takeover") == "failed"
+
+    async def test_takeover_records_cancelled(self) -> None:
+        metrics = _RecMetrics()
+        lifecycle = _VncLifecycle()
+        lifecycle.bind_exc = asyncio.CancelledError()
+        svc = _vnc_service(lifecycle, metrics)
+        with pytest.raises(asyncio.CancelledError):
+            await svc.ensure_takeover_shell_session("s-1", "tk-1", "u-1")
+        assert metrics.last(trigger="takeover") == "cancelled"

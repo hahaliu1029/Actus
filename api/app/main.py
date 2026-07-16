@@ -293,6 +293,41 @@ def _mask_database_url(url: str) -> str:
     return urlunparse(parsed._replace(netloc=netloc))
 
 
+def check_sandbox_off_flag_exclusion(settings) -> None:
+    """SPM DD-6：off × coordinator 三 flag 启动互斥（fail-fast）。
+
+    仅在 ``sandbox_provision_mode == "off"`` 下生效——off 模式不供给任何父沙箱，
+    与需要沙箱的 coordinator 分派路径互斥。三个 coordinator flag 是 **env-only helper
+    函数**（不是 Settings 属性）：``getattr(settings, ...)`` 会静默恒 False 放行，
+    故必须调用真实 helper（每次读 os.environ，无缓存）。
+    """
+    if settings.sandbox_provision_mode != "off":
+        return
+    from app.domain.services.agent_teams_flag import is_agent_teams_enabled
+    from app.domain.services.coordinator_feature_flag import is_coordinator_enabled
+    from app.domain.services.coordinator_shell_mode_flag import (
+        is_coordinator_shell_mode_enabled,
+    )
+
+    conflicting = [
+        name
+        for name, enabled in (
+            ("ACTUS_C2_COORDINATOR_ENABLED", is_coordinator_enabled()),
+            (
+                "ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED",
+                is_coordinator_shell_mode_enabled(),
+            ),
+            ("ACTUS_C2_AGENT_TEAMS_ENABLED", is_agent_teams_enabled()),
+        )
+        if enabled
+    ]
+    if conflicting:
+        raise RuntimeError(
+            f"SANDBOX_PROVISION_MODE=off is incompatible with coordinator "
+            f"flags: {conflicting}"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """创建FastAPI应用生命周期上下文管理器"""
@@ -547,6 +582,10 @@ async def lifespan(app: FastAPI):
         from app.application.services.sandbox_lifecycle_service import SandboxLifecycleService
         from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
         from app.infrastructure.storage.postgres import get_uow
+        # SPM DD-6：off × coordinator flag 启动互斥 fail-fast（在单例构造前，与
+        # check_single_worker_argv 同位置）。PR-1c 阶段 off 尚被 config validator 拒，
+        # 故此检查恒早退；PR-4 解锁 off 后才真正拦截误配。
+        check_sandbox_off_flag_exclusion(get_settings())
         SandboxLifecycleService.check_single_worker_argv()
 
         # C3 PR-3c — forward reference holder for the deferred lifecycle
@@ -684,6 +723,16 @@ async def lifespan(app: FastAPI):
                 supervisor_registry=getattr(app.state, "supervisor_registry", None),
             )
 
+        # SPM PR-1c Task 17: the singleton SandboxProvisionMetrics. Constructed
+        # BEFORE build_coordinator_runtime_deps + _build_agent_service so both
+        # composition roots (root AgentService/SessionService + coordinator
+        # SessionService/child-runner starter) inject the SAME instance. Pure
+        # in-process counters, no I/O — safe to build here.
+        from app.application.services.sandbox_provision_metrics import (
+            SandboxProvisionMetrics,
+        )
+        app.state.sandbox_provision_metrics = SandboxProvisionMetrics()
+
         coord_deps = None
         try:
             coord_deps = build_coordinator_runtime_deps(
@@ -802,6 +851,8 @@ async def lifespan(app: FastAPI):
             # flag off (see _start_b9_stats). Threaded into the hot path so
             # react_graph埋点 records ext tool calls.
             extension_stats_recorder=getattr(app.state, "extension_stats", None),
+            # SPM PR-1c Task 17: provision-flow metrics singleton (built above).
+            sandbox_provision_metrics=app.state.sandbox_provision_metrics,
             # D1a §4.1 (R2#F12): governance AdmissionPort singleton built above
             # (None when mode off). Threaded into AgentService → AgentTaskRunner →
             # SkillTool / SkillBundleSyncManager. Root/child same-source instance.

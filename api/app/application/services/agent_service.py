@@ -58,6 +58,8 @@ from app.domain.repositories.uow import IUnitOfWork
 from app.application.services.sandbox_accessors import (
     EagerBrowserAccessor,
     EagerSandboxAccessor,
+    OnDemandBrowserAccessor,
+    OnDemandSandboxAccessor,
 )
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.mailbox_skip_helper import _should_skip_mailbox_lifecycle
@@ -260,6 +262,10 @@ class AgentService:
         # to every AgentTaskRunner built by _create_task → SkillTool /
         # SkillBundleSyncManager. None = mode off (lifespan constructs nothing).
         extension_admission_port: object | None = None,
+        # SPM PR-1c Task 17: the singleton SandboxProvisionMetrics
+        # (app.state.sandbox_provision_metrics). None → lazily construct a
+        # private instance (keeps __new__-bypass tests and legacy callers safe).
+        sandbox_provision_metrics: object | None = None,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
         self._config_snapshot = config_snapshot
@@ -294,6 +300,14 @@ class AgentService:
         self._policy_snapshot_sink = policy_snapshot_sink
         self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
         self._extension_admission_port = extension_admission_port  # D1a §4.1
+        # SPM PR-1c Task 17: provision-flow metrics singleton (injected via
+        # service_dependencies from app.state; lazily defaulted for tests).
+        from app.application.services.sandbox_provision_metrics import (
+            SandboxProvisionMetrics,
+        )
+        self._provision_metrics = (
+            sandbox_provision_metrics or SandboxProvisionMetrics()
+        )
 
         # codex r5 [HIGH CONTRACT] — partial-bind protection.
         # ``AgentTaskRunner._set_terminal_status._terminal_op`` calls
@@ -468,69 +482,155 @@ class AgentService:
             SessionUnboundError,
         )
 
-        if self._sandbox_lifecycle_service:
+        # SPM PR-1c Task 17: provision-flow metrics (lazy default keeps
+        # __new__-bypass tests + legacy ctor-less callers safe).
+        metrics = getattr(self, "_provision_metrics", None)
+        if metrics is None:
+            from app.application.services.sandbox_provision_metrics import (
+                SandboxProvisionMetrics,
+            )
+            metrics = SandboxProvisionMetrics()
+            self._provision_metrics = metrics
+
+        mode = get_settings().sandbox_provision_mode
+
+        # file_view 上传闭包（两档共用；def 期零 I/O，行为与 legacy 等价）。
+        async def _upload_bytes(file_bytes: bytes, filename: str) -> str | None:
+            from io import BytesIO
+            from fastapi import UploadFile
             try:
-                sandbox = await self._sandbox_lifecycle_service.acquire(session.id)
-            except SessionUnboundError:
-                sandbox = await self._sandbox_lifecycle_service.bind_new(
-                    session.id, user_id=session.user_id
-                )
-            except SessionSuspendedError:
-                # I2 + §6: SUSPENDED → ACTIVE 必须显式 resume()，_create_task 不隐式 unsuspend。
-                # Caller（chat 的 reopen 分支、resume_tool_confirmation 等）负责判断是否 resume。
-                raise
-            except SessionFinalizedError:
-                raise RuntimeError(f"会话[{session.id}]的沙箱已终止，无法创建任务")
-        else:
-            # Fallback for tests without lifecycle service
-            _sandbox = None
-            binding_id = session.sandbox_binding.id
-            if binding_id:
-                _sandbox = await self._sandbox_cls.get(binding_id)
-            if not _sandbox:
-                _sandbox = await self._sandbox_cls.create(user_id=session.user_id)
-                session.sandbox_binding = session.sandbox_binding.model_copy(
-                    update={"id": _sandbox.id}
-                )
-                async with self._uow_factory() as uow:
-                    await uow.session.save(session)
-            sandbox = _sandbox
+                upload = UploadFile(file=BytesIO(file_bytes), filename=filename, size=len(file_bytes))
+                file_obj = await self._file_storage.upload_file(upload)
+                return await self._file_storage.get_presigned_url(file_obj)
+            except Exception:
+                logger.warning("file_uploader failed for %s", filename, exc_info=True)
+                return None
 
-        # 4.从沙箱中获取浏览器实例
-        browser = await sandbox.get_browser()
-        if not browser:
-            logger.error(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
-            raise RuntimeError(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
-
-        # [SPM Task 10] Eager-wrap the already-provisioned handle/browser for the
-        # runner ctor (get() is zero-IO / byte-equivalent `always`). The raw
-        # `sandbox` local stays for the sandbox-bound FileProcessorRegistry below.
-        sandbox_accessor = EagerSandboxAccessor(sandbox)
-        browser_accessor = EagerBrowserAccessor(browser)
-
-        # 5.构造 file_view 处理器（延迟到此处，因为需要运行时 sandbox + file_storage）
+        # 供给档分叉（spec §5.2）：on_demand 懒供给（零 lifecycle 调用）；always 现状急切
+        # （PR-1b Eager 包装 + 非 provisioner 面 outcome 三分类）。以下四变量在 runner
+        # 装配处按档二选一透传（互斥：always→lookup、on_demand→factory/flusher/provisioner）。
         file_processor_lookup = None
-        if snap.file_understanding_config:
-            from app.infrastructure.external.file_processors.registry import FileProcessorRegistry
+        file_processor_factory = None
+        attachment_flusher = None
+        sandbox_provisioner = None
 
-            async def _upload_bytes(file_bytes: bytes, filename: str) -> str | None:
-                from io import BytesIO
-                from fastapi import UploadFile
-                try:
-                    upload = UploadFile(file=BytesIO(file_bytes), filename=filename, size=len(file_bytes))
-                    file_obj = await self._file_storage.upload_file(upload)
-                    return await self._file_storage.get_presigned_url(file_obj)
-                except Exception:
-                    logger.warning("file_uploader failed for %s", filename, exc_info=True)
-                    return None
+        if mode == "on_demand":
+            # 要点1：on_demand 分支零 lifecycle 调用（不 acquire/bind_new/get_browser、不构造
+            # registry）——首个沙箱工具调用时经 SandboxProvisioner 懒供给（accessor.get()）。
+            from app.application.services.sandbox_attachment_flush import (
+                SandboxAttachmentFlusher,
+            )
+            from app.application.services.sandbox_provisioner import (
+                SandboxProvisioner,
+            )
 
-            file_processor_lookup = FileProcessorRegistry(
-                sandbox=sandbox,
-                file_uploader=_upload_bytes,
-                vision_model=snap.vision_fallback_model,
-                audio_config=snap.file_understanding_config.audio,
-                video_config=snap.file_understanding_config.video,
-                pdf_page_parallel_enabled=snap.tool_runtime.pdf_page_parallel_enabled,
+            attachment_flusher = SandboxAttachmentFlusher(
+                self._uow_factory, self._file_storage, metrics=metrics,
+            )
+            sandbox_provisioner = SandboxProvisioner(
+                session_id=session.id,
+                user_id=session.user_id,  # INV-SPM-12：恒 session owner，禁 requester id
+                lifecycle=self._sandbox_lifecycle_service,
+                hooks=[],  # 两 hook 下方注册（① 附件全量重传；② skill 同步在 runner 构造后）
+                timeout_seconds=get_settings().sandbox_provision_timeout_seconds,
+                trigger="tool_call",
+                metrics=metrics,
+            )
+            # hook ①：本 session 持久化附件全量幂等重传（trigger 默认 tool_call）。
+            sandbox_provisioner.add_hook(
+                lambda h: attachment_flusher.flush_all(session.id, h)
+            )
+            sandbox_accessor = OnDemandSandboxAccessor(sandbox_provisioner)
+            browser_accessor = OnDemandBrowserAccessor(sandbox_accessor)
+
+            if snap.file_understanding_config:
+                from app.infrastructure.external.file_processors.registry import (
+                    FileProcessorRegistry,
+                )
+
+                def _build_file_processor(handle):
+                    # 惰性：首次 file_view 时以已供给的 concrete handle 构造 registry。
+                    return FileProcessorRegistry(
+                        sandbox=handle,
+                        file_uploader=_upload_bytes,
+                        vision_model=snap.vision_fallback_model,
+                        audio_config=snap.file_understanding_config.audio,
+                        video_config=snap.file_understanding_config.video,
+                        pdf_page_parallel_enabled=snap.tool_runtime.pdf_page_parallel_enabled,
+                    )
+
+                file_processor_factory = _build_file_processor
+        else:  # always（现状 + PR-1b Eager 包装；off 归 PR-3）
+            # r19/codex R19 PART-S-1：非 provisioner 面 outcome 三分类纪律（spec §5.2d）——
+            # 既有 acquire/bind/get_browser/registry 全原样包 try/except：取消→cancelled、
+            # 异常→failed、成功→ok（否则失败/取消完全不计数，失真）。块内逻辑字节不变。
+            try:
+                if self._sandbox_lifecycle_service:
+                    try:
+                        sandbox = await self._sandbox_lifecycle_service.acquire(session.id)
+                    except SessionUnboundError:
+                        sandbox = await self._sandbox_lifecycle_service.bind_new(
+                            session.id, user_id=session.user_id
+                        )
+                    except SessionSuspendedError:
+                        # I2 + §6: SUSPENDED → ACTIVE 必须显式 resume()，_create_task 不隐式 unsuspend。
+                        # Caller（chat 的 reopen 分支、resume_tool_confirmation 等）负责判断是否 resume。
+                        raise
+                    except SessionFinalizedError:
+                        raise RuntimeError(f"会话[{session.id}]的沙箱已终止，无法创建任务")
+                else:
+                    # Fallback for tests without lifecycle service
+                    _sandbox = None
+                    binding_id = session.sandbox_binding.id
+                    if binding_id:
+                        _sandbox = await self._sandbox_cls.get(binding_id)
+                    if not _sandbox:
+                        _sandbox = await self._sandbox_cls.create(user_id=session.user_id)
+                        session.sandbox_binding = session.sandbox_binding.model_copy(
+                            update={"id": _sandbox.id}
+                        )
+                        async with self._uow_factory() as uow:
+                            await uow.session.save(session)
+                    sandbox = _sandbox
+
+                # 4.从沙箱中获取浏览器实例
+                browser = await sandbox.get_browser()
+                if not browser:
+                    logger.error(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
+                    raise RuntimeError(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
+
+                # [SPM Task 10] Eager-wrap the already-provisioned handle/browser for the
+                # runner ctor (get() is zero-IO / byte-equivalent `always`). The raw
+                # `sandbox` local stays for the sandbox-bound FileProcessorRegistry below.
+                sandbox_accessor = EagerSandboxAccessor(sandbox)
+                browser_accessor = EagerBrowserAccessor(browser)
+
+                # 5.构造 file_view 处理器（延迟到此处，因为需要运行时 sandbox + file_storage）
+                if snap.file_understanding_config:
+                    from app.infrastructure.external.file_processors.registry import (
+                        FileProcessorRegistry,
+                    )
+
+                    file_processor_lookup = FileProcessorRegistry(
+                        sandbox=sandbox,
+                        file_uploader=_upload_bytes,
+                        vision_model=snap.vision_fallback_model,
+                        audio_config=snap.file_understanding_config.audio,
+                        video_config=snap.file_understanding_config.video,
+                        pdf_page_parallel_enabled=snap.tool_runtime.pdf_page_parallel_enabled,
+                    )
+            except asyncio.CancelledError:
+                metrics.record_provision(
+                    mode="always", trigger="run_start", outcome="cancelled"
+                )
+                raise
+            except Exception:
+                metrics.record_provision(
+                    mode="always", trigger="run_start", outcome="failed"
+                )
+                raise
+            metrics.record_provision(
+                mode="always", trigger="run_start", outcome="ok"
             )
 
         # R5b-4 (cleanup): ApprovalCache 已被 ApprovalStateReader (R5b-2) +
@@ -799,6 +899,13 @@ class AgentService:
             supports_vision=snap.supports_vision,
             supports_pdf_input=snap.supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
+            # SPM PR-1c Task 17: on_demand deferred file_view + attachment routing.
+            # always → (lookup, None, "always", None, None);
+            # on_demand → (None, factory, "on_demand", flusher, provisioner).
+            file_processor_factory=file_processor_factory,
+            attachment_flusher=attachment_flusher,
+            sandbox_provision_mode=mode,
+            sandbox_provisioner=sandbox_provisioner,
             memory_flusher=self._memory_flusher,
             memory_embedding_provider=self._memory_embedding_provider,
             memory_session_factory=self._memory_session_factory,
@@ -879,6 +986,19 @@ class AgentService:
             # getattr defense mirrors the line above for __new__-bypass tests.
             extension_admission_port=getattr(self, "_extension_admission_port", None),
         )
+
+        # SPM PR-1c Task 17 — provision hook ② (skill bundle sync). Registered
+        # AFTER runner construction (the runner owns the SkillBundleSyncManager)
+        # with trigger="skill_sync" so a sync failure carries its OWN trigger into
+        # the SandboxProvisionError + metric (codex planR1#15). The concrete handle
+        # threads hook(h) → runner.start_deferred_skill_sync(h) →
+        # manager.start_deferred_sync(h) (anti-deadlock: binds h before any sandbox
+        # op). always mode never registers this hook (sandbox_provisioner is None).
+        if sandbox_provisioner is not None:
+            sandbox_provisioner.add_hook(
+                lambda h: task_runner.start_deferred_skill_sync(h),
+                trigger="skill_sync",
+            )
 
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);
         # register SkillSource into the PE built earlier and validate the final

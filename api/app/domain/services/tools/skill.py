@@ -388,6 +388,26 @@ class SkillTool(BaseTool):
         if not isinstance(entry, dict):
             return ToolResult(success=False, message="native skill 缺少 entry 配置")
 
+        # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
+        # native skills require a sandbox — the accessor is non-None on this path
+        # (off assembly never reaches _invoke_native); assert for fail-fast + narrowing.
+        #
+        # SPM Task 17 fix #1(a) — anti-deadlock HOIST: provision the sandbox FIRST,
+        # BEFORE ``ensure_ready_for_invoke``. In on_demand this run's first sandbox
+        # action can be a native skill invoke: the provision inflight runs skill-sync
+        # hook ② (``start_deferred_sync``) which binds the concrete handle into the
+        # bundle-sync manager. If ``ensure_ready_for_invoke`` ran first it would spawn
+        # a sync task whose ``_acquire_sandbox`` re-enters the SAME inflight provision
+        # (the inflight awaits the sync task via hook ②; the sync task awaits the
+        # inflight) → circular deadlock. Getting the handle first lets provision
+        # (incl. hook ② binding) complete, so ensure_ready_for_invoke then sees a
+        # bound handle. In always/Eager mode ``get()`` is zero-IO, so this reorder is
+        # behavior-neutral (INV-SPM-2).
+        assert self._sandbox_accessor is not None, (
+            "native skill invocation requires a provisioned sandbox accessor"
+        )
+        sandbox = await self._sandbox_accessor.get()
+
         synced_skill_dir = ""
         if self._bundle_sync_manager:
             synced_skill_dir, sync_error = await self._bundle_sync_manager.ensure_ready_for_invoke(
@@ -404,14 +424,6 @@ class SkillTool(BaseTool):
         exec_dir = str(entry.get("exec_dir") or "").strip() or default_exec_dir
         if not exec_dir:
             return ToolResult(success=False, message="native skill 缺少可用执行目录")
-
-        # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
-        # native skills require a sandbox — the accessor is non-None on this path
-        # (off assembly never reaches _invoke_native); assert for fail-fast + narrowing.
-        assert self._sandbox_accessor is not None, (
-            "native skill invocation requires a provisioned sandbox accessor"
-        )
-        sandbox = await self._sandbox_accessor.get()
 
         exists_result = await sandbox.check_file_exists(exec_dir)
         if not exists_result.success:

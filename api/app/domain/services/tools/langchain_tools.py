@@ -21,6 +21,11 @@ from typing import Any, Awaitable, Callable, List, Literal, Optional, Union
 from langchain_core.tools import BaseTool, StructuredTool, tool as lc_tool
 from pydantic import BaseModel
 
+from app.domain.errors.sandbox_lifecycle import (
+    SandboxProvisionError,
+    SessionFinalizedError,
+    SessionSuspendedError,
+)
 from app.domain.external.browser import BrowserAccessor
 from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
 from app.domain.external.sandbox import SandboxAccessor, SandboxHandle
@@ -105,6 +110,25 @@ def _wrap_result_outcome(
 
 
 def _exception_outcome(tool_name: str, exc: Exception) -> AllowError:
+    if isinstance(exc, SandboxProvisionError):
+        return AllowError(
+            content=f"{tool_name} 沙箱供给失败（{exc.phase}），将在下次需要时重试: {exc}",
+            reason=DecisionReason(type="exception", code="SANDBOX_PROVISION_FAILED",
+                                  message=str(exc)),
+            retryable=True,
+        )
+    if isinstance(exc, SessionSuspendedError):
+        return AllowError(
+            content=f"{tool_name} 沙箱已挂起，需要显式恢复会话",
+            reason=DecisionReason(type="exception", code="SANDBOX_SUSPENDED", message=str(exc)),
+            retryable=False,
+        )
+    if isinstance(exc, SessionFinalizedError):
+        return AllowError(
+            content=f"{tool_name} 沙箱已终止",
+            reason=DecisionReason(type="exception", code="SANDBOX_FINALIZED", message=str(exc)),
+            retryable=False,
+        )
     reason_type = "timeout" if isinstance(exc, asyncio.TimeoutError) else "exception"
     return AllowError(
         content=f"{tool_name} 异常: {exc}",
@@ -831,6 +855,10 @@ def _make_file_view_tools(
             processor_lookup = _fp_cache.get(_gen)
             if processor_lookup is None:
                 processor_lookup = file_processor_factory(sandbox)
+                # SPM Task 17 fix #2: keep at most ONE live generation. A
+                # regenerated handle (poison/rebind) must not leave the stale
+                # generation's lookup pinned in the cache; clear before insert.
+                _fp_cache.clear()
                 _fp_cache[_gen] = processor_lookup
         else:
             processor_lookup = file_processor_lookup

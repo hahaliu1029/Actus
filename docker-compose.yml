@@ -138,6 +138,12 @@ services:
       SANDBOX_HTTP_PROXY: ${SANDBOX_HTTP_PROXY:-}
       SANDBOX_HTTPS_PROXY: ${SANDBOX_HTTPS_PROXY:-}
       SANDBOX_NO_PROXY: ${SANDBOX_NO_PROXY:-}
+      # SPM §5.1 三档沙箱供给模式（env-only）。always=每 session 预置父沙箱（现状）；
+      # on_demand / off 分别在 PR-2 / PR-4 解锁。缺 passthrough 则 Docker 部署永远无法切换。
+      SANDBOX_PROVISION_MODE: ${SANDBOX_PROVISION_MODE:-always}
+      # SPM §5.2 on_demand 供给单飞超时（秒）；create/ready/hooks 三相总预算。缺 passthrough
+      # 则 Docker 部署无法调整超时（config 默认 90）。
+      SANDBOX_PROVISION_TIMEOUT_SECONDS: ${SANDBOX_PROVISION_TIMEOUT_SECONDS:-90}
       # Memory 系统 (M1 PR-6A)：host 侧根 + api 容器视角根 + sandbox mount 开关。
       # api 通过下方 volume 把 host 路径绑到容器内；sandbox 在起容器时通过
       # Docker SDK 再把同一 host 路径只读挂到 /workspace/.memory（DockerSandbox._build_memory_mount）。
@@ -152,6 +158,10 @@ services:
       # (set via .env); flip per CONTRIBUTING.md "C2 CoordinatorTaskRunner
       # Deployment" rollout checklist.
       ACTUS_C2_COORDINATOR_ENABLED: ${ACTUS_C2_COORDINATOR_ENABLED:-false}
+      # C2-full S2 shell-capable task mode (spec §3.6). Default off; read from
+      # os.environ directly, so without this passthrough a Docker deployment can
+      # never enable it (previously the only C2 flag missing from compose).
+      ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED: ${ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED:-false}
       # C2-full S4 agent-team named bundles (spec §6/R6-F6). Default off; the flag
       # is read from os.environ directly, so without this passthrough a Docker
       # deployment can never enable it.

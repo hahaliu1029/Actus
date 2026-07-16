@@ -30,6 +30,11 @@ from app.domain.models.tool_result import (
     Passthrough,
     TextBlock,
 )
+from app.domain.errors.sandbox_lifecycle import (
+    SandboxProvisionError,
+    SessionFinalizedError,
+    SessionSuspendedError,
+)
 from app.domain.services.graphs.react_graph import (
     _invoke_wrapper,
     _SessionContext,
@@ -38,6 +43,7 @@ from app.domain.services.graphs.react_graph import (
 from app.domain.services.tools._supervisor_tool_wrapper import (
     SupervisorAwareToolWrapper,
 )
+from app.domain.services.tools.langchain_tools import _make_file_tools
 from app.domain.services.tools.tool_source_resolver import ToolSource
 
 
@@ -156,6 +162,123 @@ class TestInvokeWrapperCommit2:
         for source in (_make_mcp_source(), _make_native_shell_source()):
             outcome = _run(_invoke_wrapper(fake_tool, tc, source))
             assert isinstance(outcome, AllowSuccess)
+
+
+# ============================================================
+# FIX-F1 (SPM PR-1c gate audit) — §5.2d provision-taxonomy
+# envelope must be reachable from an accessor.get() failure.
+# ============================================================
+#
+# Every sandbox tool calls ``await sandbox_accessor.get()`` BEFORE its
+# ``_exception_outcome``-guarded region, so a provision attempt that raises
+# ``SandboxProvisionError`` / ``SessionSuspendedError`` / ``SessionFinalizedError``
+# escapes the tool body entirely and lands in ``_invoke_wrapper``'s except
+# block. Before FIX-F1 the generic ``except Exception`` mis-enveloped these as
+# ``code=type(exc).__name__`` + ``retryable=False`` (+ a spurious
+# ``logger.exception`` traceback). These tests drive the REAL tool bodies —
+# a ``content_and_artifact`` sandbox tool (file_read → current path) and a
+# legacy ``response_format='content'`` tool (legacy path) — so BOTH
+# ``_invoke_wrapper`` except sites are proven, not the green-masking mock that
+# injects the exception at ``tool.ainvoke`` directly.
+
+
+class _RaisingSandboxAccessor:
+    """Minimal ``SandboxAccessor`` whose ``get()`` raises — reproduces an
+    on_demand provision failure surfacing at the accessor boundary, exactly
+    as ``OnDemandSandboxAccessor.get()`` does on create/ready/hooks failure."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def get(self):  # noqa: ANN201 — duck-typed handle
+        raise self._exc
+
+    def peek(self):  # noqa: ANN201
+        return None
+
+    async def release_owned(self) -> None:
+        return None
+
+
+class TestInvokeWrapperProvisionEnvelopeCurrentPath:
+    """FIX-F1 — real ``file_read`` (``content_and_artifact`` → current
+    ``_invoke_wrapper`` path). accessor.get() failures must map to the §5.2d
+    taxonomy envelope, NOT the generic ``code=type(exc).__name__`` fallback."""
+
+    def _drive_file_read(self, exc: Exception) -> AllowError:
+        tools = _make_file_tools(_RaisingSandboxAccessor(exc))
+        file_read = next(t for t in tools if t.name == "file_read")
+        tc = _make_tool_call("tc-prov", "file_read", {"filepath": "/workspace/x"})
+        src = ToolSource(
+            source="native", category="file", canonical_name="file_read"
+        )
+        return _run(_invoke_wrapper(file_read, tc, src))
+
+    def test_provision_error_maps_to_provision_failed_retryable(self):
+        outcome = self._drive_file_read(
+            SandboxProvisionError("s1", phase="create", trigger="tool")
+        )
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.code == "SANDBOX_PROVISION_FAILED"
+        assert outcome.retryable is True
+
+    def test_suspended_error_maps_to_suspended_not_retryable(self):
+        outcome = self._drive_file_read(SessionSuspendedError("s1"))
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.code == "SANDBOX_SUSPENDED"
+        assert outcome.retryable is False
+
+    def test_finalized_error_maps_to_finalized_not_retryable(self):
+        outcome = self._drive_file_read(SessionFinalizedError("s1"))
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.code == "SANDBOX_FINALIZED"
+        assert outcome.retryable is False
+
+
+class TestInvokeWrapperProvisionEnvelopeLegacyPath:
+    """FIX-F1 (legacy branch) — a legacy ``response_format='content'`` tool
+    whose body pulls the handle via accessor.get() must ALSO route
+    provision-taxonomy exceptions through the §5.2d envelope (covers the
+    second ``_invoke_wrapper`` except site)."""
+
+    def _drive_legacy(self, exc: Exception) -> AllowError:
+        accessor = _RaisingSandboxAccessor(exc)
+
+        @lc_tool  # no response_format → legacy ('content') _invoke_wrapper branch
+        async def legacy_sandbox_tool(filepath: str) -> str:
+            """Legacy-format sandbox tool that pulls the handle lazily."""
+            sandbox = await accessor.get()
+            return await sandbox.read_file(filepath)
+
+        tc = _make_tool_call(
+            "tc-legacy", "legacy_sandbox_tool", {"filepath": "/x"}
+        )
+        src = ToolSource(
+            source="native",
+            category="file",
+            canonical_name="legacy_sandbox_tool",
+        )
+        return _run(_invoke_wrapper(legacy_sandbox_tool, tc, src))
+
+    def test_provision_error_maps_to_provision_failed_retryable(self):
+        outcome = self._drive_legacy(
+            SandboxProvisionError("s1", phase="ready", trigger="tool")
+        )
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.code == "SANDBOX_PROVISION_FAILED"
+        assert outcome.retryable is True
+
+    def test_suspended_error_maps_to_suspended_not_retryable(self):
+        outcome = self._drive_legacy(SessionSuspendedError("s1"))
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.code == "SANDBOX_SUSPENDED"
+        assert outcome.retryable is False
+
+    def test_finalized_error_maps_to_finalized_not_retryable(self):
+        outcome = self._drive_legacy(SessionFinalizedError("s1"))
+        assert isinstance(outcome, AllowError)
+        assert outcome.reason.code == "SANDBOX_FINALIZED"
+        assert outcome.retryable is False
 
 
 class _FakeSupervisor:

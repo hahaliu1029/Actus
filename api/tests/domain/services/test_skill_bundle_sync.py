@@ -444,3 +444,203 @@ async def test_sync_failure_outcome_terminal_none(tmp_path) -> None:
     state = manager._sync_states[skill.id]
     assert state.status == "failed"
     assert state.outcome is None
+
+
+# ===========================================================================
+# SPM Task 16: native skill bundle deferred sync mode (provision hook ②)
+# ===========================================================================
+
+
+class _CountingAccessor:
+    """SandboxAccessor whose ``get()`` is FORBIDDEN inside deferred sync — in
+    production it would re-enter the inflight ``provisioner._provision_once``
+    and DEADLOCK. We count calls so tests can assert the anti-deadlock contract:
+    the deferred path must operate on the bound CONCRETE handle, never
+    ``accessor.get()``. Eager mode legitimately uses ``get()`` (byte-identical).
+    """
+
+    def __init__(self, handle: _FakeSandbox) -> None:
+        self._handle = handle
+        self.gets = 0
+
+    async def get(self) -> _FakeSandbox:
+        self.gets += 1
+        return self._handle
+
+    def peek(self) -> _FakeSandbox | None:
+        return self._handle
+
+    async def release_owned(self) -> None:
+        return None
+
+
+class _TaskSpawnCounter:
+    """Wraps ``asyncio.create_task`` and counts only the manager's own sync
+    tasks (filtered by coroutine ``__qualname__``) so foreign event-loop tasks
+    do not pollute the count. Delegates every call to the real factory."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.count = 0
+
+    def __call__(self, coro, *args, **kwargs):
+        qualname = getattr(coro, "__qualname__", "") or ""
+        if "SkillBundleSyncManager" in qualname:
+            self.count += 1
+        return self._real(coro, *args, **kwargs)
+
+
+class _SyncEnv:
+    def __init__(self, tmp_path, handle, accessor, pool, counter) -> None:
+        self.tmp_path = tmp_path
+        self.handle = handle
+        self.accessor = accessor
+        self.pool = pool
+        self._counter = counter
+        self.mgr: SkillBundleSyncManager | None = None
+
+    def make_manager(self, *, deferred: bool) -> SkillBundleSyncManager:
+        self.mgr = SkillBundleSyncManager(
+            sandbox_accessor=self.accessor,
+            skills_root_dir=self.tmp_path,
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+            deferred=deferred,
+        )
+        return self.mgr
+
+    def spawned_tasks(self) -> int:
+        return self._counter.count
+
+
+@pytest.fixture
+def sync_env(tmp_path: Path, monkeypatch) -> _SyncEnv:
+    import app.domain.services.tools.skill_bundle_sync as sbs
+
+    handle = _FakeSandbox()
+    accessor = _CountingAccessor(handle)
+    pool: list[Skill] = []
+    for sid in ("alpha--1", "beta--1"):
+        skill = _build_native_skill(sid, version="v1")
+        _write_bundle(tmp_path, sid)
+        pool.append(skill)
+
+    counter = _TaskSpawnCounter(sbs.asyncio.create_task)
+    monkeypatch.setattr(sbs.asyncio, "create_task", counter)
+    return _SyncEnv(tmp_path, handle, accessor, pool, counter)
+
+
+class TestDeferredMode:
+    async def test_deferred_prepare_creates_no_tasks(self, sync_env: _SyncEnv) -> None:
+        mgr = sync_env.make_manager(deferred=True)
+        await mgr.prepare_startup_sync(
+            skill_pool=sync_env.pool, initial_selected=sync_env.pool[:1]
+        )
+        # deferred prepare stores intent ONLY — zero asyncio.create_task
+        assert sync_env.spawned_tasks() == 0
+        # await_initial_sync returns immediately (does not hang / does not sync)
+        await mgr.await_initial_sync()
+        assert sync_env.spawned_tasks() == 0
+        assert sync_env.accessor.gets == 0
+        # start_background_sync is a no-op until the sandbox is provisioned
+        mgr.start_background_sync()
+        assert sync_env.spawned_tasks() == 0
+        # nothing was uploaded to the sandbox yet
+        assert sync_env.handle.upload_paths == []
+
+    async def test_start_deferred_sync_runs_stored_intent_idempotently(
+        self, sync_env: _SyncEnv
+    ) -> None:
+        mgr = sync_env.make_manager(deferred=True)
+        await mgr.prepare_startup_sync(
+            skill_pool=sync_env.pool, initial_selected=sync_env.pool[:1]
+        )
+        # provision hook ②: concrete handle in (anti-deadlock contract)
+        await mgr.start_deferred_sync(sync_env.handle)
+        n = sync_env.spawned_tasks()
+        assert n > 0
+        # the sync path used the bound concrete handle, NEVER accessor.get()
+        assert sync_env.accessor.gets == 0
+        # real work happened against the concrete handle
+        assert sync_env.handle.upload_paths
+        # second call is a no-op (idempotent) — spawns no new tasks
+        await mgr.start_deferred_sync(sync_env.handle)
+        assert sync_env.spawned_tasks() == n
+        assert sync_env.accessor.gets == 0
+        await mgr.cleanup()
+
+    async def test_eager_mode_unchanged(self, sync_env: _SyncEnv) -> None:
+        mgr = sync_env.make_manager(deferred=False)
+        await mgr.prepare_startup_sync(
+            skill_pool=sync_env.pool, initial_selected=sync_env.pool[:1]
+        )
+        # eager prepare eagerly creates the foreground sync task(s)
+        assert sync_env.spawned_tasks() > 0
+        await mgr.await_initial_sync()
+        await mgr.cleanup()
+
+    # ── SPM Task 17 fix #1(b): deferred+unbound _acquire_sandbox raises loud ──
+
+    async def test_acquire_sandbox_deferred_unbound_raises(
+        self, sync_env: _SyncEnv
+    ) -> None:
+        """A manager-spawned sync task is only ever created AFTER
+        start_deferred_sync bound a handle. Reaching _acquire_sandbox with
+        deferred=True and no bound handle is the exact pre-fix deadlock ordering;
+        it must raise loudly (RuntimeError) instead of silently re-entering the
+        inflight provision via accessor.get()."""
+        mgr = sync_env.make_manager(deferred=True)
+        # never called start_deferred_sync → _bound_handle is None
+        with pytest.raises(RuntimeError, match="deferred skill sync"):
+            await mgr._acquire_sandbox()
+        assert sync_env.accessor.gets == 0  # never fell through to accessor.get()
+
+    async def test_always_mode_acquire_sandbox_uses_accessor(
+        self, sync_env: _SyncEnv
+    ) -> None:
+        """always (non-deferred) mode keeps the byte-identical accessor.get()
+        path (INV-SPM-2) — fix #1(b) only guards the deferred branch."""
+        mgr = sync_env.make_manager(deferred=False)
+        handle = await mgr._acquire_sandbox()
+        assert handle is sync_env.handle
+        assert sync_env.accessor.gets == 1
+
+
+class TestOnDemandProvisionNoDeadlock:
+    """SPM Task 17 fix #1: the on_demand provision flow (get → hook ② →
+    start_deferred_sync) must COMPLETE — hook ② binds the concrete handle so the
+    deferred sync uses it, never accessor.get() (which re-enters the SAME inflight
+    provision → circular deadlock)."""
+
+    async def test_provision_get_completes_within_timeout(
+        self, sync_env: _SyncEnv
+    ) -> None:
+        from app.application.services.sandbox_provisioner import SandboxProvisioner
+        from app.domain.errors.sandbox_lifecycle import SessionUnboundError
+
+        mgr = sync_env.make_manager(deferred=True)
+        await mgr.prepare_startup_sync(
+            skill_pool=sync_env.pool, initial_selected=sync_env.pool[:1]
+        )
+
+        class _Lifecycle:
+            async def acquire(self, sid):
+                raise SessionUnboundError(sid)  # → bind_new (no ensure_sandbox)
+
+            async def bind_new(self, sid, *, user_id=None):
+                return sync_env.handle
+
+        provisioner = SandboxProvisioner(
+            session_id="s-1",
+            user_id="owner-1",
+            lifecycle=_Lifecycle(),
+            # hook ② mirrors AgentService: concrete handle → start_deferred_sync
+            hooks=[("skill_sync", lambda h: mgr.start_deferred_sync(h))],
+            timeout_seconds=5,
+        )
+        # Would HANG (wait_for timeout) if the deferred sync re-entered the
+        # inflight via accessor.get(); completes because it uses the bound handle.
+        handle = await asyncio.wait_for(provisioner.get(), timeout=5)
+        assert handle is sync_env.handle
+        assert sync_env.accessor.gets == 0  # bound handle used, no re-entry
+        assert sync_env.handle.upload_paths  # deferred sync really ran
+        await mgr.cleanup()

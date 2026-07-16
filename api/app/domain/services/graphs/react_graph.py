@@ -76,6 +76,16 @@ from app.domain.services.tools.tool_source_resolver import (
     ToolSourceUnknownError,
     resolve_tool_source,
 )
+from app.domain.errors.sandbox_lifecycle import (
+    SandboxProvisionError,
+    SessionFinalizedError,
+    SessionSuspendedError,
+)
+# FIX-F1: reuse the single §5.2d envelope producer (same source of truth the
+# guarded tool region uses) for provision-taxonomy exceptions that escape a
+# tool body via ``sandbox_accessor.get()``. langchain_tools is a sibling domain
+# module and never imports react_graph, so this top-level edge is acyclic.
+from app.domain.services.tools.langchain_tools import _exception_outcome
 from app.domain.services.executor import (
     Ask as GateAsk,
     AskPayload,
@@ -958,6 +968,23 @@ async def _invoke_wrapper(
                 ),
                 retryable=True,
             )
+        except (
+            SandboxProvisionError,
+            SessionSuspendedError,
+            SessionFinalizedError,
+        ) as exc:
+            # FIX-F1: sandbox tools call ``sandbox_accessor.get()`` BEFORE their
+            # ``_exception_outcome``-guarded region, so a provision-taxonomy
+            # failure escapes here. Route it through the SAME §5.2d envelope
+            # producer the guarded region uses instead of the generic
+            # ``code=type(exc).__name__`` fallback. Expected taxonomy → log
+            # WITHOUT a traceback (NOT logger.exception).
+            logger.info(
+                "Sandbox provision-taxonomy exception for %s: %s",
+                tool.name,
+                type(exc).__name__,
+            )
+            return _exception_outcome(tool.name, exc)
         except Exception as exc:
             logger.exception("Unexpected wrapper exception for %s", tool.name)
             return AllowError(
@@ -998,6 +1025,23 @@ async def _invoke_wrapper(
             ),
             retryable=True,
         )
+    except (
+        SandboxProvisionError,
+        SessionSuspendedError,
+        SessionFinalizedError,
+    ) as exc:
+        # FIX-F1: sandbox tools call ``sandbox_accessor.get()`` BEFORE their
+        # ``_exception_outcome``-guarded region, so a provision-taxonomy failure
+        # escapes here. Route it through the SAME §5.2d envelope producer the
+        # guarded region uses instead of the generic ``code=type(exc).__name__``
+        # fallback. Expected taxonomy → log WITHOUT a traceback (NOT
+        # logger.exception).
+        logger.info(
+            "Sandbox provision-taxonomy exception for %s: %s",
+            tool.name,
+            type(exc).__name__,
+        )
+        return _exception_outcome(tool.name, exc)
     except Exception as exc:
         logger.exception("Unexpected wrapper exception for %s", tool.name)
         return AllowError(

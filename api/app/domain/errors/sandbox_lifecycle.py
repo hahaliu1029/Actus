@@ -188,3 +188,42 @@ class SandboxDaemonUnreachable(SandboxLifecycleError):
         if detail:
             parts.append(f"({detail})")
         super().__init__("; ".join(parts))
+
+
+class SandboxProvisionError(Exception):
+    """on_demand 供给自身失败（仅 create/ready/hooks 三相；spec §5.2d）。
+
+    SessionSuspendedError/SessionFinalizedError 不得包进来——accessor 原样透传。
+
+    Note: deliberately subclasses ``Exception`` (not ``SandboxLifecycleError``):
+    this signals "provisioning itself blew up" and is distinct from the
+    binding-state pass-through errors, which the accessor re-raises unwrapped.
+    """
+
+    code = "SANDBOX_PROVISION_FAILED"
+    retryable = True
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        phase: str,
+        trigger: str,
+        attempt: str | None = None,
+        cause: str = "",
+    ) -> None:
+        # PR-1a FIX-1 pattern: explicit ValueError instead of a bare ``assert``
+        # so the invariant survives ``python -O`` in production paths.
+        if phase not in ("create", "ready", "hooks"):
+            raise ValueError(
+                f"SandboxProvisionError.phase must be one of "
+                f"create/ready/hooks, got {phase!r}"
+            )
+        self.session_id = session_id
+        self.phase = phase
+        self.trigger = trigger
+        self.attempt = attempt
+        super().__init__(
+            f"sandbox provision failed for session {session_id} "
+            f"(phase={phase}, trigger={trigger}): {cause}"
+        )

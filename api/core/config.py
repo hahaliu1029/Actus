@@ -279,6 +279,31 @@ class Settings(BaseSettings):
             )
         return normalized
 
+    # SPM §5.1：三档沙箱供给模式（env-only，禁入 config.yaml——供给面是安全/资源面，
+    # config.yaml 是运行期可写面，把供给开关放那里等于让被治理的运行期能自降治理）。
+    # ALLOWED 集随 PR 梯度增长（DD-22）：PR-1c {"always"} → PR-2 +"on_demand" → PR-4 +"off"。
+    SANDBOX_PROVISION_MODE_ALLOWED: ClassVar[set[str]] = {"always"}
+    sandbox_provision_mode: str = Field(
+        default="always",
+        validation_alias=AliasChoices(
+            "sandbox_provision_mode", "SANDBOX_PROVISION_MODE"
+        ),
+    )
+
+    @field_validator("sandbox_provision_mode")
+    @classmethod
+    def _validate_sandbox_provision_mode(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in cls.SANDBOX_PROVISION_MODE_ALLOWED:
+            raise ValueError(
+                "SANDBOX_PROVISION_MODE must be one of "
+                f"{sorted(cls.SANDBOX_PROVISION_MODE_ALLOWED)}, got {v!r}"
+            )
+        return normalized
+
+    # SPM §5.2e：provision 硬超时（覆盖完整 provisioner.get()，含 hooks）
+    sandbox_provision_timeout_seconds: int = 90
+
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 

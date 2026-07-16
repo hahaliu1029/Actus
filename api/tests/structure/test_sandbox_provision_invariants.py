@@ -18,9 +18,13 @@ gate to be either red or file-level loose. So we resolve the receiver via AST:
   ``containers.run``).
 
 Whitelists are module-relative to ``api/app``. PR-1b asserts
-``{agent_service, starter} ⊆ bind_new callers``; the provisioner membership
-assertion is added by PR-1c Task 19 (which also appends the provisioner file to
-``BIND_NEW_ALLOWED``). Constants + the single test body are the only edit points.
+``{agent_service, starter} ⊆ bind_new callers``. PR-1c Task 14 landed the
+provisioner in ``BIND_NEW_ALLOWED`` (it became a real ``lifecycle.bind_new``
+caller); Task 19 adds its ``BIND_NEW_REQUIRED`` (anti-inertness) membership so
+the gate asserts the provisioner IS still detected as a bind_new caller —
+``RESUME_ALLOWED`` stays unchanged (the provisioner must NEVER call
+``lifecycle.resume()`` (INV-SPM-9), so it appearing among resume callers stays
+red). Constants + the single test body are the only edit points.
 """
 import ast
 import functools
@@ -45,7 +49,7 @@ BIND_NEW_ALLOWED = {
     "application/services/coordinator_child_runner_starter.py",  # per-child lease
     "application/services/sandbox_lifecycle_service.py",  # definition site
     "main.py",                                            # lifespan forward-ref proxy
-    # PR-1c (Task 19) appends: "application/services/sandbox_provisioner.py"
+    "application/services/sandbox_provisioner.py",        # Task 14 landed bind_new caller
 }
 RESUME_ALLOWED = {
     "application/services/agent_service.py",              # reopen / retry_from_suspend
@@ -67,6 +71,7 @@ BIND_NEW_REQUIRED = {
     "application/services/agent_service.py",
     "application/services/coordinator_child_runner_starter.py",
     "main.py",
+    "application/services/sandbox_provisioner.py",  # Task 19: anti-inertness — provisioner IS a bind_new caller
 }
 RESUME_REQUIRED = {
     "application/services/agent_service.py",

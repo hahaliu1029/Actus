@@ -189,6 +189,10 @@ def get_session_service(request: HTTPConnection) -> SessionService:
         fs_reconciler=fs_reconciler,
         execution_supervisor=supervisor,
         subagent_limits=get_subagent_limits(),
+        # SPM PR-1c Task 17: provision metrics for vnc/takeover trigger surfaces.
+        sandbox_provision_metrics=getattr(
+            request.app.state, "sandbox_provision_metrics", None
+        ),
         # C3 PR-6 (spec §11.7) — legacy retired; SessionService no longer
         # consults a runtime flag. The ``mailbox_flag_reader`` kwarg used
         # to wire the rollback-aware live env reader is no longer passed.
@@ -1569,6 +1573,10 @@ def build_coordinator_runtime_deps(
         fs_reconciler=getattr(app_state, "fs_reconciler", None),
         execution_supervisor=getattr(app_state, "supervisor", None),
         subagent_limits=get_subagent_limits(),
+        # SPM PR-1c Task 17: provision metrics for vnc/takeover trigger surfaces.
+        sandbox_provision_metrics=getattr(
+            app_state, "sandbox_provision_metrics", None
+        ),
     )
 
     # ── 9. ProbeQuotaService was constructed above for liveness callback use.
@@ -1688,6 +1696,10 @@ def build_coordinator_runtime_deps(
         resolve_child_runner_deps=resolve_child_runner_deps,
         coordinator_metrics=coordinator_metrics,  # [C2b budget D10]
         coordinator_metrics_recorder=coordinator_metrics_recorder,  # [C2b rollout WS1b]
+        # SPM PR-1c Task 17: provision metrics for the child_spawn trigger surface.
+        sandbox_provision_metrics=getattr(
+            app_state, "sandbox_provision_metrics", None
+        ),
     )
 
     # ── 16. Pin everything on app_state so downstream DI / lifespan teardown
@@ -2152,6 +2164,10 @@ def _build_agent_service(
     # ``app.state.extension_admission_port`` (None when mode off). Threaded into
     # AgentService → AgentTaskRunner → SkillTool / SkillBundleSyncManager.
     extension_admission_port: object | None = None,
+    # SPM PR-1c Task 17: lifespan-scoped SandboxProvisionMetrics singleton.
+    # main.py passes ``app.state.sandbox_provision_metrics``. Threaded into
+    # AgentService (run_start trigger + on_demand provisioner/flusher wiring).
+    sandbox_provision_metrics: object | None = None,
 ) -> AgentService:
     """Called once in lifespan. Creates AgentService singleton and seeds generation."""
     global _last_refresh_generation
@@ -2314,6 +2330,9 @@ def _build_agent_service(
         extension_stats_recorder=extension_stats_recorder,
         # D1a §4.1: root-path governance AdmissionPort (None when mode off).
         extension_admission_port=extension_admission_port,
+        # SPM PR-1c Task 17: provision-flow metrics singleton (run_start trigger +
+        # on_demand provisioner/flusher wiring).
+        sandbox_provision_metrics=sandbox_provision_metrics,
     )
     agent_svc._supervisor = supervisor
     # C3 PR-4.5 — bind AgentService into the supervisor callback bridge

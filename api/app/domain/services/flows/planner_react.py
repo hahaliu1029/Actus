@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from app.domain.external.recall_cache import RecallCache
     from app.domain.models.app_config import ToolRuntimeConfig
     from app.domain.models.memory_recall import RecalledMemory, RecallQueryMaterial
+    from app.domain.services.execution_watchdog import ExecutionWatchdog
     from app.domain.services.permission.engine import PermissionEngine
     from app.domain.services.prompts.assembler import PromptAssembler
     from app.domain.services.prompts.memory_snapshot import MemorySnapshot
@@ -177,6 +178,9 @@ class PlannerReActFlow(BaseFlow):
         supports_vision: bool = True,
         supports_pdf_input: bool = False,
         file_processor_lookup: Any = None,  # FileProcessorLookup | None
+        # SPM PR-1c Task 17: on_demand deferred file_view processor factory
+        # (mutually exclusive with lookup; threaded to create_native_tools).
+        file_processor_factory: Any = None,  # Callable[[SandboxHandle], FileProcessorLookup] | None
         memory_embedding_provider=None,
         memory_session_factory=None,
         memory_repo_factory=None,
@@ -205,6 +209,11 @@ class PlannerReActFlow(BaseFlow):
         # every LangGraph invoke so LLM calls generate CostRecord rows.
         cost_callback_handler: Any = None,
         execution_supervisor: Any = None,
+        # SPM PR-1c Task 18 (INV-SPM-13): invoked once with the per-invoke
+        # ExecutionWatchdog right after it is created (non-child path only), so
+        # the on_demand provisioner can bind an idle-suppression guard onto it.
+        # None = always-mode / legacy → zero behavior change.
+        on_execution_watchdog: "Callable[[ExecutionWatchdog], None] | None" = None,
         # B9 Task 20: extension stats recorder (ExtensionStatsRecorder | None).
         # None = flag off / not injected → _build_config threads None into
         # configurable → react_graph埋点 is a no-op (zero-behavior).
@@ -230,6 +239,7 @@ class PlannerReActFlow(BaseFlow):
     ) -> None:
         self._cost_callback_handler = cost_callback_handler
         self._execution_supervisor = execution_supervisor
+        self._on_execution_watchdog = on_execution_watchdog  # SPM Task 18
         self._extension_stats_recorder = extension_stats_recorder  # B9 Task 20
         self._permission_engine = permission_engine
         self._session_state_machine = session_state_machine
@@ -237,6 +247,7 @@ class PlannerReActFlow(BaseFlow):
         self._supports_vision = supports_vision
         self._supports_pdf_input = supports_pdf_input
         self._file_processor_lookup = file_processor_lookup
+        self._file_processor_factory = file_processor_factory  # SPM Task 17
         self._uow_factory = uow_factory
         self._session_id = session_id
         self._summary_llm = summary_llm or llm
@@ -514,6 +525,9 @@ class PlannerReActFlow(BaseFlow):
             browser_accessor=self._browser_accessor,
             search_engine=self._search_engine,
             file_processor_lookup=self._file_processor_lookup,
+            # SPM Task 17: getattr defense for __new__-bypass flow tests that
+            # set only a subset of attrs (ctor always sets this to a value).
+            file_processor_factory=getattr(self, "_file_processor_factory", None),
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
@@ -1693,6 +1707,36 @@ class PlannerReActFlow(BaseFlow):
         text = " ".join(parts).lower()
         return "brainstorm_skill" in text or "generate_skill" in text
 
+    def _create_execution_watchdog(self) -> "ExecutionWatchdog | None":
+        """D5 + SPM Task 18 (INV-SPM-13): build the per-invoke idle/total watchdog.
+
+        Coordinator children have an external heartbeat/terminal lifecycle owner;
+        running the ordinary graph-idle watchdog for them would treat a
+        legitimately long child operation as a stalled graph, so children get NO
+        watchdog. ``_child_permission_context`` is the stable child marker (Null
+        coord deps alone also covers legacy/ordinary subagent flows and must not
+        disable it). This is the D5 condition — the watchdog is NEVER constructed
+        unconditionally.
+
+        When a watchdog IS created and an ``on_execution_watchdog`` callback was
+        injected (on_demand provisioning wiring), it is invoked exactly once so
+        the provisioner can bind an idle-suppression guard onto this fresh
+        instance. A coordinator child (watchdog=None) is eager-bound with no
+        provisioner, so there is naturally no guard to bind — consistent.
+        """
+        from app.domain.services.execution_watchdog import ExecutionWatchdog
+
+        watchdog: "ExecutionWatchdog | None" = None
+        if self._child_permission_context is None:
+            ec = self._execution_config
+            watchdog = ExecutionWatchdog(
+                total_timeout_seconds=ec.total_timeout_seconds,
+                idle_timeout_seconds=ec.idle_timeout_seconds,
+            )
+        if watchdog is not None and self._on_execution_watchdog is not None:
+            self._on_execution_watchdog(watchdog)
+        return watchdog
+
     def _build_config(self) -> dict:
         """Build the LangGraph config dict shared by invoke() and resume()."""
         # TODO(PR-9 integration): When ACTUS_C2_COORDINATOR_ENABLED=true,
@@ -1763,7 +1807,7 @@ class PlannerReActFlow(BaseFlow):
         # (BudgetEnforcementCallback + CoordinatorChildWallclockWatchdog
         # — both shipped in PR-6, both dead-coded until PR-9 binds them
         # to the inner_runner's LLM callbacks list).
-        from app.domain.services.execution_watchdog import ExecutionControl, ExecutionWatchdog
+        from app.domain.services.execution_watchdog import ExecutionControl
 
         # Read tool confirmation settings from AgentConfig (config.yaml, user-editable)
         tc = getattr(self._agent_config, "tool_confirmation", None)
@@ -1774,19 +1818,11 @@ class PlannerReActFlow(BaseFlow):
 
         # D5: Create fresh watchdog + control per invoke/resume (timer resets).
         # Tracker + metrics persist on self (survive across invoke/resume).
-        ec = self._execution_config
-        # Coordinator children have an external heartbeat/terminal lifecycle
-        # owner. Running the ordinary graph-idle watchdog as well would treat
-        # a legitimately long child operation as a stalled graph. The child
-        # permission context is injected only by the coordinator starter chain
-        # and is therefore the stable child marker; Null coord deps alone also
-        # covers legacy and ordinary subagent flows and must not disable it.
-        watchdog = None
-        if self._child_permission_context is None:
-            watchdog = ExecutionWatchdog(
-                total_timeout_seconds=ec.total_timeout_seconds,
-                idle_timeout_seconds=ec.idle_timeout_seconds,
-            )
+        # SPM Task 18: watchdog creation + the on_demand idle-guard bind callback
+        # live in _create_execution_watchdog (unit-testable). It preserves the
+        # coordinator-child None condition — NEVER construct unconditionally, or
+        # the D5 child-idle-kill regression returns.
+        watchdog = self._create_execution_watchdog()
         control = ExecutionControl()
 
         cfg: dict = {
@@ -1795,7 +1831,10 @@ class PlannerReActFlow(BaseFlow):
                 "skill_context_refresher": self._skill_context_refresher,
                 "react_graph_provider": self._react_graph_provider,
                 "skill_guide_injector": self._skill_guide_injector,
-                "has_file_view": self._file_processor_lookup is not None,
+                "has_file_view": (
+                    self._file_processor_lookup is not None
+                    or getattr(self, "_file_processor_factory", None) is not None
+                ),
                 "has_memory_tools": self._has_memory_tools,
                 "approval_state_reader": self._approval_state_reader,
                 "skill_tool": self._skill_tool,  # PE SkillSource metadata build + fail-closed skill guard
