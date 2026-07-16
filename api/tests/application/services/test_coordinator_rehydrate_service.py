@@ -3,16 +3,21 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.application.services.coordinator_rehydrate_service import (
     AlreadyAppliedInfo,
+    ApplyLeaseObservation,
     CoordinatorRehydrateService,
 )
 
 pytestmark = pytest.mark.anyio
+
+
+async def _run_under_crash_fence(_run_id, operation, **_kwargs):
+    return await operation()
 
 
 def _make_envelope(
@@ -36,33 +41,31 @@ def _make_child(*, session_id, wu_id, status="running"):
     return SimpleNamespace(id=session_id, work_unit_id=wu_id, status=status)
 
 
-class _FakeApplyReconcileMarkerStore:
-    def __init__(self) -> None:
-        self.entries: dict[str, tuple[float, float]] = {}
-        self.get_or_create_calls: list[tuple[str, float, int]] = []
-        self.clear_calls: list[str] = []
-
-    async def get_or_create(
-        self,
-        coordinator_run_id: str,
-        *,
-        now_epoch: float,
-        ttl_seconds: int,
-    ) -> float:
-        self.get_or_create_calls.append(
-            (coordinator_run_id, now_epoch, ttl_seconds),
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"apply_reconcile_grace_seconds": True},
+        {"apply_reconcile_grace_seconds": 0},
+        {"apply_reconcile_grace_seconds": -1},
+        {"apply_reconcile_grace_seconds": 1.5},
+        {"apply_reconcile_grace_seconds": "30"},
+        {"apply_reconcile_marker_ttl_seconds": True},
+        {"apply_reconcile_marker_ttl_seconds": 30},
+        {"apply_reconcile_marker_ttl_seconds": 29},
+        {"apply_reconcile_marker_ttl_seconds": 86_400.5},
+        {"apply_reconcile_marker_ttl_seconds": float("inf")},
+    ],
+)
+def test_rehydrate_reconcile_windows_require_ordered_positive_integers(
+    overrides,
+) -> None:
+    with pytest.raises(ValueError, match="apply_reconcile"):
+        CoordinatorRehydrateService(
+            session_repository=AsyncMock(),
+            envelope_store=AsyncMock(),
+            audit_repository=AsyncMock(),
+            **overrides,
         )
-        existing = self.entries.get(coordinator_run_id)
-        if existing is not None and existing[1] > now_epoch:
-            return existing[0]
-        self.entries[coordinator_run_id] = (
-            now_epoch, now_epoch + ttl_seconds,
-        )
-        return now_epoch
-
-    async def clear(self, coordinator_run_id: str) -> None:
-        self.clear_calls.append(coordinator_run_id)
-        self.entries.pop(coordinator_run_id, None)
 
 
 async def test_returns_none_when_no_children():
@@ -70,6 +73,7 @@ async def test_returns_none_when_no_children():
     sr.find_children_by_coordinator_run = AsyncMock(return_value=[])
     es = AsyncMock()
     ar = AsyncMock()
+    ar.update_terminal = AsyncMock(return_value=True)
     svc = CoordinatorRehydrateService(
         session_repository=sr, envelope_store=es, audit_repository=ar,
     )
@@ -208,11 +212,6 @@ async def test_already_applied_rollback_partial_emits_health_event():
 async def test_already_applied_crash_mid_apply_only_after_lock_missing_grace():
     emitter = AsyncMock()
     now = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
-    markers = _FakeApplyReconcileMarkerStore()
-    markers.entries["r1"] = (
-        now.timestamp() - 60,
-        now.timestamp() + 86_340,
-    )
     sr = AsyncMock()
     sr.find_children_by_coordinator_run = AsyncMock(return_value=[
         _make_child(session_id="c1", wu_id="wu1", status="running"),
@@ -220,6 +219,7 @@ async def test_already_applied_crash_mid_apply_only_after_lock_missing_grace():
     es = AsyncMock()
     es.find_terminal_envelopes_by_run = AsyncMock(return_value=[])
     ar = AsyncMock()
+    ar.update_terminal = AsyncMock(return_value=True)
     ar.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=99, status="in_progress",
         started_at=now - timedelta(seconds=600),
@@ -227,8 +227,10 @@ async def test_already_applied_crash_mid_apply_only_after_lock_missing_grace():
     svc = CoordinatorRehydrateService(
         session_repository=sr, envelope_store=es, audit_repository=ar,
         emit_event=emitter,
-        apply_lock_probe=AsyncMock(return_value=False),
-        reconcile_marker_store=markers,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=60,
+        )),
+        apply_crash_fence=_run_under_crash_fence,
         clock=lambda: now,
     )
     res = await svc.detect_existing_run(
@@ -248,6 +250,7 @@ async def test_in_progress_recent_no_alert():
     es = AsyncMock()
     es.find_terminal_envelopes_by_run = AsyncMock(return_value=[])
     ar = AsyncMock()
+    ar.update_terminal = AsyncMock(return_value=True)
     ar.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=11, status="in_progress",
         started_at=datetime.now(timezone.utc) - timedelta(seconds=30),
@@ -297,13 +300,9 @@ async def test_naive_started_at_normalized_to_utc():
     es = AsyncMock()
     es.find_terminal_envelopes_by_run = AsyncMock(return_value=[])
     ar = AsyncMock()
+    ar.update_terminal = AsyncMock(return_value=True)
     now = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
     naive_old = (now - timedelta(seconds=600)).replace(tzinfo=None)
-    markers = _FakeApplyReconcileMarkerStore()
-    markers.entries["r1"] = (
-        now.timestamp() - 60,
-        now.timestamp() + 86_340,
-    )
     ar.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=33, status="in_progress",
         started_at=naive_old,
@@ -311,8 +310,10 @@ async def test_naive_started_at_normalized_to_utc():
     svc = CoordinatorRehydrateService(
         session_repository=sr, envelope_store=es, audit_repository=ar,
         emit_event=emitter,
-        apply_lock_probe=AsyncMock(return_value=False),
-        reconcile_marker_store=markers,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=60,
+        )),
+        apply_crash_fence=_run_under_crash_fence,
         clock=lambda: now,
     )
     res = await svc.detect_existing_run(
@@ -321,28 +322,25 @@ async def test_naive_started_at_normalized_to_utc():
     assert res.already_applied.status == "crash_mid_apply"
 
 
-async def test_old_in_progress_with_fresh_apply_owner_is_recent_and_clears_marker():
+async def test_old_in_progress_with_fresh_apply_owner_is_recent():
     now = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
-    markers = _FakeApplyReconcileMarkerStore()
-    markers.entries["run-live"] = (
-        now.timestamp() - 900,
-        now.timestamp() + 85_500,
-    )
     audit_repo = AsyncMock()
+    audit_repo.update_terminal = AsyncMock(return_value=True)
     audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=70,
         status="in_progress",
         started_at=now - timedelta(hours=3),
     ))
-    lock_probe = AsyncMock(return_value=True)
+    observer = AsyncMock(return_value=ApplyLeaseObservation(
+        owner_is_live=True, missing_for_seconds=0,
+    ))
     emitter = AsyncMock()
     svc = CoordinatorRehydrateService(
         session_repository=AsyncMock(),
         envelope_store=AsyncMock(),
         audit_repository=audit_repo,
         emit_event=emitter,
-        apply_lock_probe=lock_probe,
-        reconcile_marker_store=markers,
+        apply_lease_observer=observer,
         clock=lambda: now,
     )
 
@@ -351,15 +349,77 @@ async def test_old_in_progress_with_fresh_apply_owner_is_recent_and_clears_marke
     assert result == AlreadyAppliedInfo(
         status="in_progress_recent", audit_id=70,
     )
-    lock_probe.assert_awaited_once_with("run-live")
-    assert markers.clear_calls == ["run-live"]
-    assert "run-live" not in markers.entries
+    observer.assert_awaited_once_with(
+        "run-live", marker_ttl_seconds=86_400,
+    )
     emitter.assert_not_awaited()
+
+
+async def test_atomic_apply_lease_observation_ignores_cross_pod_clock_skew():
+    now = datetime(2050, 1, 1, tzinfo=timezone.utc)
+    audit_repo = AsyncMock()
+    audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
+        id=701,
+        status="in_progress",
+        started_at=now - timedelta(hours=3),
+    ))
+    observer = AsyncMock(return_value=ApplyLeaseObservation(
+        owner_is_live=False,
+        missing_for_seconds=29.0,
+    ))
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        apply_lease_observer=observer,
+        # The pod wall clock is intentionally unrelated to the Redis lease
+        # clock. It may describe audit age, but never marker elapsed time.
+        clock=lambda: now,
+    )
+
+    result = await svc._check_already_applied("run-clock-skew")
+
+    assert result == AlreadyAppliedInfo(
+        status="in_progress_recent", audit_id=701,
+    )
+    observer.assert_awaited_once_with(
+        "run-clock-skew", marker_ttl_seconds=86_400,
+    )
+
+
+async def test_atomic_live_then_missing_observation_restarts_full_grace():
+    now = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
+    audit_repo = AsyncMock()
+    audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
+        id=702,
+        status="in_progress",
+        started_at=now - timedelta(hours=3),
+    ))
+    observer = AsyncMock(side_effect=[
+        ApplyLeaseObservation(owner_is_live=True, missing_for_seconds=0.0),
+        ApplyLeaseObservation(owner_is_live=False, missing_for_seconds=0.0),
+    ])
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        apply_lease_observer=observer,
+        clock=lambda: now,
+    )
+
+    live = await svc._check_already_applied("run-cycle")
+    first_missing = await svc._check_already_applied("run-cycle")
+
+    assert live.status == "in_progress_recent"
+    assert first_missing.status == "in_progress_recent"
+    assert observer.await_count == 2
 
 
 async def test_missing_apply_lock_first_observation_only_creates_ttl_marker():
     now = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
-    markers = _FakeApplyReconcileMarkerStore()
+    observer = AsyncMock(return_value=ApplyLeaseObservation(
+        owner_is_live=False, missing_for_seconds=0,
+    ))
     audit_repo = AsyncMock()
     audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=71,
@@ -372,8 +432,7 @@ async def test_missing_apply_lock_first_observation_only_creates_ttl_marker():
         envelope_store=AsyncMock(),
         audit_repository=audit_repo,
         emit_event=emitter,
-        apply_lock_probe=AsyncMock(return_value=False),
-        reconcile_marker_store=markers,
+        apply_lease_observer=observer,
         clock=lambda: now,
     )
 
@@ -382,19 +441,14 @@ async def test_missing_apply_lock_first_observation_only_creates_ttl_marker():
     assert result == AlreadyAppliedInfo(
         status="in_progress_recent", audit_id=71,
     )
-    assert markers.get_or_create_calls == [
-        ("run-first", now.timestamp(), 86_400),
-    ]
+    observer.assert_awaited_once_with(
+        "run-first", marker_ttl_seconds=86_400,
+    )
     emitter.assert_not_awaited()
 
 
 async def test_missing_apply_lock_within_grace_remains_recent():
     now = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
-    markers = _FakeApplyReconcileMarkerStore()
-    markers.entries["run-grace"] = (
-        now.timestamp() - 29,
-        now.timestamp() + 86_371,
-    )
     audit_repo = AsyncMock()
     audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=72,
@@ -407,8 +461,9 @@ async def test_missing_apply_lock_within_grace_remains_recent():
         envelope_store=AsyncMock(),
         audit_repository=audit_repo,
         emit_event=emitter,
-        apply_lock_probe=AsyncMock(return_value=False),
-        reconcile_marker_store=markers,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=29,
+        )),
         clock=lambda: now,
     )
 
@@ -422,12 +477,8 @@ async def test_missing_apply_lock_within_grace_remains_recent():
 
 async def test_missing_apply_lock_after_minutes_still_crashes_before_marker_ttl():
     now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
-    markers = _FakeApplyReconcileMarkerStore()
-    markers.entries["run-stale"] = (
-        now.timestamp() - 300,
-        now.timestamp() + 86_100,
-    )
     audit_repo = AsyncMock()
+    audit_repo.update_terminal = AsyncMock(return_value=True)
     audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=73,
         status="in_progress",
@@ -439,8 +490,10 @@ async def test_missing_apply_lock_after_minutes_still_crashes_before_marker_ttl(
         envelope_store=AsyncMock(),
         audit_repository=audit_repo,
         emit_event=emitter,
-        apply_lock_probe=AsyncMock(return_value=False),
-        reconcile_marker_store=markers,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=300,
+        )),
+        apply_crash_fence=_run_under_crash_fence,
         clock=lambda: now,
     )
 
@@ -449,19 +502,202 @@ async def test_missing_apply_lock_after_minutes_still_crashes_before_marker_ttl(
     assert result == AlreadyAppliedInfo(
         status="crash_mid_apply", audit_id=73,
     )
+    audit_repo.update_terminal.assert_awaited_once_with(
+        73,
+        status="crash_mid_apply",
+        failed_reason=(
+            "apply owner continuously missing beyond reconciliation grace"
+        ),
+    )
     assert emitter.await_args.args[0].metrics["code"] == (
         "coordinator_apply_crash_mid_apply"
     )
 
 
-async def test_reconcile_markers_are_isolated_by_coordinator_run_id():
+async def test_crash_classification_fails_safe_when_fence_is_busy():
     now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
-    markers = _FakeApplyReconcileMarkerStore()
-    markers.entries["run-old"] = (
-        now.timestamp() - 300,
-        now.timestamp() + 86_100,
+    audit_repo = AsyncMock()
+    audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
+        id=730,
+        status="in_progress",
+        started_at=now - timedelta(hours=3),
+    ))
+    audit_repo.update_terminal = AsyncMock(return_value=True)
+    fence = AsyncMock(return_value=None)
+    emitter = AsyncMock()
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        emit_event=emitter,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=300,
+        )),
+        apply_crash_fence=fence,
+        clock=lambda: now,
+    )
+
+    result = await svc._check_already_applied("run-fence-busy")
+
+    assert result == AlreadyAppliedInfo(
+        status="in_progress_recent", audit_id=730,
+    )
+    audit_repo.update_terminal.assert_not_awaited()
+    emitter.assert_not_awaited()
+
+
+async def test_crash_cas_miss_rereads_concurrent_success():
+    now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
+    stale = SimpleNamespace(
+        id=732,
+        status="in_progress",
+        started_at=now - timedelta(hours=3),
+    )
+    success = SimpleNamespace(
+        id=732,
+        status="success",
+        started_at=stale.started_at,
     )
     audit_repo = AsyncMock()
+    audit_repo.find_latest_for_run = AsyncMock(
+        side_effect=[stale, success, success],
+    )
+    audit_repo.update_terminal = AsyncMock(return_value=False)
+    emitter = AsyncMock()
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        emit_event=emitter,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=300,
+        )),
+        apply_crash_fence=_run_under_crash_fence,
+        clock=lambda: now,
+    )
+
+    result = await svc._check_already_applied("run-raced-success")
+
+    assert result == AlreadyAppliedInfo(status="success", audit_id=732)
+    assert audit_repo.find_latest_for_run.await_count == 3
+    emitter.assert_not_awaited()
+
+
+async def test_crash_fence_rechecks_latest_attempt_before_cas():
+    now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
+    old = SimpleNamespace(
+        id=733,
+        status="in_progress",
+        started_at=now - timedelta(hours=3),
+    )
+    replacement = SimpleNamespace(
+        id=734,
+        status="in_progress",
+        started_at=now,
+    )
+    audit_repo = AsyncMock()
+    audit_repo.find_latest_for_run = AsyncMock(
+        side_effect=[old, replacement, replacement],
+    )
+    audit_repo.update_terminal = AsyncMock(return_value=True)
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=300,
+        )),
+        apply_crash_fence=_run_under_crash_fence,
+        clock=lambda: now,
+    )
+
+    result = await svc._check_already_applied("run-replaced-attempt")
+
+    assert result == AlreadyAppliedInfo(
+        status="in_progress_recent", audit_id=734,
+    )
+    audit_repo.update_terminal.assert_not_awaited()
+
+
+async def test_persisted_crash_classification_cannot_regress_after_marker_expiry():
+    now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
+    audit = SimpleNamespace(
+        id=731,
+        status="in_progress",
+        started_at=now - timedelta(hours=25),
+    )
+    audit_repo = AsyncMock()
+    audit_repo.find_latest_for_run = AsyncMock(return_value=audit)
+
+    async def persist_terminal(_audit_id: int, **kwargs) -> bool:
+        audit.status = kwargs["status"]
+        return True
+
+    audit_repo.update_terminal = AsyncMock(side_effect=persist_terminal)
+    observer = AsyncMock(return_value=ApplyLeaseObservation(
+        owner_is_live=False,
+        missing_for_seconds=31,
+    ))
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        apply_lease_observer=observer,
+        apply_crash_fence=_run_under_crash_fence,
+        clock=lambda: now,
+    )
+
+    first = await svc._check_already_applied("run-expired-marker")
+    observer.reset_mock()
+    observer.return_value = ApplyLeaseObservation(
+        owner_is_live=False,
+        missing_for_seconds=0,
+    )
+    second = await svc._check_already_applied("run-expired-marker")
+
+    assert first.status == "crash_mid_apply"
+    assert second.status == "crash_mid_apply"
+    observer.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bad_first_missing", [float("nan"), float("inf"), float("-inf")])
+async def test_malformed_reconcile_marker_fails_closed_as_in_progress(
+    bad_first_missing: float,
+) -> None:
+    now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
+    audit_repo = AsyncMock()
+    audit_repo.update_terminal = AsyncMock(return_value=True)
+    audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
+        id=730,
+        status="in_progress",
+        started_at=now - timedelta(hours=3),
+    ))
+    emitter = AsyncMock()
+    svc = CoordinatorRehydrateService(
+        session_repository=AsyncMock(),
+        envelope_store=AsyncMock(),
+        audit_repository=audit_repo,
+        emit_event=emitter,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=bad_first_missing,
+        )),
+        clock=lambda: now,
+    )
+
+    result = await svc._check_already_applied("run-corrupt-marker")
+
+    assert result.status == "in_progress_recent"
+    emitter.assert_not_awaited()
+
+
+async def test_reconcile_markers_are_isolated_by_coordinator_run_id():
+    now = datetime(2026, 7, 15, 8, 5, tzinfo=timezone.utc)
+    observer = AsyncMock(side_effect=[
+        ApplyLeaseObservation(owner_is_live=False, missing_for_seconds=300),
+        ApplyLeaseObservation(owner_is_live=False, missing_for_seconds=0),
+    ])
+    audit_repo = AsyncMock()
+    audit_repo.update_terminal = AsyncMock(return_value=True)
     audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=74,
         status="in_progress",
@@ -471,8 +707,8 @@ async def test_reconcile_markers_are_isolated_by_coordinator_run_id():
         session_repository=AsyncMock(),
         envelope_store=AsyncMock(),
         audit_repository=audit_repo,
-        apply_lock_probe=AsyncMock(return_value=False),
-        reconcile_marker_store=markers,
+        apply_lease_observer=observer,
+        apply_crash_fence=_run_under_crash_fence,
         clock=lambda: now,
     )
 
@@ -481,20 +717,21 @@ async def test_reconcile_markers_are_isolated_by_coordinator_run_id():
 
     assert old.status == "crash_mid_apply"
     assert fresh.status == "in_progress_recent"
-    assert "run-old" in markers.entries
-    assert markers.entries["run-new"][0] == now.timestamp()
+    assert [call.args[0] for call in observer.await_args_list] == [
+        "run-old", "run-new",
+    ]
 
 
 async def test_success_and_rollback_partial_do_not_probe_apply_lock():
-    probe = AsyncMock(side_effect=AssertionError("terminal audit must not probe"))
-    markers = _FakeApplyReconcileMarkerStore()
+    observer = AsyncMock(
+        side_effect=AssertionError("terminal audit must not observe lease"),
+    )
     audit_repo = AsyncMock()
     svc = CoordinatorRehydrateService(
         session_repository=AsyncMock(),
         envelope_store=AsyncMock(),
         audit_repository=audit_repo,
-        apply_lock_probe=probe,
-        reconcile_marker_store=markers,
+        apply_lease_observer=observer,
     )
     audit_repo.find_latest_for_run = AsyncMock(return_value=SimpleNamespace(
         id=75, status="success", started_at=datetime.now(timezone.utc),
@@ -506,8 +743,7 @@ async def test_success_and_rollback_partial_do_not_probe_apply_lock():
     assert (await svc._check_already_applied("run-rollback")).status == (
         "rollback_partial"
     )
-    probe.assert_not_awaited()
-    assert markers.get_or_create_calls == []
+    observer.assert_not_awaited()
 
 
 async def test_real_session_status_enum_routed_to_pending():

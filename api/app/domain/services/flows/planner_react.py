@@ -414,6 +414,11 @@ class PlannerReActFlow(BaseFlow):
         # via the invoke-adapter. _build_config injects it (+ the SSM) into the
         # child graph cfg so react_graph's tool_node child-scope guard fires.
         self._child_permission_context = None
+        # Mailbox-plane research children emit an independent heartbeat and
+        # are orphan-checked by MailboxSupervisor. Their graph can be quiet
+        # during a legitimate long tool/LLM operation, so the graph-idle timer
+        # is not an additional wallclock owner for those runs.
+        self._mailbox_liveness_managed = False
         # [C2b budget §3-5] Child-only BudgetEnforcementCallback. None for
         # root/parent flows; set by AgentTaskRunner.set_budget_callback via the
         # starter→adapter→runner chain. _build_config appends it to
@@ -436,6 +441,10 @@ class PlannerReActFlow(BaseFlow):
         _build_config threads it (+ the SSM) into the child graph cfg for the
         tool_node child-scope guard."""
         self._child_permission_context = cpc
+
+    def set_mailbox_liveness_managed(self) -> None:
+        """Declare that mailbox heartbeat/orphan lifecycle owns liveness."""
+        self._mailbox_liveness_managed = True
 
     def set_budget_callback(self, cb) -> None:
         """[C2b budget §3-5] External seam (mirror set_cancel_event): the
@@ -1779,6 +1788,13 @@ class PlannerReActFlow(BaseFlow):
         disable it). This is the D5 condition — the watchdog is NEVER constructed
         unconditionally.
 
+        Mailbox-liveness-managed subagents (develop 2e97393) likewise have their
+        own periodic heartbeat plus the MailboxSupervisor orphan detector; a long
+        non-streaming tool/LLM call may legitimately produce no graph events for
+        minutes, so they also get NO graph watchdog (``_mailbox_liveness_managed``
+        is set only via the runner's ``set_mailbox_liveness_managed`` under the
+        complete production mailbox wiring).
+
         When a watchdog IS created and an ``on_execution_watchdog`` callback was
         injected (on_demand provisioning wiring), it is invoked exactly once so
         the provisioner can bind an idle-suppression guard onto this fresh
@@ -1788,7 +1804,10 @@ class PlannerReActFlow(BaseFlow):
         from app.domain.services.execution_watchdog import ExecutionWatchdog
 
         watchdog: "ExecutionWatchdog | None" = None
-        if self._child_permission_context is None:
+        if (
+            self._child_permission_context is None
+            and not self._mailbox_liveness_managed
+        ):
             ec = self._execution_config
             watchdog = ExecutionWatchdog(
                 total_timeout_seconds=ec.total_timeout_seconds,
@@ -1882,7 +1901,8 @@ class PlannerReActFlow(BaseFlow):
         # SPM Task 18: watchdog creation + the on_demand idle-guard bind callback
         # live in _create_execution_watchdog (unit-testable). It preserves the
         # coordinator-child None condition — NEVER construct unconditionally, or
-        # the D5 child-idle-kill regression returns.
+        # the D5 child-idle-kill regression returns. The mailbox-liveness-managed
+        # suppression (develop 2e97393) lives inside the same method.
         watchdog = self._create_execution_watchdog()
         control = ExecutionControl()
 

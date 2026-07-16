@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from app.application.services.coordinator_rehydrate_service import (
+    ApplyLeaseObservation,
     CoordinatorRehydrateService,
 )
 
@@ -42,15 +43,24 @@ async def test_call_time_emitter_emits_crash_mid_apply_when_singleton_none():
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
     from app.domain.models.event import HealthStatus
+    now = datetime.now(timezone.utc)
     audit = SimpleNamespace(
         id=99, status="in_progress",
-        started_at=datetime.now(timezone.utc) - timedelta(seconds=600),
+        started_at=now - timedelta(seconds=600),
     )
     audit_repo = MagicMock()
     audit_repo.find_latest_for_run = AsyncMock(return_value=audit)
+    audit_repo.update_terminal = AsyncMock(return_value=True)
+    async def _fence(_run_id, operation, **_kwargs):
+        return await operation()
     svc = CoordinatorRehydrateService(
         session_repository=MagicMock(), envelope_store=MagicMock(),
         audit_repository=audit_repo, publisher=MagicMock(), emit_event=None,
+        apply_lease_observer=AsyncMock(return_value=ApplyLeaseObservation(
+            owner_is_live=False, missing_for_seconds=60,
+        )),
+        apply_crash_fence=_fence,
+        clock=lambda: now,
     )
     emitted = []
     async def _emit(ev):

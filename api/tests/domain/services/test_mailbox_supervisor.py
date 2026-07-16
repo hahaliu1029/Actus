@@ -371,6 +371,24 @@ async def test_rejected_coordinator_heartbeat_does_not_extend_local_liveness(
 
 
 @pytest.mark.anyio
+async def test_ordinary_research_heartbeat_refreshes_local_liveness(
+    supervisor_ctx,
+) -> None:
+    liveness = SimpleNamespace(
+        record_heartbeat=AsyncMock(return_value=None),
+    )
+    supervisor_ctx.liveness_service = liveness
+    supervisor_ctx.clock = lambda: 456.0
+    sup = MailboxSupervisor(supervisor_ctx)
+    envelope = _env(payload={"kind": "heartbeat", "visibility": "hidden"})
+
+    await sup._refresh_last_seen_if_child_origin(envelope)  # noqa: SLF001
+
+    assert sup.get_last_seen("child-1") == 456.0
+    assert sup._known_children == []  # noqa: SLF001
+
+
+@pytest.mark.anyio
 async def test_first_coordinator_heartbeat_tracks_child_only_after_durable_acceptance(
     supervisor_ctx,
 ) -> None:

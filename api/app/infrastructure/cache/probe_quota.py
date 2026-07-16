@@ -33,10 +33,9 @@ Lua behavior:
 
 TTL note: `PROBE_QUOTA_TTL_SECONDS = 900` (15 min) is the per-slot lease
 window — an independent crash-recovery ceiling so transient client crashes
-don't permanently leak slots. Root execution wallclock defaults to unlimited,
-so callers MUST treat this 15 min quota lease as its own hard upper bound;
-long-running probes should periodically re-acquire (refresh) or get a higher
-ttl by callers' choice.
+don't permanently leak slots. It is not a task wallclock: long-running active
+probes renew the same existing member every TTL/3. Renewal never recreates a
+missing/expired member, and task completion drains renewal before exact release.
 
 Failure modes:
 - Redis exception during eval → acquire returns False (fail closed).
@@ -144,6 +143,26 @@ redis.call('EXPIRE', key, ttl)
 return 1
 """
 
+RENEW_PROBE_LUA: Final[str] = """
+local key = KEYS[1]
+local probe_id = ARGV[1]
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+
+local stored = redis.call('HGET', key, probe_id)
+if not stored then
+    return 0
+end
+local timestamp = tonumber(stored)
+if timestamp == nil or timestamp < now - ttl then
+    redis.call('HDEL', key, probe_id)
+    return 0
+end
+redis.call('HSET', key, probe_id, now)
+redis.call('EXPIRE', key, ttl)
+return 1
+"""
+
 
 class ProbeQuotaService:
     """Per-user active probe quota with atomic Lua acquire/release."""
@@ -164,6 +183,11 @@ class ProbeQuotaService:
     def _key(user_id: str) -> str:
         return f"actus:active_probes:{user_id}"
 
+    @property
+    def renew_interval_seconds(self) -> float:
+        """Rolling cadence; deliberately shorter than the cleanup window."""
+        return self._ttl_seconds / 3
+
     async def acquire(self, user_id: str, probe_run_id: str) -> bool:
         """Atomically acquire a probe slot. Returns True on success.
 
@@ -177,7 +201,7 @@ class ProbeQuotaService:
                 1,  # number of keys
                 self._key(user_id),
                 probe_run_id,
-                str(time.time()),
+                str(self._clock()),
                 str(self._max_active),
                 str(self._ttl_seconds),
             )
@@ -185,6 +209,26 @@ class ProbeQuotaService:
         except Exception as e:
             logger.warning(
                 "probe_quota acquire failed (fail-closed): user_id=%s probe_run_id=%s err=%s",
+                user_id, probe_run_id, e,
+            )
+            return False
+
+    async def renew(self, user_id: str, probe_run_id: str) -> bool:
+        """Refresh one existing live probe lease; never reacquire it."""
+        try:
+            result = await self._redis.client.eval(
+                RENEW_PROBE_LUA,
+                1,
+                self._key(user_id),
+                probe_run_id,
+                str(self._clock()),
+                str(self._ttl_seconds),
+            )
+            return bool(int(result))
+        except Exception as e:
+            logger.warning(
+                "probe_quota renew failed (fail-closed): user_id=%s "
+                "probe_run_id=%s err=%s",
                 user_id, probe_run_id, e,
             )
             return False

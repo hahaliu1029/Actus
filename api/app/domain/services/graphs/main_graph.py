@@ -276,15 +276,18 @@ async def _run_parallel_backend_impl(
             return ParallelBackendOutcome(
                 success=False,
                 summary=(
-                    f"⚠️ apply 中途 pod crash（audit {audit_id} "
-                    f"in_progress > 5min）。Workspace 可能不一致，请人工检查 "
+                    f"⚠️ apply crash fence 确认 owner lease 在 reconcile grace 后仍缺失"
+                    f"（audit {audit_id}）。Workspace 可能不一致，请人工检查 "
                     f"+ 清理 audit row 后重试。"
                 ),
             )
         if status == "in_progress_recent":
             return ParallelBackendOutcome(
                 success=False,
-                summary="apply 仍在执行（另一 pod？），等 Redis lock 释放后重试。",
+                summary=(
+                    "apply 可能仍在执行，或 Redis lock / owner lease 暂时无法安全确认/"
+                    "仍处于 reconcile grace；请稍后重试。"
+                ),
             )
         # Unknown status — surface verbatim so operator can diagnose.
         # Conservative: an undiagnosable apply state is NOT a success.

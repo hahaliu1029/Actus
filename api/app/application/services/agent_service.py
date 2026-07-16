@@ -1010,6 +1010,25 @@ class AgentService:
                 trigger="skill_sync",
             )
 
+        # A live mailbox-plane child has its own periodic heartbeat plus the
+        # MailboxSupervisor orphan detector. A long non-streaming tool/LLM call
+        # may legitimately produce no graph events for minutes or hours, so the
+        # graph idle watchdog must not act as a second fixed wallclock owner.
+        # Require the complete production mailbox wiring before disabling it;
+        # legacy/root/test paths retain the ordinary graph watchdog.
+        if (
+            session.worker_type == "subagent"
+            and session.subagent_control_plane == "mailbox"
+            and bool(getattr(
+                getattr(self, "_settings", None),
+                "mailbox_supervisor_enabled",
+                False,
+            ))
+            and getattr(self, "_supervisor_registry", None) is not None
+            and getattr(self, "_mailbox_publisher", None) is not None
+        ):
+            task_runner.set_mailbox_liveness_managed()
+
         # PE-1 §2.6: skill_tool lives on the live task_runner (constructed above);
         # register SkillSource into the PE built earlier and validate the final
         # registry. If validate fails, surface as PermissionConfigurationError

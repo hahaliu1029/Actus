@@ -219,7 +219,10 @@ class DockerSandbox(Sandbox):
                 "detach": True,
                 "remove": True,
                 "environment": {
-                    "SERVICE_TIMEOUT_MINUTES": settings.sandbox_ttl_minutes,
+                    # Pydantic Settings maps ``server_timeout_minutes`` to
+                    # SERVER_TIMEOUT_MINUTES. The old SERVICE_* spelling was
+                    # ignored, silently leaving every container at 60 minutes.
+                    "SERVER_TIMEOUT_MINUTES": settings.sandbox_ttl_minutes,
                     "CHROME_ARGS": settings.sandbox_chrome_args,
                     "HTTPS_PROXY": settings.sandbox_https_proxy,
                     "HTTP_PROXY": settings.sandbox_http_proxy,

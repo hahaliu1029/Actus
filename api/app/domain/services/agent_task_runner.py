@@ -4339,6 +4339,10 @@ class AgentTaskRunner(TaskRunner):
         self._coordinator_child_permission_context = cpc
         self._flow.set_child_permission_context(cpc)
 
+    def set_mailbox_liveness_managed(self) -> None:
+        """Forward external mailbox heartbeat ownership into the graph flow."""
+        self._flow.set_mailbox_liveness_managed()
+
     def set_budget_callback(self, cb) -> None:
         """[C2b budget §3-4] Forward the child's BudgetEnforcementCallback into
         the child PlannerReActFlow so _build_config appends it to the graph

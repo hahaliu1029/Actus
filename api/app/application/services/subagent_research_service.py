@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -52,7 +53,10 @@ from app.domain.services.subagent_research_classifier import (
 from app.domain.services.tool_filter_presets import (
     SUBAGENT_RESEARCH_ALLOWED_TOOLS,
 )
-from app.infrastructure.cache.probe_quota import ProbeQuotaService
+from app.infrastructure.cache.probe_quota import (
+    PROBE_QUOTA_TTL_SECONDS,
+    ProbeQuotaService,
+)
 from app.interfaces.schemas.subagent import (
     ChildDoneEvent,
     ChildOutcome,
@@ -103,6 +107,7 @@ class SubagentResearchService:
         mailbox_publisher: Optional[MailboxPublisher] = None,
         subagent_run_repo: Optional[SubagentRunRepository] = None,
         lifecycle_sink: Optional[Any] = None,
+        probe_quota_renew_interval_seconds: float | None = None,
     ) -> None:
         self._session_service = session_service
         self._agent_service = agent_service
@@ -112,6 +117,25 @@ class SubagentResearchService:
         self._classifier = classifier
         self._sandbox_lifecycle_service = sandbox_lifecycle_service
         self._quota_service = quota_service
+        renew_interval = probe_quota_renew_interval_seconds
+        if renew_interval is None:
+            candidate = getattr(quota_service, "renew_interval_seconds", None)
+            renew_interval = (
+                candidate
+                if isinstance(candidate, (int, float))
+                and not isinstance(candidate, bool)
+                else PROBE_QUOTA_TTL_SECONDS / 3
+            )
+        if (
+            isinstance(renew_interval, bool)
+            or not isinstance(renew_interval, (int, float))
+            or not math.isfinite(float(renew_interval))
+            or renew_interval <= 0
+        ):
+            raise ValueError(
+                "probe_quota_renew_interval_seconds must be finite and positive"
+            )
+        self._probe_quota_renew_interval_seconds = float(renew_interval)
         # [C4.1a §5.2] Optional subagent-run observation sink. None on flag-OFF
         # (repo-or-None at the composition root) → _record_child_run no-ops.
         self._subagent_run_repo = subagent_run_repo
@@ -151,6 +175,56 @@ class SubagentResearchService:
         # ``mailbox_publisher`` to actually XADD the envelopes.
         self._supervisor_registry = supervisor_registry
         self._mailbox_publisher = mailbox_publisher
+
+    async def _renew_probe_quota_lease(
+        self,
+        *,
+        user_id: str,
+        probe_run_id: str,
+        stopped: asyncio.Event,
+    ) -> None:
+        """Renew one owned probe slot until its run-scoped owner stops."""
+        while not stopped.is_set():
+            sleep_task = asyncio.create_task(
+                asyncio.sleep(self._probe_quota_renew_interval_seconds)
+            )
+            stop_task = asyncio.create_task(stopped.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    (sleep_task, stop_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for task in (sleep_task, stop_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    sleep_task, stop_task, return_exceptions=True,
+                )
+            if stop_task in done or stopped.is_set():
+                return
+            try:
+                renewed = await self._quota_service.renew(
+                    user_id, probe_run_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                renewed = False
+                logger.exception(
+                    "probe quota lease renewal raised user=%s probe=%s",
+                    user_id,
+                    probe_run_id,
+                )
+            if not renewed:
+                # Quota ownership loss is observable but is not a hidden task
+                # wallclock. Never reacquire from this loop; completion still
+                # executes the exact best-effort release.
+                logger.warning(
+                    "probe quota lease lost user=%s probe=%s",
+                    user_id,
+                    probe_run_id,
+                )
 
     async def _record_child_run(self, result: ChildResult, parent_id: str) -> None:
         """[C4.1a §5.2] best-effort 投影 + 持久化一条 research child run。
@@ -757,8 +831,18 @@ class SubagentResearchService:
         # ``_cancel_pending_children`` paired wrong indices via zip when
         # any rollback-failed child was skipped.
         startable_children: list[tuple[Any, str]] = []
+        quota_renew_stopped = asyncio.Event()
+        quota_renew_task: asyncio.Task[None] | None = None
 
         try:
+            quota_renew_task = asyncio.create_task(
+                self._renew_probe_quota_lease(
+                    user_id=user_id,
+                    probe_run_id=probe_run_id,
+                    stopped=quota_renew_stopped,
+                ),
+                name=f"probe-quota-renew:{probe_run_id}",
+            )
             for prompt in prompts[:max_children]:
                 child = await self._session_service.create_session_with_parent(
                     user_id=user_id,
@@ -995,6 +1079,15 @@ class SubagentResearchService:
             # needed. Re-introducing a sandbox lifecycle call here without
             # ``_should_skip_mailbox_lifecycle`` will trip the gate.
             # Quota release + jsonl metric write below remain unchanged.
+            # Drain renew immediately before exact release. Otherwise a late
+            # cadence tick could refresh the field after this run released it.
+            quota_renew_stopped.set()
+            if quota_renew_task is not None:
+                quota_renew_task.cancel()
+                await asyncio.gather(
+                    quota_renew_task,
+                    return_exceptions=True,
+                )
             try:
                 await asyncio.shield(
                     self._quota_service.release(user_id, probe_run_id)

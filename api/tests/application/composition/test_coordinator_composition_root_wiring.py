@@ -316,6 +316,8 @@ class _OrphanClaimRedis:
         quota_renew_result: int = 1,
     ) -> None:
         self.values: dict[str, str] = {}
+        self.pttls: dict[str, int] = {}
+        self.set_calls: list[tuple[str, str, int]] = []
         self.orphan_keys: list[str] = []
         self.deleted: list[str] = []
         self.eval_calls: list[tuple[object, ...]] = []
@@ -325,6 +327,37 @@ class _OrphanClaimRedis:
         self.replace_owner_on_publish_error = replace_owner_on_publish_error
         self.quota_renew_result = quota_renew_result
         self.xadd_calls = 0
+
+    class _ApplyLock:
+        def __init__(self, redis, key: str, timeout: float) -> None:
+            self.redis_state = redis
+            self.key = key
+            self.timeout = timeout
+            self.local_token: str | None = None
+
+        async def owned(self) -> bool:
+            return (
+                self.local_token is not None
+                and self.redis_state.values.get(self.key) == self.local_token
+                and self.redis_state.pttls.get(self.key, -2) > 0
+            )
+
+        async def extend(self, seconds: float, *, replace_ttl: bool) -> bool:
+            assert replace_ttl is True
+            if not await self.owned():
+                return False
+            self.redis_state.pttls[self.key] = int(seconds * 1000)
+            return True
+
+        async def release(self) -> None:
+            if not await self.owned():
+                raise RuntimeError("lock not owned")
+            self.redis_state.values.pop(self.key, None)
+            self.redis_state.pttls.pop(self.key, None)
+
+    def lock(self, key: str, *, blocking: bool, timeout: float):
+        assert blocking is False
+        return self._ApplyLock(self, key, timeout)
 
     async def set(
         self,
@@ -339,6 +372,8 @@ class _OrphanClaimRedis:
         if key in self.values:
             return False
         self.values[key] = str(value)
+        self.pttls[key] = ex * 1000
+        self.set_calls.append((key, str(value), ex))
         if key.startswith("coordinator:orphan-reconcile:"):
             self.orphan_keys.append(key)
         return True
@@ -358,13 +393,78 @@ class _OrphanClaimRedis:
 
     async def delete(self, key: str) -> int:
         self.deleted.append(key)
+        self.pttls.pop(key, None)
         return int(self.values.pop(key, None) is not None)
 
-    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def pttl(self, key: str) -> int:
+        if key not in self.values:
+            return -2
+        return self.pttls.get(key, -1)
+
+    async def eval(self, script: str, numkeys: int, *args: object):
         self.eval_calls.append((script, numkeys, *args))
+        if "coordinator-apply-crash-fence-v1" in script:
+            assert numkeys == 2
+            lock_key, marker_key, token, ttl_ms, minimum_ms = map(str, args)
+            if lock_key in self.values:
+                return [0, 0]
+            if marker_key not in self.values or self.pttls.get(marker_key, -2) < 0:
+                return [0, 0]
+            full_ttl_ms = int(self.values[marker_key])
+            elapsed_ms = full_ttl_ms - self.pttls[marker_key]
+            if elapsed_ms < int(minimum_ms):
+                return [0, elapsed_ms]
+            self.values[lock_key] = token
+            self.pttls[lock_key] = int(ttl_ms)
+            self.values.pop(marker_key, None)
+            self.pttls.pop(marker_key, None)
+            return [1, elapsed_ms]
+        if "coordinator-apply-lock-acquire-reset-marker-v1" in script:
+            assert numkeys == 2
+            lock_key, marker_key, token, ttl_ms = map(str, args)
+            if lock_key in self.values and self.pttls.get(lock_key, -2) > 0:
+                return 0
+            self.values[lock_key] = token
+            self.pttls[lock_key] = int(ttl_ms)
+            self.values.pop(marker_key, None)
+            self.pttls.pop(marker_key, None)
+            return 1
+        if "coordinator-apply-lock-compare-delete-v1" in script:
+            assert numkeys == 1
+            key, token = map(str, args)
+            if self.values.get(key) != token:
+                return 0
+            self.values.pop(key, None)
+            self.pttls.pop(key, None)
+            return 1
         if "ZSCORE" in script and "ZADD" in script:
             assert numkeys == 1
             return self.quota_renew_result
+        if "coordinator-apply-lease-observe-v1" in script:
+            assert numkeys == 2
+            lock_key = str(args[0])
+            marker_key = str(args[1])
+            configured_ttl_ms = int(args[2])
+            token = self.values.get(lock_key)
+            lock_ttl_ms = self.pttls.get(lock_key, -2)
+            if token and lock_ttl_ms > 0:
+                self.values.pop(marker_key, None)
+                self.pttls.pop(marker_key, None)
+                return [1, 0]
+            if marker_key not in self.values or self.pttls.get(marker_key, -2) <= 0:
+                self.values[marker_key] = str(configured_ttl_ms)
+                self.pttls[marker_key] = configured_ttl_ms
+            try:
+                full_ttl_ms = int(self.values[marker_key])
+            except ValueError:
+                return [2, 0]
+            marker_ttl_ms = self.pttls.get(marker_key, -2)
+            if marker_ttl_ms < 0:
+                return [2, 0]
+            return [0, max(0, full_ttl_ms - marker_ttl_ms)]
         assert "coordinator-orphan-owner-compare-delete-v1" in script
         assert numkeys == 1
         if self.cleanup_error is not None:
@@ -381,6 +481,7 @@ def _build_runtime_deps_with_raw_redis(
     raw_redis: object,
     *,
     app_state: SimpleNamespace | None = None,
+    sandbox_lifecycle_service: object | None = None,
 ):
     from app.interfaces.service_dependencies import (
         build_coordinator_runtime_deps,
@@ -404,7 +505,143 @@ def _build_runtime_deps_with_raw_redis(
         return build_coordinator_runtime_deps(
             app_state=app_state or SimpleNamespace(),
             redis_client=fake_redis,
+            sandbox_lifecycle_service=sandbox_lifecycle_service,
         )
+
+
+class _LeaseRenewHandle:
+    def __init__(self) -> None:
+        self.renew_timeout_lease = AsyncMock()
+        self.release = MagicMock()
+
+
+class _LeaseRenewLifecycle:
+    def __init__(self) -> None:
+        self.handles: dict[str, _LeaseRenewHandle] = {}
+        self.acquire_calls: list[str] = []
+
+    async def acquire(self, session_id: str) -> _LeaseRenewHandle:
+        self.acquire_calls.append(session_id)
+        return self.handles.setdefault(session_id, _LeaseRenewHandle())
+
+
+@pytest.mark.anyio
+async def test_ordinary_research_heartbeat_renews_child_and_parent_sandboxes() -> None:
+    lifecycle = _LeaseRenewLifecycle()
+    child_handle = _LeaseRenewHandle()
+    child_handle.renew_timeout_lease.side_effect = RuntimeError("child unavailable")
+    lifecycle.handles["child-ordinary"] = child_handle
+    parent_handle = _LeaseRenewHandle()
+    lifecycle.handles["parent-ordinary"] = parent_handle
+    deps = _build_runtime_deps_with_raw_redis(
+        _OrphanClaimRedis(),
+        sandbox_lifecycle_service=lifecycle,
+    )
+    callback = deps.coordinator_liveness_service._renew_ordinary_sandboxes
+
+    await callback(SimpleNamespace(
+        id="child-ordinary",
+        parent_session_id="parent-ordinary",
+    ))
+
+    assert lifecycle.acquire_calls == ["child-ordinary", "parent-ordinary"]
+    child_handle.release.assert_called_once_with()
+    parent_handle.renew_timeout_lease.assert_awaited_once_with()
+    parent_handle.release.assert_called_once_with()
+
+
+@pytest.mark.anyio
+async def test_rehydrate_atomic_apply_lease_observer_is_production_reachable() -> None:
+    from app.application.services.patch_applier import (
+        coordinator_apply_lock_key,
+        coordinator_apply_reconcile_marker_key,
+    )
+
+    raw_redis = _OrphanClaimRedis()
+    coord_deps = _build_runtime_deps_with_raw_redis(raw_redis)
+    service = coord_deps.rehydrate_service
+    run_id = "run:apply:1"
+    lock_key = coordinator_apply_lock_key(run_id)
+
+    observer = service._apply_lease_observer
+    first_missing = await observer(run_id, marker_ttl_seconds=86_400)
+    assert first_missing.owner_is_live is False
+    assert first_missing.missing_for_seconds == 0
+
+    marker_key = coordinator_apply_reconcile_marker_key(run_id)
+    raw_redis.pttls[marker_key] -= 31_000
+    stale_missing = await observer(run_id, marker_ttl_seconds=86_400)
+    assert stale_missing.owner_is_live is False
+    assert stale_missing.missing_for_seconds == 31
+
+    # A fresh owner atomically invalidates the old missing cycle.
+    raw_redis.values[lock_key] = "owner-token"
+    raw_redis.pttls[lock_key] = 90_000
+    live = await observer(run_id, marker_ttl_seconds=86_400)
+    assert live.owner_is_live is True
+    assert marker_key not in raw_redis.values
+
+    # No-expiry is not a healthy rolling lease; the next missing observation
+    # starts a full new grace instead of reusing the pre-live marker.
+    raw_redis.pttls[lock_key] = -1
+    restarted = await observer(run_id, marker_ttl_seconds=86_400)
+    assert restarted.owner_is_live is False
+    assert restarted.missing_for_seconds == 0
+    assert service._clock().tzinfo is not None
+
+
+@pytest.mark.anyio
+async def test_rehydrate_crash_cas_runs_under_production_apply_fence() -> None:
+    from app.application.services.patch_applier import (
+        coordinator_apply_lock_key,
+        coordinator_apply_reconcile_marker_key,
+    )
+
+    raw_redis = _OrphanClaimRedis()
+    service = _build_runtime_deps_with_raw_redis(raw_redis).rehydrate_service
+    run_id = "run:crash-fence:1"
+    marker_key = coordinator_apply_reconcile_marker_key(run_id)
+    raw_redis.values[marker_key] = "86400000"
+    raw_redis.pttls[marker_key] = 86_300_000
+    owner_seen: list[str | None] = []
+
+    async def cas() -> bool:
+        owner_seen.append(raw_redis.values.get(coordinator_apply_lock_key(run_id)))
+        return True
+
+    result = await service._apply_crash_fence(
+        run_id,
+        cas,
+        minimum_missing_seconds=30,
+    )
+
+    assert result is True
+    assert owner_seen and owner_seen[0]
+    assert coordinator_apply_lock_key(run_id) not in raw_redis.values
+    assert marker_key not in raw_redis.values
+
+
+@pytest.mark.anyio
+async def test_apply_crash_fence_rejects_reset_or_fresh_missing_cycle() -> None:
+    from app.application.services.patch_applier import (
+        coordinator_apply_reconcile_marker_key,
+    )
+
+    raw_redis = _OrphanClaimRedis()
+    service = _build_runtime_deps_with_raw_redis(raw_redis).rehydrate_service
+    operation = AsyncMock(return_value=True)
+
+    assert await service._apply_crash_fence(
+        "run-reset", operation, minimum_missing_seconds=30,
+    ) is None
+
+    marker_key = coordinator_apply_reconcile_marker_key("run-fresh")
+    raw_redis.values[marker_key] = "86400000"
+    raw_redis.pttls[marker_key] = 86_399_000
+    assert await service._apply_crash_fence(
+        "run-fresh", operation, minimum_missing_seconds=30,
+    ) is None
+    operation.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -433,6 +670,31 @@ async def test_parent_lease_renews_auto_degrade_through_shared_supervisor() -> N
     shared_supervisor.renew_auto_degrade_expiry_if_running.assert_awaited_once_with(
         session_id="parent",
     )
+
+
+@pytest.mark.anyio
+async def test_parent_lease_renews_parent_sandbox_cleanup_lease() -> None:
+    lifecycle = _LeaseRenewLifecycle()
+    coord_deps = _build_runtime_deps_with_raw_redis(
+        _OrphanClaimRedis(),
+        sandbox_lifecycle_service=lifecycle,
+    )
+    guard = coord_deps.coordinator_wait_guard_factory(watchdog=MagicMock())
+    handle = guard._parent_lease_factory(
+        root_session_id="root",
+        parent_session_id="parent",
+        coordinator_run_id="run",
+        step_id="step",
+        child_session_ids=("child-1",),
+        owner_alive=lambda: True,
+    )
+
+    await handle._renew_once()
+
+    assert lifecycle.acquire_calls == ["parent"]
+    parent_handle = lifecycle.handles["parent"]
+    parent_handle.renew_timeout_lease.assert_awaited_once_with()
+    parent_handle.release.assert_called_once_with()
 
 
 @pytest.mark.anyio
@@ -510,6 +772,36 @@ async def test_authorized_child_heartbeat_renews_same_run_without_reacquire(
     assert "ZREMRANGEBYSCORE" not in str(quota_calls[0][0])
     if renew_result == 0:
         assert "heartbeat quota lease lost" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_authorized_child_heartbeat_renews_child_sandbox_cleanup_lease() -> None:
+    from app.application.services.coordinator_liveness_lease_service import (
+        CoordinatorChildLease,
+    )
+
+    lifecycle = _LeaseRenewLifecycle()
+    coord_deps = _build_runtime_deps_with_raw_redis(
+        _OrphanClaimRedis(),
+        sandbox_lifecycle_service=lifecycle,
+    )
+    liveness = coord_deps.coordinator_liveness_service
+    lease = CoordinatorChildLease(
+        root_session_id="root",
+        parent_session_id="parent",
+        child_session_id="child-1",
+        coordinator_run_id="run",
+        work_unit_id="wu-1",
+        last_seen_epoch=1.0,
+        phase="in_tool",
+    )
+
+    await liveness._callbacks[0](lease)
+
+    assert lifecycle.acquire_calls == ["child-1"]
+    child_handle = lifecycle.handles["child-1"]
+    child_handle.renew_timeout_lease.assert_awaited_once_with()
+    child_handle.release.assert_called_once_with()
 
 
 @pytest.mark.anyio

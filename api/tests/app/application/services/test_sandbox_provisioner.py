@@ -646,7 +646,7 @@ def minimal_flow():
     """Minimal ``PlannerReActFlow`` for ``_create_execution_watchdog`` unit tests.
 
     Uses ``object.__new__`` (mirrors the ``_make_runner`` fake-self pattern in
-    ``test_runner_watchdog_emit_notification``) and sets only the 3 attributes
+    ``test_runner_watchdog_emit_notification``) and sets only the 4 attributes
     the method touches — it never triggers graph execution."""
     from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -654,6 +654,9 @@ def minimal_flow():
         flow = object.__new__(PlannerReActFlow)
         flow._on_execution_watchdog = on_execution_watchdog
         flow._child_permission_context = child_permission_context
+        # Mirrors ctor default (planner_react.py:421); the merged condition
+        # also suppresses the watchdog for mailbox-liveness-managed subagents.
+        flow._mailbox_liveness_managed = False
         flow._execution_config = SimpleNamespace(
             total_timeout_seconds=600.0, idle_timeout_seconds=120.0
         )

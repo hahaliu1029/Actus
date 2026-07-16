@@ -122,11 +122,12 @@ def skeletal_service_with_captured_runner(monkeypatch):
 
     # --- the capture itself ---
     captured: dict = {}
+    captured_runner = MagicMock()
 
     def _capture(*args, **kwargs):
         del args  # positional args unused
         captured.update(kwargs)
-        return MagicMock()
+        return captured_runner
 
     monkeypatch.setattr(
         "app.application.services.agent_service.AgentTaskRunner",
@@ -134,6 +135,7 @@ def skeletal_service_with_captured_runner(monkeypatch):
     )
 
     svc._captured_runner_kwargs = captured  # type: ignore[attr-defined]
+    svc._captured_runner = captured_runner  # type: ignore[attr-defined]
     return svc
 
 
@@ -217,3 +219,43 @@ async def test_create_task_passes_correct_initial_language(
         f"{expected_language!r} for this session input; "
         f"got {captured.get('initial_language')!r}"
     )
+
+
+async def test_create_task_marks_live_mailbox_child_as_externally_managed(
+    skeletal_service_with_captured_runner,
+) -> None:
+    service = skeletal_service_with_captured_runner
+    service._settings = MagicMock(mailbox_supervisor_enabled=True)
+    service._supervisor_registry = MagicMock()
+    service._mailbox_publisher = MagicMock()
+    session = _make_session(events=[]).model_copy(update={
+        "worker_type": "subagent",
+        "parent_session_id": "parent-1",
+        "root_session_id": "parent-1",
+        "depth": 1,
+        "subagent_control_plane": "mailbox",
+        "tool_filter_preset": "subagent_research",
+    })
+
+    await service._create_task(session)
+
+    service._captured_runner.set_mailbox_liveness_managed.assert_called_once_with()
+
+
+async def test_create_task_keeps_graph_watchdog_without_complete_mailbox_wiring(
+    skeletal_service_with_captured_runner,
+) -> None:
+    service = skeletal_service_with_captured_runner
+    service._settings = MagicMock(mailbox_supervisor_enabled=True)
+    service._supervisor_registry = None
+    service._mailbox_publisher = MagicMock()
+    session = _make_session(events=[]).model_copy(update={
+        "worker_type": "subagent",
+        "parent_session_id": "parent-1",
+        "subagent_control_plane": "mailbox",
+        "tool_filter_preset": "subagent_research",
+    })
+
+    await service._create_task(session)
+
+    service._captured_runner.set_mailbox_liveness_managed.assert_not_called()

@@ -13,14 +13,16 @@ Domain contracts consumed:
 
 Emits:
 - ``HealthEvent`` (via injected ``emit_event`` callable) on rollback_partial
-  and crash_mid_apply (apply audit row stuck in_progress > 5min).
+  and crash_mid_apply (the apply owner lease is continuously absent for the
+  reconciliation grace window).
 """
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +33,10 @@ class AlreadyAppliedInfo:
 
     ``status`` is one of: 'success' (apply completed) | 'rollback_partial'
     (apply failed AND rollback could not restore everything — manual
-    recovery required) | 'crash_mid_apply' (in_progress > 5min — pod crashed
-    mid-apply) | 'in_progress_recent' (in_progress < 5min — another pod
-    holds the Redis lock).
+    recovery required) | 'crash_mid_apply' (owner lease stayed absent for the
+    reconciliation grace — pod crashed mid-apply) | 'in_progress_recent'
+    (owner lease is live, could not be checked safely, or is still within the
+    missing-owner grace window).
     """
     status: str
     audit_id: int
@@ -63,20 +66,55 @@ class RehydrateResult:
     already_applied: Optional[AlreadyAppliedInfo] = None
 
 
-# Threshold for "apply row stuck in_progress" → pod crashed mid-apply.
-# 5min covers worst-case healthy apply duration (multi-file with rollback
-# verify), so longer than this is safely interpreted as a crashed pod.
-_CRASH_MID_APPLY_SECONDS = 300
+@dataclass(frozen=True)
+class ApplyLeaseObservation:
+    """Atomic Redis-time observation of apply ownership and missing age."""
+
+    owner_is_live: bool
+    missing_for_seconds: float
+
+
+_APPLY_RECONCILE_GRACE_SECONDS = 30
+_APPLY_RECONCILE_MARKER_TTL_SECONDS = 86_400
+
+
+class ApplyLeaseObserver(Protocol):
+    """Atomically reconcile the canonical apply lock and missing marker."""
+
+    async def __call__(
+        self,
+        coordinator_run_id: str,
+        *,
+        marker_ttl_seconds: int,
+    ) -> ApplyLeaseObservation: ...
+
+
+class ApplyCrashFence(Protocol):
+    """Run one audit CAS while exclusively owning the canonical apply key.
+
+    ``None`` means the lock was busy or ownership became ambiguous. ``False``
+    is a completed DB CAS miss; ``True`` is a completed DB transition.
+    """
+
+    async def __call__(
+        self,
+        coordinator_run_id: str,
+        operation: Callable[[], Awaitable[bool]],
+        *,
+        minimum_missing_seconds: int,
+    ) -> bool | None: ...
 
 
 class CoordinatorRehydrateService:
     """Read-only crash-recovery scanner. Stateless across invocations.
 
-    Constructor takes the 3 domain repos + 2 optional infrastructure hooks:
+    Constructor takes the 3 domain repos plus infrastructure hooks:
     ``publisher`` (mailbox publisher for unexpected-child CANCEL_REQUEST —
     NOT used in detect_existing_run; held for future API growth) and
     ``emit_event`` (async callable accepting a HealthEvent for the
-    rollback_partial / crash_mid_apply alerts).
+    rollback_partial / crash_mid_apply alerts). Production also injects the
+    atomic apply-lease observer used to distinguish a healthy long-running
+    apply from a crashed owner without relying on pod wall clocks.
     """
 
     def __init__(
@@ -87,12 +125,44 @@ class CoordinatorRehydrateService:
         audit_repository,
         publisher=None,
         emit_event: Optional[Callable[[Any], Awaitable[None]]] = None,
+        apply_lease_observer: Optional[ApplyLeaseObserver] = None,
+        apply_crash_fence: Optional[ApplyCrashFence] = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        apply_reconcile_grace_seconds: int = _APPLY_RECONCILE_GRACE_SECONDS,
+        apply_reconcile_marker_ttl_seconds: int = (
+            _APPLY_RECONCILE_MARKER_TTL_SECONDS
+        ),
     ) -> None:
+        if (
+            isinstance(apply_reconcile_grace_seconds, bool)
+            or not isinstance(apply_reconcile_grace_seconds, int)
+            or apply_reconcile_grace_seconds <= 0
+        ):
+            raise ValueError(
+                "apply_reconcile_grace_seconds must be a positive integer",
+            )
+        if (
+            isinstance(apply_reconcile_marker_ttl_seconds, bool)
+            or not isinstance(apply_reconcile_marker_ttl_seconds, int)
+            or apply_reconcile_marker_ttl_seconds
+            <= apply_reconcile_grace_seconds
+        ):
+            raise ValueError(
+                "apply_reconcile_marker_ttl_seconds must be an integer "
+                "greater than apply_reconcile_grace_seconds",
+            )
         self._sr = session_repository
         self._es = envelope_store
         self._ar = audit_repository
         self._publisher = publisher
         self._emit_event = emit_event
+        self._apply_lease_observer = apply_lease_observer
+        self._apply_crash_fence = apply_crash_fence
+        self._clock = clock
+        self._apply_reconcile_grace_seconds = apply_reconcile_grace_seconds
+        self._apply_reconcile_marker_ttl_seconds = (
+            apply_reconcile_marker_ttl_seconds
+        )
 
     async def detect_existing_run(
         self,
@@ -218,34 +288,224 @@ class CoordinatorRehydrateService:
             return AlreadyAppliedInfo(
                 status="rollback_partial", audit_id=audit.id,
             )
+        if audit.status == "crash_mid_apply":
+            # The first confirmed grace violation is persisted below. A
+            # terminal audit is the monotonic authority after the Redis marker
+            # retention TTL expires, so later scans cannot regress to recent.
+            return AlreadyAppliedInfo(
+                status="crash_mid_apply", audit_id=audit.id,
+            )
         if audit.status == "in_progress":
-            now = datetime.now(timezone.utc)
+            now = self._clock()
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
             started_at = audit.started_at
             # Some ORMs may yield naive datetime; normalize defensively.
             if started_at.tzinfo is None:
                 started_at = started_at.replace(tzinfo=timezone.utc)
             age = (now - started_at).total_seconds()
-            if age > _CRASH_MID_APPLY_SECONDS:
-                await self._emit_health(
-                    code="coordinator_apply_crash_mid_apply",
-                    reason=(
-                        f"audit {audit.id} in_progress for {age:.0f}s on "
-                        f"run {coordinator_run_id}; pod crashed mid-apply; "
-                        f"manual recovery required"
-                    ),
+
+            if self._apply_lease_observer is not None:
+                try:
+                    observation = await self._apply_lease_observer(
+                        coordinator_run_id,
+                        marker_ttl_seconds=(
+                            self._apply_reconcile_marker_ttl_seconds
+                        ),
+                    )
+                except Exception:
+                    # One atomic Redis operation owns both the lease probe and
+                    # marker transition. An ambiguous/failed observation can
+                    # never prove a crash.
+                    logger.exception(
+                        "rehydrate: atomic apply lease observation failed run=%s",
+                        coordinator_run_id,
+                    )
+                    return AlreadyAppliedInfo(
+                        status="in_progress_recent", audit_id=audit.id,
+                    )
+
+                if (
+                    not isinstance(observation, ApplyLeaseObservation)
+                    or not isinstance(observation.owner_is_live, bool)
+                ):
+                    logger.error(
+                        "rehydrate: invalid atomic apply lease observation "
+                        "run=%s value=%r",
+                        coordinator_run_id,
+                        observation,
+                    )
+                    return AlreadyAppliedInfo(
+                        status="in_progress_recent", audit_id=audit.id,
+                    )
+                if observation.owner_is_live:
+                    return AlreadyAppliedInfo(
+                        status="in_progress_recent", audit_id=audit.id,
+                    )
+                missing_age = observation.missing_for_seconds
+                if (
+                    isinstance(missing_age, bool)
+                    or not isinstance(missing_age, (int, float))
+                    or not math.isfinite(float(missing_age))
+                    or missing_age < 0
+                ):
+                    logger.error(
+                        "rehydrate: invalid atomic apply lease observation "
+                        "run=%s value=%r",
+                        coordinator_run_id,
+                        observation,
+                    )
+                    return AlreadyAppliedInfo(
+                        status="in_progress_recent", audit_id=audit.id,
+                    )
+                return await self._classify_missing_apply_owner(
                     coordinator_run_id=coordinator_run_id,
-                    audit_id=audit.id,
+                    audit=audit,
+                    audit_age=age,
+                    missing_age=float(missing_age),
                     emit_event=emit_event,
                 )
-                return AlreadyAppliedInfo(
-                    status="crash_mid_apply", audit_id=audit.id,
-                )
+
+            # Missing composition is never crash evidence. Production tests pin
+            # the observer to the shared canonical apply-lock key.
+            logger.error(
+                "rehydrate: atomic apply lease observer missing run=%s",
+                coordinator_run_id,
+            )
             return AlreadyAppliedInfo(
                 status="in_progress_recent", audit_id=audit.id,
             )
         # Other terminal failure statuses (digest_drift / write_io_error /
         # apply_aborted etc.) → not "already applied" — caller may retry.
         return None
+
+    async def _classify_missing_apply_owner(
+        self,
+        *,
+        coordinator_run_id: str,
+        audit: Any,
+        audit_age: float,
+        missing_age: float,
+        emit_event=None,
+    ) -> Optional[AlreadyAppliedInfo]:
+        if missing_age >= self._apply_reconcile_grace_seconds:
+            if self._apply_crash_fence is None:
+                logger.error(
+                    "rehydrate: apply crash fence missing run=%s",
+                    coordinator_run_id,
+                )
+                return AlreadyAppliedInfo(
+                    status="in_progress_recent", audit_id=audit.id,
+                )
+
+            async def persist_crash_if_still_in_progress() -> bool:
+                latest = await self._ar.find_latest_for_run(
+                    coordinator_run_id,
+                )
+                if (
+                    latest is None
+                    or latest.id != audit.id
+                    or latest.status != "in_progress"
+                ):
+                    return False
+                return await self._ar.update_terminal(
+                    audit.id,
+                    status="crash_mid_apply",
+                    failed_reason=(
+                        "apply owner continuously missing beyond "
+                        "reconciliation grace"
+                    ),
+                )
+
+            try:
+                persisted = await self._apply_crash_fence(
+                    coordinator_run_id,
+                    persist_crash_if_still_in_progress,
+                    minimum_missing_seconds=(
+                        self._apply_reconcile_grace_seconds
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "rehydrate: failed to fence/persist crash_mid_apply run=%s "
+                    "audit=%s",
+                    coordinator_run_id,
+                    audit.id,
+                )
+                return AlreadyAppliedInfo(
+                    status="in_progress_recent", audit_id=audit.id,
+                )
+            if persisted is None:
+                # A rollback/replacement owner won the canonical lock, or the
+                # fence lost ownership. Neither state proves a crash.
+                return AlreadyAppliedInfo(
+                    status="in_progress_recent", audit_id=audit.id,
+                )
+            if not isinstance(persisted, bool):
+                logger.error(
+                    "rehydrate: invalid apply crash fence result run=%s "
+                    "value=%r",
+                    coordinator_run_id,
+                    persisted,
+                )
+                return AlreadyAppliedInfo(
+                    status="in_progress_recent", audit_id=audit.id,
+                )
+            if not persisted:
+                # A concurrent terminal writer won first. Re-read the latest
+                # audit authority; never overwrite or regress that outcome.
+                latest = await self._ar.find_latest_for_run(
+                    coordinator_run_id,
+                )
+                if latest is None:
+                    return AlreadyAppliedInfo(
+                        status="in_progress_recent", audit_id=audit.id,
+                    )
+                if latest.status == "success":
+                    return AlreadyAppliedInfo(
+                        status="success", audit_id=latest.id,
+                    )
+                if latest.status == "crash_mid_apply":
+                    return AlreadyAppliedInfo(
+                        status="crash_mid_apply", audit_id=latest.id,
+                    )
+                if latest.status == "rollback_partial":
+                    await self._emit_health(
+                        code="coordinator_apply_rollback_partial",
+                        reason=(
+                            f"audit {latest.id} rollback_partial on run "
+                            f"{coordinator_run_id}; manual recovery required"
+                        ),
+                        coordinator_run_id=coordinator_run_id,
+                        audit_id=latest.id,
+                        emit_event=emit_event,
+                    )
+                    return AlreadyAppliedInfo(
+                        status="rollback_partial", audit_id=latest.id,
+                    )
+                if latest.status == "in_progress":
+                    return AlreadyAppliedInfo(
+                        status="in_progress_recent", audit_id=latest.id,
+                    )
+                return None
+            await self._emit_health(
+                code="coordinator_apply_crash_mid_apply",
+                reason=(
+                    f"audit {audit.id} in_progress for {audit_age:.0f}s and "
+                    f"apply owner missing for {missing_age:.0f}s on run "
+                    f"{coordinator_run_id}; pod crashed mid-apply; "
+                    f"manual recovery required"
+                ),
+                coordinator_run_id=coordinator_run_id,
+                audit_id=audit.id,
+                emit_event=emit_event,
+            )
+            return AlreadyAppliedInfo(
+                status="crash_mid_apply", audit_id=audit.id,
+            )
+        return AlreadyAppliedInfo(
+            status="in_progress_recent", audit_id=audit.id,
+        )
 
     async def _emit_health(
         self,

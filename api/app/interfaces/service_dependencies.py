@@ -1153,7 +1153,15 @@ def build_coordinator_runtime_deps(
         CoordinatorEnvelopeFactory,
     )
     from app.application.services.coordinator_rehydrate_service import (
+        ApplyLeaseObservation,
         CoordinatorRehydrateService,
+    )
+    from app.application.services.patch_applier import (
+        COORDINATOR_APPLY_LOCK_TTL_SECONDS,
+        bind_coordinator_apply_lock_token,
+        compare_delete_coordinator_apply_lock,
+        coordinator_apply_lock_key,
+        coordinator_apply_reconcile_marker_key,
     )
     from app.application.services.coordinator_parent_execution_lease import (
         CoordinatorParentExecutionLease,
@@ -1313,6 +1321,40 @@ def build_coordinator_runtime_deps(
     # unbound-closure window during composition.
     probe_quota = ProbeQuotaService(redis_client=redis_client)
 
+    async def _renew_sandbox_cleanup_lease(session_id: str) -> None:
+        """Reset one active sandbox cleanup lease without retaining a handle."""
+        if sandbox_lifecycle_service is None:
+            return
+        handle = await sandbox_lifecycle_service.acquire(session_id)
+        try:
+            await handle.renew_timeout_lease()
+        finally:
+            handle.release()
+
+    async def _renew_child_sandbox_from_heartbeat(lease) -> None:  # noqa: ANN001
+        # ``record_heartbeat`` runs callbacks only after the child row and
+        # liveness CAS agree, so the child id here is already authoritative.
+        await _renew_sandbox_cleanup_lease(lease.child_session_id)
+
+    async def _renew_ordinary_research_sandboxes(row) -> None:  # noqa: ANN001
+        # Ordinary research uses process-local mailbox liveness rather than a
+        # coordinator Redis lease, but its child and waiting parent sandboxes
+        # still need rolling cleanup leases during hour-scale work.
+        session_ids = (row.id, row.parent_session_id)
+        for session_id in session_ids:
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            try:
+                await _renew_sandbox_cleanup_lease(session_id)
+            except Exception:
+                # Renew the other sandbox even if one binding disappeared or
+                # its server is transiently unavailable.
+                logger.warning(
+                    "ordinary research sandbox renew skipped session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+
     async def _renew_quota_from_child_heartbeat(lease) -> None:  # noqa: ANN001
         # ``record_heartbeat`` invokes callbacks only after schema validation,
         # DB lineage authorization, and the Redis refresh CAS. Re-read the
@@ -1363,6 +1405,16 @@ def build_coordinator_runtime_deps(
     coordinator_liveness_service = CoordinatorLivenessLeaseService(
         redis=raw_redis,
         session_repository=session_repository_adapter,  # type: ignore[arg-type]
+        renew_child_sandbox=(
+            _renew_child_sandbox_from_heartbeat
+            if sandbox_lifecycle_service is not None
+            else None
+        ),
+        renew_ordinary_sandboxes=(
+            _renew_ordinary_research_sandboxes
+            if sandbox_lifecycle_service is not None
+            else None
+        ),
         renew_quota=_renew_quota_from_child_heartbeat,
     )
 
@@ -1478,11 +1530,249 @@ def build_coordinator_runtime_deps(
     )
 
     # ── 6. CoordinatorRehydrateService — wraps repo + envelope_store + audit. ─
+    # Apply ownership is authoritative for in-progress recovery. One Lua call
+    # atomically observes the canonical lock and updates the run marker. PTTL
+    # is the elapsed-time source, so cross-pod wall-clock skew cannot shorten
+    # or extend the 30s grace. A live owner clears an old missing cycle in the
+    # same atomic operation; Redis errors fail closed in the service.
+    _APPLY_LEASE_OBSERVE_SCRIPT = r"""
+-- coordinator-apply-lease-observe-v1
+local token = redis.call('GET', KEYS[1])
+local lock_ttl_ms = redis.call('PTTL', KEYS[1])
+if token and string.len(token) > 0 and lock_ttl_ms > 0 then
+  redis.call('DEL', KEYS[2])
+  return {1, 0}
+end
+
+local configured_ttl_ms = tonumber(ARGV[1])
+local marker_full_ttl_ms = redis.call('GET', KEYS[2])
+local marker_ttl_ms = redis.call('PTTL', KEYS[2])
+if (not marker_full_ttl_ms) or marker_ttl_ms <= 0 then
+  redis.call('SET', KEYS[2], ARGV[1], 'PX', configured_ttl_ms, 'NX')
+  marker_full_ttl_ms = redis.call('GET', KEYS[2])
+  marker_ttl_ms = redis.call('PTTL', KEYS[2])
+end
+
+local full_ttl_ms = tonumber(marker_full_ttl_ms)
+if (not full_ttl_ms) or marker_ttl_ms < 0 then
+  return {2, 0}
+end
+local elapsed_ms = full_ttl_ms - marker_ttl_ms
+if elapsed_ms < 0 then
+  elapsed_ms = 0
+end
+return {0, elapsed_ms}
+"""
+
+    _APPLY_CRASH_FENCE_SCRIPT = r"""
+-- coordinator-apply-crash-fence-v1
+if redis.call('GET', KEYS[1]) then
+  return {0, 0}
+end
+
+local marker_full_ttl_ms = redis.call('GET', KEYS[2])
+local marker_ttl_ms = redis.call('PTTL', KEYS[2])
+local full_ttl_ms = tonumber(marker_full_ttl_ms)
+if (not marker_full_ttl_ms) or (not full_ttl_ms) or marker_ttl_ms < 0 then
+  return {0, 0}
+end
+local elapsed_ms = full_ttl_ms - marker_ttl_ms
+if elapsed_ms < 0 then
+  return {2, 0}
+end
+if elapsed_ms < tonumber(ARGV[3]) then
+  return {0, elapsed_ms}
+end
+
+local acquired = redis.call(
+  'SET', KEYS[1], ARGV[1], 'NX', 'PX', tonumber(ARGV[2])
+)
+if not acquired then
+  return {0, elapsed_ms}
+end
+redis.call('DEL', KEYS[2])
+return {1, elapsed_ms}
+"""
+
+    class _RedisApplyLeaseObserver:
+        def __init__(self, redis) -> None:  # type: ignore[no-untyped-def]
+            self._redis = redis
+
+        async def __call__(
+            self,
+            coordinator_run_id: str,
+            *,
+            marker_ttl_seconds: int,
+        ) -> ApplyLeaseObservation:
+            result = await self._redis.eval(
+                _APPLY_LEASE_OBSERVE_SCRIPT,
+                2,
+                coordinator_apply_lock_key(coordinator_run_id),
+                coordinator_apply_reconcile_marker_key(coordinator_run_id),
+                marker_ttl_seconds * 1000,
+            )
+            if (
+                not isinstance(result, (list, tuple))
+                or len(result) != 2
+            ):
+                raise RuntimeError(
+                    f"invalid apply lease observation result: {result!r}",
+                )
+            state = int(result[0])
+            elapsed_ms = int(result[1])
+            if state == 2:
+                raise RuntimeError("corrupt apply reconcile marker")
+            if state not in (0, 1) or elapsed_ms < 0:
+                raise RuntimeError(
+                    f"invalid apply lease observation values: {result!r}",
+                )
+            return ApplyLeaseObservation(
+                owner_is_live=state == 1,
+                missing_for_seconds=elapsed_ms / 1000.0,
+            )
+
+    class _RedisApplyCrashFence:
+        """Execute the audit CAS under a rolling canonical apply lease."""
+
+        def __init__(self, redis) -> None:  # type: ignore[no-untyped-def]
+            self._redis = redis
+
+        async def __call__(
+            self,
+            coordinator_run_id: str,
+            operation,
+            *,
+            minimum_missing_seconds: int,
+        ) -> bool | None:
+            lock_key = coordinator_apply_lock_key(coordinator_run_id)
+            marker_key = coordinator_apply_reconcile_marker_key(
+                coordinator_run_id,
+            )
+            lock = self._redis.lock(
+                lock_key,
+                blocking=False,
+                timeout=COORDINATOR_APPLY_LOCK_TTL_SECONDS,
+            )
+            token = uuid.uuid4().hex
+            try:
+                result = await self._redis.eval(
+                    _APPLY_CRASH_FENCE_SCRIPT,
+                    2,
+                    lock_key,
+                    marker_key,
+                    token,
+                    str(int(COORDINATOR_APPLY_LOCK_TTL_SECONDS * 1_000)),
+                    str(minimum_missing_seconds * 1_000),
+                )
+            except BaseException:
+                # The response may be lost after SET. Exact-token cleanup is
+                # safe and leaves a bounded TTL if Redis is also unavailable.
+                try:
+                    await compare_delete_coordinator_apply_lock(
+                        self._redis,
+                        lock_key,
+                        token,
+                    )
+                except BaseException:
+                    logger.exception(
+                        "ambiguous apply crash fence cleanup failed run=%s",
+                        coordinator_run_id,
+                    )
+                raise
+            if (
+                not isinstance(result, (list, tuple))
+                or len(result) != 2
+            ):
+                raise RuntimeError(
+                    f"invalid apply crash fence result: {result!r}",
+                )
+            state = int(result[0])
+            if state == 2:
+                raise RuntimeError("corrupt apply reconcile marker age")
+            if state == 0:
+                return None
+            if state != 1:
+                raise RuntimeError(
+                    f"invalid apply crash fence state: {result!r}",
+                )
+            try:
+                bind_coordinator_apply_lock_token(lock, token)
+            except BaseException:
+                try:
+                    await compare_delete_coordinator_apply_lock(
+                        self._redis,
+                        lock_key,
+                        token,
+                    )
+                except BaseException:
+                    logger.exception(
+                        "apply crash fence token-bind cleanup failed run=%s",
+                        coordinator_run_id,
+                    )
+                raise
+
+            lost = asyncio.Event()
+
+            async def renew() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(
+                            COORDINATOR_APPLY_LOCK_TTL_SECONDS / 3.0,
+                        )
+                        if not await lock.owned():
+                            lost.set()
+                            return
+                        if not await lock.extend(
+                            COORDINATOR_APPLY_LOCK_TTL_SECONDS,
+                            replace_ttl=True,
+                        ):
+                            lost.set()
+                            return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    lost.set()
+                    logger.exception(
+                        "apply crash fence renew failed run=%s",
+                        coordinator_run_id,
+                    )
+
+            renew_task = asyncio.create_task(
+                renew(),
+                name=f"apply-crash-fence-renew:{coordinator_run_id}",
+            )
+            try:
+                if not await lock.owned():
+                    return None
+                result = await operation()
+                if lost.is_set() or not await lock.owned():
+                    return None
+                return result
+            finally:
+                renew_task.cancel()
+                try:
+                    await renew_task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    if await lock.owned():
+                        await lock.release()
+                except Exception:
+                    logger.exception(
+                        "apply crash fence release failed run=%s",
+                        coordinator_run_id,
+                    )
+
+    from datetime import datetime, timezone
+
     rehydrate_service = CoordinatorRehydrateService(
         session_repository=session_repository_adapter,
         envelope_store=coordinator_envelope_store,
         audit_repository=coordinator_apply_audit_repo,
         publisher=mailbox_publisher,
+        apply_lease_observer=_RedisApplyLeaseObserver(raw_redis),
+        apply_crash_fence=_RedisApplyCrashFence(raw_redis),
+        clock=lambda: datetime.now(timezone.utc),
     )
 
     # ── 7. CoordinatorRunOrchestrator factory — per-run wrapper around the
@@ -1758,6 +2048,9 @@ def build_coordinator_runtime_deps(
                     session_id=context.parent_session_id,
                 )
 
+        async def _renew_parent_sandbox(context) -> None:  # noqa: ANN001
+            await _renew_sandbox_cleanup_lease(context.parent_session_id)
+
         async def _renew_quota(context) -> None:  # noqa: ANN001
             if context.user_id is None:
                 logger.warning(
@@ -1826,6 +2119,11 @@ def build_coordinator_runtime_deps(
             liveness_service=coordinator_liveness_service,
             touch_parent_activity=_touch_parent_activity,
             renew_auto_degrade=_renew_auto_degrade,
+            renew_parent_sandbox=(
+                _renew_parent_sandbox
+                if sandbox_lifecycle_service is not None
+                else None
+            ),
             renew_quota=_renew_quota,
             on_all_children_stale=_reconcile_all_children_stale,
             **kwargs,
