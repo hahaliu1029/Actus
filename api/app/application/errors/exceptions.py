@@ -47,6 +47,24 @@ class ConflictError(AppException):
         super().__init__(code=409, status_code=409, msg=msg)
 
 
+class SandboxDisabledError(AppException):
+    """SPM PR-3 Task 28 — ``sandbox_provision_mode == "off"`` 下访问需要沙箱平面的
+    端点（file/download/shell/takeover-start/reopen/retry-from-suspend/skills-create）。
+
+    off 部署没有沙箱面（INV-SPM-3 zero-touch），这些操作无法服务。合同（spec §5.6
+    / §5.2c-8，r27/codex R27 冻结）：``code=409, status_code=409,
+    msg="SANDBOX_DISABLED"``——``AppException.code`` 与统一 ``Response.code`` 协议
+    都是 ``int``（字符串 code 会在异常处理器构造响应模型时炸），所以稳定机读哨兵放
+    ``msg`` 字段。FE/测试判定 = HTTP 409 且 ``msg == "SANDBOX_DISABLED"``。
+
+    WS（vnc / takeover-shell）不走本异常：它们在 accept 后发自有 payload
+    ``{"type":"status","code":"SANDBOX_DISABLED"}`` 再 ``close(code=4409)``。
+    """
+
+    def __init__(self, msg: str = "SANDBOX_DISABLED"):
+        super().__init__(code=409, status_code=409, msg=msg)
+
+
 class ValidationError(AppException):
     """数据验证错误异常"""
 

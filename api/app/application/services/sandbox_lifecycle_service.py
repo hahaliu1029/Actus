@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 from datetime import UTC, datetime, timedelta
-from typing import Callable, Optional, Type, cast
+from typing import Any, Callable, Optional, Type, cast
 
 from app.domain.errors.sandbox_lifecycle import (
     SandboxAlreadyDestroyed,
@@ -1189,14 +1189,27 @@ class SandboxLifecycleService:
             # Cleanup lock (eng review decision #3)
             self._pop_lock_for(session_id)
 
-    async def reconcile_orphans(self) -> None:
+    async def reconcile_orphans(self, *, docker_dependent_enabled: bool = True) -> None:
         """App startup reconciliation (I11).
 
         1. Scan DESTROYING: container dead → DESTROYED; alive → continue destroy
         2. PR1 default: lazy rehydrate (first acquire triggers). Proactive
            ACTIVE/SUSPENDED scan deferred to PR2.
+
+        SPM PR-3 Task 28 (spec §5.2c-5 / INV-SPM-3): ``docker_dependent_enabled``
+        gates the Docker-dependent stages. Under ``off`` startup (main.py passes
+        ``False``) the **DESTROYING probe/drain/destroy loop** and the
+        **label-sweep** are skipped (no Docker socket) with one log line —
+        DESTROYING bindings are left intact for the pre-switch runbook / TTL to
+        drain. The **non-Docker** stages still run regardless: the
+        CREATING→UNBOUND DB repair AND the mailbox supervisor / PEL recovery
+        (R24-CLASS3 — PEL drain is Redis, not Docker).
         """
-        logger.info("Starting sandbox lifecycle reconcile_orphans scan")
+        logger.info(
+            "Starting sandbox lifecycle reconcile_orphans scan "
+            "(docker_dependent_enabled=%s)",
+            docker_dependent_enabled,
+        )
 
         try:
             async with self._uow_factory() as uow:
@@ -1213,7 +1226,20 @@ class SandboxLifecycleService:
             if s.sandbox_binding.state == DESTROYING
         ]
 
-        for session in destroying_sessions:
+        # SPM PR-3 Task 28: the DESTROYING probe/drain/destroy loop and the
+        # label-sweep below both touch the Docker socket. Under off startup they
+        # are skipped with one log line (bindings kept intact for the runbook /
+        # TTL). The CREATING→UNBOUND repair + mailbox/PEL recovery further down
+        # are non-Docker and run regardless.
+        if not docker_dependent_enabled:
+            logger.info(
+                "reconcile_orphans: docker_dependent_enabled=False (off mode) — "
+                "skipping %d DESTROYING probe/drain/destroy + label-sweep "
+                "(Docker-dependent); CREATING→UNBOUND repair + mailbox/PEL "
+                "recovery still run",
+                len(destroying_sessions),
+            )
+        for session in (destroying_sessions if docker_dependent_enabled else []):
             binding = session.sandbox_binding
             session_id = session.id
 
@@ -1351,9 +1377,11 @@ class SandboxLifecycleService:
         # AFTER the CREATING→UNBOUND repair (binding repair first) and BEFORE the
         # mailbox PEL recovery below (which it must NOT perturb). It is fully
         # fail-safe internally, so it can never abort the reconcile pass.
-        # (PR-3 / Task 28 will add the off-mode gate; here it runs
-        # unconditionally.)
-        await self._sweep_orphan_containers()
+        # SPM PR-3 Task 28: it enumerates + `docker rm`s containers by label, so
+        # it is Docker-dependent → skipped under off startup (the DESTROYING loop
+        # above already skipped; one consolidated log line covers both).
+        if docker_dependent_enabled:
+            await self._sweep_orphan_containers()
 
         # C3 PR-3c (plan §11.3) — mailbox supervisor recovery after pod restart.
         # When a pod dies, every per-pod ``MailboxSupervisor`` task dies with it.
@@ -1452,6 +1480,40 @@ class SandboxLifecycleService:
                             "reconcile_orphans: ensured mailbox supervisor for root %s",
                             root_id,
                         )
+
+    async def account_lingering_after_off(self, metrics: Any) -> int:
+        """SPM PR-3 Task 28 (spec §5.9, r9/codex R8-G3): off-startup residual
+        sandbox accounting.
+
+        Counts DB bindings that STILL hold a live-ish sandbox after switching to
+        off — the predicate is ``sandbox_id IS NOT NULL AND state ∈ {ACTIVE,
+        SUSPENDED, DESTROYING}`` (NOT the loose "non-terminal": the default
+        ``UNBOUND`` / ``id=None`` binding every session carries would all
+        false-count). Writes the count to the provision-metrics singleton via the
+        REAL ``record_lingering_after_off`` (the G3 anti-fake guard — a snapshot
+        assertion proves the production metric is wired, not a stub field).
+
+        Returns ``N`` for the caller's log line. Best-effort: a query failure
+        logs + returns 0 (metrics never mask a boot; nothing is recorded).
+        """
+        try:
+            async with self._uow_factory() as uow:
+                all_sessions = await uow.session.get_all()
+        except Exception:
+            logger.exception(
+                "account_lingering_after_off: session query failed; "
+                "skipping off-startup lingering accounting"
+            )
+            return 0
+
+        lingering = sum(
+            1
+            for s in all_sessions
+            if s.sandbox_binding.id is not None
+            and s.sandbox_binding.state in (ACTIVE, SUSPENDED, DESTROYING)
+        )
+        metrics.record_lingering_after_off(count=lingering)
+        return lingering
 
     # ── Internal helpers ──
 

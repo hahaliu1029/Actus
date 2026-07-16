@@ -613,6 +613,89 @@ async def test_supervisor_dispatches_terminal_envelope_to_real_handler(
     assert pending["pending"] == 0
 
 
+class _OffFacadeLifecycle:
+    """SPM PR-3 Task 25 — replicates the ``main.py`` ``_DeferredLifecycle.destroy``
+    off no-op: when ``sandbox_provision_mode == 'off'`` it RETURNS NORMALLY without
+    delegating to the underlying lifecycle service. This is the single injection
+    point that makes the supervisor's four destroy sites off no-ops while the
+    handler continues to clear_child_tracking / callback / mark_processed / XACK.
+    A raise (rather than a clean return) here would retain the PEL — the test below
+    asserts the positive side effects survive to prove the no-op only skips the
+    lifecycle mutation, not the whole envelope-processing body.
+    """
+
+    def __init__(self, underlying) -> None:
+        self._underlying = underlying
+
+    async def destroy(self, session_id, reason) -> None:
+        from core.config import get_settings
+
+        if get_settings().sandbox_provision_mode == "off":
+            return
+        await self._underlying.destroy(session_id, reason)
+
+
+@pytest.mark.anyio
+async def test_off_legacy_mailbox_PEL_zero_lifecycle(
+    fake_redis, audit_repo, stub_lifecycle, stub_agent_callback, monkeypatch
+):
+    """off legacy-PEL drain: a RESULT_READY envelope referencing an always→off
+    migrated child (ACTIVE binding leftover) drives ZERO lifecycle destroy, yet
+    the handler still XACKs + writes processed_at + fires the terminal callback +
+    clears child tracking. Asserting the positive side effects (not just zero
+    lifecycle) guards against a handler that erroneously early-returns."""
+    from core.config import Settings, get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "sandbox_provision_mode", "off", raising=False)
+    monkeypatch.setattr(
+        Settings,
+        "SANDBOX_PROVISION_MODE_ALLOWED",
+        {"always", "on_demand", "off"},
+        raising=False,
+    )
+
+    ctx = SupervisorContext(
+        root_session_id="root-1",
+        pod_id="pod-a",
+        instance_id="i1",
+        redis=fake_redis,
+        audit_repo=audit_repo,
+        publisher=RedisMailboxPublisher(fake_redis),
+        sandbox_lifecycle=_OffFacadeLifecycle(stub_lifecycle),
+        agent_service_callback=stub_agent_callback,
+        telemetry=_StubTelemetry(),
+    )
+    sup = MailboxSupervisor(ctx, block_ms=0, idle_poll_sleep_s=0.01)
+    # Seed child tracking so the terminal handler's clear_child_tracking is
+    # observable (a no-op destroy that early-returned would leave this set).
+    sup._last_seen_mono["child-1"] = 1.0  # noqa: SLF001
+
+    eid = "01HSPYU0R00000000000000000"
+    task = asyncio.create_task(sup.run())
+    await asyncio.sleep(0.05)
+    pub = RedisMailboxPublisher(fake_redis)
+    await pub.publish(_env(t=MailboxEnvelopeType.RESULT_READY, eid=eid))
+    await asyncio.sleep(0.5)
+    await sup.stop()
+    await task
+
+    # zero lifecycle — the off facade skipped delegation to the real service.
+    assert stub_lifecycle.destroy_calls == []
+    # positive side effects PRESERVED:
+    #   terminal callback fired
+    assert any(e.envelope_id == eid for e in stub_agent_callback.received)
+    #   processed_at written (mark_processed)
+    assert audit_repo.rows[("root-1", eid)]["processed_at"] is not None
+    #   XACK happened → PEL drained
+    pending = await fake_redis.xpending(
+        "actus:child:root-1:mailbox", "actus:mailbox-supervisor:v1"
+    )
+    assert pending["pending"] == 0
+    #   child tracking cleared (clear_child_tracking removed the seeded entry)
+    assert sup.get_last_seen("child-1") is None
+
+
 def _make_dummy_ctx():
     """Build a minimal SupervisorContext for sync validation tests.
 

@@ -182,8 +182,17 @@ def _multimodal_block_from_dict(block: dict[str, Any]):
 # --------------------------------------------------------------------------- #
 
 
-def _make_message_tools() -> list[StructuredTool]:
-    """Create message tools (no external dependency needed)."""
+def _make_message_tools(*, sandbox_tools_enabled: bool = True) -> list[StructuredTool]:
+    """Create message tools (no external dependency needed).
+
+    ``sandbox_tools_enabled``（SPM Task 24，冻结签名 R28-META3）：message 工具本身
+    在 off 档仍绑定（非沙箱工具），但 ``message_ask_user`` 的 ``suggest_user_takeover``
+    enum 随此 flag 收缩——``True``（默认，always / on_demand）保留
+    ``Literal["none","shell","browser"]``（现状，逐字节不变）；``False``（off）收缩为
+    ``Literal["none"]``（无 sandbox 可接管 shell/browser，泄漏该接管面无意义）。
+    两条终装配链按 ``get_settings().sandbox_provision_mode != "off"`` 求值后透传
+    （与 ``apply_sandbox_capability_gate`` 的 ``sandbox_tools_enabled`` 同源布尔）。
+    """
 
     @lc_tool(response_format="content_and_artifact")
     async def message_notify_user(text: str) -> tuple[str, ToolOutcome]:
@@ -191,23 +200,45 @@ def _make_message_tools() -> list[StructuredTool]:
         outcome = AllowSuccess(content="Continue")
         return outcome.content, outcome
 
-    @lc_tool(response_format="content_and_artifact")
-    async def message_ask_user(
-        text: str,
-        attachments: Optional[Union[str, List[str]]] = None,
-        suggest_user_takeover: Optional[Literal["none", "shell", "browser"]] = None,
-    ) -> tuple[str, ToolOutcome]:
-        """Ask the user a question and wait for their reply. Use for clarification, confirmation, or requesting input.
+    if sandbox_tools_enabled:
 
-        NOTE: The system may return SOFT_HINT if it determines the agent should
-        try to solve autonomously first. Only call again if user input is truly
-        required.
-        """
-        del attachments, suggest_user_takeover
-        # Actual SOFT_HINT / interrupt logic is handled by react_graph's tool_node.
-        # This is the fallback return value.
-        outcome = AllowSuccess(content="WAITING_FOR_USER")
-        return outcome.content, outcome
+        @lc_tool(response_format="content_and_artifact")
+        async def message_ask_user(
+            text: str,
+            attachments: Optional[Union[str, List[str]]] = None,
+            suggest_user_takeover: Optional[Literal["none", "shell", "browser"]] = None,
+        ) -> tuple[str, ToolOutcome]:
+            """Ask the user a question and wait for their reply. Use for clarification, confirmation, or requesting input.
+
+            NOTE: The system may return SOFT_HINT if it determines the agent should
+            try to solve autonomously first. Only call again if user input is truly
+            required.
+            """
+            del attachments, suggest_user_takeover
+            # Actual SOFT_HINT / interrupt logic is handled by react_graph's tool_node.
+            # This is the fallback return value.
+            outcome = AllowSuccess(content="WAITING_FOR_USER")
+            return outcome.content, outcome
+
+    else:
+
+        @lc_tool(response_format="content_and_artifact")
+        async def message_ask_user(
+            text: str,
+            attachments: Optional[Union[str, List[str]]] = None,
+            suggest_user_takeover: Optional[Literal["none"]] = None,
+        ) -> tuple[str, ToolOutcome]:
+            """Ask the user a question and wait for their reply. Use for clarification, confirmation, or requesting input.
+
+            NOTE: The system may return SOFT_HINT if it determines the agent should
+            try to solve autonomously first. Only call again if user input is truly
+            required.
+            """
+            del attachments, suggest_user_takeover
+            # Actual SOFT_HINT / interrupt logic is handled by react_graph's tool_node.
+            # This is the fallback return value.
+            outcome = AllowSuccess(content="WAITING_FOR_USER")
+            return outcome.content, outcome
 
     tools = [message_notify_user, message_ask_user]
     for t in tools:
@@ -1001,6 +1032,81 @@ def _make_file_view_tools(
 # --------------------------------------------------------------------------- #
 
 
+# SPM Task 24 — off-mode tool-face contraction gate.
+#
+# 实名冻结：由 Step-1 一次性枚举脚本对真实工厂（_make_file_tools /
+# _make_shell_tools / _make_browser_tools / _make_file_view_tools）产出的 tool.name
+# 采集，再并入三个 skill-creation 名（generate_skill / install_skill /
+# brainstorm_skill，来自 create_skill_langchain_tools）。**literal 写死，不动态计算**
+# ——gate 的意义是防漂移：工厂新增沙箱工具而不更新此集，test_face_set_matches_factories
+# 立刻转红，强制人工 review。
+SANDBOX_FACE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        # file (_make_file_tools)
+        "file_read",
+        "file_write",
+        "file_str_replace",
+        "file_find_in_content",
+        "file_find_by_name",
+        "file_list",
+        # file_view (_make_file_view_tools)
+        "file_view",
+        # shell (_make_shell_tools)
+        "shell_execute",
+        "shell_read_output",
+        "shell_wait_process",
+        "shell_write_input",
+        "shell_kill_process",
+        # browser (_make_browser_tools)
+        "browser_view",
+        "browser_navigate",
+        "browser_click",
+        "browser_input",
+        "browser_move_mouse",
+        "browser_press_key",
+        "browser_select_option",
+        "browser_scroll_up",
+        "browser_scroll_down",
+        "browser_console_exec",
+        "browser_console_view",
+        "browser_restart",
+        # skill creation (create_skill_langchain_tools)
+        "generate_skill",
+        "install_skill",
+        "brainstorm_skill",
+    }
+)
+
+
+def apply_sandbox_capability_gate(
+    tools: list[BaseTool], *, sandbox_tools_enabled: bool
+) -> list[BaseTool]:
+    """终装配工具面收缩闸（SPM Task 24）。
+
+    ``sandbox_tools_enabled=True``（always / on_demand）→ identity：返回**同一个
+    list 对象**（byte-zero，调用方 ``is`` 可断言）。``False``（off）→ 移除
+    ``SANDBOX_FACE_TOOL_NAMES`` 中的全部工具（file / file_view / shell / browser
+    四族 + generate_skill / install_skill / brainstorm_skill）。
+
+    闭包断言：gate 必须是两条终装配链（runner ``_build_lc_tools_full`` / flow
+    ``_collect_all_tools``）的**最后一步**——之后再 ``extend`` 会破坏
+    ``bound == before - SANDBOX_FACE_TOOL_NAMES`` 使 structure/单测现形。该 gate 跑在
+    **生产装配路径**上，故用显式 ``raise AssertionError``（``python -O`` 会 strip 掉
+    ``assert`` 语句，与 epic 的 -O-safe 约定一致）。
+    """
+    if sandbox_tools_enabled:
+        return tools
+    before = {t.name for t in tools}
+    filtered = [t for t in tools if t.name not in SANDBOX_FACE_TOOL_NAMES]
+    bound = {t.name for t in filtered}
+    expected = before - SANDBOX_FACE_TOOL_NAMES
+    if bound != expected:
+        raise AssertionError(
+            f"OFF tool closure violated: {bound ^ expected}"
+        )
+    return filtered
+
+
 def create_native_tools(
     sandbox_accessor: SandboxAccessor | None,
     browser_accessor: BrowserAccessor | None,
@@ -1039,7 +1145,9 @@ def create_native_tools(
     Returns a flat list of tools ready to be bound to an LLM or added to a ToolNode.
     """
     tools: list[StructuredTool] = []
-    tools.extend(_make_message_tools())
+    # SPM Task 24: message tools stay bound in off, but their takeover enum
+    # contracts with the same boolean (True → full enum, byte-identical).
+    tools.extend(_make_message_tools(sandbox_tools_enabled=include_sandbox_tools))
     if include_sandbox_tools:
         assert sandbox_accessor is not None, (
             "create_native_tools(include_sandbox_tools=True) requires a sandbox_accessor"

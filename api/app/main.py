@@ -328,6 +328,81 @@ def check_sandbox_off_flag_exclusion(settings) -> None:
         )
 
 
+async def _run_terminal_sandbox_reaper_if_enabled(
+    app: FastAPI,
+    postgres_client,
+    *,
+    docker_dependent_enabled: bool,
+) -> None:
+    """SPM PR-3 Task 28 — C2 leaked-sandbox startup reaper, off-gated.
+
+    The reaper destroys leaked per-child sandbox containers via
+    ``lifecycle_service.destroy()`` → ``docker rm`` (see
+    ``sandbox_terminal_reaper.py``). It is Docker-dependent, so under off startup
+    it is skipped entirely with one log line — off has no sandbox plane, and the
+    C2b child-row reaper (a pure-DB ``ssm.terminate`` sweep, NOT gated) already
+    handles the DB-side zombie-RUNNING backstop. Extracted from the lifespan body
+    so the off gate is unit-testable (reaper-not-scheduled spy).
+
+    Best-effort: a query/DI failure logs + is swallowed so it never aborts
+    lifespan startup (leaked sandboxes are re-scanned next boot — NG8).
+    """
+    if not docker_dependent_enabled:
+        logger.info(
+            "sandbox_reaper: skipped (sandbox_provision_mode=off — "
+            "Docker-dependent leaked-sandbox startup sweep)"
+        )
+        return
+    try:
+        from app.application.services.sandbox_terminal_reaper import (
+            sweep_terminal_coordinator_active_sandboxes,
+        )
+        from app.infrastructure.repositories.db_session_repository import (
+            DBSessionRepository,
+        )
+
+        sandbox_reaper_svc = getattr(
+            app.state, "sandbox_lifecycle_service", None
+        )
+        if sandbox_reaper_svc is None:
+            logger.info(
+                "sandbox_reaper: lifecycle service unavailable — skipping sweep"
+            )
+        else:
+            async with postgres_client.session_factory() as db_session:
+                repo = DBSessionRepository(db_session=db_session)
+                # Total budget for the sweep. NOTE: this wait_for only bounds
+                # the async-cancellable portion — DockerSandbox.get()/destroy()
+                # still make SYNCHRONOUS Docker SDK calls on the event loop
+                # (docker_sandbox.py: containers.get/reload/remove), so a fully
+                # hung Docker daemon can still block startup past this budget.
+                # That is a PRE-EXISTING systemic exposure shared with
+                # reconcile_orphans() above (which awaits the same Docker path
+                # with no bound at all); the complete fix (async-safe
+                # DockerSandbox via asyncio.to_thread + per-call client timeout)
+                # is a deferred follow-up. On a cancellable timeout the outer
+                # best-effort except logs + swallows; leaked sandboxes are
+                # re-scanned next boot (restart-bounded — NG8).
+                stats = await asyncio.wait_for(
+                    sweep_terminal_coordinator_active_sandboxes(
+                        session_repo=repo,
+                        lifecycle_service=sandbox_reaper_svc,
+                    ),
+                    timeout=30.0,
+                )
+                if stats.destroyed or stats.errored:
+                    logger.warning(
+                        "sandbox_reaper: scanned=%d destroyed=%d "
+                        "already_gone=%d errored=%d",
+                        stats.scanned,
+                        stats.destroyed,
+                        stats.already_gone,
+                        stats.errored,
+                    )
+    except Exception as e:
+        logger.warning("sandbox_reaper: sweep failed (swallowed): %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """创建FastAPI应用生命周期上下文管理器"""
@@ -601,6 +676,15 @@ async def lifespan(app: FastAPI):
 
         class _DeferredLifecycle:
             async def destroy(self, session_id: str, reason) -> None:
+                # SPM PR-3 Task 25 (CLASS-3): single injection point for the
+                # MailboxSupervisor's four destroy sites. Under off there is no
+                # sandbox plane / Docker socket, so destroy is a no-op that RETURNS
+                # NORMALLY — the supervisor handler then continues to
+                # clear_child_tracking / callback / mark_processed / XACK (a raise
+                # here would retain the PEL). INV-SPM-3 zero-touch: an always→off
+                # migrated historical binding is never destroyed/rewritten.
+                if get_settings().sandbox_provision_mode == "off":
+                    return
                 svc = _pending_lifecycle_ref.get("svc")
                 if svc is None:
                     logger.warning(
@@ -819,8 +903,29 @@ async def lifespan(app: FastAPI):
         )
 
         # 9. Reconcile orphans BEFORE confirmation sweep (eng review #12)
-        await sandbox_lifecycle_service.reconcile_orphans()
+        # SPM PR-3 Task 28: under off startup the Docker-dependent stages
+        # (DESTROYING probe/drain/destroy + label-sweep) are skipped; the
+        # non-Docker CREATING→UNBOUND repair + mailbox/PEL recovery still run.
+        _spm_mode = settings.sandbox_provision_mode
+        await sandbox_lifecycle_service.reconcile_orphans(
+            docker_dependent_enabled=(_spm_mode != "off"),
+        )
         logger.info("Sandbox orphan reconciliation 完成")
+
+        # SPM PR-3 Task 28 (spec §5.9): off-startup residual-sandbox accounting.
+        # Records the count of still-bound sandboxes (sandbox_id NOT NULL AND
+        # state ∈ {ACTIVE,SUSPENDED,DESTROYING}) into the provision-metrics
+        # singleton so ops can see always→off migration leftovers awaiting the
+        # pre-switch runbook / TTL drain. off-only; no-op cost on always/on_demand.
+        if _spm_mode == "off":
+            _lingering = await sandbox_lifecycle_service.account_lingering_after_off(
+                app.state.sandbox_provision_metrics
+            )
+            logger.info(
+                "off startup: %d lingering sandbox binding(s) recorded "
+                "(awaiting runbook/TTL drain)",
+                _lingering,
+            )
 
         # 9b. B9 运行时扩展统计（Task 19）——**必须在 _build_agent_service 之前**：
         # recorder 单例先就绪，才能进 AgentService → AgentTaskRunner 的热路径组装链
@@ -1017,56 +1122,14 @@ async def lifespan(app: FastAPI):
         # container is left ACTIVE with no reaper (F0.6/F0.7). This match-only
         # startup sweep destroys those leaked containers idempotently
         # (restart-bounded — NG8). Mirrors the C2b child-row reaper above.
-        # OUTER best-effort try: a query/DI failure logs + is swallowed so it
-        # never aborts lifespan startup.
-        try:
-            from app.application.services.sandbox_terminal_reaper import (
-                sweep_terminal_coordinator_active_sandboxes,
-            )
-            from app.infrastructure.repositories.db_session_repository import (
-                DBSessionRepository,
-            )
-
-            sandbox_reaper_svc = getattr(
-                app.state, "sandbox_lifecycle_service", None
-            )
-            if sandbox_reaper_svc is None:
-                logger.info(
-                    "sandbox_reaper: lifecycle service unavailable — skipping sweep"
-                )
-            else:
-                async with postgres_client.session_factory() as db_session:
-                    repo = DBSessionRepository(db_session=db_session)
-                    # Total budget for the sweep. NOTE: this wait_for only bounds
-                    # the async-cancellable portion — DockerSandbox.get()/destroy()
-                    # still make SYNCHRONOUS Docker SDK calls on the event loop
-                    # (docker_sandbox.py: containers.get/reload/remove), so a fully
-                    # hung Docker daemon can still block startup past this budget.
-                    # That is a PRE-EXISTING systemic exposure shared with
-                    # reconcile_orphans() above (which awaits the same Docker path
-                    # with no bound at all); the complete fix (async-safe
-                    # DockerSandbox via asyncio.to_thread + per-call client timeout)
-                    # is a deferred follow-up. On a cancellable timeout the outer
-                    # best-effort except logs + swallows; leaked sandboxes are
-                    # re-scanned next boot (restart-bounded — NG8).
-                    stats = await asyncio.wait_for(
-                        sweep_terminal_coordinator_active_sandboxes(
-                            session_repo=repo,
-                            lifecycle_service=sandbox_reaper_svc,
-                        ),
-                        timeout=30.0,
-                    )
-                    if stats.destroyed or stats.errored:
-                        logger.warning(
-                            "sandbox_reaper: scanned=%d destroyed=%d "
-                            "already_gone=%d errored=%d",
-                            stats.scanned,
-                            stats.destroyed,
-                            stats.already_gone,
-                            stats.errored,
-                        )
-        except Exception as e:
-            logger.warning("sandbox_reaper: sweep failed (swallowed): %s", e)
+        # SPM PR-3 Task 28: Docker-dependent (destroy → docker rm) → the helper
+        # skips the whole sweep under off startup (the DB-only C2b child-row
+        # reaper above stays ungated). Extracted for off-gate unit testability.
+        await _run_terminal_sandbox_reaper_if_enabled(
+            app,
+            postgres_client,
+            docker_dependent_enabled=(_spm_mode != "off"),
+        )
 
         # R3: Background scan for existing skills missing scan_report
         # Must start BEFORE yield (startup phase). After yield is shutdown.

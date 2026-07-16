@@ -29,6 +29,7 @@ async def run_background_summary(
     lang: str = "zh",
     *,
     callbacks: list[Any] | None = None,
+    sandbox_tools_enabled: bool = True,
 ) -> str | None:
     """Generate a user-visible streaming summary, independent of the graph.
 
@@ -48,7 +49,12 @@ async def run_background_summary(
     """
     from app.domain.services.prompts import get_prompt_bundle
 
-    bundle = get_prompt_bundle(lang)
+    # SPM Task 27: the off-variant flag is threaded from the caller
+    # (``AgentTaskRunner`` — the canonical ``_sandbox_provision_off`` single
+    # source) rather than re-read from settings here, keeping this graph-external
+    # helper free of a duplicate settings read. Default True → on-variant
+    # (byte-identity for any caller that omits the flag).
+    bundle = get_prompt_bundle(lang, sandbox_tools_enabled=sandbox_tools_enabled)
     chunks: list[str] = []
     stream_id = str(uuid4())
 

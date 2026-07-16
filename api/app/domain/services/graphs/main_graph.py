@@ -492,6 +492,24 @@ def _parallel_dispatch_allowed(config: Any) -> bool:
     return configurable.get("parallel_execution_subgraph") is not None
 
 
+def _sandbox_provision_off() -> bool:
+    """SPM Task 26: True iff ``sandbox_provision_mode == "off"``.
+
+    Mirror of ``AgentTaskRunner._sandbox_provision_off`` — the single settings
+    read that feeds ``build_render_context(sandbox_tools_enabled=...)`` from the
+    graph nodes (which have no ``self``). Settings unavailable (tests bypassing
+    lifespan) → False, i.e. keep the full sandbox-teaching prompt, locking
+    always / on_demand byte-identity. ``off`` is config-rejected today, so this
+    is always False in practice.
+    """
+    try:
+        from core.config import get_settings
+
+        return get_settings().sandbox_provision_mode == "off"
+    except Exception:
+        return False
+
+
 def _pwu_paths_contract_ok(step: Any) -> bool:
     """[dispatch-fallback fix] Pre-flight the single-path contract over every
     ``proposed_paths`` entry BEFORE entering the parallel branch.
@@ -842,7 +860,10 @@ def build_main_graph(
 
     async def planner_node(state: MainGraphState, config: RunnableConfig) -> dict:
         """Call planner LLM to create a plan from user message."""
-        bundle = get_prompt_bundle(state.get("language", "zh"))
+        bundle = get_prompt_bundle(
+            state.get("language", "zh"),
+            sandbox_tools_enabled=not _sandbox_provision_off(),
+        )
         attachments = state.get("attachments", [])
         image_blocks = state.get("image_content_blocks", [])
         # Planner 不传图片但需要知道附件包含图片，使用 planner 专用提示
@@ -911,6 +932,8 @@ def build_main_graph(
             # not be taught a schema they cannot dispatch — emissions would
             # only be stripped at the parse boundary below.
             parallel_dispatch_allowed=_parallel_dispatch_allowed(config),
+            # SPM Task 26: sandbox-teaching sections collapse under off.
+            sandbox_tools_enabled=not _sandbox_provision_off(),
         )
         result = prompt_assembler.assemble(
             section_bundle.planner,
@@ -1025,7 +1048,10 @@ def build_main_graph(
         """
         from app.domain.services.execution_watchdog import _should_terminate
 
-        bundle = get_prompt_bundle(state.get("language", "zh"))
+        bundle = get_prompt_bundle(
+            state.get("language", "zh"),
+            sandbox_tools_enabled=not _sandbox_provision_off(),
+        )
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
@@ -1228,6 +1254,8 @@ def build_main_graph(
             ctx = build_render_context(
                 state_for_render, fresh_config, agent_config,
                 memory_snapshot=memory_snapshot,
+                # SPM Task 26: sandbox-teaching sections collapse under off.
+                sandbox_tools_enabled=not _sandbox_provision_off(),
             )
             # fallback_used=True when react_graph_provider was unavailable
             # and we're relying on the legacy state.skill_context path.
@@ -1483,7 +1511,10 @@ def build_main_graph(
         """
         from app.domain.services.execution_watchdog import _should_terminate
 
-        bundle = get_prompt_bundle(state.get("language", "zh"))
+        bundle = get_prompt_bundle(
+            state.get("language", "zh"),
+            sandbox_tools_enabled=not _sandbox_provision_off(),
+        )
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")
@@ -1608,6 +1639,8 @@ def build_main_graph(
                     # updater registry shares the teaching section and its
                     # re-plan emissions are stripped by the same gate below.
                     parallel_dispatch_allowed=_parallel_dispatch_allowed(config),
+                    # SPM Task 26: sandbox-teaching sections collapse under off.
+                    sandbox_tools_enabled=not _sandbox_provision_off(),
                 )
                 result = prompt_assembler.assemble(
                     section_bundle.updater,
@@ -1746,7 +1779,10 @@ def build_main_graph(
         frontend updates. The final MessageEvent carries partial=False,
         the same stream_id, and parsed attachments.
         """
-        bundle = get_prompt_bundle(state.get("language", "zh"))
+        bundle = get_prompt_bundle(
+            state.get("language", "zh"),
+            sandbox_tools_enabled=not _sandbox_provision_off(),
+        )
 
         event_queue: asyncio.Queue | None = (
             config.get("configurable", {}).get("event_queue")

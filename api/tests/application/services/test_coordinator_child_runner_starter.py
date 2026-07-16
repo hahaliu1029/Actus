@@ -180,6 +180,40 @@ def _make_starter(
     )
 
 
+async def test_off_starter_refuses_start(monkeypatch):
+    """SPM PR-3 Task 25 (spec §5.7 second-layer defense): off has no sandbox plane
+    and MUST NOT spawn coordinator children — the starter entry raises before any
+    manifest fetch (the DD-6 startup mutex is layer 1)."""
+    from core.config import Settings, get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "sandbox_provision_mode", "off", raising=False)
+    monkeypatch.setattr(
+        Settings,
+        "SANDBOX_PROVISION_MODE_ALLOWED",
+        {"always", "on_demand", "off"},
+        raising=False,
+    )
+    artifact = _FakeArtifactStorage(_manifest_bytes())
+    starter = _make_starter()
+    starter._artifact_storage = artifact  # observe: refusal precedes manifest fetch
+
+    with pytest.raises(AssertionError):
+        await starter.start(
+            coordinator_run_id="run-1",
+            work_unit=_FakeWorkUnit("wu-1"),
+            child_session_id="child-1",
+            spawn_manifest_ref="ref-1",
+            cancel_event=asyncio.Event(),
+            root_session_id="root-1",
+            parent_session_id="parent-1",
+            parent_sandbox=MagicMock(),
+            user_id="user-1",
+        )
+    # entry assert fires BEFORE any SpawnManifest fetch (second-layer defense).
+    assert artifact.calls == []
+
+
 async def test_start_invokes_run_work_unit_with_decoded_manifest(monkeypatch):
     from app.application.services.coordinator_child_runner_starter import (
         DefaultCoordinatorChildRunnerStarter,

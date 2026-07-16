@@ -105,6 +105,7 @@ def build_render_context(
     team_members: "tuple[tuple[str, str], ...] | None" = None,
     recalled_memory: "RecalledMemory | None" = None,
     parallel_dispatch_allowed: bool = True,
+    sandbox_tools_enabled: bool = True,
 ) -> RenderContext:
     """Build a ``RenderContext`` from LangGraph state + config + AgentConfig.
 
@@ -129,6 +130,14 @@ def build_render_context(
     planner's recalled_memory section. Only the two planner entrances
     pass it; every other call site takes the None default and renders
     byte-identically.
+
+    SPM Task 26: ``sandbox_tools_enabled`` is the deployment constant
+    (``sandbox_provision_mode != "off"``) threaded to the sandbox-teaching
+    sections. Every production call site passes it (derived from settings
+    the same way Task 24's tool chains do); the ``True`` default keeps
+    non-threaded construction points byte-identical. ``off`` is
+    config-rejected today, so the value is always ``True`` in practice —
+    the ``False`` path is dormant plumbing for the PR-4 off unlock.
     """
     configurable = (config.get("configurable") if config else None) or {}
     llm = configurable.get("llm")
@@ -169,4 +178,5 @@ def build_render_context(
         team_members=team_members,
         recalled_memory=recalled_memory,
         parallel_dispatch_allowed=parallel_dispatch_allowed,
+        sandbox_tools_enabled=sandbox_tools_enabled,
     )

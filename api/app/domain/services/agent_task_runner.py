@@ -649,6 +649,23 @@ class AgentTaskRunner(TaskRunner):
         self._attachment_flusher = attachment_flusher
         self._sandbox_provision_mode = sandbox_provision_mode
         self._sandbox_provisioner = sandbox_provisioner
+        # SPM PR-3 Task 25: bidirectional accessor↔mode assembly guard (fail-fast
+        # mis-wiring). off ⟹ BOTH accessors MUST be None (no sandbox plane);
+        # non-off ⟹ BOTH MUST be non-None. Explicit ``raise AssertionError`` (not a
+        # bare ``assert``) so the guard survives ``python -O`` (epic convention)
+        # while still surfacing as AssertionError for the composition contract test.
+        _off = sandbox_provision_mode == "off"
+        if _off and (sandbox_accessor is not None or browser_accessor is not None):
+            raise AssertionError(
+                "AgentTaskRunner: sandbox_provision_mode='off' requires "
+                "sandbox_accessor=None and browser_accessor=None (no sandbox plane)"
+            )
+        if (not _off) and (sandbox_accessor is None or browser_accessor is None):
+            raise AssertionError(
+                "AgentTaskRunner: sandbox_provision_mode="
+                f"{sandbox_provision_mode!r} requires non-None sandbox_accessor and "
+                "browser_accessor"
+            )
         self._mcp_config = mcp_config
         self._mcp_tool = MCPTool()
         self._a2a_config = a2a_config
@@ -657,15 +674,27 @@ class AgentTaskRunner(TaskRunner):
         self._liveness_acquired: list[tuple[str, str]] = []
         settings = get_settings()
         self._skill_repository = FileSkillRepository(settings.skills_root_dir)
-        self._skill_bundle_sync = SkillBundleSyncManager(
-            sandbox_accessor=self._sandbox_accessor,
-            skills_root_dir=settings.skills_root_dir,
-            sandbox_skill_root=settings.skill_sandbox_bundle_root,
-            admission_port=self._admission_port,  # D1a §4.1: off=None
-            # SPM Task 16: on_demand → deferred sync (startup seq no-ops fast;
-            # start_deferred_sync(handle) is wired as provision hook ② in Task 17).
-            deferred=(self._sandbox_provision_mode == "on_demand"),
-        )
+        # SPM PR-3 Task 25: off has no sandbox plane → skip the SkillBundleSyncManager
+        # entirely (it needs sandbox_accessor to sync native skill bundles to the
+        # sandbox filesystem; off has no accessor and no native skills — those are
+        # removed by _apply_off_native_skill_filter in invoke()). All downstream
+        # consumers of ``self._skill_bundle_sync`` are None-guarded. always /
+        # on_demand: byte-identical (``_off`` False → the manager is built as before).
+        if _off:
+            self._skill_bundle_sync = None
+        else:
+            self._skill_bundle_sync = SkillBundleSyncManager(
+                sandbox_accessor=self._sandbox_accessor,
+                skills_root_dir=settings.skills_root_dir,
+                sandbox_skill_root=settings.skill_sandbox_bundle_root,
+                admission_port=self._admission_port,  # D1a §4.1: off=None
+                # SPM Task 16: on_demand → deferred sync (startup seq no-ops fast;
+                # start_deferred_sync(handle) is wired as provision hook ② in Task 17).
+                deferred=(self._sandbox_provision_mode == "on_demand"),
+            )
+        # SkillTool is STILL constructed under off — it serves the MCP/A2A skill face
+        # (native skills are filtered out upstream). SkillTool tolerates a None
+        # sandbox_accessor and None bundle_sync_manager (every deref is guarded).
         self._skill_tool = SkillTool(
             sandbox_accessor=self._sandbox_accessor,
             mcp_tool=self._mcp_tool,
@@ -675,20 +704,25 @@ class AgentTaskRunner(TaskRunner):
             skill_sandbox_bundle_root=settings.skill_sandbox_bundle_root,
             admission_port=self._admission_port,  # D1a §4.1: off=None
         )
+        # SPM PR-3 Task 25: off skips skill-creation tools — CreateSkillTool needs a
+        # sandbox_accessor to verify generated skills in the sandbox, and skill
+        # creation is meaningless without a sandbox plane. Both stay None under off
+        # so create_skill_langchain_tools returns an empty list (no generate_skill /
+        # brainstorm_skill bound). always / on_demand: byte-identical.
         self._create_skill_tool = (
             CreateSkillTool(
                 skill_creator_service=skill_creator_service,
                 sandbox_accessor=self._sandbox_accessor,
                 user_id=user_id or "",
             )
-            if skill_creator_service is not None
+            if (skill_creator_service is not None and not _off)
             else None
         )
         self._brainstorm_skill_tool = (
             BrainstormSkillTool(
                 skill_creator_service=skill_creator_service,
             )
-            if skill_creator_service is not None
+            if (skill_creator_service is not None and not _off)
             else None
         )
         self._skill_index_service = SkillIndexService(
@@ -1352,7 +1386,14 @@ class AgentTaskRunner(TaskRunner):
           全量重传兜底）。随后按 id 从 DB hydrate id-only File 元数据供 vision 组装
           （纯 DB，零沙箱触碰）。
         """
-        if self._sandbox_provision_mode == "on_demand":
+        if self._sandbox_provision_mode == "off":
+            # SPM PR-3 Task 25: off has no sandbox plane (sandbox_accessor is None) —
+            # sandbox-side attachment sync is a no-op. Attachments stay persisted on
+            # the MessageEvent; only hydrate id-only File metadata from the DB so
+            # vision assembly (_build_image_blocks) still sees full MIME/size (pure
+            # DB, zero sandbox touch). A None-accessor deref here would crash the run.
+            await self._hydrate_id_only_attachments_for_vision(event)
+        elif self._sandbox_provision_mode == "on_demand":
             handle = self._sandbox_accessor.peek()
             if handle is not None and self._attachment_flusher is not None:
                 try:
@@ -2095,6 +2136,8 @@ class AgentTaskRunner(TaskRunner):
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
+            # SPM Task 24: off 档摘要零 file/shell/browser/file_view 类别（U3）。
+            include_sandbox_tools=not self._sandbox_provision_off(),
         )
         groups: dict[str, list[str]] = {}
         for tool in tools:
@@ -2123,6 +2166,34 @@ class AgentTaskRunner(TaskRunner):
         )
 
         return build_memory_mount_scope_from_settings(self._user_id, settings)
+
+    def _sandbox_provision_off(self) -> bool:
+        """SPM Task 24：True 当且仅当 ``sandbox_provision_mode == "off"``。
+
+        settings 拿不到（测试环境绕过 lifespan）→ False，即保留 always 档的完整
+        工具面/技能池，锁死 always / on_demand 的 byte-zero。此单一入口喂给
+        ``_build_lc_tools_full`` 的 gate、``_get_native_tool_names_by_category`` 的
+        ``include_sandbox_tools`` 与 native skill 池过滤，保证三处同源。
+        """
+        try:
+            from core.config import get_settings
+
+            return get_settings().sandbox_provision_mode == "off"
+        except Exception:
+            return False
+
+    def _apply_off_native_skill_filter(self, pool: list["Skill"]) -> list["Skill"]:
+        """SPM Task 24：off 档从 skill 池剔除 NATIVE skills（需沙箱才能运行）。
+
+        non-off → identity（byte-zero）。调用点在 D1a admission ``filter_skills``
+        **之前**，确保任何后续 selection / binding 都看不到 native skill（含被
+        team force-include 强行拉回的 native member skill）。
+        """
+        if not self._sandbox_provision_off():
+            return pool
+        from app.domain.models.skill import SkillRuntimeType
+
+        return [s for s in pool if s.runtime_type != SkillRuntimeType.NATIVE]
 
     def _build_available_tool_summary(self) -> str:
         """构建可用工具摘要，减少模型对工具可用性的错觉。"""
@@ -2569,7 +2640,10 @@ class AgentTaskRunner(TaskRunner):
         ``SkillTool.initialize()`` became atomic. See design:
         docs/superpowers/specs/2026-04-13-skill-tool-initialize-atomicity-design.md
         """
-        from app.domain.services.tools.langchain_tools import create_native_tools
+        from app.domain.services.tools.langchain_tools import (
+            apply_sandbox_capability_gate,
+            create_native_tools,
+        )
         from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
         from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
         from app.domain.services.tools.langchain_skill_tools import (
@@ -2581,6 +2655,11 @@ class AgentTaskRunner(TaskRunner):
         )
 
         lc_tools: list[Any] = []
+
+        # SPM Task 24: single boolean source for this chain — feeds the native
+        # tool-face skip (include_sandbox_tools), the MCP off refusal
+        # (sandbox_files_enabled) and the terminal capability gate below.
+        sandbox_tools_enabled = not self._sandbox_provision_off()
 
         lc_tools.extend(
             create_native_tools(
@@ -2596,6 +2675,7 @@ class AgentTaskRunner(TaskRunner):
                 # 否则 planner 阶段守护拦了，实际 tool call 路径还是裸透传。
                 memory_mount_scope=self._build_memory_mount_scope(),
                 supervisor=self._execution_supervisor,
+                include_sandbox_tools=sandbox_tools_enabled,
                 file_view_media_type_enabled=self._tool_runtime.file_view_media_type_enabled,
                 file_view_image_cache_enabled=self._tool_runtime.file_view_image_cache_enabled,
                 document_preview_enabled=self._tool_runtime.document_preview_enabled,
@@ -2616,6 +2696,7 @@ class AgentTaskRunner(TaskRunner):
                     tool_names=self._exclude_admission_blocked_mcp(None),
                     url_map_ref=_url_map_ref,
                     sandbox_file_uploader=_sandbox_uploader,
+                    sandbox_files_enabled=sandbox_tools_enabled,
                 )
             )
         else:
@@ -2629,6 +2710,7 @@ class AgentTaskRunner(TaskRunner):
                     tool_names=self._exclude_admission_blocked_mcp(mcp_bind_names),
                     url_map_ref=_url_map_ref,
                     sandbox_file_uploader=_sandbox_uploader,
+                    sandbox_files_enabled=sandbox_tools_enabled,
                 )
             )
             from app.domain.services.tools.langchain_mcp_discovery import (
@@ -2662,11 +2744,23 @@ class AgentTaskRunner(TaskRunner):
             create_dynamic_skill_langchain_tools(self._skill_tool)
         )
 
+        # SPM PR-3 Task 25: None-guard the bundle-sync derefs — off has no
+        # SkillBundleSyncManager (``self._skill_bundle_sync is None``). Pass an empty
+        # ``file_listings_ref`` (optional) + the default sandbox skill root so the
+        # guide tool builds without a None deref. always / on_demand: byte-identical.
         lc_tools.append(
             create_skill_guide_tool(
                 skill_pool_ref=lambda: self._session_skill_pool,
-                file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
-                sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
+                file_listings_ref=(
+                    (lambda: self._skill_bundle_sync.get_file_listing_all())
+                    if self._skill_bundle_sync is not None
+                    else None
+                ),
+                sandbox_skill_root=(
+                    self._skill_bundle_sync.sandbox_skill_root
+                    if self._skill_bundle_sync is not None
+                    else "/home/ubuntu/workspace/.skills"
+                ),
             )
         )
 
@@ -2715,6 +2809,13 @@ class AgentTaskRunner(TaskRunner):
             _built = {t.name for t in lc_tools}
             _assert_member_tools_built(required=_member_required, built_names=_built)
 
+        # SPM Task 24: off-mode tool-face contraction — MUST be the LAST assembly
+        # step (the gate's closure assertion trips if any post-gate extend leaks a
+        # face tool; the structure test anchors this as the last stmt before return).
+        # always / on_demand → identity (same list object). No .extend after this.
+        lc_tools = apply_sandbox_capability_gate(
+            lc_tools, sandbox_tools_enabled=sandbox_tools_enabled
+        )
         return wrap_tool_list_for_supervisor(lc_tools, self._execution_supervisor)
 
     def _build_lc_tools_for_step(self) -> list[Any]:
@@ -3685,6 +3786,9 @@ class AgentTaskRunner(TaskRunner):
                     _on_summary_event,
                     lang=_summary_lang,
                     callbacks=_cost_callbacks,
+                    # SPM Task 27: off deployment gets the no-sandbox SUMMARIZE
+                    # variant. Canonical single source = self._sandbox_provision_off().
+                    sandbox_tools_enabled=not self._sandbox_provision_off(),
                 )
             except asyncio.CancelledError:
                 # Send a final non-partial message to clear the ghost partial
@@ -4700,7 +4804,14 @@ class AgentTaskRunner(TaskRunner):
             # exactly as before; in on_demand it returns None until the first
             # sandbox tool call triggers provision → recheck is skipped. Both
             # modes share the same semantics (provision-if-provisioned).
-            handle = self._sandbox_accessor.peek()
+            # SPM PR-3 Task 25: off has no sandbox_accessor (None) — there is no
+            # handle to recheck, so peek is skipped. always / on_demand: byte-identical
+            # (accessor non-None → peek runs exactly as before).
+            handle = (
+                self._sandbox_accessor.peek()
+                if self._sandbox_accessor is not None
+                else None
+            )
             if handle is not None:
                 await handle.ensure_sandbox()
             # PR-9b-A audit round-1 P1 (Fix 3 / INV-A6) — prime the planner's
@@ -4816,6 +4927,11 @@ class AgentTaskRunner(TaskRunner):
             self._session_skill_pool = _force_include_member_skills(
                 self._session_skill_pool, enabled_skills, _member_slugs,
             )
+            # SPM Task 24: off 档剔除 NATIVE skills（需沙箱运行）——放在 D1a admission
+            # 过滤之前，team force-include 拉回的 native skill 同样被剔除。non-off 恒等。
+            self._session_skill_pool = self._apply_off_native_skill_filter(
+                self._session_skill_pool
+            )
             # D1a G4：最终池过滤（team force-include 也不得越过 admission，F22/R1#13）
             self._session_skill_pool = await filter_skills(
                 self._admission_port, self._session_skill_pool)
@@ -4857,20 +4973,31 @@ class AgentTaskRunner(TaskRunner):
                 _member_slugs,
             )
             initial_skills = await filter_skills(getattr(self, "_admission_port", None), initial_skills)   # D1a G4 终选集
-            await self._skill_bundle_sync.prepare_startup_sync(
-                skill_pool=self._session_skill_pool,
-                initial_selected=initial_skills,
-            )
-            await self._skill_bundle_sync.await_initial_sync()
+            # SPM PR-3 Task 25: off has no SkillBundleSyncManager — skip the native
+            # bundle sync (no sandbox to sync to, no native skills in the pool). The
+            # SkillTool preselect below STILL runs so MCP/A2A skills bind. always /
+            # on_demand: byte-identical (manager present → full sync as before).
+            if self._skill_bundle_sync is not None:
+                await self._skill_bundle_sync.prepare_startup_sync(
+                    skill_pool=self._session_skill_pool,
+                    initial_selected=initial_skills,
+                )
+                await self._skill_bundle_sync.await_initial_sync()
             await self._apply_preselected_skills(initial_skills)
-            self._skill_bundle_sync.start_background_sync()
+            if self._skill_bundle_sync is not None:
+                self._skill_bundle_sync.start_background_sync()
 
             # 传递 skill pool getter 和 file listings getter 给 flow，用于 get_skill_guide 按需加载
             # 使用 hasattr duck-typing guard，兼容测试中的 mock flow
             if hasattr(self._flow, '_skill_pool_getter'):
                 self._flow._skill_pool_getter = lambda: self._session_skill_pool
-                self._flow._file_listings_getter = lambda: self._skill_bundle_sync.get_file_listing_all()
-                self._flow._sandbox_skill_root = self._skill_bundle_sync.sandbox_skill_root
+                # SPM PR-3 Task 25: None-guard — off has no bundle-sync manager. Leave
+                # the flow's file-listings getter / sandbox skill root at their ctor
+                # defaults (None getter → guide tool omits the sandbox resources
+                # section). always / on_demand: byte-identical.
+                if self._skill_bundle_sync is not None:
+                    self._flow._file_listings_getter = lambda: self._skill_bundle_sync.get_file_listing_all()
+                    self._flow._sandbox_skill_root = self._skill_bundle_sync.sandbox_skill_root
             # MCP progressive loading: pass discovery dependencies to flow
             if hasattr(self._flow, '_mcp_tool_ref'):
                 self._flow._mcp_tool_ref = lambda: self._mcp_tool
@@ -5406,21 +5533,30 @@ class AgentTaskRunner(TaskRunner):
         logger.info("开始清除销毁AgentTaskRunner资源")
         # 1a. Close the browser first (idempotent; Eager/OnDemand 同 API). Task 10
         # / r4 category-D frozen release chain: browser BEFORE sandbox.
-        try:
-            await self._browser_accessor.aclose()
-        except Exception as exc:
-            logger.warning("browser_accessor.aclose() 失败（继续清理）: %s", exc)
+        # SPM PR-3 Task 25: off has no browser_accessor (None) — nothing to close
+        # (avoids the None-deref warning noise; off path must not touch accessors).
+        # getattr defense mirrors the codebase convention for __new__-bypass runner
+        # unit tests that never set the accessor attributes.
+        if getattr(self, "_browser_accessor", None) is not None:
+            try:
+                await self._browser_accessor.aclose()
+            except Exception as exc:
+                logger.warning("browser_accessor.aclose() 失败（继续清理）: %s", exc)
 
-        try:
-            # 1b. Release the accessor-owned sandbox handle (lifecycle service owns
-            # actual destruction). r7/F3: release_owned() covers today's Eager
-            # release() semantics; OnDemand (PR-1c) routes to
-            # provisioner.release_held_handle() so a hooks_failed handle
-            # (peek()==None but the provisioner still holds it) is NOT leaked.
-            logger.info("释放 AgentTaskRunner 的沙箱 handle")
-            await self._sandbox_accessor.release_owned()
-        except Exception as exc:
-            logger.warning("sandbox_accessor.release_owned() 失败（继续清理）: %s", exc)
+        # SPM PR-3 Task 25: off has no sandbox_accessor (None) — no handle to release
+        # (off path must not touch the accessor; avoids None-deref warning noise).
+        # getattr defense mirrors the __new__-bypass runner unit-test convention.
+        if getattr(self, "_sandbox_accessor", None) is not None:
+            try:
+                # 1b. Release the accessor-owned sandbox handle (lifecycle service owns
+                # actual destruction). r7/F3: release_owned() covers today's Eager
+                # release() semantics; OnDemand (PR-1c) routes to
+                # provisioner.release_held_handle() so a hooks_failed handle
+                # (peek()==None but the provisioner still holds it) is NOT leaked.
+                logger.info("释放 AgentTaskRunner 的沙箱 handle")
+                await self._sandbox_accessor.release_owned()
+            except Exception as exc:
+                logger.warning("sandbox_accessor.release_owned() 失败（继续清理）: %s", exc)
 
         try:
             # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）

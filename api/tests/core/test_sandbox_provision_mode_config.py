@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from pydantic import ValidationError
 
@@ -73,6 +75,48 @@ def _mk_settings(mode: str) -> Settings:
     return Settings.model_construct(sandbox_provision_mode=mode)
 
 
+# Task 29 — FULL off×coordinator exclusion matrix.
+#
+# Per-flag ``(env_value, is_truthy)`` options feeding a Cartesian product over
+# the three env-only coordinator flags × mode {off, always}. Each flag exercises
+# at least one truthy token ("1"/"true" — parsed by the shared
+# ``_TRUTHY = {"true","1","yes","on"}`` in coordinator_feature_flag.py /
+# coordinator_shell_mode_flag.py / agent_teams_flag.py) and one falsy form
+# ("0" / "false" / unset). ``None`` means leave the var unset (a falsy path).
+_MATRIX_FLAG_VALUES = {
+    "ACTUS_C2_COORDINATOR_ENABLED": (("1", True), ("0", False)),
+    "ACTUS_C2_COORDINATOR_SHELL_MODE_ENABLED": (("true", True), ("false", False)),
+    "ACTUS_C2_AGENT_TEAMS_ENABLED": (("1", True), (None, False)),
+}
+
+
+def _off_coordinator_matrix_params():
+    """Build the full mode × flag-value Cartesian as pytest params.
+
+    2 modes × 2**3 flag combinations = 16 cases. ``env`` maps each flag to its
+    cell value (``None`` → leave unset); ``expected_conflicts`` is the ordered
+    subset of truthy flags (only meaningful under mode == "off").
+    """
+    flag_names = tuple(_MATRIX_FLAG_VALUES)
+    per_flag = [_MATRIX_FLAG_VALUES[name] for name in flag_names]
+    params = []
+    for mode in ("off", "always"):
+        for combo in itertools.product(*per_flag):
+            env = {}
+            truthy = []
+            id_bits = [mode]
+            for name, (value, is_truthy) in zip(flag_names, combo):
+                env[name] = value
+                short = name.removeprefix("ACTUS_C2_").removesuffix("_ENABLED")
+                id_bits.append(f"{short}={'unset' if value is None else value}")
+                if is_truthy:
+                    truthy.append(name)
+            params.append(
+                pytest.param(mode, env, tuple(truthy), id="-".join(id_bits))
+            )
+    return params
+
+
 class TestOffCoordinatorExclusion:
     def test_off_with_coordinator_flag_fails_fast(self, monkeypatch):
         # flag 是 env-only helper（无缓存，每次读 os.environ）。hermetic：先清三键再设一，
@@ -93,3 +137,39 @@ class TestOffCoordinatorExclusion:
         # mode != "off" → 提前 return，flag 状态无关（即使 coordinator flag 开着也放行）。
         monkeypatch.setenv("ACTUS_C2_COORDINATOR_ENABLED", "1")
         check_sandbox_off_flag_exclusion(_mk_settings("always"))
+
+    @pytest.mark.parametrize(
+        "mode, env, expected_conflicts", _off_coordinator_matrix_params()
+    )
+    def test_off_coordinator_exclusion_full_truthy_falsy_matrix(
+        self, monkeypatch, mode, env, expected_conflicts
+    ):
+        """Full matrix: off × any-truthy-flag → RuntimeError naming exactly the
+        truthy flag(s); every other cell (mode == "always" regardless of flags,
+        or off with all three flags falsy) returns None.
+
+        env-only helpers read ``os.environ`` fresh on each call, so hermeticity
+        requires clearing all three vars before seeding this cell.
+        """
+        for var in _C2_FLAGS:
+            monkeypatch.delenv(var, raising=False)
+        for var, value in env.items():
+            if value is not None:
+                monkeypatch.setenv(var, value)
+
+        settings = _mk_settings(mode)
+
+        if mode == "off" and expected_conflicts:
+            with pytest.raises(RuntimeError, match="incompatible") as excinfo:
+                check_sandbox_off_flag_exclusion(settings)
+            message = str(excinfo.value)
+            # 每个 truthy flag 都被点名 ...
+            for name in expected_conflicts:
+                assert name in message, (name, message)
+            # ... 且 falsy flag 不会被误列（三名互不为子串，absence 断言无歧义）。
+            for name in _C2_FLAGS:
+                if name not in expected_conflicts:
+                    assert name not in message, (name, message)
+        else:
+            # mode == "always" 在读 flag 前短路；off + 全 falsy 无冲突。二者均返回 None。
+            assert check_sandbox_off_flag_exclusion(settings) is None

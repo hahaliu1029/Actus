@@ -307,7 +307,11 @@ class TestCollectAllTools:
         raw_mcp = _make_tool("mcp_raw")
         raw_memory = _make_tool("memory_search")
 
-        monkeypatch.setattr(flow, "_collect_native_tools", lambda: [already_wrapped])
+        # SPM Task 24: _collect_native_tools / _collect_mcp_tools now take a
+        # keyword-only sandbox_tools_enabled flag (threaded from _collect_all_tools).
+        monkeypatch.setattr(
+            flow, "_collect_native_tools", lambda **_kw: [already_wrapped]
+        )
         monkeypatch.setattr(
             flow,
             "_collect_mcp_tools",

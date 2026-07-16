@@ -20,7 +20,12 @@ def _main_src() -> str:
 def test_sandbox_reaper_wired_after_child_row_reaper_before_skill_scan():
     src = _main_src()
     i_child = src.index("sweep_running_mailbox_children")
-    i_sandbox = src.index("sweep_terminal_coordinator_active_sandboxes")
+    # SPM Task 28 extracted the reaper into the module-scope helper
+    # ``_run_terminal_sandbox_reaper_if_enabled``, so the sweep symbol now first
+    # appears textually in that helper's import (BEFORE the lifespan body). Anchor
+    # the ordering on the lifespan CALL SITE instead — the ``await``-prefix is
+    # unique to the call site (the ``async def`` line has no ``await``).
+    i_sandbox = src.index("await _run_terminal_sandbox_reaper_if_enabled(")
     i_skill = src.index("_background_skill_scan")
     assert i_child < i_sandbox < i_skill, (
         "sandbox_terminal_reaper must run after the C2b child-row reaper and "

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import AsyncGenerator
 
+from app.application.errors.exceptions import SandboxDisabledError
 from app.application.services.app_config_service import AppConfigService
 from app.application.services.skill_service import SkillService
 from app.application.services.user_tool_enablement_service import UserToolEnablementService
@@ -157,6 +158,13 @@ async def create_skill_ai(
     admin_user: AdminUser,
     creator_service=Depends(get_skill_creator_service),
 ) -> EventSourceResponse:
+    # SPM PR-3 Task 28 (spec §5.6 matrix): AI skill creation runs generated code
+    # in a sandbox — off has no sandbox plane. Raise 409 SANDBOX_DISABLED here,
+    # BEFORE the EventSourceResponse is constructed (raising inside the generator
+    # would surface as a mid-stream 200 SSE error, not a 409). INV-SPM-7.
+    if get_settings().sandbox_provision_mode == "off":
+        raise SandboxDisabledError()
+
     async def event_generator() -> AsyncGenerator[ServerSentEvent, None]:
         try:
             async for event in creator_service.create(

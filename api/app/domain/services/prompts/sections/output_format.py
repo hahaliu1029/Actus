@@ -68,9 +68,70 @@ EXAMPLE JSON OUTPUT:
 }"""
 
 
+# SPM Task 26 off variant (sandbox_tools_enabled=False): identical JSON
+# contract with the sandbox-path examples replaced by non-path (empty
+# attachments) examples and the "沙箱/in sandbox" wording dropped from the
+# attachments field comment. The ``attachments`` field stays in the schema
+# (the parser contract is unchanged) — only the illustrative /home/ubuntu
+# paths are removed.
+_ZH_TEXT_OFF = """## 返回格式
+
+必须返回符合以下 TypeScript 接口定义的 JSON 格式，包含所有必填字段。
+
+```typescript
+interface Response {
+  /** 任务步骤是否成功执行 **/
+  success: boolean;
+  /** 需要交付给用户的生成文件的路径数组 **/
+  attachments: string[];
+  /** 任务结果文本，如果没有结果需要交付则留空 **/
+  result: string;
+}
+```
+
+JSON 输出示例：
+{
+    "success": true,
+    "result": "我们已经完成了数据清洗任务，并生成了摘要。",
+    "attachments": []
+}"""
+
+
+_EN_TEXT_OFF = """## Return Format
+
+Must return JSON format complying with the following TypeScript interface, including all required fields.
+
+```typescript
+interface Response {
+  /** Whether the task is executed successfully **/
+  success: boolean;
+  /** Array of file paths for generated files to be delivered to user **/
+  attachments: string[];
+  /** Task result, empty if no result to deliver **/
+  result: string;
+}
+```
+
+EXAMPLE JSON OUTPUT:
+{
+    "success": true,
+    "result": "We have finished the task",
+    "attachments": []
+}"""
+
+
 def _render(ctx: RenderContext) -> SectionOutput:
-    """Return the language-appropriate output_format prompt."""
-    text = _EN_TEXT if ctx.lang == "en" else _ZH_TEXT
+    """Return the language-appropriate output_format prompt.
+
+    SPM Task 26: when ``sandbox_tools_enabled`` is False (off deployment) the
+    sandbox-path examples (``/home/ubuntu/...``) and the "沙箱/in sandbox"
+    field wording are replaced by non-path equivalents. The default True path
+    returns the unchanged constants (INV-SPM-2 byte-identity).
+    """
+    if not ctx.sandbox_tools_enabled:
+        text = _EN_TEXT_OFF if ctx.lang == "en" else _ZH_TEXT_OFF
+    else:
+        text = _EN_TEXT if ctx.lang == "en" else _ZH_TEXT
     return SectionOutput(text=text)
 
 

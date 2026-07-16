@@ -128,6 +128,21 @@ class RenderContext:
     (``main_graph._parallel_dispatch_allowed``). Default True keeps every
     non-threaded call site (executor ctx, fixtures, tests) byte-identical.
     """
+    sandbox_tools_enabled: bool = True
+    """SPM Task 26: whether sandbox-face tools (file / shell / browser /
+    skill-creation) are provisioned for this deployment.
+
+    A **deployment constant** derived once from settings
+    (``sandbox_provision_mode != "off"``) — NOT per-step state — so the
+    cacheable sections that read it (``identity`` / ``behavior_core`` /
+    ``output_format``) stay cacheable (DD-7). ``True`` (always / on_demand;
+    ``off`` is config-rejected today) selects the current sandbox-teaching
+    prose, keeping every existing render byte-identical (INV-SPM-2). ``False``
+    (off) selects the sandbox-free variant that removes shell/browser/takeover/
+    skill-creation teaching and rewords the MCP-over-browser/terminal
+    comparison. Default ``True`` keeps every non-threaded construction point
+    (fixtures, tests) byte-identical.
+    """
 
 
 # ---- SectionOutput ------------------------------------------------------ #

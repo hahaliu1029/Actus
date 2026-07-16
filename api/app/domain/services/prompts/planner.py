@@ -138,3 +138,83 @@ JSON输出示例：
 计划 (plan):
 {plan}
 """
+
+# SPM Task 27 off variant of CREATE_PLAN_PROMPT (sandbox_tools_enabled=False).
+# Two surgical diffs vs the on constant above:
+#   1. MCP/A2A bullet: drop the "而非通过浏览器或终端访问" comparison (off has no
+#      browser/terminal tools) — keep the "优先使用 MCP 工具" preference.
+#   2. Skill-creation bullet removed entirely (brainstorm_skill / generate_skill /
+#      install_skill are sandbox-face tools gated off in the off deployment).
+# Every other line — including the {message}/{attachments} placeholders and the
+# {{ }}-escaped TypeScript block — is byte-shared with the on constant.
+# UPDATE_PLAN_PROMPT and EXECUTION_SUMMARY_NONE_FALLBACK carry no sandbox
+# teaching and are reused as-is by the off bundle (no _OFF variant needed).
+CREATE_PLAN_PROMPT_OFF = """
+你现在正在根据用户的消息创建一个计划:
+{message}
+
+注意：
+- **你必须使用用户消息中使用的语言来执行任务**
+- 你的计划必须简洁明了，不要添加任何不必要的细节
+- 你的步骤必须是原子性且独立的，以便下一个执行者可以使用工具逐一执行它们
+- 你需要判断任务是否可以拆分为多个步骤，如果可以，返回多个步骤；否则，返回单个步骤
+- **图片附件处理（严格禁止幻觉）**：你**无法看到**图片内容，只能看到文件名。**严禁**在 `message`、`step.description`、`goal` 中描述、猜测或断言图片内容（如颜色、布局、文字、UI 元素等）。正确做法：步骤描述使用泛化表述（如"分析用户上传的图片并根据内容用 HTML 实现"），`message` 只确认收到图片和任务意图，图片内容的精确分析留给执行者通过工具完成。
+  - 错误示例：`"这是一个用户注册卡片UI设计，包含Create Account标题"` ← 你看不到图片，这是幻觉
+  - 正确示例：`"分析用户上传的设计图，用 HTML/CSS 还原页面效果"` ← 不描述图片内容
+- **MCP/A2A 工具优先**：如果下方 `Available Tool Summary` 中包含 `mcp tools`，说明已接入对应的 MCP 服务（如 Notion、GitHub 等）。**制定计划时必须优先安排使用这些 MCP 工具。** MCP 工具通过 API 直接操作，可靠高效。例如用户说"查看 Notion 中的内容"且有 Notion 相关的 MCP 工具可用时，步骤应为"调用 Notion MCP 工具检索数据"。
+- **empty steps + memory tools 的约束**：如果你原本想返回空 `steps`，但 `Available Tool Summary` 显示有 memory 工具（如 `memory_search` / `memory_get`），不要在 `message` 里直接拒答。改为输出一个单步计划去查询记忆再回答，`message` 使用中性进度提示，例如"正在查询你的记忆以回答这个问题……"。
+- **汇总/整理类步骤必须复用前序产出**：若计划中安排了"整理/汇总/归纳/总结/合并"类步骤，且其依赖的信息已由前序步骤搜索/采集产出，该步骤描述必须显式要求"基于前序步骤已产出的文件整合"，并注明"禁止重新执行 search_web / mcp_*_web_search 等检索工具，除非前序产出明显缺失"。不写硬约束会导致执行者在"整理"阶段再次全量搜索，浪费工具调用。
+
+返回格式要求：
+- 必须返回符合以下 TypeScript 接口定义的 JSON 格式
+- 必须包含指定的所有必填字段
+- 如果判定任务不可行, 则"steps"返回空数组，"goal"返回空字符串
+
+TypeScript 接口定义：
+```typescript
+interface CreatePlanResponse {{
+  /** 对用户消息的回复以及对任务的思考，尽可能详细，使用用户的语言 **/
+  message: string;
+  /** 根据用户消息确定的工作语言 **/
+  language: string;
+  /** 步骤数组，每个步骤包含id和描述 **/
+  steps: Array<{{
+    /** 步骤标识符 **/
+    id: string;
+    /** 步骤描述 **/
+    description: string;
+  }}>;
+  /** 根据上下文生成的计划目标 **/
+  goal: string;
+  /** 根据上下文生成的计划标题 **/
+  title: string;
+}}
+```
+
+JSON 输出示例:
+{{
+  "message": "用户回复消息",
+  "goal": "目标描述",
+  "title": "任务标题",
+  "language": "zh",
+  "steps": [
+    {{
+      "id": "1",
+      "description": "步骤1描述"
+    }}
+  ]
+}}
+
+输入:
+- message: 用户的消息
+- attachments: 用户的附件
+
+输出:
+- JSON 格式的计划
+
+用户消息:
+{message}
+
+附件:
+{attachments}
+"""

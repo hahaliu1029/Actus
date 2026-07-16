@@ -258,6 +258,20 @@ class DefaultCoordinatorChildRunnerStarter:
         parent_sandbox: Any,  # per-run; provided by dispatch_node from cfg
         user_id: str,
     ) -> None:
+        # SPM PR-3 Task 25 (spec §5.7): second-layer defense. off has no sandbox
+        # plane and MUST NOT spawn coordinator children (the DD-6 startup mutex is
+        # layer 1 — off is exclusive with the coordinator flags). Explicit raise
+        # (not bare ``assert``) so the guard survives ``python -O`` while still
+        # surfacing as AssertionError; a reachable off child-dispatch is a
+        # composition/config bug and must fail loud, not silently bind a lease.
+        from core.config import get_settings
+
+        if get_settings().sandbox_provision_mode == "off":
+            raise AssertionError(
+                "coordinator child_runner_starter.start invoked under "
+                "sandbox_provision_mode='off' — off has no sandbox plane and must "
+                "not spawn coordinator children (spec §5.7 second-layer defense)"
+            )
         # 1. Fetch + decode SpawnManifest.
         raw = await self._artifact_storage.get_bytes(spawn_manifest_ref)
         data = json.loads(raw)

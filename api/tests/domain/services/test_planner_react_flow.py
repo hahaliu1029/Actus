@@ -371,9 +371,11 @@ class TestRunPlannerForDetectionLanguageDispatch:
         real_get_bundle = prompts_mod.get_prompt_bundle
         real_get_section = prompts_mod.get_prompt_section_bundle
 
-        def _spy_bundle(lang: str):
+        def _spy_bundle(lang: str, *, sandbox_tools_enabled: bool = True):
+            # SPM Task 27: mirror the real get_prompt_bundle signature (the call
+            # site now passes sandbox_tools_enabled=) and forward it through.
             calls.append(("bundle", lang))
-            return real_get_bundle(lang)
+            return real_get_bundle(lang, sandbox_tools_enabled=sandbox_tools_enabled)
 
         def _spy_section(lang: str):
             calls.append(("section", lang))

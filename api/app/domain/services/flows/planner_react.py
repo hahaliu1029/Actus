@@ -518,8 +518,14 @@ class PlannerReActFlow(BaseFlow):
 
     # -- Tool collection sub-methods ------------------------------------------
 
-    def _collect_native_tools(self) -> list:
-        """Collect sandbox/browser/search tools."""
+    def _collect_native_tools(self, *, sandbox_tools_enabled: bool = True) -> list:
+        """Collect sandbox/browser/search tools.
+
+        ``sandbox_tools_enabled``（SPM Task 24）：off 档为 ``False``——不构造
+        file / file_view / shell / browser 四族（``create_native_tools`` 的
+        ``include_sandbox_tools`` 门），也收缩 message 接管 enum。默认 ``True`` 保留
+        既有 __new__-bypass flow 测试的行为不变。
+        """
         return create_native_tools(
             sandbox_accessor=self._sandbox_accessor,
             browser_accessor=self._browser_accessor,
@@ -532,6 +538,7 @@ class PlannerReActFlow(BaseFlow):
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
             supervisor=self._execution_supervisor,
+            include_sandbox_tools=sandbox_tools_enabled,
             file_view_media_type_enabled=getattr(
                 self._tool_runtime, "file_view_media_type_enabled", False
             ),
@@ -562,11 +569,32 @@ class PlannerReActFlow(BaseFlow):
 
         return build_memory_mount_scope_from_settings(self._user_id, settings)
 
-    async def _collect_mcp_tools(self) -> list:
+    def _sandbox_provision_off(self) -> bool:
+        """SPM Task 24：True 当且仅当 ``sandbox_provision_mode == "off"``。
+
+        settings 拿不到（测试绕过 lifespan）→ False（保留 always 档完整工具面），
+        锁死 always / on_demand byte-zero。与 ``AgentTaskRunner._sandbox_provision_off``
+        同语义——flow 的终装配链 ``_collect_all_tools`` 用它派生
+        ``sandbox_tools_enabled`` 单一布尔，喂给 native skip / MCP off refusal / gate。
+        """
+        try:
+            from core.config import get_settings
+
+            return get_settings().sandbox_provision_mode == "off"
+        except Exception:
+            return False
+
+    async def _collect_mcp_tools(self, *, sandbox_tools_enabled: bool = True) -> list:
         """Collect MCP tools with progressive loading.
 
         Small tool set (<=15): bind all directly.
         Large tool set (>15): only always_bind + discovery tools.
+
+        ``sandbox_tools_enabled``（SPM Task 24）：off 档为 ``False``——透传
+        ``sandbox_files_enabled=False`` 到 ``create_mcp_langchain_tools``，使每个 MCP
+        工具在收到 ``/home/ubuntu`` 路径参数时结构化拒绝（不上传 / 不透传）。此 flow
+        独立链此前不传 resolver/uploader，故 off refusal 由 flag 驱动、独立于
+        url_map_ref。默认 ``True`` → always / on_demand 逐字节不变。
         """
         if not self._mcp_tool:
             return []
@@ -591,9 +619,13 @@ class PlannerReActFlow(BaseFlow):
                 }
                 tools.extend(create_mcp_langchain_tools(
                     self._mcp_tool, tool_names=direct_names,
+                    sandbox_files_enabled=sandbox_tools_enabled,
                 ))
             else:
-                tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+                tools.extend(create_mcp_langchain_tools(
+                    self._mcp_tool, tool_names=None,
+                    sandbox_files_enabled=sandbox_tools_enabled,
+                ))
         else:
             if self._mcp_always_bind_names:
                 bind_names = self._mcp_always_bind_names
@@ -601,6 +633,7 @@ class PlannerReActFlow(BaseFlow):
                     bind_names = {n for n in bind_names if n not in blocked_names}
                 tools.extend(create_mcp_langchain_tools(
                     self._mcp_tool, tool_names=bind_names,
+                    sandbox_files_enabled=sandbox_tools_enabled,
                 ))
             if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
                 from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
@@ -655,15 +688,34 @@ class PlannerReActFlow(BaseFlow):
         Order: native -> MCP -> A2A -> skill creation -> memory.
         Dynamic Skill tools are NOT included here — they are injected
         per-step by react_graph_provider.
+
+        SPM Task 24 — final-assembly point ②：``apply_sandbox_capability_gate`` 收尾。
+        与 runner ``_build_lc_tools_full`` 对称，off 档收缩沙箱工具面。``sandbox_tools_enabled``
+        单一布尔喂给 native skip / MCP off refusal / gate 三处。
         """
+        from app.domain.services.tools.langchain_tools import (
+            apply_sandbox_capability_gate,
+        )
+
+        sandbox_tools_enabled = not self._sandbox_provision_off()
         tools: list = []
-        tools.extend(self._collect_native_tools())
-        tools.extend(await self._collect_mcp_tools())
+        tools.extend(
+            self._collect_native_tools(sandbox_tools_enabled=sandbox_tools_enabled)
+        )
+        tools.extend(
+            await self._collect_mcp_tools(sandbox_tools_enabled=sandbox_tools_enabled)
+        )
         tools.extend(self._collect_a2a_tools())
         tools.extend(self._collect_skill_creation_tools())
         tools.extend(self._collect_memory_tools())
         self._has_memory_tools = any(
             t.name in ("memory_search", "memory_get", "memory_save") for t in tools
+        )
+        # SPM Task 24: off-mode tool-face contraction — MUST be the LAST assembly
+        # step (structure test anchors the gate as the last stmt before return; no
+        # .extend after it). always / on_demand → identity (same list object).
+        tools = apply_sandbox_capability_gate(
+            tools, sandbox_tools_enabled=sandbox_tools_enabled
         )
         return wrap_tool_list_for_supervisor(tools, self._execution_supervisor)
 
@@ -1100,7 +1152,10 @@ class PlannerReActFlow(BaseFlow):
         """调用 LLM 生成结构化对话摘要。"""
         from app.domain.services.prompts import get_prompt_bundle
 
-        bundle = get_prompt_bundle(getattr(plan, "language", "zh"))
+        bundle = get_prompt_bundle(
+            getattr(plan, "language", "zh"),
+            sandbox_tools_enabled=not self._sandbox_provision_off(),
+        )
         steps_summary = "\n".join(
             f"- {s.description}: {'完成' if s.status == ExecutionStatus.COMPLETED else '未完成'}"
             + (f"\n  结果: {s.result[:200]}" if s.result else "")
@@ -1479,7 +1534,10 @@ class PlannerReActFlow(BaseFlow):
         from app.domain.services.prompts.render_context import build_render_context
         from app.domain.services.prompts.section import PromptMode
 
-        bundle = get_prompt_bundle(message.language)
+        bundle = get_prompt_bundle(
+            message.language,
+            sandbox_tools_enabled=not self._sandbox_provision_off(),
+        )
         lang = message.language
 
         attachments = getattr(message, "attachments", [])
@@ -1598,6 +1656,9 @@ class PlannerReActFlow(BaseFlow):
             # real subgraph (coordinator child / Null coord_deps) the teaching
             # section must not train the planner on an undispatchable schema.
             parallel_dispatch_allowed=self._parallel_dispatch_capable(),
+            # SPM Task 26: sandbox-teaching sections collapse under off
+            # (same single-source bool as the tool-face gate at :700).
+            sandbox_tools_enabled=not self._sandbox_provision_off(),
         )
         result = self._prompt_assembler.assemble(
             section_bundle.planner,

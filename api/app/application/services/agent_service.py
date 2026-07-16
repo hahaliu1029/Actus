@@ -13,6 +13,7 @@ from app.application.errors.exceptions import (
     ConflictError,
     ForbiddenError,
     NotFoundError,
+    SandboxDisabledError,
     ServiceUnavailableError,
 )
 from langchain_core.language_models import BaseChatModel
@@ -560,7 +561,16 @@ class AgentService:
                     )
 
                 file_processor_factory = _build_file_processor
-        else:  # always（现状 + PR-1b Eager 包装；off 归 PR-3）
+        elif mode == "off":
+            # off（spec §5.4.0）：无沙箱面——不构造 provisioner/accessor/browser/
+            # FileProcessorRegistry/flusher（四个 file/attachment 变量保持上面初始化
+            # 的 None，互斥面全空）。runner ctor 收 sandbox_accessor=None /
+            # browser_accessor=None / sandbox_provision_mode="off"；runner ctor 的
+            # 双向 assert 锁死装配正确性（off ⟺ 两 accessor 皆 None）。零 lifecycle
+            # 调用、零 metrics（无 provision）——纯聊天 run 全程 INV-SPM-3 零触碰。
+            sandbox_accessor = None
+            browser_accessor = None
+        else:  # always（现状 + PR-1b Eager 包装）
             # r19/codex R19 PART-S-1：非 provisioner 面 outcome 三分类纪律（spec §5.2d）——
             # 既有 acquire/bind/get_browser/registry 全原样包 try/except：取消→cancelled、
             # 异常→failed、成功→ok（否则失败/取消完全不计数，失真）。块内逻辑字节不变。
@@ -1122,13 +1132,21 @@ class AgentService:
                     session_id,
                 )
             elif session is None or session.worker_type == "root":
-                try:
-                    await self._sandbox_lifecycle_service.suspend(session_id)
-                except Exception:
-                    logger.debug(
-                        "on_task_runner_complete: suspend for session %s skipped",
-                        session_id,
-                    )
+                # SPM PR-3 Task 25 (CLASS-3 / U5): off has no sandbox plane — skip
+                # the lifecycle suspend so an always→off migrated historical binding
+                # is never revived/rewritten (INV-SPM-3 zero-touch). The session
+                # status transition (COMPLETED/TIMED_OUT) is written by the runner
+                # BEFORE this callback, so gating ONLY the suspend leaves session
+                # state progression intact. The live-event-sink release below still
+                # runs (registry cleanup, not a lifecycle mutation).
+                if get_settings().sandbox_provision_mode != "off":
+                    try:
+                        await self._sandbox_lifecycle_service.suspend(session_id)
+                    except Exception:
+                        logger.debug(
+                            "on_task_runner_complete: suspend for session %s skipped",
+                            session_id,
+                        )
             else:
                 logger.debug(
                     "on_task_runner_complete: skip suspend session=%s — "
@@ -3102,6 +3120,11 @@ class AgentService:
                     if (
                         self._sandbox_lifecycle_service
                         and session.status in (SessionStatus.COMPLETED, SessionStatus.TIMED_OUT)
+                        # SPM PR-3 Task 25 (CLASS-3 / U5): off has no sandbox plane —
+                        # skip the re-chat resume so an always→off migrated historical
+                        # binding is never revived (INV-SPM-3 zero-touch). The task
+                        # (re)creation + message enqueue below proceed unchanged.
+                        and get_settings().sandbox_provision_mode != "off"
                     ):
                         try:
                             await self._sandbox_lifecycle_service.resume(session.id)
@@ -3207,10 +3230,15 @@ class AgentService:
                             session_id,
                         )
                     elif session.worker_type == "root":
-                        try:
-                            await self._sandbox_lifecycle_service.suspend(session_id)
-                        except Exception:
-                            logger.debug("status-reconcile suspend for %s skipped", session_id)
+                        # SPM PR-3 Task 25 (CLASS-3 / R22): off has no sandbox plane —
+                        # skip the status-reconcile suspend (INV-SPM-3 zero-touch). The
+                        # SSM terminate + COMPLETED transition above already ran; only
+                        # the lifecycle mutation is gated.
+                        if get_settings().sandbox_provision_mode != "off":
+                            try:
+                                await self._sandbox_lifecycle_service.suspend(session_id)
+                            except Exception:
+                                logger.debug("status-reconcile suspend for %s skipped", session_id)
                     else:
                         logger.debug(
                             "status-reconcile: skip suspend %s — worker_type=%s "
@@ -3371,18 +3399,23 @@ class AgentService:
                     session_id,
                 )
             elif session.worker_type == "root":
-                try:
-                    await self._sandbox_lifecycle_service.suspend(session_id)
-                except Exception:
-                    # SPM Task 20 — suspend-on-UNBOUND is expected for on_demand
-                    # pure-chat sessions that never provisioned a sandbox; keep the
-                    # detail at debug so it stops being warning-level noise. Only
-                    # the log level changes — behavior is identical (INV-SPM-2).
-                    logger.debug(
-                        "Failed to suspend sandbox for session %s",
-                        session_id,
-                        exc_info=True,
-                    )
+                # SPM PR-3 Task 25 (CLASS-3 / R22): off has no sandbox plane — skip the
+                # stop-session suspend (INV-SPM-3 zero-touch). The SSM terminate +
+                # supervisor stop + background-slot cleanup above already ran; only the
+                # lifecycle mutation is gated so session state transition is intact.
+                if get_settings().sandbox_provision_mode != "off":
+                    try:
+                        await self._sandbox_lifecycle_service.suspend(session_id)
+                    except Exception:
+                        # SPM Task 20 — suspend-on-UNBOUND is expected for on_demand
+                        # pure-chat sessions that never provisioned a sandbox; keep the
+                        # detail at debug so it stops being warning-level noise. Only
+                        # the log level changes — behavior is identical (INV-SPM-2).
+                        logger.debug(
+                            "Failed to suspend sandbox for session %s",
+                            session_id,
+                            exc_info=True,
+                        )
             else:
                 logger.debug(
                     "stop_session: skip suspend %s — worker_type=%s is not "
@@ -4045,6 +4078,15 @@ end
         user_role: Optional[str] = None,
     ) -> Dict[str, object]:
         """Retry a suspended background task without changing ownership."""
+        # SPM PR-3 Task 28 (spec §5.6 matrix, r14/codex R13(L)): off has no sandbox
+        # plane. retry-from-suspend would drive lifecycle ``resume()`` to revive a
+        # suspended sandbox (INV-SPM-9 whitelist member) — under off that must 409
+        # BEFORE any lifecycle touch. Pre-check at method top (ahead of
+        # ``_get_accessible_session`` + the DESTROYING/SUSPENDED binding guards +
+        # the ``supervisor.resume`` call) so off is zero-touch. This also renders
+        # the two lifecycle writes Task 25 deferred below unreachable under off.
+        if get_settings().sandbox_provision_mode == "off":
+            raise SandboxDisabledError()
         session = await self._get_accessible_session(session_id, user_id, is_admin)
         if session.status != SessionStatus.RUNNING:
             raise BadRequestError("当前会话状态不支持后台重试")
@@ -4647,6 +4689,12 @@ end
         cancel_timeout_seconds: int = TAKEOVER_CANCEL_TIMEOUT_SECONDS,
     ) -> Dict[str, object]:
         """启动会话接管"""
+        # SPM PR-3 Task 28 (spec §5.6 matrix): off has no sandbox plane — takeover
+        # start needs a live sandbox terminal/browser, so 409 SANDBOX_DISABLED
+        # here at method top (INV-SPM-7). read/renew/reject/end/cleanup stay
+        # ungated (they tear down / inspect existing takeover state only).
+        if get_settings().sandbox_provision_mode == "off":
+            raise SandboxDisabledError()
         try:
             control_scope = ControlScope(scope)
         except ValueError as exc:
@@ -5056,6 +5104,11 @@ end
         user_role: Optional[str] = None,
     ):
         """已完成会话的补救接管：completed -> takeover_pending，并调度 pending timeout。"""
+        # SPM PR-3 Task 28 (spec §5.6 matrix): reopen resurrects a completed
+        # session's sandbox for takeover — off has no sandbox plane, so 409
+        # SANDBOX_DISABLED at method top before any state transition (INV-SPM-7).
+        if get_settings().sandbox_provision_mode == "off":
+            raise SandboxDisabledError()
         # scope 在 reopen 阶段故意不传：reopen 仅恢复到 takeover_pending，
         # 具体 scope 在后续 start_takeover 时由用户选择确定
         self._assert_takeover_capability(

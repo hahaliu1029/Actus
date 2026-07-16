@@ -32,9 +32,36 @@ _EN_TEXT = """You are a task execution agent, and you need to complete the follo
 5. Submit Results: Send the result to user, result must be detailed and specific"""
 
 
+# SPM Task 26 off variant: identical 5-step loop with the sandbox-execution
+# phrasing removed from step 3 (tools still execute, just not via a sandbox).
+_ZH_TEXT_OFF = """你是一个任务执行智能体（Agent）, 你需要按照以下步骤完成任务:
+
+1. **分析事件**：理解用户需求和当前状态，重点关注最新的用户消息以及上一步的执行结果。
+2. **选择工具**：根据当前状态和任务规划，选择下一个需要调用的工具。
+3. **等待执行**：选定的工具操作将被实际执行（你只需生成调用指令）。
+4. **循环迭代**：每次迭代原则上只选择一个工具调用，耐心重复上述步骤，直到任务完成。
+5. **提交结果**：将最终结果发送给用户，结果必须详尽且具体。"""
+
+
+_EN_TEXT_OFF = """You are a task execution agent, and you need to complete the following steps:
+1. Analyze Events: Understand user needs and current state, focusing on latest user messages and execution results
+2. Select Tools: Choose the next tool call based on current state and task planning
+3. Wait for Execution: Selected tool action will be executed
+4. Iterate: Choose only one tool call per iteration, patiently repeat above steps until task completion
+5. Submit Results: Send the result to user, result must be detailed and specific"""
+
+
 def _render(ctx: RenderContext) -> SectionOutput:
-    """Return the language-appropriate identity prompt."""
-    text = _EN_TEXT if ctx.lang == "en" else _ZH_TEXT
+    """Return the language-appropriate identity prompt.
+
+    SPM Task 26: when ``sandbox_tools_enabled`` is False (off deployment) the
+    step-3 "executed by sandbox environment" phrasing is dropped. The default
+    True path returns the unchanged constants (INV-SPM-2 byte-identity).
+    """
+    if not ctx.sandbox_tools_enabled:
+        text = _EN_TEXT_OFF if ctx.lang == "en" else _ZH_TEXT_OFF
+    else:
+        text = _EN_TEXT if ctx.lang == "en" else _ZH_TEXT
     return SectionOutput(text=text)
 
 

@@ -1169,6 +1169,18 @@ async def takeover_shell_websocket(
     # Starlette 不允许对未 accept 的 WebSocket 调用 close()。
     await websocket.accept()
 
+    # SPM PR-3 Task 28 (spec §5.6 matrix, lines 216-217 "先 accept … accept 后
+    # status 消息 + close 4409"): off has no sandbox plane, so a takeover shell
+    # WS can never be served. Reject immediately after accept — dominant global
+    # condition, ahead of the takeover_id/auth checks (INV-SPM-7 WS 4409). The
+    # payload uses a string ``code`` (OUR wire, not the REST int Response.code).
+    if get_settings().sandbox_provision_mode == "off":
+        await websocket.send_text(
+            json.dumps({"type": "status", "code": "SANDBOX_DISABLED"}, ensure_ascii=False)
+        )
+        await websocket.close(code=4409, reason="SANDBOX_DISABLED")
+        return
+
     if not takeover_id:
         await websocket.send_text(
             json.dumps({"type": "status", "state": "error", "message": "缺少takeover_id"}, ensure_ascii=False)
@@ -1583,6 +1595,19 @@ async def vnc_websocket(
     # 3.使用对应协议接收websocket连接
     logger.info(f"为会话[{session_id}]开启WebSocket连接")
     await websocket.accept(subprotocol=selected_protocol)
+
+    # SPM PR-3 Task 28 (spec §5.6 matrix, lines 216-217 "accept 后 status 消息 +
+    # close 4409"): off has no sandbox plane. vnc runs auth BEFORE accept, so the
+    # off-check sits right after accept (the earliest point a status message can
+    # be sent) and before ``get_vnc_url`` (which would bind_new a container). The
+    # novnc page's PRIMARY off-detection is the Session GET preflight (§5.8);
+    # 4409 is the server-side backstop (RFB can't read the close code).
+    if get_settings().sandbox_provision_mode == "off":
+        await websocket.send_text(
+            json.dumps({"type": "status", "code": "SANDBOX_DISABLED"}, ensure_ascii=False)
+        )
+        await websocket.close(code=4409, reason="SANDBOX_DISABLED")
+        return
 
     try:
         # 4.获取对应会话的vnc链接

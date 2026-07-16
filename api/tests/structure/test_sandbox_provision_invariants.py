@@ -204,3 +204,96 @@ def test_gate_detects_violation_negative_control(tmp_path) -> None:
     assert _file_calls_lifecycle_method(tree, src, "bind_new")
     assert _file_calls_lifecycle_method(tree, src, "resume")
     assert _file_creates_container(tree, src)
+
+
+# ── SPM Task 24: off tool-face gate must be the terminal assembly step ───────
+#
+# Both final-assembly chains (runner ``_build_lc_tools_full`` + flow
+# ``_collect_all_tools``) must call ``apply_sandbox_capability_gate`` as the LAST
+# statement before ``return`` — any post-gate ``.extend`` would leak a sandbox
+# face tool in off mode. Anchored via AST (a source grep would false-positive on
+# the docstring / import line).
+_GATE_CALL = "apply_sandbox_capability_gate"
+
+
+def _find_function_def(tree: ast.AST, name: str):
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+            return n
+    return None
+
+
+def _stmt_calls(node: ast.AST, callee: str) -> bool:
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id == callee:
+                return True
+            if isinstance(f, ast.Attribute) and f.attr == callee:
+                return True
+    return False
+
+
+def _stmt_has_extend(node: ast.AST) -> bool:
+    for n in ast.walk(node):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "extend"
+        ):
+            return True
+    return False
+
+
+def _gate_is_terminal(func: ast.AST) -> bool:
+    """Gate call is the statement immediately before the final ``return`` AND no
+    ``.extend`` follows it (i.e. nothing re-grows the list after the gate)."""
+    body = func.body
+    if not body or not isinstance(body[-1], ast.Return):
+        return False
+    gate_idx = -1
+    for i, stmt in enumerate(body):
+        if _stmt_calls(stmt, _GATE_CALL):
+            gate_idx = i
+    if gate_idx == -1 or gate_idx != len(body) - 2:
+        return False
+    return not any(_stmt_has_extend(stmt) for stmt in body[gate_idx + 1:])
+
+
+def test_runner_build_lc_tools_full_gate_is_terminal() -> None:
+    path = APP_ROOT / "domain/services/agent_task_runner.py"
+    func = _find_function_def(ast.parse(path.read_text(encoding="utf-8")), "_build_lc_tools_full")
+    assert func is not None, "_build_lc_tools_full not found"
+    assert _gate_is_terminal(func), (
+        "INV-SPM-24: apply_sandbox_capability_gate must be the last stmt before "
+        "return in _build_lc_tools_full (no post-gate .extend)"
+    )
+
+
+def test_flow_collect_all_tools_gate_is_terminal() -> None:
+    path = APP_ROOT / "domain/services/flows/planner_react.py"
+    func = _find_function_def(ast.parse(path.read_text(encoding="utf-8")), "_collect_all_tools")
+    assert func is not None, "_collect_all_tools not found"
+    assert _gate_is_terminal(func), (
+        "INV-SPM-24: apply_sandbox_capability_gate must be the last stmt before "
+        "return in _collect_all_tools (no post-gate .extend)"
+    )
+
+
+def test_gate_terminal_anchor_negative_control() -> None:
+    """反向自证：a chain whose gate is NOT terminal (an extend follows) fails."""
+    leaky = ast.parse(
+        "def f(self):\n"
+        "    tools = []\n"
+        "    tools = apply_sandbox_capability_gate(tools, sandbox_tools_enabled=True)\n"
+        "    tools.extend(more())\n"
+        "    return tools\n"
+    )
+    assert not _gate_is_terminal(_find_function_def(leaky, "f"))
+    ungated = ast.parse(
+        "def g(self):\n"
+        "    tools = []\n"
+        "    tools.extend(more())\n"
+        "    return tools\n"
+    )
+    assert not _gate_is_terminal(_find_function_def(ungated, "g"))

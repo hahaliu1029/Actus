@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Type
 from app.application.errors.exceptions import (
     ForbiddenError,
     NotFoundError,
+    SandboxDisabledError,
     ServerRequestsError,
 )
 from app.domain.errors.sandbox_lifecycle import (
@@ -393,7 +394,12 @@ class SessionService:
         # 3. Lifecycle-managed sandbox destroy (I6: quiesce barrier)
         destroy_error: SandboxLifecycleError | None = None
         for target in delete_targets:
-            if self._lifecycle:
+            # SPM PR-3 Task 25 (CLASS-3): off has no Docker socket — there is no
+            # container to destroy, so skip the lifecycle.destroy (INV-SPM-3
+            # zero-touch; leftover always-time containers are drained by the off
+            # runbook §10.3 pre-switch + TTL). Task/background-slot cleanup and the
+            # session row deletion below proceed unchanged.
+            if self._lifecycle and get_settings().sandbox_provision_mode != "off":
                 try:
                     await self._lifecycle.destroy(target.id, DestroyReason.SESSION_DELETE)
                 except (SandboxAlreadyDestroyed, SandboxBindingMissing) as e:
@@ -493,6 +499,14 @@ class SessionService:
         Raises NotFoundError/ServerRequestsError with user-friendly message
         for all lifecycle error states.
         """
+        # SPM PR-3 Task 28 (spec §5.6 matrix / DD-10): off has no sandbox plane —
+        # the file/download/shell endpoints that route through here MUST 409 with
+        # the SANDBOX_DISABLED sentinel instead of touching the lifecycle service
+        # (INV-SPM-3 zero-touch; INV-SPM-7 off REST 409). Pre-check BEFORE the
+        # ``_lifecycle`` guard and BEFORE any acquire/resume so off never mutates
+        # sandbox state. always / on_demand fall through byte-identically.
+        if get_settings().sandbox_provision_mode == "off":
+            raise SandboxDisabledError()
         if not self._lifecycle:
             raise ServerRequestsError("Sandbox lifecycle service not available")
         try:

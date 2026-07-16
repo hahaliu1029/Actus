@@ -114,10 +114,37 @@ def _json_schema_to_pydantic(
 _SANDBOX_PATH_PREFIX = "/home/ubuntu/"
 
 
+def _sandbox_files_disabled_outcome(kwargs: dict[str, Any]) -> AllowError | None:
+    """SPM Task 24：off 档探测 MCP 工具参数里的沙箱路径。
+
+    任一 str 值以 ``/home/ubuntu/`` 开头 → 返回结构化 disabled ``AllowError``
+    （「本部署未启用沙箱文件系统」，match module 的 outcome 约定），调用方短路：
+    **不上传、不透传路径、不发 MCP invoke、不抛裸异常**。无沙箱路径参数 → None
+    （纯远程 MCP 工具不受影响，正常执行）。
+    """
+    for value in kwargs.values():
+        if isinstance(value, str) and value.startswith(_SANDBOX_PATH_PREFIX):
+            message = (
+                "本部署未启用沙箱文件系统（sandbox_provision_mode=off），"
+                f"无法处理沙箱路径参数：{value}"
+            )
+            return AllowError(
+                content=message,
+                reason=DecisionReason(
+                    type="exception",
+                    code="sandbox_files_disabled",
+                    message=message,
+                ),
+            )
+    return None
+
+
 async def _resolve_sandbox_paths(
     kwargs: dict[str, Any],
     url_map: dict[str, str],
     sandbox_file_uploader: Any | None = None,
+    *,
+    sandbox_files_enabled: bool = True,
 ) -> dict[str, Any]:
     """Replace sandbox file paths in MCP tool arguments with presigned URLs.
 
@@ -126,6 +153,12 @@ async def _resolve_sandbox_paths(
     2. Dynamic: path starts with /home/ubuntu/ but not in url_map (agent-generated
        files, e.g. extracted from zip) → download from sandbox, upload to storage,
        get presigned URL, cache in url_map for future calls
+
+    ``sandbox_files_enabled``（SPM Task 24，R22-U4：显式 flag，**非** ``uploader is
+    None`` 推断——always 无 uploader 时同样传 None，None 不可区分 off/always）：off
+    档为 ``False``，此时**不触发动态上传**（沙箱 FS 未启用）。``_make_mcp_coroutine``
+    已在上游对含沙箱路径的调用短路结构化拒绝，此处 flag 仅做防御性跳过 upload 分支
+    （always ``True`` → 逐字节不变）。
     """
     resolved = {}
     for key, value in kwargs.items():
@@ -139,7 +172,7 @@ async def _resolve_sandbox_paths(
             continue
 
         # Path 2: dynamic upload for agent-generated sandbox files
-        if sandbox_file_uploader is not None:
+        if sandbox_files_enabled and sandbox_file_uploader is not None:
             try:
                 url = await sandbox_file_uploader(value)
                 if url:
@@ -162,16 +195,31 @@ def _make_mcp_coroutine(
     tool_name: str,
     url_map_ref: Any | None = None,
     sandbox_file_uploader: Any | None = None,
+    *,
+    sandbox_files_enabled: bool = True,
 ):
-    """为每个 MCP tool 创建独立的协程，通过闭包绑定 tool_name。"""
+    """为每个 MCP tool 创建独立的协程，通过闭包绑定 tool_name。
+
+    ``sandbox_files_enabled``（SPM Task 24）：off 档为 ``False``——含 ``/home/ubuntu``
+    路径参数的调用**在发 MCP invoke 之前**短路结构化拒绝。该检测独立于
+    ``url_map_ref``（flow 独立装配链不传 url_map_ref，仍须能拒绝），确保两条装配链
+    统一收口。always / on_demand（``True``）跳过该分支 → 逐字节不变。
+    """
 
     async def _invoke(**kwargs: Any) -> tuple[str, ToolOutcome]:
+        # SPM Task 24: off 档——沙箱文件系统未启用。任一沙箱路径参数直接结构化
+        # 拒绝（不上传、不透传、不发 MCP invoke），独立于 url_map_ref 布线。
+        if not sandbox_files_enabled:
+            disabled = _sandbox_files_disabled_outcome(kwargs)
+            if disabled is not None:
+                return disabled.content, disabled
         # Resolve sandbox paths → presigned URLs before calling MCP server
         if url_map_ref is not None:
             try:
                 url_map = url_map_ref()
                 kwargs = await _resolve_sandbox_paths(
                     kwargs, url_map, sandbox_file_uploader,
+                    sandbox_files_enabled=sandbox_files_enabled,
                 )
             except Exception:
                 pass  # Don't break tool call if resolution fails
@@ -248,6 +296,8 @@ def create_mcp_langchain_tools(
     tool_names: set[str] | None = None,
     url_map_ref: Any | None = None,
     sandbox_file_uploader: Any | None = None,
+    *,
+    sandbox_files_enabled: bool = True,
 ) -> list[StructuredTool]:
     """Convert MCPTool's registered tools into LangChain StructuredTool instances.
 
@@ -259,6 +309,12 @@ def create_mcp_langchain_tools(
         sandbox paths to presigned URLs, for automatic path resolution.
     sandbox_file_uploader : optional async callable(sandbox_path) -> presigned_url
         for dynamically uploading agent-generated sandbox files to storage.
+    sandbox_files_enabled : SPM Task 24 explicit off-mode flag. ``False`` (off)
+        makes every generated tool refuse ``/home/ubuntu`` path arguments with a
+        structured disabled outcome (no upload / no passthrough). ``True`` (default,
+        always / on_demand) is byte-identical to the pre-Task-24 behavior. BOTH
+        assembly chains (runner ``_build_lc_tools_full`` + flow ``_collect_mcp_tools``)
+        thread this flag.
     """
     tools: list[StructuredTool] = []
 
@@ -281,6 +337,7 @@ def create_mcp_langchain_tools(
                     mcp_tool, name,
                     url_map_ref=url_map_ref,
                     sandbox_file_uploader=sandbox_file_uploader,
+                    sandbox_files_enabled=sandbox_files_enabled,
                 ),
                 name=name,
                 description=description,
