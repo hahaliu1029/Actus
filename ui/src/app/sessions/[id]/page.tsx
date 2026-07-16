@@ -897,6 +897,11 @@ export default function SessionPage() {
     () => isSandboxDestroyed(eventList),
     [eventList]
   );
+  // SPM Task 30 (contract A): off deployments have no sandbox → the whole
+  // workbench area (which carries the VNC link + takeover entry) is withheld,
+  // and sandbox-only file rows disable their download/preview actions (they
+  // would 409). Absent / always / on_demand keep the current behavior.
+  const sandboxOff = visibleSession?.sandbox_mode === "off";
   const workbenchVisible = (!isMobile && desktopWorkbenchVisible) || (isMobile && mobileWorkbenchOpen);
   const isCurrentSessionStreaming = Boolean(sessionId) && isChatting && chatSessionId === sessionId;
   const isBackgroundSuspended =
@@ -1520,6 +1525,7 @@ export default function SessionPage() {
               summary={progressSummary}
               files={currentSessionFiles}
               running={sessionRunning}
+              sandboxOff={sandboxOff}
               onPreviewFile={handleTaskDockPreviewFile}
               onDownloadFile={handleTaskDockDownloadFile}
             />
@@ -1559,7 +1565,7 @@ export default function SessionPage() {
           </div>
         </main>
 
-        {!isMobile && desktopWorkbenchVisible ? (
+        {!isMobile && desktopWorkbenchVisible && !sandboxOff ? (
           <aside className="sticky top-[84px] hidden h-[calc(100vh-104px)] min-h-[620px] w-[620px] shrink-0 self-start lg:block xl:w-[660px]">
             <WorkbenchPanel
               sessionId={sessionId}
@@ -1578,17 +1584,19 @@ export default function SessionPage() {
 
       <Sheet open={mobileWorkbenchOpen} onOpenChange={setMobileWorkbenchOpen}>
         <SheetContent side="right" className="w-full max-w-none border-l-border p-3 sm:max-w-[620px]">
-          <WorkbenchPanel
-            sessionId={sessionId}
-            status={visibleSession?.status || "pending"}
-            takeoverId={takeoverMeta.takeoverId}
-            takeoverScope={takeoverMeta.takeoverScope}
-            takeoverExpiresAt={takeoverMeta.takeoverExpiresAt}
-            snapshots={workbenchSnapshots}
-            running={sessionRunning}
-            visible={mobileWorkbenchOpen}
-            onPreviewImage={handlePreviewImage}
-          />
+          {sandboxOff ? null : (
+            <WorkbenchPanel
+              sessionId={sessionId}
+              status={visibleSession?.status || "pending"}
+              takeoverId={takeoverMeta.takeoverId}
+              takeoverScope={takeoverMeta.takeoverScope}
+              takeoverExpiresAt={takeoverMeta.takeoverExpiresAt}
+              snapshots={workbenchSnapshots}
+              running={sessionRunning}
+              visible={mobileWorkbenchOpen}
+              onPreviewImage={handlePreviewImage}
+            />
+          )}
         </SheetContent>
       </Sheet>
 

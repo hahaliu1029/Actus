@@ -499,8 +499,9 @@ def _sandbox_provision_off() -> bool:
     read that feeds ``build_render_context(sandbox_tools_enabled=...)`` from the
     graph nodes (which have no ``self``). Settings unavailable (tests bypassing
     lifespan) → False, i.e. keep the full sandbox-teaching prompt, locking
-    always / on_demand byte-identity. ``off`` is config-rejected today, so this
-    is always False in practice.
+    always / on_demand byte-identity. ``off`` is a first-class mode since PR-4 /
+    Task 32; for off deployments this returns True and drives the sandbox-free
+    prompt variant.
     """
     try:
         from core.config import get_settings

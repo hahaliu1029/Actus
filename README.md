@@ -83,6 +83,7 @@ Actus 由三个核心运行时组成：
 ### 前置条件
 
 - Docker Engine + Docker Compose v2
+  - off 档部署需 Docker Compose ≥ 2.24.4（`!override` YAML 标签，见 `docs/runbooks/sandbox-off-runbook.md`）
 - 至少 6 GB 可用内存
 - 一个可用的 LLM API Key（启动后在设置页填写，或预写入运行时配置）
 

@@ -5,6 +5,7 @@ type MockSession = {
   session_id: string;
   title: string | null;
   status: "pending" | "running" | "waiting" | "completed" | "timed_out";
+  sandbox_mode?: "always" | "on_demand" | "off";
   supervisor_snapshot?: {
     execution_mode: "foreground" | "background";
     execution_phase: string;
@@ -123,9 +124,22 @@ vi.mock("@/components/session/merged-timeline-panel", () => ({
   MergedTimelinePanel: () => <div data-testid="merged-timeline-panel" />,
 }));
 
-vi.mock("@/components/session-task-dock", () => ({
-  SessionTaskDock: () => <div data-testid="session-task-dock" />,
-}));
+// SPM Task 30: wrap the REAL SessionTaskDock so the off-mode file-row disabling
+// (contract A4) is exercised end-to-end, while keeping the `session-task-dock`
+// testid available for pre-existing layout assertions.
+vi.mock("@/components/session-task-dock", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/session-task-dock")>();
+  return {
+    SessionTaskDock: (
+      props: React.ComponentProps<typeof actual.SessionTaskDock>
+    ) => (
+      <div data-testid="session-task-dock">
+        <actual.SessionTaskDock {...props} />
+      </div>
+    ),
+  };
+});
 
 vi.mock("@/components/workbench-panel", () => ({
   WorkbenchPanel: () => <div data-testid="workbench-panel" />,
@@ -783,6 +797,202 @@ describe("SessionPage", () => {
       expect(screen.queryByText(/文件：/)).not.toBeInTheDocument(); // 默认折叠
       fireEvent.click(screen.getByRole("button", { name: /已读取文件/ }));
       expect(screen.getByText(/文件：/)).toBeInTheDocument(); // override 写入并展开
+    });
+  });
+
+  describe("SPM Task 30: off 门控", () => {
+    const planEvent = {
+      event: "plan",
+      data: { steps: [{ id: "s1", description: "步骤一", status: "completed" }] },
+    };
+    // sandbox-only (no MinIO key) → both download + preview 409 in off.
+    const sandboxOnlyFile = {
+      id: "f-sandbox",
+      filename: "report.pdf",
+      filepath: "/home/ubuntu/report.pdf",
+      key: "",
+      extension: "pdf",
+      mime_type: "application/pdf",
+      size: 100,
+    };
+    // has MinIO key + image/pdf → download + preview both go via MinIO → usable.
+    const hasKeyImageFile = {
+      id: "f-minio-img",
+      filename: "chart.png",
+      filepath: "/home/ubuntu/chart.png",
+      key: "minio-key-1",
+      extension: "png",
+      mime_type: "image/png",
+      size: 200,
+    };
+    // has MinIO key but TEXT → download via MinIO OK, but text preview always
+    // routes through the sandbox (viewFile) → preview disabled in off.
+    const hasKeyTextFile = {
+      id: "f-minio-txt",
+      filename: "notes.txt",
+      filepath: "/home/ubuntu/notes.txt",
+      key: "minio-key-2",
+      extension: "txt",
+      mime_type: "text/plain",
+      size: 300,
+    };
+
+    beforeEach(() => {
+      document.documentElement.lang = "zh";
+    });
+
+    it("off 会话隐藏 WorkbenchPanel（沙箱区/VNC 链接/接管入口整块不渲染）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "completed",
+        sandbox_mode: "off",
+        events: [],
+      };
+
+      render(<SessionPage />);
+
+      expect(screen.queryAllByTestId("workbench-panel")).toHaveLength(0);
+    });
+
+    it.each<"always" | "on_demand" | undefined>(["always", "on_demand", undefined])(
+      "非 off (%s) 会话仍渲染 WorkbenchPanel（回归）",
+      (mode) => {
+        sessionStoreState.currentSession = {
+          session_id: "s-b",
+          title: "B 会话",
+          status: "completed",
+          sandbox_mode: mode,
+          events: [],
+        };
+
+        render(<SessionPage />);
+
+        expect(
+          screen.queryAllByTestId("workbench-panel").length
+        ).toBeGreaterThan(0);
+      }
+    );
+
+    it("off 会话中 sandbox-only 文件行照常渲染但下载与预览按钮均禁用并带 tooltip", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "completed",
+        sandbox_mode: "off",
+        events: [planEvent],
+      };
+      sessionStoreState.currentSessionFiles = [sandboxOnlyFile, hasKeyImageFile];
+
+      render(<SessionPage />);
+
+      fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+      fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+
+      // 行照常渲染（文件名可见）
+      expect(screen.getByText("report.pdf")).toBeInTheDocument();
+
+      const sandboxDownload = screen.getByRole("button", {
+        name: "下载文件 report.pdf",
+      });
+      expect(sandboxDownload).toBeDisabled();
+      expect(sandboxDownload).toHaveAttribute("title", "本部署未启用沙箱");
+
+      const sandboxPreview = screen.getByRole("button", {
+        name: "预览文件 report.pdf",
+      });
+      expect(sandboxPreview).toBeDisabled();
+      expect(sandboxPreview).toHaveAttribute("title", "本部署未启用沙箱");
+    });
+
+    it("off 会话中有 MinIO key 的图片文件下载与预览均可用（走 MinIO 通路）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "completed",
+        sandbox_mode: "off",
+        events: [planEvent],
+      };
+      sessionStoreState.currentSessionFiles = [hasKeyImageFile];
+
+      render(<SessionPage />);
+
+      fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+      fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+
+      // 有 MinIO key 且图片 → 下载与预览均走 MinIO 通路（downloadFile），不被门控
+      expect(
+        screen.getByRole("button", { name: "下载文件 chart.png" })
+      ).not.toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "预览文件 chart.png" })
+      ).not.toBeDisabled();
+    });
+
+    it("off 会话中有 MinIO key 的文本文件下载可用但预览禁用（viewFile 走沙箱）带 tooltip", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "completed",
+        sandbox_mode: "off",
+        events: [planEvent],
+      };
+      sessionStoreState.currentSessionFiles = [hasKeyTextFile];
+
+      render(<SessionPage />);
+
+      fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+      fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+
+      // 有 MinIO key → 下载走 MinIO 通路，可用
+      expect(
+        screen.getByRole("button", { name: "下载文件 notes.txt" })
+      ).not.toBeDisabled();
+      // 文本预览只有沙箱通路（sessionApi.viewFile），off 下禁用并带 tooltip
+      const preview = screen.getByRole("button", { name: "预览文件 notes.txt" });
+      expect(preview).toBeDisabled();
+      expect(preview).toHaveAttribute("title", "本部署未启用沙箱");
+    });
+
+    it("非 off 会话中 sandbox-only 文件行下载按钮不禁用（回归）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "completed",
+        events: [planEvent],
+      };
+      sessionStoreState.currentSessionFiles = [sandboxOnlyFile];
+
+      render(<SessionPage />);
+
+      fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+      fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+
+      expect(
+        screen.getByRole("button", { name: "下载文件 report.pdf" })
+      ).not.toBeDisabled();
+    });
+
+    it("非 off 会话中有 MinIO key 的文本文件预览按钮可用（回归对偶）", () => {
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "completed",
+        sandbox_mode: "always",
+        events: [planEvent],
+      };
+      sessionStoreState.currentSessionFiles = [hasKeyTextFile];
+
+      render(<SessionPage />);
+
+      fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+      fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+
+      // 非 off：文本预览的沙箱通路（sessionApi.viewFile）可用 → 预览按钮不禁用
+      // （T30 review Minor-1：off 组「文本文件预览禁用」测试的回归对偶）。
+      expect(
+        screen.getByRole("button", { name: "预览文件 notes.txt" })
+      ).not.toBeDisabled();
     });
   });
 });

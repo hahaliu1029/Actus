@@ -1,11 +1,12 @@
-"""SPM Task 12/23 — sandbox_provision_mode 三态 config validator + off×coordinator
+"""SPM Task 12/23/32 — sandbox_provision_mode 三态 config validator + off×coordinator
 启动互斥校验的单元测试。
 
-- config validator：PR-2 阶段 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always",
-  "on_demand"}``（Task 23 解锁 on_demand），故 on_demand 被接受、off 仍被 validator
-  拒绝（off 在 PR-4 解锁）。
+- config validator：终态 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always",
+  "on_demand", "off"}``（Task 32 解锁 off，梯度收官）——三档全部被 validator 接受并
+  按既有 normalize（strip + lower）归一；非法值（如 "lazy"、空串）仍被拒。
 - exclusion：``check_sandbox_off_flag_exclusion`` 在 mode=="off" 时对三个 **env-only**
-  coordinator flag helper（非 Settings 属性）做 fail-fast 互斥（SPM DD-6）。
+  coordinator flag helper（非 Settings 属性）做 fail-fast 互斥（SPM DD-6）。此组与
+  ALLOWED 解锁正交（用 ``model_construct`` 绕过 validator），解锁后仍全绿。
 
 构造方式照抄同目录 ``test_config_extension_governance_mode.py`` / ``test_sandbox_strict_caps_flag.py``
 的 ``Settings(env="test", ...)`` 风格。
@@ -42,10 +43,29 @@ class TestSandboxProvisionModeConfig:
             == "on_demand"
         )
 
-    def test_off_rejected_while_not_allowed(self):
-        """DD-22 阶段语义：PR-2 阶段 off 仍必须被拒（PR-4 解锁）。"""
-        with pytest.raises(ValidationError):
-            Settings(env="test", sandbox_provision_mode="off")
+    def test_final_allowed_values_accept_three_reject_invalid(self):
+        """DD-22 终态（Task 32）：``SANDBOX_PROVISION_MODE_ALLOWED`` 解锁为三值全集
+        ``{"always", "on_demand", "off"}`` —— 三档全部被 validator 接受（含 case/
+        whitespace normalize），非法值仍被拒。
+
+        取代 PR-2 阶段的 ``test_off_rejected_while_not_allowed``（彼时 off 尚未进
+        ALLOWED、被 validator fail-fast 拒）。off×coordinator 启动互斥
+        （``TestOffCoordinatorExclusion``）与本解锁正交，仍全绿。"""
+        # 三档全接受，且各自 round-trip 原值。
+        for mode in ("always", "on_demand", "off"):
+            assert (
+                Settings(env="test", sandbox_provision_mode=mode).sandbox_provision_mode
+                == mode
+            )
+        # off 也走既有 normalize（strip + lower）——大小写/空白变体归一为 "off"。
+        assert (
+            Settings(env="test", sandbox_provision_mode=" OFF ").sandbox_provision_mode
+            == "off"
+        )
+        # 非法值仍拒（validator 语义不因解锁而放宽：空串、拼写错误、旧枚举名）。
+        for bad in ("lazy", "", "disabled"):
+            with pytest.raises(ValidationError):
+                Settings(env="test", sandbox_provision_mode=bad)
 
     def test_normalizes_case_whitespace(self):
         assert (
@@ -64,13 +84,13 @@ _C2_FLAGS = (
 
 
 def _mk_settings(mode: str) -> Settings:
-    """构造指定 provision_mode 的 Settings。
+    """构造指定 provision_mode 的 Settings（绕过 validator 直接注入）。
 
-    PR-2 阶段 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always", "on_demand"}``，validator
-    仍会拒 "off"（PR-4 才解锁）。这里用 ``model_construct`` 绕过 validator 直接注入
+    这里用 ``model_construct`` 绕过 **所有** validator 直接注入
     ``sandbox_provision_mode`` —— 本组测试验证的是 ``check_sandbox_off_flag_exclusion``
-    的分支逻辑（只读 ``.sandbox_provision_mode``），validator 本身由
-    ``TestSandboxProvisionModeConfig`` 覆盖，二者关注点分离。
+    的分支逻辑（只读 ``.sandbox_provision_mode``），validator 本身（三档全接受、非法
+    值拒）由 ``TestSandboxProvisionModeConfig`` 覆盖，二者关注点分离。终态下 off 已进
+    ALLOWED，``model_construct`` 仍是把注入与 validation 关注点解耦的最短路径。
     """
     return Settings.model_construct(sandbox_provision_mode=mode)
 

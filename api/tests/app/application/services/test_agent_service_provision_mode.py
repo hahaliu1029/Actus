@@ -223,11 +223,12 @@ class _Env:
 @pytest.fixture
 def agent_service_env(monkeypatch):
     def _make(*, mode: str = "always", requester_id: str | None = None):
-        # monkeypatch settings mode + ALLOWED (bypass the field validator gate).
-        # on_demand is unlocked in the production ALLOWED set since PR-2; `off`
-        # stays REJECTED at the config layer (ALLOWED={always,on_demand}) until
-        # PR-4, so the monkeypatched ALLOWED below is still required to unit-test
-        # the off runtime code path.
+        # Force the process settings singleton to ``mode`` for the code path under
+        # test. Setting the attribute directly on the instance bypasses the
+        # constructor field validator, so all three modes are injectable. `off` is
+        # now a first-class value in the production ALLOWED set (unlocked in PR-4 /
+        # Task 32); the ALLOWED pin below is redundant with production but kept as
+        # an explicit, self-contained anchor of the terminal three-value set.
         from core.config import Settings, get_settings
 
         settings = get_settings()
@@ -375,9 +376,11 @@ class TestCreateTaskProvisionFork:
 
 
 def _set_mode(monkeypatch, mode: str) -> None:
-    """Monkeypatch the process settings singleton to ``mode`` and unlock the
-    ALLOWED set so the config field-validator (which still REJECTS ``off`` until
-    PR-4) doesn't block the runtime code path under test."""
+    """Monkeypatch the process settings singleton to ``mode``. ``off`` is now a
+    first-class value in the production ALLOWED set (unlocked in PR-4 / Task 32);
+    the ALLOWED pin is redundant with production but kept as an explicit anchor of
+    the terminal three-value set. Setting the attribute directly on the instance
+    also bypasses the constructor field-validator regardless of mode."""
     from core.config import Settings, get_settings
 
     settings = get_settings()

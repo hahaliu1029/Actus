@@ -1,18 +1,61 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 
-import { VNCViewer } from "@/components/vnc-viewer";
+import { VNCViewer, type VNCStatus } from "@/components/vnc-viewer";
+import { sessionApi } from "@/lib/api/session";
 import { useAuthStore } from "@/lib/store/auth-store";
 import { buildVNCProxyUrl } from "@/lib/vnc/url";
+import { t } from "@/lib/i18n";
+
+// SPM Task 30 (contract B): the direct `/novnc` URL runs a Session GET preflight
+// before creating any RFB. off → disabled copy, no VNCViewer. We do NOT rely on
+// WS close codes (RFB does not surface them — DD-21); preflight is the sole off
+// judgement source.
+type PreflightPhase = "loading" | "error" | "off" | "ready";
+
+// SPM Task 30 (contract C): map the VNC status enum to i18n copy at the page.
+const STATUS_KEY: Record<VNCStatus, string> = {
+  connecting: "novnc.connecting",
+  connected: "novnc.connected",
+  disconnected: "novnc.disconnected",
+  error: "novnc.connectionError",
+};
 
 export default function NoVNCPage() {
   const params = useParams<{ id: string }>();
   const accessToken = useAuthStore((state) => state.accessToken);
-  const [status, setStatus] = useState("正在连接...");
+  const [status, setStatus] = useState<VNCStatus>("connecting");
+  const [preflight, setPreflight] = useState<PreflightPhase>("loading");
 
   const sessionId = params?.id;
+
+  useEffect(() => {
+    if (!sessionId || !accessToken) {
+      return;
+    }
+    // Initial state is already "loading"; the async resolution below drives the
+    // terminal phase (react-hooks/set-state-in-effect forbids a sync reset here,
+    // and the effect only re-runs when sessionId/accessToken change).
+    let cancelled = false;
+    sessionApi
+      .getSession(sessionId)
+      .then((session) => {
+        if (cancelled) {
+          return;
+        }
+        setPreflight(session.sandbox_mode === "off" ? "off" : "ready");
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPreflight("error");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, accessToken]);
 
   const vncUrl = useMemo(() => {
     if (!sessionId || !accessToken) {
@@ -37,7 +80,31 @@ export default function NoVNCPage() {
     );
   }
 
-  const isConnected = status === "VNC 连接成功";
+  if (preflight === "loading") {
+    return (
+      <div className="flex h-screen items-center justify-center bg-black">
+        <div className="text-sm text-white/80">{t("novnc.preflightLoading")}</div>
+      </div>
+    );
+  }
+
+  if (preflight === "error") {
+    return (
+      <div className="flex h-screen items-center justify-center bg-black">
+        <div className="text-sm text-red-500">{t("novnc.preflightError")}</div>
+      </div>
+    );
+  }
+
+  if (preflight === "off") {
+    return (
+      <div className="flex h-screen items-center justify-center bg-black">
+        <div className="text-sm text-white/80">{t("sandbox.disabled")}</div>
+      </div>
+    );
+  }
+
+  const isConnected = status === "connected";
 
   return (
     <div className="relative h-screen w-full overflow-hidden bg-black">
@@ -50,9 +117,7 @@ export default function NoVNCPage() {
               : "animate-pulse bg-yellow-500"
           }`}
         />
-        <span className="text-xs text-white/80">
-          {isConnected ? "已连接" : "连接中..."}
-        </span>
+        <span className="text-xs text-white/80">{t(STATUS_KEY[status])}</span>
       </div>
       <VNCViewer url={vncUrl} viewOnly={false} onStatus={setStatus} />
     </div>

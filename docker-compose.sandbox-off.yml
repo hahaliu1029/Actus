@@ -1,0 +1,21 @@
+# docker-compose.sandbox-off.yml — canonical off deployment override (see runbook)
+# Requires Docker Compose >= 2.24.4 (!override YAML tag)
+services:
+  api:
+    environment:
+      SANDBOX_PROVISION_MODE: "off"   # literal-pin: kills "override file + default always" drift
+    depends_on: !override             # NOT !reset (renders null on Compose v5.2.0, drops ALL deps)
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      # base has 4 entries; the ONLY deletion is sandbox-image. Conditions copied verbatim.
+    volumes: !override                # literal re-declaration is list-merge; must !override full list
+      - api-data:/app/data
+      - ./api/config.yaml:/app/data/config.yaml
+      - ${MEMORY_ROOT_HOST:?MEMORY_ROOT_HOST is required and must be an absolute host path}:${MEMORY_ROOT_CONTAINER:-/app/data/memory}
+      # base has 4 entries; the ONLY deletion is /var/run/docker.sock:/var/run/docker.sock.
+  sandbox-image:
+    profiles: ["sandbox-build"]       # de-activate: deleting depends_on alone doesn't stop `up --build` selecting it

@@ -64,8 +64,9 @@ def get_prompt_bundle(
     chain, or ``/home/ubuntu`` paths) are swapped for sandbox-agnostic variants
     so an ``off`` deployment never advertises tools it does not have. The
     default True path returns the unchanged on-variant constants and MUST stay
-    byte-identical (``off`` is config-rejected today, so True is the only path
-    that runs in production). The bundle is rebuilt per call (no cache), so no
+    byte-identical (INV-SPM-2: the on-variant golden must never drift; ``off`` is
+    a first-class mode since PR-4 / Task 32 and drives the False path). The
+    bundle is rebuilt per call (no cache), so no
     keying by flag is needed — on/off namespaces never share state.
     """
     normalized = (lang or "zh").lower().strip()

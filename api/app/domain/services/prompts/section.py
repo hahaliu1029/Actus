@@ -135,8 +135,8 @@ class RenderContext:
     A **deployment constant** derived once from settings
     (``sandbox_provision_mode != "off"``) — NOT per-step state — so the
     cacheable sections that read it (``identity`` / ``behavior_core`` /
-    ``output_format``) stay cacheable (DD-7). ``True`` (always / on_demand;
-    ``off`` is config-rejected today) selects the current sandbox-teaching
+    ``output_format``) stay cacheable (DD-7). ``True`` (always / on_demand)
+    selects the current sandbox-teaching
     prose, keeping every existing render byte-identical (INV-SPM-2). ``False``
     (off) selects the sandbox-free variant that removes shell/browser/takeover/
     skill-creation teaching and rewords the MCP-over-browser/terminal

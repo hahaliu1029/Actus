@@ -36,5 +36,13 @@
     "notStarted": "沙箱未启动——首次需要时自动创建",
     "provisionFailed": "沙箱启动失败，将在下次需要时重试",
     "disabled": "本部署未启用沙箱"
+  },
+  "novnc": {
+    "preflightLoading": "检查沙箱状态…",
+    "preflightError": "无法获取会话信息",
+    "connecting": "连接中…",
+    "connected": "已连接",
+    "disconnected": "连接已断开",
+    "connectionError": "VNC 连接异常断开"
   }
 }

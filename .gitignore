@@ -74,6 +74,10 @@ docs/*
 !docs/shell-mode/
 docs/shell-mode/*
 !docs/shell-mode/c2-shell-mode.md
+# [SPM PR-4] Same pattern for the checked-in sandbox off deployment runbook.
+!docs/runbooks/
+docs/runbooks/*
+!docs/runbooks/sandbox-off-runbook.md
 
 # Git worktrees
 .worktrees/

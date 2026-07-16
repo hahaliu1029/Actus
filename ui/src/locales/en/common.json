@@ -36,5 +36,13 @@
     "notStarted": "Sandbox not started — created on first use",
     "provisionFailed": "Sandbox failed to start — will retry on next use",
     "disabled": "Sandbox is disabled in this deployment"
+  },
+  "novnc": {
+    "preflightLoading": "Checking sandbox status…",
+    "preflightError": "Failed to load session info",
+    "connecting": "Connecting…",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "connectionError": "VNC connection lost"
   }
 }

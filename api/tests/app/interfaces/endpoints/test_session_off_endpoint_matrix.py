@@ -46,8 +46,10 @@ def anyio_backend() -> str:
 
 
 def _set_off(monkeypatch) -> None:
-    """Force ``sandbox_provision_mode='off'`` on the process settings singleton
-    (config still REJECTS off until PR-4, so also unlock ALLOWED)."""
+    """Force ``sandbox_provision_mode='off'`` on the process settings singleton.
+    ``off`` is now a first-class value in the production ALLOWED set (unlocked in
+    PR-4 / Task 32); the ALLOWED pin below is redundant with production but kept as
+    an explicit anchor of the terminal three-value set."""
     from core.config import Settings, get_settings
 
     settings = get_settings()

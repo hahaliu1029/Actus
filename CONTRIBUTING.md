@@ -26,7 +26,7 @@
 
 - Python 3.12（后端）
 - Node.js 22+（前端）
-- Docker + Docker Compose v2
+- Docker + Docker Compose v2（off 档部署需 Docker Compose ≥ 2.24.4，`!override` YAML 标签）
 - PostgreSQL、Redis
 
 ## 开发方式建议

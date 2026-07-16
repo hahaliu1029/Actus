@@ -143,6 +143,17 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
     );
     return started ? "none" : "notStarted";
   });
+  // SPM Task 30 (contract A): off deployments have no sandbox, so the VNC link
+  // and the (start-)takeover entry — both provision triggers that would
+  // 409/4409 — are hidden. Scoped to the viewed session like `sandboxAffordance`.
+  // Defense-in-depth: `page.tsx` already withholds the whole panel in off, this
+  // keeps the panel self-protecting if ever mounted with an off session.
+  const sandboxOff = useSessionStore((state) => {
+    const cs = state.currentSession;
+    return Boolean(
+      cs && cs.session_id === sessionId && cs.sandbox_mode === "off"
+    );
+  });
   const setMessage = useUIStore((state) => state.setMessage);
   const accessToken = useAuthStore((state) => state.accessToken);
 
@@ -536,7 +547,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
       <div className="mb-3 flex items-center justify-between gap-2">
         <h2 className="text-[32px] font-semibold tracking-tight text-foreground">Actus 的电脑</h2>
         <div className="flex items-center gap-2">
-          {canStartTakeover ? (
+          {canStartTakeover && !sandboxOff ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -637,15 +648,17 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
             </span>
           ) : null}
 
-          <Link
-            href={`/sessions/${sessionId}/novnc`}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center rounded-xl border border-border bg-card p-2 text-muted-foreground transition-colors hover:bg-accent"
-            title="打开实时窗口（VNC）"
-          >
-            <Expand size={16} />
-          </Link>
+          {sandboxOff ? null : (
+            <Link
+              href={`/sessions/${sessionId}/novnc`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center rounded-xl border border-border bg-card p-2 text-muted-foreground transition-colors hover:bg-accent"
+              title="打开实时窗口（VNC）"
+            >
+              <Expand size={16} />
+            </Link>
+          )}
         </div>
       </div>
 

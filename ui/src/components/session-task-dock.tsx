@@ -5,8 +5,10 @@ import { memo, useMemo, useState } from "react";
 
 import { StatusIndicator } from "@/components/status-indicator";
 import type { FileInfo } from "@/lib/api/types";
+import { t } from "@/lib/i18n";
 import {
   formatFileSize,
+  getFilePreviewKind,
   type SessionProgressSummary,
 } from "@/lib/session-ui";
 import { getStepStatusMeta } from "@/lib/status-copy";
@@ -16,15 +18,44 @@ type SessionTaskDockProps = {
   summary: SessionProgressSummary | null;
   files: FileInfo[];
   running?: boolean;
+  /**
+   * SPM Task 30 (contract A4): off deployments have no sandbox. Rows still
+   * render, but actions whose consumption path routes through the sandbox
+   * (which would 409) are disabled with a tooltip. See {@link sandboxFileActionGate}.
+   */
+  sandboxOff?: boolean;
   onPreviewFile: (file: FileInfo) => void;
   onDownloadFile: (file: FileInfo) => void;
   className?: string;
 };
 
+/**
+ * SPM Task 30 (contract A4) off-mode action gating, split by consumption path:
+ * - download: only a sandbox-only file (no MinIO key) 409s (`downloadSandboxFile`);
+ *   a file with a MinIO key downloads via the MinIO path (`downloadFile`).
+ * - preview: text preview always routes through the sandbox (`viewFile`, no MinIO
+ *   text path), so any text file 409s in off; image/pdf preview uses the MinIO
+ *   path when a key exists. So preview is disabled for sandbox-only OR text files.
+ */
+function sandboxFileActionGate(
+  file: FileInfo,
+  sandboxOff: boolean
+): { downloadDisabled: boolean; previewDisabled: boolean } {
+  if (!sandboxOff) {
+    return { downloadDisabled: false, previewDisabled: false };
+  }
+  const sandboxOnly = !file.key && Boolean(file.filepath);
+  return {
+    downloadDisabled: sandboxOnly,
+    previewDisabled: sandboxOnly || getFilePreviewKind(file) === "text",
+  };
+}
+
 export const SessionTaskDock = memo(function SessionTaskDock({
   summary,
   files,
   running = false,
+  sandboxOff = false,
   onPreviewFile,
   onDownloadFile,
   className,
@@ -157,33 +188,42 @@ export const SessionTaskDock = memo(function SessionTaskDock({
                       暂无文件
                     </p>
                   ) : (
-                    sortedFiles.map((file) => (
-                      <div
-                        key={file.id}
-                        className="flex items-center justify-between gap-2 rounded-xl border border-border bg-muted p-2"
-                      >
-                        <button
-                          type="button"
-                          aria-label={`预览文件 ${file.filename}`}
-                          className="min-w-0 flex-1 text-left"
-                          onClick={() => onPreviewFile(file)}
+                    sortedFiles.map((file) => {
+                      const { downloadDisabled, previewDisabled } =
+                        sandboxFileActionGate(file, sandboxOff);
+                      const disabledTooltip = t("sandbox.disabled");
+                      return (
+                        <div
+                          key={file.id}
+                          className="flex items-center justify-between gap-2 rounded-xl border border-border bg-muted p-2"
                         >
-                          <p className="truncate text-sm font-medium text-foreground/85">{file.filename}</p>
-                          <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`下载文件 ${file.filename}`}
-                          className="shrink-0 rounded-lg border border-border bg-card px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-accent"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            onDownloadFile(file);
-                          }}
-                        >
-                          下载
-                        </button>
-                      </div>
-                    ))
+                          <button
+                            type="button"
+                            aria-label={`预览文件 ${file.filename}`}
+                            className="min-w-0 flex-1 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={previewDisabled}
+                            title={previewDisabled ? disabledTooltip : undefined}
+                            onClick={() => onPreviewFile(file)}
+                          >
+                            <p className="truncate text-sm font-medium text-foreground/85">{file.filename}</p>
+                            <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`下载文件 ${file.filename}`}
+                            className="shrink-0 rounded-lg border border-border bg-card px-2 py-1 text-xs text-foreground/80 transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-card"
+                            disabled={downloadDisabled}
+                            title={downloadDisabled ? disabledTooltip : undefined}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onDownloadFile(file);
+                            }}
+                          >
+                            下载
+                          </button>
+                        </div>
+                      );
+                    })
                   )}
                 </div>
               )}

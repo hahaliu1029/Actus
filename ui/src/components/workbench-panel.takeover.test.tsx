@@ -597,3 +597,61 @@ describe("WorkbenchPanel sandbox provisioning affordance (SPM Task 22)", () => {
     expect(screen.queryByTestId("sandbox-badge")).toBeNull();
   });
 });
+
+describe("WorkbenchPanel off gating (SPM Task 30)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setSandboxStoreOverrides({});
+    document.documentElement.lang = "zh";
+  });
+
+  function renderPanel(sandboxMode: "always" | "on_demand" | "off" | undefined) {
+    setSandboxStoreOverrides({
+      sandboxBadge: "none",
+      currentSession: {
+        session_id: "sid-off",
+        title: null,
+        status: "running",
+        sandbox_mode: sandboxMode,
+        events: [],
+      },
+    });
+    return render(
+      <WorkbenchPanel
+        sessionId="sid-off"
+        status="running"
+        takeoverId={null}
+        takeoverScope={null}
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={true}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+  }
+
+  it("off 隐藏 VNC 链接与主动接管入口", () => {
+    renderPanel("off");
+    expect(screen.queryByTitle("打开实时窗口（VNC）")).toBeNull();
+    expect(screen.queryByRole("button", { name: "主动接管" })).toBeNull();
+  });
+
+  it("on_demand 保留 VNC 链接与主动接管入口", () => {
+    renderPanel("on_demand");
+    expect(screen.getByTitle("打开实时窗口（VNC）")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "主动接管" })).toBeInTheDocument();
+  });
+
+  it("always 保留 VNC 链接与主动接管入口", () => {
+    renderPanel("always");
+    expect(screen.getByTitle("打开实时窗口（VNC）")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "主动接管" })).toBeInTheDocument();
+  });
+
+  it("sandbox_mode 缺省保留 VNC 链接与主动接管入口（老 BE 兼容）", () => {
+    renderPanel(undefined);
+    expect(screen.getByTitle("打开实时窗口（VNC）")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "主动接管" })).toBeInTheDocument();
+  });
+});

@@ -8,9 +8,9 @@ Two guarantees:
    the off deployment must not teach an agent about a sandbox it does not have
    (INV-SPM-3).
 2. **on (sandbox_tools_enabled=True, the default)** renders are byte-identical
-   to the canonical pre-change section constants (INV-SPM-2). ``off`` is
-   config-rejected today, so the default-True path is the ONLY one that runs in
-   production and must not drift.
+   to the canonical pre-change section constants (INV-SPM-2). The on-path golden
+   must never drift, even now that ``off`` is a first-class mode (unlocked in
+   PR-4 / Task 32) and exercises the separate False path in production.
 
 The planner single-step skill-creation teaching lives in the ``CREATE_PLAN_PROMPT``
 HumanMessage template (``prompts/planner.py`` / ``prompts/en/planner.py``), NOT
@@ -246,8 +246,9 @@ def test_off_create_plan_rewords_mcp_but_keeps_it(lang: str) -> None:
 @pytest.mark.parametrize("lang", ["zh", "en"])
 def test_default_true_bundle_byte_identical(lang: str) -> None:
     """INV-SPM-2: default (True) bundle == the committed baseline golden, dumped
-    once from the pre-change constants. off is config-rejected today, so this
-    True path is the ONLY one that runs in production and must never drift."""
+    once from the pre-change constants. The on/True path golden must never drift,
+    even now that off is a first-class mode (unlocked in PR-4 / Task 32) and drives
+    the separate False path."""
     assert _dump_bundle(get_prompt_bundle(lang)) == _load_golden(
         f"baseline_bundle_{lang}.json"
     )

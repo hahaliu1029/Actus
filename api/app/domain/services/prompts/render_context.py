@@ -135,9 +135,9 @@ def build_render_context(
     (``sandbox_provision_mode != "off"``) threaded to the sandbox-teaching
     sections. Every production call site passes it (derived from settings
     the same way Task 24's tool chains do); the ``True`` default keeps
-    non-threaded construction points byte-identical. ``off`` is
-    config-rejected today, so the value is always ``True`` in practice —
-    the ``False`` path is dormant plumbing for the PR-4 off unlock.
+    non-threaded construction points byte-identical. ``off`` is a first-class
+    provision mode since PR-4 (Task 32), so the ``False`` path is now live for
+    off deployments (the sandbox-teaching sections are suppressed end-to-end).
     """
     configurable = (config.get("configurable") if config else None) or {}
     llm = configurable.get("llm")

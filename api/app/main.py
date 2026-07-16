@@ -658,8 +658,8 @@ async def lifespan(app: FastAPI):
         from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
         from app.infrastructure.storage.postgres import get_uow
         # SPM DD-6：off × coordinator flag 启动互斥 fail-fast（在单例构造前，与
-        # check_single_worker_argv 同位置）。PR-1c 阶段 off 尚被 config validator 拒，
-        # 故此检查恒早退；PR-4 解锁 off 后才真正拦截误配。
+        # check_single_worker_argv 同位置）。off 已随 PR-4 (Task 32) 进入 ALLOWED，
+        # 此检查现真正生效——off + 任一 coordinator flag 同时开机即 fail-fast 拦截误配。
         check_sandbox_off_flag_exclusion(get_settings())
         SandboxLifecycleService.check_single_worker_argv()
 

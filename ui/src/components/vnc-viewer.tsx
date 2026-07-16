@@ -3,10 +3,19 @@
 import { useEffect, useRef } from "react";
 import RFB from "@novnc/novnc/lib/rfb";
 
+/**
+ * SPM Task 30 (contract C): VNC connection status as a stable enum. The page
+ * layer maps each value to i18n copy via `t()`, so this component no longer
+ * emits localized strings. `"connecting"` is the page-side initial state; the
+ * RFB events map connect → connected, clean disconnect → disconnected,
+ * unclean disconnect → error.
+ */
+export type VNCStatus = "connecting" | "connected" | "disconnected" | "error";
+
 interface VNCViewerProps {
   url: string;
   viewOnly?: boolean;
-  onStatus?: (status: string) => void;
+  onStatus?: (status: VNCStatus) => void;
 }
 
 export function VNCViewer({ url, viewOnly, onStatus }: VNCViewerProps) {
@@ -31,16 +40,16 @@ export function VNCViewer({ url, viewOnly, onStatus }: VNCViewerProps) {
     rfb.background = "#000";
 
     rfb.addEventListener("connect", () => {
-      onStatus?.("VNC 连接成功");
+      onStatus?.("connected");
     });
 
     rfb.addEventListener("disconnect", (event) => {
       const detail = event.detail;
       if (detail?.clean) {
-        onStatus?.("VNC 连接关闭");
+        onStatus?.("disconnected");
         return;
       }
-      onStatus?.("VNC 连接异常断开");
+      onStatus?.("error");
     });
 
     return () => {
