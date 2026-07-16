@@ -62,7 +62,10 @@ class HardenedFakeSandbox:
         return True
 
     @classmethod
-    async def create(cls, user_id: Optional[str] = None, *, runtime_policy=None):
+    async def create(cls, user_id: Optional[str] = None, *, runtime_policy=None, **_kw):
+        # SPM Task 3: bind_new now threads session_id/attempt container metadata
+        # into create(); accept + ignore them here (**_kw) so the legacy fake keeps
+        # working (Step 4 fake-signature migration).
         cls.last_runtime_policy = runtime_policy
         # Mirror _create_task: applied set iff a policy was passed (hardening on).
         return cls(applied=_APPLIED if runtime_policy is not None else None)
@@ -95,7 +98,8 @@ class LegacyFakeSandbox:
         return True
 
     @classmethod
-    async def create(cls, user_id: Optional[str] = None):
+    async def create(cls, user_id: Optional[str] = None, **_kw):
+        # SPM Task 3 Step 4: accept + ignore session_id/attempt kwargs.
         cls.create_called_with = user_id
         return cls()
 
@@ -186,7 +190,7 @@ async def test_hardening_on_without_applied_falls_back_to_observe(monkeypatch):
 
     # NOTE: must be an ASYNC classmethod — bind_new does `await ...create(...)`. A sync
     # lambda would return a non-awaitable → TypeError, never reaching the fallback.
-    async def _create_without_applied(cls, user_id=None, *, runtime_policy=None):
+    async def _create_without_applied(cls, user_id=None, *, runtime_policy=None, **_kw):
         return cls(applied=None)
 
     monkeypatch.setattr(

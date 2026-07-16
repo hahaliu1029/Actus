@@ -140,3 +140,51 @@ class SandboxBindingMissing(SandboxLifecycleError):
     def __init__(self, session_id: str) -> None:
         super().__init__(f"sandbox binding missing for session {session_id}")
         self.session_id = session_id
+
+
+class SandboxProvisionInvalidated(SandboxLifecycleError):
+    """Raised inside ``bind_new`` when an in-flight provision was invalidated by a
+    concurrent ``destroy`` / ``delete`` / ``quiesce`` (SPM spec §5.2c, DD-17).
+
+    The provision flight's ``invalidated`` outcome is captured so the caller /
+    audit can distinguish a container that was torn down mid-create (CAS-1 /
+    CAS-2 windows) from an ordinary provision failure. Mirrors the ctor shape of
+    the other lifecycle errors: ``(session_id, invalidation_outcome)``.
+    """
+
+    def __init__(self, session_id: str, invalidation_outcome: Optional[str] = None) -> None:
+        self.session_id = session_id
+        self.invalidation_outcome = invalidation_outcome
+        super().__init__(
+            f"provision for session {session_id} was invalidated "
+            f"({invalidation_outcome or 'unknown'})"
+        )
+
+
+class SandboxDaemonUnreachable(SandboxLifecycleError):
+    """Docker daemon unreachable while inspecting / enumerating a managed sandbox.
+
+    Raised by ``DockerSandbox.get_strict`` / ``list_managed_containers`` (SPM
+    Task 5) when the Docker API errors (``APIError``) or the client itself cannot
+    be constructed (no socket / daemon down). This is deliberately DISTINCT from
+    the *terminal* signals — NotFound, non-running, or no-IP, all of which map to
+    ``None`` / "the sandbox is gone". A daemon-unreachable is a transient
+    infrastructure fault: Task 6's reconcile / label-sweep MUST NOT treat it as
+    "container no longer exists", or a momentary daemon blip would sweep live
+    containers. Always chained from the underlying Docker error via
+    ``raise SandboxDaemonUnreachable(...) from e`` so forensics keep the cause.
+    """
+
+    def __init__(
+        self,
+        detail: Optional[str] = None,
+        container_id: Optional[str] = None,
+    ) -> None:
+        self.detail = detail
+        self.container_id = container_id
+        parts = ["Docker daemon unreachable"]
+        if container_id:
+            parts.append(f"for container {container_id}")
+        if detail:
+            parts.append(f"({detail})")
+        super().__init__("; ".join(parts))

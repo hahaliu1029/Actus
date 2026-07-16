@@ -5,6 +5,7 @@ import re
 import socket
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Optional, Self
 
@@ -28,6 +29,7 @@ def _is_within(path: Path, root: Path) -> bool:
 
 import docker
 import httpx
+from app.domain.errors.sandbox_lifecycle import SandboxDaemonUnreachable
 from app.domain.external.browser import Browser
 from app.domain.external.sandbox import Sandbox
 from app.domain.models.tool_result import ToolResult
@@ -185,12 +187,18 @@ class DockerSandbox(Sandbox):
     def _create_task(
         cls, user_id: Optional[str] = None, *,
         runtime_policy: "ContainerRuntimePolicy | None" = None,
+        session_id: str | None = None, attempt: str | None = None,
     ) -> Self:
         """创建沙箱容器的异步任务。
 
         ``user_id`` 为 M1 引入：传入时为 sandbox 注入 read-only bind mount，
         ``${memory_root_host}/{user_id}`` → ``${memory_root_container}/{user_id}``。
         见 docs/superpowers/specs/2026-04-17-m0-sandbox-memory-mount-spike.md。
+
+        ``session_id`` / ``attempt`` 为 SPM Task 5 引入：仅用于给容器打
+        ``actus.session_id`` / ``actus.attempt`` label，供 Task 6 reconcile 的
+        label-sweep 识别本平台托管的孤儿容器。任一为空则不加对应 label 键
+        （外部 ``sandbox_address`` 模式不走本方法，不受影响）。
         """
         # 1.获取系统配置信息
         settings = get_settings()
@@ -227,6 +235,17 @@ class DockerSandbox(Sandbox):
                 # 容器级资源上限，防止 Chromium 失控导致宿主机 OOM
                 "mem_limit": settings.sandbox_mem_limit,
             }
+
+            # 4b.SPM Task 5：给容器打托管 label（供 Task 6 reconcile label-sweep 识别）。
+            # session_id / attempt 任一为空则不加对应键——None 时 container_config 无
+            # "labels" 键，外部 sandbox_address 模式不走本方法故完全不受影响。
+            labels: dict[str, str] = {}
+            if session_id:
+                labels["actus.session_id"] = session_id
+            if attempt:
+                labels["actus.attempt"] = attempt
+            if labels:
+                container_config["labels"] = labels
 
             # 5.判断是否传递了网络
             if settings.sandbox_network:
@@ -289,21 +308,40 @@ class DockerSandbox(Sandbox):
             # 6.调用docker客户端容器运行参数创建沙箱
             container = docker_client.containers.run(**container_config)
 
-            # 7.等待容器网络初始化完成后再获取IP
-            ip = cls._wait_for_container_ip(container)
-            if not ip:
-                networks = (
-                    (container.attrs.get("NetworkSettings", {}) or {}).get("Networks", {})
-                    or {}
+            # 7.等待容器网络初始化完成后再获取IP。SPM §5.2c-3 半成功清理：
+            #   containers.run 已经产出真实容器，之后任何失败（含拿不到 IP）都属于
+            #   "半成功"——创建路径必须自己把容器清掉，否则会漏一个无人认领的孤儿。
+            #   捕获 BaseException 以覆盖 CancelledError / KeyboardInterrupt（to_thread
+            #   下罕见但不为零），清理尽力而为、失败仅告警，随后原样重抛。
+            try:
+                ip = cls._wait_for_container_ip(container)
+                if not ip:
+                    networks = (
+                        (container.attrs.get("NetworkSettings", {}) or {}).get("Networks", {})
+                        or {}
+                    )
+                    raise Exception(
+                        f"容器已创建但未获取到IP地址，容器网络: {list(networks.keys())}"
+                    )
+                # FIX-B (P1-3): build the sandbox INSIDE the half-success cleanup
+                # try so a ``DockerSandbox(...)`` constructor failure ALSO tears the
+                # container down instead of leaking a live-but-ownerless container
+                # (create then fails upward with no handle for a disposer). The
+                # bare-name ``return sandbox`` below cannot raise.
+                sandbox = DockerSandbox(
+                    ip=ip, container_name=container_name,
+                    applied_runtime_policy=applied_runtime_policy,
                 )
-                raise Exception(
-                    f"容器已创建但未获取到IP地址，容器网络: {list(networks.keys())}"
-                )
+            except BaseException:
+                try:
+                    container.remove(force=True)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "IP-wait 失败后清理容器 %s 失败: %s", container_name, cleanup_error
+                    )
+                raise
 
-            return DockerSandbox(
-                ip=ip, container_name=container_name,
-                applied_runtime_policy=applied_runtime_policy,
-            )
+            return sandbox
         except SandboxHardeningConfigError:
             # C5d-2: preserve the typed fail-closed error — the broad handler below
             # would re-wrap it as a generic Exception and lose the type. Fail-closed
@@ -315,17 +353,27 @@ class DockerSandbox(Sandbox):
             raise Exception(f"创建Docker沙箱容器失败: {str(e)}")
         finally:
             if "docker_client" in locals():
-                docker_client.close()
+                # FIX-B (P1-3): best-effort close — a ``docker_client.close()``
+                # failure in the finally must never discard a successfully-built
+                # sandbox (return value) nor mask an in-flight exception already
+                # propagating out of the try/except above.
+                try:
+                    docker_client.close()
+                except Exception:
+                    logger.warning("关闭 docker client 失败（忽略）", exc_info=True)
 
     @classmethod
     async def create(
         cls, user_id: Optional[str] = None, *,
         runtime_policy: "ContainerRuntimePolicy | None" = None,
+        session_id: str | None = None, attempt: str | None = None,
     ) -> Self:
         """类方法，创建沙箱容器。
 
         ``user_id`` 为 M1 memory 系统引入。``runtime_policy`` 为 C5c 引入：
         hardening 开启时由调用方编译后传入；不传时 byte-identical 旧行为 (INV-0)。
+        ``session_id`` / ``attempt`` 为 SPM Task 5 引入：仅透传给 ``_create_task``
+        用于打托管 label（external ``sandbox_address`` 模式不走容器创建，忽略之）。
         """
         # 1.获取系统配置信息
         settings = get_settings()
@@ -333,13 +381,15 @@ class DockerSandbox(Sandbox):
         # 2.判断是否使用现成的沙箱
         if settings.sandbox_address:
             # 3.将沙箱主机/地址解析成ip（external 模式：runtime_policy inert，
-            #   _create_task 不运行 → applied_runtime_policy 保持 None）
+            #   _create_task 不运行 → applied_runtime_policy 保持 None；
+            #   session_id/attempt 无容器可打 label，忽略）
             ip = await cls._resolve_hostname_to_ip(settings.sandbox_address)
             return DockerSandbox(ip=ip)
 
         # 4.使用子线程创建一个容器后返回
         return await asyncio.to_thread(
-            cls._create_task, user_id, runtime_policy=runtime_policy
+            cls._create_task, user_id, runtime_policy=runtime_policy,
+            session_id=session_id, attempt=attempt,
         )
 
     @staticmethod
@@ -437,9 +487,19 @@ class DockerSandbox(Sandbox):
         for a container that no longer exists.
         """
         try:
-            # 1.关闭httpx客户端
+            # 1.关闭httpx客户端（best-effort，FIX-I）：aclose 失败**不得**跳过容器移除。
+            # 旧代码把 aclose 放在主 try 内，任何 aclose 异常都会跳到下方 except → 返回
+            # False 且容器永不移除（泄漏）。单独 try 包住 aclose 后，返回契约以"容器是否
+            # 真正被移除"为准（aclose 失败 + 移除成功 → True，更贴近真相：容器确已消失）。
             if self.client:
-                await self.client.aclose()
+                try:
+                    await self.client.aclose()
+                except Exception as e:
+                    logger.warning(
+                        "destroy: httpx client aclose failed (continuing to "
+                        "container removal): %s",
+                        e,
+                    )
 
             # 2.关闭并移除容器
             if self._container_name:
@@ -526,6 +586,157 @@ class DockerSandbox(Sandbox):
             # 8.其他错误统一捕获
             logger.error(f"获取沙箱发生未知错误: {str(e)}")
             return None
+
+    @classmethod
+    async def get_strict(cls, id: str) -> Optional[Self]:
+        """``get`` 的 strict 变体：区分「terminal / 已消失」与「daemon 不可达」。
+
+        SPM Task 5：lifecycle / reconcile 需要能判断"容器真没了"（terminal）还是
+        "只是 Docker daemon 暂时连不上"。``get`` 把二者都吞成 ``None``，会让
+        reconcile 在 daemon 抖动时误把活着的容器当成已销毁。``get_strict``：
+
+        - NotFound / 容器非 running / 拿不到 IP → ``None``（与今日 terminal 语义一致）
+        - ``APIError`` / 无法创建 client / 其他未知异常 → raise
+          ``SandboxDaemonUnreachable``（infra 故障，调用方另行处理，不得当 gone）
+
+        ``get`` 本体保持不动——其他调用方仍依赖它"错误即 None"的宽松语义。
+        """
+        # 1.external 模式与 get 一致：解析地址失败即 None（无 docker daemon 概念）
+        settings = get_settings()
+        if settings.sandbox_address:
+            try:
+                ip = await cls._resolve_hostname_to_ip(settings.sandbox_address)
+                return DockerSandbox(ip=ip, container_name=id)
+            except Exception as e:
+                logger.error(f"解析沙箱地址失败: {str(e)}")
+                return None
+
+        try:
+            # 2.创建docker客户端并根据容器名字获取容器
+            docker_client = cls._create_docker_client()
+
+            try:
+                # 3.根据id获取容器
+                container = docker_client.containers.get(id)
+                container.reload()
+
+                # 4.容器存在但未运行 → terminal，返回 None（与 get 一致）
+                if container.status != "running":
+                    logger.warning(f"容器存在但未运行, 容器名字: {id}")
+                    return None
+
+                # 5.拿不到 IP → terminal，返回 None（与 get 一致）
+                ip = cls._get_container_ip(container)
+                if not ip:
+                    return None
+
+                return DockerSandbox(ip=ip, container_name=id)
+            except NotFound:
+                # 6.容器被销毁 → terminal，返回 None（与 get 一致）
+                logger.warning(f"该容器找不到可能被销毁: {str(id)}")
+                return None
+            except APIError as e:
+                # 7.get 在此吞成 None；strict 反之翻译成 daemon-unreachable 上抛
+                logger.error(f"Docker API出错(get_strict): {str(e)}")
+                raise SandboxDaemonUnreachable(
+                    f"Docker API error inspecting container {id}: {e}",
+                    container_id=id,
+                ) from e
+            finally:
+                # 8.显式关闭 docker client
+                docker_client.close()
+        except SandboxDaemonUnreachable:
+            # 内层 APIError 已翻译，直接放行——避免被下方宽 except 二次包裹、
+            # 丢失 APIError 作为直接 __cause__。
+            raise
+        except Exception as e:
+            # 9.无法创建 client / 其他未知异常 → 也视为 daemon 不可达上抛
+            logger.error(f"获取沙箱(get_strict)发生未知错误: {str(e)}")
+            raise SandboxDaemonUnreachable(
+                f"failed to reach Docker daemon inspecting container {id}: {e}",
+                container_id=id,
+            ) from e
+
+    @staticmethod
+    def _parse_container_created(created_raw: object) -> datetime:
+        """把 docker ``attrs["Created"]`` ISO 串解析成 tz-aware ``datetime``。
+
+        Python 3.12 的 ``datetime.fromisoformat`` 直接吃 ``Z`` 后缀与 9 位纳秒
+        （自动截断到微秒）。任何解析失败（None / 非串 / 畸形）都保守回退到
+        ``datetime.now(UTC)``——Task 6 label-sweep 会把宽限窗内的"新容器"跳过，
+        故未知创建时间宁可当成刚创建（漏删）也绝不误删。
+        """
+        if isinstance(created_raw, str) and created_raw.strip():
+            try:
+                dt = datetime.fromisoformat(created_raw.strip())
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                return dt
+            except (ValueError, TypeError):
+                pass
+        return datetime.now(UTC)
+
+    @classmethod
+    def list_managed_containers(cls) -> list[dict]:
+        """枚举本平台托管（带 ``actus.session_id`` label）的容器。
+
+        SPM Task 6 reconcile 的 label-sweep 数据源。每项：
+        ``{"name", "session_id", "attempt", "created_at": datetime}``。
+
+        - external ``sandbox_address`` 模式：没有本地 daemon 可枚举 → ``[]``
+        - Docker 异常 → raise ``SandboxDaemonUnreachable``（调用侧 fail-safe：
+          daemon 抖动时 reconcile 必须放弃本轮清理，绝不能把"枚举失败"当成
+          "没有托管容器"进而误删或误判）
+        """
+        settings = get_settings()
+        if settings.sandbox_address:
+            return []
+
+        docker_client = None
+        try:
+            docker_client = cls._create_docker_client()
+            containers = docker_client.containers.list(
+                all=True, filters={"label": "actus.session_id"}
+            )
+            rows: list[dict] = []
+            for c in containers:
+                attrs = c.attrs or {}
+                labels = ((attrs.get("Config") or {}).get("Labels")) or {}
+                rows.append(
+                    {
+                        "name": c.name,
+                        "session_id": labels.get("actus.session_id"),
+                        "attempt": labels.get("actus.attempt"),
+                        "created_at": cls._parse_container_created(attrs.get("Created")),
+                    }
+                )
+            return rows
+        except Exception as e:
+            logger.error(f"枚举托管容器失败: {str(e)}")
+            raise SandboxDaemonUnreachable(
+                f"failed to list managed containers: {e}"
+            ) from e
+        finally:
+            if docker_client is not None:
+                docker_client.close()
+
+    @classmethod
+    def remove_container(cls, name: str) -> None:
+        """按名字强制删除容器；已不存在（``NotFound``）视作成功吞掉。
+
+        SPM Task 6 reconcile 清理孤儿容器用。仅吞 ``NotFound``（gone-is-gone），
+        其它 Docker 异常照常上抛给调用方决定是否重试。
+        """
+        docker_client = None
+        try:
+            docker_client = cls._create_docker_client()
+            try:
+                docker_client.containers.get(name).remove(force=True)
+            except NotFound:
+                logger.info("删除容器 %s 时已不存在，按成功处理", name)
+        finally:
+            if docker_client is not None:
+                docker_client.close()
 
     async def get_browser(self) -> Browser:
         """获取沙箱中的浏览器实例"""

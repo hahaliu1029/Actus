@@ -48,7 +48,8 @@ class FakeSandbox:
         return True
 
     @classmethod
-    async def create(cls, user_id: Optional[str] = None) -> "FakeSandbox":
+    async def create(cls, user_id: Optional[str] = None, **_kw) -> "FakeSandbox":
+        # SPM Task 3 Step 4: accept + ignore session_id/attempt kwargs.
         return cls()
 
 

@@ -93,7 +93,7 @@ class FakeSandbox:
         return True
 
     @classmethod
-    async def create(cls, user_id: Optional[str] = None) -> "FakeSandbox":
+    async def create(cls, user_id: Optional[str] = None, **_kw) -> "FakeSandbox":
         return cls()
 
     @classmethod
@@ -482,7 +482,7 @@ async def test_destroy_rehydrates_registry_on_destroying_retry_with_missing_entr
             return True
 
         @classmethod
-        async def create(cls, user_id: Optional[str] = None) -> "RehydratableSandbox":
+        async def create(cls, user_id: Optional[str] = None, **_kw) -> "RehydratableSandbox":
             return cls()
 
         @classmethod
@@ -532,7 +532,7 @@ async def test_destroy_raises_on_destroying_retry_when_rehydrate_returns_none() 
 
     class NoContainerSandbox:
         @classmethod
-        async def create(cls, user_id: Optional[str] = None):
+        async def create(cls, user_id: Optional[str] = None, **_kw):
             return None
 
         @classmethod
@@ -715,7 +715,7 @@ async def test_reconcile_destroying_container_dead() -> None:
 
     class NoContainerSandbox:
         @classmethod
-        async def create(cls, user_id: Optional[str] = None):
+        async def create(cls, user_id: Optional[str] = None, **_kw):
             return None
 
         @classmethod
@@ -833,7 +833,7 @@ async def test_orphan_transitions_to_destroyed() -> None:
 
     class NoContainerSandbox:
         @classmethod
-        async def create(cls, user_id: Optional[str] = None):
+        async def create(cls, user_id: Optional[str] = None, **_kw):
             return None
 
         @classmethod

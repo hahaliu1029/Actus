@@ -50,7 +50,8 @@ class _FakeSandbox:
         return MagicMock()
 
     @classmethod
-    async def create(cls, user_id: str | None = None) -> "_FakeSandbox":
+    async def create(cls, user_id: str | None = None, **_kw) -> "_FakeSandbox":
+        # SPM Task 3 Step 4: accept + ignore session_id/attempt kwargs.
         cls._counter += 1
         return cls(f"sbx-{cls._counter}")
 

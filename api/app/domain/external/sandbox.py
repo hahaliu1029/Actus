@@ -210,6 +210,7 @@ class Sandbox(Protocol):
     async def create(
         cls, user_id: Optional[str] = None, *,
         runtime_policy: "ContainerRuntimePolicy | None" = None,
+        session_id: Optional[str] = None, attempt: Optional[str] = None,
     ) -> Self:
         """类方法，用于快速创建一个沙箱。
 
@@ -220,6 +221,11 @@ class Sandbox(Protocol):
         ``runtime_policy`` 为 C5c 引入：传入（仅 hardening 开启时）令实现方把
         compiled hardening kwargs 合并进 container_config 并构建 applied 快照；
         不传时按旧行为创建（INV-0 byte-identical）。
+
+        ``session_id`` / ``attempt`` 为 SPM Task 5 引入（FIX-E: 补齐 Protocol 声明，
+        使 lifecycle service 无条件透传这两个 kwarg 时不会撞上严格实现方的 TypeError）：
+        纯 label 元数据（``actus.session_id`` / ``actus.attempt``），供 reconcile
+        label-sweep 识别本平台托管的孤儿容器；external ``sandbox_address`` 模式忽略之。
         """
         ...
 
