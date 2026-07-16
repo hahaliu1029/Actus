@@ -30,5 +30,11 @@
     "title": "合并时间线",
     "show": "显示合并时间线",
     "hide": "隐藏合并时间线"
+  },
+  "sandbox": {
+    "provisioning": "沙箱准备中…",
+    "notStarted": "沙箱未启动——首次需要时自动创建",
+    "provisionFailed": "沙箱启动失败，将在下次需要时重试",
+    "disabled": "本部署未启用沙箱"
   }
 }

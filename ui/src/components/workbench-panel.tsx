@@ -25,7 +25,11 @@ import {
   type WorkbenchSnapshot,
 } from "@/lib/session-ui";
 import { startTakeoverWithReopen } from "@/lib/session-takeover";
-import { useSessionStore } from "@/lib/store/session-store";
+import { t } from "@/lib/i18n";
+import {
+  useSessionStore,
+  type SessionEventRecord,
+} from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 import { useAuthStore } from "@/lib/store/auth-store";
 import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
@@ -113,6 +117,32 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
   const renewTimerRef = useRef<number | null>(null);
   const prevPageVisibleRef = useRef(isPageVisible);
   const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
+  // PR2 Task 22: the on_demand sandbox header affordance, collapsed into ONE
+  // narrow selector that returns a string primitive so this memoized panel only
+  // re-renders when the affordance actually flips — not on every streaming
+  // event. `always`/`off`/absent mode → "none" so the header renders nothing new
+  // (byte-zero visual change). The badge slot is the store's authority; the
+  // empty-state `notStarted` is the panel-level refinement of a "none" badge.
+  const sandboxAffordance = useSessionStore((state):
+    | "provisioning"
+    | "failed"
+    | "notStarted"
+    | "none" => {
+    const cs = state.currentSession;
+    if (!cs || cs.session_id !== sessionId || cs.sandbox_mode !== "on_demand") {
+      return "none";
+    }
+    const badge = state.sandboxBadge;
+    if (badge === "provisioning" || badge === "failed") {
+      return badge;
+    }
+    // badge === "none": distinguish "no sandbox provisioned yet" (empty-state)
+    // from a live/torn-down sandbox (render nothing).
+    const started = (cs.events as SessionEventRecord[]).some(
+      (evt) => evt.event === "sandbox_state_changed"
+    );
+    return started ? "none" : "notStarted";
+  });
   const setMessage = useUIStore((state) => state.setMessage);
   const accessToken = useAuthStore((state) => state.accessToken);
 
@@ -586,6 +616,25 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+          ) : null}
+
+          {sandboxAffordance !== "none" ? (
+            <span
+              data-testid="sandbox-badge"
+              data-badge={sandboxAffordance}
+              className={cn(
+                "inline-flex items-center rounded-xl border px-2.5 py-1 text-xs",
+                sandboxAffordance === "failed"
+                  ? "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-400"
+                  : "border-border bg-card text-muted-foreground"
+              )}
+            >
+              {sandboxAffordance === "provisioning"
+                ? t("sandbox.provisioning")
+                : sandboxAffordance === "failed"
+                  ? t("sandbox.provisionFailed")
+                  : t("sandbox.notStarted")}
+            </span>
           ) : null}
 
           <Link

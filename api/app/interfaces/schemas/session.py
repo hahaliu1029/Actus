@@ -103,6 +103,10 @@ class GetSessionResponse(BaseModel):
     status: SessionStatus
     events: List[AgentSSEEvent] = Field(default_factory=list)
     supervisor_snapshot: Optional[SupervisorSnapshot] = None
+    # SPM Task 20 — deployment-constant sandbox provision mode surfaced to the
+    # FE so the client renders the correct sandbox affordances. Value sourced
+    # from ``get_settings().sandbox_provision_mode`` at route-assembly time.
+    sandbox_mode: Literal["always", "on_demand", "off"] = "always"
 
 
 class EventsSinceResponse(BaseModel):

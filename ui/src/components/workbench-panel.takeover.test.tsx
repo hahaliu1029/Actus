@@ -10,15 +10,27 @@ const {
   mockReopenTakeover,
   mockFetchSessionById,
   mockSetMessage,
-} = vi.hoisted(() => ({
-  mockStartTakeover: vi.fn(),
-  mockEndTakeover: vi.fn(),
-  mockRejectTakeover: vi.fn(),
-  mockRenewTakeover: vi.fn(),
-  mockReopenTakeover: vi.fn(),
-  mockFetchSessionById: vi.fn(),
-  mockSetMessage: vi.fn(),
-}));
+  getSandboxStoreOverrides,
+  setSandboxStoreOverrides,
+} = vi.hoisted(() => {
+  // SPM Task 22: a mutable slice the mocked useSessionStore merges in, so each
+  // sandbox test can inject `currentSession` + `sandboxBadge` without perturbing
+  // the takeover tests (which leave it `{}` → currentSession stays null).
+  let sandboxOverrides: Record<string, unknown> = {};
+  return {
+    mockStartTakeover: vi.fn(),
+    mockEndTakeover: vi.fn(),
+    mockRejectTakeover: vi.fn(),
+    mockRenewTakeover: vi.fn(),
+    mockReopenTakeover: vi.fn(),
+    mockFetchSessionById: vi.fn(),
+    mockSetMessage: vi.fn(),
+    getSandboxStoreOverrides: () => sandboxOverrides,
+    setSandboxStoreOverrides: (next: Record<string, unknown>) => {
+      sandboxOverrides = next;
+    },
+  };
+});
 
 vi.mock("next/link", () => ({
   default: ({
@@ -52,6 +64,9 @@ vi.mock("@/lib/store/session-store", () => ({
   useSessionStore: (selector: (state: Record<string, unknown>) => unknown) =>
     selector({
       fetchSessionById: mockFetchSessionById,
+      currentSession: null,
+      sandboxBadge: "none",
+      ...getSandboxStoreOverrides(),
     }),
 }));
 
@@ -108,6 +123,7 @@ describe("WorkbenchPanel takeover controls", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useRealTimers();
+    setSandboxStoreOverrides({});
     mockStartTakeover.mockResolvedValue({
       status: "running",
       request_status: "starting",
@@ -451,5 +467,133 @@ describe("WorkbenchPanel takeover controls", () => {
       type: "error",
       text: "当前状态不支持启动接管",
     });
+  });
+});
+
+describe("WorkbenchPanel sandbox provisioning affordance (SPM Task 22)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setSandboxStoreOverrides({});
+    // `t()` reads document.documentElement.lang; pin zh for deterministic copy.
+    document.documentElement.lang = "zh";
+  });
+
+  function renderPanel(over: {
+    sandboxMode?: "always" | "on_demand" | "off";
+    events?: Array<{ event: string; data: Record<string, unknown> }>;
+    sandboxBadge?: "provisioning" | "failed" | "none";
+  }) {
+    setSandboxStoreOverrides({
+      sandboxBadge: over.sandboxBadge ?? "none",
+      currentSession: {
+        session_id: "sid-sandbox",
+        title: null,
+        status: "running",
+        sandbox_mode: over.sandboxMode,
+        events: over.events ?? [],
+      },
+    });
+    return render(
+      <WorkbenchPanel
+        sessionId="sid-sandbox"
+        status="running"
+        takeoverId={null}
+        takeoverScope={null}
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={true}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+  }
+
+  it("always mode renders NOTHING new (byte-zero: no sandbox badge even mid-provisioning)", () => {
+    renderPanel({ sandboxMode: "always", sandboxBadge: "provisioning" });
+    expect(screen.queryByTestId("sandbox-badge")).toBeNull();
+  });
+
+  it("off mode renders no sandbox badge", () => {
+    renderPanel({ sandboxMode: "off", sandboxBadge: "provisioning" });
+    expect(screen.queryByTestId("sandbox-badge")).toBeNull();
+  });
+
+  it("absent sandbox_mode renders no sandbox badge", () => {
+    renderPanel({ sandboxMode: undefined, sandboxBadge: "provisioning" });
+    expect(screen.queryByTestId("sandbox-badge")).toBeNull();
+  });
+
+  it("on_demand + zero sandbox events → notStarted empty-state copy", () => {
+    renderPanel({ sandboxMode: "on_demand", events: [], sandboxBadge: "none" });
+    const badge = screen.getByTestId("sandbox-badge");
+    expect(badge.getAttribute("data-badge")).toBe("notStarted");
+    expect(badge.textContent).toContain("沙箱未启动——首次需要时自动创建");
+  });
+
+  it("on_demand + provisioning badge → provisioning copy", () => {
+    renderPanel({
+      sandboxMode: "on_demand",
+      events: [
+        { event: "sandbox_state_changed", data: { new_state: "creating" } },
+      ],
+      sandboxBadge: "provisioning",
+    });
+    const badge = screen.getByTestId("sandbox-badge");
+    expect(badge.getAttribute("data-badge")).toBe("provisioning");
+    expect(badge.textContent).toContain("沙箱准备中…");
+  });
+
+  it("on_demand + failed badge → provisionFailed copy", () => {
+    renderPanel({
+      sandboxMode: "on_demand",
+      events: [
+        {
+          event: "sandbox_state_changed",
+          data: { new_state: "unbound", reason: "provision_failed" },
+        },
+      ],
+      sandboxBadge: "failed",
+    });
+    const badge = screen.getByTestId("sandbox-badge");
+    expect(badge.getAttribute("data-badge")).toBe("failed");
+    expect(badge.textContent).toContain("沙箱启动失败，将在下次需要时重试");
+  });
+
+  it("on_demand + active sandbox (badge none, events present) → no badge", () => {
+    renderPanel({
+      sandboxMode: "on_demand",
+      events: [
+        { event: "sandbox_state_changed", data: { new_state: "active" } },
+      ],
+      sandboxBadge: "none",
+    });
+    expect(screen.queryByTestId("sandbox-badge")).toBeNull();
+  });
+
+  it("badge is scoped to the viewed session (mismatched currentSession → no badge)", () => {
+    setSandboxStoreOverrides({
+      sandboxBadge: "provisioning",
+      currentSession: {
+        session_id: "some-other-session",
+        title: null,
+        status: "running",
+        sandbox_mode: "on_demand",
+        events: [],
+      },
+    });
+    render(
+      <WorkbenchPanel
+        sessionId="sid-sandbox"
+        status="running"
+        takeoverId={null}
+        takeoverScope={null}
+        takeoverExpiresAt={null}
+        snapshots={[]}
+        running={true}
+        visible={true}
+        onPreviewImage={() => {}}
+      />
+    );
+    expect(screen.queryByTestId("sandbox-badge")).toBeNull();
   });
 });

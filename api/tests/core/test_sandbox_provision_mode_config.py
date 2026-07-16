@@ -1,8 +1,9 @@
-"""SPM Task 12 — sandbox_provision_mode 三态 config validator + off×coordinator
+"""SPM Task 12/23 — sandbox_provision_mode 三态 config validator + off×coordinator
 启动互斥校验的单元测试。
 
-- config validator：PR-1c 阶段 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always"}``，
-  故 on_demand / off 均被 validator 拒绝（分别在 PR-2 / PR-4 解锁）。
+- config validator：PR-2 阶段 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always",
+  "on_demand"}``（Task 23 解锁 on_demand），故 on_demand 被接受、off 仍被 validator
+  拒绝（off 在 PR-4 解锁）。
 - exclusion：``check_sandbox_off_flag_exclusion`` 在 mode=="off" 时对三个 **env-only**
   coordinator flag helper（非 Settings 属性）做 fail-fast 互斥（SPM DD-6）。
 
@@ -26,13 +27,21 @@ class TestSandboxProvisionModeConfig:
         # SPM §5.2e：provision 硬超时缺省 90s。
         assert Settings(env="test").sandbox_provision_timeout_seconds == 90
 
-    def test_on_demand_rejected_while_not_allowed(self):
-        """DD-22 阶段语义：PR-1c 阶段 ALLOWED={"always"}，on_demand 必须被拒（PR-2 解锁）。"""
-        with pytest.raises(ValidationError):
-            Settings(env="test", sandbox_provision_mode="on_demand")
+    def test_on_demand_accepted_after_unlock(self):
+        """DD-22 阶段语义：PR-2（Task 23）解锁 on_demand → validator 接受，且沿用
+        既有 normalize（case/whitespace 归一）。"""
+        assert (
+            Settings(env="test", sandbox_provision_mode="on_demand").sandbox_provision_mode
+            == "on_demand"
+        )
+        # normalize 仍生效（与 always 同路径）。
+        assert (
+            Settings(env="test", sandbox_provision_mode=" On_Demand ").sandbox_provision_mode
+            == "on_demand"
+        )
 
     def test_off_rejected_while_not_allowed(self):
-        """DD-22 阶段语义：PR-1c 阶段 off 必须被拒（PR-4 解锁）。"""
+        """DD-22 阶段语义：PR-2 阶段 off 仍必须被拒（PR-4 解锁）。"""
         with pytest.raises(ValidationError):
             Settings(env="test", sandbox_provision_mode="off")
 
@@ -55,8 +64,8 @@ _C2_FLAGS = (
 def _mk_settings(mode: str) -> Settings:
     """构造指定 provision_mode 的 Settings。
 
-    PR-1c 阶段 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always"}``，validator 会拒
-    "off" / "on_demand"。这里用 ``model_construct`` 绕过 validator 直接注入
+    PR-2 阶段 ``SANDBOX_PROVISION_MODE_ALLOWED == {"always", "on_demand"}``，validator
+    仍会拒 "off"（PR-4 才解锁）。这里用 ``model_construct`` 绕过 validator 直接注入
     ``sandbox_provision_mode`` —— 本组测试验证的是 ``check_sandbox_off_flag_exclusion``
     的分支逻辑（只读 ``.sandbox_provision_mode``），validator 本身由
     ``TestSandboxProvisionModeConfig`` 覆盖，二者关注点分离。

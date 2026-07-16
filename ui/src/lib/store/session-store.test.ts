@@ -9,6 +9,7 @@ vi.mock("@/lib/api/session", () => ({
     getSession: vi.fn(),
     getSessionFiles: vi.fn(),
     chat: vi.fn(),
+    getEventsSince: vi.fn(),
     retryFromSuspend: vi.fn(),
     stopSession: vi.fn(),
     deleteSession: vi.fn(),
@@ -34,8 +35,11 @@ import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
 import type { ListSessionItem, Session, SupervisorSnapshot } from "@/lib/api/types";
 import {
+  deriveSandboxBadge,
+  deriveStatusFromEvents,
   useFilteredSessionsForList,
   useSessionStore,
+  type SessionEventRecord,
 } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
@@ -1136,6 +1140,428 @@ describe("session-store", () => {
       const current = useSessionStore.getState().currentSession;
       expect(current?.status).toBe("timed_out");
       expect(current?.events?.some((e) => e.event === "sandbox_state_changed")).toBe(true);
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // PR2 Task 21 (INV-SPM-11): in on_demand mode `sandbox_state_changed`
+  // {creating|active} events arrive MID-RUN via lazy provisioning. Only the
+  // terminal `destroyed` transition may collapse a live chat or fold recovery
+  // status; a non-destroyed sandbox event must keep the chat alive and must NOT
+  // set sawSignal in deriveStatusFromEvents.
+  // ------------------------------------------------------------------------
+  describe("INV-SPM-11 destroyed-only collapse points", () => {
+    function mkRec(
+      event: string,
+      data: Record<string, unknown>
+    ): SessionEventRecord {
+      return { event, data } as SessionEventRecord;
+    }
+
+    it("creating event mid-chat does NOT mark terminal (chat continues)", async () => {
+      // ①+②: sandbox_state_changed{creating} with NO onClose → the stream is still
+      // in flight: status stays running, isChatting stays true, abort NOT cleared.
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "sandbox_state_changed",
+          data: {
+            event_id: "evt-creating",
+            created_at: Math.floor(Date.now() / 1000),
+            old_state: "none",
+            new_state: "creating",
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-creating", { message: "hi" });
+
+      const state = useSessionStore.getState();
+      expect(state.currentSession?.status).toBe("running");
+      expect(state.isChatting).toBe(true);
+      expect(state.chatSessionId).toBe("s-creating");
+      expect(state.chatAbort).not.toBeNull();
+    });
+
+    it("active event mid-chat does NOT clear chat state", async () => {
+      // ②: sandbox_state_changed{active} likewise must not reset streaming flags.
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "sandbox_state_changed",
+          data: {
+            event_id: "evt-active",
+            created_at: Math.floor(Date.now() / 1000),
+            old_state: "creating",
+            new_state: "active",
+          },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-active", { message: "hi" });
+
+      const state = useSessionStore.getState();
+      expect(state.currentSession?.status).toBe("running");
+      expect(state.isChatting).toBe(true);
+      expect(state.chatAbort).not.toBeNull();
+    });
+
+    it("disconnect after only a creating event IS recoverable (error suppressed)", async () => {
+      // ③: streamConnected=true (onConnected) + creating (non-terminal) → onError
+      // finds isRecoverableDisconnect === true and suppresses the error toast.
+      mockedSessionApi.chat.mockImplementation(
+        (_sessionId, _params, onEvent, onError, _onClose, onConnected) => {
+          onConnected?.();
+          onEvent({
+            type: "sandbox_state_changed",
+            data: {
+              event_id: "evt-creating-drop",
+              created_at: Math.floor(Date.now() / 1000),
+              new_state: "creating",
+            },
+          });
+          onError?.(new Error("stream dropped"));
+          return () => {};
+        }
+      );
+
+      await useSessionStore
+        .getState()
+        .sendChat("s-creating-drop", { message: "hi" });
+
+      // Recoverable disconnect → no error toast surfaced.
+      expect(useUIStore.getState().message).toBeNull();
+    });
+
+    it("disconnect after a destroyed event is NOT suppressed (error surfaced)", async () => {
+      // ① regression / ③ contrast: destroyed sets sawTerminalEvent → onError finds
+      // isRecoverableDisconnect === false and surfaces the error toast.
+      mockedSessionApi.chat.mockImplementation(
+        (_sessionId, _params, onEvent, onError, _onClose, onConnected) => {
+          onConnected?.();
+          onEvent({
+            type: "sandbox_state_changed",
+            data: {
+              event_id: "evt-destroyed-drop",
+              created_at: Math.floor(Date.now() / 1000),
+              old_state: "destroying",
+              new_state: "destroyed",
+            },
+          });
+          onError?.(new Error("stream dropped"));
+          return () => {};
+        }
+      );
+
+      await useSessionStore
+        .getState()
+        .sendChat("s-destroyed-drop", { message: "hi" });
+
+      expect(useUIStore.getState().message).toEqual({
+        type: "error",
+        text: "stream dropped",
+      });
+    });
+
+    it("destroyed event on live path IS terminal (clears chat, folds status)", async () => {
+      // ①+②: destroyed + onClose → streaming flags reset and status folds to a
+      // terminal value (completed for a non-timed_out session).
+      mockedSessionApi.chat.mockImplementation(
+        (_sessionId, _params, onEvent, _onError, onClose) => {
+          onEvent({
+            type: "sandbox_state_changed",
+            data: {
+              event_id: "evt-destroyed-live",
+              created_at: Math.floor(Date.now() / 1000),
+              old_state: "destroying",
+              new_state: "destroyed",
+            },
+          });
+          onClose?.();
+          return () => {};
+        }
+      );
+
+      await useSessionStore
+        .getState()
+        .sendChat("s-destroyed-live", { message: "hi" });
+
+      const state = useSessionStore.getState();
+      expect(state.currentSession?.status).toBe("completed");
+      expect(state.isChatting).toBe(false);
+      expect(state.chatAbort).toBeNull();
+    });
+
+    it("deriveStatusFromEvents returns null for a pure-CREATING history", () => {
+      // ④: a non-destroyed sandbox event must NOT set sawSignal — otherwise a null
+      // recovery status would be pushed to "running".
+      expect(
+        deriveStatusFromEvents([
+          mkRec("sandbox_state_changed", { new_state: "creating" }),
+        ])
+      ).toBeNull();
+    });
+
+    it("deriveStatusFromEvents ignores a transient destroying event (null)", () => {
+      // ④: `destroying` is transient (not terminal) — also must not fold.
+      expect(
+        deriveStatusFromEvents([
+          mkRec("sandbox_state_changed", { new_state: "destroying" }),
+        ])
+      ).toBeNull();
+    });
+
+    it("deriveStatusFromEvents still folds a destroyed event", () => {
+      // ④/⑤: destroyed IS terminal — derived starts at running → completed.
+      expect(
+        deriveStatusFromEvents([
+          mkRec("sandbox_state_changed", { new_state: "destroyed" }),
+        ])
+      ).toBe("completed");
+    });
+
+    it("deriveStatusFromEvents: destroyed preserves preceding timed_out (⑤ lock)", () => {
+      // ⑤ regression lock: resolveStatusFromEvent maps destroyed → timed_out when a
+      // preceding health(terminated) already pinned timed_out (watchdog semantics).
+      expect(
+        deriveStatusFromEvents([
+          mkRec("health", { status: "terminated" }),
+          mkRec("sandbox_state_changed", { new_state: "destroyed" }),
+        ])
+      ).toBe("timed_out");
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // PR2 Task 22 (spec §5.8 / R3#B6): the on_demand sandbox provisioning badge.
+  // `deriveSandboxBadge` is a pure reverse-scan; the `sandboxBadge` store slot is
+  // recomputed on the live SSE path + every merge/reload path.
+  // ------------------------------------------------------------------------
+  describe("deriveSandboxBadge (SPM Task 22)", () => {
+    function mkRec(
+      event: string,
+      data: Record<string, unknown>
+    ): SessionEventRecord {
+      return { event, data } as SessionEventRecord;
+    }
+
+    // ---- the five reverse-scan states -----------------------------------
+    it("creating → provisioning", () => {
+      expect(
+        deriveSandboxBadge([mkRec("sandbox_state_changed", { new_state: "creating" })])
+      ).toBe("provisioning");
+    });
+
+    it("active → none", () => {
+      expect(
+        deriveSandboxBadge([mkRec("sandbox_state_changed", { new_state: "active" })])
+      ).toBe("none");
+    });
+
+    it("destroyed → none", () => {
+      expect(
+        deriveSandboxBadge([mkRec("sandbox_state_changed", { new_state: "destroyed" })])
+      ).toBe("none");
+    });
+
+    it("unbound + provision_failed → failed", () => {
+      expect(
+        deriveSandboxBadge([
+          mkRec("sandbox_state_changed", {
+            new_state: "unbound",
+            reason: "provision_failed",
+          }),
+        ])
+      ).toBe("failed");
+    });
+
+    it("unbound + provision_cancelled → failed", () => {
+      expect(
+        deriveSandboxBadge([
+          mkRec("sandbox_state_changed", {
+            new_state: "unbound",
+            reason: "provision_cancelled",
+          }),
+        ])
+      ).toBe("failed");
+    });
+
+    // ---- else / empty → none --------------------------------------------
+    it("unbound with an unrelated reason → none", () => {
+      expect(
+        deriveSandboxBadge([
+          mkRec("sandbox_state_changed", {
+            new_state: "unbound",
+            reason: "idle_timeout",
+          }),
+        ])
+      ).toBe("none");
+    });
+
+    it("no sandbox events (or empty) → none", () => {
+      expect(deriveSandboxBadge([mkRec("message", { role: "assistant" })])).toBe(
+        "none"
+      );
+      expect(deriveSandboxBadge([])).toBe("none");
+    });
+
+    // ---- reverse-scan: only the LAST sandbox event decides ---------------
+    it("the LAST sandbox event decides (earlier ones ignored)", () => {
+      expect(
+        deriveSandboxBadge([
+          mkRec("sandbox_state_changed", { new_state: "creating" }),
+          mkRec("message", { role: "assistant" }),
+          mkRec("sandbox_state_changed", { new_state: "active" }),
+        ])
+      ).toBe("none");
+    });
+
+    // ---- retry clears the failed badge ----------------------------------
+    it("retry clears failed: [failed, creating] → provisioning", () => {
+      expect(
+        deriveSandboxBadge([
+          mkRec("sandbox_state_changed", {
+            new_state: "unbound",
+            reason: "provision_failed",
+          }),
+          mkRec("sandbox_state_changed", { new_state: "creating" }),
+        ])
+      ).toBe("provisioning");
+    });
+
+    it("failed persists after a preceding creating: [creating, failed] → failed", () => {
+      expect(
+        deriveSandboxBadge([
+          mkRec("sandbox_state_changed", { new_state: "creating" }),
+          mkRec("sandbox_state_changed", {
+            new_state: "unbound",
+            reason: "provision_failed",
+          }),
+        ])
+      ).toBe("failed");
+    });
+  });
+
+  describe("sandboxBadge store slot (SPM Task 22)", () => {
+    it("live path: a creating SSE event sets sandboxBadge = provisioning", async () => {
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "sandbox_state_changed",
+          data: { event_id: "evt-c", created_at: 1, new_state: "creating" },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-badge-live", { message: "hi" });
+
+      expect(useSessionStore.getState().sandboxBadge).toBe("provisioning");
+    });
+
+    it("live path: creating → active → unbound(failed) walks the slot provisioning → none → failed", async () => {
+      mockedSessionApi.chat.mockImplementationOnce(
+        (_sessionId, _params, onEvent) => {
+          onEvent({
+            type: "sandbox_state_changed",
+            data: { event_id: "e1", new_state: "creating" },
+          });
+          return () => {};
+        }
+      );
+      await useSessionStore.getState().sendChat("s-walk", { message: "1" });
+      expect(useSessionStore.getState().sandboxBadge).toBe("provisioning");
+
+      mockedSessionApi.chat.mockImplementationOnce(
+        (_sessionId, _params, onEvent) => {
+          onEvent({
+            type: "sandbox_state_changed",
+            data: { event_id: "e2", new_state: "active" },
+          });
+          return () => {};
+        }
+      );
+      await useSessionStore.getState().sendChat("s-walk", { message: "2" });
+      expect(useSessionStore.getState().sandboxBadge).toBe("none");
+
+      mockedSessionApi.chat.mockImplementationOnce(
+        (_sessionId, _params, onEvent) => {
+          onEvent({
+            type: "sandbox_state_changed",
+            data: {
+              event_id: "e3",
+              new_state: "unbound",
+              reason: "provision_failed",
+            },
+          });
+          return () => {};
+        }
+      );
+      await useSessionStore.getState().sendChat("s-walk", { message: "3" });
+      expect(useSessionStore.getState().sandboxBadge).toBe("failed");
+    });
+
+    it("live path: a background session's sandbox event does NOT overwrite the badge", async () => {
+      // Viewing s-fg; a chat stream for s-bg (different id) emits creating.
+      useSessionStore.setState({
+        currentSession: buildSession({ session_id: "s-fg", events: [] }),
+        activeSessionId: "s-fg",
+      });
+      mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent) => {
+        onEvent({
+          type: "sandbox_state_changed",
+          data: { event_id: "evt-bg", created_at: 1, new_state: "creating" },
+        });
+        return () => {};
+      });
+
+      await useSessionStore.getState().sendChat("s-bg", { message: "hi" });
+
+      expect(useSessionStore.getState().sandboxBadge).toBe("none");
+    });
+
+    it("reload restore: fetchSessionById folds a persisted creating event into the slot", async () => {
+      mockedSessionApi.getSession.mockResolvedValue(
+        buildSession({
+          session_id: "s-reload",
+          status: "waiting",
+          events: [
+            {
+              event: "sandbox_state_changed",
+              data: { event_id: "evt-r", created_at: 1, new_state: "creating" },
+            },
+          ],
+        })
+      );
+
+      await useSessionStore.getState().fetchSessionById("s-reload");
+
+      expect(useSessionStore.getState().sandboxBadge).toBe("provisioning");
+    });
+
+    it("reconnect restore: recoverSession folds recovered events into the slot", async () => {
+      useSessionStore.setState({
+        currentSession: buildSession({
+          session_id: "s-rec",
+          status: "running",
+          events: [],
+        }),
+        activeSessionId: "s-rec",
+      });
+      mockedSessionApi.getEventsSince.mockResolvedValue({
+        events: [
+          {
+            event: "sandbox_state_changed",
+            data: { event_id: "evt-rc", created_at: 1, new_state: "creating" },
+          },
+        ],
+        session_status: "running",
+        has_more: false,
+        last_seq: 5,
+        supervisor_snapshot: null,
+      });
+
+      await useSessionStore.getState().recoverSession("s-rec");
+
+      expect(useSessionStore.getState().sandboxBadge).toBe("provisioning");
     });
   });
 });

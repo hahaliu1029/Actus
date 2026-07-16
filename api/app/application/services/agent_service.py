@@ -3374,7 +3374,11 @@ class AgentService:
                 try:
                     await self._sandbox_lifecycle_service.suspend(session_id)
                 except Exception:
-                    logger.warning(
+                    # SPM Task 20 — suspend-on-UNBOUND is expected for on_demand
+                    # pure-chat sessions that never provisioned a sandbox; keep the
+                    # detail at debug so it stops being warning-level noise. Only
+                    # the log level changes — behavior is identical (INV-SPM-2).
+                    logger.debug(
                         "Failed to suspend sandbox for session %s",
                         session_id,
                         exc_info=True,

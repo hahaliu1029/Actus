@@ -379,6 +379,9 @@ export type Session = {
   // B3-core PR-1 — null/0 when backend hasn't populated yet
   last_seq?: number;
   supervisor_snapshot?: SupervisorSnapshot | null;
+  /** SPM Task 20 — deployment-constant sandbox provision mode (snake_case wire
+   *  field). Optional for backward compat with payloads predating the field. */
+  sandbox_mode?: "always" | "on_demand" | "off";
   /** B1-2 provisional CALLING 防重放水位线（触发权威事件的 seq） */
   provisional_prune_watermark?: number;
   /** B1-2 自上次 turn-close 信号后是否尚未开新轮 */

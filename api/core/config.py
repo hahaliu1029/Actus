@@ -282,7 +282,8 @@ class Settings(BaseSettings):
     # SPM §5.1：三档沙箱供给模式（env-only，禁入 config.yaml——供给面是安全/资源面，
     # config.yaml 是运行期可写面，把供给开关放那里等于让被治理的运行期能自降治理）。
     # ALLOWED 集随 PR 梯度增长（DD-22）：PR-1c {"always"} → PR-2 +"on_demand" → PR-4 +"off"。
-    SANDBOX_PROVISION_MODE_ALLOWED: ClassVar[set[str]] = {"always"}
+    # PR-2 unlock：on_demand 现已交付并解锁（off 仍在 PR-4 解锁）。
+    SANDBOX_PROVISION_MODE_ALLOWED: ClassVar[set[str]] = {"always", "on_demand"}
     sandbox_provision_mode: str = Field(
         default="always",
         validation_alias=AliasChoices(

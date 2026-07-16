@@ -87,6 +87,12 @@ type SessionState = {
   _isRecovering: boolean;
   probeState: ProbeState;
   agentTree: AgentTreeState;
+  // PR2 Task 22: the current session's on_demand sandbox provisioning badge,
+  // recomputed by `deriveSandboxBadge` on the live SSE path + every merge/reload
+  // path. Orthogonal to Task 21's terminal collapse — this slot never gates
+  // stream/status logic. Trust it only when `currentSession.session_id` matches
+  // the panel's session (the panel cross-checks).
+  sandboxBadge: SandboxBadge;
 };
 
 type SessionActions = {
@@ -235,6 +241,7 @@ const initialState: SessionState = {
   _isRecovering: false,
   probeState: initialProbeState,
   agentTree: initialAgentTree,
+  sandboxBadge: "none",
 };
 
 function asString(value: unknown): string {
@@ -297,6 +304,71 @@ function resolveControlStatus(
     });
   }
   return currentStatus;
+}
+
+// PR2 (INV-SPM-11): in on_demand mode `sandbox_state_changed{creating|active}`
+// arrives MID-RUN (lazy provisioning) and MUST NOT be treated as a terminal /
+// cleanup signal — only the terminal `destroyed` transition may collapse a live
+// chat or fold recovery status. Payload lives under `.data.new_state` (fixture
+// `session-store.test.ts:1122-1130`; mirrors `resolveStatusFromEvent` :336-338).
+function isSandboxDestroyedEvent(evt: { type?: string; data?: unknown }): boolean {
+  if (evt.type !== "sandbox_state_changed") return false;
+  const data = (evt.data ?? {}) as Record<string, unknown>;
+  return typeof data.new_state === "string" && data.new_state === "destroyed";
+}
+
+// PR2 Task 22 (spec §5.8 / R3#B6): the on_demand sandbox provisioning badge.
+// A reverse-scan verdict over `sandbox_state_changed` history — see
+// `deriveSandboxBadge` for the mapping. "none" means the header renders no badge
+// (the on_demand empty-state `notStarted` copy is a panel-level refinement, NOT
+// part of this 3-state contract).
+export type SandboxBadge = "provisioning" | "failed" | "none";
+
+// PR2 Task 22: the two `sandbox_state_changed.data.reason` values PR-1a's
+// `_transition(event_reason=...)` rides on `unbound` transitions that mean the
+// provisioning attempt did not succeed (hard failure vs cooperative cancel). Any
+// other unbound reason (e.g. a normal teardown) is NOT a failed badge.
+const SANDBOX_FAILED_REASONS: ReadonlySet<string> = new Set([
+  "provision_failed",
+  "provision_cancelled",
+]);
+
+/**
+ * PR2 Task 22 (spec §5.8 / R3#B6): reverse-scan `events` for the LAST
+ * `sandbox_state_changed` and map it to a header badge:
+ *   - `new_state == "creating"`                       → "provisioning"
+ *   - `new_state == "active" | "destroyed"`           → "none"
+ *   - `new_state == "unbound"` && reason ∈ FAILED     → "failed"
+ *   - anything else / no sandbox event                → "none"
+ *
+ * The scan stops at the single most-recent sandbox event (not the most-recent
+ * "interesting" one), so a `failed` badge naturally persists until the NEXT
+ * `creating`/`active` transition — a retry emits a fresh `creating` and the
+ * reverse-scan flips back to "provisioning" with no extra clear-logic. Mirrors
+ * the `.event` / `.data.new_state` / `.data.reason` access pattern used by
+ * `deriveStatusFromEvents`' destroyed-only block (Task 21).
+ */
+export function deriveSandboxBadge(events: SessionEventRecord[]): SandboxBadge {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.event !== "sandbox_state_changed") {
+      continue;
+    }
+    const data = (event.data ?? {}) as Record<string, unknown>;
+    const newState = typeof data.new_state === "string" ? data.new_state : "";
+    if (newState === "creating") {
+      return "provisioning";
+    }
+    if (newState === "unbound") {
+      const reason = typeof data.reason === "string" ? data.reason : "";
+      return SANDBOX_FAILED_REASONS.has(reason) ? "failed" : "none";
+    }
+    // active | destroyed | destroying | anything else on the LAST sandbox event
+    // → no badge. Return here (not continue): the contract keys off the single
+    // most-recent sandbox event.
+    return "none";
+  }
+  return "none";
 }
 
 function resolveStatusFromEvent(
@@ -827,9 +899,14 @@ export function pickMoreAdvancedStatus(
   return best;
 }
 
+// PR2 (INV-SPM-11): `sandbox_state_changed` is deliberately NOT a blanket signal
+// type — a non-destroyed sandbox event (creating/active) must NOT set sawSignal
+// (it would push a null recovery status to "running"). The destroyed-only case
+// is handled explicitly inside `deriveStatusFromEvents` before this membership
+// check.
 const SIGNAL_EVENT_TYPES = new Set([
   "done", "error", "wait", "tool_confirmation",
-  "control", "health", "finishing", "sandbox_state_changed",
+  "control", "health", "finishing",
   "session_mode_changed",
 ]);
 
@@ -886,6 +963,22 @@ export function deriveStatusFromEvents(
   let sawSignal = false;
 
   for (const event of events) {
+    // PR2 (INV-SPM-11): sandbox events fold status ONLY when terminal-destroyed.
+    // A non-destroyed sandbox event (creating/active from lazy provisioning) must
+    // NOT set sawSignal, otherwise a pure-CREATING recovery history would push a
+    // null status to "running" (R3#A2). Handled before the membership check.
+    if (event.event === "sandbox_state_changed") {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      if (data.new_state !== "destroyed") {
+        continue;
+      }
+      sawSignal = true;
+      derived = resolveStatusFromEvent(derived, {
+        type: event.event,
+        data: event.data ?? {},
+      } as SSEEventData);
+      continue;
+    }
     if (!SIGNAL_EVENT_TYPES.has(event.event)) {
       continue;
     }
@@ -1486,6 +1579,11 @@ export const useSessionStore = create<SessionStore>()(
                 { ...normalizedRemote, events: freshReplay.events },
                 freshReplay.state
               ),
+              // PR2 Task 22: reload restore — derive the badge from the freshly
+              // folded persisted events (same pure fn as the live path).
+              sandboxBadge: deriveSandboxBadge(
+                freshReplay.events as SessionEventRecord[]
+              ),
             };
           }
 
@@ -1537,6 +1635,9 @@ export const useSessionStore = create<SessionStore>()(
 
           return {
             currentSession: nextSession,
+            // PR2 Task 22: keep the badge slot in lockstep with the merged
+            // events on every refetch (same pure fn as the live path).
+            sandboxBadge: deriveSandboxBadge(mergedEvents),
           };
         });
 
@@ -1788,6 +1889,9 @@ export const useSessionStore = create<SessionStore>()(
               last_seq: nextLastSeq,
               supervisor_snapshot: nextSnapshot,
             },
+            // PR2 Task 22: reload/reconnect restore — recompute the badge over the
+            // merged recovered events (same pure fn as the live path).
+            sandboxBadge: deriveSandboxBadge(merged),
           };
         });
 
@@ -1977,6 +2081,9 @@ export const useSessionStore = create<SessionStore>()(
           }
 
           // E2: 标记是否收到终止事件（在 set() 外部）
+          // PR2 (INV-SPM-11): only a terminal `destroyed` sandbox transition marks
+          // the stream terminal — mid-run creating/active events (lazy provisioning
+          // in on_demand mode) must keep the chat alive.
           if (
             event.type === "done" ||
             event.type === "error" ||
@@ -1984,7 +2091,7 @@ export const useSessionStore = create<SessionStore>()(
             event.type === "tool_confirmation" ||
             event.type === "control" ||
             event.type === "owner_conflict" ||
-            event.type === "sandbox_state_changed"
+            isSandboxDestroyedEvent(event)
           ) {
             sawTerminalEvent = true;
           }
@@ -2063,7 +2170,8 @@ export const useSessionStore = create<SessionStore>()(
               event.type === "owner_conflict" ||
               event.type === "finishing" ||
               event.type === "health" ||
-              event.type === "sandbox_state_changed"
+              // PR2 (INV-SPM-11): destroyed-only — creating/active must not clear chat.
+              isSandboxDestroyedEvent(event)
             ) {
               const isFinishing = event.type === "finishing";
               const isHealth = event.type === "health";
@@ -2098,6 +2206,22 @@ export const useSessionStore = create<SessionStore>()(
               sessions: nextSessions,
             };
           });
+
+          // PR2 Task 22: recompute the on_demand provisioning badge from the
+          // now-updated events. A SEPARATE set() keeps this fully orthogonal to
+          // Task 21's terminal-collapse branches above (INV-SPM-11). Scoped to
+          // the current session only — a background session's sandbox event must
+          // not overwrite the viewed session's badge.
+          if (event.type === "sandbox_state_changed") {
+            set((state) => {
+              const cs = state.currentSession;
+              if (!cs || cs.session_id !== sessionId) {
+                return {};
+              }
+              const badge = deriveSandboxBadge(cs.events as SessionEventRecord[]);
+              return badge === state.sandboxBadge ? {} : { sandboxBadge: badge };
+            });
+          }
         },
         (error) => {
           // R5b-5: tool_confirmation 提交收到 HTTP 409（losing-claim / late-duplicate

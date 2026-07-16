@@ -789,6 +789,8 @@ async def get_session(
             status=session.status,
             events=EventMapper.events_to_sse_events(session.events),
             supervisor_snapshot=supervisor_snapshot,
+            # SPM Task 20 — deployment constant, read at assembly time.
+            sandbox_mode=get_settings().sandbox_provision_mode,
         ),
     )
 
