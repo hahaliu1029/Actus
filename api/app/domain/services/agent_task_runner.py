@@ -1663,6 +1663,13 @@ class AgentTaskRunner(TaskRunner):
     async def _sync_file_to_storage(self, filepath: str) -> File:
         """将沙箱中指定的文件路径数据同步到存储桶中"""
         try:
+            # INV-SPM-12 (SPM P1-1): peek — post-outcome storage sync must never
+            # provision (a Denied/failed file tool + LLM-authored attachment paths
+            # must not spawn a container). No sandbox → nothing to download.
+            # always: Eager peek ≡ handle (byte-identical).
+            sandbox = self._sandbox_accessor.peek()
+            if sandbox is None:
+                return
             # 1.根据文件路径从会话中查找文件数据
             async with self._uow:
                 file = await self._uow.session.get_file_by_path(
@@ -1670,7 +1677,6 @@ class AgentTaskRunner(TaskRunner):
                 )
 
             # 2.从沙箱中下载文件
-            sandbox = await self._sandbox_accessor.get()
             file_data = await sandbox.download_file(filepath)
 
             # 3.判断会话中的文件是否存在
@@ -1715,7 +1721,11 @@ class AgentTaskRunner(TaskRunner):
         （源代码通过 file_write 工具已自动同步）。
         """
         try:
-            sandbox = await self._sandbox_accessor.get()
+            # INV-SPM-12 (SPM P1-1): peek — post-outcome output-file scan must never
+            # provision. No sandbox → nothing to scan. always: Eager peek ≡ handle.
+            sandbox = self._sandbox_accessor.peek()
+            if sandbox is None:
+                return
             list_result = await sandbox.list_files(exec_dir)
             if not list_result.success:
                 return
@@ -3339,11 +3349,18 @@ class AgentTaskRunner(TaskRunner):
                 logger.debug("处理工具事件: tool_name=%s, function=%s, category=%s", event.tool_name, event.function_name, category)
                 # 2.工具为浏览器则补全工具浏览器工具内容
                 if category == "browser":
-                    screenshot_url = await self._get_browser_screenshot()
-                    logger.debug("浏览器截图完成: url=%s", screenshot_url[:80] if screenshot_url else "(empty)")
-                    event.tool_content = BrowserToolContent(
-                        screenshot=screenshot_url,
-                    )
+                    # INV-SPM-12 (SPM P1-1): only screenshot an ALREADY-provisioned
+                    # sandbox — the observability pump must never trigger browser /
+                    # sandbox provision (a Denied/failed browser tool must not spawn
+                    # a container). _get_browser_screenshot → browser_accessor.get()
+                    # chains sandbox_accessor.get(), so gate on the sandbox peek here.
+                    # always: Eager peek ≡ handle. on_demand no-sandbox → skip.
+                    if self._sandbox_accessor.peek() is not None:
+                        screenshot_url = await self._get_browser_screenshot()
+                        logger.debug("浏览器截图完成: url=%s", screenshot_url[:80] if screenshot_url else "(empty)")
+                        event.tool_content = BrowserToolContent(
+                            screenshot=screenshot_url,
+                        )
                 elif category == "search":
                     # 3.工具为搜索则添加搜索工具内容
                     # R4 CS3 Task 15 migration: read envelope.function_result.data (dict)
@@ -3367,15 +3384,23 @@ class AgentTaskRunner(TaskRunner):
                     # 4.工具为shell则生成shell工具内容
                     # R4 CS3 Task 16: use envelope.function_args for consistency.
                     session_id = envelope.function_args.get("session_id", "default")
-                    sandbox = await self._sandbox_accessor.get()
-                    shell_result = await sandbox.read_shell_output(
-                        session_id, console=True,
-                    )
-                    console_records = (shell_result.data or {}).get("console_records", [])
-                    event.tool_content = ShellToolContent(
-                        console=console_records
-                    )
-                    # Shell 命令可能生成输出文件，主动扫描并同步
+                    # INV-SPM-12 (SPM P1-1): enrichment is post-outcome
+                    # observability — peek an ALREADY-provisioned sandbox, never
+                    # provision from the event pump. react_graph emits CALLED
+                    # ToolEvents for Denied/AllowError too, so a get() here would
+                    # spawn a container for a refused shell call. always: Eager
+                    # peek ≡ handle (byte-identical); on_demand no-sandbox → skip.
+                    sandbox = self._sandbox_accessor.peek()
+                    if sandbox is not None:
+                        shell_result = await sandbox.read_shell_output(
+                            session_id, console=True,
+                        )
+                        console_records = (shell_result.data or {}).get("console_records", [])
+                        event.tool_content = ShellToolContent(
+                            console=console_records
+                        )
+                    # Shell 命令可能生成输出文件，主动扫描并同步（_sync_generated_files
+                    # 自带 peek 守卫；无沙箱 → 内部早退，不供给）。
                     exec_dir = envelope.function_args.get("exec_dir", "")
                     if exec_dir:
                         await self._sync_generated_files(exec_dir)
@@ -3384,19 +3409,24 @@ class AgentTaskRunner(TaskRunner):
                     # R4 CS3 Task 16: use envelope.function_args / envelope.function_name.
                     filepath = envelope.function_args.get("filepath")
                     if filepath:
-                        sandbox = await self._sandbox_accessor.get()
-                        file_read_result = await sandbox.read_file(filepath)
-                        file_content: str = (file_read_result.data or {}).get(
-                            "content", ""
-                        )
-                        event.tool_content = FileToolContent(content=file_content)
-                        # 写操作和显式文件查看都需要把沙箱文件同步到会话文件列表
-                        if envelope.function_name in (
-                            "file_write",
-                            "file_str_replace",
-                            "file_view",
-                        ):
-                            await self._sync_file_to_storage(filepath)
+                        # INV-SPM-12 (SPM P1-1): peek — never provision from the
+                        # observability pump (a Denied/failed file tool must not
+                        # spawn a container). always: Eager peek ≡ handle.
+                        sandbox = self._sandbox_accessor.peek()
+                        if sandbox is not None:
+                            file_read_result = await sandbox.read_file(filepath)
+                            file_content: str = (file_read_result.data or {}).get(
+                                "content", ""
+                            )
+                            event.tool_content = FileToolContent(content=file_content)
+                            # 写操作和显式文件查看都需要把沙箱文件同步到会话文件列表
+                            if envelope.function_name in (
+                                "file_write",
+                                "file_str_replace",
+                                "file_view",
+                            ):
+                                await self._sync_file_to_storage(filepath)
+                        # on_demand no-sandbox → skip read/sync (never provision).
                     else:
                         event.tool_content = FileToolContent(content="(No Content)")
                 elif category in ("mcp", "a2a"):
@@ -3448,18 +3478,27 @@ class AgentTaskRunner(TaskRunner):
                     )
                     if shell_sid:
                         # 读取终端输出，供 UI 终端面板展示
-                        try:
-                            sandbox = await self._sandbox_accessor.get()
-                            shell_result = await sandbox.read_shell_output(
-                                shell_sid, console=True,
-                            )
-                            console_records = (shell_result.data or {}).get(
-                                "console_records", []
-                            )
-                            event.tool_content = ShellToolContent(
-                                console=console_records
-                            )
-                        except Exception:
+                        # INV-SPM-12 (SPM P1-1): peek — a FAILED native skill still
+                        # carries shell_session_id (skill.py:500), but the pump must
+                        # never provision. No sandbox → fall back to SkillToolContent
+                        # (same as a read failure). always: Eager peek ≡ handle.
+                        sandbox = self._sandbox_accessor.peek()
+                        if sandbox is not None:
+                            try:
+                                shell_result = await sandbox.read_shell_output(
+                                    shell_sid, console=True,
+                                )
+                                console_records = (shell_result.data or {}).get(
+                                    "console_records", []
+                                )
+                                event.tool_content = ShellToolContent(
+                                    console=console_records
+                                )
+                            except Exception:
+                                event.tool_content = SkillToolContent(
+                                    skill_result=skill_data
+                                )
+                        else:
                             event.tool_content = SkillToolContent(
                                 skill_result=skill_data
                             )
