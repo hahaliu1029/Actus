@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.services.tools.langchain_tools import _make_file_tools
 from app.domain.services.tools.memory_mount_scope import (
     MemoryMountScope,
@@ -122,7 +123,7 @@ class TestFileToolsGuardDisabledWhenNoScope:
         sandbox = AsyncMock()
         sandbox.read_file = AsyncMock(return_value=_ok_result("hello"))
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=None)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=None)
         file_read = _tool_by_name(tools, "file_read")
 
         result = await file_read.ainvoke({"filepath": "/workspace/.memory/evil.md"})
@@ -305,7 +306,7 @@ class TestFileToolsGuardActiveAndRefusesSymlinks:
         sandbox = AsyncMock()
         sandbox.read_file = AsyncMock()  # 不应被调用
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         file_read = _tool_by_name(tools, "file_read")
 
         # 3) agent 请求读 symlink path（bind mount 内）
@@ -340,7 +341,7 @@ class TestFileToolsGuardActiveAndRefusesSymlinks:
         sandbox = AsyncMock()
         sandbox.replace_in_file = AsyncMock()
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         tool = _tool_by_name(tools, "file_str_replace")
 
         await tool.ainvoke(
@@ -375,7 +376,7 @@ class TestFileToolsGuardActiveAndRefusesSymlinks:
         sandbox = AsyncMock()
         sandbox.search_in_file = AsyncMock()
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         tool = _tool_by_name(tools, "file_find_in_content")
 
         await tool.ainvoke(
@@ -409,7 +410,7 @@ class TestFileToolsGuardActiveAndRefusesSymlinks:
         sandbox = AsyncMock()
         sandbox.read_file = AsyncMock()  # 不应被调用
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         file_read = _tool_by_name(tools, "file_read")
 
         result = await file_read.ainvoke(
@@ -439,7 +440,7 @@ class TestFileToolsGuardPassesThroughNonSymlinks:
         sandbox = AsyncMock()
         sandbox.read_file = AsyncMock(return_value=_ok_result("normal content"))
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         file_read = _tool_by_name(tools, "file_read")
 
         result = await file_read.ainvoke(
@@ -463,7 +464,7 @@ class TestFileToolsGuardPassesThroughNonSymlinks:
         sandbox = AsyncMock()
         sandbox.read_file = AsyncMock(return_value=_ok_result("other"))
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         file_read = _tool_by_name(tools, "file_read")
 
         await file_read.ainvoke({"filepath": "/workspace/other_area/x.md"})
@@ -484,7 +485,7 @@ class TestFileToolsGuardPassesThroughNonSymlinks:
         sandbox = AsyncMock()
         sandbox.read_file = AsyncMock(return_value=_ok_result("x"))
 
-        tools = _make_file_tools(sandbox, memory_mount_scope=scope)
+        tools = _make_file_tools(EagerSandboxAccessor(sandbox), memory_mount_scope=scope)
         file_read = _tool_by_name(tools, "file_read")
 
         await file_read.ainvoke(

@@ -23,6 +23,10 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from app.application.services.agent_service import AgentService
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
@@ -64,8 +68,8 @@ def _build_child_runner(deps: ChildRunnerSharedDeps):
         tool_filter=frozenset({"file_write"}),
         mailbox_publisher=MagicMock(),
         terminal_envelope_publisher_disabled=True,
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )

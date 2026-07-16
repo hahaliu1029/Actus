@@ -21,6 +21,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import (
     A2AConfig,
     AgentConfig,
@@ -181,9 +185,9 @@ def _make_runner(monkeypatch: pytest.MonkeyPatch) -> AgentTaskRunner:
         session_id="atom-test",
         user_id="user-atom",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
     runner._mcp_tool = _FakeMCPTool()
     runner._a2a_tool = _FakeA2ATool()

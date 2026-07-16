@@ -39,7 +39,9 @@ def test_build_config_wraps_sandbox_in_adapter_port_not_raw():
     flow._coord_deps = coord
     cfg = flow._build_config()
     assert cfg["configurable"]["parent_sandbox"] is wrapped
-    factory.assert_called_once_with(flow._sandbox)
+    # [SPM Task 10] Eager path: _make_parent_sandbox_port wraps the peek()'d raw
+    # handle via the injected factory (never ParentSandboxAdapter directly).
+    factory.assert_called_once_with(flow._sandbox_accessor.peek())
 
 
 def test_planner_react_no_new_infrastructure_import_in_build_config():

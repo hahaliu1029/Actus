@@ -25,6 +25,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.tools.tool_source_resolver import (
     _CANONICAL_TOOL_IDENTITIES,
     KNOWN_CATEGORIES,
@@ -72,14 +76,14 @@ def _enumerate_native_tools():
 
     tools = []
     tools.extend(langchain_tools._make_message_tools())
-    tools.extend(langchain_tools._make_file_tools(sandbox))
-    tools.extend(langchain_tools._make_shell_tools(sandbox))
-    tools.extend(langchain_tools._make_browser_tools(browser))
+    tools.extend(langchain_tools._make_file_tools(EagerSandboxAccessor(sandbox)))
+    tools.extend(langchain_tools._make_shell_tools(EagerSandboxAccessor(sandbox)))
+    tools.extend(langchain_tools._make_browser_tools(EagerBrowserAccessor(browser)))
     tools.extend(langchain_tools._make_search_tools(search_engine))
     tools.extend(
         langchain_tools._make_file_view_tools(
-            sandbox,
-            processor_lookup=MagicMock(),
+            EagerSandboxAccessor(sandbox),
+            file_processor_lookup=MagicMock(),
             supports_vision=True,
             supports_pdf_input=True,
         )

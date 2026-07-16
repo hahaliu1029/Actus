@@ -15,6 +15,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.domain.models.event import ToolEvent, ToolEventStatus
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.tools.tool_source_resolver import KNOWN_CATEGORIES
 
@@ -82,9 +86,10 @@ def _build_minimal_runner() -> AgentTaskRunner:
     Tasks 15/16/17 会在这个 helper 基础上加 14 contract + 5 regression 测试.
     """
     runner = object.__new__(AgentTaskRunner)
-    runner._sandbox = AsyncMock()
-    runner._sandbox.read_shell_output = AsyncMock(return_value=MagicMock(data={}))
-    runner._sandbox.read_file = AsyncMock(return_value=MagicMock(data={}))
+    _sb = AsyncMock()
+    _sb.read_shell_output = AsyncMock(return_value=MagicMock(data={}))
+    _sb.read_file = AsyncMock(return_value=MagicMock(data={}))
+    runner._sandbox_accessor = EagerSandboxAccessor(_sb)
     runner._sync_generated_files = AsyncMock()
     runner._sync_file_to_storage = AsyncMock()
     runner._get_browser_screenshot = AsyncMock(return_value="data:image/png;base64,xyz")
@@ -364,7 +369,7 @@ class TestEnrichmentShell:
         )
 
         runner = _build_minimal_runner()
-        runner._sandbox.read_shell_output = AsyncMock(
+        runner._sandbox_accessor.peek().read_shell_output = AsyncMock(
             return_value=MagicMock(data={"console_records": [{"cmd": "ls"}]})
         )
 
@@ -397,7 +402,7 @@ class TestEnrichmentShell:
         )
 
         runner = _build_minimal_runner()
-        runner._sandbox.read_shell_output = AsyncMock(
+        runner._sandbox_accessor.peek().read_shell_output = AsyncMock(
             return_value=MagicMock(data={"console_records": []})
         )
 
@@ -427,7 +432,7 @@ class TestEnrichmentFile:
         )
 
         runner = _build_minimal_runner()
-        runner._sandbox.read_file = AsyncMock(return_value=MagicMock(data={"content": "hello"}))
+        runner._sandbox_accessor.peek().read_file = AsyncMock(return_value=MagicMock(data={"content": "hello"}))
 
         await runner._handle_tool_event(evt)
 
@@ -484,7 +489,7 @@ class TestEnrichmentSkill:
         )
 
         runner = _build_minimal_runner()
-        runner._sandbox.read_shell_output = AsyncMock(
+        runner._sandbox_accessor.peek().read_shell_output = AsyncMock(
             return_value=MagicMock(data={"console_records": [{"out": "stdout"}]})
         )
 
@@ -652,13 +657,13 @@ class TestToolContentChannelBinaryEquality:
         )
 
         runner1 = _build_minimal_runner()
-        runner1._sandbox.read_shell_output = AsyncMock(
+        runner1._sandbox_accessor.peek().read_shell_output = AsyncMock(
             return_value=MagicMock(data={"console_records": [{"cmd": "ls"}]})
         )
         await runner1._handle_tool_event(pre_evt)
 
         runner2 = _build_minimal_runner()
-        runner2._sandbox.read_shell_output = AsyncMock(
+        runner2._sandbox_accessor.peek().read_shell_output = AsyncMock(
             return_value=MagicMock(data={"console_records": [{"cmd": "ls"}]})
         )
         await runner2._handle_tool_event(r4_evt)
@@ -692,11 +697,11 @@ class TestToolContentChannelBinaryEquality:
         )
 
         runner1 = _build_minimal_runner()
-        runner1._sandbox.read_file = AsyncMock(return_value=MagicMock(data={"content": "hello"}))
+        runner1._sandbox_accessor.peek().read_file = AsyncMock(return_value=MagicMock(data={"content": "hello"}))
         await runner1._handle_tool_event(pre_evt)
 
         runner2 = _build_minimal_runner()
-        runner2._sandbox.read_file = AsyncMock(return_value=MagicMock(data={"content": "hello"}))
+        runner2._sandbox_accessor.peek().read_file = AsyncMock(return_value=MagicMock(data={"content": "hello"}))
         await runner2._handle_tool_event(r4_evt)
 
         assert isinstance(pre_evt.tool_content, FileToolContent)

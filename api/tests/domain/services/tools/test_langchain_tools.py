@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from langchain_core.tools import BaseTool as LCBaseTool
 from app.domain.models.tool_result import ToolResult
+from app.application.services.sandbox_accessors import EagerBrowserAccessor, EagerSandboxAccessor
 
 pytestmark = pytest.mark.anyio
 
@@ -59,8 +60,8 @@ class TestCreateNativeTools:
     def test_returns_list_of_langchain_tools(self, mock_sandbox, mock_browser, mock_search_engine):
         from app.domain.services.tools.langchain_tools import create_native_tools
         tools = create_native_tools(
-            sandbox=mock_sandbox,
-            browser=mock_browser,
+            sandbox_accessor=EagerSandboxAccessor(mock_sandbox),
+            browser_accessor=EagerBrowserAccessor(mock_browser),
             search_engine=mock_search_engine,
         )
         assert isinstance(tools, list)
@@ -69,8 +70,8 @@ class TestCreateNativeTools:
     def test_expected_tool_names(self, mock_sandbox, mock_browser, mock_search_engine):
         from app.domain.services.tools.langchain_tools import create_native_tools
         tools = create_native_tools(
-            sandbox=mock_sandbox,
-            browser=mock_browser,
+            sandbox_accessor=EagerSandboxAccessor(mock_sandbox),
+            browser_accessor=EagerBrowserAccessor(mock_browser),
             search_engine=mock_search_engine,
         )
         names = {t.name for t in tools}
@@ -85,14 +86,14 @@ class TestCreateNativeTools:
 class TestMessageTools:
     async def test_message_notify_user(self, mock_sandbox, mock_browser, mock_search_engine):
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=mock_sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(mock_sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         notify = next(t for t in tools if t.name == "message_notify_user")
         result = await notify.ainvoke({"text": "hello"})
         assert "Continue" in str(result)
 
     async def test_message_ask_user(self, mock_sandbox, mock_browser, mock_search_engine):
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=mock_sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(mock_sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         ask = next(t for t in tools if t.name == "message_ask_user")
         result = await ask.ainvoke({"text": "confirm?"})
         assert result is not None
@@ -109,7 +110,7 @@ class TestShellExecuteStatusHandling:
 
     def _build_tools(self, sandbox):
         from app.domain.services.tools.langchain_tools import create_native_tools
-        return create_native_tools(sandbox=sandbox, browser=AsyncMock(), search_engine=AsyncMock())
+        return create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(AsyncMock()), search_engine=AsyncMock())
 
     async def test_running_status_returns_poll_instructions(self, mock_browser, mock_search_engine):
         sandbox = AsyncMock()
@@ -127,7 +128,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "apt-get update && apt-get install -y unzip"})
@@ -147,7 +148,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "echo hello world"})
@@ -162,7 +163,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "touch /tmp/x"})
@@ -178,7 +179,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "ls /nope"})
@@ -194,7 +195,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         await shell.ainvoke({"command": "sleep 10", "wait_seconds": 60})
@@ -209,7 +210,7 @@ class TestShellExecuteStatusHandling:
         sandbox = AsyncMock()
         sandbox.exec_command = AsyncMock(return_value=ToolResult(success=True, message="hello"))
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "echo hello"})
@@ -221,7 +222,7 @@ class TestShellExecuteStatusHandling:
             return_value=ToolResult(success=False, message="sandbox unreachable", data=None)
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "ls"})
@@ -236,7 +237,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         # LLM passes an absurd value — wrapper must clamp below the httpx 600s timeout.
@@ -255,7 +256,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         await shell.ainvoke({"command": "ls", "wait_seconds": 0})
@@ -289,7 +290,7 @@ class TestShellExecuteStatusHandling:
             )
         )
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         result = await shell.ainvoke({"command": "apt-get update"})
@@ -309,7 +310,7 @@ class TestShellExecuteStatusHandling:
         )
         sandbox.read_shell_output = AsyncMock(side_effect=RuntimeError("transient network blip"))
         from app.domain.services.tools.langchain_tools import create_native_tools
-        tools = create_native_tools(sandbox=sandbox, browser=mock_browser, search_engine=mock_search_engine)
+        tools = create_native_tools(sandbox_accessor=EagerSandboxAccessor(sandbox), browser_accessor=EagerBrowserAccessor(mock_browser), search_engine=mock_search_engine)
         shell = next(t for t in tools if t.name == "shell_execute")
 
         # Peek failure must not break the running-status message.

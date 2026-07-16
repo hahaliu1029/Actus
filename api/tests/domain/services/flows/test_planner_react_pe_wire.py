@@ -8,6 +8,10 @@ import inspect
 
 import pytest
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
 
@@ -52,8 +56,8 @@ def test_planner_react_flow_stores_pe_and_ssm():
         llm=MagicMock(),
         agent_config=AgentConfig(max_iterations=10, max_retries=3, max_search_results=5),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),
@@ -79,8 +83,8 @@ def test_planner_react_flow_defaults_pe_ssm_to_none():
         llm=MagicMock(),
         agent_config=AgentConfig(max_iterations=10, max_retries=3, max_search_results=5),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

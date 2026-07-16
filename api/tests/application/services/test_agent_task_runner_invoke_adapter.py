@@ -461,6 +461,10 @@ def test_set_budget_callback_chain_reaches_flow_config():
     from unittest.mock import MagicMock
 
     from app.domain.models.app_config import AgentConfig
+    from app.application.services.sandbox_accessors import (
+        EagerBrowserAccessor,
+        EagerSandboxAccessor,
+    )
     from app.domain.services.agent_task_runner import AgentTaskRunner
     from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -471,8 +475,8 @@ def test_set_budget_callback_chain_reaches_flow_config():
             max_iterations=10, max_retries=3, max_search_results=5,
         ),
         session_id="chain-test",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

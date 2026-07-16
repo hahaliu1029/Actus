@@ -23,6 +23,10 @@ from app.domain.services.agent_task_runner import (
     _force_include_member_skills,
     _member_referenced_providers,
 )
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.tools.mcp import _mcp_tool_namespace
 
 pytestmark = pytest.mark.anyio
@@ -324,8 +328,8 @@ def _build_lc_tools_runner_no_cpc(monkeypatch):
     runner = object.__new__(AgentTaskRunner)
     runner._tool_filter = None
     runner._execution_supervisor = None
-    runner._sandbox = MagicMock()
-    runner._browser = MagicMock()
+    runner._sandbox_accessor = EagerSandboxAccessor(MagicMock())
+    runner._browser_accessor = EagerBrowserAccessor(MagicMock())
     runner._search_engine = MagicMock()
     runner._file_processor_lookup = None
     runner._supports_vision = True

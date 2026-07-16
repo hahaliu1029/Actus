@@ -18,6 +18,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import AgentConfig, MemoryConfig
 from app.domain.models.memory_chunk import FlushBatch, RawChunk
 from app.domain.models.plan import ExecutionStatus, Plan, Step
@@ -58,8 +62,8 @@ def _make_flow(
         "session_id": "s-gate",
         "user_id": TEST_USER_ID_FIXED,
         "uow_factory": MagicMock(),
-        "browser": MagicMock(),
-        "sandbox": MagicMock(),
+        "browser_accessor": EagerBrowserAccessor(MagicMock()),
+        "sandbox_accessor": EagerSandboxAccessor(MagicMock()),
         "search_engine": MagicMock(),
         "mcp_tool": MagicMock(),
         "a2a_tool": MagicMock(),

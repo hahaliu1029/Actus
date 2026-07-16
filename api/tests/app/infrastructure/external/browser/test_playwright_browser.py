@@ -830,3 +830,97 @@ async def test_input_falls_back_to_click_and_type_for_aria_textbox() -> None:
     assert locator_clicks == [True]
     assert typed == ["query"]
     assert enters == [True]
+
+
+# ── SPM Task 8: PlaywrightBrowser.aclose() ──────────────────────────────────
+
+
+class _CloseTrackingPage:
+    """Page fake for the cleanup()/aclose() path — records close() + tracks state
+    so a page already closed in the context loop isn't double-closed."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self._closed = False
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self._closed = True
+
+
+class _CloseTrackingContext:
+    def __init__(self, pages: list) -> None:
+        self.pages = pages
+
+
+class _CloseTrackingBrowser:
+    def __init__(self, contexts: list) -> None:
+        self.contexts = contexts
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _StopTrackingPlaywright:
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+
+async def test_playwright_browser_aclose_closes_connection_idempotently() -> None:
+    """SPM Task 8: ``aclose()`` delegates to the existing ``cleanup()`` → closes the
+    page + browser, stops playwright, and resets all three handles to ``None`` in
+    ``cleanup()``'s ``finally``. A second ``aclose()`` is therefore a no-op — every
+    handle is already ``None`` so no close is re-issued and nothing raises."""
+    browser = PlaywrightBrowser(cdp_url="ws://example")
+    page = _CloseTrackingPage()
+    concrete_browser = _CloseTrackingBrowser([_CloseTrackingContext([page])])
+    pw = _StopTrackingPlaywright()
+    browser.page = page  # type: ignore[assignment]
+    browser.browser = concrete_browser  # type: ignore[assignment]
+    browser.playwright = pw  # type: ignore[assignment]
+
+    await browser.aclose()
+
+    assert concrete_browser.close_calls == 1
+    assert pw.stop_calls == 1
+    assert page.close_calls == 1  # closed once (context loop), not double-closed
+    # Handles reset → the connection is provably released.
+    assert browser.page is None
+    assert browser.browser is None
+    assert browser.playwright is None
+
+    # Idempotent: second call finds no handles → no new closes, no raise.
+    await browser.aclose()
+    assert concrete_browser.close_calls == 1
+    assert pw.stop_calls == 1
+    assert page.close_calls == 1
+
+
+async def test_playwright_browser_aclose_swallows_close_error() -> None:
+    """SPM Task 8: ``aclose()`` is best-effort — an underlying ``close()`` that raises
+    must NOT propagate, and the handles are still cleared (``cleanup()``'s
+    ``finally`` runs regardless)."""
+    browser = PlaywrightBrowser(cdp_url="ws://example")
+
+    class _BoomBrowser(_CloseTrackingBrowser):
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("browser close boom")
+
+    concrete_browser = _BoomBrowser([])
+    browser.browser = concrete_browser  # type: ignore[assignment]
+    browser.playwright = _StopTrackingPlaywright()  # type: ignore[assignment]
+
+    await browser.aclose()  # must not raise
+
+    assert concrete_browser.close_calls == 1
+    # cleanup()'s finally still cleared the handles despite the raise.
+    assert browser.browser is None
+    assert browser.playwright is None

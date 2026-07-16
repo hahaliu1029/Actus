@@ -8,6 +8,10 @@ from unittest.mock import MagicMock, patch
 from app.application.services.coordinator_runtime_deps import (
     _NullCoordinatorRuntimeDeps,
 )
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import AgentConfig
 
 
@@ -33,8 +37,8 @@ def _make_default_flow():
             max_iterations=10, max_retries=3, max_search_results=5,
         ),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

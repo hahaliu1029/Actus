@@ -23,6 +23,10 @@ from app.domain.models.memory_recall import (
     RecalledMemoryItem,
 )
 from app.domain.models.message import Message
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.flows import planner_react as planner_react_mod
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -83,8 +87,8 @@ def _make_flow(llm=None, **overrides):
         llm=llm if llm is not None else MagicMock(),
         agent_config=MagicMock(memory=_memory_cfg()),
         session_id="sess-1",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(),
         a2a_tool=MagicMock(),

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from app.domain.external.sandbox import SandboxHandle
+from app.domain.external.sandbox import SandboxAccessor
 from app.domain.models.extension_governance import SyncOutcome
 from app.domain.models.skill import Skill, SkillRuntimeType
 from app.domain.services.extension_admission_gates import (
@@ -51,13 +51,13 @@ class SkillBundleSyncManager:
 
     def __init__(
         self,
-        sandbox: SandboxHandle,
+        sandbox_accessor: SandboxAccessor,
         skills_root_dir: str | Path,
         sandbox_skill_root: str,
         background_concurrency: int = DEFAULT_BACKGROUND_CONCURRENCY,
         admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 旧路径零调用）
     ) -> None:
-        self._sandbox = sandbox
+        self._sandbox_accessor = sandbox_accessor
         self._skills_root_dir = Path(skills_root_dir)
         self.sandbox_skill_root = str(sandbox_skill_root).rstrip("/")
         self._background_concurrency = max(1, int(background_concurrency or 1))
@@ -328,11 +328,13 @@ class SkillBundleSyncManager:
         if not files:
             raise RuntimeError(f"Skill[{skill.id}] bundle为空，无法同步")
 
+        # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
+        sandbox = await self._sandbox_accessor.get()
         for source_path in files:
             rel_path = source_path.relative_to(bundle_dir).as_posix()
             target_path = f"{sandbox_skill_dir}/{rel_path}"
             with source_path.open("rb") as fp:
-                result = await self._sandbox.upload_file(
+                result = await sandbox.upload_file(
                     file_data=fp,
                     filepath=target_path,
                     filename=source_path.name,
@@ -351,7 +353,7 @@ class SkillBundleSyncManager:
             },
             ensure_ascii=False,
         )
-        marker_result = await self._sandbox.write_file(
+        marker_result = await sandbox.write_file(
             filepath=marker_path,
             content=marker,
         )
@@ -401,14 +403,16 @@ class SkillBundleSyncManager:
         )
 
     async def _read_marker_version(self, marker_path: str) -> str:
-        exists_result = await self._sandbox.check_file_exists(marker_path)
+        # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
+        sandbox = await self._sandbox_accessor.get()
+        exists_result = await sandbox.check_file_exists(marker_path)
         if not exists_result.success:
             return ""
         data = exists_result.data if isinstance(exists_result.data, dict) else {}
         if not data.get("exists"):
             return ""
 
-        read_result = await self._sandbox.read_file(filepath=marker_path, max_length=4096)
+        read_result = await sandbox.read_file(filepath=marker_path, max_length=4096)
         if not read_result.success:
             return ""
         read_data = read_result.data if isinstance(read_result.data, dict) else {}

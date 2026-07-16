@@ -5,6 +5,7 @@ import copy
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.tool_result import AllowError, AllowSuccess, Asked, ToolResult
 from app.domain.services.tools.skill import SkillTool
@@ -196,7 +197,7 @@ def _make_bare_skill_tool() -> SkillTool:
     initialize() — callers control initialization order to exercise atomicity.
     """
     return SkillTool(
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
     )
@@ -204,7 +205,7 @@ def _make_bare_skill_tool() -> SkillTool:
 
 async def test_native_skill_executes_entry_command() -> None:
     sandbox = _FakeSandbox()
-    skill_tool = SkillTool(sandbox=sandbox, mcp_tool=_FakeMCPTool(), a2a_tool=_FakeA2ATool())
+    skill_tool = SkillTool(sandbox_accessor=EagerSandboxAccessor(sandbox), mcp_tool=_FakeMCPTool(), a2a_tool=_FakeA2ATool())
 
     skill = _build_native_skill()
 
@@ -231,7 +232,7 @@ async def test_native_defaults_exec_dir_to_skill_directory_when_missing() -> Non
     skill.manifest["bundle_file_count"] = 0
 
     skill_tool = SkillTool(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
     )
@@ -260,7 +261,7 @@ async def test_native_waits_for_sync_before_execute() -> None:
     )
 
     skill_tool = SkillTool(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
         bundle_sync_manager=sync_manager,
@@ -291,7 +292,7 @@ async def test_native_returns_error_when_sync_failed() -> None:
     )
 
     skill_tool = SkillTool(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
         bundle_sync_manager=sync_manager,
@@ -318,7 +319,7 @@ async def test_native_explicit_exec_dir_not_overridden() -> None:
     )
 
     skill_tool = SkillTool(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
         bundle_sync_manager=sync_manager,
@@ -336,7 +337,7 @@ async def test_native_explicit_exec_dir_not_overridden() -> None:
 
 async def test_mcp_skill_delegates_to_mcp_tool() -> None:
     mcp_tool = _FakeMCPTool()
-    skill_tool = SkillTool(sandbox=_FakeSandbox(), mcp_tool=mcp_tool, a2a_tool=_FakeA2ATool())
+    skill_tool = SkillTool(sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()), mcp_tool=mcp_tool, a2a_tool=_FakeA2ATool())
 
     skill = Skill(
         slug="demo-mcp",
@@ -371,7 +372,7 @@ async def test_mcp_skill_delegates_to_mcp_tool() -> None:
 
 async def test_a2a_skill_delegates_to_a2a_tool() -> None:
     a2a_tool = _FakeA2ATool()
-    skill_tool = SkillTool(sandbox=_FakeSandbox(), mcp_tool=_FakeMCPTool(), a2a_tool=a2a_tool)
+    skill_tool = SkillTool(sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()), mcp_tool=_FakeMCPTool(), a2a_tool=a2a_tool)
 
     skill = Skill(
         slug="demo-a2a",
@@ -409,7 +410,7 @@ async def test_skill_invoke_high_risk_manifest_executes_directly() -> None:
     # Risk enforcement is now handled by the Stage P branch in react_graph.tool_node.
     # SkillTool.invoke() always executes the tool regardless of risk_level.
     skill_tool = SkillTool(
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
         risk_mode="enforce_confirmation",
@@ -426,7 +427,7 @@ async def test_skill_invoke_high_risk_manifest_executes_directly() -> None:
 
 async def test_skill_risk_enforce_off_returns_success() -> None:
     skill_tool = SkillTool(
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
         risk_mode="off",
@@ -441,7 +442,7 @@ async def test_skill_risk_enforce_off_returns_success() -> None:
 
 async def test_skill_risk_enforce_low_risk_returns_success() -> None:
     skill_tool = SkillTool(
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
         mcp_tool=_FakeMCPTool(),
         a2a_tool=_FakeA2ATool(),
         risk_mode="enforce_confirmation",
@@ -456,7 +457,7 @@ async def test_skill_risk_enforce_low_risk_returns_success() -> None:
 
 
 async def test_skill_tool_normalizes_and_shortens_function_name() -> None:
-    skill_tool = SkillTool(sandbox=_FakeSandbox(), mcp_tool=_FakeMCPTool(), a2a_tool=_FakeA2ATool())
+    skill_tool = SkillTool(sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()), mcp_tool=_FakeMCPTool(), a2a_tool=_FakeA2ATool())
 
     skill = Skill(
         slug="pptx-skill",

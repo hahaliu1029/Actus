@@ -372,3 +372,31 @@ class SandboxHandle(Protocol):
     async def __aenter__(self) -> "SandboxHandle": ...
 
     async def __aexit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None: ...
+
+
+class SandboxAccessor(Protocol):
+    """SPM PR-1b：tool/runner 层访问沙箱 handle 的显式契约（typing-only）。
+
+    实现分档：
+      * ``EagerSandboxAccessor`` —— always 档 / 子会话：包裹既有 concrete handle，
+        ``get()`` 零供给零 IO（byte-equivalent ``always`` 行为）；
+      * ``OnDemandSandboxAccessor``（PR-1c）—— 首次 ``get()`` 才触发供给。
+
+    NOT @runtime_checkable（与 ``SandboxHandle`` 一致——结构化协议，isinstance 无意义）。
+    Caller 变量始终注解为 ``SandboxAccessor``，不 import 具体实现类。
+    """
+
+    async def get(self) -> "SandboxHandle":
+        """Provision-if-needed。返回即保证 (a) handle 存在 (b) 当前 generation ready
+        (c) post-provision hooks 全部成功。create/ready/hooks 失败抛 SandboxProvisionError；
+        SessionSuspendedError / SessionFinalizedError 原样透传（不包装）。"""
+        ...
+
+    def peek(self) -> "SandboxHandle | None":
+        """非供给探针：ready 时返回缓存 handle，否则 None。永不触发创建。"""
+        ...
+
+    async def release_owned(self) -> None:
+        """r7/F3：runner 终态释放本 accessor 所有权下的 handle（幂等）。Eager=release 包裹的 handle；
+        OnDemand=provisioner.release_held_handle()（覆盖 ready/hooks_failed，peek()=None 也不漏）。"""
+        ...

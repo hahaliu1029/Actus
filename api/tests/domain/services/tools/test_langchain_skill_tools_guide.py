@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import MagicMock
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.tool_result import ToolResult
 from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
@@ -125,7 +126,7 @@ class TestGetSkillGuideEndToEnd:
 
         sandbox = _SimpleSandbox()
         manager = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir=skills_root,
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
 

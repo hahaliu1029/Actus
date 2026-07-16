@@ -19,6 +19,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
+
 pytestmark = pytest.mark.anyio
 
 
@@ -252,8 +257,8 @@ async def test_tool_filter_blocks_tool_at_registry_construction(monkeypatch) -> 
     runner = object.__new__(AgentTaskRunner)
     runner._tool_filter = frozenset({"search_web"})
     runner._execution_supervisor = None
-    runner._sandbox = MagicMock()
-    runner._browser = MagicMock()
+    runner._sandbox_accessor = EagerSandboxAccessor(MagicMock())
+    runner._browser_accessor = EagerBrowserAccessor(MagicMock())
     runner._search_engine = MagicMock()
     runner._file_processor_lookup = None
     runner._supports_vision = True

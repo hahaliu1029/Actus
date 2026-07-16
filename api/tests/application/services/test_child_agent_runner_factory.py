@@ -34,6 +34,10 @@ from app.application.services.child_agent_runner_factory import (
     BuiltChildRunner,
     ChildAgentTaskRunnerFactory,
 )
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 
 
 pytestmark = pytest.mark.anyio
@@ -66,8 +70,8 @@ async def test_build_coordinator_step_disables_terminal_publisher() -> None:
         child_permission_context=_mk_cctx(),
         tool_filter_preset="coordinator_step",
         cancel_event=ce,
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )
@@ -99,8 +103,8 @@ async def test_build_subagent_research_keeps_default_publisher() -> None:
         child_permission_context=_mk_cctx(),
         tool_filter_preset="subagent_research",
         cancel_event=ce,
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )
@@ -124,8 +128,8 @@ async def test_build_resolves_tool_filter_from_preset() -> None:
         child_permission_context=_mk_cctx(),
         tool_filter_preset="coordinator_step",
         cancel_event=asyncio.Event(),
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )
@@ -150,8 +154,8 @@ async def test_build_unknown_preset_raises_value_error() -> None:
             child_permission_context=_mk_cctx(),
             tool_filter_preset="totally_made_up_preset",
             cancel_event=asyncio.Event(),
-            sandbox=MagicMock(),
-            browser=MagicMock(),
+            sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+            browser_accessor=EagerBrowserAccessor(MagicMock()),
             user_id="u1",
             cost_callback_handler=MagicMock(),
         )
@@ -176,8 +180,8 @@ async def test_built_wrapper_carries_runtime_deps() -> None:
         child_permission_context=cctx,
         tool_filter_preset="coordinator_step",
         cancel_event=ce,
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )
@@ -215,8 +219,8 @@ async def test_build_threads_coordinator_metrics_recorder_to_adapter() -> None:
         child_permission_context=_mk_cctx(),
         tool_filter_preset="coordinator_step",
         cancel_event=asyncio.Event(),
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
         coordinator_metrics_recorder=rec,
@@ -258,23 +262,23 @@ async def test_build_forwards_per_child_deps_and_wraps_in_adapter():
         runner_class=builder, mailbox_publisher=MagicMock(), task_cls=fake_task_cls,
     )
     ce = asyncio.Event()
-    sandbox = MagicMock()
-    browser = MagicMock()
+    sandbox = EagerSandboxAccessor(MagicMock())
+    browser = EagerBrowserAccessor(MagicMock())
     cost_handler = MagicMock()
     built = await factory.build(
         child_session_id="c1",
         child_permission_context=_mk_cctx(),
         tool_filter_preset="coordinator_step",
         cancel_event=ce,
-        sandbox=sandbox,
-        browser=browser,
+        sandbox_accessor=sandbox,
+        browser_accessor=browser,
         user_id="u1",
         cost_callback_handler=cost_handler,
     )
     # builder received the per-child deps
     kw = builder.call_args.kwargs
-    assert kw["sandbox"] is sandbox
-    assert kw["browser"] is browser
+    assert kw["sandbox_accessor"] is sandbox
+    assert kw["browser_accessor"] is browser
     assert kw["user_id"] == "u1"
     assert kw["cost_callback_handler"] is cost_handler
     assert kw["terminal_envelope_publisher_disabled"] is True

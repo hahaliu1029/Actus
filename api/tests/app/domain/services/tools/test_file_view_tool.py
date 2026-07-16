@@ -3,6 +3,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 from langchain_core.messages import ToolMessage
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.external.file_processor import FileProcessResult
 
 
@@ -38,7 +42,7 @@ class TestFileViewTool:
     def test_file_view_plain_ainvoke_returns_summary_text(self):
         from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
-        tools = _make_file_view_tools(_make_sandbox_mock(), FakeLookup(), supports_vision=True)
+        tools = _make_file_view_tools(EagerSandboxAccessor(_make_sandbox_mock()), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
         result = asyncio.run(
@@ -50,7 +54,7 @@ class TestFileViewTool:
     def test_file_view_tool_call_returns_tool_message_with_passthrough_artifact(self):
         from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
-        tools = _make_file_view_tools(_make_sandbox_mock(), FakeLookup(), supports_vision=True)
+        tools = _make_file_view_tools(EagerSandboxAccessor(_make_sandbox_mock()), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
         result = asyncio.run(
@@ -71,7 +75,7 @@ class TestFileViewTool:
     def test_file_view_unsupported_type_returns_string(self):
         from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
-        tools = _make_file_view_tools(_make_sandbox_mock("text/plain"), FakeLookup(), supports_vision=True)
+        tools = _make_file_view_tools(EagerSandboxAccessor(_make_sandbox_mock("text/plain")), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
         result = asyncio.run(
@@ -85,7 +89,7 @@ class TestFileViewTool:
         from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
         tools = _make_file_view_tools(
-            _make_sandbox_mock("application/octet-stream"), FakeLookup(), supports_vision=True,
+            EagerSandboxAccessor(_make_sandbox_mock("application/octet-stream")), FakeLookup(), supports_vision=True,
         )
         file_view = tools[0]
 
@@ -105,7 +109,7 @@ class TestFileViewTool:
             mime_output="/bin/bash: file: 未找到命令\n",
             returncode=127,
         )
-        tools = _make_file_view_tools(sandbox, FakeLookup(), supports_vision=True)
+        tools = _make_file_view_tools(EagerSandboxAccessor(sandbox), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
         result = asyncio.run(
@@ -123,7 +127,7 @@ class TestFileViewTool:
             mime_output="cannot open `/no/such/file` (No such file or directory)\n",
             returncode=1,
         )
-        tools = _make_file_view_tools(sandbox, FakeLookup(), supports_vision=True)
+        tools = _make_file_view_tools(EagerSandboxAccessor(sandbox), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
         result = asyncio.run(file_view.ainvoke({"filepath": "/no/such/file.png"}))
@@ -133,8 +137,8 @@ class TestFileViewTool:
         from app.domain.services.tools.langchain_tools import create_native_tools
 
         tools = create_native_tools(
-            sandbox=AsyncMock(), browser=AsyncMock(), search_engine=AsyncMock(),
-            processor_lookup=FakeLookup(), supports_vision=True,
+            sandbox_accessor=EagerSandboxAccessor(AsyncMock()), browser_accessor=EagerBrowserAccessor(AsyncMock()), search_engine=AsyncMock(),
+            file_processor_lookup=FakeLookup(), supports_vision=True,
         )
         tool_names = [t.name for t in tools]
         assert "file_view" in tool_names
@@ -143,7 +147,7 @@ class TestFileViewTool:
         from app.domain.services.tools.langchain_tools import create_native_tools
 
         tools = create_native_tools(
-            sandbox=AsyncMock(), browser=AsyncMock(), search_engine=AsyncMock(),
+            sandbox_accessor=EagerSandboxAccessor(AsyncMock()), browser_accessor=EagerBrowserAccessor(AsyncMock()), search_engine=AsyncMock(),
         )
         tool_names = [t.name for t in tools]
         assert "file_view" not in tool_names

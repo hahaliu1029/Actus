@@ -69,3 +69,26 @@ class Browser(Protocol):
     async def console_view(self, max_lines: Optional[int] = None) -> ToolResult:
         """传递最大输出行数，获取控制台的输出结果，如果不传递则获取所有结果"""
         ...
+
+    async def aclose(self) -> None:
+        """best-effort 关闭底层连接（幂等；无连接时 no-op）。
+
+        SPM PR-1b：``BrowserAccessor`` 终态释放委托到本方法。既有实现方
+        （``PlaywrightBrowser``）委托其现有 ``cleanup()``；``Browser`` 是 Protocol
+        而非 ABC，结构化子类型下未实现本方法的第三方类不会在运行期破裂
+        （无 isinstance 校验），故此处无需提供默认实现。"""
+        ...
+
+
+class BrowserAccessor(Protocol):
+    """SPM PR-1b：tool 层访问 Browser 的显式契约（typing-only；镜像 SandboxAccessor）。
+
+    Eager 实现（``EagerBrowserAccessor``）包裹既有 Browser，``get()`` 零 IO；
+    OnDemand 变体留 PR-1c。NOT @runtime_checkable（结构化协议）。
+    """
+
+    async def get(self) -> "Browser": ...
+
+    def peek(self) -> "Browser | None": ...
+
+    async def aclose(self) -> None: ...

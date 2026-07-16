@@ -7,8 +7,17 @@ and ``coordinator_wait_guard_factory``. NOT projected as cfg keys:
 
 - ``coordinator_envelope_store`` — consumed only by ``SupervisorContext`` at
   ``_factory`` time.
-- ``parent_sandbox_adapter_factory`` — CONSUMED at ``_build_config`` time to wrap
-  the raw ``SandboxHandle`` into a ``ParentSandboxPort`` (transform, not a key).
+- ``parent_sandbox_adapter_factory`` — the ``SandboxHandle -> ParentSandboxPort``
+  wrapper (a transform, NOT a cfg key). Consumption is two-tier by supply mode
+  (SPM Task 10):
+    * eager (``always`` / child): CONSUMED at ``_build_config`` time — the flow
+      wraps the peeked raw handle directly (``factory(handle)``), byte-identical
+      to the pre-SPM behavior.
+    * ``on_demand``: the flow hands the SAME factory to a
+      ``LazyParentSandboxPort`` (``_make_parent_sandbox_port``), which invokes it
+      per sandbox generation on the FIRST coordinator parent I/O — deferred, NOT
+      at ``_build_config`` time. (Never ``ParentSandboxAdapter`` directly —
+      r21/R21-U6 DI invariant.)
 - ``coordinator_metrics`` — consumed at composition time by the starter ctor
   (budget D10 exhaustion counter); the graph never reads it.
 

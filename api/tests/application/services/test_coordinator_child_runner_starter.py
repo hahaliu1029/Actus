@@ -507,7 +507,7 @@ async def test_start_provisions_child_sandbox_and_cost_handler(monkeypatch):
     assert captured["cost"] == ("child-1", "user-1")
     bk = runner_factory.build.call_args.kwargs
     assert bk["user_id"] == "user-1"
-    assert "sandbox" in bk and "browser" in bk and "cost_callback_handler" in bk
+    assert "sandbox_accessor" in bk and "browser_accessor" in bk and "cost_callback_handler" in bk
     assert captured["ctor"].get("child_sandbox") is not None  # A1: child_sandbox Port threaded
     # A1: the child gets its OWN sandbox port, never the parent's handle.
     assert captured["ctor"]["child_sandbox"] is not captured["ctor"]["parent_sandbox"]

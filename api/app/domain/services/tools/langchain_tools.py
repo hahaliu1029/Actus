@@ -4,7 +4,10 @@ Each function wraps the corresponding sandbox/browser/search method and returns
 a string result (LangChain convention).
 
 Usage:
-    tools = create_native_tools(sandbox=sandbox, browser=browser, search_engine=engine)
+    tools = create_native_tools(
+        sandbox_accessor=sandbox_accessor, browser_accessor=browser_accessor,
+        search_engine=engine,
+    )
 """
 
 from __future__ import annotations
@@ -13,14 +16,14 @@ import asyncio
 import json
 import logging
 import shlex
-from typing import Any, Awaitable, List, Literal, Optional, Union
+from typing import Any, Awaitable, Callable, List, Literal, Optional, Union
 
 from langchain_core.tools import BaseTool, StructuredTool, tool as lc_tool
 from pydantic import BaseModel
 
-from app.domain.external.browser import Browser
+from app.domain.external.browser import BrowserAccessor
 from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
-from app.domain.external.sandbox import SandboxHandle
+from app.domain.external.sandbox import SandboxAccessor, SandboxHandle
 from app.domain.external.search import SearchEngine
 from app.domain.models.tool_result import (
     AllowError,
@@ -194,11 +197,15 @@ def _make_message_tools() -> list[StructuredTool]:
 
 
 def _make_file_tools(
-    sandbox: SandboxHandle,
+    sandbox_accessor: SandboxAccessor,
     *,
     memory_mount_scope: MemoryMountScope | None = None,
 ) -> list[StructuredTool]:
     """Create file tools that delegate to sandbox.
+
+    PR-1b (SPM Task 9): the factory captures the ``SandboxAccessor``; every tool
+    coroutine pulls the concrete handle lazily via ``await sandbox_accessor.get()``
+    on each call (Eager accessor = zero-IO byte-equivalent ``always`` behavior).
 
     ``memory_mount_scope``（codex fix P0）：非空时，读类工具（file_read /
     file_str_replace / file_find_in_content）会先把 filepath 映射回 api
@@ -251,6 +258,7 @@ def _make_file_tools(
         max_length: int = 2000,
     ) -> tuple[str, ToolOutcome]:
         """Read file content from the sandbox filesystem."""
+        sandbox = await sandbox_accessor.get()
         if _is_symlink_in_scope(filepath):
             return await _refuse_symlink_outcome(filepath)
         return await _invoke_result_tool(
@@ -275,6 +283,7 @@ def _make_file_tools(
         sudo: bool = False,
     ) -> tuple[str, ToolOutcome]:
         """Write content to a file in the sandbox filesystem."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "file_write",
             sandbox.write_file(
@@ -296,6 +305,7 @@ def _make_file_tools(
         filepath: str, old_str: str, new_str: str, sudo: bool = False
     ) -> tuple[str, ToolOutcome]:
         """Replace a string in a file."""
+        sandbox = await sandbox_accessor.get()
         # memory mount 内读写都可能跟随 symlink；守护覆盖所有读类 file tools。
         if _is_symlink_in_scope(filepath):
             return await _refuse_symlink_outcome(filepath)
@@ -313,6 +323,7 @@ def _make_file_tools(
         filepath: str, regex: str, sudo: bool = False
     ) -> tuple[str, ToolOutcome]:
         """Search file content using regex."""
+        sandbox = await sandbox_accessor.get()
         if _is_symlink_in_scope(filepath):
             return await _refuse_symlink_outcome(filepath)
         return await _invoke_result_tool(
@@ -326,6 +337,7 @@ def _make_file_tools(
         dir_path: str, glob_pattern: str
     ) -> tuple[str, ToolOutcome]:
         """Find files by name pattern."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "file_find_by_name",
             sandbox.find_files(dir_path, glob_pattern),
@@ -335,6 +347,7 @@ def _make_file_tools(
     @lc_tool(response_format="content_and_artifact")
     async def file_list(dir_path: str) -> tuple[str, ToolOutcome]:
         """List directory contents."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "file_list",
             sandbox.list_files(dir_path),
@@ -352,8 +365,12 @@ def _make_file_tools(
 # --------------------------------------------------------------------------- #
 
 
-def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
-    """Create shell tools that delegate to sandbox."""
+def _make_shell_tools(sandbox_accessor: SandboxAccessor) -> list[StructuredTool]:
+    """Create shell tools that delegate to sandbox.
+
+    PR-1b (SPM Task 9): each tool coroutine pulls the handle lazily via
+    ``await sandbox_accessor.get()`` per call (Eager = zero-IO byte-equivalent).
+    """
 
     _DEFAULT_WAIT_SECONDS = 5  # Matches sandbox service default, kept in sync intentionally.
     # Upper bound on the sync wait window. Stays under the httpx client timeout
@@ -381,6 +398,7 @@ def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         instead of returning early. Values are clamped to a safe ceiling that
         stays below the underlying HTTP client timeout.
         """
+        sandbox = await sandbox_accessor.get()
         # Clamp LLM-supplied wait_seconds so it cannot exceed the httpx client
         # timeout (which would orphan the command) or slip through as a non-positive.
         clamped_wait: Optional[int] = None
@@ -472,6 +490,7 @@ def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         session_id: str = "default",
     ) -> tuple[str, ToolOutcome]:
         """Read the latest output from a shell session."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "shell_read_output",
             sandbox.read_shell_output(session_id=session_id),
@@ -483,6 +502,7 @@ def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         session_id: str = "default", seconds: int = 5
     ) -> tuple[str, ToolOutcome]:
         """Wait for a running process to produce output."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "shell_wait_process",
             sandbox.wait_process(session_id=session_id, seconds=seconds),
@@ -496,6 +516,7 @@ def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         press_enter: bool = True,
     ) -> tuple[str, ToolOutcome]:
         """Write input to a running shell process."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "shell_write_input",
             sandbox.write_shell_input(
@@ -511,6 +532,7 @@ def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
         session_id: str = "default",
     ) -> tuple[str, ToolOutcome]:
         """Kill a running process in a shell session."""
+        sandbox = await sandbox_accessor.get()
         return await _invoke_result_tool(
             "shell_kill_process",
             sandbox.kill_process(session_id=session_id),
@@ -528,12 +550,17 @@ def _make_shell_tools(sandbox: SandboxHandle) -> list[StructuredTool]:
 # --------------------------------------------------------------------------- #
 
 
-def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
-    """Create browser tools that delegate to Browser."""
+def _make_browser_tools(browser_accessor: BrowserAccessor) -> list[StructuredTool]:
+    """Create browser tools that delegate to Browser.
+
+    PR-1b (SPM Task 9): each tool coroutine pulls the browser lazily via
+    ``await browser_accessor.get()`` per call (Eager = zero-IO byte-equivalent).
+    """
 
     @lc_tool(response_format="content_and_artifact")
     async def browser_view() -> tuple[str, ToolOutcome]:
         """Get a snapshot of the current browser page content and screenshot."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_view",
             browser.view_page(),
@@ -543,6 +570,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     @lc_tool(response_format="content_and_artifact")
     async def browser_navigate(url: str) -> tuple[str, ToolOutcome]:
         """Navigate the browser to a URL."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_navigate",
             browser.navigate(url),
@@ -556,6 +584,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         coordinate_y: Optional[float] = None,
     ) -> tuple[str, ToolOutcome]:
         """Click an element on the page by index or coordinates."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_click",
             browser.click(
@@ -575,6 +604,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         coordinate_y: Optional[float] = None,
     ) -> tuple[str, ToolOutcome]:
         """Type text into an input field."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_input",
             browser.input(
@@ -592,6 +622,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         coordinate_x: float, coordinate_y: float
     ) -> tuple[str, ToolOutcome]:
         """Move the mouse cursor to specific coordinates."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_move_mouse",
             browser.move_mouse(coordinate_x=coordinate_x, coordinate_y=coordinate_y),
@@ -601,6 +632,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     @lc_tool(response_format="content_and_artifact")
     async def browser_press_key(key: str) -> tuple[str, ToolOutcome]:
         """Press a keyboard key."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_press_key",
             browser.press_key(key),
@@ -612,6 +644,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         index: int, option: int
     ) -> tuple[str, ToolOutcome]:
         """Select an option from a dropdown."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_select_option",
             browser.select_option(index=index, option=option),
@@ -621,6 +654,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     @lc_tool(response_format="content_and_artifact")
     async def browser_scroll_up(to_top: bool = False) -> tuple[str, ToolOutcome]:
         """Scroll the page up."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_scroll_up",
             browser.scroll_up(to_top=to_top),
@@ -632,6 +666,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         to_bottom: bool = False
     ) -> tuple[str, ToolOutcome]:
         """Scroll the page down."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_scroll_down",
             browser.scroll_down(to_down=to_bottom),
@@ -643,6 +678,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         javascript: str,
     ) -> tuple[str, ToolOutcome]:
         """Execute JavaScript in the browser console."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_console_exec",
             browser.console_exec(javascript),
@@ -656,6 +692,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
         max_lines: int = 50,
     ) -> tuple[str, ToolOutcome]:
         """View the browser console output."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_console_view",
             browser.console_view(max_lines=max_lines),
@@ -665,6 +702,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     @lc_tool(response_format="content_and_artifact")
     async def browser_restart(url: str = "") -> tuple[str, ToolOutcome]:
         """Restart the browser, optionally navigating to a URL."""
+        browser = await browser_accessor.get()
         return await _invoke_result_tool(
             "browser_restart",
             browser.restart(url=url),
@@ -751,22 +789,51 @@ async def _stat_file_for_cache(sandbox: SandboxHandle, filepath: str) -> dict | 
 
 
 def _make_file_view_tools(
-    sandbox: SandboxHandle,
-    processor_lookup: FileProcessorLookup,
-    supports_vision: bool,
+    sandbox_accessor: SandboxAccessor,
+    file_processor_lookup: FileProcessorLookup | None = None,
+    file_processor_factory: Callable[[SandboxHandle], FileProcessorLookup] | None = None,
+    supports_vision: bool = True,
     supports_pdf_input: bool = False,
     *,
     file_view_media_type_enabled: bool = False,
     file_view_image_cache_enabled: bool = False,
     document_preview_enabled: bool = False,
 ) -> list[StructuredTool]:
-    """Create file_view tool for multimodal file understanding."""
+    """Create file_view tool for multimodal file understanding.
+
+    PR-1b (SPM Task 9): the handle is pulled lazily per call via
+    ``await sandbox_accessor.get()``.
+
+    Two processor-supply paths (mutually exclusive — at most one non-None):
+      * ``file_processor_lookup`` — a ready ``FileProcessorLookup`` (current
+        behavior; used by every Eager call site today).
+      * ``file_processor_factory`` — deferred construction for the PR-1c OnDemand
+        world where the lookup can only be built once a handle exists. Inside the
+        tool body the pulled handle is passed to ``factory(handle)``; the result
+        is memoized in a per-run closure cache keyed by ``handle.generation`` so a
+        poison/regeneration transparently rebuilds it.
+    """
+    assert not (
+        file_processor_lookup is not None and file_processor_factory is not None
+    ), "file_view: file_processor_lookup and file_processor_factory are mutually exclusive"
+    # Factory-path per-run cache (per-tool lifetime); keyed by handle generation.
+    _fp_cache: dict[int, FileProcessorLookup] = {}
 
     @lc_tool(response_format="content_and_artifact")
     async def file_view(filepath: str) -> tuple[str, ToolOutcome]:
         """View and understand a file's content. Use this for images, PDFs,
         audio, and video files instead of file_read.
         Returns the file content in a format the model can understand."""
+
+        sandbox = await sandbox_accessor.get()
+        if file_processor_factory is not None:
+            _gen = sandbox.generation
+            processor_lookup = _fp_cache.get(_gen)
+            if processor_lookup is None:
+                processor_lookup = file_processor_factory(sandbox)
+                _fp_cache[_gen] = processor_lookup
+        else:
+            processor_lookup = file_processor_lookup
 
         # 1. Detect MIME type (sandbox `file` command + extension fallback)
         try:
@@ -907,20 +974,35 @@ def _make_file_view_tools(
 
 
 def create_native_tools(
-    sandbox: SandboxHandle,
-    browser: Browser,
+    sandbox_accessor: SandboxAccessor | None,
+    browser_accessor: BrowserAccessor | None,
     search_engine: SearchEngine,
-    processor_lookup: FileProcessorLookup | None = None,
+    file_processor_lookup: FileProcessorLookup | None = None,
     supports_vision: bool = True,
     supports_pdf_input: bool = False,
     memory_mount_scope: MemoryMountScope | None = None,
     supervisor: Any | None = None,
     *,
+    include_sandbox_tools: bool = True,
+    file_processor_factory: Callable[[SandboxHandle], FileProcessorLookup] | None = None,
     file_view_media_type_enabled: bool = False,
     file_view_image_cache_enabled: bool = False,
     document_preview_enabled: bool = False,
 ) -> list[BaseTool]:
     """Create all native LangChain tools.
+
+    PR-1b (SPM Task 9): sandbox/browser are supplied as ``SandboxAccessor`` /
+    ``BrowserAccessor`` (typing-only contracts). The Eager accessors used by every
+    call site today make ``get()`` a zero-IO pure return, so tool behavior is
+    byte-equivalent to the old raw-handle wiring (INV-SPM-2).
+
+    ``include_sandbox_tools``（off-assembly future-proofing）：True（默认）时构造
+    文件/file_view/shell/browser 沙箱族——此时两个 accessor 必须非 None（误装配
+    fail-fast，assert）。False 时整族跳过（off 档只装 message/search，永不解引用
+    None accessor）。本任务无调用点传 False——仅冻结签名与门结构。
+
+    ``file_processor_lookup`` / ``file_processor_factory`` 至多一个非 None（互斥由
+    ``_make_file_view_tools`` assert）；两者皆 None 则不注册 file_view。
 
     ``memory_mount_scope``（codex fix P0）透传到 ``_make_file_tools`` 打开
     客户端侧 symlink 守护。agent runner / planner_react 构造 scope 后传入；
@@ -930,15 +1012,26 @@ def create_native_tools(
     """
     tools: list[StructuredTool] = []
     tools.extend(_make_message_tools())
-    tools.extend(_make_file_tools(sandbox, memory_mount_scope=memory_mount_scope))
-    if processor_lookup:
-        tools.extend(_make_file_view_tools(
-            sandbox, processor_lookup, supports_vision, supports_pdf_input,
-            file_view_media_type_enabled=file_view_media_type_enabled,
-            file_view_image_cache_enabled=file_view_image_cache_enabled,
-            document_preview_enabled=document_preview_enabled,
-        ))
-    tools.extend(_make_shell_tools(sandbox))
-    tools.extend(_make_browser_tools(browser))
+    if include_sandbox_tools:
+        assert sandbox_accessor is not None, (
+            "create_native_tools(include_sandbox_tools=True) requires a sandbox_accessor"
+        )
+        assert browser_accessor is not None, (
+            "create_native_tools(include_sandbox_tools=True) requires a browser_accessor"
+        )
+        tools.extend(_make_file_tools(sandbox_accessor, memory_mount_scope=memory_mount_scope))
+        if file_processor_lookup is not None or file_processor_factory is not None:
+            tools.extend(_make_file_view_tools(
+                sandbox_accessor,
+                file_processor_lookup=file_processor_lookup,
+                file_processor_factory=file_processor_factory,
+                supports_vision=supports_vision,
+                supports_pdf_input=supports_pdf_input,
+                file_view_media_type_enabled=file_view_media_type_enabled,
+                file_view_image_cache_enabled=file_view_image_cache_enabled,
+                document_preview_enabled=document_preview_enabled,
+            ))
+        tools.extend(_make_shell_tools(sandbox_accessor))
+        tools.extend(_make_browser_tools(browser_accessor))
     tools.extend(_make_search_tools(search_engine))
     return wrap_tool_list_for_supervisor(tools, supervisor)

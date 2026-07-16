@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
+
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
@@ -145,7 +147,7 @@ async def _real_skill_tool_with(skills):
     bundle sync needed for tool-name generation)."""
     from app.domain.services.tools.skill import SkillTool
 
-    st = SkillTool(sandbox=MagicMock(), mcp_tool=MagicMock(), a2a_tool=MagicMock())
+    st = SkillTool(sandbox_accessor=EagerSandboxAccessor(MagicMock()), mcp_tool=MagicMock(), a2a_tool=MagicMock())
     await st.initialize(list(skills))
     return st
 

@@ -1002,8 +1002,8 @@ def _make_shared_child_runner_builder(
 
     def _build(
         *, session_id, tool_filter, mailbox_publisher,
-        terminal_envelope_publisher_disabled, sandbox, browser, user_id,
-        cost_callback_handler, external_terminal_owner=False,
+        terminal_envelope_publisher_disabled, sandbox_accessor, browser_accessor,
+        user_id, cost_callback_handler, external_terminal_owner=False,
         external_heartbeat_owner=False,
     ):
         deps = resolve_child_runner_deps()  # live, post-lifespan
@@ -1045,7 +1045,10 @@ def _make_shared_child_runner_builder(
                     return None
 
             child_file_processor_lookup = FileProcessorRegistry(
-                sandbox=sandbox,
+                # [SPM Task 10] FileProcessorRegistry is sandbox-bound (raw handle);
+                # unwrap via peek() (Eager → never None in PR-1b). The runner ctor
+                # below receives the accessor itself.
+                sandbox=sandbox_accessor.peek(),
                 file_uploader=_upload_bytes,
                 vision_model=deps.vision_fallback_model,
                 audio_config=deps.file_understanding_config.audio,
@@ -1063,9 +1066,9 @@ def _make_shared_child_runner_builder(
             session_id=session_id,
             user_id=user_id,
             file_storage=deps.file_storage,
-            browser=browser,
+            browser_accessor=browser_accessor,
             search_engine=deps.search_engine,
-            sandbox=sandbox,
+            sandbox_accessor=sandbox_accessor,
             checkpointer_pool=deps.checkpointer_pool,
             cost_callback_handler=cost_callback_handler,
             tool_filter=tool_filter,

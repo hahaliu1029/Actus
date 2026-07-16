@@ -20,6 +20,7 @@ import inspect
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.tool_result import AllowError, AllowSuccess, ToolResult
 from app.domain.services.tools.skill import SkillTool
@@ -104,7 +105,7 @@ def _make_skill_with_command(command: str, *, slug: str = "demo-native") -> Skil
 
 def _make_skill_tool(**overrides) -> SkillTool:
     defaults: dict = {
-        "sandbox": _FakeSandbox(),
+        "sandbox_accessor": EagerSandboxAccessor(_FakeSandbox()),
         "mcp_tool": _FakeMCPTool(),
         "a2a_tool": _FakeA2ATool(),
     }
@@ -143,7 +144,7 @@ async def test_ast_validator_blocks_fs_destructive_rm_rf() -> None:
     cwd_boundary, per validator precedence) BEFORE sandbox.exec_command
     is reached. The ToolResult surfaces the ``[AST 拦截]`` template."""
     sandbox = _FakeSandbox()
-    skill_tool = _make_skill_tool(sandbox=sandbox)
+    skill_tool = _make_skill_tool(sandbox_accessor=EagerSandboxAccessor(sandbox))
     skill = _make_skill_with_command("rm -rf /")
 
     await skill_tool.initialize([skill])
@@ -158,7 +159,7 @@ async def test_ast_validator_blocks_fs_destructive_rm_rf() -> None:
 async def test_ast_validator_blocks_system_admin_command() -> None:
     """`mount /dev/sda1 /mnt` must be denied (system_admin category)."""
     sandbox = _FakeSandbox()
-    skill_tool = _make_skill_tool(sandbox=sandbox)
+    skill_tool = _make_skill_tool(sandbox_accessor=EagerSandboxAccessor(sandbox))
     skill = _make_skill_with_command("mount /dev/sda1 /mnt")
 
     await skill_tool.initialize([skill])
@@ -185,7 +186,7 @@ async def test_legacy_regex_fires_on_patterns_ast_misses() -> None:
     Belt-and-suspenders message must differ from the AST template."""
     sandbox = _FakeSandbox()
     skill_tool = _make_skill_tool(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         blocked_command_patterns=["blocked"],
     )
     skill = _make_skill_with_command("echo blocked")
@@ -207,7 +208,7 @@ async def test_legacy_regex_fires_on_patterns_ast_misses() -> None:
 
 async def test_benign_command_passes_both_layers() -> None:
     sandbox = _FakeSandbox()
-    skill_tool = _make_skill_tool(sandbox=sandbox)
+    skill_tool = _make_skill_tool(sandbox_accessor=EagerSandboxAccessor(sandbox))
     skill = _make_skill_with_command("echo hello")
 
     await skill_tool.initialize([skill])
@@ -247,7 +248,7 @@ async def test_invoke_native_emits_no_policy_snapshot(monkeypatch) -> None:
         lambda self, inp: called.append(inp),
     )
     sandbox = _FakeSandbox()
-    skill_tool = _make_skill_tool(sandbox=sandbox)
+    skill_tool = _make_skill_tool(sandbox_accessor=EagerSandboxAccessor(sandbox))
     skill = _make_skill_with_command("rm -rf /")
 
     await skill_tool.initialize([skill])
@@ -273,7 +274,7 @@ async def test_invoke_native_denial_diagnosis_byte_identical() -> None:
         validate(command, effective_cwd=exec_dir), original_command=command
     )
     sandbox = _FakeSandbox()
-    skill_tool = _make_skill_tool(sandbox=sandbox)
+    skill_tool = _make_skill_tool(sandbox_accessor=EagerSandboxAccessor(sandbox))
     skill = _make_skill_with_command(command)
 
     await skill_tool.initialize([skill])

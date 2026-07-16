@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill_creator import (
     SkillCreationProgress,
     SkillCreationResult,
@@ -40,7 +41,7 @@ def mock_creator() -> MagicMock:
 def tool(mock_creator: MagicMock, mock_sandbox: MagicMock) -> CreateSkillTool:
     return CreateSkillTool(
         skill_creator_service=mock_creator,
-        sandbox=mock_sandbox,
+        sandbox_accessor=EagerSandboxAccessor(mock_sandbox),
         user_id="user-1",
     )
 

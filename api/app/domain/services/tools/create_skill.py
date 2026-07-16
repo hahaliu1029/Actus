@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from app.domain.external.sandbox import SandboxHandle
+from app.domain.external.sandbox import SandboxAccessor
 from app.domain.models.skill_creator import (
     SkillBlueprint,
     SkillCreationProgress,
@@ -23,10 +23,12 @@ class CreateSkillTool(BaseTool):
 
     name: str = "skill_creator"
 
-    def __init__(self, skill_creator_service, sandbox: SandboxHandle, user_id: str = "") -> None:
+    def __init__(
+        self, skill_creator_service, sandbox_accessor: SandboxAccessor, user_id: str = ""
+    ) -> None:
         super().__init__()
         self._creator = skill_creator_service
-        self._sandbox = sandbox
+        self._sandbox_accessor = sandbox_accessor
         self._user_id = user_id
 
     @tool(
@@ -73,9 +75,11 @@ class CreateSkillTool(BaseTool):
                         json.loads(blueprint_json)
                     )
 
+            # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
+            sandbox = await self._sandbox_accessor.get()
             async for event in self._creator.generate(
                 description=description,
-                sandbox=self._sandbox,
+                sandbox=sandbox,
                 blueprint=parsed_blueprint,
             ):
                 if isinstance(event, SkillGeneratedFiles):

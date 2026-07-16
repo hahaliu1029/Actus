@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import AgentConfig
 
 from tests.conftest import TEST_USER_ID_FIXED
@@ -24,8 +28,8 @@ def _make_flow(**overrides):
         "session_id": "test-session",
         "user_id": TEST_USER_ID_FIXED,
         "uow_factory": AsyncMock(),
-        "browser": MagicMock(),
-        "sandbox": MagicMock(),
+        "browser_accessor": EagerBrowserAccessor(MagicMock()),
+        "sandbox_accessor": EagerSandboxAccessor(MagicMock()),
         "search_engine": MagicMock(),
         "mcp_tool": MagicMock(),
         "a2a_tool": MagicMock(),

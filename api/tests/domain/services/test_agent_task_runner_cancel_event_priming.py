@@ -19,6 +19,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 
 
@@ -167,8 +171,8 @@ def test_primed_event_flows_through_build_config_into_cfg() -> None:
             max_iterations=10, max_retries=3, max_search_results=5,
         ),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(name="parent_sandbox"),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock(name="parent_sandbox")),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

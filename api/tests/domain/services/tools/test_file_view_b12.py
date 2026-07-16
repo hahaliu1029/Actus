@@ -2,6 +2,10 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.external.file_processor import FileProcessResult
 from app.domain.models.tool_result import Passthrough
 
@@ -38,7 +42,7 @@ def _invoke_file_view(**flags):
     from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
     tools = _make_file_view_tools(
-        _make_sandbox_mock(), _FakeLookup(), supports_vision=True, **flags
+        EagerSandboxAccessor(_make_sandbox_mock()), _FakeLookup(), supports_vision=True, **flags
     )
     file_view = tools[0]
     return asyncio.run(file_view.ainvoke({
@@ -68,8 +72,8 @@ def test_planner_collect_native_tools_forwards_media_type_flag() -> None:
     from app.domain.services.flows.planner_react import PlannerReActFlow
 
     flow = PlannerReActFlow.__new__(PlannerReActFlow)
-    flow._sandbox = MagicMock()
-    flow._browser = MagicMock()
+    flow._sandbox_accessor = EagerSandboxAccessor(MagicMock())
+    flow._browser_accessor = EagerBrowserAccessor(MagicMock())
     flow._search_engine = MagicMock()
     flow._file_processor_lookup = MagicMock()
     flow._supports_vision = True
@@ -139,7 +143,7 @@ def _img_result(text: str):
 def _invoke_cache(lookup, **flags):
     from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
-    tools = _make_file_view_tools(_sandbox_with_stat(), lookup, supports_vision=True, **flags)
+    tools = _make_file_view_tools(EagerSandboxAccessor(_sandbox_with_stat()), lookup, supports_vision=True, **flags)
     return asyncio.run(tools[0].ainvoke({
         "id": "c", "name": "file_view", "args": {"filepath": "/w/a.png"}, "type": "tool_call",
     }))
@@ -292,7 +296,7 @@ def test_file_view_cache_miss_on_ctime_change() -> None:
     sandbox.exec_command = AsyncMock(side_effect=_exec)
     sandbox.generation = 1
 
-    tools = _make_file_view_tools(sandbox, reg, supports_vision=True,
+    tools = _make_file_view_tools(EagerSandboxAccessor(sandbox), reg, supports_vision=True,
                                   file_view_image_cache_enabled=True)
 
     def _call():
@@ -336,7 +340,7 @@ def _invoke_pdf(**flags):
     from app.domain.services.tools.langchain_tools import _make_file_view_tools
 
     tools = _make_file_view_tools(
-        _make_sandbox_mock("application/pdf"), _PdfLookup(),
+        EagerSandboxAccessor(_make_sandbox_mock("application/pdf")), _PdfLookup(),
         supports_vision=True, supports_pdf_input=True, **flags,
     )
     return asyncio.run(tools[0].ainvoke({

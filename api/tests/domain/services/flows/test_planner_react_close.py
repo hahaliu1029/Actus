@@ -1,5 +1,9 @@
 import pytest
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
 
@@ -17,8 +21,8 @@ def _make_flow(checkpointer=None):
         llm=MagicMock(),
         agent_config=MagicMock(),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(),
         a2a_tool=MagicMock(),

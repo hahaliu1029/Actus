@@ -18,6 +18,10 @@ import app.domain.services.tools.langchain_skill_tools as langchain_skill_tools
 import app.domain.services.tools.langchain_tools as langchain_tools
 import app.domain.services.tools.memory_tools as memory_tools
 from app.application.services.agent_service import AgentService
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.tools._supervisor_tool_wrapper import (
     SupervisorAwareToolWrapper,
@@ -149,8 +153,8 @@ def test_build_lc_tools_full_wraps_non_native_aggregate_tools(
     )
 
     runner = AgentTaskRunner.__new__(AgentTaskRunner)
-    runner._sandbox = MagicMock()
-    runner._browser = MagicMock()
+    runner._sandbox_accessor = EagerSandboxAccessor(MagicMock())
+    runner._browser_accessor = EagerBrowserAccessor(MagicMock())
     runner._search_engine = MagicMock()
     runner._file_processor_lookup = None
     runner._supports_vision = True

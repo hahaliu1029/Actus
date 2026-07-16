@@ -4,6 +4,10 @@ import pytest
 
 from app.domain.models.event import ToolEvent, ToolEventStatus
 from app.domain.models.tool_result import ToolResult
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 
 pytestmark = pytest.mark.anyio
@@ -16,7 +20,7 @@ def anyio_backend() -> str:
 
 async def test_handle_tool_event_syncs_file_view_artifact_to_storage() -> None:
     runner = object.__new__(AgentTaskRunner)
-    runner._sandbox = type(
+    _sb = type(
         "FakeSandbox",
         (),
         {
@@ -31,6 +35,7 @@ async def test_handle_tool_event_syncs_file_view_artifact_to_storage() -> None:
             )
         },
     )()
+    runner._sandbox_accessor = EagerSandboxAccessor(_sb)
     runner._sync_file_to_storage = AsyncMock()
 
     event = ToolEvent(
@@ -43,7 +48,9 @@ async def test_handle_tool_event_syncs_file_view_artifact_to_storage() -> None:
 
     await runner._handle_tool_event(event)
 
-    runner._sandbox.read_file.assert_awaited_once_with("/home/ubuntu/final-report.pdf")
+    runner._sandbox_accessor.peek().read_file.assert_awaited_once_with(
+        "/home/ubuntu/final-report.pdf"
+    )
     runner._sync_file_to_storage.assert_awaited_once_with(
         "/home/ubuntu/final-report.pdf"
     )

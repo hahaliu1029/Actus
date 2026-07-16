@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.tool_result import ToolResult
 from app.domain.services.tools.skill_bundle_sync import SkillBundleSyncManager
@@ -106,7 +107,7 @@ async def test_initial_sync_uploads_bundle_and_writes_marker(tmp_path: Path) -> 
     _write_bundle(tmp_path, skill.id)
 
     manager = SkillBundleSyncManager(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         skills_root_dir=tmp_path,
         sandbox_skill_root="/home/ubuntu/workspace/.skills",
     )
@@ -129,7 +130,7 @@ async def test_same_version_marker_skips_reupload(tmp_path: Path) -> None:
     _write_bundle(tmp_path, skill.id)
 
     manager_first = SkillBundleSyncManager(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         skills_root_dir=tmp_path,
         sandbox_skill_root="/home/ubuntu/workspace/.skills",
     )
@@ -138,7 +139,7 @@ async def test_same_version_marker_skips_reupload(tmp_path: Path) -> None:
     first_upload_count = len(sandbox.upload_paths)
 
     manager_second = SkillBundleSyncManager(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         skills_root_dir=tmp_path,
         sandbox_skill_root="/home/ubuntu/workspace/.skills",
     )
@@ -154,7 +155,7 @@ async def test_concurrent_ensure_ready_syncs_once(tmp_path: Path) -> None:
     _write_bundle(tmp_path, skill.id)
 
     manager = SkillBundleSyncManager(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         skills_root_dir=tmp_path,
         sandbox_skill_root="/home/ubuntu/workspace/.skills",
     )
@@ -177,7 +178,7 @@ async def test_sync_failure_is_reported_to_invoke_path(tmp_path: Path) -> None:
     sandbox.fail_upload_paths.add(f"/home/ubuntu/workspace/.skills/{skill.id}/scripts/run.py")
 
     manager = SkillBundleSyncManager(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         skills_root_dir=tmp_path,
         sandbox_skill_root="/home/ubuntu/workspace/.skills",
     )
@@ -198,7 +199,7 @@ class TestFileListingCache:
         """Before sync, file listing should be None."""
         sandbox = _FakeSandbox()
         manager = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir="/tmp/skills",
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir="/tmp/skills",
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
         assert manager.get_file_listing("nonexistent-id") is None
@@ -207,7 +208,7 @@ class TestFileListingCache:
         """Before sync, get_file_listing_all should return empty dict."""
         sandbox = _FakeSandbox()
         manager = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir="/tmp/skills",
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir="/tmp/skills",
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
         assert manager.get_file_listing_all() == {}
@@ -219,7 +220,7 @@ class TestFileListingCache:
 
         sandbox = _FakeSandbox()
         manager = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir=skills_root,
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
         skill = _build_native_skill("test-skill", version="v1")
@@ -238,7 +239,7 @@ class TestFileListingCache:
 
         sandbox = _FakeSandbox()
         manager = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir=skills_root,
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
         skill = _build_native_skill("cached-skill", version="v1")
@@ -249,7 +250,7 @@ class TestFileListingCache:
 
         # Second manager: should hit version-match early return
         manager2 = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir=skills_root,
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
         await manager2.prepare_startup_sync([skill], [skill])
@@ -269,7 +270,7 @@ class TestFileListingCache:
             "/home/ubuntu/workspace/.skills/fail-skill/SKILL.md"
         )
         manager = SkillBundleSyncManager(
-            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_accessor=EagerSandboxAccessor(sandbox), skills_root_dir=skills_root,
             sandbox_skill_root="/home/ubuntu/workspace/.skills",
         )
         skill = _build_native_skill("fail-skill", version="v1")
@@ -313,7 +314,7 @@ class _FakeAdmissionPort:
 
 def _mgr(sandbox, tmp_path, **kw) -> SkillBundleSyncManager:
     return SkillBundleSyncManager(
-        sandbox=sandbox,
+        sandbox_accessor=EagerSandboxAccessor(sandbox),
         skills_root_dir=tmp_path,
         sandbox_skill_root="/home/ubuntu/workspace/.skills",
         **kw,

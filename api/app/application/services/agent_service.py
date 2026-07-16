@@ -55,6 +55,10 @@ from app.domain.models.session import SandboxBindingState, Session, SessionStatu
 # from app.domain.repositories.file_repository import FileRepository
 # from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.uow import IUnitOfWork
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.mailbox_skip_helper import _should_skip_mailbox_lifecycle
 from app.domain.services.session.mode_event import ModeChangedEventSink
@@ -498,6 +502,12 @@ class AgentService:
             logger.error(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
             raise RuntimeError(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
 
+        # [SPM Task 10] Eager-wrap the already-provisioned handle/browser for the
+        # runner ctor (get() is zero-IO / byte-equivalent `always`). The raw
+        # `sandbox` local stays for the sandbox-bound FileProcessorRegistry below.
+        sandbox_accessor = EagerSandboxAccessor(sandbox)
+        browser_accessor = EagerBrowserAccessor(browser)
+
         # 5.构造 file_view 处理器（延迟到此处，因为需要运行时 sandbox + file_storage）
         file_processor_lookup = None
         if snap.file_understanding_config:
@@ -780,9 +790,9 @@ class AgentService:
             session_id=session.id,
             user_id=session.user_id,
             file_storage=self._file_storage,
-            browser=browser,
+            browser_accessor=browser_accessor,
             search_engine=self._search_engine,
-            sandbox=sandbox,
+            sandbox_accessor=sandbox_accessor,
             skill_creator_service=snap.skill_creator_service,
             summary_llm=snap.summary_llm,
             checkpointer_pool=self._checkpointer_pool,

@@ -22,6 +22,10 @@ from app.application.services import child_agent_runner_factory as factory_mod
 from app.application.services.child_agent_runner_factory import (
     ChildAgentTaskRunnerFactory,
 )
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.services.permission.child_permission_context import (
     ChildBudget, ChildPermissionContext, SpawnManifest,
@@ -82,8 +86,8 @@ async def _build(*, shell_mode: bool):
         child_permission_context=_cpc(shell_mode=shell_mode),
         tool_filter_preset=COORDINATOR_STEP_PRESET,
         cancel_event=asyncio.Event(),
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )
@@ -132,8 +136,8 @@ async def test_non_coordinator_preset_no_shell_union_even_flag_on(monkeypatch):
         child_permission_context=_cpc(shell_mode=True),
         tool_filter_preset="subagent_research",
         cancel_event=asyncio.Event(),
-        sandbox=MagicMock(),
-        browser=MagicMock(),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
         user_id="u1",
         cost_callback_handler=MagicMock(),
     )

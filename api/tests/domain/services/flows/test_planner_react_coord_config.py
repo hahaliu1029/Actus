@@ -8,6 +8,10 @@ from unittest.mock import MagicMock
 from app.application.services.coordinator_runtime_deps import (
     _CoordinatorRuntimeDeps,
 )
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import AgentConfig
 
 
@@ -75,8 +79,8 @@ def _build_flow_with_real_coord_deps():
             max_iterations=10, max_retries=3, max_search_results=5,
         ),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),
@@ -86,7 +90,9 @@ def _build_flow_with_real_coord_deps():
     # Per-run attrs are set on the instance after construction (matches the
     # production wire: AgentTaskRunner / main_graph._run_parallel_backend
     # populate these per invoke; here we exercise the cfg-building contract).
-    flow._sandbox = MagicMock(name="parent_sandbox")
+    # [SPM Task 10] The parent raw handle now lives inside the Eager accessor;
+    # _make_parent_sandbox_port wraps peek() via the injected factory.
+    flow._sandbox_accessor = EagerSandboxAccessor(MagicMock(name="parent_sandbox"))
     flow._cancel_event = MagicMock(name="cancel_event")
     return flow, sentinels
 
@@ -122,10 +128,12 @@ def test_build_config_threads_per_run_objects():
     cfg = flow._build_config()
     assert cfg["configurable"]["cancel_event"] is flow._cancel_event
     # [finish-core §5.2 G2] parent_sandbox is the wrapped Port, NOT the raw
-    # handle — the factory is invoked with the per-run raw handle.
-    assert cfg["configurable"]["parent_sandbox"] is not flow._sandbox
+    # handle — the factory is invoked with the per-run raw handle. [SPM Task 10]
+    # The raw handle is now peek()'d out of the Eager sandbox accessor.
+    parent_handle = flow._sandbox_accessor.peek()
+    assert cfg["configurable"]["parent_sandbox"] is not parent_handle
     flow._coord_deps.parent_sandbox_adapter_factory.assert_called_with(
-        flow._sandbox
+        parent_handle
     )
 
 
@@ -144,8 +152,8 @@ def _build_minimal_child_flow(*, cost_callback_handler=None):
             max_iterations=10, max_retries=3, max_search_results=5,
         ),
         session_id="test-child-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

@@ -27,6 +27,10 @@ from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.models.tool_result import ToolResult
 from app.domain.models.user_tool_enablement import ToolType
 from app.domain.models.plan import Step
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 from app.domain.services.session.default_state_machine import (
     DefaultSessionStateMachine,
@@ -388,9 +392,9 @@ async def test_invoke_wait_event_sets_waiting_status(monkeypatch) -> None:
         session_id="session-wait",
         user_id="user-wait",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
     runner._mcp_tool = _FakeMCPTool()
     runner._a2a_tool = _FakeA2ATool()
@@ -430,9 +434,9 @@ async def test_invoke_control_requested_sets_takeover_pending_status(monkeypatch
         session_id="session-control",
         user_id="user-control",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
     runner._mcp_tool = _FakeMCPTool()
     runner._a2a_tool = _FakeA2ATool()
@@ -492,9 +496,9 @@ async def test_invoke_applies_user_preferences_before_tool_initialization(
         session_id="session-1",
         user_id="user-1",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     fake_mcp_tool = _FakeMCPTool()
@@ -562,9 +566,9 @@ async def test_invoke_starts_skill_sync_with_filtered_pool(monkeypatch) -> None:
         session_id="session-2",
         user_id="user-2",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     fake_skill_tool = _FakeSkillTool()
@@ -615,9 +619,9 @@ async def test_invoke_uses_frozen_skill_pool_for_each_message(monkeypatch) -> No
         session_id="session-3",
         user_id="user-3",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     fake_skill_tool = _FakeSkillTool()
@@ -667,9 +671,9 @@ async def test_runner_passes_overflow_config_to_flow(monkeypatch) -> None:
         session_id="session-4",
         user_id="user-4",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
         overflow_config=overflow_config,
     )
 
@@ -694,9 +698,9 @@ async def test_runner_passes_summary_llm_to_flow(monkeypatch) -> None:
         session_id="session-summary-llm",
         user_id="user-summary-llm",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
         summary_llm=summary_llm,
     )
 
@@ -719,9 +723,9 @@ async def test_initial_skills_do_not_seed_anchor(monkeypatch) -> None:
         session_id="session-initial-anchor",
         user_id="user-initial-anchor",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
     runner._mcp_tool = _FakeMCPTool()
     runner._a2a_tool = _FakeA2ATool()
@@ -762,9 +766,9 @@ async def test_skill_anchor_switches_a_continue_b_continue(monkeypatch) -> None:
         session_id="session-anchor-switch",
         user_id="user-anchor-switch",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     sql_skill = _build_skill("sql", name="SQL")
@@ -800,9 +804,9 @@ async def test_ambiguous_message_triggers_llm_but_explicit_message_does_not(monk
         session_id="session-llm-trigger",
         user_id="user-llm-trigger",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     sql_skill = _build_skill("sql", name="SQL")
@@ -845,9 +849,9 @@ async def test_step_lock_reselects_once_when_unknown_tool_hits_threshold(monkeyp
         session_id="session-step-lock",
         user_id="user-step-lock",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     skill_a = _build_skill("skill-a", name="Skill A")
@@ -906,9 +910,9 @@ async def test_non_planner_flow_uses_virtual_step_id_for_skill_lock(monkeypatch)
         session_id="session-virtual-step",
         user_id="user-virtual-step",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     runner._mcp_tool = _FakeMCPTool()
@@ -941,9 +945,9 @@ def test_runtime_context_includes_capped_available_tool_summary() -> None:
         session_id="session-tool-summary",
         user_id="user-tool-summary",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
     runner._skill_tool = _FakeSkillTool()
 
@@ -979,9 +983,9 @@ async def test_invoke_wires_skill_context_provider_on_message_event(monkeypatch)
         session_id="session-provider-wiring",
         user_id="user-provider-wiring",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
 
     runner._mcp_tool = _FakeMCPTool()

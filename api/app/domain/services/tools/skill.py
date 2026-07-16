@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.domain.external.sandbox import SandboxHandle
+from app.domain.external.sandbox import SandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType
 from app.domain.models.tool_result import (
     AllowError,
@@ -74,7 +74,7 @@ class SkillTool(BaseTool):
 
     def __init__(
         self,
-        sandbox: SandboxHandle,
+        sandbox_accessor: SandboxAccessor | None,
         mcp_tool: MCPTool,
         a2a_tool: A2ATool,
         risk_mode: str = "off",
@@ -83,8 +83,10 @@ class SkillTool(BaseTool):
         skill_sandbox_bundle_root: str | None = None,
         admission_port: Any = None,  # D1a §4.1: ExtensionAdmissionPort | None（off=None → 旧路径零调用）
     ) -> None:
+        # PR-1b (SPM Task 9): accessor is Optional — off assembly wires only
+        # MCP/A2A paths and never touches the native (sandbox) runtime.
         super().__init__()
-        self._sandbox = sandbox
+        self._sandbox_accessor = sandbox_accessor
         self._mcp_tool = mcp_tool
         self._a2a_tool = a2a_tool
         self._risk_mode = risk_mode
@@ -403,7 +405,15 @@ class SkillTool(BaseTool):
         if not exec_dir:
             return ToolResult(success=False, message="native skill 缺少可用执行目录")
 
-        exists_result = await self._sandbox.check_file_exists(exec_dir)
+        # PR-1b (SPM Task 9): pull the concrete handle lazily at use time.
+        # native skills require a sandbox — the accessor is non-None on this path
+        # (off assembly never reaches _invoke_native); assert for fail-fast + narrowing.
+        assert self._sandbox_accessor is not None, (
+            "native skill invocation requires a provisioned sandbox accessor"
+        )
+        sandbox = await self._sandbox_accessor.get()
+
+        exists_result = await sandbox.check_file_exists(exec_dir)
         if not exists_result.success:
             return ToolResult(
                 success=False,
@@ -469,7 +479,7 @@ class SkillTool(BaseTool):
         full_command = f"{command} {shlex.quote(payload)}"
         session_id = f"skill-{uuid.uuid4()}"
 
-        result = await self._sandbox.exec_command(session_id, exec_dir, full_command)
+        result = await sandbox.exec_command(session_id, exec_dir, full_command)
         if not result.success:
             # 即使失败也传递 session_id，便于 UI 终端读取输出
             if result.data is None:
@@ -479,7 +489,7 @@ class SkillTool(BaseTool):
                 result.data["exec_dir"] = exec_dir
             return result
 
-        output = await self._sandbox.read_shell_output(session_id)
+        output = await sandbox.read_shell_output(session_id)
         final = output if output.success else result
         # 将 session_id 和 exec_dir 注入 data，供 agent_task_runner 使用
         if final.data is None:

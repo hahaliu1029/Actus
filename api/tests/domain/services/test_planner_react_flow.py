@@ -11,6 +11,10 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from langgraph.checkpoint.memory import MemorySaver
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import DoneEvent, PlanEvent, WaitEvent
 from app.domain.models.memory import Memory
@@ -61,8 +65,8 @@ def _make_flow(mock_llm, mock_uow, **overrides):
         llm=mock_llm,
         agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
         session_id="test-session",
-        browser=AsyncMock(),
-        sandbox=AsyncMock(),
+        browser_accessor=EagerBrowserAccessor(AsyncMock()),
+        sandbox_accessor=EagerSandboxAccessor(AsyncMock()),
         search_engine=AsyncMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

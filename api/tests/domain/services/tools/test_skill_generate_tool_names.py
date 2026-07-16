@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.services.tools.skill import SkillTool
 
@@ -24,7 +25,7 @@ def test_resolver_matches_a_real_skilltool_get_tools():
     # SkillTool.initialize/get_tools produces for the same skills.
     import asyncio
     s = _skill("repo-map", [{"name": "search"}, {"name": "tree"}])
-    st = SkillTool(sandbox=MagicMock(), mcp_tool=MagicMock(), a2a_tool=MagicMock())
+    st = SkillTool(sandbox_accessor=EagerSandboxAccessor(MagicMock()), mcp_tool=MagicMock(), a2a_tool=MagicMock())
     # Brief used the deprecated asyncio.get_event_loop().run_until_complete(...),
     # which raises "no current event loop" on Python 3.12 + pytest-asyncio strict
     # mode. asyncio.run(...) is the repo-wide idiom and preserves the test intent.
@@ -87,7 +88,7 @@ def test_expander_member_name_equals_child_built_name_after_floor():
 
     # 3) Child builds the real SkillTool over the floored selection (same order
     #    that reaches initialize() via _apply_preselected_skills dedup).
-    st = SkillTool(sandbox=MagicMock(), mcp_tool=MagicMock(), a2a_tool=MagicMock())
+    st = SkillTool(sandbox_accessor=EagerSandboxAccessor(MagicMock()), mcp_tool=MagicMock(), a2a_tool=MagicMock())
     asyncio.run(st.initialize(floored))
     built = {t["function"]["name"] for t in st.get_tools()}
     bindings = {name: b["skill"].slug for name, b in st._tool_bindings.items()}
@@ -120,7 +121,7 @@ def test_append_last_order_misidentifies_member_tool_proving_floor_fix():
 
     # Simulate the OLD append-LAST selection order (non-member first, member last).
     append_last_order = [nonmember, member]
-    st = SkillTool(sandbox=MagicMock(), mcp_tool=MagicMock(), a2a_tool=MagicMock())
+    st = SkillTool(sandbox_accessor=EagerSandboxAccessor(MagicMock()), mcp_tool=MagicMock(), a2a_tool=MagicMock())
     asyncio.run(st.initialize(append_last_order))
     bindings = {name: b["skill"].slug for name, b in st._tool_bindings.items()}
 

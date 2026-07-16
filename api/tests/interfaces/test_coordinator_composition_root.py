@@ -17,6 +17,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
+
 
 def test_shared_runner_builder_constructs_full_child_runner_with_confirmation_off():
     """The shared runner builder resolves the process-shared deps LAZILY and
@@ -46,7 +51,8 @@ def test_shared_runner_builder_constructs_full_child_runner_with_confirmation_of
         session_id="c1", tool_filter=frozenset({"file_write"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
         external_terminal_owner=True, external_heartbeat_owner=True,
-        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     assert runner._agent_config.tool_confirmation.enabled is False
@@ -87,7 +93,8 @@ def test_shared_runner_builder_threads_session_state_machine():
     runner = builder(
         session_id="c1", tool_filter=frozenset({"file_write"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
-        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     assert runner._session_state_machine is ssm
@@ -123,7 +130,8 @@ def test_shared_runner_builder_binds_file_processor_lookup_when_configured():
     runner = builder(
         session_id="c1", tool_filter=frozenset({"file_view"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
-        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     assert isinstance(runner._file_processor_lookup, FileProcessorRegistry)
@@ -155,7 +163,8 @@ def test_shared_runner_builder_no_file_view_binding_when_unconfigured():
     runner = builder(
         session_id="c1", tool_filter=frozenset({"file_view"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
-        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     assert runner._file_processor_lookup is None
@@ -190,7 +199,8 @@ def test_shared_runner_builder_threads_lifecycle_runtime():
     runner = builder(
         session_id="c1", tool_filter=frozenset({"file_write"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
-        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     # (b) forwarded by identity (runner ctor keeps a non-None config as-is).
@@ -220,7 +230,8 @@ def test_shared_runner_builder_lifecycle_runtime_defaults_off_when_unset():
     runner = builder(
         session_id="c1", tool_filter=frozenset({"file_write"}),
         mailbox_publisher=MagicMock(), terminal_envelope_publisher_disabled=True,
-        sandbox=MagicMock(), browser=MagicMock(), user_id="u1",
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+        browser_accessor=EagerBrowserAccessor(MagicMock()), user_id="u1",
         cost_callback_handler=MagicMock(),
     )
     assert runner._lifecycle_runtime.lifecycle_events_enabled is False

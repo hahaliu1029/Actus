@@ -1118,6 +1118,10 @@ class TestBuildWorkUnitsTreeLease:
         from app.application.services.child_agent_runner_factory import (
             ChildAgentTaskRunnerFactory,
         )
+        from app.application.services.sandbox_accessors import (
+            EagerBrowserAccessor,
+            EagerSandboxAccessor,
+        )
         from app.domain.models.tool_filter_presets import (
             COORDINATOR_STEP_PRESET,
         )
@@ -1198,8 +1202,8 @@ class TestBuildWorkUnitsTreeLease:
                 child_permission_context=cpc,
                 tool_filter_preset=COORDINATOR_STEP_PRESET,
                 cancel_event=asyncio.Event(),
-                sandbox=MagicMock(),
-                browser=MagicMock(),
+                sandbox_accessor=EagerSandboxAccessor(MagicMock()),
+                browser_accessor=EagerBrowserAccessor(MagicMock()),
                 user_id="u1",
                 cost_callback_handler=MagicMock(),
             )

@@ -268,6 +268,24 @@ class PlaywrightBrowser(BrowserProtocol):
             self.browser = None
             self.playwright = None
 
+    async def aclose(self) -> None:
+        """SPM Task 8：best-effort 关闭底层 Playwright/CDP 连接（幂等；无连接时 no-op）。
+
+        委托既有 ``cleanup()``——它已关闭 pages/browser、``stop()`` playwright、吞掉
+        内部 Exception，并在 ``finally`` 把三个句柄重置为 ``None``，因此第二次调用
+        自然 no-op（所有句柄已 ``None`` → 各 ``if`` 分支跳过）。外层再包一层
+        best-effort try/except 以满足 ``BrowserAccessor.aclose`` 合同——即便
+        ``cleanup`` 的语义未来改变也不外抛。
+
+        NEW method（INV-SPM-2：不触碰任何既有方法/行为）。
+        """
+        try:
+            await self.cleanup()
+        except Exception:  # best-effort terminal close — never propagate
+            logger.warning(
+                "PlaywrightBrowser.aclose best-effort close failed", exc_info=True
+            )
+
     async def wait_for_page_load(self, timeout: int = 15) -> bool:
         """传递超时时间，等待当前页面是否加载完毕"""
         # 1.确保当前页面存在

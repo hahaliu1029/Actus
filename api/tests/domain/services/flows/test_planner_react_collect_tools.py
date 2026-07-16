@@ -6,6 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools._supervisor_tool_wrapper import (
     SupervisorAwareToolWrapper,
@@ -19,8 +23,8 @@ def _make_flow(**overrides):
         llm=MagicMock(),
         agent_config=MagicMock(),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(),
         a2a_tool=MagicMock(),

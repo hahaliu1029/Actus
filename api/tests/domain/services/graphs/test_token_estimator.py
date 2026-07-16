@@ -495,6 +495,10 @@ class TestCheckOverflowWiring:
         from app.domain.models.app_config import AgentConfig
         from app.domain.models.context_overflow_config import ContextOverflowConfig
         from app.domain.models.memory import Memory
+        from app.application.services.sandbox_accessors import (
+            EagerBrowserAccessor,
+            EagerSandboxAccessor,
+        )
         from app.domain.services.flows.planner_react import PlannerReActFlow
 
         overflow = ContextOverflowConfig(
@@ -516,8 +520,8 @@ class TestCheckOverflowWiring:
             llm=MagicMock(),
             agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
             session_id="test-session",
-            browser=AsyncMock(),
-            sandbox=AsyncMock(),
+            browser_accessor=EagerBrowserAccessor(AsyncMock()),
+            sandbox_accessor=EagerSandboxAccessor(AsyncMock()),
             search_engine=AsyncMock(),
             mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
             a2a_tool=MagicMock(manager=None),

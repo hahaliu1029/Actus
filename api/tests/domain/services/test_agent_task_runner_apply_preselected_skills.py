@@ -13,6 +13,10 @@ import pytest
 
 from app.domain.models.app_config import AgentConfig, A2AConfig, MCPConfig
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.services.agent_task_runner import AgentTaskRunner
 
 pytestmark = pytest.mark.anyio
@@ -110,9 +114,9 @@ def _make_runner(monkeypatch: pytest.MonkeyPatch) -> AgentTaskRunner:
         session_id="apply-preselected-test",
         user_id="user-test",
         file_storage=object(),
-        browser=object(),
+        browser_accessor=EagerBrowserAccessor(object()),
         search_engine=object(),
-        sandbox=_FakeSandbox(),
+        sandbox_accessor=EagerSandboxAccessor(_FakeSandbox()),
     )
     runner._mcp_tool = _FakeMCPTool()
     runner._a2a_tool = _FakeA2ATool()

@@ -23,10 +23,10 @@ from app.application.services.continuation_intent_classifier import (
 )
 from app.domain.services.permission.child_scope_violation import ChildScopeViolation
 from app.domain.services.graphs.react_graph import CancelledByEventError
-from app.domain.external.browser import Browser
+from app.domain.external.browser import BrowserAccessor
 from app.domain.external.file_storage import FileStorage
 from app.domain.external.memory_flusher import MemoryFlusher
-from app.domain.external.sandbox import Sandbox, SandboxHandle
+from app.domain.external.sandbox import SandboxAccessor
 from app.domain.external.search import SearchEngine
 from app.domain.external.mailbox_publisher import MailboxPublisher
 from app.domain.external.supervisor_registry import SupervisorRegistryPort
@@ -409,9 +409,9 @@ class AgentTaskRunner(TaskRunner):
         # session_repository: SessionRepository,  # 会话仓库
         file_storage: FileStorage,  # 文件存储桶
         # file_repository: FileRepository,  # 文件数据仓库
-        browser: Browser,  # 浏览器
+        browser_accessor: BrowserAccessor,  # 浏览器 accessor（PR-1b：Eager 包裹既有 Browser）
         search_engine: SearchEngine,  # 搜索引擎
-        sandbox: SandboxHandle | Sandbox,  # 沙箱（优先 SandboxHandle）
+        sandbox_accessor: SandboxAccessor,  # 沙箱 accessor（PR-1b：Eager 包裹既有 handle）
         skill_creator_service=None,  # skill创建服务
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
@@ -614,7 +614,7 @@ class AgentTaskRunner(TaskRunner):
         self._session_id = session_id
         self._user_id = user_id
         # self._session_repository = session_repository
-        self._sandbox = sandbox
+        self._sandbox_accessor = sandbox_accessor
         self._mcp_config = mcp_config
         self._mcp_tool = MCPTool()
         self._a2a_config = a2a_config
@@ -624,13 +624,13 @@ class AgentTaskRunner(TaskRunner):
         settings = get_settings()
         self._skill_repository = FileSkillRepository(settings.skills_root_dir)
         self._skill_bundle_sync = SkillBundleSyncManager(
-            sandbox=sandbox,
+            sandbox_accessor=self._sandbox_accessor,
             skills_root_dir=settings.skills_root_dir,
             sandbox_skill_root=settings.skill_sandbox_bundle_root,
             admission_port=self._admission_port,  # D1a §4.1: off=None
         )
         self._skill_tool = SkillTool(
-            sandbox=sandbox,
+            sandbox_accessor=self._sandbox_accessor,
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
             risk_mode=(skill_risk_policy or SkillRiskPolicy()).mode.value,
@@ -641,7 +641,7 @@ class AgentTaskRunner(TaskRunner):
         self._create_skill_tool = (
             CreateSkillTool(
                 skill_creator_service=skill_creator_service,
-                sandbox=sandbox,
+                sandbox_accessor=self._sandbox_accessor,
                 user_id=user_id or "",
             )
             if skill_creator_service is not None
@@ -729,7 +729,7 @@ class AgentTaskRunner(TaskRunner):
         )
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
-        self._browser = browser
+        self._browser_accessor = browser_accessor
         self._search_engine = search_engine
 
         # B5 post-audit MEDIUM #3: eagerly import the ZH/EN bundles at
@@ -793,8 +793,8 @@ class AgentTaskRunner(TaskRunner):
             agent_config=agent_config,
             session_id=session_id,
             force_initial_compaction=self._force_initial_compaction,  # B11 §8
-            browser=browser,
-            sandbox=sandbox,
+            browser_accessor=browser_accessor,
+            sandbox_accessor=sandbox_accessor,
             search_engine=search_engine,
             mcp_tool=self._mcp_tool,
             a2a_tool=self._a2a_tool,
@@ -1247,7 +1247,8 @@ class AgentTaskRunner(TaskRunner):
             filepath = f"/home/ubuntu/upload/{file.filename}"
 
             # 3.调用沙箱将文件上传至沙箱
-            tool_result = await self._sandbox.upload_file(
+            sandbox = await self._sandbox_accessor.get()
+            tool_result = await sandbox.upload_file(
                 file_data=file_data, filepath=filepath, filename=file.filename
             )
 
@@ -1306,7 +1307,8 @@ class AgentTaskRunner(TaskRunner):
         try:
             filename = os.path.basename(sandbox_path)
             # Read file from sandbox
-            result = await self._sandbox.download_file(sandbox_path)
+            sandbox = await self._sandbox_accessor.get()
+            result = await sandbox.download_file(sandbox_path)
             if not result or not hasattr(result, "read"):
                 logger.warning("Failed to download sandbox file %s", sandbox_path)
                 return None
@@ -1492,7 +1494,8 @@ class AgentTaskRunner(TaskRunner):
                 )
 
             # 2.从沙箱中下载文件
-            file_data = await self._sandbox.download_file(filepath)
+            sandbox = await self._sandbox_accessor.get()
+            file_data = await sandbox.download_file(filepath)
 
             # 3.判断会话中的文件是否存在
             if file:
@@ -1536,7 +1539,8 @@ class AgentTaskRunner(TaskRunner):
         （源代码通过 file_write 工具已自动同步）。
         """
         try:
-            list_result = await self._sandbox.list_files(exec_dir)
+            sandbox = await self._sandbox_accessor.get()
+            list_result = await sandbox.list_files(exec_dir)
             if not list_result.success:
                 return
 
@@ -1589,7 +1593,8 @@ class AgentTaskRunner(TaskRunner):
     async def _get_browser_screenshot(self) -> str:
         """获取浏览器截图并返回截图文件对应的在线URL"""
         # 1.调用浏览器完成截图
-        screenshot = await self._browser.screenshot()
+        browser = await self._browser_accessor.get()
+        screenshot = await browser.screenshot()
 
         # 2.将浏览器截图上传到文件存储中
         file = await self._file_storage.upload_file(
@@ -1946,10 +1951,10 @@ class AgentTaskRunner(TaskRunner):
         from app.domain.services.tools.langchain_tools import create_native_tools
 
         tools = create_native_tools(
-            sandbox=self._sandbox,
-            browser=self._browser,
+            sandbox_accessor=self._sandbox_accessor,
+            browser_accessor=self._browser_accessor,
             search_engine=self._search_engine,
-            processor_lookup=self._file_processor_lookup,
+            file_processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
@@ -2442,10 +2447,10 @@ class AgentTaskRunner(TaskRunner):
 
         lc_tools.extend(
             create_native_tools(
-                sandbox=self._sandbox,
-                browser=self._browser,
+                sandbox_accessor=self._sandbox_accessor,
+                browser_accessor=self._browser_accessor,
                 search_engine=self._search_engine,
-                processor_lookup=self._file_processor_lookup,
+                file_processor_lookup=self._file_processor_lookup,
                 supports_vision=self._supports_vision,
                 supports_pdf_input=self._supports_pdf_input,
                 # codex fix P0 round-2：step graph 每次 rebuild 都要带守卫，
@@ -3122,7 +3127,8 @@ class AgentTaskRunner(TaskRunner):
                     # 4.工具为shell则生成shell工具内容
                     # R4 CS3 Task 16: use envelope.function_args for consistency.
                     session_id = envelope.function_args.get("session_id", "default")
-                    shell_result = await self._sandbox.read_shell_output(
+                    sandbox = await self._sandbox_accessor.get()
+                    shell_result = await sandbox.read_shell_output(
                         session_id, console=True,
                     )
                     console_records = (shell_result.data or {}).get("console_records", [])
@@ -3138,7 +3144,8 @@ class AgentTaskRunner(TaskRunner):
                     # R4 CS3 Task 16: use envelope.function_args / envelope.function_name.
                     filepath = envelope.function_args.get("filepath")
                     if filepath:
-                        file_read_result = await self._sandbox.read_file(filepath)
+                        sandbox = await self._sandbox_accessor.get()
+                        file_read_result = await sandbox.read_file(filepath)
                         file_content: str = (file_read_result.data or {}).get(
                             "content", ""
                         )
@@ -3202,7 +3209,8 @@ class AgentTaskRunner(TaskRunner):
                     if shell_sid:
                         # 读取终端输出，供 UI 终端面板展示
                         try:
-                            shell_result = await self._sandbox.read_shell_output(
+                            sandbox = await self._sandbox_accessor.get()
+                            shell_result = await sandbox.read_shell_output(
                                 shell_sid, console=True,
                             )
                             console_records = (shell_result.data or {}).get(
@@ -4546,7 +4554,8 @@ class AgentTaskRunner(TaskRunner):
 
             # 2.确保沙箱、mcp、a2a均初始化完成
             logger.info(f"AgentTaskRunner任务处理开始")
-            await self._sandbox.ensure_sandbox()
+            sandbox = await self._sandbox_accessor.get()
+            await sandbox.ensure_sandbox()
             # PR-9b-A audit round-1 P1 (Fix 3 / INV-A6) — prime the planner's
             # per-run cancel_event so ``PlannerReActFlow._build_config()``
             # injects a real ``asyncio.Event`` (not ``None``) into the 18-key
@@ -5248,13 +5257,23 @@ class AgentTaskRunner(TaskRunner):
         This method only releases the handle and cleans up tools/flow.
         """
         logger.info("开始清除销毁AgentTaskRunner资源")
+        # 1a. Close the browser first (idempotent; Eager/OnDemand 同 API). Task 10
+        # / r4 category-D frozen release chain: browser BEFORE sandbox.
         try:
-            # 1. Release sandbox handle (lifecycle service owns actual destruction)
-            if self._sandbox and hasattr(self._sandbox, "release"):
-                logger.info("释放 AgentTaskRunner 的沙箱 handle")
-                self._sandbox.release()
+            await self._browser_accessor.aclose()
         except Exception as exc:
-            logger.warning("sandbox.release() 失败（继续清理）: %s", exc)
+            logger.warning("browser_accessor.aclose() 失败（继续清理）: %s", exc)
+
+        try:
+            # 1b. Release the accessor-owned sandbox handle (lifecycle service owns
+            # actual destruction). r7/F3: release_owned() covers today's Eager
+            # release() semantics; OnDemand (PR-1c) routes to
+            # provisioner.release_held_handle() so a hooks_failed handle
+            # (peek()==None but the provisioner still holds it) is NOT leaked.
+            logger.info("释放 AgentTaskRunner 的沙箱 handle")
+            await self._sandbox_accessor.release_owned()
+        except Exception as exc:
+            logger.warning("sandbox_accessor.release_owned() 失败（继续清理）: %s", exc)
 
         try:
             # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）

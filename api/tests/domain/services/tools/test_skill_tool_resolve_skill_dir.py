@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.application.services.sandbox_accessors import EagerSandboxAccessor
 from app.domain.models.skill import Skill, SkillRuntimeType, SkillSourceType
 from app.domain.services.tools.skill import SkillTool
 
@@ -43,7 +44,7 @@ def _make_skilltool() -> SkillTool:
     sandbox = AsyncMock()
     mcp = MagicMock()
     a2a = MagicMock()
-    return SkillTool(sandbox=sandbox, mcp_tool=mcp, a2a_tool=a2a)
+    return SkillTool(sandbox_accessor=EagerSandboxAccessor(sandbox), mcp_tool=mcp, a2a_tool=a2a)
 
 
 class TestResolveSkillDirContract:

@@ -38,9 +38,10 @@ from app.application.services.coordinator_runtime_deps import (
     _CoordinatorRuntimeDeps,
     _NullCoordinatorRuntimeDeps,
 )
-from app.domain.external.browser import Browser
+from app.application.services.lazy_parent_sandbox_port import LazyParentSandboxPort
+from app.domain.external.browser import BrowserAccessor
 from app.domain.external.embedding_provider import EmbeddingUnavailableError
-from app.domain.external.sandbox import SandboxHandle
+from app.domain.external.sandbox import SandboxAccessor
 from app.domain.external.search import SearchEngine
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.context_overflow_config import ContextOverflowConfig
@@ -159,8 +160,8 @@ class PlannerReActFlow(BaseFlow):
         llm: BaseChatModel,
         agent_config: AgentConfig,
         session_id: str,
-        browser: Browser,
-        sandbox: SandboxHandle,
+        browser_accessor: BrowserAccessor,
+        sandbox_accessor: SandboxAccessor,
         search_engine: SearchEngine,
         mcp_tool: MCPTool,
         a2a_tool: A2ATool,
@@ -272,8 +273,8 @@ class PlannerReActFlow(BaseFlow):
         # MCP/A2A 在 AgentTaskRunner.run() 中异步初始化，构造时尚未就绪
         self._llm = llm
         self._agent_config = agent_config
-        self._sandbox = sandbox
-        self._browser = browser
+        self._sandbox_accessor = sandbox_accessor
+        self._browser_accessor = browser_accessor
         self._search_engine = search_engine
         self._mcp_tool = mcp_tool
         self._a2a_tool = a2a_tool
@@ -468,6 +469,28 @@ class PlannerReActFlow(BaseFlow):
             return ""
         return self._skill_context_provider()
 
+    def _make_parent_sandbox_port(self, adapter_factory):
+        """[SPM Task 10 / r18 R17-Q1] Build the coordinator ``parent_sandbox``
+        ``ParentSandboxPort`` from ``self._sandbox_accessor`` + the injected
+        ``parent_sandbox_adapter_factory``.
+
+        Discriminator via ``peek()`` (NO concrete-accessor-class import in the
+        domain flow — protocol method only):
+
+        - Eager (``always`` / child): ``peek()`` is NEVER None → keep the existing
+          direct ``adapter_factory(handle)`` wrap so ``always`` behavior stays
+          byte-identical (zero-behavior-change priority).
+        - ``on_demand`` not-yet-provisioned: ``peek()`` is None → defer the wrap to
+          the FIRST coordinator parent I/O via ``LazyParentSandboxPort`` (a pure
+          chat never provisions). r21/R21-U6: the Lazy port reuses the SAME
+          injected factory — it MUST NOT construct ``ParentSandboxAdapter``
+          directly (coordinator DI invariant + injection structure test).
+        """
+        handle = self._sandbox_accessor.peek()
+        if handle is not None:
+            return adapter_factory(handle)
+        return LazyParentSandboxPort(self._sandbox_accessor, adapter_factory)
+
     def _parallel_dispatch_capable(self) -> bool:
         """[child-pwu fix] Whether THIS flow can dispatch parallel work units.
 
@@ -487,9 +510,10 @@ class PlannerReActFlow(BaseFlow):
     def _collect_native_tools(self) -> list:
         """Collect sandbox/browser/search tools."""
         return create_native_tools(
-            sandbox=self._sandbox, browser=self._browser,
+            sandbox_accessor=self._sandbox_accessor,
+            browser_accessor=self._browser_accessor,
             search_engine=self._search_engine,
-            processor_lookup=self._file_processor_lookup,
+            file_processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
             supports_pdf_input=self._supports_pdf_input,
             memory_mount_scope=self._build_memory_mount_scope(),
@@ -1897,8 +1921,8 @@ class PlannerReActFlow(BaseFlow):
                 "cancel_event": self._cancel_event,  # per-run, not in _coord_deps
                 "patch_reducer_service": cd.patch_reducer_service,
                 "patch_applier_deps": cd.patch_applier_deps,
-                "parent_sandbox": self._coord_deps.parent_sandbox_adapter_factory(
-                    self._sandbox
+                "parent_sandbox": self._make_parent_sandbox_port(
+                    self._coord_deps.parent_sandbox_adapter_factory
                 ),  # [finish-core §5.2 G2] Port, not raw handle (domain stays infra-free)
                 "artifact_storage": cd.artifact_storage,
                 "cost_rollup_service": cd.cost_rollup_service,

@@ -12,6 +12,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.app_config import AgentConfig
 from app.domain.services.flows.planner_react import PlannerReActFlow
 
@@ -29,8 +33,8 @@ def _make_flow(*, approval_state_reader=None) -> PlannerReActFlow:
             max_iterations=10, max_retries=3, max_search_results=5
         ),
         session_id="test-session",
-        browser=MagicMock(),
-        sandbox=MagicMock(),
+        browser_accessor=EagerBrowserAccessor(MagicMock()),
+        sandbox_accessor=EagerSandboxAccessor(MagicMock()),
         search_engine=MagicMock(),
         mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
         a2a_tool=MagicMock(manager=None),

@@ -33,6 +33,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
 
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.event import MessageEvent
 from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef
 from app.domain.services.prompts.memory_snapshot import MemorySnapshot
@@ -489,8 +493,8 @@ class TestEnsureGraphsForwardsProvider:
             llm=llm,
             agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
             session_id="sess-1",
-            browser=AsyncMock(),
-            sandbox=AsyncMock(),
+            browser_accessor=EagerBrowserAccessor(AsyncMock()),
+            sandbox_accessor=EagerSandboxAccessor(AsyncMock()),
             search_engine=AsyncMock(),
             mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
             a2a_tool=MagicMock(manager=None),
@@ -540,8 +544,8 @@ class TestEnsureGraphsForwardsProvider:
             llm=llm,
             agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
             session_id="sess-1",
-            browser=AsyncMock(),
-            sandbox=AsyncMock(),
+            browser_accessor=EagerBrowserAccessor(AsyncMock()),
+            sandbox_accessor=EagerSandboxAccessor(AsyncMock()),
             search_engine=AsyncMock(),
             mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
             a2a_tool=MagicMock(manager=None),

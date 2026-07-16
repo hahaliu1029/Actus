@@ -25,6 +25,10 @@ from app.application.services.coordinator_child_runner import (
 from app.application.services.cost_callback_factory import (
     build_supervisor_aware_callback_handler,
 )
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 from app.domain.models.tool_filter_presets import COORDINATOR_STEP_PRESET
 from app.domain.services.cost_callback_handler import _infer_provider
 from app.domain.services.pricing.static_pricing import compute_cost, get_price
@@ -316,8 +320,12 @@ class DefaultCoordinatorChildRunnerStarter:
                 child_permission_context=child_permission_context,
                 tool_filter_preset=COORDINATOR_STEP_PRESET,
                 cancel_event=cancel_event,
-                sandbox=child_handle,
-                browser=child_browser,
+                # [SPM Task 10] Wrap the BARE child_handle / child_browser in Eager
+                # accessors (spec §5.7). NOTE: ParentSandboxAdapter(child_handle)
+                # above is the coordinator collection port — a SEPARATE concern,
+                # left untouched.
+                sandbox_accessor=EagerSandboxAccessor(child_handle),
+                browser_accessor=EagerBrowserAccessor(child_browser),
                 user_id=user_id,
                 cost_callback_handler=cost_callback_handler,
                 coordinator_metrics_recorder=self._coordinator_metrics_recorder,
