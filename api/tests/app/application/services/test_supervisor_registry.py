@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,6 +58,59 @@ class _Factory:
         sup = _FakeSupervisor(root_session_id, will_crash=will_crash)
         self.created.append(sup)
         return sup
+
+
+class _DrainingSupervisor:
+    """Supervisor fake with one in-flight envelope side effect.
+
+    ``stop()`` mirrors the production graceful-drain contract: signal the
+    run loop, then wait until the current side effect has completed.
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self._ready_event: asyncio.Event | None = None
+        self.handler_started = asyncio.Event()
+        self.release_handler = asyncio.Event()
+        self.handler_completed = asyncio.Event()
+        self.stop_requested = asyncio.Event()
+        self.stopped = asyncio.Event()
+        self.stop_calls = 0
+
+    async def run(self) -> None:
+        if self._ready_event is not None:
+            self._ready_event.set()
+        try:
+            self.handler_started.set()
+            await self.release_handler.wait()
+            self.handler_completed.set()
+            await self.stop_requested.wait()
+        finally:
+            self.stopped.set()
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        self.stop_requested.set()
+        await self.stopped.wait()
+
+
+class _SelfStoppingSupervisor:
+    """Supervisor fake that invokes the injected rollback stop callback."""
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self._ready_event: asyncio.Event | None = None
+        self._ctx = SimpleNamespace(stop_self_callback=None)
+        self.request_stop_calls = 0
+
+    def request_stop(self) -> None:
+        self.request_stop_calls += 1
+
+    async def run(self) -> None:
+        if self._ready_event is not None:
+            self._ready_event.set()
+        await asyncio.sleep(0)
+        await self._ctx.stop_self_callback()
 
 
 @pytest.mark.anyio
@@ -137,6 +191,64 @@ async def test_stop_all_cancels_all_tasks():
     # After stop_all, slots cleared.
     health_after = await reg.health_check()
     assert health_after == {}
+
+
+@pytest.mark.anyio
+async def test_stop_drains_in_flight_handler_before_cancelling_task():
+    """Root terminalization must not interrupt a terminal-envelope side effect.
+
+    The production supervisor exposes ``stop()`` specifically to drain the
+    current handler.  The registry must use that contract instead of cancelling
+    the run task immediately, otherwise CANCEL_ACK persistence / sandbox
+    destruction can be cut in half.
+    """
+    created: list[_DrainingSupervisor] = []
+
+    def factory(root: str) -> _DrainingSupervisor:
+        supervisor = _DrainingSupervisor(root)
+        created.append(supervisor)
+        return supervisor
+
+    reg = SupervisorRegistry(supervisor_factory=factory, restart_interval_s=10.0)
+    await reg.spawn("root-drain")
+    supervisor = created[0]
+    await supervisor.handler_started.wait()
+
+    stop_task = asyncio.create_task(reg.stop("root-drain"))
+    await asyncio.sleep(0)
+
+    assert supervisor.stop_calls == 1
+    assert not stop_task.done()
+    assert not supervisor.handler_completed.is_set()
+
+    supervisor.release_handler.set()
+    await asyncio.wait_for(stop_task, timeout=1.0)
+
+    assert supervisor.handler_completed.is_set()
+    assert supervisor.stopped.is_set()
+    assert await reg.health_check() == {}
+
+
+@pytest.mark.anyio
+async def test_supervisor_self_stop_requests_exit_without_awaiting_own_task():
+    created: list[_SelfStoppingSupervisor] = []
+
+    def factory(root: str) -> _SelfStoppingSupervisor:
+        supervisor = _SelfStoppingSupervisor(root)
+        created.append(supervisor)
+        return supervisor
+
+    reg = SupervisorRegistry(supervisor_factory=factory, restart_interval_s=10.0)
+    await reg.spawn("root-self-stop")
+
+    for _ in range(10):
+        if not await reg.health_check():
+            break
+        await asyncio.sleep(0)
+
+    assert created[0].request_stop_calls == 1
+    assert await reg.health_check() == {}
+    await reg.stop_all()
 
 
 @pytest.mark.anyio

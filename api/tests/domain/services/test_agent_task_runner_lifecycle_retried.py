@@ -11,7 +11,7 @@ from tests.domain.services.test_agent_task_runner_lifecycle_task_layer import (
 )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_retried_first_event_with_epoch_and_no_started():
     runner, task = _make_runner(), _Task()
     runner._retry_lifecycle_context = RetryLifecycleContext(retry_budget_remaining=2)
@@ -23,7 +23,7 @@ async def test_retried_first_event_with_epoch_and_no_started():
     assert payloads[0]["state"] == "running"              # retried 即 reopening edge（§5）
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_second_retry_epoch_two():
     runner, task = _make_runner(), _Task()
     runner._retry_lifecycle_context = RetryLifecycleContext(retry_budget_remaining=1)
@@ -32,7 +32,7 @@ async def test_second_retry_epoch_two():
     assert _lifecycle_payloads(task)[0]["epoch"] == 2
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_post_retry_terminal_carries_current_epoch():
     from app.domain.models.lifecycle import LifecycleEventKind as K
     runner, task = _make_runner(), _Task()
@@ -41,7 +41,7 @@ async def test_post_retry_terminal_carries_current_epoch():
     assert _lifecycle_payloads(task)[0]["epoch"] == 1
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_flag_off_context_consumed_but_nothing_emitted():
     # R7#P3c：flag-off 下 context 传了无人消费——wire 零差异，context 仍被清
     runner, task = _make_runner(flag_on=False), _Task()

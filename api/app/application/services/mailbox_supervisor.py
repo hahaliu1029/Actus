@@ -2196,7 +2196,7 @@ class MailboxSupervisor:
         (the orphaned task is the caller's problem; this method must not
         block shutdown indefinitely).
         """
-        self._stopping.set()
+        self.request_stop()
         try:
             await asyncio.wait_for(self._stopped.wait(), timeout=drain_timeout_s)
         except asyncio.TimeoutError:
@@ -2205,6 +2205,14 @@ class MailboxSupervisor:
                 self._ctx.root_session_id,
                 drain_timeout_s,
             )
+
+    def request_stop(self) -> None:
+        """Signal the run loop to exit without waiting for its own task.
+
+        Used by the registry callback when rollback detection requests a stop
+        from inside the supervisor task itself.
+        """
+        self._stopping.set()
 
     async def _handle_envelope(
         self, redis_id: bytes, envelope: MailboxEnvelope

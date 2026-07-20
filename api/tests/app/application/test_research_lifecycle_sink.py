@@ -52,7 +52,7 @@ def _sink(*, master=True, sub=True, emit_returns="msg-1"):
     return sink, emit, repo, counter
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_delivers_started_when_parent_task_active():
     sink, emit, repo, counter = _sink()
     ok = await sink.child_started(parent_session_id="parent-1", child_session_id="child-1")
@@ -67,7 +67,7 @@ async def test_delivers_started_when_parent_task_active():
     assert counter.count == 0
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "outcome,expected_kind,expected_reason",
     [
@@ -85,7 +85,7 @@ async def test_child_done_outcome_mapping(outcome, expected_kind, expected_reaso
     assert (ev.event.value, ev.reason) == (expected_kind, expected_reason)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_skip_is_observable_not_silent(caplog):
     # R15 核心：无活跃 task → 计数器 + 结构化日志；不 persist
     sink, emit, repo, counter = _sink(emit_returns=None)
@@ -97,7 +97,7 @@ async def test_skip_is_observable_not_silent(caplog):
     assert any("lifecycle_research_sink_skipped" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("master,sub", [(False, True), (True, False), (False, False)])
 async def test_and_gate_zero_construction(master, sub):
     # AND 门（R10#A9）：任一 off → 零构造零 emit 零计数（flag-off 不是 skip，是不存在）
@@ -108,7 +108,7 @@ async def test_and_gate_zero_construction(master, sub):
     assert counter.count == 0 and repo.persisted == []
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sink_never_raises(caplog):
     sink, emit, _, _ = _sink()
     emit.side_effect = RuntimeError("redis down")
@@ -117,7 +117,7 @@ async def test_sink_never_raises(caplog):
     assert ok is False  # 观测面永不破坏 research 主流程
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sink_contains_event_build_failure(monkeypatch, caplog):
     # T15 flip 前硬化（final review R1）：构造期 LifecycleContractError（词表漂移等）
     # 同样不得穿透 research 主流程——「sink 永不 raise」覆盖构造+投递全程

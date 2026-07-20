@@ -45,6 +45,7 @@ class _SupervisorSlot:
     """
 
     root_session_id: str
+    supervisor: "MailboxSupervisor"
     task: asyncio.Task
     instance_id: str
     restart_count: int = 0
@@ -131,6 +132,7 @@ class SupervisorRegistry:
         # is interrupted).
         self._slots[root_session_id] = _SupervisorSlot(
             root_session_id=root_session_id,
+            supervisor=sup,
             task=task,
             instance_id=instance_id,
         )
@@ -190,16 +192,39 @@ class SupervisorRegistry:
         )
 
     async def stop(self, root_session_id: str) -> None:
-        """Cancel + remove the supervisor for one root. Idempotent on
-        unknown root."""
+        """Drain + remove the supervisor for one root.
+
+        External callers use ``MailboxSupervisor.stop()`` so an in-flight
+        terminal-envelope side effect can finish before the run task exits.
+        The rollback self-stop callback cannot await its own task, so that
+        path only requests a stop and lets the run loop return naturally.
+        """
         slot = self._slots.pop(root_session_id, None)
         if slot is None:
             return
-        slot.task.cancel()
+
+        if asyncio.current_task() is slot.task:
+            request_stop = getattr(slot.supervisor, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
+            else:  # pragma: no cover - compatibility for partial test fakes
+                slot.task.cancel()
+            return
+
         try:
-            await slot.task
-        except (asyncio.CancelledError, Exception):
-            pass
+            graceful_stop = getattr(slot.supervisor, "stop", None)
+            if callable(graceful_stop):
+                await graceful_stop()
+        finally:
+            # ``MailboxSupervisor.stop`` is bounded. If its drain timeout
+            # expires, the registry still owns task cleanup and must not leave
+            # an untracked run loop behind after popping the slot.
+            if not slot.task.done():
+                slot.task.cancel()
+            try:
+                await slot.task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def stop_all(self) -> None:
         """Cancel every supervisor task + the restart loop. Required for
@@ -307,6 +332,7 @@ class SupervisorRegistry:
                 name=f"mailbox-sup:{root}:{new_instance_id}",
             )
             slot.task = new_task
+            slot.supervisor = sup
             slot.instance_id = new_instance_id
             logger.warning(
                 "supervisor restarted root=%s instance=%s restart_count=%d "

@@ -65,7 +65,7 @@ def _lifecycle(task):
     return [json.loads(r) for r in task.output_stream.events if json.loads(r)["type"] == "lifecycle"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_double_source_terminal_emitted_once():
     # §12-5：sibling-cancel（fail-fast 实时）与 reduce（批量时刻）双源同 child
     # 终态——emitter in-process 首发者胜（跨重启重复由前端 reducer 权威去重）
@@ -78,7 +78,7 @@ async def test_double_source_terminal_emitted_once():
     assert runner._uow.session.lookup_calls == 2      # 每 source 一次批查（仍各查一次——去重在 emit 层）
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_master_off_subagent_on_emits_nothing():
     # R10#A9：master-off + subagent-on 必须零发射零批查
     runner, task = _wire_subagent(_make_runner(False), master_on=False, sub_on=True), _Task()
@@ -87,7 +87,7 @@ async def test_master_off_subagent_on_emits_nothing():
     assert runner._uow.session.lookup_calls == 0
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_master_on_subagent_off_emits_nothing_for_coordinator():
     runner, task = _wire_subagent(_make_runner(True), master_on=True, sub_on=False), _Task()
     await runner._put_and_add_event(task, _reduce_cancelled())
@@ -95,7 +95,7 @@ async def test_master_on_subagent_off_emits_nothing_for_coordinator():
     assert runner._uow.session.lookup_calls == 0
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_child_runner_emits_plan_step_tool_lifecycle():
     # §12-8 positive（R9#P2c 锁孤儿承诺）：child runner 的 plan/step/tool 照常投影。
     # root gate 只属 task 层 helper（T10）——若未来有人给咽喉 hook 加 root 门控，

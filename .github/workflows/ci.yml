@@ -243,6 +243,10 @@ jobs:
           ACTUS_REQUIRE_SANDBOX_TESTS: "1"
           JWT_SECRET_KEY: ci-test-secret-key
           ENV: test
+          SANDBOX_IMAGE: actus-sandbox:latest
+          SANDBOX_NAME_PREFIX: actus-sb
+          MEMORY_ROOT_HOST: "${{ runner.temp }}/actus-hardening-memory"
+          MEMORY_ROOT_CONTAINER: "${{ runner.temp }}/actus-hardening-memory"
         run: uv run pytest tests/sandbox/ -m "sandbox and sandbox_real_image" -v
 
   sandbox-test:

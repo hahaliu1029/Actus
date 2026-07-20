@@ -33,7 +33,7 @@ def test_list_is_coroutine_abstractmethod() -> None:
     assert inspect.iscoroutinefunction(SubagentRunRepository.list_by_parent_session)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_concrete_subclass_instantiable_and_runs() -> None:
     recorded: list[SubagentRunResult] = []
 

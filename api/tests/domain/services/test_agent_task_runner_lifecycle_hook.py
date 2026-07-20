@@ -81,7 +81,7 @@ def _plan_event() -> PlanEvent:
     return PlanEvent(plan=Plan(id="plan-1"), status=PlanEventStatus.CREATED)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_flag_on_pairs_source_then_lifecycle_with_greater_seq():
     runner, task = _make_runner(True), _Task()
     await runner._put_and_add_event(task, _plan_event())
@@ -95,7 +95,7 @@ async def test_flag_on_pairs_source_then_lifecycle_with_greater_seq():
     assert lc["lifecycle_type"] == "plan" and lc["event"] == "started"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_persist_follows_source_true():
     runner, task = _make_runner(True), _Task()
     await runner._put_and_add_event(task, _plan_event(), persist=True)
@@ -103,7 +103,7 @@ async def test_persist_follows_source_true():
     assert persisted_types == ["plan", "lifecycle"]     # R3#8: lifecycle persist 跟随 source
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_persist_follows_source_false():
     runner, task = _make_runner(True), _Task()
     await runner._put_and_add_event(task, _plan_event(), persist=False)
@@ -111,7 +111,7 @@ async def test_persist_follows_source_false():
     assert len(task.output_stream.events) == 2          # 但都进流
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_flag_off_zero_entry_zero_construction():
     # INV-C7-3：flag-off 下 hook 零进入——projector.project 与 build_lifecycle_event 零调用
     runner, task = _make_runner(False), _Task()
@@ -124,7 +124,7 @@ async def test_flag_off_zero_entry_zero_construction():
     assert json.loads(task.output_stream.events[0])["type"] == "plan"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_lifecycle_event_does_not_reproject():
     # 递归防护双保险：emit 路径传 project_lifecycle=False；且投影器自投影守卫兜底
     runner, task = _make_runner(True), _Task()
@@ -133,7 +133,7 @@ async def test_lifecycle_event_does_not_reproject():
     assert len(task.output_stream.events) == 1
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_projection_failure_never_breaks_source_emit():
     runner, task = _make_runner(True), _Task()
     with patch.object(LifecycleProjector, "project", new=AsyncMock(side_effect=RuntimeError("boom"))):
@@ -141,7 +141,7 @@ async def test_projection_failure_never_breaks_source_emit():
     assert len(task.output_stream.events) == 1          # source 照常入流，投影失败仅告警
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_legacy_runner_without_lifecycle_attrs_is_noop():
     # 既有测试用 __new__ 构造且不设 C7 属性——hook 必须 getattr 防御性 no-op
     runner, task = _make_runner(True), _Task()

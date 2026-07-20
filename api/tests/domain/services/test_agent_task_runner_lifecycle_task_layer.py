@@ -34,7 +34,7 @@ def _lifecycle_payloads(task: _Task) -> list[dict]:
 
 
 class TestEmitHelper:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_root_emits_task_lifecycle(self):
         runner, task = _make_runner(), _Task()
         await runner._emit_task_lifecycle(task, K.STARTED)
@@ -43,7 +43,7 @@ class TestEmitHelper:
             ("task", "started", "running", "sess-1")
         ]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_child_runner_never_emits_task_lifecycle(self):
         # §12-7(b) root-only gate：child 的执行观测归 subagent 层
         runner, task = _make_runner(is_root=False), _Task()
@@ -51,14 +51,14 @@ class TestEmitHelper:
         await runner._emit_task_lifecycle(task, K.COMPLETED)
         assert _lifecycle_payloads(task) == []
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_flag_off_zero_emission(self):
         runner, task = _make_runner(flag_on=False), _Task()
         await runner._emit_task_lifecycle(task, K.COMPLETED)
         assert task.output_stream.events == []          # INV-C7-3：连 root 查询都不做
         runner._is_root_session.assert_not_awaited()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_terminal_dedup_in_process(self):
         runner, task = _make_runner(), _Task()
         await runner._emit_task_lifecycle(task, K.COMPLETED)
@@ -66,14 +66,14 @@ class TestEmitHelper:
         payloads = _lifecycle_payloads(task)
         assert len(payloads) == 1 and payloads[0]["event"] == "completed"  # INV-C7-5 同 (unit,epoch) 终态首发者胜
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_epoch_attached_to_all_task_events(self):
         runner, task = _make_runner(), _Task()
         runner._lifecycle_task_epoch = 1
         await runner._emit_task_lifecycle(task, K.PROGRESS, reason="finishing")
         assert _lifecycle_payloads(task)[0]["epoch"] == 1
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_never_raises_on_internal_failure(self):
         runner, task = _make_runner(), _Task()
         runner._is_root_session = AsyncMock(side_effect=RuntimeError("db down"))
@@ -82,13 +82,13 @@ class TestEmitHelper:
 
 
 class TestStartedRetriedMutex:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_no_context_emits_started(self):
         runner, task = _make_runner(), _Task()
         await runner._emit_task_started_or_retried(task)
         assert [p["event"] for p in _lifecycle_payloads(task)] == ["started"]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_context_emits_retried_and_suppresses_started(self):
         # §12-7(d)：retry 路径下 task.started 零发射（互斥）
         from app.domain.models.lifecycle import RetryLifecycleContext

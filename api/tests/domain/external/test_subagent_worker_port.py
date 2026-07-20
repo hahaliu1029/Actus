@@ -31,7 +31,7 @@ def test_run_is_coroutine_abstractmethod() -> None:
     assert inspect.iscoroutinefunction(SubagentWorker.run)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_concrete_subclass_instantiable_and_runs() -> None:
     class _Concrete(SubagentWorker):
         async def run(self, spec):  # type: ignore[override]

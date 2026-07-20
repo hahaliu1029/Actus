@@ -40,7 +40,7 @@ def _split(task: _Task):
     return [e for e in raw if e["type"] != "lifecycle"], [e for e in raw if e["type"] == "lifecycle"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_every_whitelisted_source_gets_paired_lifecycle():
     runner, task = _make_runner(True), _Task()
     for factory, _ in SCRIPT:
@@ -56,7 +56,7 @@ async def test_every_whitelisted_source_gets_paired_lifecycle():
         assert lc["seq"] > src["seq"]                  # 同 seq 空间且严格更大；相邻性不断言
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_concurrent_emitters_keep_pairing_intact():
     # adversarial（R1#3/INV-C7-6）：两个协程各推一半事件，await 点交错；
     # 配对经 source_event_id 仍一一对应，且每对 lifecycle.seq > source.seq。

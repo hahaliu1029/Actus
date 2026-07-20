@@ -20,7 +20,7 @@ class _FakeQueue:
             yield message_id, payload
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_mixed_stream_replay_keeps_lifecycle_and_skips_garbage(monkeypatch):
     lc = build_lifecycle_event(T.STEP, K.COMPLETED, unit_id="s1")
     lc.seq = 12
@@ -41,7 +41,7 @@ async def test_mixed_stream_replay_keeps_lifecycle_and_skips_garbage(monkeypatch
     assert restored.seq == 12
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_seq_cursor_filters_lifecycle_like_any_event(monkeypatch):
     lc_old = build_lifecycle_event(T.TOOL, K.STARTED, unit_id="tc1"); lc_old.seq = 5
     lc_new = build_lifecycle_event(T.TOOL, K.COMPLETED, unit_id="tc1"); lc_new.seq = 9

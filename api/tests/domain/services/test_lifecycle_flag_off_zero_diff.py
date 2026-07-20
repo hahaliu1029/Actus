@@ -15,7 +15,7 @@ from tests.domain.services.test_agent_task_runner_lifecycle_hook import (
 )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_flag_off_stream_is_sources_verbatim():
     runner, task = _make_runner(False), _Task()
     sources = [
@@ -35,7 +35,7 @@ async def test_flag_off_stream_is_sources_verbatim():
     assert all(json.loads(r)["type"] != "lifecycle" for r in task.output_stream.events)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_flag_on_smoke_projects_plan_and_step_only():
     runner, task = _make_runner(True), _Task()
     await runner._put_and_add_event(task, MessageEvent(message="hi"))

@@ -316,7 +316,7 @@ def _worker(result=None, *, raises=None) -> A2aSubagentWorker:
 
 
 class TestRunGuard:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_non_remote_spec_rejected(self) -> None:
         worker = _worker(ToolResult(success=True, data={"result": {}}))
         spec = WorkerSpec(
@@ -330,7 +330,7 @@ class TestRunGuard:
 
 
 class TestRunTransport:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_transport_failure_clean_error_no_url(self) -> None:
         result = ToolResult(
             success=False,
@@ -341,34 +341,34 @@ class TestRunTransport:
         assert r.error_summary == "a2a transport error"
         assert "https://" not in (r.error_summary or "")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_timeout(self) -> None:
         r = await _worker(raises=TimeoutError()).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.TIMED_OUT
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unexpected_exception_failed(self) -> None:
         r = await _worker(raises=RuntimeError("x")).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.FAILED
         assert r.error_summary == "a2a transport error"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_data_none_unknown(self) -> None:
         r = await _worker(ToolResult(success=True, data=None)).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.UNKNOWN
         assert r.error_summary == "empty A2A payload"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_data_non_dict_unknown(self) -> None:
         r = await _worker(ToolResult(success=True, data="oops")).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.UNKNOWN
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_data_empty_dict_unknown(self) -> None:
         r = await _worker(ToolResult(success=True, data={})).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.UNKNOWN
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_jsonrpc_error_in_200_failed_redacted(self) -> None:
         result = ToolResult(
             success=True, data={"error": {"message": "boom at https://h/x"}}
@@ -386,41 +386,41 @@ class TestRunStateClassification:
         data = {"result": {"status": status}}
         return await _worker(ToolResult(success=True, data=data)).run(_remote_spec())
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_completed_success(self) -> None:
         r = await self._run_state("completed", message={"parts": [{"text": "done"}]})
         assert r.terminal_outcome == WorkerTerminalOutcome.SUCCESS
         assert r.summary == "done"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_failed(self) -> None:
         r = await self._run_state("failed")
         assert r.terminal_outcome == WorkerTerminalOutcome.FAILED
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_canceled(self) -> None:
         r = await self._run_state("canceled")
         assert r.terminal_outcome == WorkerTerminalOutcome.CANCELLED
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_input_required_waiting(self) -> None:
         r = await self._run_state("input-required")
         assert r.lifecycle_state == WorkerLifecycleState.WAITING_INPUT
         assert r.terminal_outcome is None
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_working_unknown(self) -> None:
         r = await self._run_state("working")
         assert r.terminal_outcome == WorkerTerminalOutcome.UNKNOWN
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unknown_state_unknown(self) -> None:
         r = await self._run_state("banana")
         assert r.terminal_outcome == WorkerTerminalOutcome.UNKNOWN
 
 
 class TestRunNonConformant:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_reply_shape_success(self) -> None:
         # {"reply":"task done"} → SUCCESS + summary，无 error（引 test_r2_wrapper_integration.py:142）
         r = await _worker(ToolResult(success=True, data={"reply": "task done"})).run(_remote_spec())
@@ -428,13 +428,13 @@ class TestRunNonConformant:
         assert r.summary == "task done"
         assert r.error_summary is None
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_result_plain_string_success(self) -> None:
         r = await _worker(ToolResult(success=True, data={"result": "plain"})).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.SUCCESS
         assert r.summary == "plain"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unparseable_dict_success_with_preview(self) -> None:
         # 非空 dict、无 state、无可抽文本 → 默认 SUCCESS + preview + unparsed error
         r = await _worker(ToolResult(success=True, data={"weird": {"x": 1}})).run(_remote_spec())
@@ -444,7 +444,7 @@ class TestRunNonConformant:
 
 
 class TestRunRobustness:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_malformed_shapes_do_not_crash(self) -> None:
         malformed = [
             {"result": {"status": "not-a-dict"}},
@@ -462,7 +462,7 @@ class TestRunRobustness:
                 WorkerLifecycleState.WAITING_INPUT,
             }
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_giant_text_capped(self) -> None:
         data = {"result": {"status": {"message": {"parts": [{"text": "x" * 1_000_000}]}}}}
         r = await _worker(ToolResult(success=True, data=data)).run(_remote_spec())
@@ -470,7 +470,7 @@ class TestRunRobustness:
 
 
 class TestRunIdentityFields:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_identity_cost_duration(self) -> None:
         spec = _remote_spec(child_session_id="cs")
         data = {"result": {"status": {"state": "completed", "message": {"parts": [{"text": "ok"}]}}}}
@@ -484,7 +484,7 @@ class TestRunIdentityFields:
         assert r.duration_source == "observed_local"
         assert r.duration_seconds is not None and r.duration_seconds >= 0
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_never_pending_or_running(self) -> None:
         for data in [
             {"result": {"status": {"state": "completed"}}},
@@ -503,7 +503,7 @@ class TestRunSpecCoverage:
     """spec §7 PR-3 补全 case（R2#P2-a）：adapter 级 Message-like / 深嵌套 fallback /
     giant error / giant fallback / REMOTE 缺 remote_target guard。"""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_message_like_parts_success(self) -> None:
         # adapter 级 Message-like（result.parts 直挂，无 status）→ SUCCESS via (c)
         data = {"result": {"parts": [{"text": "m"}]}}
@@ -511,7 +511,7 @@ class TestRunSpecCoverage:
         assert r.terminal_outcome == WorkerTerminalOutcome.SUCCESS
         assert r.summary == "m"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_deep_nesting_fallback_no_crash(self) -> None:
         node: dict = {}
         cur = node
@@ -523,21 +523,21 @@ class TestRunSpecCoverage:
         assert r.terminal_outcome == WorkerTerminalOutcome.SUCCESS
         assert isinstance(r.summary, str)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_giant_error_message_capped(self) -> None:
         data = {"error": {"message": "x" * 1_000_000}}
         r = await _worker(ToolResult(success=True, data=data)).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.FAILED
         assert len(r.error_summary or "") <= 2_048
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_giant_fallback_preview_capped(self) -> None:
         data = {"junk": "y" * 1_000_000}
         r = await _worker(ToolResult(success=True, data=data)).run(_remote_spec())
         assert r.terminal_outcome == WorkerTerminalOutcome.SUCCESS
         assert len(r.summary) <= 4_096
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_remote_spec_missing_target_rejected(self) -> None:
         # model_construct 绕过 validator，构造 REMOTE + remote_target=None，验 run() guard 第二支
         spec = WorkerSpec.model_construct(

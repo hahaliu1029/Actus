@@ -46,20 +46,20 @@ def _tool_event(
 
 
 class TestPhaseEvents:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_calling_maps_started_pending(self, projector):
         out = await projector.project(_tool_event(ToolEventStatus.CALLING))
         assert [(o.lifecycle_type, o.event, o.state) for o in out] == [(T.TOOL, K.STARTED, S.PENDING)]
         assert out[0].unit_id == "tc-1"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_running_maps_progress_running(self, projector):
         out = await projector.project(_tool_event(ToolEventStatus.RUNNING))
         assert [(o.event, o.state) for o in out] == [(K.PROGRESS, S.RUNNING)]
 
 
 class TestCalledOutcomes:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     @pytest.mark.parametrize(
         "variant,reason_type,expected_kind,expected_state,expected_reason",
         [
@@ -80,19 +80,19 @@ class TestCalledOutcomes:
             (expected_kind, expected_state, expected_reason)
         ]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_asked_is_not_projected(self, projector):
         # Asked 走 ToolConfirmationEvent 独立通道（§4.3 注）
         out = await projector.project(_tool_event(ToolEventStatus.CALLED, variant="asked"))
         assert list(out) == []
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_denied_never_maps_failed(self, projector):
         # 取消非失败——denied 的 state 必须是 cancelled（§4.3）
         out = await projector.project(_tool_event(ToolEventStatus.CALLED, variant="denied"))
         assert out[0].state is S.CANCELLED and out[0].state is not S.FAILED
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_no_raw_error_text_leaks_into_lifecycle(self, projector):
         # 敏感信息禁入：allow_error 的 message/code 只留在 source，lifecycle 仅受控 code
         out = await projector.project(
@@ -107,7 +107,7 @@ class TestLegacyFallback:
         def __init__(self, success: bool) -> None:
             self.success = success
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_called_no_artifact_success_true(self, projector):
         ev = _tool_event(ToolEventStatus.CALLED)
         ev.function_result = None
@@ -117,19 +117,19 @@ class TestLegacyFallback:
         out = await projector.project(ev2)
         assert [(o.event, o.reason) for o in out] == [(K.COMPLETED, None)]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_called_no_artifact_success_false(self, projector):
         ev = _tool_event(ToolEventStatus.CALLED)
         ev.function_result = self._LegacyResult(False)
         out = await projector.project(ev)
         assert [(o.event, o.state, o.reason) for o in out] == [(K.FAILED, S.FAILED, "tool_error")]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_called_nothing_resolvable_returns_empty(self, projector):
         out = await projector.project(_tool_event(ToolEventStatus.CALLED))
         assert list(out) == []  # 不硬造终态
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_malformed_artifact_falls_back_gracefully(self, projector):
         ev = _tool_event(ToolEventStatus.CALLED)
         ev.artifact = {"outcome": "not-a-dict"}

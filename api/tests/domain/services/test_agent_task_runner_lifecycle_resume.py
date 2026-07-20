@@ -36,7 +36,7 @@ def _prime_resume(runner: AgentTaskRunner, *, deferred: bool, postprocess_cancel
     runner._was_timed_out = False
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resume_normal_completion_emits_completed():
     runner, task = _make_runner(), _Task()
     _prime_resume(runner, deferred=True)
@@ -46,7 +46,7 @@ async def test_resume_normal_completion_emits_completed():
     assert _lifecycle_payloads(task)[0]["reason"] == "finishing"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resume_timed_out_emits_failed_watchdog():
     runner, task = _make_runner(), _Task()
     _prime_resume(runner, deferred=True)
@@ -56,7 +56,7 @@ async def test_resume_timed_out_emits_failed_watchdog():
     assert (terminal["event"], terminal["reason"]) == ("failed", "watchdog_timeout")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resume_no_deferred_emits_completed():
     runner, task = _make_runner(), _Task()
     _prime_resume(runner, deferred=False)
@@ -64,7 +64,7 @@ async def test_resume_no_deferred_emits_completed():
     assert [p["event"] for p in _lifecycle_payloads(task)] == ["completed"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resume_postprocess_cancelled_emits_no_terminal():
     # §12-7(c) 负向：回流 RUNNING，终态由后续 invoke() 覆盖
     runner, task = _make_runner(), _Task()
@@ -75,7 +75,7 @@ async def test_resume_postprocess_cancelled_emits_no_terminal():
     assert events == ["progress"]                        # 只有 finishing progress
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resume_postprocess_exception_emits_completed_postprocess_failed():
     runner, task = _make_runner(), _Task()
     _prime_resume(runner, deferred=True)
@@ -85,7 +85,7 @@ async def test_resume_postprocess_exception_emits_completed_postprocess_failed()
     assert (terminal["event"], terminal["reason"]) == ("completed", "postprocess_failed")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resume_generic_exception_emits_nothing_terminal():
     # R7：兜底 except 无终态状态写——lifecycle 镜像（零终态发射）
     runner, task = _make_runner(), _Task()

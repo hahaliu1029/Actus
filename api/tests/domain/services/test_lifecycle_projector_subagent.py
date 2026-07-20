@@ -67,7 +67,7 @@ MAPPING = {"wu-a": "child-a", "wu-b": "child-b", "wu-c": "child-c"}
 
 
 class TestSpawned:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_spawned_maps_started_without_lookup(self):
         lookup = _CountingLookup(MAPPING)
         out = await _projector(lookup).project(_spawned())
@@ -80,7 +80,7 @@ class TestSpawned:
         assert out[0].epoch == 0                      # INV-C7-8：非 task 恒 0
         assert lookup.calls == 0                       # spawned 自带 child id
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_spawned_missing_child_id_skips(self):
         ev = _spawned()
         ev.child_session_id = None
@@ -89,7 +89,7 @@ class TestSpawned:
 
 
 class TestReduce:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_reduce_expands_per_child_with_single_query(self):
         lookup = _CountingLookup(MAPPING)
         out = await _projector(lookup).project(_reduce({
@@ -103,7 +103,7 @@ class TestReduce:
             "child-c": (K.FAILED, "watchdog_timeout"),
         }
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_needs_authorization_maps_failed_with_original_outcome(self):
         out = await _projector(_CountingLookup(MAPPING)).project(
             _reduce({"wu-a": RO.NEEDS_AUTHORIZATION})
@@ -111,24 +111,24 @@ class TestReduce:
         assert (out[0].event, out[0].reason) == (K.FAILED, "needs_authorization")
         assert out[0].detail.original_outcome == "needs_authorization"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_outcome_maps_cancelled(self):
         out = await _projector(_CountingLookup(MAPPING)).project(_reduce({"wu-a": RO.CANCELLED}))
         assert [(o.event, o.state) for o in out] == [(K.CANCELLED, S.CANCELLED)]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unknown_wu_skipped_others_survive(self):
         out = await _projector(_CountingLookup({"wu-a": "child-a"})).project(_reduce({
             "wu-a": RO.SUCCESS, "wu-ghost": RO.FAILED,
         }))
         assert [o.unit_id for o in out] == ["child-a"]  # 合法降级：缺映射跳过+log
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lookup_failure_degrades_to_empty(self):
         out = await _projector(_CountingLookup(MAPPING, fail=True)).project(_reduce({"wu-a": RO.SUCCESS}))
         assert list(out) == []                          # 不 raise 不硬造
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_group_outcome_never_maps_per_child(self):
         # R4#6：CONFLICT/INCOMPLETE/MIXED 是 group 级信号——per-child 展开只由
         # per_worker_outcomes 驱动；INCOMPLETE 下无 outcome 的 child 停 started（§1 局限 1）
@@ -139,7 +139,7 @@ class TestReduce:
 
 
 class TestSiblingCancel:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_sibling_cancel_expands_via_lookup(self):
         lookup = _CountingLookup(MAPPING)
         out = await _projector(lookup).project(_sibling_cancel(["wu-b", "wu-c"]))
@@ -149,7 +149,7 @@ class TestSiblingCancel:
 
 
 class TestAndGate:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_subagent_flag_off_projects_nothing(self):
         # R10#A9 运行期 AND：master 在 hook 层查，subagent 在分支入口查
         lookup = _CountingLookup(MAPPING)

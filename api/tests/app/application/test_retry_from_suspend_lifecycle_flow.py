@@ -41,7 +41,7 @@ async def _mode_transition_fence():
     yield
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_retry_flow_passes_typed_context_with_claimed_budget():
     svc = AgentService.__new__(AgentService)
     session = _suspended_session()
@@ -64,7 +64,7 @@ async def test_retry_flow_passes_typed_context_with_claimed_budget():
     assert ctx.trigger == "user" and ctx.previous_state == "suspended"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_retried_wire_payload_matches_fe_fixture():
     # 跨语言互锁：与 ui/src/lib/lifecycle/__tests__/wire-contract.test.ts 的 SAMPLE 字面一致
     import json

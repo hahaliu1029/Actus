@@ -30,7 +30,7 @@ def _team(*members):
     return TeamBundle(slug="t", name="T", members=tuple(members))
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_mcp_member_skill_with_c2_child_safe_resolves():
     repo = _FakeSkillRepo([_skill("safe-mcp", policy={"c2_child_safe": True})])
     m = TeamMember(role="r", description="d", system_prompt="p", skills=("safe-mcp",))
@@ -42,7 +42,7 @@ async def test_mcp_member_skill_with_c2_child_safe_resolves():
     assert cap.native_skill_slugs == ()  # mcp skill ⇒ not native
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_mcp_member_skill_without_c2_child_safe_fails_closed():
     repo = _FakeSkillRepo([_skill("unsafe-mcp")])  # no policy.c2_child_safe
     m = TeamMember(role="r", description="d", system_prompt="p", skills=("unsafe-mcp",))
@@ -50,7 +50,7 @@ async def test_mcp_member_skill_without_c2_child_safe_fails_closed():
         await resolve_team_member_map(team=_team(m), skill_repository=repo)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_native_member_skill_resolves_and_is_tracked_pr5():
     # [S4 §13 PR-5] native member skills RESOLVE (no longer rejected at resolve);
     # their slug is collected into native_skill_slugs and their generated tool
@@ -67,7 +67,7 @@ async def test_native_member_skill_resolves_and_is_tracked_pr5():
     assert "skill_nat_go" in cap.member_skill_tools  # native tool name included
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_unknown_or_disabled_skill_fails_closed():
     repo = _FakeSkillRepo([_skill("dis", enabled=False, policy={"c2_child_safe": True})])
     m = TeamMember(role="r", description="d", system_prompt="p", skills=("dis",))
@@ -78,7 +78,7 @@ async def test_unknown_or_disabled_skill_fails_closed():
         await resolve_team_member_map(team=_team(m2), skill_repository=repo)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_prompt_only_member_no_skills():
     repo = _FakeSkillRepo([])
     m = TeamMember(role="r", description="d", system_prompt="p")  # skills=()

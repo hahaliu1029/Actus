@@ -15,7 +15,7 @@ def _epoch_for(remaining: int) -> int:
     return max(0, RETRY_BUDGET_INITIAL - remaining)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_epoch_monotonic_across_simulated_restarts():
     # 「重启」= 全新 runner 实例；epoch 只依赖持久列 remaining（3→2→1）
     seen = []
@@ -29,7 +29,7 @@ async def test_epoch_monotonic_across_simulated_restarts():
     assert seen == sorted(seen)                   # 单调不回退
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_post_retry_followup_task_inherits_epoch_from_persistent_column():
     # retry 之后的普通 follow-up task（无 context）也携带当前 epoch（§5）
     runner, task = _make_runner(), _Task()

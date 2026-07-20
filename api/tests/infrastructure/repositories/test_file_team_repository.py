@@ -52,7 +52,7 @@ def _write_team(root, slug, team_md=_TEAM_MD):
     return d
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_get_by_slug_parses_frontmatter(tmp_path):
     _write_team(tmp_path, "code-migration-squad")
     repo = FileTeamRepository(tmp_path)
@@ -64,13 +64,13 @@ async def test_get_by_slug_parses_frontmatter(tmp_path):
     assert team.members[0].default_phase == "exploration"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_get_by_slug_missing_returns_none(tmp_path):
     repo = FileTeamRepository(tmp_path)
     assert await repo.get_by_slug("nope") is None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_list_all(tmp_path):
     _write_team(tmp_path, "code-migration-squad")
     repo = FileTeamRepository(tmp_path)
@@ -78,7 +78,7 @@ async def test_list_all(tmp_path):
     assert [t.slug for t in teams] == ["code-migration-squad"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_malformed_yaml_raises_team_artifact_error(tmp_path):
     _write_team(tmp_path, "broken", team_md="---\n: : not yaml :\n---\n")
     repo = FileTeamRepository(tmp_path)
@@ -86,7 +86,7 @@ async def test_malformed_yaml_raises_team_artifact_error(tmp_path):
         await repo.get_by_slug("broken")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_schema_violation_raises_team_artifact_error(tmp_path):
     # Single-fault fixture: write to dir == frontmatter slug so the ONLY fault is
     # the duplicate-role schema violation (no dir-slug mismatch). Assert the branch.
@@ -97,7 +97,7 @@ async def test_schema_violation_raises_team_artifact_error(tmp_path):
         await repo.get_by_slug("code-migration-squad")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_directory_slug_mismatch_raises(tmp_path):
     # [codex-R4-F4] directory name is authoritative; frontmatter slug must match.
     bad = _TEAM_MD.replace("slug: code-migration-squad", "slug: other-slug")
@@ -110,7 +110,7 @@ async def test_directory_slug_mismatch_raises(tmp_path):
 # ---- path-safety / fail-closed defenses (FIX 1 + FIX 2) ------------------ #
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_absolute_slug_rejected(tmp_path):
     # An absolute slug must be rejected (would escape root_dir entirely).
     repo = FileTeamRepository(tmp_path)
@@ -119,7 +119,7 @@ async def test_absolute_slug_rejected(tmp_path):
         await repo.get_by_slug(abs_slug)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_parent_traversal_slug_rejected(tmp_path):
     # Place a VALID team exactly where a successful "../" traversal FROM root would
     # resolve, so absent the reject get_by_slug would actually load it — proving the
@@ -137,7 +137,7 @@ async def test_parent_traversal_slug_rejected(tmp_path):
         await repo.get_by_slug("../escape")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_backslash_slug_rejected(tmp_path):
     # A backslash is a valid filename char on POSIX, but no legitimate team slug
     # contains a separator; reject it explicitly (cross-platform hardening).
@@ -153,7 +153,7 @@ _EVIL_TEAM_MD = _TEAM_MD.replace("slug: code-migration-squad", "slug: evil")
 
 
 @pytest.mark.skipif(not _SYMLINKS_SUPPORTED, reason="symlinks unsupported on platform")
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_symlink_package_rejected(tmp_path):
     # A real, valid team dir OUTSIDE root; symlink root/evil -> it. Without the
     # symlink defense, get_by_slug("evil") would happily load it (frontmatter
@@ -170,7 +170,7 @@ async def test_symlink_package_rejected(tmp_path):
 
 
 @pytest.mark.skipif(not _SYMLINKS_SUPPORTED, reason="symlinks unsupported on platform")
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_symlink_team_md_rejected(tmp_path):
     # The package dir is real but TEAM.md is a symlink → containment-escape vector.
     # frontmatter slug == "evil" so, absent the symlink defense, it would LOAD.
@@ -189,7 +189,7 @@ async def test_symlink_team_md_rejected(tmp_path):
         await repo.get_by_slug("evil")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_team_md_is_directory_raises(tmp_path):
     # TEAM.md exists but is a DIRECTORY → read_text would leak a raw OSError.
     pkg = tmp_path / "x"
@@ -199,7 +199,7 @@ async def test_team_md_is_directory_raises(tmp_path):
         await repo.get_by_slug("x")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_team_md_invalid_utf8_raises(tmp_path):
     # TEAM.md is non-UTF-8 → read_text(encoding="utf-8") would leak UnicodeDecodeError.
     pkg = tmp_path / "y"
@@ -210,7 +210,7 @@ async def test_team_md_invalid_utf8_raises(tmp_path):
         await repo.get_by_slug("y")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_valid_but_absent_slug_returns_none(tmp_path):
     # A structurally-VALID slug whose dir simply does not exist must return None.
     repo = FileTeamRepository(tmp_path)
