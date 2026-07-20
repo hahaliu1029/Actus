@@ -219,7 +219,10 @@ async def test_finalize_uninstall_soft_deletes_and_converts_failed_install(facto
     by_type_state = {(o.operation_type, o.state) for o in ops}
     assert ("plugin_uninstall", "completed") in by_type_state
     assert ("plugin_install", "compensated") in by_type_state          # 旧 failed → compensated
-    failed_install = next(o for o in ops if o.operation_type == "plugin_install")
+    failed_install = next(
+        o for o in ops
+        if o.operation_type == "plugin_install" and o.state == "compensated"
+    )
     assert f"cleaned_up_via={op.id}" in failed_install.error
     assert "uninstalled" in await _events_for(factory, op.id)          # 父行软删 audit
 

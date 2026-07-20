@@ -38,8 +38,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.application.errors.exceptions import ConflictError
 from app.application.services.agent_service import AgentService
+from app.domain.services.permission.errors import PolicyConflict
 from app.domain.services.permission.confirmation_queue import (
     ZSET_KEY,
     ConfirmationDetail,
@@ -337,47 +337,26 @@ async def test_skill_session_scope_concurrent_resume_has_one_winner(
     )
 
     winners = [r for r in results if not isinstance(r, BaseException)]
-    conflicts = [r for r in results if isinstance(r, ConflictError)]
+    conflicts = [r for r in results if isinstance(r, PolicyConflict)]
     unexpected = [
         r for r in results
-        if isinstance(r, BaseException) and not isinstance(r, ConflictError)
+        if isinstance(r, BaseException) and not isinstance(r, PolicyConflict)
     ]
 
     assert not unexpected, f"并发 preflight 出现非 409 异常: {unexpected!r}"
     assert len(winners) == 1, f"预期 1 winner，实际 {len(winners)}: {results!r}"
     assert len(conflicts) == 1
-    assert conflicts[0].status_code == 409
+    assert str(conflicts[0]) == "approval_already_claimed"
 
     winner_state = winners[0]
-    assert winner_state.decision_id is not None
+    assert winner_state.decision_id is None
+    assert winner_state.claim_nonce is not None
     assert winner_state.persistent_scope is True
 
-    # DB invariants (R5 合同 + R3 集成)：
+    # Direct preflight stops before commit_resume; the Redis claim exists but
+    # DB grant/audit rows do not yet.
     grant_rows = await _fetch_grant_rows(session_factory, tool_call_id)
-    assert len(grant_rows) == 1, (
-        f"confirmation_id={tool_call_id} 对应 grant 必须 == 1，实际 {len(grant_rows)}"
-    )
-    grant = grant_rows[0]
-    assert grant["decision_id"] == winner_state.decision_id, (
-        "DB 里的 grant.decision_id 必须与 winner state.decision_id 一致"
-    )
-    assert grant["tool_source"] == "skill", (
-        f"Skill-source 触发的 grant 必须 tool_source='skill'，实际 "
-        f"{grant['tool_source']!r}；R3→R5 链路 tool_source 未正确传递。"
-    )
-    assert grant["tool_name"] == _SKILL_TOOL_NAME
-    assert grant["scope"] == "session"
-    assert grant["effect"] == "approve"
-    assert grant["source_type"] == "user_click"
-    assert grant["user_id"] == test_user_id  # grant owner = detail.user_id
+    assert grant_rows == []
 
     audit_rows = await _fetch_audit_rows(session_factory, test_session_id)
-    assert len(audit_rows) == 1
-    audit = audit_rows[0]
-    assert audit["tool_name"] == _SKILL_TOOL_NAME
-    assert audit["action"] == "approve"
-    assert audit["scope"] == "session"
-    assert audit["approved_by"] == "user"
-    assert audit["decision_id"] == winner_state.decision_id, (
-        "audit.decision_id FK 必须指向 winner grant（R5 writer 同事务 grant+audit）"
-    )
+    assert audit_rows == []

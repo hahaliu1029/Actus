@@ -59,6 +59,7 @@ def _snapshot(session: Session) -> dict[str, Any]:
         "background_reason": session.background_reason,
         "expires_at": None,
         "retry_budget_remaining": session.retry_budget_remaining,
+        "execution_revision": session.execution_revision,
         "suspended_reason": None,
         "terminal_reason": None,
         "last_progress_at": None,

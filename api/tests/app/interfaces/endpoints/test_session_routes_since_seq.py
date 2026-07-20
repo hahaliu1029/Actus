@@ -48,6 +48,7 @@ def _fake_supervisor_snapshot() -> dict[str, Any]:
         "background_reason": "explicit",
         "expires_at": None,
         "retry_budget_remaining": 1,
+        "execution_revision": 0,
         "suspended_reason": None,
         "terminal_reason": None,
         "last_progress_at": None,

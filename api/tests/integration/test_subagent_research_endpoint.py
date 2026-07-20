@@ -79,9 +79,10 @@ def _install_stub_research_service(app, events=None, raise_exc=None):
 
 
 async def test_endpoint_requires_parent_ownership(
-    asgi_client, sample_user_token
+    app, asgi_client, sample_user_token
 ):
     """POST with non-existent parent_session_id → 404 (not 500)."""
+    _install_stub_research_service(app)
     response = await asgi_client.post(
         "/api/sessions/00000000-0000-0000-0000-000000000000/subagents/research",
         json={"prompts": ["test"], "max_children": 1},
@@ -91,9 +92,10 @@ async def test_endpoint_requires_parent_ownership(
 
 
 async def test_endpoint_cross_tenant_returns_404(
-    asgi_client, other_user_token, sample_session
+    app, asgi_client, other_user_token, sample_session
 ):
     """User B accessing User A's parent → 404 (existence not leaked)."""
+    _install_stub_research_service(app)
     response = await asgi_client.post(
         f"/api/sessions/{sample_session.id}/subagents/research",
         json={"prompts": ["test"], "max_children": 1},
@@ -108,9 +110,10 @@ async def test_endpoint_cross_tenant_returns_404(
 
 
 async def test_endpoint_validates_max_children_upper_bound(
-    asgi_client, sample_user_token, sample_session
+    app, asgi_client, sample_user_token, sample_session
 ):
     """max_children > 3 → 422 Unprocessable (Pydantic Field constraint)."""
+    _install_stub_research_service(app)
     response = await asgi_client.post(
         f"/api/sessions/{sample_session.id}/subagents/research",
         json={"prompts": ["test"], "max_children": 10},
@@ -120,9 +123,10 @@ async def test_endpoint_validates_max_children_upper_bound(
 
 
 async def test_endpoint_validates_prompts_minimum(
-    asgi_client, sample_user_token, sample_session
+    app, asgi_client, sample_user_token, sample_session
 ):
     """Empty prompts list → 422 (Pydantic min_length=1)."""
+    _install_stub_research_service(app)
     response = await asgi_client.post(
         f"/api/sessions/{sample_session.id}/subagents/research",
         json={"prompts": [], "max_children": 1},
@@ -132,9 +136,10 @@ async def test_endpoint_validates_prompts_minimum(
 
 
 async def test_endpoint_validates_prompts_maximum(
-    asgi_client, sample_user_token, sample_session
+    app, asgi_client, sample_user_token, sample_session
 ):
     """prompts list > 3 → 422 (Pydantic max_length=3)."""
+    _install_stub_research_service(app)
     response = await asgi_client.post(
         f"/api/sessions/{sample_session.id}/subagents/research",
         json={"prompts": ["a", "b", "c", "d"], "max_children": 3},

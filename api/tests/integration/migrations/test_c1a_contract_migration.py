@@ -26,8 +26,9 @@ async def test_child_must_have_preset_check_now_references_parent_session_id(db_
         )
     )).all()
     assert len(rows) == 1
-    assert "parent_session_id" in rows[0].def_, rows[0].def_
-    assert "sample_session_id" not in rows[0].def_, rows[0].def_
+    constraint_def = rows[0][1]
+    assert "parent_session_id" in constraint_def, constraint_def
+    assert "sample_session_id" not in constraint_def, constraint_def
 
 
 async def test_mirror_function_dropped(db_session):
@@ -52,8 +53,9 @@ async def test_parent_user_trigger_swapped_to_parent_only(db_session):
         )
     )).first()
     assert func_body is not None
-    assert "sample_session_id" not in func_body.def_, func_body.def_
-    assert "parent_session_id" in func_body.def_, func_body.def_
+    function_def = func_body[0]
+    assert "sample_session_id" not in function_def, function_def
+    assert "parent_session_id" in function_def, function_def
 
     trig_def = (await db_session.execute(
         sa.text(
@@ -62,4 +64,4 @@ async def test_parent_user_trigger_swapped_to_parent_only(db_session):
         )
     )).first()
     assert trig_def is not None
-    assert "sample_session_id" not in trig_def.def_, trig_def.def_
+    assert "sample_session_id" not in trig_def[0], trig_def[0]

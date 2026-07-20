@@ -99,9 +99,11 @@ async def _seed_child_with_cost(
     async with async_session_factory() as s:
         await s.execute(
             text(
-                "INSERT INTO sessions(id, user_id, parent_session_id, "
-                "coordinator_run_id, status, title, created_at, updated_at) "
-                "VALUES (:sid, :uid, :parent, :run_id, 'pending', 'b3 child', "
+                "INSERT INTO sessions(id, user_id, parent_session_id, worker_type, "
+                "coordinator_run_id, tool_filter_preset, status, title, "
+                "created_at, updated_at) "
+                "VALUES (:sid, :uid, :parent, 'subagent', :run_id, 'coordinator_step', "
+                "'pending', 'b3 child', "
                 "NOW(), NOW())"
             ),
             {
@@ -150,9 +152,11 @@ async def _seed_empty_child(
     async with async_session_factory() as s:
         await s.execute(
             text(
-                "INSERT INTO sessions(id, user_id, parent_session_id, "
-                "coordinator_run_id, status, title, created_at, updated_at) "
-                "VALUES (:sid, :uid, :parent, :run_id, 'pending', 'empty', "
+                "INSERT INTO sessions(id, user_id, parent_session_id, worker_type, "
+                "coordinator_run_id, tool_filter_preset, status, title, "
+                "created_at, updated_at) "
+                "VALUES (:sid, :uid, :parent, 'subagent', :run_id, 'coordinator_step', "
+                "'pending', 'empty', "
                 "NOW(), NOW())"
             ),
             {

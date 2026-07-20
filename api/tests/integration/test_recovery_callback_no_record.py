@@ -65,10 +65,13 @@ async def test_recovery_callback_no_record_no_event_otel_only(
 
     # Step 1: commit seed rows so independent UoW connections can see them
     async with uow_factory() as uow:
-        uow.db_session.add_all([
-            UserModel(id=user_id, username=f"u-{user_id[:8]}", password_hash="x"),
-            SessionModel(id=session_id, user_id=user_id, status="pending", title="t"),
-        ])
+        uow.db_session.add(
+            UserModel(id=user_id, username=f"u-{user_id[:8]}", password_hash="x")
+        )
+        await uow.db_session.flush()
+        uow.db_session.add(
+            SessionModel(id=session_id, user_id=user_id, status="pending", title="t")
+        )
         await uow.db_session.commit()
 
     try:

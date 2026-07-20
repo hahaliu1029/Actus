@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from app.application.services.agent_service import AgentService
+from app.application.services.coordinator_parent_cancel_fanout import CancelFanoutResult
 from app.application.errors.exceptions import BadRequestError, ConflictError, ForbiddenError
 from app.domain.models.event import ControlAction, ControlEvent, ControlScope, ControlSource
 from app.domain.models.session import Session, SessionStatus
@@ -1464,6 +1465,19 @@ class _OrderTask:
         return True
 
 
+class _DrainingFanout:
+    def __init__(self, order: list[str]) -> None:
+        self._order = order
+
+    async def cancel_children(self, *, parent_session_id: str, reason: str):
+        self._order.append("fanout")
+        return CancelFanoutResult(enumerated=2, published=2, failed=0)
+
+    async def wait_for_children_terminal(self, *, parent_session_id: str) -> bool:
+        self._order.append("drain")
+        return True
+
+
 async def test_stop_session_root_fans_out_before_task_cancel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1488,6 +1502,39 @@ async def test_stop_session_root_fans_out_before_task_cancel(
 
     assert fanout.calls == [("s1", "parent_cancel")]
     assert order == ["fanout", "cancel"]  # fanout BEFORE the parent task.cancel
+
+
+async def test_stop_session_drains_child_terminals_before_stopping_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(id="s1", user_id="u1", status=SessionStatus.RUNNING)
+    uow = _Uow(session=session)
+    service = _make_service(uow)
+    order: list[str] = []
+    service._coordinator_parent_cancel_fanout = _DrainingFanout(order)
+    task = _OrderTask(order)
+
+    async def fake_get_accessible_session(*args, **kwargs) -> Session:
+        return session
+
+    async def fake_get_task(_session: Session):
+        return task
+
+    async def fake_stop_supervisor(_session_id: str) -> None:
+        order.append("supervisor-stop")
+
+    monkeypatch.setattr(service, "_get_accessible_session", fake_get_accessible_session)
+    monkeypatch.setattr(service, "_get_task", fake_get_task)
+    monkeypatch.setattr(
+        service,
+        "_maybe_stop_supervisor_for_session",
+        fake_stop_supervisor,
+    )
+
+    await service.stop_session("s1", "u1")
+
+    assert order == ["fanout", "cancel", "drain", "supervisor-stop"]
+    assert task.cancel_reason == "stop_child_drain"
 
 
 async def test_stop_session_fanout_raises_still_terminalizes(

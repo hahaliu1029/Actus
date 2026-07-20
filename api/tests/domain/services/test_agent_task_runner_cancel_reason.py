@@ -302,6 +302,25 @@ async def test_cancel_reason_stop_emits_done_and_marks_completed() -> None:
     assert '"type":"done"' in task.output_stream.events[0]
 
 
+async def test_cancel_reason_stop_child_drain_defers_supervisor_stop() -> None:
+    runner = _build_runner("session-stop-child-drain")
+    task = _DummyTask(cancel_reason="stop_child_drain")
+    _prime_runner_for_loop_cancellation(runner, task)
+    registry = MagicMock()
+    registry.stop = AsyncMock()
+    runner._supervisor_registry = registry
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.invoke(task)
+
+    await asyncio.sleep(0)
+
+    assert runner._uow.session.terminal_updates == [
+        ("session-stop-child-drain", SessionStatus.COMPLETED, "user_cancel"),
+    ]
+    registry.stop.assert_not_awaited()
+
+
 async def test_cancel_reason_takeover_start_skips_done_event_and_completed_status() -> None:
     runner = _build_runner("session-takeover-cancel")
     task = _DummyTask(cancel_reason="takeover_start")

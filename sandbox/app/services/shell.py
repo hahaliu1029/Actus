@@ -438,8 +438,17 @@ class ShellService:
             except (ProcessLookupError, OSError):
                 continue
 
-        # (2) §3.2(c) bounded best-effort /proc survivor check.
-        return self._workspace_quiescent(killed_pgids)
+        # (2) §3.2(c) bounded /proc survivor check. SIGKILL delivery and
+        # process reaping are asynchronous, so an immediate scan can still see
+        # a process that is already doomed and false-report the workspace as
+        # non-quiescent. Give the kernel a short bounded grace period; a real
+        # survivor still fails closed after the final scan.
+        for attempt in range(5):
+            if self._workspace_quiescent(killed_pgids):
+                return True
+            if attempt < 4:
+                await asyncio.sleep(0.02)
+        return False
 
     def _workspace_quiescent(self, killed_pgids: "set[int] | None" = None) -> bool:
         """Return False if ANY /proc descendant has a cwd or open fd resolving

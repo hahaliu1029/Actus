@@ -35,7 +35,7 @@ async def _insert_child_session(db_session, *, child_id, user_id, parent_id):
             "INSERT INTO sessions (id, user_id, parent_session_id, worker_type, "
             "  tool_filter_preset, title, latest_message, status, "
             "  events, files, memories) "
-            "VALUES (:id, :uid, :pid, 'subagent', 'subagent_research', '', '', 'PENDING', "
+            "VALUES (:id, :uid, :pid, 'subagent', 'subagent_research', '', '', 'pending', "
             "  '[]'::jsonb, '[]'::jsonb, '{}'::jsonb)"
         ),
         {"id": child_id, "uid": user_id, "pid": parent_id},

@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 from app.domain.models.mailbox_envelope import (
     MailboxEnvelope,
@@ -66,6 +67,23 @@ async def test_xreadgroup_returns_envelopes(fake_redis):
     assert len(entries) == 1
     _redis_id, parsed = entries[0]
     assert parsed.envelope_id == env.envelope_id
+
+
+@pytest.mark.anyio
+async def test_xreadgroup_zero_timeout_is_non_blocking():
+    """Redis ``BLOCK 0`` means wait forever; zero must omit ``BLOCK``."""
+    redis = AsyncMock()
+    redis.xreadgroup.return_value = []
+    consumer = RedisMailboxConsumer(redis, "root-1", "pod-a", "i1")
+
+    assert await consumer.read(count=10, block_ms=0) == []
+    redis.xreadgroup.assert_awaited_once_with(
+        groupname="actus:mailbox-supervisor:v1",
+        consumername="pod-a:root-1:i1",
+        streams={"actus:child:root-1:mailbox": ">"},
+        count=10,
+        block=None,
+    )
 
 
 @pytest.mark.anyio

@@ -15,6 +15,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 
 pytestmark = pytest.mark.integration
@@ -51,6 +52,20 @@ def _public_tables(engine) -> set[str]:
         }
 
 
+def _reset_public_schema(cfg: Config) -> None:
+    """Rebuild only the disposable integration database from Alembic base."""
+    sync_url = cfg.get_main_option("sqlalchemy.url")
+    if make_url(sync_url).database != "manus_test":
+        raise RuntimeError("R6 migration tests require the isolated manus_test DB")
+    engine = create_engine(sync_url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+    finally:
+        engine.dispose()
+
+
 def test_r6_upgrade_and_downgrade_roundtrip():
     """R6 → pre-R6 → R6. Verify table structure at each pinned revision."""
     cfg = _alembic_cfg()
@@ -58,9 +73,9 @@ def test_r6_upgrade_and_downgrade_roundtrip():
     engine = create_engine(sync_url)
 
     try:
-        # Establish a known baseline at R6 (conftest already upgraded to
-        # current head; explicitly pin to R6 so any new revision on top of
-        # R6 doesn't change what we're about to assert against).
+        # Build the historical boundary from base. Downgrading from current
+        # head would cross the intentionally forward-only PE-4d2 migration.
+        _reset_public_schema(cfg)
         command.upgrade(cfg, R6_REVISION)
 
         tables = _public_tables(engine)
@@ -87,6 +102,7 @@ def test_r6_upgrade_and_downgrade_roundtrip():
         # Always restore schema to the real head so a mid-test failure
         # doesn't leave subsequent integration tests running against a
         # downgraded DB.
+        _reset_public_schema(cfg)
         command.upgrade(cfg, "head")
 
 
@@ -96,7 +112,8 @@ def test_r6_preserves_enablement_rows_across_rename():
     sync_url = cfg.get_main_option("sqlalchemy.url")
     engine = create_engine(sync_url)
 
-    # Pin starting revision to R6 explicitly (see module docstring).
+    # Build starting revision from base (see forward-only note above).
+    _reset_public_schema(cfg)
     command.upgrade(cfg, R6_REVISION)
     user_id = str(uuid.uuid4())
     row_id = str(uuid.uuid4())
@@ -132,6 +149,7 @@ def test_r6_preserves_enablement_rows_across_rename():
         # Cleanup — FK CASCADE removes the enablement row regardless of
         # which table it currently lives in. Always restore to real head
         # so subsequent tests aren't affected by a pinned-R6 state.
+        _reset_public_schema(cfg)
         command.upgrade(cfg, "head")
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM users WHERE id=:id"), {"id": user_id})

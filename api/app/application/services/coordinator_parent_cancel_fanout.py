@@ -14,6 +14,7 @@ Application-layer pure orchestration — no FastAPI / SQLAlchemy import.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -119,3 +120,37 @@ class CoordinatorParentCancelFanout:
             failed,
         )
         return CancelFanoutResult(len(children), published, failed)
+
+    async def wait_for_children_terminal(
+        self,
+        *,
+        parent_session_id: str,
+        poll_interval_seconds: float = 0.05,
+    ) -> bool:
+        """Wait until the parent's running coordinator-child query is empty.
+
+        The caller owns the timeout.  An empty query means the still-running
+        children enumerated by ``cancel_children`` have had their terminal
+        envelopes consumed and reconciled durably by the root supervisor.  A
+        repository failure is contained and reported as ``False`` so parent
+        terminalization can continue via the watchdog fallback.
+        """
+        if self._session_repository is None:
+            return True
+        while True:
+            try:
+                children = (
+                    await self._session_repository.find_running_mailbox_children_for_parent(
+                        parent_session_id
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "parent-cancel terminal drain query failed parent=%s",
+                    parent_session_id,
+                    exc_info=True,
+                )
+                return False
+            if not children:
+                return True
+            await asyncio.sleep(poll_interval_seconds)

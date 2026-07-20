@@ -5,6 +5,7 @@ siblings -> coordinator_sibling_cancel emitted + reducer group_outcome in
 (failed, cancelled) + >=2 CANCEL_ACK(cancelled) + >=1 RESULT_READY(failed)
 envelopes; sandbox files stay at their original content (apply skipped).
 """
+import anyio
 import pytest
 from sqlalchemy import text
 
@@ -82,16 +83,22 @@ async def test_e2e_first_failed_cancels_siblings(
     assert "coordinator_sibling_cancel" in types
     assert reduce_events[-1]["data"]["group_outcome"] in ("failed", "cancelled")
 
-    # KEEP existing DB asserts: >=2 CANCEL_ACK(cancelled) + >=1 RESULT_READY(failed):
-    async with async_session() as s:
-        # at least 2 CANCEL_ACK envelopes (per siblings cancelled)
-        cancelled = (await s.execute(text("""
-            SELECT COUNT(*) FROM coordinator_result_envelope_store
-            WHERE coordinator_run_id LIKE :p AND envelope_type='CANCEL_ACK'
-              AND payload->>'final_state' = 'cancelled'
-        """), {"p": f"{session_id}:%"})).scalar()
-        assert cancelled >= 2, f"expect >=2 CANCEL_ACK(cancelled); got {cancelled}"
+    # The reduce event may reach SSE while the final sibling is still
+    # publishing its CANCEL_ACK. Wait for the durable terminal store instead
+    # of racing that independent finalizer task.
+    cancelled = 0
+    with anyio.fail_after(15):
+        while cancelled < 2:
+            async with async_session() as s:
+                cancelled = (await s.execute(text("""
+                    SELECT COUNT(*) FROM coordinator_result_envelope_store
+                    WHERE coordinator_run_id LIKE :p AND envelope_type='CANCEL_ACK'
+                      AND payload->>'final_state' = 'cancelled'
+                """), {"p": f"{session_id}:%"})).scalar()
+            if cancelled < 2:
+                await anyio.sleep(0.2)
 
+    async with async_session() as s:
         # at least 1 RESULT_READY(failed)
         failed_count = (await s.execute(text("""
             SELECT COUNT(*) FROM coordinator_result_envelope_store

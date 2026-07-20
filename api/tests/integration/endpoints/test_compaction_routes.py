@@ -39,14 +39,21 @@ async def _seed_committed(uow_factory, *, with_compaction: bool = False, pre_com
     compaction_id = None
 
     async with uow_factory() as uow:
-        uow.db_session.add_all([
-            UserModel(id=user_id, username=f"t18_{user_id[:8]}", password_hash="x"),
-            SessionModel(id=session_id, user_id=user_id, status="pending", title="t18 test"),
-        ])
+        uow.db_session.add(
+            UserModel(id=user_id, username=f"t18_{user_id[:8]}", password_hash="x")
+        )
+        # These models intentionally expose no ORM relationship.  Flush the
+        # parent explicitly so PostgreSQL never sees the child INSERT first.
+        await uow.db_session.flush()
+        uow.db_session.add(
+            SessionModel(id=session_id, user_id=user_id, status="pending", title="t18 test")
+        )
+        await uow.db_session.flush()
         if with_compaction:
             compaction_id = _uuid.uuid4().hex[:16]
             uow.db_session.add(
                 ConversationCompactionModel(
+                    id=_uuid.uuid4(),
                     compaction_id=compaction_id,
                     session_id=session_id,
                     summary="test summary for route test",
@@ -153,6 +160,7 @@ async def test_list_endpoint_returns_records_sorted_desc(uow_factory, async_sess
     async with uow_factory() as uow:
         uow.db_session.add_all([
             ConversationCompactionModel(
+                id=_uuid.uuid4(),
                 compaction_id=cid_older,
                 session_id=session_id,
                 summary="older compaction",
@@ -168,6 +176,7 @@ async def test_list_endpoint_returns_records_sorted_desc(uow_factory, async_sess
                 created_at=ts_older,
             ),
             ConversationCompactionModel(
+                id=_uuid.uuid4(),
                 compaction_id=cid_newer,
                 session_id=session_id,
                 summary="newer compaction",
@@ -452,10 +461,13 @@ async def _seed_status(uow_factory, status: str):
     uid = str(_uuid2.uuid4())
     sid = f"sess-b11-{_uuid2.uuid4().hex[:12]}"
     async with uow_factory() as uow:
-        uow.db_session.add_all([
-            UserModel(id=uid, username=f"b11_{uid[:8]}", password_hash="x"),
-            SessionModel(id=sid, user_id=uid, status=status, title="b11"),
-        ])
+        uow.db_session.add(
+            UserModel(id=uid, username=f"b11_{uid[:8]}", password_hash="x")
+        )
+        await uow.db_session.flush()
+        uow.db_session.add(
+            SessionModel(id=sid, user_id=uid, status=status, title="b11")
+        )
         await uow.db_session.commit()
     return uid, sid
 
@@ -513,7 +525,7 @@ async def test_post_compaction_flag_off_409(uow_factory, async_session_factory):
             auth_user=User(id=uid, username="b11", role=UserRole.USER, status=UserStatus.ACTIVE),
             sid=sid, fake_redis=fake, manual=False, guard=True,
         )
-        assert resp.status_code == 409 and resp.json()["detail"] == "manual_compaction_disabled"
+        assert resp.status_code == 409 and resp.json()["msg"] == "manual_compaction_disabled"
         assert f"manual_compact_pending:{sid}" not in fake.client.store  # never SET on reject
     finally:
         await _cleanup(uow_factory, uid, sid)
@@ -527,7 +539,7 @@ async def test_post_compaction_running_409_run_active(uow_factory, async_session
             auth_user=User(id=uid, username="b11", role=UserRole.USER, status=UserStatus.ACTIVE),
             sid=sid, fake_redis=_FakeRedisClient(), manual=True, guard=True,
         )
-        assert resp.status_code == 409 and resp.json()["detail"] == "run_active"
+        assert resp.status_code == 409 and resp.json()["msg"] == "run_active"
     finally:
         await _cleanup(uow_factory, uid, sid)
 

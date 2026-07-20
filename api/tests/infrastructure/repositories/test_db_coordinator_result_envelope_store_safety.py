@@ -213,6 +213,38 @@ class TestPersistTerminalSafety:
         row = factory.sessions[0].added[0]
         assert row.payload == payload
 
+    async def test_inline_manifest_machine_ids_are_not_redacted_as_pii(self) -> None:
+        """Digest/ref fields are structured identifiers, not phone numbers."""
+        factory = _FakeSessionFactory()
+        repo = DbCoordinatorResultEnvelopeStoreRepository(factory)  # type: ignore[arg-type]
+        payload = {
+            "outcome": "success",
+            "patch_manifest": {
+                "patch_id": "run-12345678:wu-12345678:p",
+                "coordinator_run_id": "run-12345678",
+                "work_unit_id": "wu-12345678",
+                "files": [
+                    {
+                        "path": "workspace/result.txt",
+                        "op": "add",
+                        "base_digest": None,
+                        "new_digest": "1234567890abcdef" * 4,
+                        "content_ref": "coordinator/12345678/patch/1234567890",
+                        "content_size": 12,
+                    }
+                ],
+            },
+        }
+        await repo.persist_terminal(
+            coordinator_run_id="r1",
+            work_unit_id="wu_manifest",
+            child_session_id="c_manifest",
+            envelope_type="RESULT_READY",
+            payload=payload,
+        )
+        row = factory.sessions[0].added[0]
+        assert row.payload == payload
+
     async def test_payload_with_non_whitelisted_keys_filtered_before_insert(self) -> None:
         factory = _FakeSessionFactory()
         repo = DbCoordinatorResultEnvelopeStoreRepository(factory)  # type: ignore[arg-type]
@@ -276,3 +308,14 @@ class TestPiiExcludesManifestRef:
         }
         scan_target = _pii_scan_target(filtered)
         assert "a@b.co" in scan_target
+
+    def test_email_in_manifest_path_is_still_scanned(self) -> None:
+        filtered = {
+            "outcome": "success",
+            "patch_manifest": {
+                "patch_id": "run-12345678:wu-12345678:p",
+                "files": [{"path": "workspace/alice@example.com.txt", "op": "add"}],
+            },
+        }
+        scan_target = _pii_scan_target(filtered)
+        assert "alice@example.com" in scan_target

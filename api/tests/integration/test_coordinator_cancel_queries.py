@@ -11,6 +11,7 @@ test_sandbox_terminal_reaper modules.
 from __future__ import annotations
 
 import uuid as _uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -48,11 +49,20 @@ def _child(*, sid, uid, parent, status="running", plane="mailbox",
     # Null-lineage rows (run_id=None) are exempt — NULLs aren't constrained.
     if run_id is not None and wu_id is None:
         wu_id = f"wu-{sid}"
+    is_terminal = status in {"completed", "timed_out"}
     return SessionModel(
         id=sid, user_id=uid, parent_session_id=parent, status=status,
         worker_type="subagent", subagent_control_plane=plane,
         execution_mode=mode, coordinator_run_id=run_id, work_unit_id=wu_id,
         tool_filter_preset=preset, sandbox_state=sandbox_state, title="child",
+        execution_phase="terminated" if is_terminal else "running",
+        terminal_reason="natural" if is_terminal else None,
+        background_reason="explicit" if mode == "background" else None,
+        expires_at=(
+            datetime.now(timezone.utc) + timedelta(hours=1)
+            if mode == "background"
+            else None
+        ),
     )
 
 

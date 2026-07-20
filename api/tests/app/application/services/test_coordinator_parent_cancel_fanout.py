@@ -38,6 +38,16 @@ class _FakeRepo:
         return list(self._children)
 
 
+class _SequencedRepo:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[str] = []
+
+    async def find_running_mailbox_children_for_parent(self, parent_session_id):
+        self.calls.append(parent_session_id)
+        return list(self._responses.pop(0))
+
+
 class _CapturingPublisher:
     def __init__(self, fail_on=None):
         self.published = []
@@ -170,3 +180,28 @@ async def test_correlation_id_falls_back_to_parent():
     res = await _make(repo, pub, _FakeStarter()).cancel_children(parent_session_id="p1")
     assert res == CancelFanoutResult(1, 1, 0)
     assert pub.published[0].correlation_id == "p1"
+
+
+async def test_wait_for_children_terminal_polls_until_running_query_is_empty():
+    child = _children(1)
+    repo = _SequencedRepo([child, child, []])
+    fanout = _make(repo, _CapturingPublisher(), _FakeStarter())
+
+    settled = await fanout.wait_for_children_terminal(
+        parent_session_id="p1",
+        poll_interval_seconds=0,
+    )
+
+    assert settled is True
+    assert repo.calls == ["p1", "p1", "p1"]
+
+
+async def test_wait_for_children_terminal_contains_query_failure():
+    fanout = _make(_FakeRepo(raises=True), _CapturingPublisher(), _FakeStarter())
+
+    settled = await fanout.wait_for_children_terminal(
+        parent_session_id="p1",
+        poll_interval_seconds=0,
+    )
+
+    assert settled is False

@@ -41,6 +41,52 @@ import pytest
 pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
+def _lua_admit_keys(user_id: str, session_id: str) -> list[str]:
+    return [
+        "supervisor:system:bg_count",
+        f"supervisor:user:{user_id}",
+        f"supervisor:hot:{session_id}",
+        f"supervisor:bg:{user_id}",
+        f"supervisor:bg-generation:{user_id}",
+        "supervisor:system:bg-members",
+        "supervisor:system:bg-reconcile-pending",
+        "supervisor:system:bg-reconcile-due",
+    ]
+
+
+def _lua_admit_args(
+    user_id: str,
+    session_id: str,
+    expires_at: str,
+    max_system: str,
+    max_user: str,
+) -> list[object]:
+    generation = 1
+    return [
+        session_id,
+        expires_at,
+        max_system,
+        max_user,
+        expires_at,
+        generation,
+        0,
+        f"v1|{generation}|{user_id}",
+        86400,
+    ]
+
+
+def _lua_revoke_keys(user_id: str) -> list[str]:
+    return [
+        "supervisor:system:bg_count",
+        f"supervisor:user:{user_id}",
+        f"supervisor:bg:{user_id}",
+        f"supervisor:bg-generation:{user_id}",
+        "supervisor:system:bg-members",
+        "supervisor:system:bg-reconcile-pending",
+        "supervisor:system:bg-reconcile-due",
+    ]
+
+
 # -- C-FSM-1: T1 admit foreground sets execution_mode='foreground' atomically --
 async def test_C_FSM_1_admit_foreground_marks_session_fg_running(
     agent_service_with_redis, sample_user, session_repo,
@@ -108,8 +154,8 @@ async def test_C_Admission_1_lua_admit_4_key_returns_correct_codes(redis_client)
     expires_at = "1999999999"
     rc = await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
-        keys=[sys_key, user_key, hot_key_template.format(sid1), bg_key],
-        args=[sid1, expires_at, "100", "5"],
+        keys=_lua_admit_keys(user_id, sid1),
+        args=_lua_admit_args(user_id, sid1, expires_at, "100", "5"),
     )
     assert rc == 0, f"first admit should succeed; got rc={rc}"
 
@@ -128,8 +174,8 @@ async def test_C_Admission_1_lua_admit_4_key_returns_correct_codes(redis_client)
     # Re-admit same session → 3 (already_bg)
     rc = await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
-        keys=[sys_key, user_key, hot_key_template.format(sid1), bg_key],
-        args=[sid1, expires_at, "100", "5"],
+        keys=_lua_admit_keys(user_id, sid1),
+        args=_lua_admit_args(user_id, sid1, expires_at, "100", "5"),
     )
     assert rc == 3, f"re-admit must return 3 (already_bg); got rc={rc}"
 
@@ -138,8 +184,8 @@ async def test_C_Admission_1_lua_admit_4_key_returns_correct_codes(redis_client)
     sid2 = "sess-2"
     rc_sys_full = await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
-        keys=[sys_key, user_key, hot_key_template.format(sid2), bg_key],
-        args=[sid2, expires_at, "1", "5"],  # max_sys=1, already 1 used → system_full
+        keys=_lua_admit_keys(user_id, sid2),
+        args=_lua_admit_args(user_id, sid2, expires_at, "1", "5"),
     )
     assert rc_sys_full == 1, f"max_sys=1 with 1 used must return 1 (system_full); got {rc_sys_full}"
 
@@ -153,26 +199,25 @@ async def test_C_Admission_2_user_slot_exhausted(redis_client):
     user_id = "u-admission-2"
 
     def keys_for(sid: str) -> list[str]:
-        return [
-            "supervisor:system:bg_count",
-            f"supervisor:user:{user_id}",
-            f"supervisor:hot:{sid}",
-            f"supervisor:bg:{user_id}",
-        ]
+        return _lua_admit_keys(user_id, sid)
 
     # Fill 5 slots
     for i in range(5):
         rc = await run_lua_with_fallback(
             redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
             keys=keys_for(f"sess-{i}"),
-            args=[f"sess-{i}", "1999999999", "100", "5"],
+            args=_lua_admit_args(
+                user_id, f"sess-{i}", "1999999999", "100", "5"
+            ),
         )
         assert rc == 0
     # 6th must reject with user_full (rc=2)
     rc = await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
         keys=keys_for("sess-overflow"),
-        args=["sess-overflow", "1999999999", "100", "5"],
+        args=_lua_admit_args(
+            user_id, "sess-overflow", "1999999999", "100", "5"
+        ),
     )
     assert rc == 2
 
@@ -187,13 +232,11 @@ async def test_C_Lua_Revoke_Idempotent(redis_client):
     user_id = "u-revoke"
     sid = "sess-rev"
     hot_key = f"supervisor:hot:{sid}"
-    keys_admit = [
-        "supervisor:system:bg_count", f"supervisor:user:{user_id}",
-        hot_key, f"supervisor:bg:{user_id}",
-    ]
+    keys_admit = _lua_admit_keys(user_id, sid)
     await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
-        keys=keys_admit, args=[sid, "1999999999", "100", "5"],
+        keys=keys_admit,
+        args=_lua_admit_args(user_id, sid, "1999999999", "100", "5"),
     )
 
     # Round-3 audit P1#6 fix: pre-populate hot Hash with FG-mode fields so we
@@ -208,13 +251,10 @@ async def test_C_Lua_Revoke_Idempotent(redis_client):
         "last_activity_at": "1700000000.0",
     })
 
-    keys_revoke = [
-        "supervisor:system:bg_count", f"supervisor:user:{user_id}",
-        f"supervisor:bg:{user_id}",  # NOT hot — round-2 P0-3
-    ]
+    keys_revoke = _lua_revoke_keys(user_id)
     rc1 = await run_lua_with_fallback(
         redis_client, source=LUA_REVOKE_SOURCE, sha=LUA_REVOKE_SHA,
-        keys=keys_revoke, args=[sid],
+        keys=keys_revoke, args=[sid, 1, 0, "", "", ""],
     )
     assert rc1 == 1, f"first revoke of admitted session should return 1; got {rc1}"
 
@@ -247,7 +287,7 @@ async def test_C_Lua_Revoke_Idempotent(redis_client):
 
     rc2 = await run_lua_with_fallback(
         redis_client, source=LUA_REVOKE_SOURCE, sha=LUA_REVOKE_SHA,
-        keys=keys_revoke, args=[sid],
+        keys=keys_revoke, args=[sid, 1, 0, "", "", ""],
     )
     assert rc2 == 0, f"idempotent: second revoke of removed session should return 0; got {rc2}"
 
@@ -259,22 +299,23 @@ async def test_C_Lua_NoScript_fallback_after_script_flush(redis_client):
     )
 
     user_id = "u-noscript"
-    keys = [
-        "supervisor:system:bg_count", f"supervisor:user:{user_id}",
-        "supervisor:hot:sess-ns", f"supervisor:bg:{user_id}",
-    ]
+    keys = _lua_admit_keys(user_id, "sess-ns")
     # Flush server script cache to force NOSCRIPT
     await redis_client.script_flush()
     # First call: EVALSHA miss → fallback → success
     rc = await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
-        keys=keys, args=["sess-ns", "1999999999", "100", "5"],
+        keys=keys,
+        args=_lua_admit_args(user_id, "sess-ns", "1999999999", "100", "5"),
     )
     assert rc == 0
     # Second call: cache warm, EVALSHA succeeds
     rc = await run_lua_with_fallback(
         redis_client, source=LUA_ADMIT_SOURCE, sha=LUA_ADMIT_SHA,
-        keys=keys, args=["sess-ns-2", "1999999999", "100", "5"],
+        keys=_lua_admit_keys(user_id, "sess-ns-2"),
+        args=_lua_admit_args(
+            user_id, "sess-ns-2", "1999999999", "100", "5"
+        ),
     )
     assert rc == 0
 

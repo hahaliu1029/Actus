@@ -102,6 +102,33 @@ def _pii_guard(payload_json: str) -> bool:
 # path needs to resolve the manifest. The application layer remains the
 # canonical PII surface for free-text fields.
 _PII_EXCLUDED_FIELDS = frozenset({"patch_manifest_ref"})
+_PII_EXCLUDED_MANIFEST_FIELDS = frozenset(
+    {
+        "patch_id",
+        "coordinator_run_id",
+        "work_unit_id",
+        "base_digest",
+        "new_digest",
+        "content_ref",
+        "content_size",
+        "diff_ref",
+    }
+)
+
+
+def _pii_scannable_manifest(value: Any) -> Any:
+    """Drop structured manifest identifiers while retaining paths and ops."""
+    if isinstance(value, dict):
+        return {
+            key: _pii_scannable_manifest(item)
+            for key, item in value.items()
+            if key not in _PII_EXCLUDED_MANIFEST_FIELDS
+        }
+    if isinstance(value, list):
+        return [_pii_scannable_manifest(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_pii_scannable_manifest(item) for item in value)
+    return value
 
 
 def _pii_scan_target(filtered: dict[str, Any]) -> str:
@@ -110,6 +137,10 @@ def _pii_scan_target(filtered: dict[str, Any]) -> str:
     Falls back to the full dict if the trimmed dict is not serialisable (it
     always is here, but keep the guard defensive)."""
     scannable = {k: v for k, v in filtered.items() if k not in _PII_EXCLUDED_FIELDS}
+    if "patch_manifest" in scannable:
+        scannable["patch_manifest"] = _pii_scannable_manifest(
+            scannable["patch_manifest"]
+        )
     try:
         return json.dumps(scannable, separators=(",", ":"))
     except (TypeError, ValueError):

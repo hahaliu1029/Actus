@@ -65,6 +65,7 @@ def _build_svc_with_session(
     session.background_reason = "explicit"
     session.expires_at = expires_at
     session.retry_budget_remaining = 2
+    session.execution_revision = 0
     session.suspended_reason = None
     session.terminal_reason = terminal_reason
 
@@ -82,6 +83,7 @@ def _assert_base_snapshot_fields(snapshot):
         "background_reason",
         "expires_at",
         "retry_budget_remaining",
+        "execution_revision",
         "suspended_reason",
         "terminal_reason",
         "last_progress_at",
@@ -93,6 +95,7 @@ def _assert_base_snapshot_fields(snapshot):
     assert snapshot.background_reason == "explicit"
     assert snapshot.expires_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert snapshot.retry_budget_remaining == 2
+    assert snapshot.execution_revision == 0
     assert snapshot.suspended_reason is None
 
 

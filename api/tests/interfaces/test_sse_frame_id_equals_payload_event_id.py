@@ -63,6 +63,9 @@ class _TwoFrameAgentService:
     """yield 两帧: 一条 message + 一条 ToolEvent. 两者的 event.id 走 EventMapper 后
     payload.event_id 相等, 验证 invariant 对多种 event 类型成立."""
 
+    async def get_session(self, session_id: str) -> None:
+        return None
+
     async def chat(self, **kwargs: Any) -> AsyncGenerator[BaseEvent, None]:
         msg = MessageEvent(
             role="assistant",
@@ -99,6 +102,10 @@ class _NoConflictScope:
 
 
 class _NoConflictSupervisor:
+    @asynccontextmanager
+    async def mode_transition_fence(self, **kwargs: Any):
+        yield
+
     @asynccontextmanager
     async def subscriber_scope(self, **kwargs: Any):
         yield _NoConflictScope()

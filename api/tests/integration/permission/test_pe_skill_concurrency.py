@@ -20,11 +20,6 @@ import pytest
 pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
-@pytest.fixture
-def anyio_backend() -> str:
-    return "asyncio"
-
-
 class _SlowRefresher:
     def __init__(self, *, sleep_seconds: float, status: str = "refreshed"):
         from app.domain.services.permission.sources.skill_metadata import (

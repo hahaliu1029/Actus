@@ -71,6 +71,7 @@ async def _seed_child(db_session, *, sample_user, parent_id, child_id):
         retry_budget_remaining=3,
         was_background=False,
         worker_type="subagent",
+        tool_filter_preset="subagent_research",
         subagent_control_plane="mailbox",
     )
     db_session.add(row)

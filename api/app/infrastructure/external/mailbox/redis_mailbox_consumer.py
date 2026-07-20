@@ -83,7 +83,10 @@ class RedisMailboxConsumer:
             consumername=self._consumer_name,
             streams={self._stream_key: ">"},
             count=count,
-            block=block_ms,
+            # Redis ``BLOCK 0`` means wait forever.  Tests and callers use
+            # zero to request a non-blocking poll, which redis-py represents
+            # by omitting BLOCK (``None``).
+            block=block_ms if block_ms > 0 else None,
         )
         return self._parse_xread_result(result)
 

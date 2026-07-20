@@ -21,36 +21,48 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
 @pytest.fixture
-async def seeded_root(uow_factory, sample_user):
+async def seeded_root(uow_factory):
     """Insert root + (MAX_DESCENDANTS_PER_ROOT - 1) subagent children.
 
-    ``sample_user`` is the integration-conftest UserModel fixture
-    (api/tests/integration/conftest.py:275) — ``.id`` is the user UUID string.
+    The user is committed through the same independent UoW family as the
+    concurrent spawn calls, so every connection can resolve its FK.
     """
     from app.domain.models.session import Session
+    from app.infrastructure.models.user import UserModel
+
+    user_id = str(uuid.uuid4())
     root_id = uuid.uuid4().hex
     async with uow_factory() as uow:
+        uow.db_session.add(
+            UserModel(
+                id=user_id,
+                username=f"c1a_{user_id[:8]}",
+                password_hash="x",
+            )
+        )
+        await uow.db_session.flush()
         await uow.session.save(
-            Session(id=root_id, user_id=sample_user.id, worker_type="root", title="root")
+            Session(id=root_id, user_id=user_id, worker_type="root", title="root")
         )
     svc = SessionService(uow_factory=uow_factory)
     for _ in range(MAX_DESCENDANTS_PER_ROOT - 1):
         await svc.create_session_with_parent(
-            user_id=sample_user.id,
+            user_id=user_id,
             parent_session_id=root_id,
             tool_filter_preset="subagent_research",
         )
-    return root_id
+    return root_id, user_id
 
 
-async def test_concurrent_spawn_at_cap_minus_one_serializes(seeded_root, uow_factory, sample_user):
+async def test_concurrent_spawn_at_cap_minus_one_serializes(seeded_root, uow_factory):
     svc = SessionService(uow_factory=uow_factory)
+    root_id, user_id = seeded_root
 
     async def attempt():
         try:
             await svc.create_session_with_parent(
-                user_id=sample_user.id,
-                parent_session_id=seeded_root,
+                user_id=user_id,
+                parent_session_id=root_id,
                 tool_filter_preset="subagent_research",
             )
             return "ok"

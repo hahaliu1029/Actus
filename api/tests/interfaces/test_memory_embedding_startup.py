@@ -28,6 +28,14 @@ def anyio_backend() -> str:
 
 def _enter_base_patches(stack: ExitStack) -> None:
     """Enter all external dep patches into the given ExitStack."""
+    mock_supervisor = MagicMock(
+        script_load_all=AsyncMock(),
+        reconcile_running_background_at_boot=AsyncMock(),
+    )
+    mock_agent_service = MagicMock(
+        _supervisor=mock_supervisor,
+        shutdown=AsyncMock(),
+    )
     stack.enter_context(
         patch("app.main.get_redis", return_value=MagicMock(init=AsyncMock(), shutdown=AsyncMock()))
     )
@@ -43,13 +51,25 @@ def _enter_base_patches(stack: ExitStack) -> None:
     stack.enter_context(
         patch(
             "app.interfaces.service_dependencies._build_agent_service",
-            return_value=MagicMock(shutdown=AsyncMock()),
+            return_value=mock_agent_service,
+        )
+    )
+    stack.enter_context(
+        patch(
+            "app.interfaces.service_dependencies.build_supervisor_registry",
+            return_value=MagicMock(stop_all=AsyncMock()),
         )
     )
     stack.enter_context(
         patch("app.infrastructure.checkpointer_pool.CheckpointerPool", return_value=MagicMock(
             open=AsyncMock(), close=AsyncMock(), pool=MagicMock(),
         ))
+    )
+    stack.enter_context(
+        patch(
+            "app.domain.services.idle_watchdog.IdleWatchdog",
+            return_value=MagicMock(start=MagicMock(), stop=AsyncMock()),
+        )
     )
 
 

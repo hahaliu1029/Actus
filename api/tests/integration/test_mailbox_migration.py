@@ -81,6 +81,7 @@ async def test_pre_pr5_subagent_rows_with_null_plane_remain_legacy(
         retry_budget_remaining=3,
         was_background=False,
         worker_type="subagent",
+        tool_filter_preset="subagent_research",
         # subagent_control_plane intentionally unset — pre-C3 baseline.
     )
     db_session.add(orm)
@@ -310,6 +311,7 @@ async def test_rollback_check_stops_supervisor_when_all_children_legacy_or_null(
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane=None,
         )
     )
@@ -327,6 +329,7 @@ async def test_rollback_check_stops_supervisor_when_all_children_legacy_or_null(
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="legacy",
         )
     )
@@ -396,6 +399,7 @@ async def test_rollback_check_does_not_stop_when_a_child_is_still_mailbox(
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="mailbox",
         )
     )
@@ -413,6 +417,7 @@ async def test_rollback_check_does_not_stop_when_a_child_is_still_mailbox(
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="legacy",
         )
     )
@@ -493,10 +498,12 @@ async def test_rollback_check_ignores_terminal_mailbox_children(
             title="pr5 rollback completed mailbox subagent",
             task_id=sub_completed_sid,
             execution_mode="foreground",
-            execution_phase="completed",
+            execution_phase="terminated",
+            terminal_reason="natural",
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="mailbox",
         )
     )
@@ -510,10 +517,12 @@ async def test_rollback_check_ignores_terminal_mailbox_children(
             title="pr5 rollback timed_out mailbox subagent",
             task_id=sub_timedout_sid,
             execution_mode="foreground",
-            execution_phase="timed_out",
+            execution_phase="terminated",
+            terminal_reason="natural",
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="mailbox",
         )
     )
@@ -532,6 +541,7 @@ async def test_rollback_check_ignores_terminal_mailbox_children(
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="legacy",
         )
     )
@@ -550,6 +560,7 @@ async def test_rollback_check_ignores_terminal_mailbox_children(
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane=None,
         )
     )
@@ -621,10 +632,12 @@ async def test_rollback_check_does_not_stop_when_all_subagents_terminal(
             title="pr5 rollback completed mailbox subagent",
             task_id=sub_completed_sid,
             execution_mode="foreground",
-            execution_phase="completed",
+            execution_phase="terminated",
+            terminal_reason="natural",
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="mailbox",
         )
     )
@@ -638,10 +651,12 @@ async def test_rollback_check_does_not_stop_when_all_subagents_terminal(
             title="pr5 rollback timed_out mailbox subagent",
             task_id=sub_timedout_sid,
             execution_mode="foreground",
-            execution_phase="timed_out",
+            execution_phase="terminated",
+            terminal_reason="natural",
             retry_budget_remaining=3,
             was_background=False,
             worker_type="subagent",
+            tool_filter_preset="subagent_research",
             subagent_control_plane="mailbox",
         )
     )

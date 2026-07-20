@@ -42,7 +42,13 @@ import pytest
 import sqlalchemy as sa
 
 
-pytestmark = pytest.mark.integration
+MIGRATION_TARGET = "c1a_session_tree_expand"
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.anyio,
+    pytest.mark.usefixtures("migration_schema_at"),
+]
 
 
 @pytest.fixture
@@ -83,7 +89,6 @@ async def parent_session(db_session, user_row):
     return parent_id
 
 
-@pytest.mark.asyncio
 async def test_check_constraint_names_are_clean(db_session):
     """``Base.metadata.naming_convention`` double-prefixed CHECK names in
     T12 / b4m1; C1a uses raw SQL to avoid the same bug. Assert the exact
@@ -108,7 +113,6 @@ async def test_check_constraint_names_are_clean(db_session):
     }
 
 
-@pytest.mark.asyncio
 async def test_mirror_trigger_derives_worker_type_on_insert(
     db_session, user_row, parent_session
 ):
@@ -137,7 +141,6 @@ async def test_mirror_trigger_derives_worker_type_on_insert(
     assert row.worker_type == "subagent"
 
 
-@pytest.mark.asyncio
 async def test_mirror_trigger_raises_on_two_column_conflict(
     db_session, user_row, parent_session
 ):
@@ -175,7 +178,6 @@ async def test_mirror_trigger_raises_on_two_column_conflict(
             await db_session.flush()
 
 
-@pytest.mark.asyncio
 async def test_mirror_trigger_propagates_null_on_update(
     db_session, user_row, parent_session
 ):
@@ -215,7 +217,6 @@ async def test_mirror_trigger_propagates_null_on_update(
     assert row.worker_type == "root"
 
 
-@pytest.mark.asyncio
 async def test_parent_user_match_trigger_blocks_cross_user_child(db_session):
     """INSERT a child belonging to user B referencing a parent owned by user A
     → DEFERRED constraint trigger ``trg_sessions_parent_user_match`` raises
@@ -271,7 +272,6 @@ async def test_parent_user_match_trigger_blocks_cross_user_child(db_session):
             await db_session.execute(sa.text("SET CONSTRAINTS ALL IMMEDIATE"))
 
 
-@pytest.mark.asyncio
 async def test_parent_user_match_allows_cascade_null(
     db_session, user_row, parent_session
 ):
@@ -299,6 +299,12 @@ async def test_parent_user_match_allows_cascade_null(
         {"id": child_id, "uid": user_row, "pid": parent_session},
     )
     await db_session.flush()
+    # Drain the deferred INSERT trigger events while both rows still have the
+    # same user. Otherwise the later SET CONSTRAINTS would replay the child's
+    # INSERT snapshot (non-null NEW.user_id) after the parent has already been
+    # cascade-nulled and falsely attribute that old event to the DELETE path.
+    await db_session.execute(sa.text("SET CONSTRAINTS ALL IMMEDIATE"))
+    await db_session.execute(sa.text("SET CONSTRAINTS ALL DEFERRED"))
     # Wrap the cascade + forced trigger fire in a savepoint so any unexpected
     # trigger rejection (real bug) rolls back to the savepoint instead of
     # tainting the outer test transaction. Mirrors test #5's begin_nested

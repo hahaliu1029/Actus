@@ -99,8 +99,8 @@ async def test_check_overflow_commit_failure_rolls_back_both_writes_and_no_event
             id=sid, user_id=uid, status="pending", title="16a test session"
         )
         uow_seed.db_session.add(user)
-        uow_seed.db_session.add(session_row)
         await uow_seed.db_session.flush()
+        uow_seed.db_session.add(session_row)
         await uow_seed.db_session.commit()  # explicit: make rows visible to other connections
 
     try:

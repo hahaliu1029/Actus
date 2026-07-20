@@ -109,12 +109,25 @@ async def async_engine():
 
 @pytest.fixture
 async def db_session(async_engine):
-    """Per-test async session with automatic rollback."""
-    async_session = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
-    async with async_session() as session:
-        async with session.begin():
+    """Per-test async session whose explicit commits stay rollback-isolated.
+
+    Several integration tests intentionally commit before exercising an ASGI
+    route.  Bind the session to an outer connection transaction and let each
+    ``session.commit()`` release only a savepoint; teardown still rolls the
+    entire test back.
+    """
+    async with async_engine.connect() as connection:
+        outer_transaction = await connection.begin()
+        session = AsyncSession(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
             yield session
-            await session.rollback()
+        finally:
+            await session.close()
+            await outer_transaction.rollback()
 
 
 # ── B6 fixtures ──────────────────────────────────────────────────────────────
@@ -176,6 +189,7 @@ async def seed_session(db_session):
         title="b6 smoke session",
     )
     db_session.add(user)
+    await db_session.flush()
     db_session.add(session_row)
     await db_session.flush()
 
@@ -203,6 +217,7 @@ async def seed_other_user_session(db_session):
         title="b6 other user session",
     )
     db_session.add(user)
+    await db_session.flush()
     db_session.add(session_row)
     await db_session.flush()
 
@@ -245,34 +260,47 @@ def fake_summary_llm():
 
 
 @pytest.fixture
-async def planner_react_with_compactor(uow_factory, fake_summary_llm, seed_session):
+async def planner_react_with_compactor(db_session, fake_summary_llm, seed_session):
     """Minimal ``PlannerReActFlow`` bypassing ``__init__``, wired to a real ``GradualCompactor`` + UoW.
 
     Uses ``PlannerReActFlow.__new__`` to skip the heavy constructor; only the
     fields that B6 tests touch are populated.
 
-    .. WARNING:: Transaction isolation gap.
-
-       ``seed_session`` flushes user/session rows through ``db_session``'s
-       ``begin()...rollback()`` block — they are visible to ``db_session``
-       but never committed.  ``uow_factory()`` opens an **independent**
-       connection with its own transaction; under PostgreSQL's read-committed
-       isolation it cannot see those uncommitted rows.
-
-       Tests that exercise compaction at ``level > 0`` (which calls
-       ``uow.session.save_memory(self._session_id, "react", memory)`` inside
-       ``_check_overflow``) will see a 0-row UPDATE or FK violation against
-       ``sessions.id``.  If your B6 test needs the persistence path, either:
-
-       (a) commit the seed data manually before invoking the flow (use a
-           separate UoW + ``await uow.db_session.commit()``), or
-       (b) replace ``flow._uow_factory`` with a no-op / mock that doesn't
-           hit the DB.
+    The flow's UoW shares ``db_session`` so the flushed seed row is visible.
+    Explicit commits release only the fixture savepoint; the outer test
+    transaction still rolls every write back at teardown.
     """
     from app.domain.models.context_overflow_config import ContextOverflowConfig
     from app.domain.services.flows.planner_react import PlannerReActFlow
     from app.domain.services.graphs.compaction import GradualCompactor
     from app.domain.services.graphs.token_estimator import TokenEstimator
+    from app.infrastructure.repositories.db_conversation_compaction_repository import (
+        DBConversationCompactionRepository,
+    )
+    from app.infrastructure.repositories.db_session_repository import (
+        DBSessionRepository,
+    )
+
+    class _SameSessionUow:
+        def __init__(self):
+            self.db_session = db_session
+            self.session = DBSessionRepository(db_session=db_session)
+            self.compaction = DBConversationCompactionRepository(
+                db_session=db_session
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, _exc_val, _exc_tb):
+            if exc_type is not None:
+                await db_session.rollback()
+            else:
+                await db_session.commit()
+            return False
+
+    def _same_session_uow_factory():
+        return _SameSessionUow()
 
     estimator = TokenEstimator(strategy="char")
     overflow_cfg = ContextOverflowConfig(
@@ -296,7 +324,7 @@ async def planner_react_with_compactor(uow_factory, fake_summary_llm, seed_sessi
     flow = PlannerReActFlow.__new__(PlannerReActFlow)  # bypass heavy __init__
     flow._compactor = compactor
     flow._summary_llm = fake_summary_llm
-    flow._uow_factory = uow_factory
+    flow._uow_factory = _same_session_uow_factory
     flow._session_id = seed_session.id
     flow._overflow_config = overflow_cfg
     flow._cost_callback_handler = None
@@ -481,6 +509,10 @@ async def runner_factory(db_session, sample_user):
         async def ensure_sandbox(self) -> None:
             return None
 
+    class _NoopBrowser:
+        async def aclose(self) -> None:
+            return None
+
     class _NoopTool:
         manager = None
 
@@ -497,6 +529,10 @@ async def runner_factory(db_session, sample_user):
 
     def _factory(*, session_id: str, user_id: str | None = None, **overrides):
         from app.domain.services.agent_task_runner import AgentTaskRunner
+        from app.application.services.sandbox_accessors import (
+            EagerBrowserAccessor,
+            EagerSandboxAccessor,
+        )
         from app.domain.services.session.default_state_machine import (
             DefaultSessionStateMachine,
         )
@@ -515,9 +551,9 @@ async def runner_factory(db_session, sample_user):
             session_id=session_id,
             user_id=user_id or sample_user.id,
             file_storage=object(),
-            browser=object(),
             search_engine=object(),
-            sandbox=_NoopSandbox(),
+            sandbox_accessor=EagerSandboxAccessor(_NoopSandbox()),
+            browser_accessor=EagerBrowserAccessor(_NoopBrowser()),
             **overrides,
         )
         runner._mcp_tool = _NoopTool()
@@ -661,7 +697,10 @@ async def redis_client(monkeypatch):
     from app.infrastructure.external.message_queue import redis_stream_message_queue
 
     client = redis_asyncio.from_url(
-        "redis://localhost:6379/15",  # DB 15 for tests; isolate from app DB 0
+        os.environ.get(
+            "ACTUS_TEST_REDIS_URL",
+            "redis://localhost:6379/15",  # DB 15 for tests; isolate from app DB 0
+        ),
         decode_responses=True,
     )
     class _RedisClientWrapper:
@@ -713,7 +752,7 @@ def app():
 
 
 @pytest.fixture
-async def asgi_client(app, _auth_dependency_overrides):
+async def asgi_client(app, _auth_dependency_overrides, db_session, redis_client):
     """httpx AsyncClient for endpoint tests — uses ASGITransport + DI override.
 
     Round-2 audit P1-C fix: ``sample_user`` only ``flush()``-es inside the
@@ -727,10 +766,45 @@ async def asgi_client(app, _auth_dependency_overrides):
     NOT in pyproject.toml).
     """
     import httpx
+    from app.application.services.session_service import SessionService
+    from app.infrastructure.repositories.db_session_repository import DBSessionRepository
+    from app.infrastructure.storage.postgres import get_db_session
+    from app.infrastructure.storage.redis import get_redis
+    from app.interfaces.service_dependencies import get_session_service
+
+    async def _override_db_session():
+        yield db_session
+
+    class _SameSessionUow:
+        def __init__(self):
+            self.db_session = db_session
+            self.session = DBSessionRepository(db_session=db_session)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
+            return False
+
+    def _same_session_uow_factory():
+        return _SameSessionUow()
+
+    app.dependency_overrides[get_db_session] = _override_db_session
+    app.dependency_overrides[get_redis] = lambda: redis_client
+    app.dependency_overrides[get_session_service] = lambda: SessionService(
+        uow_factory=_same_session_uow_factory
+    )
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        yield client
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            yield client
+    finally:
+        app.dependency_overrides.pop(get_db_session, None)
+        app.dependency_overrides.pop(get_redis, None)
+        app.dependency_overrides.pop(get_session_service, None)
 
 
 @pytest.fixture
@@ -1023,6 +1097,7 @@ async def child_session_in_db(db_session, sample_user, full_supervisor_stack):
         was_background=False,
         worker_type="subagent",
         subagent_control_plane="mailbox",
+        tool_filter_preset="subagent_research",
     )
     db_session.add(child_row)
     await db_session.flush()

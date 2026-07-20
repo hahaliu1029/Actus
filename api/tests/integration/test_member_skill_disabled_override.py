@@ -24,7 +24,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.application.services.sandbox_accessors import EagerSandboxAccessor
+from app.application.services.sandbox_accessors import (
+    EagerBrowserAccessor,
+    EagerSandboxAccessor,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -50,7 +53,7 @@ def _member_mcp_skill(slug: str, server_name: str):
             "tools": [{
                 "name": "go",
                 "description": "member tool",
-                "parameters": {"type": "object", "properties": {}},
+                "parameters": {},
                 "entry": {"tool_name": tool_name},
             }],
         },
@@ -70,7 +73,7 @@ def _member_a2a_skill(slug: str, agent_id: str):
             "tools": [{
                 "name": "ask",
                 "description": "member a2a tool",
-                "parameters": {"type": "object", "properties": {}},
+                "parameters": {},
                 "entry": {"agent_id": agent_id},
             }],
         },
@@ -97,6 +100,7 @@ def _seed_build_runner(monkeypatch, *, skill_tool, cpc):
     import app.domain.services.tools.langchain_skill_tools as lskill
     import app.domain.services.tools.langchain_tools as ltools
     from app.domain.services.agent_task_runner import AgentTaskRunner
+    from app.domain.models.app_config import ToolRuntimeConfig
 
     class _Named:
         def __init__(self, name: str) -> None:
@@ -112,9 +116,12 @@ def _seed_build_runner(monkeypatch, *, skill_tool, cpc):
 
     runner = object.__new__(AgentTaskRunner)
     runner._tool_filter = None
+    runner._tool_runtime = ToolRuntimeConfig()
     runner._execution_supervisor = None
     runner._sandbox = MagicMock()
+    runner._sandbox_accessor = EagerSandboxAccessor(runner._sandbox)
     runner._browser = MagicMock()
+    runner._browser_accessor = EagerBrowserAccessor(runner._browser)
     runner._search_engine = MagicMock()
     runner._file_processor_lookup = None
     runner._supports_vision = True

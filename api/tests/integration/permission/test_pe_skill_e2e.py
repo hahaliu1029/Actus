@@ -24,8 +24,43 @@ pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 
 @pytest.fixture
-def anyio_backend() -> str:
-    return "asyncio"
+async def committed_pe_session(async_session_factory):
+    """Committed FK parent/child visible to the PE's independent UoWs."""
+    from uuid import uuid4
+
+    from sqlalchemy import delete
+
+    from app.infrastructure.models.session import SessionModel
+    from app.infrastructure.models.user import UserModel
+
+    user_id = str(uuid4())
+    session_id = f"sess-pe-e2e-{uuid4().hex[:12]}"
+    async with async_session_factory() as db:
+        db.add(
+            UserModel(
+                id=user_id,
+                username=f"pe_e2e_{uuid4().hex[:12]}",
+                password_hash="x",
+            )
+        )
+        await db.flush()
+        db.add(
+            SessionModel(
+                id=session_id,
+                user_id=user_id,
+                status="running",
+                title="PE skill E2E",
+                mode_revision=1,
+            )
+        )
+        await db.commit()
+
+    yield user_id, session_id
+
+    async with async_session_factory() as db:
+        await db.execute(delete(SessionModel).where(SessionModel.id == session_id))
+        await db.execute(delete(UserModel).where(UserModel.id == user_id))
+        await db.commit()
 
 
 async def _build_pe_engine_with_real_deps(
@@ -87,7 +122,7 @@ async def _build_pe_engine_with_real_deps(
 
 
 async def test_skill_high_risk_asked_then_user_approve_full_e2e(
-    uow_factory, redis_client, sample_session, sample_user,
+    uow_factory, redis_client, committed_pe_session,
     fake_skill_tool_with_high_risk_binding,
 ):
     """Skill tool registered with final_risk=HIGH:
@@ -108,6 +143,7 @@ async def test_skill_high_risk_asked_then_user_approve_full_e2e(
     pe = await _build_pe_engine_with_real_deps(
         uow_factory, redis_client, fake_skill_tool_with_high_risk_binding,
     )
+    user_id, session_id = committed_pe_session
 
     meta = SkillCallMetadata(
         tool_name="myskill_run",
@@ -122,8 +158,8 @@ async def test_skill_high_risk_asked_then_user_approve_full_e2e(
         tool_name="myskill_run",
         tool_args={"q": 1},
         tool_source="skill",
-        user_id=str(sample_user.id),
-        session_id=str(sample_session.id),
+        user_id=user_id,
+        session_id=session_id,
         risk_assessment=None,         # caller did NOT pre-fill (Risk #1 demo)
         tool_call_id="tc_e2e",
         source_metadata=meta,
@@ -145,7 +181,7 @@ async def test_skill_high_risk_asked_then_user_approve_full_e2e(
     #   ResumeSignal(confirmation_id, action, grant_scope, actor)
     # confirmation_id = f"{session_id}:{tool_call_id}" (PE step 9 _cid format).
     approve_signal = ResumeSignal(
-        confirmation_id=f"{sample_session.id}:tc_e2e",
+        confirmation_id=f"{session_id}:tc_e2e",
         action="approve",
         grant_scope="session",
     )

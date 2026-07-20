@@ -122,6 +122,8 @@ from fastapi import UploadFile
 from pydantic import TypeAdapter
 
 logger = logging.getLogger(__name__)
+
+_USER_STOP_CHILD_DRAIN_REASON = "stop_child_drain"
 _EVENT_SEQ_TTL_SECONDS = 86400
 
 
@@ -558,6 +560,9 @@ class AgentTaskRunner(TaskRunner):
         self._coord_deps_for_planner: Any = coord_deps
         self._cached_is_root_session: Optional[bool] = None
         self._supervisor_spawned: bool = False  # set after first successful spawn (informational only — spawn is idempotent)
+        # User-stop with live coordinator children lets AgentService own the
+        # final supervisor teardown after their terminal ACKs are drained.
+        self._defer_mailbox_supervisor_stop: bool = False
         # C3 PR-4.5 — child-side envelope publisher state.
         # ``_mailbox_publisher`` is the wire publisher (RedisMailboxPublisher in
         # production, fake in tests). ``_cached_session_for_publisher`` is the
@@ -4155,7 +4160,7 @@ class AgentTaskRunner(TaskRunner):
 
     @staticmethod
     def _terminal_reason_for_cancel(cancel_reason: str) -> str:
-        if cancel_reason == "stop":
+        if cancel_reason in {"stop", _USER_STOP_CHILD_DRAIN_REASON}:
             return "user_cancel"
         return "natural"
 
@@ -4427,6 +4432,8 @@ class AgentTaskRunner(TaskRunner):
         ``getattr`` defends against ``__new__``-bypass test runners
         (see ``_maybe_spawn_mailbox_supervisor`` for the rationale).
         """
+        if getattr(self, "_defer_mailbox_supervisor_stop", False):
+            return
         registry = getattr(self, "_supervisor_registry", None)
         if registry is None:
             return
@@ -5317,8 +5324,15 @@ class AgentTaskRunner(TaskRunner):
                 if cancel_reason == "session_delete":
                     raise
 
+                if cancel_reason == _USER_STOP_CHILD_DRAIN_REASON:
+                    # AgentService keeps the root supervisor alive until the
+                    # already-cancelled coordinator children have published
+                    # and reconciled their terminal ACKs, then stops it via
+                    # the normal explicit hook.
+                    self._defer_mailbox_supervisor_stop = True
+
                 await self._put_and_add_event(task, DoneEvent())
-                if cancel_reason == "stop":
+                if cancel_reason in {"stop", _USER_STOP_CHILD_DRAIN_REASON}:
                     # C7 §4.4 — 仅用户 stop 映射 cancelled；suspend/takeover/delete
                     # 已在上方 re-raise（非终态清单，禁止「所有 CancelledError→cancelled」）
                     await self._emit_task_lifecycle(

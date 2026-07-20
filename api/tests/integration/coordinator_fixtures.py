@@ -565,6 +565,10 @@ async def sandbox_real():
     user_id = f"test-{_uuid.uuid4().hex[:8]}"
     sandbox = await DockerSandbox.create(user_id=user_id)
     try:
+        # create() only starts the container. Wait for the sandbox HTTP
+        # service before the first adapter call; otherwise CI races startup and
+        # the byte-roundtrip smoke fails with httpx.ConnectError.
+        await sandbox.ensure_sandbox()
         yield sandbox
     finally:
         # ``DockerSandbox.destroy()`` (docker_sandbox.py:334) catches its OWN

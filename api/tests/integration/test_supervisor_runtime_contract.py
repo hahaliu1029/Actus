@@ -64,14 +64,14 @@ async def test_idle_watchdog_scan_suspends_stale_background_session(
         background_reason="explicit",
         expires_at=expires_at,
         execution_phase="running",
+        was_background=True,
     )
     supervisor = agent_service_with_redis._supervisor
-    await supervisor.admit(
+    await supervisor._run_lua_admit(
         session_id=session.id,
         user_id=sample_user.id,
-        execution_mode="background",
-        background_reason="explicit",
         expires_at=expires_at,
+        generation=session.execution_revision,
     )
     task = _CancelableTask()
     supervisor._register_runner(session.id, task)
@@ -198,6 +198,7 @@ async def test_background_resume_refreshes_existing_redis_slot_score(
         expires_at=old_expires_at,
         execution_phase="suspended",
         suspended_reason="bg_idle_timeout",
+        sandbox_state="active",
     )
     old_score = old_expires_at.timestamp()
     await redis_client.hset(
@@ -211,10 +212,12 @@ async def test_background_resume_refreshes_existing_redis_slot_score(
         {session.id: old_score},
     )
 
-    claimed_retry_budget = await session_repo.claim_background_retry_from_suspend(
+    claim = await session_repo.claim_background_retry_from_suspend(
         session.id,
         expires_at=new_expires_at,
     )
+    assert claim is not None
+    claimed_retry_budget, claimed_execution_revision = claim
 
     admission_rc = await agent_service_with_redis._supervisor.resume(
         session_id=session.id,
@@ -222,6 +225,7 @@ async def test_background_resume_refreshes_existing_redis_slot_score(
         execution_mode="background",
         expires_at=new_expires_at,
         retry_budget_remaining=claimed_retry_budget,
+        expected_execution_revision=claimed_execution_revision,
     )
 
     fresh = await session_repo.get_by_id(session.id)
@@ -480,7 +484,7 @@ async def test_expired_sweep_terminal_failure_keeps_zset_retry_entry(
 
     monkeypatch.setattr(
         agent_service_with_redis._supervisor,
-        "terminate",
+        "terminate_expired_background",
         fail_terminate,
     )
 

@@ -73,35 +73,89 @@ async def test_mailbox_plane_research_emits_spawn_request_envelope(
     from app.application.services.session_service import SessionService
     from app.application.services.subagent_research_service import (
         ChildResult,
+        SubagentResearchService,
+    )
+    from app.domain.services.graphs.token_estimator import TokenEstimator
+    from app.domain.services.subagent_research_classifier import ClassifierResult
+    from app.infrastructure.external.mailbox.redis_mailbox_publisher import (
+        RedisMailboxPublisher,
     )
     from app.infrastructure.models.session import SessionModel
+    from app.infrastructure.repositories.db_session_repository import (
+        DBSessionRepository,
+    )
     from app.interfaces.schemas.subagent import ChildOutcome
     from app.interfaces.service_dependencies import (
         get_subagent_research_service,
     )
 
-    real_factory = get_subagent_research_service
+    class _SameSessionUow:
+        def __init__(self):
+            self.db_session = db_session
+            self.session = DBSessionRepository(db_session=db_session)
 
-    def _patch_factory(*args, **kwargs):  # noqa: ANN002, ANN003
-        svc = real_factory(*args, **kwargs)
+        async def __aenter__(self):
+            return self
 
-        async def _stub_consume(child_session_id: str, user_id: str, prompt: str):
-            del user_id
-            return ChildResult(
-                child_id=child_session_id,
-                prompt=prompt,
-                outcome=ChildOutcome.COMPLETED,
-                final_answer="stub",
-                transcript_tokens=0,
-                error_summary=None,
-            )
+        async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
+            return False
 
-        svc._consume_child = _stub_consume  # type: ignore[assignment]
-        return svc
+    def _same_session_uow_factory():
+        return _SameSessionUow()
+
+    class _Classifier:
+        async def classify_batch(self, prompts):
+            return [ClassifierResult(approved=True, reason="test") for _ in prompts]
+
+    class _Quota:
+        renew_interval_seconds = 60.0
+
+        async def acquire(self, _user_id, _probe_run_id):
+            return True
+
+        async def renew(self, _user_id, _probe_run_id):
+            return True
+
+        async def release(self, _user_id, _probe_run_id):
+            return True
+
+    class _Registry:
+        async def spawn(self, _parent_id):
+            return None
+
+    svc = SubagentResearchService(
+        session_service=SessionService(uow_factory=_same_session_uow_factory),
+        agent_service=object(),
+        execution_supervisor=object(),
+        token_estimator=TokenEstimator(strategy="char"),
+        summary_llm=object(),
+        classifier=_Classifier(),
+        sandbox_lifecycle_service=object(),
+        quota_service=_Quota(),
+        supervisor_registry=_Registry(),
+        mailbox_publisher=RedisMailboxPublisher(redis_client.client),
+    )
+
+    async def _stub_consume(child_session_id: str, user_id: str, prompt: str):
+        del user_id
+        return ChildResult(
+            child_id=child_session_id,
+            prompt=prompt,
+            outcome=ChildOutcome.COMPLETED,
+            final_answer="stub",
+            transcript_tokens=0,
+            error_summary=None,
+        )
+
+    async def _stub_summary(**_kwargs):
+        return "stub summary", []
+
+    svc._consume_child = _stub_consume  # type: ignore[assignment]
+    svc._do_summary_join_with_retry = _stub_summary  # type: ignore[assignment]
 
     from fastapi import FastAPI
     app_instance: FastAPI = asgi_client._transport.app  # type: ignore[attr-defined]
-    app_instance.dependency_overrides[get_subagent_research_service] = _patch_factory
+    app_instance.dependency_overrides[get_subagent_research_service] = lambda: svc
 
     # codex r1 [R1-8] — persist control_plane='mailbox' on the child
     # DB row so the runner-side reads see the same value as the

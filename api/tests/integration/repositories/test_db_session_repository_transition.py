@@ -39,7 +39,7 @@ async def ensure_session(db_session, sample_user):
 
 
 @pytest.fixture
-async def ensure_committed_session(async_engine, sample_user):
+async def ensure_committed_session(async_engine):
     """Factory: insert + COMMIT a SessionModel row; yield its id; delete on teardown.
 
     Unlike ``ensure_session`` (which flushes inside a rolled-back transaction),
@@ -56,32 +56,27 @@ async def ensure_committed_session(async_engine, sample_user):
     session_factory = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
 
     created_ids: list[str] = []
-    user_committed = False
+    committed_user_id = f"user-pe0-conc-{uuid.uuid4().hex[:12]}"
+    # Use a fixture-owned committed user. Reusing sample_user here deadlocks:
+    # its same PK is still uncommitted in the outer db_session transaction, so
+    # PostgreSQL waits for that transaction while the test waits for INSERT.
+    async with session_factory() as setup_session:
+        async with setup_session.begin():
+            setup_session.add(
+                UserModel(
+                    id=committed_user_id,
+                    username=f"pe0_conc_{uuid.uuid4().hex[:12]}",
+                    password_hash="x",
+                )
+            )
 
     async def _factory(*, status: SessionStatus) -> str:
-        nonlocal user_committed
         sid = f"sess-pe0-conc-{uuid.uuid4().hex[:12]}"
         async with session_factory() as setup_session:
             async with setup_session.begin():
-                # Ensure the user row is committed (sample_user is only flushed in
-                # the rolled-back db_session transaction — not visible to other
-                # connections until we insert it here too).
-                if not user_committed:
-                    # Use INSERT ... ON CONFLICT DO NOTHING to avoid duplicate key
-                    # if the row somehow already exists.
-                    from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-                    stmt = pg_insert(UserModel).values(
-                        id=sample_user.id,
-                        username=sample_user.username,
-                        password_hash=sample_user.password_hash,
-                    ).on_conflict_do_nothing(index_elements=["id"])
-                    await setup_session.execute(stmt)
-                    user_committed = True
-
                 orm = SessionModel(
                     id=sid,
-                    user_id=sample_user.id,
+                    user_id=committed_user_id,
                     status=status.value,
                     title="pe-0 concurrent cas test session",
                     mode_revision=0,
@@ -99,12 +94,12 @@ async def ensure_committed_session(async_engine, sample_user):
                 await cleanup_session.execute(
                     delete(SessionModel).where(SessionModel.id.in_(created_ids))
                 )
-        # Also remove the user row we may have committed above.
-        async with session_factory() as cleanup_session:
-            async with cleanup_session.begin():
-                await cleanup_session.execute(
-                    delete(UserModel).where(UserModel.id == sample_user.id)
-                )
+    # Also remove the fixture-owned user row committed above.
+    async with session_factory() as cleanup_session:
+        async with cleanup_session.begin():
+            await cleanup_session.execute(
+                delete(UserModel).where(UserModel.id == committed_user_id)
+            )
 
 
 async def test_transition_status_cas_increments_mode_revision(session_repo, ensure_session):

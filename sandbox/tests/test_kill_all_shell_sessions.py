@@ -48,6 +48,34 @@ async def test_kill_all_shell_sessions_killpgs_tracked_groups(monkeypatch):
     assert (2001, signal.SIGKILL) in killed
 
 
+async def test_kill_all_shell_sessions_waits_for_sigkill_reaping(monkeypatch):
+    """A just-killed process may remain in /proc briefly before it is reaped."""
+    from app.services.shell import ShellService
+
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+
+    svc = ShellService()
+    svc.active_shells = {"s1": _FakeShell(pid=1001)}  # type: ignore[assignment]
+    svc.pty_shells = {}  # type: ignore[assignment]
+
+    checks = iter([False, True])
+    monkeypatch.setattr(
+        svc,
+        "_workspace_quiescent",
+        lambda killed_pgids: next(checks),
+    )
+    sleeps: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    assert await svc.kill_all_shell_sessions() is True
+    assert sleeps
+
+
 class _FakeProc:
     def __init__(self, pid: int) -> None:
         self.pid = pid  # start_new_session=True ⇒ pgid == pid

@@ -97,6 +97,7 @@ async def test_supervisor_trusts_publisher_for_child_root_ownership(
         retry_budget_remaining=3,
         was_background=False,
         worker_type="subagent",
+        tool_filter_preset="subagent_research",
         subagent_control_plane="mailbox",
     )
     db_session.add(other_root)

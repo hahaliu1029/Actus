@@ -48,8 +48,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.application.errors.exceptions import ConflictError
 from app.application.services.agent_service import AgentService
+from app.domain.services.permission.errors import PolicyConflict
 from app.domain.services.permission.confirmation_queue import (
     ZSET_KEY,
     ConfirmationDetail,
@@ -271,12 +271,12 @@ async def _gather_with_results(coros):
     return await asyncio.gather(*coros, return_exceptions=True)
 
 
-def _split_winner_and_409(results: list) -> tuple[list, list[ConflictError]]:
-    """Partition results into (non-exception values, ConflictError list)."""
+def _split_winner_and_conflict(results: list) -> tuple[list, list[PolicyConflict]]:
+    """Partition direct service results into winner and PE race conflict."""
     winners = []
     conflicts = []
     for r in results:
-        if isinstance(r, ConflictError):
+        if isinstance(r, PolicyConflict):
             conflicts.append(r)
         elif isinstance(r, BaseException):
             raise AssertionError(f"unexpected exception in concurrent preflight: {r!r}")
@@ -326,21 +326,23 @@ async def test_session_scope_concurrent_resume_has_one_winner(
             ),
         ]
     )
-    winners, conflicts = _split_winner_and_409(results)
+    winners, conflicts = _split_winner_and_conflict(results)
 
     assert len(winners) == 1, f"预期 1 winner，实际 {len(winners)}: {results!r}"
     assert len(conflicts) == 1, f"预期 1 ConflictError，实际 {len(conflicts)}"
-    assert conflicts[0].status_code == 409
+    assert str(conflicts[0]) == "approval_already_claimed"
 
     winner_state = winners[0]
-    assert winner_state.decision_id is not None
+    assert winner_state.decision_id is None
+    assert winner_state.claim_nonce is not None
     assert winner_state.persistent_scope is True
 
-    # DB invariant: 1 grant + 1 audit（R5 writer.write 原子 grant+audit）
-    assert await _count_grants(session_factory, tool_call_id) == 1
+    # PE preflight only owns the Redis CAS. Grant/audit are written later by
+    # commit_resume after the graph consumes the handoff.
+    assert await _count_grants(session_factory, tool_call_id) == 0
     assert (
         await _count_audit(session_factory, session_id=test_session_id, scope="session")
-        == 1
+        == 0
     )
 
 
@@ -380,15 +382,16 @@ async def test_session_scope_kickoff_rollback_allows_fresh_retry(
         is_admin=False,
         tool_confirmation=conf,
     )
-    first_decision_id = first_state.decision_id
-    assert first_decision_id is not None
+    first_claim_nonce = first_state.claim_nonce
+    assert first_claim_nonce is not None
 
     # 模拟 drive 阶段 task.resume 失败 → 触发 rollback 骨架
-    await service._rollback_resume_claim(
+    await service._rollback_resume_claim_if_present(
         persistent_scope=True,
-        decision_id=first_decision_id,
+        decision_id=None,
         session_id=test_session_id,
         tool_call_id=tool_call_id,
+        claim_nonce=first_claim_nonce,
     )
 
     # rollback 后 grant + audit 都该 0（writer.delete_grant 对称删）
@@ -409,16 +412,16 @@ async def test_session_scope_kickoff_rollback_allows_fresh_retry(
         is_admin=False,
         tool_confirmation=conf,
     )
-    assert second_state.decision_id is not None
-    assert second_state.decision_id != first_decision_id, (
-        "retry winner 必须拿到新 decision_id；若相同说明 rollback 没删 grant 行"
+    assert second_state.claim_nonce is not None
+    assert second_state.claim_nonce != first_claim_nonce, (
+        "retry winner 必须拿到新 claim_nonce；若相同说明 Redis claim 未回滚"
     )
 
     # 最终 DB 状态：仅 1 grant（retry 的） + 1 audit
-    assert await _count_grants(session_factory, tool_call_id) == 1
+    assert await _count_grants(session_factory, tool_call_id) == 0
     assert (
         await _count_audit(session_factory, session_id=test_session_id, scope="session")
-        == 1
+        == 0
     )
 
 
@@ -467,17 +470,18 @@ async def test_once_scope_concurrent_resume_has_one_winner(
             ),
         ]
     )
-    winners, conflicts = _split_winner_and_409(results)
+    winners, conflicts = _split_winner_and_conflict(results)
 
     assert len(winners) == 1, f"预期 1 winner，实际 {len(winners)}: {results!r}"
     assert len(conflicts) == 1
-    assert conflicts[0].status_code == 409
+    assert str(conflicts[0]) == "approval_already_claimed"
 
     winner_state = winners[0]
     assert winner_state.persistent_scope is False
     assert winner_state.decision_id is None  # once 不建 grant
 
-    # DB invariants：once 不写 grant，只写 audit（经 write_audit_only）
+    # Preflight has not reached commit_resume yet, so neither grant nor audit
+    # is durable at this seam.
     assert await _count_grants(session_factory, tool_call_id) == 0
     async with session_factory() as s:
         rows = (
@@ -489,10 +493,4 @@ async def test_once_scope_concurrent_resume_has_one_winner(
                 {"sid": test_session_id},
             )
         ).mappings().all()
-    assert len(rows) == 1, f"预期 1 audit 行，实际 {len(rows)}"
-    assert rows[0]["scope"] == "once"
-    assert rows[0]["decision_id"] is None, (
-        "once audit 的 decision_id 必须为 NULL——once 不建 grant，"
-        "writer.write_audit_only 不应透传任何 decision_id"
-    )
-    assert rows[0]["approved_by"] == "user"
+    assert rows == []

@@ -132,8 +132,10 @@ jobs:
           docker run --rm --network host --entrypoint /bin/sh \
             minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
             "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb --ignore-existing --region us-east-1 local/a2a-mcp"
-      - name: Pre-pull sandbox image
-        run: docker pull actus-sandbox:latest || docker build -t actus-sandbox:latest sandbox/
+      - name: Build sandbox image
+        # Coordinator E2E must exercise the sandbox code from this commit.
+        # Pulling a mutable `latest` can silently bypass local sandbox fixes.
+        run: docker build -t actus-sandbox:latest sandbox/
       - name: Run coordinator E2E (flag-on)
         env:
           SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test
@@ -199,6 +201,8 @@ jobs:
         working-directory: api
         env:
           ACTUS_REQUIRE_SANDBOX_TESTS: "1"
+          JWT_SECRET_KEY: ci-test-secret-key
+          ENV: test
         run: uv run pytest tests/sandbox/ -m "sandbox and not sandbox_real_image" -v
 
   sandbox-hardening-smoke:
@@ -237,6 +241,8 @@ jobs:
         working-directory: api
         env:
           ACTUS_REQUIRE_SANDBOX_TESTS: "1"
+          JWT_SECRET_KEY: ci-test-secret-key
+          ENV: test
         run: uv run pytest tests/sandbox/ -m "sandbox and sandbox_real_image" -v
 
   sandbox-test:

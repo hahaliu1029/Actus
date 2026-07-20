@@ -23,7 +23,13 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
-pytestmark = pytest.mark.integration
+MIGRATION_TARGET = "t12_tool_filter_preset"
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.anyio,
+    pytest.mark.usefixtures("migration_schema_at"),
+]
 
 
 DB_URL = os.environ.get(
@@ -47,7 +53,42 @@ def alembic_cfg() -> Config:
     return cfg
 
 
-@pytest.mark.asyncio
+async def _insert_user(db_session, *, user_id: str, username: str) -> None:
+    await db_session.execute(
+        text(
+            "INSERT INTO users (id, username, password_hash) "
+            "VALUES (:uid, :username, 'x')"
+        ),
+        {"uid": user_id, "username": username},
+    )
+
+
+async def _insert_session(
+    db_session,
+    *,
+    session_id: str,
+    user_id: str,
+    title: str,
+    sample_session_id: str | None = None,
+    tool_filter_preset: str | None = None,
+) -> None:
+    """Insert against the historical T12 schema without using head ORM."""
+    await db_session.execute(
+        text(
+            "INSERT INTO sessions "
+            "(id, user_id, status, title, sample_session_id, tool_filter_preset) "
+            "VALUES (:sid, :uid, 'pending', :title, :parent, :preset)"
+        ),
+        {
+            "sid": session_id,
+            "uid": user_id,
+            "title": title,
+            "parent": sample_session_id,
+            "preset": tool_filter_preset,
+        },
+    )
+
+
 async def test_upgrade_creates_tool_filter_preset_column(db_session):
     """alembic upgrade head must add tool_filter_preset as VARCHAR(64) NULLABLE."""
     async_conn = await db_session.connection()
@@ -67,7 +108,6 @@ async def test_upgrade_creates_tool_filter_preset_column(db_session):
     )
 
 
-@pytest.mark.asyncio
 async def test_upgrade_creates_check_constraint(db_session):
     """The CHECK constraint must exist and reference tool_filter_preset."""
     res = await db_session.execute(
@@ -93,36 +133,27 @@ async def test_upgrade_creates_check_constraint(db_session):
     assert "null" in constraintdef
 
 
-@pytest.mark.asyncio
 async def test_check_constraint_allows_null_and_known_preset(db_session):
     """Inserts with NULL or known preset value must succeed."""
-    from app.infrastructure.models.session import SessionModel
-    from app.infrastructure.models.user import UserModel
-
     uid = str(_uuid.uuid4())
     sid_null = f"sess-t12-null-{_uuid.uuid4().hex[:12]}"
     sid_known = f"sess-t12-known-{_uuid.uuid4().hex[:12]}"
 
-    db_session.add(
-        UserModel(id=uid, username=f"t12ok_{uid[:8]}", password_hash="x")
+    await _insert_user(
+        db_session, user_id=uid, username=f"t12ok_{uid[:8]}"
     )
-    db_session.add(
-        SessionModel(
-            id=sid_null,
-            user_id=uid,
-            status="pending",
-            title="null preset",
-            tool_filter_preset=None,
-        )
+    await _insert_session(
+        db_session,
+        session_id=sid_null,
+        user_id=uid,
+        title="null preset",
     )
-    db_session.add(
-        SessionModel(
-            id=sid_known,
-            user_id=uid,
-            status="pending",
-            title="known preset",
-            tool_filter_preset="subagent_research",
-        )
+    await _insert_session(
+        db_session,
+        session_id=sid_known,
+        user_id=uid,
+        title="known preset",
+        tool_filter_preset="subagent_research",
     )
     await db_session.flush()
 
@@ -138,34 +169,26 @@ async def test_check_constraint_allows_null_and_known_preset(db_session):
     assert rows[sid_known] == "subagent_research"
 
 
-@pytest.mark.asyncio
 async def test_check_constraint_rejects_unknown_preset(db_session):
     """An unknown preset value must be rejected by the DB CHECK constraint."""
-    from app.infrastructure.models.session import SessionModel
-    from app.infrastructure.models.user import UserModel
-
     uid = str(_uuid.uuid4())
     sid = f"sess-t12-bad-{_uuid.uuid4().hex[:12]}"
 
-    db_session.add(
-        UserModel(id=uid, username=f"t12bad_{uid[:8]}", password_hash="x")
-    )
-    db_session.add(
-        SessionModel(
-            id=sid,
-            user_id=uid,
-            status="pending",
-            title="bad preset",
-            tool_filter_preset="not_a_real_preset",
-        )
+    await _insert_user(
+        db_session, user_id=uid, username=f"t12bad_{uid[:8]}"
     )
 
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
-            await db_session.flush()
+            await _insert_session(
+                db_session,
+                session_id=sid,
+                user_id=uid,
+                title="bad preset",
+                tool_filter_preset="not_a_real_preset",
+            )
 
 
-@pytest.mark.asyncio
 async def test_child_check_constraint_rejects_null_preset_on_child(db_session):
     """Codex R1 P1 defense-in-depth: a child row (sample_session_id non-null)
     with tool_filter_preset = NULL must be rejected at the DB layer.
@@ -175,40 +198,32 @@ async def test_child_check_constraint_rejects_null_preset_on_child(db_session):
     ``ck_sessions_child_must_have_preset`` CHECK constraint must block the
     row so a restored task on resume cannot run unrestricted.
     """
-    from app.infrastructure.models.session import SessionModel
-    from app.infrastructure.models.user import UserModel
-
     uid = str(_uuid.uuid4())
     parent_sid = f"sess-t12-p-{_uuid.uuid4().hex[:12]}"
     child_sid = f"sess-t12-c-{_uuid.uuid4().hex[:12]}"
 
-    db_session.add(
-        UserModel(id=uid, username=f"t12child_{uid[:8]}", password_hash="x")
+    await _insert_user(
+        db_session, user_id=uid, username=f"t12child_{uid[:8]}"
     )
-    db_session.add(
-        SessionModel(
-            id=parent_sid, user_id=uid, status="pending", title="parent",
-        )
-    )
-    # Bypass the app-level guard by writing the ORM directly. The DB CHECK
-    # must catch this.
-    db_session.add(
-        SessionModel(
-            id=child_sid,
-            user_id=uid,
-            status="pending",
-            title="orphan child",
-            sample_session_id=parent_sid,
-            tool_filter_preset=None,  # ← the F8 bypass attempt
-        )
+    await _insert_session(
+        db_session,
+        session_id=parent_sid,
+        user_id=uid,
+        title="parent",
     )
 
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
-            await db_session.flush()
+            await _insert_session(
+                db_session,
+                session_id=child_sid,
+                user_id=uid,
+                title="orphan child",
+                sample_session_id=parent_sid,
+                tool_filter_preset=None,
+            )
 
 
-@pytest.mark.asyncio
 async def test_child_check_rejects_update_setting_preset_to_null(db_session):
     """Codex R2 P2: CHECK constraints fire on UPDATE too — pin the
     semantic that an existing valid child row cannot be silently demoted
@@ -220,30 +235,26 @@ async def test_child_check_rejects_update_setting_preset_to_null(db_session):
     ``UPDATE sessions SET tool_filter_preset = NULL WHERE id = ...`` on
     a child row gets caught at the DB layer.
     """
-    from app.infrastructure.models.session import SessionModel
-    from app.infrastructure.models.user import UserModel
-
     uid = str(_uuid.uuid4())
     parent_sid = f"sess-t12-up-p-{_uuid.uuid4().hex[:12]}"
     child_sid = f"sess-t12-up-c-{_uuid.uuid4().hex[:12]}"
 
-    db_session.add(
-        UserModel(id=uid, username=f"t12upd_{uid[:8]}", password_hash="x")
+    await _insert_user(
+        db_session, user_id=uid, username=f"t12upd_{uid[:8]}"
     )
-    db_session.add(
-        SessionModel(
-            id=parent_sid, user_id=uid, status="pending", title="parent",
-        )
+    await _insert_session(
+        db_session,
+        session_id=parent_sid,
+        user_id=uid,
+        title="parent",
     )
-    db_session.add(
-        SessionModel(
-            id=child_sid,
-            user_id=uid,
-            status="pending",
-            title="legit child",
-            sample_session_id=parent_sid,
-            tool_filter_preset="subagent_research",  # initially valid
-        )
+    await _insert_session(
+        db_session,
+        session_id=child_sid,
+        user_id=uid,
+        title="legit child",
+        sample_session_id=parent_sid,
+        tool_filter_preset="subagent_research",
     )
     await db_session.flush()
 
@@ -295,8 +306,8 @@ def test_upgrade_backfills_existing_children_with_subagent_research(
         # staging DBs will be in when T12 lands.
         with engine.begin() as conn:
             conn.execute(text(
-                "INSERT INTO users (id, username, password_hash, status, created_at, updated_at) "
-                "VALUES (:u, :name, 'x', 'active', NOW(), NOW())"
+                "INSERT INTO users (id, username, password_hash) "
+                "VALUES (:u, :name, 'x')"
             ), {"u": uid, "name": f"t12bf_{uid[:8]}"})
             conn.execute(text(
                 "INSERT INTO sessions (id, user_id, status, title) "
@@ -336,7 +347,7 @@ def test_upgrade_backfills_existing_children_with_subagent_research(
         # Restore head schema FIRST so downstream tests run against the
         # right revision even if cleanup hits a snag — schema integrity is
         # more important than seed-row hygiene.
-        command.upgrade(alembic_cfg, "head")
+        command.upgrade(alembic_cfg, T12_REVISION)
 
         # Cleanup order: child → parent → user. Self-FK on sessions is
         # ON DELETE RESTRICT, so parent delete would error while child
@@ -359,7 +370,6 @@ def test_upgrade_backfills_existing_children_with_subagent_research(
             )
 
 
-@pytest.mark.asyncio
 async def test_child_check_allows_null_preset_on_non_child(db_session):
     """Symmetric to the above: top-level sessions (sample_session_id NULL)
     keep the back-compat right to have NULL preset.
@@ -369,24 +379,17 @@ async def test_child_check_allows_null_preset_on_non_child(db_session):
     have preset". Pin this so a future tightening doesn't accidentally
     break non-child writes.
     """
-    from app.infrastructure.models.session import SessionModel
-    from app.infrastructure.models.user import UserModel
-
     uid = str(_uuid.uuid4())
     sid = f"sess-t12-top-{_uuid.uuid4().hex[:12]}"
 
-    db_session.add(
-        UserModel(id=uid, username=f"t12top_{uid[:8]}", password_hash="x")
+    await _insert_user(
+        db_session, user_id=uid, username=f"t12top_{uid[:8]}"
     )
-    db_session.add(
-        SessionModel(
-            id=sid,
-            user_id=uid,
-            status="pending",
-            title="top-level",
-            sample_session_id=None,
-            tool_filter_preset=None,
-        )
+    await _insert_session(
+        db_session,
+        session_id=sid,
+        user_id=uid,
+        title="top-level",
     )
     await db_session.flush()
 
@@ -409,12 +412,6 @@ def test_downgrade_upgrade_roundtrip(alembic_cfg):
     engine = create_engine(sync_url)
 
     try:
-        # Establish baseline at t12. Conftest already upgraded to head;
-        # today head IS t12 so this is a no-op, but use ``downgrade`` so
-        # a future revision stacked above t12 doesn't silently shift the
-        # baseline (same fix R3 applied to the p1m roundtrip test).
-        command.downgrade(alembic_cfg, T12_REVISION)
-
         # ---- Downgrade: column + CHECK gone. ----
         command.downgrade(alembic_cfg, PRE_T12_REVISION)
         with engine.connect() as conn:
@@ -510,4 +507,4 @@ def test_downgrade_upgrade_roundtrip(alembic_cfg):
             assert "sample_session_id" in childdef
             assert "tool_filter_preset" in childdef
     finally:
-        command.upgrade(alembic_cfg, "head")
+        command.upgrade(alembic_cfg, T12_REVISION)

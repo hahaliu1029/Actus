@@ -11,6 +11,7 @@ tests/app/application/services/test_child_terminal_reconciler.py.
 from __future__ import annotations
 
 import uuid as _uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -45,11 +46,20 @@ async def _mk_root(db_session, uid: str) -> str:
 
 def _child(*, sid, uid, parent, status="running", plane="mailbox",
            mode="foreground", run_id=None, wu_id=None, preset="coordinator_step"):
+    is_terminal = status in {"completed", "timed_out"}
     return SessionModel(
         id=sid, user_id=uid, parent_session_id=parent, status=status,
         worker_type="subagent", subagent_control_plane=plane,
         execution_mode=mode, coordinator_run_id=run_id, work_unit_id=wu_id,
         tool_filter_preset=preset, title="child",
+        execution_phase="terminated" if is_terminal else "running",
+        terminal_reason="natural" if is_terminal else None,
+        background_reason="explicit" if mode == "background" else None,
+        expires_at=(
+            datetime.now(timezone.utc) + timedelta(hours=1)
+            if mode == "background"
+            else None
+        ),
     )
 
 
@@ -129,6 +139,7 @@ async def test_sweep_terminalizes_row_lagged_child(async_session_factory, uow_fa
     # Commit setup via a standalone (non-begin-wrapped) session.
     async with async_session_factory() as setup:
         setup.add(UserModel(id=uid, username=f"reaper_{uid[:8]}", password_hash="x"))
+        await setup.flush()
         setup.add(SessionModel(id=root, user_id=uid, status="running",
                                title="coord root", worker_type="root"))
         await setup.flush()  # parent before child (self-FK)
@@ -219,6 +230,7 @@ async def test_sweep_r18_skips_no_envelope_child_preserving_respawn_trigger(
 
     async with async_session_factory() as setup:
         setup.add(UserModel(id=uid, username=f"reaper_{uid[:8]}", password_hash="x"))
+        await setup.flush()
         setup.add(SessionModel(id=root, user_id=uid, status="running",
                                title="coord root", worker_type="root"))
         await setup.flush()

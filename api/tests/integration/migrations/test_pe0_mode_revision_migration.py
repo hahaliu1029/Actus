@@ -3,12 +3,18 @@
 import pytest
 from sqlalchemy import inspect
 
+MIGRATION_TARGET = "pe0_mode_rev"
 
-@pytest.mark.integration
-@pytest.mark.asyncio
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.anyio,
+    pytest.mark.usefixtures("migration_schema_at"),
+]
+
+
 async def test_mode_revision_column_exists_after_migration(db_session):
     """alembic upgrade head must add the column with NOT NULL DEFAULT 0."""
-    bind = db_session.get_bind()
+    async_conn = await db_session.connection()
 
     def _check(sync_conn):
         cols = {c["name"]: c for c in inspect(sync_conn).get_columns("sessions")}
@@ -17,13 +23,11 @@ async def test_mode_revision_column_exists_after_migration(db_session):
         assert col["nullable"] is False
         return col
 
-    col = await bind.run_sync(_check)
+    col = await async_conn.run_sync(_check)
     # Default may come back as a server-side expression literal
     assert "0" in str(col["default"]) if col.get("default") is not None else True
 
 
-@pytest.mark.integration
-@pytest.mark.asyncio
 async def test_existing_sessions_get_mode_revision_zero(db_session):
     """Backfill: existing rows must read mode_revision=0 after upgrade."""
     from sqlalchemy import text

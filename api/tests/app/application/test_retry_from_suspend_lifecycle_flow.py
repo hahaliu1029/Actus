@@ -1,5 +1,6 @@
 """C7 PR7 — §12-4 收口：HTTP 语义入口 retry_from_suspend → claim → context 透传。
 （真 HTTP/DB/沙箱链路标注「CI 验证」——本文件锁 application 编排层的可单测半段。）"""
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,7 +25,7 @@ def _suspended_session():
 
 
 class _ClaimUoW:
-    def __init__(self, claimed: int) -> None:
+    def __init__(self, claimed: tuple[int, int]) -> None:
         self.session = MagicMock()
         self.session.claim_background_retry_from_suspend = AsyncMock(return_value=claimed)
 
@@ -35,14 +36,22 @@ class _ClaimUoW:
         return False
 
 
+@asynccontextmanager
+async def _mode_transition_fence():
+    yield
+
+
 @pytest.mark.asyncio
 async def test_retry_flow_passes_typed_context_with_claimed_budget():
     svc = AgentService.__new__(AgentService)
     session = _suspended_session()
     svc._get_accessible_session = AsyncMock(return_value=session)
-    svc._uow_factory = lambda: _ClaimUoW(claimed=2)
+    svc._uow_factory = lambda: _ClaimUoW(claimed=(2, 1))
     svc._sandbox_lifecycle_service = MagicMock(resume=AsyncMock())
     svc._supervisor = MagicMock(resume=AsyncMock(return_value="rc-1"))
+    svc._supervisor.mode_transition_fence = MagicMock(
+        return_value=_mode_transition_fence()
+    )
     svc._resume_task_with_handoff = AsyncMock()
 
     await svc.retry_from_suspend("sess-1", "user-1")

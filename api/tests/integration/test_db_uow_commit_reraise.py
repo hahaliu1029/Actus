@@ -16,18 +16,27 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
 @pytest.fixture
-async def two_users(db_session):
+async def two_users(async_session_factory):
     user_a, user_b = uuid.uuid4().hex, uuid.uuid4().hex
-    for uid in (user_a, user_b):
-        await db_session.execute(
-            sa.text(
-                "INSERT INTO users (id, username, password_hash) "
-                "VALUES (:id, :u, 'x')"
-            ),
-            {"id": uid, "u": f"u_{uid[:8]}"},
-        )
-    await db_session.commit()
-    return user_a, user_b
+    async with async_session_factory() as session:
+        for uid in (user_a, user_b):
+            await session.execute(
+                sa.text(
+                    "INSERT INTO users (id, username, password_hash) "
+                    "VALUES (:id, :u, 'x')"
+                ),
+                {"id": uid, "u": f"u_{uid[:8]}"},
+            )
+        await session.commit()
+    try:
+        yield user_a, user_b
+    finally:
+        async with async_session_factory() as session:
+            await session.execute(
+                sa.text("DELETE FROM users WHERE id IN (:a, :b)"),
+                {"a": user_a, "b": user_b},
+            )
+            await session.commit()
 
 
 async def test_deferred_trigger_violation_propagates(uow_factory, two_users):

@@ -1798,11 +1798,17 @@ async def _run_subagent_research(
     release) is delayed until garbage collection — i.e. effectively
     leaks until the event loop is shut down.
     """
-    parent = await session_service.get_session(
-        session_id=resolved_parent_id,
-        user_id=current_user.id,
-        is_admin=current_user.is_admin(),
-    )
+    try:
+        parent = await session_service.get_session(
+            session_id=resolved_parent_id,
+            user_id=current_user.id,
+            is_admin=current_user.is_admin(),
+        )
+    except ForbiddenError as exc:
+        # Do not disclose that a cross-tenant parent session exists.
+        raise NotFoundError(
+            f"Session {resolved_parent_id} not found or not accessible"
+        ) from exc
     if parent is None:
         raise NotFoundError(
             f"Session {resolved_parent_id} not found or not accessible"

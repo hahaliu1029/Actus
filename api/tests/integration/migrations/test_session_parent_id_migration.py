@@ -28,7 +28,13 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 
-pytestmark = pytest.mark.integration
+MIGRATION_TARGET = "p1m_sample_session_id"
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.anyio,
+    pytest.mark.usefixtures("migration_schema_at"),
+]
 
 
 # Mirror conftest.py fallback (see test_r6_migration.py:25-28) so this file is
@@ -55,7 +61,6 @@ def alembic_cfg() -> Config:
     return cfg
 
 
-@pytest.mark.asyncio
 async def test_upgrade_creates_sample_session_id_column(db_session):
     """alembic upgrade head must add sample_session_id as VARCHAR(255) NULLABLE."""
     # AsyncSession.get_bind() returns the *sync* Engine which has no
@@ -78,7 +83,6 @@ async def test_upgrade_creates_sample_session_id_column(db_session):
     )
 
 
-@pytest.mark.asyncio
 async def test_upgrade_creates_fk_with_restrict(db_session):
     """The fk_sessions_sample_session_id_sessions self-FK must use ON DELETE RESTRICT."""
     res = await db_session.execute(
@@ -106,7 +110,6 @@ async def test_upgrade_creates_fk_with_restrict(db_session):
     )
 
 
-@pytest.mark.asyncio
 async def test_upgrade_creates_partial_index(db_session):
     """The ix_sessions_sample_session_id index must be a partial index
     (WHERE sample_session_id IS NOT NULL)."""
@@ -144,14 +147,6 @@ def test_downgrade_upgrade_roundtrip(alembic_cfg):
     engine = create_engine(sync_url)
 
     try:
-        # Establish baseline at p1m. Conftest already upgraded to head; with
-        # T12 (`t12_tool_filter_preset`) now living above p1m, walking to
-        # p1m is a *downgrade* direction. Calling ``command.upgrade(...,
-        # P1M_REVISION)`` would be a no-op / error on a head-stamped DB;
-        # use ``downgrade`` so the baseline is reachable from any future
-        # revision stacked on top of t12 as well.
-        command.downgrade(alembic_cfg, P1M_REVISION)
-
         # ---- Downgrade to pe0_mode_rev: column / FK / partial index gone. ----
         command.downgrade(alembic_cfg, PRE_P1M_REVISION)
 
@@ -278,13 +273,11 @@ def test_downgrade_upgrade_roundtrip(alembic_cfg):
                 f"{indexdef!r}"
             )
     finally:
-        # Always restore schema to the real head so a mid-test failure
-        # doesn't leave subsequent integration tests running against a
-        # downgraded DB.
-        command.upgrade(alembic_cfg, "head")
+        # Restore this module's historical target. The module isolation
+        # fixture restores the real head after every test in this file.
+        command.upgrade(alembic_cfg, P1M_REVISION)
 
 
-@pytest.mark.asyncio
 async def test_fk_restrict_blocks_parent_delete_with_live_children(db_session):
     """FK RESTRICT semantics: deleting a parent session that still has live
     children must raise IntegrityError.
@@ -294,37 +287,31 @@ async def test_fk_restrict_blocks_parent_delete_with_live_children(db_session):
     RESTRICT *behavior* that prevents orphan child sessions from bypassing
     the frontend useFilteredSessionsForList filter at runtime.
     """
-    from app.infrastructure.models.session import SessionModel
-    from app.infrastructure.models.user import UserModel
-
     uid = str(_uuid.uuid4())
     parent_sid = f"sess-p1m-parent-{_uuid.uuid4().hex[:12]}"
     child_sid = f"sess-p1m-child-{_uuid.uuid4().hex[:12]}"
 
-    db_session.add(
-        UserModel(id=uid, username=f"p1mtest_{uid[:8]}", password_hash="x")
+    await db_session.execute(
+        text(
+            "INSERT INTO users (id, username, password_hash) "
+            "VALUES (:uid, :username, 'x')"
+        ),
+        {"uid": uid, "username": f"p1mtest_{uid[:8]}"},
     )
-    db_session.add(
-        SessionModel(
-            id=parent_sid,
-            user_id=uid,
-            status="pending",
-            title="parent",
-        )
+    await db_session.execute(
+        text(
+            "INSERT INTO sessions (id, user_id, status, title) "
+            "VALUES (:sid, :uid, 'pending', 'parent')"
+        ),
+        {"sid": parent_sid, "uid": uid},
     )
-    db_session.add(
-        SessionModel(
-            id=child_sid,
-            user_id=uid,
-            status="pending",
-            title="child",
-            sample_session_id=parent_sid,
-            # T12 cross-column CHECK (ck_sessions_child_must_have_preset)
-            # now requires a non-null preset on every child row, so this
-            # pre-T12 fixture must satisfy it to keep covering the
-            # *parent-delete RESTRICT* invariant it was written for.
-            tool_filter_preset="subagent_research",
-        )
+    await db_session.execute(
+        text(
+            "INSERT INTO sessions "
+            "(id, user_id, status, title, sample_session_id) "
+            "VALUES (:sid, :uid, 'pending', 'child', :parent_sid)"
+        ),
+        {"sid": child_sid, "uid": uid, "parent_sid": parent_sid},
     )
     await db_session.flush()
 

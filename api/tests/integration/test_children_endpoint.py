@@ -10,24 +10,29 @@ pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 
 async def test_happy_path_returns_descendants(
-    asgi_client, uow_factory, sample_user, sample_session, sample_user_token,
+    asgi_client, db_session, sample_user, sample_session, sample_user_token,
 ):
-    """Seed 3 children via SessionService and assert /children returns them.
+    """Seed 3 children and assert /children returns them.
 
     Order is set-based: the recursive CTE orders by (depth ASC, id ASC) but
     with all children at depth=1 the ordering is purely id ASC. We compare
     sorted lists so future ordering tweaks don't flake this test.
     """
-    from app.application.services.session_service import SessionService
-    svc = SessionService(uow_factory=uow_factory)
     child_ids = []
     for _ in range(3):
-        child = await svc.create_session_with_parent(
-            user_id=sample_user.id,
-            parent_session_id=sample_session.id,
-            tool_filter_preset="subagent_research",
+        child_id = uuid.uuid4().hex
+        await db_session.execute(
+            sa.text(
+                "INSERT INTO sessions (id, user_id, parent_session_id, worker_type, "
+                "  tool_filter_preset, title, latest_message, status, "
+                "  events, files, memories) "
+                "VALUES (:id, :uid, :pid, 'subagent', 'subagent_research', '', '', "
+                "  'pending', '[]'::jsonb, '[]'::jsonb, '{}'::jsonb)"
+            ),
+            {"id": child_id, "uid": sample_user.id, "pid": sample_session.id},
         )
-        child_ids.append(child.id)
+        child_ids.append(child_id)
+    await db_session.commit()
     expected = sorted(child_ids)
 
     resp = await asgi_client.get(
@@ -72,7 +77,7 @@ async def test_truncated_when_descendants_exceed_cap(
                 "INSERT INTO sessions (id, user_id, parent_session_id, worker_type, "
                 "  tool_filter_preset, title, latest_message, status, "
                 "  events, files, memories) "
-                "VALUES (:id, :uid, :pid, 'subagent', 'subagent_research', '', '', 'PENDING', "
+                "VALUES (:id, :uid, :pid, 'subagent', 'subagent_research', '', '', 'pending', "
                 "  '[]'::jsonb, '[]'::jsonb, '{}'::jsonb)"
             ),
             {"id": cid, "uid": sample_user.id, "pid": sample_session.id},

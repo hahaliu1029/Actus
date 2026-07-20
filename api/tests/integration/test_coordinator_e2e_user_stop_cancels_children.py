@@ -2,14 +2,12 @@
 cancels dispatched children. Runs flag-ON in the coordinator-e2e CI job only
 (needs pg+redis+minio+sandbox).
 
-Asserts on the RAW mailbox stream via XRANGE (supervisor-independent — F0.6,
-since stop_session kills the root supervisor before it drains): one
-CANCEL_REQUEST per running child + CANCEL_ACK(cancelled) present + ZERO
-RESULT_READY(success) for the cancelled children; child rows reach a terminal
-status; resolves well under the 300s watchdog.
+Asserts on durable mailbox audit + terminal envelope storage after the raw
+mailbox streams have been cleaned: one CANCEL_REQUEST per running child +
+CANCEL_ACK(cancelled) present + ZERO RESULT_READY(success) for the cancelled
+children; child rows reach a terminal status; resolves well under the 300s
+watchdog.
 """
-import json
-
 import anyio
 import pytest
 from sqlalchemy import text
@@ -90,29 +88,34 @@ async def test_e2e_user_stop_cancels_children(
     elapsed = anyio.current_time() - start
     assert elapsed < 300  # resolved well under the 300s watchdog
 
-    # Let the cancelled children's CANCEL_ACK land after the CANCEL_REQUEST.
-    await anyio.sleep(3)
+    # Root terminal cleanup intentionally deletes the ephemeral Redis stream.
+    # Assert on durable consumer audit + terminal envelope storage, waiting for
+    # both independent child finalizers to settle.
+    cancel_req_children = 0
+    cancel_acks = 0
+    with anyio.fail_after(15):
+        while cancel_req_children < 2 or cancel_acks < 2:
+            async with async_session() as s:
+                cancel_req_children = (await s.execute(text("""
+                    SELECT COUNT(DISTINCT child_session_id)
+                    FROM mailbox_envelope_audit
+                    WHERE parent_session_id=:p AND type='CANCEL_REQUEST'
+                """), {"p": session_id})).scalar()
+                cancel_acks = (await s.execute(text("""
+                    SELECT COUNT(*) FROM coordinator_result_envelope_store
+                    WHERE coordinator_run_id LIKE :p AND envelope_type='CANCEL_ACK'
+                      AND payload->>'final_state' = 'cancelled'
+                """), {"p": f"{session_id}:%"})).scalar()
+            if cancel_req_children < 2 or cancel_acks < 2:
+                await anyio.sleep(0.2)
 
-    # Raw mailbox stream (supervisor-independent — F0.6). depth=1 -> root==parent.
-    from app.domain.models.mailbox_envelope import MAILBOX_STREAM_KEY_TEMPLATE
-    stream_key = MAILBOX_STREAM_KEY_TEMPLATE.format(root_session_id=session_id)
-    entries = await redis_real.xrange(stream_key)
-    envs = [json.loads(fields["envelope"]) for _id, fields in entries]
-
-    cancel_reqs = [e for e in envs if e["type"] == "CANCEL_REQUEST"]
-    cancel_acks = [
-        e for e in envs
-        if e["type"] == "CANCEL_ACK" and (e.get("payload") or {}).get("final_state") == "cancelled"
-    ]
-    success = [
-        e for e in envs
-        if e["type"] == "RESULT_READY" and (e.get("payload") or {}).get("outcome") == "success"
-    ]
-    # one CANCEL_REQUEST per running child (>=2 distinct children)
-    assert len({e["child_session_id"] for e in cancel_reqs}) >= 2
-    # cooperative cancel, NOT misleading success
-    assert len(cancel_acks) >= 2
-    assert success == []
+    async with async_session() as s:
+        success = (await s.execute(text("""
+            SELECT COUNT(*) FROM coordinator_result_envelope_store
+            WHERE coordinator_run_id LIKE :p AND envelope_type='RESULT_READY'
+              AND payload->>'outcome' = 'success'
+        """), {"p": f"{session_id}:%"})).scalar()
+    assert success == 0
 
     async with async_session() as s:
         statuses = [r[0] for r in (await s.execute(text(

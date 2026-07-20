@@ -141,6 +141,12 @@ _REDIS_STREAM_ID_RE = re.compile(r"^\d+-\d+$")
 # dispatched children fall back to the <=300s watchdog (NG1). Module-level so
 # tests can monkeypatch it small.
 _PARENT_CANCEL_FANOUT_TIMEOUT_SECONDS = 5.0
+# Keep the root MailboxSupervisor alive briefly after the parent task is
+# cancelled so it can consume + persist each child's terminal CANCEL_ACK before
+# ``_maybe_stop_supervisor_for_session`` tears it down. Bounded separately from
+# publish/enumeration; timeout falls back to the restart watchdog/reaper.
+_PARENT_CANCEL_DRAIN_TIMEOUT_SECONDS = 5.0
+_PARENT_CANCEL_DRAIN_TASK_REASON = "stop_child_drain"
 
 
 @dataclass(frozen=True)
@@ -3362,12 +3368,13 @@ class AgentService:
         # defense-in-depth: an exception OR a timeout is swallowed and the parent
         # still terminalizes (the dispatched children fall back to the watchdog —
         # NG1).
+        fanout_result = None
         if (
             session.worker_type == "root"
             and self._coordinator_parent_cancel_fanout is not None
         ):
             try:
-                await asyncio.wait_for(
+                fanout_result = await asyncio.wait_for(
                     self._coordinator_parent_cancel_fanout.cancel_children(
                         parent_session_id=session_id, reason="parent_cancel"
                     ),
@@ -3383,7 +3390,42 @@ class AgentService:
         # 2.根据会话获取任务信息
         task = await self._get_task(session)
         if task:
-            task.cancel(reason="stop")
+            task.cancel(
+                reason=(
+                    _PARENT_CANCEL_DRAIN_TASK_REASON
+                    if getattr(fanout_result, "enumerated", 0) > 0
+                    else "stop"
+                )
+            )
+
+        # The root task is now cancelled, so it cannot dispatch another child
+        # after the fanout snapshot. Keep its supervisor alive until the
+        # already-enumerated children leave RUNNING; that transition is written
+        # by the supervisor only after it durably consumes their terminal ACKs.
+        # Without this barrier, the supervisor stop below races the ACKs and
+        # user-stop leaks both terminal rows and child sandboxes until restart.
+        if (
+            getattr(fanout_result, "enumerated", 0) > 0
+            and self._coordinator_parent_cancel_fanout is not None
+        ):
+            try:
+                settled = await asyncio.wait_for(
+                    self._coordinator_parent_cancel_fanout.wait_for_children_terminal(
+                        parent_session_id=session_id
+                    ),
+                    timeout=_PARENT_CANCEL_DRAIN_TIMEOUT_SECONDS,
+                )
+                if not settled:
+                    logger.warning(
+                        "coordinator child terminal drain failed for parent=%s",
+                        session_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "coordinator child terminal drain failed or timed out for parent=%s",
+                    session_id,
+                    exc_info=True,
+                )
 
         # 3.更新会话任务状态
         async with self._uow_factory() as uow:
