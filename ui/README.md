@@ -17,15 +17,24 @@
   - 浏览器预览
   - VNC 画面
   - 时间线回放
+  - 子智能体树、合并时间线与成本汇总
+  - 上下文压缩折叠标记与详情弹窗
+  - `/help`、`/mcp`、`/skills`、`/cost`、`/permissions`、`/takeover`、
+    `/compact` 斜杠命令及 Skill 命令补全
+  - 图片、视频和 PDF/文档结构化工具结果预览
+  - 按会话 `sandbox_mode` 收缩工作台、VNC 与沙箱文件操作
 - 会话事件恢复（两条路径）：
   - **页面刷新 / 重新进入**：先 `GET /sessions/{id}` 拉完整快照，再 `POST /sessions/{id}/chat` 携带 `event_id` 续流
-  - **运行中连接中断**：通过 `GET /sessions/{id}/events?since=...` 增量取后续事件
+  - **运行中连接中断**：通过 `GET /sessions/{id}/events?since_seq=...&since=...` 增量补齐；优先使用单调 `seq`，同时保留 `event_id` 兼容旧事件。该 GET 不是实时订阅，补齐后会话仍在运行时需重新走 `/chat` 的 `event_id` 续流路径
 - 设置弹窗：
   - Agent 通用配置
   - 模型提供商配置
   - MCP 服务器
   - A2A Agent 配置
   - Skill 生态
+  - MCP / A2A / Skill 运行时扩展总览、探测与统一启停
+  - Plugin 安装、启停与卸载
+  - 记忆管理（创建、编辑、筛选、批量删除、pin/unpin）
   - 文件理解配置（视觉降级、音频转录、视频分析）— 视觉/音频面板新版样式
   - 用户管理
 - 文件传输面板：上传/下载进度跟踪、EMA 测速、取消和重试
@@ -116,6 +125,13 @@ ui/
 - `components/workbench-browser-preview.tsx`
 - `components/vnc-viewer.tsx`
 - `components/manus-settings.tsx`
+- `components/command-menu.tsx` — 斜杠命令筛选与键盘补全
+- `components/session/agent-tree-panel.tsx` — 子智能体层级与运行状态
+- `components/session/merged-timeline-panel.tsx` — 父子会话合并时间线
+- `components/session/compaction-detail-modal.tsx` — 上下文压缩详情
+- `components/settings/extensions-overview.tsx` — 运行时扩展清单与治理入口
+- `components/settings/plugin-install-dialog.tsx` — Plugin 安装流程
+- `components/settings/memory-management.tsx` — 用户记忆管理
 - `components/markdown-renderer.tsx` — react-markdown + shiki 渲染管道
 - `components/tool-confirmation-card.tsx` — 工具调用确认卡片，对接后端工具审批系统
 - `components/transfer-panel.tsx` — 文件传输进度面板
@@ -128,8 +144,12 @@ Zustand store 位于：
 - `src/lib/store/auth-store.ts`
 - `src/lib/store/session-store.ts`
 - `src/lib/store/settings-store.ts`
+- `src/lib/store/lifecycle-store.ts` — C7 生命周期事件的灰度 typed reducer 状态
 - `src/lib/store/transfer-store.ts` — 文件传输状态管理（进度、速度、取消）
 - `src/lib/store/ui-store.ts`
+
+斜杠命令定义与执行位于 `src/lib/commands/`；父子会话树归一化位于
+`src/lib/agent-tree.ts`；生命周期事件协议与分发位于 `src/lib/lifecycle/`。
 
 ## HTTP 客户端
 

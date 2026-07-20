@@ -17,11 +17,11 @@
 
 ## 项目概览
 
-Actus 由三个核心运行时组成：
+Actus 由三个核心应用运行时组成：
 
-- `api/`：FastAPI 后端，负责会话、Agent、权限、文件、配置、Skill 生态与沙箱调度
+- `api/`：FastAPI 后端，负责会话、Agent、权限、文件、配置、扩展治理与沙箱调度
 - `ui/`：Next.js 16 前端，提供聊天、任务摘要、工作台、设置页和管理界面
-- `sandbox/`：按会话动态拉起的 Docker 沙箱，内置 Shell、文件系统、Chromium、VNC/noVNC
+- `sandbox/`：启用沙箱时按会话动态拉起的 Docker 运行时，内置 Shell、文件系统、Chromium、VNC/noVNC
 
 系统基于 **LangGraph** 状态机实现 `Planner + ReAct` 双阶段流程：先规划任务，再逐步执行，并在执行过程中通过 SSE 持续推送计划、步骤、工具调用、消息和接管事件。
 
@@ -29,21 +29,23 @@ Actus 由三个核心运行时组成：
 
 - **LangGraph Agent 编排**：两层图架构（main_graph 规划调度 + react_graph 工具执行循环），支持规划、步骤执行、等待用户输入、最终总结，并通过 `FINISHING` 中间态承载异步收尾
 - **LangChain 工具体系**：文件、Shell、浏览器、搜索工具通过 `@tool` 装饰器统一注册
-- **MCP / A2A / Skill 扩展**：统一纳入 Agent 工具选择与运行时编排，支持渐进式 MCP 工具发现和基于 Embedding 的 Skill 语义选择
+- **统一扩展运行时与治理**：MCP / A2A / Skill / Plugin 统一进入扩展总览；MCP/A2A/Skill 支持全局与用户级启停，Plugin 使用独立父级启停；并提供健康探测、调用统计及可选的 `off` / `shadow` / `enforce` 治理模式（安装预检、来源与内容 pin、隔离、重新批准、审计）
+- **Plugin 组合安装**：`plugin.json` 可声明 Skill、MCP、A2A 成员；支持脱敏 dry-run 预览，以及带补偿和启动恢复的安装/卸载 saga
 - **Skill v2 文件系统存储**：Skill 保存在 `/app/data/skills`，支持 GitHub、本地目录和 SKILL.md 格式安装
 - **多模态文件理解**：音频转录（Whisper API / 沙箱 faster-whisper）、PDF 解析（原生 / pymupdf4llm）、图片处理、视频关键帧提取 + 视觉模型分析
 - **上下文溢出治理**：两级渐进压缩（85% LLM 摘要 / 95% 硬截断）+ 同步三阶段裁剪，自动保护上下文窗口
 - **模块化提示词系统（B5）**：sections / bundles / reminders / assembler / budget 子模块组合，支持中英文 bundle 和按情境注入的 reminders
 - **Agent 记忆系统（M1 Memory Redesign 完成）**：三分类（`user` / `rule` / `fact`）+ `memory_search` / `memory_get` / `memory_save` 工具 + 检索流水线（cosine 相似度 → 时间衰减 → MMR 多样性重排）+ Embedding 熔断器；文件为事实源（host bind-mount 到 sandbox 只读）+ `FsReconciler` 后台修复 DB/fs 一致性；LLM 质量闸（独立 CircuitBreaker + per-user daily cap）+ 系统通知（gate paused / quota exceeded / fs failure）
-- **工具审批与确认系统**：用户级永久允许/拒绝规则（`always_allow` / `always_deny`，按 command/dir glob 匹配）+ 会话级允许缓存（仅对 approve 生效）+ Smart Approve 智能批准 + 显式确认（前端 approve 支持 once/session/always 三档，deny 为一次性），含风险评估和持久化审计日志
+- **Permission Engine 工具审批**：native / MCP / A2A / Skill 统一进入决策链；用户可按工具设置 `auto` / `ask` / `deny`，显式确认支持 session / always grant，Smart Approve 超时或异常时回落人工确认，并保留持久化审计
 - **会话事件恢复**：基于 Redis Stream 的 SSE 状态恢复，刷新或断线重连后从最后位点继续
 - **执行健康监控**：步骤级 watchdog + 执行指标采集 + 工具失败追踪 + 统一 JSON Envelope
 - **LLM 调用预算**：连接阶段 / 读取阶段独立 timeout 预算，与 LangGraph RetryPolicy 对齐，避免 9 次 HTTP 重试放大
 - **人工接管**：支持 `shell` 和 `browser` 两类接管，包含申请、续期、结束、补救流程
 - **工作台视图**：终端预览、浏览器预览、VNC 画面、时间线回放、文件预览
 - **流式交互**：会话列表与对话执行均支持 SSE；接管终端和 VNC 使用 WebSocket
-- **容器化沙箱**：每个会话独立 Docker 容器，内置 Chromium、Xvfb、x11vnc、websockify
-- **对象存储与附件**：上传文件落到 MinIO/S3 兼容存储，并与会话关联；文件传输支持进度跟踪、断点续传
+- **三档沙箱供给**：`always` 在任务启动时预置沙箱，`on_demand` 延迟到首个沙箱访问，`off` 完全关闭沙箱工具、接管与容器供给面
+- **容器化沙箱**：启用沙箱时，每个会话使用独立 Docker 容器，内置 Chromium、Xvfb、x11vnc、websockify
+- **对象存储与附件**：标准 Compose 默认启动 loopback-only MinIO，也支持远程 S3 兼容存储；上传文件与会话关联，文件传输支持进度跟踪、断点续传
 - **用户与管理**：JWT 鉴权、超级管理员、用户管理、工具偏好、应用设置
 - **SSH 隧道**：可选的 autossh 反向隧道，将本地 API 暴露到云服务器
 - **多语言贯通**：`Message.language` 字段贯穿 prompt assembler，按用户语言派发中英文 bundle
@@ -94,19 +96,23 @@ git clone https://github.com/hahaliu1029/Actus.git
 cd Actus
 
 cp .env.example .env
+cp api/config.yaml.example api/config.yaml
 # 编辑 .env，至少填写：
 # POSTGRES_PASSWORD
 # JWT_SECRET_KEY
 # MINIO_ACCESS_KEY
 # MINIO_SECRET_KEY
+# MEMORY_ROOT_HOST=/absolute/path/to/actus-memory
 # NEXT_PUBLIC_API_BASE_URL
+# 非专门验证 coordinator 时，显式设置 ACTUS_C2_COORDINATOR_ENABLED=false；
+# .env.example 当前为 CI/评估方便保留 true，但生产 rollout gate 尚未完成
 # 可选：如需覆盖默认 Python 包镜像，设置 PYTHON_PACKAGE_INDEX_URL
 
 # Memory 系统首次部署（Memory Redesign M1 起必做）：
-# host 端 memory 根目录必须存在，否则 docker compose up 会在 api 容器挂载阶段失败
-mkdir -p ~/.actus/memory
+# MEMORY_ROOT_HOST 必须是 host 绝对路径，且目录必须预先存在
+mkdir -p /absolute/path/to/actus-memory
 # 如你在 .env 里启用了 ACTUS_UID 非 root 模式，请额外执行：
-# sudo chown -R ${ACTUS_UID:-1000}:${ACTUS_GID:-1000} ~/.actus/memory
+# sudo chown -R ${ACTUS_UID:-1000}:${ACTUS_GID:-1000} /absolute/path/to/actus-memory
 
 docker compose --env-file .env up -d --build
 
@@ -126,19 +132,55 @@ docker compose exec api python scripts/create_super_admin.py
 启动前会幂等创建 `a2a-mcp` bucket。S3 API 为 `http://127.0.0.1:9000`，管理控制台为
 `http://127.0.0.1:9001`，凭据来自 `.env` 的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`。
 修改 `MINIO_API_PORT` 后，对外 endpoint 会自动变为 `localhost:<port>`；只有需要覆盖
-主机名或 TLS 时才设置 `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_SECURE`。
+主机名或 TLS 时才设置 `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_SECURE`。根 `.env` 中的
+`MINIO_ENDPOINT` 不控制标准 Compose：API 的内部 I/O 固定走 `minio:9000`。
 
-Compose 固定的归档 MinIO release 镜像用于可复现的本地开发，不作为生产基线。生产
-部署或需要远程 URL 消费者时，应由部署者维护远程 S3 或受保护的 TLS endpoint。现有
-`tunnel` profile 只转发 API，不转发本地 MinIO；MCP 或其他远程 URL 直接拉取方必须能
-访问上述 remote/public endpoint。
+从远程存储切换到本地 MinIO 会得到新的空数据集；系统不会自动迁移原附件。Compose 固定的
+归档 MinIO release 镜像用于可复现的本地开发，不作为生产基线。生产部署或需要远程 URL
+消费者时，应由部署者维护远程 S3 或受保护的 TLS endpoint。现有 `tunnel` profile 只转发
+API，不转发本地 MinIO；MCP 或其他远程 URL 直接拉取方必须能访问上述 remote/public endpoint。
 
 ### 运行时配置说明
 
-- Compose 模式下，后端运行时配置文件实际位于 `api-data` volume 内的 `/app/data/config.yaml`
-- 如果该文件不存在，后端会按代码默认值自动创建
-- 推荐在首次启动后，通过前端 `设置 -> 模型提供商 / MCP 服务器 / A2A Agent 配置 / Skill 生态` 完成配置
+- 标准 Compose 将 host 侧 `api/config.yaml` bind-mount 到容器内 `/app/data/config.yaml`
+- 首次启动前应按上面的 quick start 从 `api/config.yaml.example` 初始化该文件
+- 推荐在首次启动后，通过前端 `设置 -> 模型提供商 / 扩展总览 / MCP 服务器 / A2A Agent 配置 / Skill 生态` 完成配置
 - `api/config.yaml.example` 主要用于**本地后端开发**或你需要手工预填配置文件时参考
+
+### 沙箱供给模式
+
+`SANDBOX_PROVISION_MODE` 是仅由环境变量控制、重新创建 API 容器后生效的部署级开关
+（`docker compose restart api` 不会应用新环境变量）：
+
+- `always`（默认）：任务启动时获取或创建会话沙箱
+- `on_demand`：首个沙箱工具、VNC、接管或 coordinator 父沙箱 I/O 才触发创建；纯聊天会话不创建容器
+- `off`：不注册沙箱/Skill 创建工具，关闭接管和 VNC，并保证应用路径不创建容器
+
+`off` 部署必须使用 [docker-compose.sandbox-off.yml](docker-compose.sandbox-off.yml) 移除
+`sandbox-image` 依赖和 Docker socket，并先关闭三个 coordinator 开关。完整的 drain、部署、
+验证与回退命令见 [sandbox off runbook](docs/runbooks/sandbox-off-runbook.md)。
+`SANDBOX_PROVISION_TIMEOUT_SECONDS` 只控制 `on_demand` 创建、就绪和 post-provision hooks
+的总预算。
+
+### 扩展治理模式
+
+`EXTENSION_GOVERNANCE_MODE` 同样是仅由环境变量控制、重新创建 API 容器后生效的部署级
+开关（不要用不会刷新环境变量的 `docker compose restart api`）：
+
+- `off`（默认）：不启用治理 registry 与 Plugin 管道，现有 MCP / A2A / Skill 配置路径保持原行为
+- `shadow`：记录扫描、观测、pin 和审计；检测类异常 fail-open，但隔离、停用、删除、父 Plugin 阻断仍生效
+- `enforce`：对未 pin、pin 失配或治理存储不可用的扩展 fail-closed
+
+治理开启后，管理员可在“扩展总览”执行观测刷新、pin 批准、隔离、重新批准、治理启停和
+Plugin 安装/卸载。前端 Plugin 安装入口先执行脱敏 dry-run；API 调用方在同一端点显式选择
+dry-run 或正式安装。`shadow` 下 caution/dangerous 检测结果只告警；`enforce` 下 caution
+需要 `acknowledge`、dangerous 需要 `force`；MCP/A2A 成员 probe 失败在 `shadow` / `enforce`
+都需要 `force`。
+
+不要从 `off` 直接切到 `enforce`：先以 `shadow` 重建 API，刷新 observation、检查审计并批准
+计划启用的 pin，再进入 `enforce`。反向切到 `off` 也不是“保持现状但停止记账”：Plugin 管理面
+与父项 `parent_blocked` 投影会消失，已物化成员将按原 MCP/A2A/Skill 配置继续运行。完整流程和
+边界见 [API 文档](api_zhcn.md#plugin-v2plugins)。
 
 ### 修改 `sandbox/` 后的正确重建方式
 
@@ -168,11 +210,17 @@ npm run dev
 
 后端本地运行与 Compose 使用的根目录 `.env` 不是一套变量。`api/core/config.py` 读取的是 `api/.env` 中的运行时变量，例如：
 
+下面的 `api/.env` 只适用于 host-run API 或自定义编排；标准 Compose 会把 API 内部
+`MINIO_ENDPOINT` 覆盖为 `minio:9000`。
+
 ```bash
 cd api
 cp config.yaml.example config.yaml
+```
 
-cat > .env <<'EOF'
+仅当 `api/.env` 不存在时创建它；已有文件应逐项合并并先备份，不要覆盖本地密钥：
+
+```dotenv
 ENV=development
 LOG_LEVEL=INFO
 APP_CONFIG_FILEPATH=config.yaml
@@ -191,12 +239,13 @@ MINIO_BUCKET_NAME=a2a-mcp
 JWT_SECRET_KEY=replace-with-a-strong-random-string
 SANDBOX_IMAGE=actus-sandbox:latest
 SANDBOX_NAME_PREFIX=actus-sb
-EOF
+```
 
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-bash dev.sh
+```bash
+cd ..
+uv sync
+cd api
+uv run bash dev.sh
 ```
 
 本地后端开发通常还需要：
@@ -212,7 +261,7 @@ bash dev.sh
 ```bash
 # 后端
 cd api
-pytest
+uv run pytest
 
 # 前端
 cd ui
@@ -266,10 +315,10 @@ Actus/
 | 上下文治理 | TokenEstimator、ContextAssembler、GradualCompactor |
 | 文件理解 | Whisper (OpenAI/sandbox)、pymupdf4llm、视觉模型帧分析 |
 | Embedding | OpenAI Embeddings、Redis 缓存、numpy 向量索引 |
-| 扩展协议 | MCP（含渐进式发现）、A2A、Skill（含 SKILL.md 格式） |
+| 扩展协议 | MCP（含渐进式发现）、A2A、Skill（含 SKILL.md 格式）、Plugin 组合包与扩展治理 |
 | 前端 | Next.js 16、React 19、Tailwind CSS 4、Zustand |
 | 浏览器执行 | Chromium、CDP、Playwright 风格 DOM 操作 |
-| 沙箱 | Docker、Supervisor、Xvfb、x11vnc、websockify |
+| 沙箱 | Docker、Supervisor、Xvfb、x11vnc、websockify；always / on_demand / off 三档供给 |
 | 测试 | pytest、Vitest、Testing Library |
 
 ## 许可证

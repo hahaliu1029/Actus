@@ -37,6 +37,12 @@
 
 ```bash
 cp .env.example .env
+cp api/config.yaml.example api/config.yaml
+mkdir -p "$HOME/.actus/memory"
+# 编辑 .env：至少替换 PostgreSQL/JWT/MinIO 默认密钥、NEXT_PUBLIC_API_BASE_URL，
+# 把 MEMORY_ROOT_HOST 改成上面目录展开后的宿主机绝对路径（不要写 ~）。
+# 非专门验证 coordinator 时，同时设置 ACTUS_C2_COORDINATOR_ENABLED=false；
+# 模板当前为 CI/评估方便保留 true，生产 rollout gate 尚未完成。
 docker compose --env-file .env up -d --build
 ```
 
@@ -51,6 +57,14 @@ Compose 固定的归档 MinIO release 镜像不作为生产基线。生产部署
 API，不转发本地 MinIO；MCP 或其他远程 URL 直接拉取需要可访问的 remote/public
 endpoint。
 
+沙箱供给由 `SANDBOX_PROVISION_MODE=always|on_demand|off` 控制：`always` 保持每个
+session 预置父沙箱的默认行为；`on_demand` 延迟到首次沙箱工具、VNC、接管或 coordinator
+父沙箱 I/O 触发；
+`off` 完全关闭沙箱面。`always` / `on_demand` 使用标准 Compose；`off` 必须先 drain
+存量容器、关闭三个 coordinator flag，再叠加 `docker-compose.sandbox-off.yml`，不能只改
+环境变量。完整流程见
+[`docs/runbooks/sandbox-off-runbook.md`](docs/runbooks/sandbox-off-runbook.md)。
+
 ### 方式二：本地运行前端或后端
 
 适合快速迭代某个子项目，但要注意前后端与 Compose 使用的配置来源不同。
@@ -59,14 +73,25 @@ endpoint。
 
 ### 1. 启动依赖
 
-你至少需要 PostgreSQL、Redis，以及一个已经构建好的 `sandbox-image`。最简单做法是：
+你至少需要宿主机可访问的 PostgreSQL、Redis，以及一个已经构建好的 `sandbox-image`。
+标准 Compose 的 PostgreSQL/Redis 不发布 host 端口，不能直接配合 host-run API；可启动
+两个显式绑定 loopback 的一次性开发容器，并复用标准 Compose 的 MinIO：
 
 ```bash
-docker compose up -d postgres redis minio minio-init
-docker compose build sandbox-image
+docker run -d --rm --name actus-pg-dev \
+  -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=manus \
+  pgvector/pgvector:pg17
+docker run -d --rm --name actus-redis-dev \
+  -p 127.0.0.1:6379:6379 \
+  redis:8.2 redis-server --appendonly yes
+docker compose --env-file .env up -d minio minio-init
+docker compose --env-file .env build sandbox-image
 ```
 
-这会复用标准 Compose 的本地 MinIO；宿主机直跑 API 时使用下面的 loopback 配置。
+如果本机端口已被占用，请同步改 host 映射和 `api/.env`。上述 pg/redis 容器在
+`docker stop actus-pg-dev actus-redis-dev` 后自动删除，适合一次性开发数据；需要保留数据时
+请显式添加专用 volume。宿主机直跑 API 时使用下面的 loopback 配置。
 
 ### 2. 配置本地后端环境
 
@@ -102,19 +127,54 @@ cp config.yaml.example config.yaml
 
 ### 3. 安装依赖并启动
 
+后端 Python 命令统一使用仓库的 uv workspace 环境，不要调用系统
+`python` / `python3` / `pytest` / `pip`：
+
 ```bash
+uv sync
 cd api
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-bash dev.sh
+uv run bash dev.sh
 ```
 
 ### 4. 后端测试
 
+日常开发优先跑受影响的 unit 路径：
+
 ```bash
 cd api
-pytest
+uv run pytest tests/app/ -v
+# 或精确到文件 / test node
+uv run pytest tests/core/test_sandbox_provision_mode_config.py -v
+```
+
+`tests/integration/` 会在 module 启动时执行 Alembic migration，不能指向 Compose 的
+开发库 `manus`。Compose PostgreSQL 默认也不向宿主机发布端口。本地确需跑 integration
+时，使用独立的 `manus_test` 容器；推荐映射到 `127.0.0.1:55432`，避免与其他 PostgreSQL
+冲突：
+
+```bash
+docker run -d --rm --name actus-pg-test \
+  -p 127.0.0.1:55432:5432 \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=manus_test \
+  pgvector/pgvector:pg17
+
+cd api
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/manus_test \
+  uv run pytest tests/integration/<target> -v
+```
+
+部分 integration 还依赖 Redis、MinIO 或真实 sandbox，按目标 fixture 准备依赖；不要为了
+跑测试把 URL 改成 `.../manus`。CI 的 `backend-test` 使用独立 `manus_test` PostgreSQL 与
+Redis，并排除 `coordinator_recovery`、`slow`、`sandbox`、`browser_eval`；
+`coordinator-e2e`、sandbox adversarial 与 real-image smoke 由各自 job 单独运行。
+
+`sandbox/` 是独立 pytest project；它与 `api/app` 使用同名顶层 package，不能混在同一
+pytest collection 中。沙箱纯单元测试从 member 目录运行：
+
+```bash
+cd sandbox
+uv run --locked pytest -q
 ```
 
 ## Prompt Assembly 不变式（B5 两时钟架构）
@@ -176,6 +236,20 @@ executor_node 在默认生产路径下**局部**消费 `StepMetadata.skill_conte
 Actus 的沙箱生命周期由 `SandboxLifecycleService` 管理，采用 K8s 风格的
 terminal-state 状态机（详见 `docs/superpowers/specs/2026-04-15-sandbox-lifecycle-design.md`）。
 
+### 三档供给契约
+
+| 模式 | 运行时约束 |
+|------|------------|
+| `always` | eager accessor；session run 启动时准备父沙箱，保持既有行为 |
+| `on_demand` | provisioner 单飞；首个沙箱触发才执行 create / ready / hooks，超时总预算由 `SANDBOX_PROVISION_TIMEOUT_SECONDS` 控制 |
+| `off` | 零 lifecycle mutation；不注册沙箱工具，拒绝 VNC/接管/skill-create；部署时必须移除 Docker Socket |
+
+`off` 的结构契约由 `docker-compose.sandbox-off.yml` 固化：literal-pin
+`SANDBOX_PROVISION_MODE=off`，从 `api.depends_on` 删除 `sandbox-image`，从 volumes 删除
+`/var/run/docker.sock`，并通过 profile 停用 `sandbox-image`。该 override 使用 Compose
+`!override`，要求 Docker Compose ≥ 2.24.4。`off` 与任一 coordinator flag 为 `true`
+互斥，API 启动期会 fail-fast。
+
 ### 单 Worker 硬约束
 
 **当前 sandbox lifecycle 仅支持单 worker 部署。** 状态转换通过进程内
@@ -224,11 +298,13 @@ Prompt snapshot（session-scoped 注入）。三者的同步边界：
 
 **首次部署 checklist**（`README.md` 同步要求）：
 ```bash
-mkdir -p ${MEMORY_ROOT_HOST:-~/.actus/memory}     # host bind source 必须先存在
+mkdir -p "$HOME/.actus/memory"
+# .env 中的 MEMORY_ROOT_HOST 必须填写该目录展开后的宿主机绝对路径，不能写 ~
 # 如果用 ACTUS_UID 非 root 跑 api，先 chown 把所有权翻过去
 ```
 
-运维路径：`python -m app.cli.memory_reconcile [--user-id UID]` 手动全库扫
+运维路径（从 `api/` 执行）：`uv run python -m app.cli.memory_reconcile [--user-id UID]`
+手动全库扫
 DB/fs 一致性（覆盖 pending backlog + per-user fs walk + orphan 隔离）。
 
 ## C2 CoordinatorTaskRunner Deployment (spec §6.4)
@@ -521,7 +597,7 @@ docs: refresh deployment and API docs
 
 提交 PR 前请尽量完成以下检查：
 
-- 后端相关改动已运行 `pytest`
+- 后端相关改动已通过 `uv run pytest <focused-path>`；涉及 integration 时使用隔离的 `manus_test`
 - 前端相关改动已运行 `npm run test`
 - 如涉及构建链路，已运行 `npm run build`
 - 文档与代码一致

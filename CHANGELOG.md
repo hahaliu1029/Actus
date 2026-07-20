@@ -4,7 +4,39 @@
 
 ## [Unreleased]
 
-_最新批次：2026-05-18 (PE-1)_
+_最新批次：2026-07-16（沙箱供给模式收口）_
+
+### 2026-07 核心能力更新
+
+- **三档沙箱供给模式**：新增 env-only 的
+  `SANDBOX_PROVISION_MODE=always|on_demand|off`。`on_demand` 延迟到首个沙箱或
+  浏览器工具调用再单飞建容器；`off` 同时收缩工具、提示词、会话端点和前端工作台
+  表面，并提供 `docker-compose.sandbox-off.yml` 与运维 runbook。
+- **扩展与 Plugin 治理（D1a）**：统一 MCP / A2A / Skill 运行时清单，新增
+  `off|shadow|enforce` 治理模式、准入与隔离、审计、pin/reapprove，以及 Plugin
+  安装/卸载 saga；管理面路由位于 `/api/v1/runtime/extensions`、
+  `/api/v2/extensions`、`/api/v2/plugins`。
+- **本地 MinIO Compose 栈**：标准 Compose 默认启动 loopback-only MinIO，
+  `minio-init` 幂等创建 bucket；内部 endpoint 与浏览器可访问的 public endpoint
+  分离，并增加结构测试与 `scripts.verify_local_minio` 验证入口。
+- **斜杠命令（B11）**：前端新增 `/help`、`/mcp`、`/skills`、`/cost`、
+  `/permissions`、`/takeover`、`/compact`，并允许已启用 Skill 作为受校验的命令入口。
+- **多模态文件链路（B12）**：图片/视频 `media_type`、PDF/文档结构化预览、文件处理
+  缓存与并行页处理进入默认路径，工具事件保留对应的结构化渲染元数据。
+- **统一生命周期事件（C7）**：新增 plan / step / tool / task / subagent 封闭事件词表、
+  单一构造入口、SSE dual-emit 与前端 typed reducer；后端与前端开关继续默认关闭，按
+  同版本 pod 灰度开启。
+- **多智能体会话面**：补齐子会话树、成本树、合并时间线、研究子智能体入口和
+  subagent run 可选持久化观测面。
+
+### 2026-06 权限与协调器更新
+
+- **Permission Engine 完成主路径接管**：native / Skill / MCP / A2A 来源统一进入
+  `DefaultPermissionEngine`；审批持久化收敛到 ApprovalState Reader/Writer，旧
+  `tool_approval_rules` fallback、legacy flags 与缓存旁路已经退役。
+- **CoordinatorTaskRunner**：并行 work unit、mailbox supervisor、child scope、预算、
+  取消/回收、shell-capable task、层级治理与 agent-team bundle 已接入；生产开关和
+  canary/rollback 仍按 `CONTRIBUTING.md` 与 runbook 执行。
 
 ### Permission Engine (PE-1)
 
@@ -21,11 +53,11 @@ _最新批次：2026-05-18 (PE-1)_
 
 ### 新增
 
-- **工具审批规则与确认系统**：组合三层策略
-  - **用户级永久规则**：`tool_approval_rule.py` 模型（`always_allow` / `always_deny`，按 command + dir glob 匹配，按 `user_id` 持久化），仓储 `tool_approval_rule_repository.py` / `tool_approval_log_repository.py`，ORM 与迁移 `s1_add_tool_approval_tables.py`
-  - **会话级允许缓存**：`approval_cache.py` 在 Redis 写 `approval:{session_id}:{tool_name}:{arg_digest}`（TTL 24h，仅缓存 approve；deny 不缓存）
-  - **运行时决策**：`risk_assessor.py` 划分风险等级，`smart_approve.py` 通过 `summary_llm` 做独立的 LLM 风险判定（返回 approve/deny/escalate），`confirmation_manager.py` 在需要显式确认时暂停 graph 并发出 `ToolConfirmationEvent`
-  - 前端 `tool-confirmation-card.tsx`：approve 提供 once / session / always 三档（对应"本次"/"本会话"/"始终"），deny 仅一次性
+- **工具审批与确认系统**：当前实现已经收敛到 Permission Engine
+  - **用户偏好**：`user_tool_approval_policy.py` 按 canonical tool name 保存 `auto` / `ask` / `deny`，覆盖 native / MCP / A2A / Skill
+  - **Grant 持久化**：`approval_grant.py` + ApprovalState Reader/Writer 保存 session / always 范围的 approve/deny 决策；旧 `tool_approval_rules` 与 Redis `approval_cache` 旁路已退役
+  - **运行时决策**：`permission/default_engine.py` 组合来源、用户偏好、child scope、风险与 escalation；Smart Approve 超时或基础设施错误时 fail-safe 回落人工确认
+  - **暂停与恢复**：`permission/confirmation_queue.py` 承载 durable confirmation 与 resume preflight，前端 `tool-confirmation-card.tsx` 展示用户决策
 - **会话事件恢复（SSE State Recovery）**：基于 Redis Stream 的 `infrastructure/external/event_recovery/redis_event_recovery.py`，支持刷新或断线重连后从最后位点恢复事件流；前端 `session-recovery.test.ts` 覆盖端到端恢复路径（对应 TODOS #23 E2）
 - **记忆系统下沉到 Agent 工具层**：
   - 新增 `domain/services/tools/memory_tools.py`：`memory_search`（embedding 召回 + ranker 流水线）和 `memory_get`（按 chunk_id 取详情）两个 Agent 可调工具
