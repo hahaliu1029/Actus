@@ -135,7 +135,7 @@ jobs:
       - name: Build sandbox image
         # Coordinator E2E must exercise the sandbox code from this commit.
         # Pulling a mutable `latest` can silently bypass local sandbox fixes.
-        run: docker build -t actus-sandbox:latest sandbox/
+        run: docker build --build-arg PYTHON_PACKAGE_INDEX_URL=https://pypi.org/simple -t actus-sandbox:latest sandbox/
       - name: Run coordinator E2E (flag-on)
         env:
           SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/manus_test
@@ -232,7 +232,7 @@ jobs:
         # (plan-R2 P3 silent-failure fix).
         run: |
           for i in 1 2 3; do
-            docker build -t actus-sandbox:latest sandbox/ && exit 0
+            docker build --build-arg PYTHON_PACKAGE_INDEX_URL=https://pypi.org/simple -t actus-sandbox:latest sandbox/ && exit 0
             echo "build attempt $i failed"; sleep 10
           done
           exit 1
@@ -315,10 +315,10 @@ jobs:
           grep -Fq 'published: "19000"' <<<"$minio_block"
 
       - name: Build API image
-        run: docker build -t actus-api:ci ./api
+        run: docker build --build-arg PYTHON_PACKAGE_INDEX_URL=https://pypi.org/simple -t actus-api:ci ./api
 
       - name: Build Sandbox image
-        run: docker build -t actus-sandbox:ci ./sandbox
+        run: docker build --build-arg PYTHON_PACKAGE_INDEX_URL=https://pypi.org/simple -t actus-sandbox:ci ./sandbox
 
       - name: Build UI image
         run: docker build -t actus-ui:ci ./ui --build-arg NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api
