@@ -78,7 +78,8 @@ The default execution model is a **LangGraph**-based `Planner + ReAct` flow: Act
 ```
 </details>
 
-For backend layering and runtime composition, see [项目架构.md](项目架构.md). Source: [architecture.excalidraw](architecture.excalidraw).
+For backend layering and runtime composition, see [项目架构.md](项目架构.md). Diagram sources:
+[architecture.mmd](architecture.mmd) / [architecture.excalidraw](architecture.excalidraw).
 
 ## Docker Compose Quick Start
 

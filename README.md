@@ -78,7 +78,8 @@ Actus 由三个核心应用运行时组成：
 ```
 </details>
 
-后端分层与关键模块见 [项目架构文档](项目架构.md)。源文件：[architecture.excalidraw](architecture.excalidraw)。
+后端分层与关键模块见 [项目架构文档](项目架构.md)。图源：
+[architecture.mmd](architecture.mmd) / [architecture.excalidraw](architecture.excalidraw)。
 
 ## Docker Compose 快速开始
 

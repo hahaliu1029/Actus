@@ -1,0 +1,69 @@
+---
+title: Actus Architecture
+---
+flowchart TB
+  subgraph Clients["Clients"]
+    client["Browser / Mobile"]
+  end
+
+  subgraph Frontend["Frontend"]
+    gateway["Nginx Gateway<br/>:80"]
+    ui["Next.js 16<br/>React 19 + Zustand"]
+  end
+
+  subgraph Backend["FastAPI Backend"]
+    direction TB
+    interfaces["Interfaces<br/>Routes · SSE · WebSocket"]
+    application["Application Services<br/>Session · Sandbox · Extensions"]
+    agent["Agent Runtime<br/>LangGraph · Planner/ReAct<br/>Coordinator + Lifecycle"]
+    policy["Policy + Extensions<br/>Permission Engine<br/>MCP · A2A · Skill · Plugin"]
+    cognition["Memory + Context<br/>Recall · Prompt Assembly<br/>Compaction · Cost"]
+    infrastructure["Infrastructure Adapters<br/>Postgres · Redis · MinIO · Docker"]
+
+    interfaces --> application
+    application --> agent
+    application --> policy
+    application --> cognition
+    agent --> infrastructure
+    policy --> infrastructure
+    cognition --> infrastructure
+  end
+
+  subgraph Dependencies["Runtime Dependencies"]
+    direction TB
+    llm["LLM Providers<br/>Chat / Responses"]
+    extensions["Extension Providers<br/>MCP · A2A · Skill Bundles"]
+    postgres["PostgreSQL 17 + pgvector<br/>Business · Checkpoints · Governance"]
+    redis["Redis 8.2<br/>Recovery · Cache · Limits · Mailbox"]
+    object["MinIO / S3<br/>Attachments · Presigned URLs"]
+    sandbox["Session Sandbox<br/>always · on_demand · off<br/>Shell · Browser · VNC"]
+  end
+
+  client --> gateway --> ui --> interfaces
+  agent --> llm
+  policy --> extensions
+  infrastructure --> postgres
+  infrastructure --> redis
+  infrastructure --> object
+  infrastructure --> sandbox
+
+  classDef clientNode fill:#2563eb,color:#ffffff,stroke:#1e3a8a,stroke-width:2px
+  classDef frontendNode fill:#bfdbfe,color:#172554,stroke:#2563eb,stroke-width:2px
+  classDef interfaceNode fill:#a7f3d0,color:#064e3b,stroke:#047857,stroke-width:2px
+  classDef domainNode fill:#ddd6fe,color:#3b0764,stroke:#7c3aed,stroke-width:2px
+  classDef policyNode fill:#fef3c7,color:#713f12,stroke:#d97706,stroke-width:2px
+  classDef infraNode fill:#fed7aa,color:#7c2d12,stroke:#c2410c,stroke-width:2px
+  classDef dependencyNode fill:#f1f5f9,color:#0f172a,stroke:#475569,stroke-width:2px
+
+  class client clientNode
+  class gateway,ui frontendNode
+  class interfaces,application interfaceNode
+  class agent,cognition domainNode
+  class policy policyNode
+  class infrastructure infraNode
+  class llm,extensions,postgres,redis,object,sandbox dependencyNode
+
+  style Clients fill:#eff6ff,stroke:#93c5fd,stroke-width:2px
+  style Frontend fill:#eff6ff,stroke:#60a5fa,stroke-width:2px
+  style Backend fill:#f8fafc,stroke:#334155,stroke-width:2px
+  style Dependencies fill:#f8fafc,stroke:#64748b,stroke-width:2px
