@@ -46,15 +46,15 @@ class TestConfigSnapshot:
 
 
 class TestGenerationBasedRefresh:
-    def test_fast_path_no_refresh(self):
+    def test_fast_path_no_refresh(self, monkeypatch):
         import app.interfaces.service_dependencies as mod
 
         mock_request = MagicMock()
         mock_agent_svc = MagicMock()
         mock_request.app.state.agent_service = mock_agent_svc
 
-        mod._config_generation = 1
-        mod._last_refresh_generation = 1
+        monkeypatch.setattr(mod, "_config_generation", 1)
+        monkeypatch.setattr(mod, "_last_refresh_generation", 1)
 
         with patch.object(mod, "_load_app_config"):
             result = mod.get_agent_service(mock_request)
@@ -62,7 +62,7 @@ class TestGenerationBasedRefresh:
         assert result is mock_agent_svc
         mock_agent_svc._refresh_config.assert_not_called()
 
-    def test_slow_path_triggers_refresh(self):
+    def test_slow_path_triggers_refresh(self, monkeypatch):
         import app.interfaces.service_dependencies as mod
 
         mock_request = MagicMock()
@@ -70,9 +70,9 @@ class TestGenerationBasedRefresh:
         mock_request.app.state.agent_service = mock_agent_svc
 
         mock_config = MagicMock()
-        mod._config_cache = mock_config
-        mod._config_generation = 2
-        mod._last_refresh_generation = 1
+        monkeypatch.setattr(mod, "_config_cache", mock_config)
+        monkeypatch.setattr(mod, "_config_generation", 2)
+        monkeypatch.setattr(mod, "_last_refresh_generation", 1)
 
         mock_snapshot = MagicMock()
         with patch.object(mod, "_load_app_config", return_value=mock_config):

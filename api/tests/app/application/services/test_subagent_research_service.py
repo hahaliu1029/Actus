@@ -86,7 +86,13 @@ async def test_probe_quota_lease_renews_until_stopped(mock_deps):
 async def test_probe_quota_lease_loss_is_observable_but_not_a_task_deadline(
     mock_deps, caplog
 ):
-    mock_deps["quota_service"].renew.return_value = False
+    renew_attempted = asyncio.Event()
+
+    async def lose_lease(*_args):
+        renew_attempted.set()
+        return False
+
+    mock_deps["quota_service"].renew.side_effect = lose_lease
     svc = SubagentResearchService(
         **mock_deps,
         probe_quota_renew_interval_seconds=0.001,
@@ -100,10 +106,7 @@ async def test_probe_quota_lease_loss_is_observable_but_not_a_task_deadline(
         )
     )
 
-    for _ in range(100):
-        if mock_deps["quota_service"].renew.await_count:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(renew_attempted.wait(), timeout=1.0)
     stopped.set()
     await task
 
