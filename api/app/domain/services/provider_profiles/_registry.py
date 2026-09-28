@@ -151,7 +151,9 @@ def infer_provider_from_base_url(
     # minimax / glm / openai_official 分支保持 base_url-only 匹配
     if "minimax" in bu or "minimaxi" in bu:
         return "minimax"
-    if "bigmodel.cn" in bu or "zhipu" in bu:
+    if "bigmodel.cn" in bu or "zhipu" in bu or "api.z.ai" in bu:
+        if mn == "glm-5.2" or mn.startswith("glm-5.2-"):
+            return "glm_5_2_coding" if "/coding/" in bu else "glm_5_2"
         return "glm"
     if "api.openai.com" in bu:
         return "openai_official"

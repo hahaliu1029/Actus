@@ -13,7 +13,7 @@ Target models: MiniMax-M2 / M2.1 / M2.5 / M2.7 (text-only reasoning family).
   P1 保留 content-embedded 语义 (D3 决策).
 - XML tool calls 在 vLLM/SGLang 后端通常归一化到 tool_calls 字段; 自托管 /
   transformers / TGI 部署下可能 leak 到 content → adapter XML fallback
-  parser 已兜底 (emits_tool_calls_in_content=True declarative).
+  parser 仅在显式启用后解析完整 MiniMax 工具包络，普通正文与代码示例保持文本。
 
 Docs source:
 - OpenAI-compat reference: https://platform.minimax.io/docs/api-reference/text-openai-api
@@ -37,7 +37,7 @@ MINIMAX_PROFILE = ProviderProfile(
     api_mode_fallback_enabled=False,
     tool_choice_any_alias="auto",
     tool_choice_forbidden_when_thinking=frozenset(),
-    emits_tool_calls_in_content=True,  # declarative: XML fallback unconditional (Finding 1)
+    emits_tool_calls_in_content=True,  # opt in to complete MiniMax tool envelopes
     supports_thinking=True,
     thinking_always_on=True,
     thinking_toggle_style="none",

@@ -9,6 +9,7 @@ import type { SessionEventRecord } from "../session-store";
 import type { sessionApi } from "../../api/session";
 import type {
   ChatParams,
+  ExecutionStateChangedEvent,
   SSEEventData,
   SSEEventHandler,
   SupervisorSnapshot,
@@ -827,6 +828,30 @@ describe("recoverSession", () => {
   });
 
   it("folds a legacy execution event when no supervisor snapshot exists", () => {
+    // Historical wire records predate the required execution_revision field.
+    // Preserve that omission at the unvalidated SSE boundary under test.
+    const legacyEvent = {
+      type: "execution_state_changed",
+      data: {
+        event_id: "1000-8",
+        created_at: "2026-05-11T08:00:00Z",
+        seq: 8,
+        payload: {
+          execution_mode: "background",
+          execution_phase: "running",
+          background_reason: "explicit",
+          expires_at: null,
+          retry_budget_remaining: 3,
+          suspended_reason: null,
+          terminal_reason: null,
+        },
+      },
+    } satisfies {
+      type: "execution_state_changed";
+      data: Omit<ExecutionStateChangedEvent, "payload"> & {
+        payload: Omit<ExecutionStateChangedEvent["payload"], "execution_revision">;
+      };
+    };
     const session = __test_applySSEToSession(
       {
         session_id: "s1",
@@ -836,23 +861,7 @@ describe("recoverSession", () => {
         supervisor_snapshot: null,
         events: [],
       },
-      {
-        type: "execution_state_changed",
-        data: {
-          event_id: "1000-8",
-          created_at: "2026-05-11T08:00:00Z",
-          seq: 8,
-          payload: {
-            execution_mode: "background",
-            execution_phase: "running",
-            background_reason: "explicit",
-            expires_at: null,
-            retry_budget_remaining: 3,
-            suspended_reason: null,
-            terminal_reason: null,
-          },
-        },
-      },
+      legacyEvent as unknown as SSEEventData,
     );
 
     expect(session.supervisor_snapshot).toMatchObject({

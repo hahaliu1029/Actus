@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from typing import Any
 
 from langchain_core.messages import (
@@ -17,6 +18,28 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+
+
+_PERSISTED_PROTOCOL_FIELDS = (
+    "reasoning_content",
+    "responses_output_items",
+    "refusal",
+)
+
+
+def _copy_protocol_fields(additional_kwargs: Any) -> dict[str, Any]:
+    """Persist only assistant fields required for provider message round-trips.
+
+    Copy nested Responses items so Memory compaction or restored state cannot
+    mutate the live graph's message metadata through a shared reference.
+    """
+    if not isinstance(additional_kwargs, dict):
+        return {}
+    return {
+        key: deepcopy(additional_kwargs[key])
+        for key in _PERSISTED_PROTOCOL_FIELDS
+        if key in additional_kwargs
+    }
 
 
 _IMAGE_VISION_HINT = (
@@ -116,6 +139,7 @@ def dicts_to_messages(dicts: list[dict[str, Any]]) -> list[BaseMessage]:
             messages.append(AIMessage(
                 content=content,
                 tool_calls=tool_calls if tool_calls else [],
+                additional_kwargs=_copy_protocol_fields(d.get("additional_kwargs")),
             ))
         elif role == "tool":
             messages.append(ToolMessage(
@@ -316,6 +340,9 @@ def messages_to_dicts(messages: list[BaseMessage]) -> list[dict[str, Any]]:
                 "role": "assistant",
                 "content": msg.content or "",
             }
+            protocol_fields = _copy_protocol_fields(msg.additional_kwargs)
+            if protocol_fields:
+                d["additional_kwargs"] = protocol_fields
             if msg.tool_calls:
                 d["tool_calls"] = [
                     {

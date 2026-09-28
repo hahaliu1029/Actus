@@ -24,6 +24,7 @@ import { ExtensionsOverview } from "@/components/settings/extensions-overview";
 import { ExtensionInstallPreviewFlow } from "@/components/settings/mcp-install-preview";
 import { MemoryManagement } from "@/components/settings/memory-management";
 import { PluginInstallDialog } from "@/components/settings/plugin-install-dialog";
+import { ProviderProfileSelect } from "@/components/settings/provider-profile-select";
 import { SkillDetailDrawer } from "@/components/settings/skill-detail-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,7 +41,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
 import { configApi } from "@/lib/api/config";
-import type { AgentConfig, ExtensionInstallPreviewWire, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
+import type { AgentConfig, ExtensionInstallPreviewWire, FileUnderstandingConfig, LLMConfig, LLMConnectionTestResult, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
 import { mergeAgentSavePayload } from "@/lib/settings/merge-agent-config";
 import { useSessionStore } from "@/lib/store/session-store";
@@ -144,6 +145,8 @@ export function ManusSettings() {
 
   const [llmForm, setLLMForm] = useState<LLMConfig>({
     base_url: "https://api.deepseek.com",
+    provider: null,
+    supports_response_format: true,
     api_key: "",
     model_name: "deepseek-reasoner",
     supports_vision: false,
@@ -162,6 +165,12 @@ export function ManusSettings() {
     token_safety_factor: 1.15,
     unknown_model_context_window: 32768,
   });
+
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionTest, setConnectionTest] = useState<{
+    config: LLMConfig;
+    result: LLMConnectionTestResult;
+  } | null>(null);
 
   const [fileForm, setFileForm] = useState<FileUnderstandingConfig>({
     vision_fallback: { enabled: false, base_url: "", api_key: "", model_name: "", api_type: "chat_completions" },
@@ -253,16 +262,39 @@ export function ManusSettings() {
     }
 
     if (activeTab === "llm") {
+      if (!llmConfig) {
+        setMessage({ type: "error", text: "模型配置尚未加载，无法保存默认值。请关闭设置后重试。" });
+        return;
+      }
       await updateLLMConfig(llmForm);
       return;
     }
 
     if (activeTab === "file") {
+      if (!fileUnderstanding) {
+        setMessage({ type: "error", text: "文件理解配置尚未加载，请关闭设置后重试。" });
+        return;
+      }
       await updateFileUnderstandingConfig(fileForm);
       return;
     }
 
     setOpen(false);
+  }
+
+  async function handleTestConnection(): Promise<void> {
+    if (!isAdmin || !llmConfig || testingConnection) return;
+    const config = llmForm;
+    setTestingConnection(true);
+    setConnectionTest(null);
+    try {
+      const result = await configApi.testLLMConnection(config);
+      setConnectionTest({ config, result });
+    } catch (error) {
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "模型连接测试失败" });
+    } finally {
+      setTestingConnection(false);
+    }
   }
 
   // D1a T27：MCP 添加走 ExtensionInstallPreviewFlow 两阶段。parseMcpConfig 抛错由 flow
@@ -626,14 +658,15 @@ export function ManusSettings() {
                     <label className="text-sm text-foreground/85">
                       提供商基础地址（base_url）
                       <Input
+                        aria-label="提供商基础地址（base_url）"
                         value={llmForm.base_url}
                         onChange={(event) =>
-                          setLLMForm((prev) => ({ ...prev, base_url: event.target.value }))
+                          setLLMForm((prev) => ({ ...prev, base_url: event.target.value, provider: null }))
                         }
                         className="mt-1"
                       />
                       <p className="mt-1 text-xs text-muted-foreground">
-                        LLM API 的基础 URL 地址，需兼容 OpenAI 接口格式。例如 DeepSeek 为 https://api.deepseek.com，OpenAI 为 https://api.openai.com/v1。
+                        填写服务商提供的 API 基础地址，保留 /v1 或 /api/coding/paas/v4 等前缀。不要包含 /chat/completions、/responses、查询参数或片段；系统不会自动补 /v1。
                       </p>
                     </label>
 
@@ -655,15 +688,31 @@ export function ManusSettings() {
                     <label className="text-sm text-foreground/85">
                       模型名
                       <Input
+                        aria-label="模型名"
                         value={llmForm.model_name}
                         onChange={(event) =>
-                          setLLMForm((prev) => ({ ...prev, model_name: event.target.value }))
+                          setLLMForm((prev) => ({ ...prev, model_name: event.target.value, provider: null }))
                         }
                         className="mt-1"
                       />
                       <p className="mt-1 text-xs text-muted-foreground">
-                        要使用的模型标识，如 deepseek-chat、deepseek-reasoner、gpt-4o 等。使用带推理的模型时，传递 tools 会自动降级到对话模型。
+                        填写该端点实际支持的模型标识。不同模型的工具、推理与图片能力由兼容策略处理。
                       </p>
+                    </label>
+
+                    <ProviderProfileSelect
+                      label="模型兼容策略"
+                      value={llmForm.provider}
+                      onChange={(provider) => setLLMForm((prev) => ({ ...prev, provider }))}
+                    />
+                    <label className="text-sm text-foreground/85">
+                      支持 response_format
+                      <Switch
+                        aria-label="支持 response_format"
+                        className="ml-3"
+                        checked={llmForm.supports_response_format ?? true}
+                        onCheckedChange={(checked) => setLLMForm((prev) => ({ ...prev, supports_response_format: checked }))}
+                      />
                     </label>
 
                     <label className="text-sm text-foreground/85">
@@ -721,10 +770,10 @@ export function ManusSettings() {
                           chat_completions（仅 Chat Completions）
                         </option>
                         <option value="responses">responses（仅 Responses API）</option>
-                        <option value="auto">auto（先 Chat，失败后回退 Responses）</option>
+                        <option value="auto">auto（仅兼容策略允许时切换协议）</option>
                       </select>
                       <p className="mt-1 text-xs text-muted-foreground">
-                        OpenAI gpt-5.4 推荐使用 auto，gpt-5.4-pro 必须使用 responses。
+                        仅支持 Responses 的端点请选择 responses。auto 只在兼容策略允许且出现协议兼容错误时切换；GLM 等策略不会切换到 Responses。
                       </p>
                     </label>
 
@@ -1648,7 +1697,7 @@ export function ManusSettings() {
                               onChange={(e) =>
                                 setFileForm((prev) => ({
                                   ...prev,
-                                  vision_fallback: { ...prev.vision_fallback, base_url: e.target.value },
+                                  vision_fallback: { ...prev.vision_fallback, base_url: e.target.value, provider: null },
                                 }))
                               }
                               className="mt-1"
@@ -1679,7 +1728,7 @@ export function ManusSettings() {
                               onChange={(e) =>
                                 setFileForm((prev) => ({
                                   ...prev,
-                                  vision_fallback: { ...prev.vision_fallback, model_name: e.target.value },
+                                  vision_fallback: { ...prev.vision_fallback, model_name: e.target.value, provider: null },
                                 }))
                               }
                               className="mt-1"
@@ -1703,8 +1752,22 @@ export function ManusSettings() {
                             >
                               <option value="chat_completions">Chat Completions</option>
                               <option value="responses">Responses</option>
-                              <option value="auto">Auto (先 Chat 后 Responses)</option>
+                              <option value="auto">Auto（兼容策略允许时切换）</option>
                             </select>
+                          </label>
+                          <ProviderProfileSelect
+                            label="视觉模型兼容策略"
+                            value={fileForm.vision_fallback.provider}
+                            onChange={(provider) => setFileForm((prev) => ({ ...prev, vision_fallback: { ...prev.vision_fallback, provider } }))}
+                          />
+                          <label className="text-sm text-foreground/85">
+                            视觉模型支持 response_format
+                            <Switch
+                              aria-label="视觉模型支持 response_format"
+                              className="ml-3"
+                              checked={fileForm.vision_fallback.supports_response_format ?? true}
+                              onCheckedChange={(checked) => setFileForm((prev) => ({ ...prev, vision_fallback: { ...prev.vision_fallback, supports_response_format: checked } }))}
+                            />
                           </label>
                         </div>
                       )}
@@ -1878,7 +1941,26 @@ export function ManusSettings() {
               ) : null}
             </div>
 
-            <div className="flex items-center justify-end gap-3 border-t border-border px-7 py-4">
+            {activeTab === "llm" ? (
+              <div className="border-t border-border px-7 py-3 text-xs text-muted-foreground">
+                {!llmConfig ? (
+                  <p role="alert">当前模型配置尚未加载，暂时无法保存或测试。请关闭设置后重新打开重试。</p>
+                ) : (
+                  <p>保存仅更新配置。测试连接会发送少量文本请求，可能产生模型费用；不会保存配置。</p>
+                )}
+                {connectionTest?.config === llmForm ? (
+                  <p role="status" className={connectionTest.result.success ? "mt-2 text-emerald-700 dark:text-emerald-400" : "mt-2 text-destructive"}>
+                    {connectionTest.result.message}（策略：{connectionTest.result.provider}，协议：{connectionTest.result.api_type}）
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-border px-7 py-4">
+              {activeTab === "llm" ? (
+                <Button variant="outline" disabled={!isAdmin || isLoading || !llmConfig || testingConnection} onClick={() => void handleTestConnection()}>
+                  {testingConnection ? "正在测试..." : "测试连接"}
+                </Button>
+              ) : null}
               <Button
                 variant="outline"
                 className="h-10 rounded-xl border-border px-6 text-foreground/85"
@@ -1890,7 +1972,7 @@ export function ManusSettings() {
               </Button>
               <Button
                 className="h-10 rounded-xl bg-primary px-6 text-primary-foreground hover:bg-primary/90"
-                disabled={isLoading || (!isAdmin && (activeTab === "agent" || activeTab === "llm" || activeTab === "file"))}
+                disabled={isLoading || (activeTab === "llm" && !llmConfig) || (activeTab === "file" && !fileUnderstanding) || (!isAdmin && (activeTab === "agent" || activeTab === "llm" || activeTab === "file"))}
                 onClick={() => {
                   void handleSave();
                 }}

@@ -133,3 +133,24 @@ async def test_run_probe_with_timeout_runs_in_current_task_context() -> None:
     await _run_probe_with_timeout(probe(), timeout_seconds=1)
 
     assert probe_task is parent_task
+
+
+async def test_invalid_provider_rejected_before_config_write():
+    from app.application.errors.exceptions import ValidationError
+    repo = _InMemoryAppConfigRepo(_build_app_config())
+    original = repo.load().llm_config
+    with pytest.raises(ValidationError):
+        await AppConfigService(repo).update_llm_config(LLMConfig(provider="misspelled"))
+    assert repo.load().llm_config is original
+
+
+async def test_invalid_vision_provider_rejected_before_write():
+    from app.application.errors.exceptions import ValidationError
+    from app.domain.models.app_config import FileUnderstandingConfig, VisionFallbackConfig
+    repo = _InMemoryAppConfigRepo(_build_app_config())
+    original = repo.load().file_understanding
+    with pytest.raises(ValidationError):
+        await AppConfigService(repo).update_file_understanding_config(FileUnderstandingConfig(
+            vision_fallback=VisionFallbackConfig(provider="misspelled"),
+        ))
+    assert repo.load().file_understanding is original

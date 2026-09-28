@@ -15,14 +15,16 @@ Key differences from ActusChatModel (Chat Completions):
 Implements:
 - _generate: raises NotImplementedError (project is async-only)
 - _agenerate: calls Responses API, returns ChatResult with AIMessage
-- _astream: fallback to _agenerate (yields single ChatGenerationChunk)
+- _astream: consumes Responses SSE events; tool calls commit only on completion
 - bind_tools: returns new instance with tools bound, tools converted via _convert_tools
 """
 
 from __future__ import annotations
 
 import json
+import inspect
 import logging
+from copy import deepcopy
 from typing import Any, AsyncIterator, List, Literal, Optional
 
 from langchain_core.callbacks import (
@@ -41,12 +43,16 @@ from langchain_core.messages import (
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 import httpx
+import openai
 from openai import AsyncOpenAI
 
 from pydantic import Field
 
 from app.application.errors.exceptions import ServerRequestsError
-from app.infrastructure.external.llm._timeout_helpers import with_llm_timeout
+from app.infrastructure.external.llm._timeout_helpers import (
+    translate_transient,
+    with_llm_timeout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +389,11 @@ class ActusResponsesModel(BaseChatModel):
                         }
                         for tc in msg.tool_calls
                     ]
+                output_items = msg.additional_kwargs.get("responses_output_items")
+                if output_items:
+                    # Keep native reasoning items (including encrypted_content) and
+                    # their ordering. Chat adapters ignore this private carrier.
+                    entry["responses_output_items"] = deepcopy(output_items)
                 result.append(entry)
             elif isinstance(msg, ToolMessage):
                 content = msg.content or ""
@@ -455,6 +466,25 @@ class ActusResponsesModel(BaseChatModel):
         for message in messages:
             role = message.get("role")
 
+            native_items = message.get("responses_output_items")
+            if role == "assistant" and native_items:
+                normalized = ActusResponsesModel._normalize_response({"output": native_items})
+                if (
+                    (normalized.get("content") or "") == (message.get("content") or "")
+                    and ActusResponsesModel._parse_tool_calls(normalized.get("tool_calls"))
+                    == ActusResponsesModel._parse_tool_calls(message.get("tool_calls"))
+                ):
+                    # Replay exactly once. Do not append reconstructed tool calls
+                    # as well, which would duplicate call_ids in the next request.
+                    converted.extend(deepcopy(native_items))
+                    continue
+                # Context management may edit/truncate an AIMessage. Respect its
+                # current text/tools instead of restoring stale native output.
+                converted.extend(
+                    deepcopy(item) for item in native_items
+                    if item.get("type") == "reasoning"
+                )
+
             if role == "tool":
                 converted.append({
                     "type": "function_call_output",
@@ -491,7 +521,10 @@ class ActusResponsesModel(BaseChatModel):
                 })
                 continue
 
-            converted.append(message)
+            converted.append({
+                key: value for key, value in message.items()
+                if key != "responses_output_items"
+            })
 
         return converted
 
@@ -521,25 +554,44 @@ class ActusResponsesModel(BaseChatModel):
         if not isinstance(dumped, dict):
             dumped = {"output": []}
         output_items = dumped.get("output", [])
+        if not isinstance(output_items, list):
+            raise ServerRequestsError("Responses API returned invalid output items")
 
         content_text = ""
+        refusals: list[str] = []
         tool_calls: List[dict[str, Any]] = []
 
         for item in output_items:
+            if not isinstance(item, dict):
+                raise ServerRequestsError("Responses API returned invalid output item")
             item_type = item.get("type")
 
             if item_type == "message":
-                for part in item.get("content", []):
+                parts = item.get("content")
+                if not isinstance(parts, list):
+                    raise ServerRequestsError("Responses API returned invalid message content")
+                for part in parts:
+                    if not isinstance(part, dict):
+                        raise ServerRequestsError("Responses API returned invalid message part")
                     if part.get("type") == "output_text":
-                        content_text += part.get("text", "")
+                        text = part.get("text")
+                        if not isinstance(text, str):
+                            raise ServerRequestsError("Responses API returned invalid output text")
+                        content_text += text
+                    elif part.get("type") == "refusal":
+                        refusal = part.get("refusal")
+                        if not isinstance(refusal, str):
+                            raise ServerRequestsError("Responses API returned invalid refusal")
+                        content_text += refusal
+                        refusals.append(refusal)
 
             elif item_type == "function_call":
                 tool_calls.append({
-                    "id": item.get("call_id", item.get("id", "")),
+                    "id": item.get("call_id"),
                     "type": "function",
                     "function": {
                         "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
+                        "arguments": item.get("arguments"),
                     },
                 })
 
@@ -549,6 +601,8 @@ class ActusResponsesModel(BaseChatModel):
         }
         if tool_calls:
             message["tool_calls"] = tool_calls
+        if refusals:
+            message["refusal"] = "".join(refusals)
 
         return message
 
@@ -561,25 +615,107 @@ class ActusResponsesModel(BaseChatModel):
         """Parse tool_calls from normalized response into LangChain format."""
         if not raw_tool_calls:
             return []
+        if not isinstance(raw_tool_calls, list):
+            raise ServerRequestsError("Responses API returned invalid tool calls")
 
         tool_calls = []
+        seen_ids: set[str] = set()
         for tc in raw_tool_calls:
+            if not isinstance(tc, dict) or not isinstance(tc.get("function"), dict):
+                raise ServerRequestsError("Responses API returned an invalid tool call")
             fn = tc.get("function", {})
             fn_name = fn.get("name", "")
-            fn_args = fn.get("arguments", "{}")
+            fn_args = fn.get("arguments")
 
             if isinstance(fn_args, str):
                 try:
-                    fn_args = json.loads(fn_args)
-                except json.JSONDecodeError:
-                    fn_args = {}
+                    def reject_constant(value: str) -> None:
+                        raise ValueError(f"non-JSON constant: {value}")
+
+                    fn_args = json.loads(fn_args, parse_constant=reject_constant)
+                except (ValueError, TypeError) as exc:
+                    raise ServerRequestsError(
+                        "Responses API returned invalid JSON tool arguments"
+                    ) from exc
+            if not isinstance(fn_args, dict):
+                raise ServerRequestsError(
+                    "Responses API tool arguments must be a JSON object"
+                )
+            try:
+                json.dumps(fn_args, allow_nan=False)
+            except (ValueError, TypeError) as exc:
+                raise ServerRequestsError(
+                    "Responses API returned invalid JSON tool arguments"
+                ) from exc
+            call_id = tc.get("id")
+            if (
+                not isinstance(fn_name, str) or not fn_name.strip()
+                or not isinstance(call_id, str) or not call_id.strip()
+            ):
+                raise ServerRequestsError("Responses API returned an invalid tool call")
+            if call_id in seen_ids:
+                raise ServerRequestsError("Responses API returned duplicate tool call IDs")
+            seen_ids.add(call_id)
 
             tool_calls.append({
-                "id": tc.get("id", ""),
+                "id": call_id,
                 "name": fn_name,
                 "args": fn_args,
             })
         return tool_calls
+
+    def _response_to_message(self, response: Any) -> AIMessage:
+        """Validate the provider's terminal state before admitting any tool calls."""
+        dumped = response.model_dump() if hasattr(response, "model_dump") else response
+        if not isinstance(dumped, dict):
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned unexpected response "
+                f"(type={type(response).__name__})"
+            )
+        status = dumped.get("status")
+        if (
+            status != "completed"
+            or dumped.get("error") is not None
+            or dumped.get("incomplete_details") is not None
+        ):
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned non-completed response "
+                f"(status={status or 'unknown'})"
+            )
+        output = dumped.get("output")
+        if not isinstance(output, list) or any(not isinstance(item, dict) for item in output):
+            raise ServerRequestsError(f"LLM ({self.model_name}) returned invalid output items")
+        if any(item.get("status") not in (None, "completed") for item in output):
+            raise ServerRequestsError(f"LLM ({self.model_name}) returned incomplete output item")
+        normalized = self._normalize_response(dumped)
+        content = normalized.get("content") or ""
+        tool_calls = self._parse_tool_calls(normalized.get("tool_calls"))
+        if not content and not tool_calls:
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned empty response (no content, no tool_calls)"
+            )
+        additional_kwargs: dict[str, Any] = {}
+        # Only native conversation items belong in a subsequent input. Other
+        # built-in tool events are not ordinary assistant messages.
+        native_items = [
+            deepcopy(item) for item in output
+            if item.get("type") in ("reasoning", "message", "function_call")
+        ]
+        if native_items:
+            additional_kwargs["responses_output_items"] = native_items
+        if "refusal" in normalized:
+            additional_kwargs["refusal"] = normalized["refusal"]
+        metadata = {
+            key: dumped[key] for key in ("id", "status", "model")
+            if dumped.get(key) is not None
+        }
+        return AIMessage(
+            content=content,
+            tool_calls=tool_calls,
+            additional_kwargs=additional_kwargs,
+            response_metadata=metadata,
+            usage_metadata=_extract_responses_usage_metadata(_resp_get(response, "usage")),
+        )
 
     # ---- LangChain interface: _generate (sync) --------------------------- #
 
@@ -594,14 +730,13 @@ class ActusResponsesModel(BaseChatModel):
 
     # ---- LangChain interface: _agenerate (async) ------------------------- #
 
-    async def _agenerate(
+    def _build_request_params(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> ChatResult:
-        """Call AsyncOpenAI Responses API and return ChatResult.
+    ) -> dict[str, Any]:
+        """Build one Responses request for both synchronous and SSE responses.
 
         A7 P0.4: routes through the 6-step pipeline (tool_choice resolve,
         outbound rewrites, response_format resolve, WARN emit, wire serialize,
@@ -614,7 +749,6 @@ class ActusResponsesModel(BaseChatModel):
         """
         from app.application.errors.exceptions import InternalError
         from app.domain.services.provider_profiles._base import RewriteWarning
-        from app.domain.services.provider_profiles._classify import classify_error
         from app.domain.services.provider_profiles._rewrites import (
             apply_outbound_rewrites,
             build_sdk_params,
@@ -623,7 +757,6 @@ class ActusResponsesModel(BaseChatModel):
             resolve_tool_choice,
         )
 
-        client = self._get_client()
         profile = self.profile
 
         # Step 1: tool_choice 归口 (per_call + bound)
@@ -716,7 +849,7 @@ class ActusResponsesModel(BaseChatModel):
             params["tools"] = all_tools
 
         if stop:
-            params["stop"] = stop
+            raise ValueError("Responses API does not support stop sequences")
 
         # --- Responses-specific field remap (runs AFTER build_sdk_params) --- #
         # messages → input (Responses API uses input items, not chat messages)
@@ -736,9 +869,27 @@ class ActusResponsesModel(BaseChatModel):
         )
         if effective_max_output is not None:
             params["max_output_tokens"] = effective_max_output
-        # response_format → text = {"format": response_format}
+        # Chat JSON Schema nests name/schema/strict under json_schema;
+        # Responses text.format puts them directly beside type.
         if "response_format" in params:
-            params["text"] = {"format": params.pop("response_format")}
+            response_format = params.pop("response_format")
+            if response_format.get("type") == "json_schema":
+                schema_config = response_format.get("json_schema")
+                if isinstance(schema_config, dict):
+                    response_format = {**schema_config, "type": "json_schema"}
+            params["text"] = {**(params.get("text") or {}), "format": response_format}
+        choice = params.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("type") == "function" and "function" in choice:
+            params["tool_choice"] = {"type": "function", "name": choice["function"]["name"]}
+        elif isinstance(choice, str) and choice not in ("auto", "none", "required"):
+            params["tool_choice"] = {"type": "function", "name": choice}
+        # Stateless reasoning requires the encrypted item on the next input;
+        # preserve explicit include choices while asking for that payload.
+        if params.get("store") is False:
+            include = list(params.get("include") or [])
+            if "reasoning.encrypted_content" not in include:
+                include.append("reasoning.encrypted_content")
+            params["include"] = include
 
         # B5 C11: emit telemetry (non-blocking — any failure is swallowed).
         from app.infrastructure.external.llm._telemetry_mixin import (
@@ -748,53 +899,37 @@ class ActusResponsesModel(BaseChatModel):
         emit_invocation_telemetry(self, messages, all_tools)
 
         logger.info(
-            "ActusResponsesModel._agenerate: model=%s, tools=%d, tool_choice=%s, "
+            "ActusResponsesModel request: model=%s, tools=%d, tool_choice=%s, "
             "provider=%s",
             self.model_name, len(all_tools), resolved_tc, profile.provider_id,
         )
+        return params
+
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        from app.domain.services.provider_profiles._classify import classify_error
+
+        params = self._build_request_params(messages, stop=stop, **kwargs)
+        client = self._get_client()
 
         try:
             response = await with_llm_timeout(
                 self, client.responses.create(**params)
             )
         except Exception as exc:
-            err_class = classify_error(exc, profile)
+            err_class = classify_error(exc, self.profile)
             logger.debug(
                 "[A7] Responses adapter exception classified: provider=%s class=%s exc=%s",
-                profile.provider_id, err_class, type(exc).__name__,
+                self.profile.provider_id, err_class, type(exc).__name__,
             )
             raise
 
-        # Validate response — proxies may return strings, ints, or other
-        # non-object types instead of a proper Responses API object.
-        if not hasattr(response, "model_dump") and not isinstance(response, dict):
-            raw = str(response)[:200]
-            raise ServerRequestsError(
-                f"LLM ({self.model_name}) returned unexpected response "
-                f"(type={type(response).__name__}): {raw}"
-            )
-
-        # Normalize Responses API output to Chat Completions-compatible dict
-        normalized = self._normalize_response(response)
-        content = normalized.get("content") or ""
-        tool_calls = self._parse_tool_calls(normalized.get("tool_calls"))
-
-        # Validate: entirely empty response is almost always a provider-side
-        # error (e.g. 404 wrapped in 200, or empty output array).
-        # Raise ServerRequestsError so RetryPolicy / fallback can act on it.
-        if not content and not tool_calls:
-            raise ServerRequestsError(
-                f"LLM ({self.model_name}) returned empty response "
-                f"(no content, no tool_calls)"
-            )
-
-        ai_message = AIMessage(
-            content=content,
-            tool_calls=tool_calls,
-            usage_metadata=_extract_responses_usage_metadata(
-                _resp_get(response, "usage")
-            ),
-        )
+        ai_message = self._response_to_message(response)
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 
     # ---- LangChain interface: _astream (async streaming) ----------------- #
@@ -806,34 +941,84 @@ class ActusResponsesModel(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        """Streaming fallback: calls _agenerate and yields a single chunk.
+        """Stream text immediately; admit tools only after response.completed.
 
-        The Responses API does not use the same streaming interface as
-        Chat Completions. This method provides compatibility by wrapping
-        the non-streaming result as a single ChatGenerationChunk.
+        Function argument deltas are deliberately buffered by the provider's
+        final response. Passing partial JSON to AIMessageChunk would let its
+        permissive parser repair a truncated call into an executable one.
         """
-        result = await self._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        msg = result.generations[0].message
+        params = self._build_request_params(messages, stop=stop, **kwargs)
+        params["stream"] = True
+        client = self._get_client()
 
-        ai_chunk = AIMessageChunk(
-            content=msg.content,
-            tool_call_chunks=[
-                {
-                    "index": i,
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "args": json.dumps(tc["args"]) if isinstance(tc["args"], dict) else tc["args"],
-                }
-                for i, tc in enumerate(msg.tool_calls)
-            ] if msg.tool_calls else [],
-            usage_metadata=getattr(msg, "usage_metadata", None),
-        )
-        gen_chunk = ChatGenerationChunk(message=ai_chunk)
+        async def obtain_stream():
+            pending = client.responses.create(**params)
+            return await pending if inspect.isawaitable(pending) else pending
 
-        if run_manager:
-            await run_manager.on_llm_new_token(msg.content, chunk=gen_chunk)
-
-        yield gen_chunk
+        stream = await with_llm_timeout(self, obtain_stream())
+        if not hasattr(stream, "__aiter__"):
+            raise ServerRequestsError(f"LLM ({self.model_name}) did not return a Responses stream")
+        emitted_text = ""
+        completed = False
+        try:
+            async for event in stream:
+                event_type = _resp_get(event, "type")
+                if event_type in ("response.failed", "response.incomplete", "response.cancelled"):
+                    raise ServerRequestsError(
+                        f"LLM ({self.model_name}) stream ended with {event_type}"
+                    )
+                if event_type == "error":
+                    raise ServerRequestsError(
+                        f"LLM ({self.model_name}) Responses stream error "
+                        f"(code={_resp_get(event, 'code') or 'unknown'})"
+                    )
+                if event_type in ("response.output_text.delta", "response.refusal.delta"):
+                    delta = _resp_get(event, "delta")
+                    if not isinstance(delta, str):
+                        raise ServerRequestsError("Responses stream returned invalid text delta")
+                    emitted_text += delta
+                    chunk = ChatGenerationChunk(message=AIMessageChunk(content=delta))
+                elif event_type == "response.completed":
+                    response = _resp_get(event, "response")
+                    msg = self._response_to_message(response)
+                    if not msg.content.startswith(emitted_text):
+                        raise ServerRequestsError("Responses stream final text does not match its deltas")
+                    chunk = ChatGenerationChunk(message=AIMessageChunk(
+                        content=msg.content[len(emitted_text):],
+                        tool_call_chunks=[
+                            {"index": i, "id": tc["id"], "name": tc["name"], "args": json.dumps(tc["args"])}
+                            for i, tc in enumerate(msg.tool_calls)
+                        ],
+                        additional_kwargs=msg.additional_kwargs,
+                        response_metadata=msg.response_metadata,
+                        usage_metadata=msg.usage_metadata,
+                        chunk_position="last",
+                    ))
+                    completed = True
+                else:
+                    # Lifecycle / reasoning / tool argument events are retained
+                    # losslessly in the completed response's output items.
+                    continue
+                if run_manager:
+                    await run_manager.on_llm_new_token(chunk.text, chunk=chunk)
+                yield chunk
+                if completed:
+                    break
+        except openai.APIError as exc:
+            raise translate_transient(self, exc) from exc
+        finally:
+            close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+            if callable(close):
+                try:
+                    closing = close()
+                    if inspect.isawaitable(closing):
+                        await closing
+                except Exception:
+                    logger.warning("Could not close Responses stream", exc_info=True)
+        if not completed:
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) stream ended without response.completed"
+            )
 
     # ---- bind_tools ------------------------------------------------------ #
 

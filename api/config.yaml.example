@@ -3,14 +3,14 @@
 # cp config.yaml.example config.yaml
 
 llm_config:
-  base_url: https://api.deepseek.com/    # LLM API 地址
+  base_url: https://api.deepseek.com/    # API 基础地址：保留版本前缀，不带 /chat/completions 或 /responses
   api_key: ''                             # 你的 LLM API Key
   model_name: deepseek-reasoner           # 模型名称
-  # provider: deepseek_reasoner          # A7: 显式声明 provider_id (kimi_k2 / kimi_k2_6 / deepseek_chat / deepseek_reasoner / dashscope_qwen / dashscope_qwen_vl / anthropic_compat / gemini_compat / minimax / glm / openai_official / generic_openai). 未填按 base_url 启发式推断，K2.6 必须显式声明不会被自动识别。
-  #                                      # A7 P1 (2026-04-23): DashScope 拆 text / vl 两 profile。base_url 命中 DashScope / Anthropic / Gemini 三家之一但 model_name 不在 allowlist (如 qwen3.5-plus / Opus 4.7 / Gemini 2.5 Pro) → heuristic 返回 generic_openai (= 今天行为)。MiniMax / GLM 无 model-name allowlist，直接按 base_url 匹配。显式 provider=<registered_id> 会绕过 allowlist 验证，仅建议在明确对齐时使用。
+  # provider: deepseek_reasoner          # A7: 显式声明 provider_id (kimi_k2 / kimi_k2_6 / deepseek_chat / deepseek_reasoner / dashscope_qwen / dashscope_qwen_vl / anthropic_compat / gemini_compat / minimax / glm / glm_5_2 / glm_5_2_coding / openai_official / generic_openai). 未填按 base_url 启发式推断，K2.6 必须显式声明不会被自动识别。
+  #                                      # A7 P1 (2026-04-23): DashScope 拆 text / vl 两 profile。base_url 命中 DashScope / Anthropic / Gemini 三家之一但 model_name 不在 allowlist (如 qwen3.5-plus / Opus 4.7 / Gemini 2.5 Pro) → heuristic 返回 generic_openai (= 今天行为)。MiniMax 按地址匹配；GLM-5.2 按型号与标准/Coding地址单独适配思考内容，其余 GLM 保持旧策略。显式 provider=<registered_id> 会绕过 allowlist 验证，仅建议在明确对齐时使用。
   temperature: 0.7
   max_tokens: 8192
-  # api_type: chat_completions            # API 类型: chat_completions / responses / auto
+  # api_type: chat_completions            # chat_completions / responses / auto；auto 仅在策略允许的协议错误时切换，不会因普通超时切换
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
   # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
   # supports_pdf_input: false             # 是否支持原生 PDF 文件输入（需要模型支持，如 gpt-4o）
@@ -199,6 +199,8 @@ skill_risk_policy:
 #     api_key: ""                    # 留空则复用主 LLM 的 api_key
 #     model_name: ""                 # 如 gpt-4o-mini
 #     api_type: "chat_completions"   # chat_completions / responses / auto
+#     provider: null                # 独立按地址/型号识别；第三方代理可显式填上方 provider_id
+#     supports_response_format: true
 #   audio:
 #     provider: "disabled"           # sandbox_whisper | openai_api | disabled
 #     openai_api_key: ""

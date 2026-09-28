@@ -106,6 +106,7 @@ def _chat_response_with_usage(usage_obj: Any):
 
 def _responses_payload_with_usage(usage: Any) -> dict:
     return {
+        "status": "completed",
         "output": [
             {"type": "message", "content": [{"type": "output_text", "text": "hi"}]}
         ],
@@ -196,6 +197,7 @@ async def test_responses_empty_object_usage_yields_unknown_cost_record() -> None
     )
     response = SimpleNamespace(
         model_dump=lambda: {
+            "status": "completed",
             "output": [
                 {
                     "type": "message",

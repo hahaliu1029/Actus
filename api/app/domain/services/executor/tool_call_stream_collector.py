@@ -1,8 +1,8 @@
 """B1-2 tool-call streaming collector — dual products (spec §5.2).
 
-1. AUTHORITATIVE merged message: pure chunk-sum (``acc = acc + chunk``,
-   LangChain semantics). Execution input is ALWAYS taken from this product —
-   byte-equivalent to the ainvoke baseline, field by field.
+1. AUTHORITATIVE merged message: chunk-sum (``acc = acc + chunk``), followed
+   by strict validation of the raw tool arguments at finalize. LangChain's
+   partial-JSON repair must never turn an unfinished call into executable input.
 2. ADVISORY incremental completion stream: built from RAW ``tool_call_chunks``
    (never mid-stream ``.tool_calls`` — parse_partial_json is best-effort).
    Completion = index switch ∨ new non-empty id at same index ∨ stream end;
@@ -15,6 +15,8 @@ import logging
 from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessageChunk
+
+from app.application.errors.exceptions import ServerRequestsError
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +120,9 @@ class ToolCallStreamCollector:
         else:
             try:
                 args = json.loads(raw)
+                json.dumps(args, allow_nan=False)
             except (ValueError, TypeError):
-                return                        # strict 失败 → 零增量；执行输入不受影响
+                return                        # finalize also rejects invalid execution input
             if not isinstance(args, dict):
                 return
         self._emitted_ids.add(cur.id)
@@ -150,17 +153,28 @@ class ToolCallStreamCollector:
             ),
         )
         sorted_chunks = [chunks[i] for i in order]
-        # tool_calls 与 chunks 经 id 对齐重排；缺 id 的保持相对原序殿后
-        by_id = {tc.get("id"): tc for tc in (final.tool_calls or []) if tc.get("id")}
-        sorted_calls = [
-            by_id[c["id"]] for c in sorted_chunks
-            if c.get("id") and c["id"] in by_id
-        ]
-        leftovers = [
-            tc for tc in (final.tool_calls or [])
-            if not tc.get("id") or tc.get("id") not in {c.get("id") for c in sorted_chunks}
-        ]
+        # Reparse raw arguments, never trust .tool_calls: LangChain may have
+        # silently repaired a missing brace or string terminator there.
+        calls: list[dict] = []
+        seen: set[str] = set()
+        for chunk in sorted_chunks:
+            call_id, name, raw = chunk.get("id"), chunk.get("name"), chunk.get("args")
+            if not call_id or not name or call_id in seen:
+                raise ServerRequestsError("Invalid streamed tool call identity")
+            try:
+                args = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                raise ServerRequestsError("Invalid or incomplete streamed tool arguments") from exc
+            if not isinstance(args, dict):
+                raise ServerRequestsError("Streamed tool arguments must be a JSON object")
+            try:
+                json.dumps(args, allow_nan=False)
+            except (ValueError, TypeError) as exc:
+                raise ServerRequestsError("Streamed tool arguments contain invalid JSON values") from exc
+            seen.add(call_id)
+            calls.append({"id": call_id, "name": name, "args": args, "type": "tool_call"})
         return final.model_copy(update={
-            "tool_calls": sorted_calls + leftovers,
+            "tool_calls": calls,
+            "invalid_tool_calls": [],
             "tool_call_chunks": sorted_chunks,
         })

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mockGetAccessToken = vi.fn(() => "mock-token");
+const mockGetAccessToken = vi.fn<typeof import("./auth-utils").getAccessToken>(() => "mock-token");
 const mockHandleLogout = vi.fn();
 const mockMaybeRefreshToken = vi.fn(async () => true);
 

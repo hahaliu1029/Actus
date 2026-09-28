@@ -175,11 +175,11 @@ async def test_chat_adapter_streaming_accumulates_reasoning_content_for_kimi() -
     ]
 
     async def fake_stream(**params):
-        for d in deltas:
+        for i, d in enumerate(deltas):
             chunk = MagicMock()
             choice = MagicMock()
             choice.delta = d
-            choice.finish_reason = None
+            choice.finish_reason = "stop" if i == len(deltas) - 1 else None
             chunk.choices = [choice]
             yield chunk
 
@@ -209,11 +209,11 @@ async def test_chat_adapter_streaming_kimi_k2_6_uses_reasoning_field() -> None:
     deltas = [SimpleNamespace(content="a", reasoning="think", tool_calls=None)]
 
     async def fake_stream(**params):
-        for d in deltas:
+        for i, d in enumerate(deltas):
             chunk = MagicMock()
             choice = MagicMock()
             choice.delta = d
-            choice.finish_reason = None
+            choice.finish_reason = "stop" if i == len(deltas) - 1 else None
             chunk.choices = [choice]
             yield chunk
 

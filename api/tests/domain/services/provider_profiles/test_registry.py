@@ -77,8 +77,7 @@ def test_p1_profiles_registered_on_package_import() -> None:
         assert get_profile(pid).provider_id == pid
 
 
-def test_registry_has_12_entries() -> None:
-    """T-P1-R1: _REGISTRY grows from 6 (P0) to 12 (P0 + P1)."""
+def test_registry_has_expected_entries() -> None:
     from app.domain.services.provider_profiles._registry import _REGISTRY
     assert set(_REGISTRY.keys()) == {
         # P0
@@ -89,6 +88,7 @@ def test_registry_has_12_entries() -> None:
         "dashscope_qwen", "dashscope_qwen_vl",
         "anthropic_compat", "gemini_compat",
         "minimax", "glm",
+        "glm_5_2", "glm_5_2_coding",
     }
 
 

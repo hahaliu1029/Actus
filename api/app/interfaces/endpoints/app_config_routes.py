@@ -1,22 +1,72 @@
+import asyncio
 import logging
 from typing import Dict, Optional
 
 from app.application.services.app_config_service import AppConfigService
 from app.domain.models.app_config import AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig
-from app.interfaces.dependencies import AdminUser, CurrentUser
+from app.interfaces.dependencies import AdminUser, CurrentUser, rate_limit_write
 from app.interfaces.schemas.app_config import (
     ListA2AServerResponse,
     ListMCPServerResponse,
+    LLMConnectionTestResult,
 )
 from app.interfaces.schemas.base import Response
 from app.interfaces.service_dependencies import (
     get_app_config_service,
     get_extension_install_service,
+    _build_llm,
 )
 from fastapi import APIRouter, Body, Depends, Query
+from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/app-config", tags=["设置模块"])
+
+
+@router.post(
+    "/llm/test",
+    response_model=Response[LLMConnectionTestResult],
+    dependencies=[Depends(rate_limit_write)],
+    summary="测试模型基础请求（不保存配置）",
+)
+async def test_llm_connection(
+    new_llm_config: LLMConfig,
+    admin_user: AdminUser,
+    app_config_service: AppConfigService = Depends(get_app_config_service),
+) -> Response[LLMConnectionTestResult]:
+    config = new_llm_config.model_copy(deep=True)
+    AppConfigService.validate_llm_provider(config.provider)
+    if not config.api_key.strip():
+        saved = await app_config_service.get_llm_config()
+        config.api_key = saved.api_key
+    # Bound this explicit, billable probe; use the production adapter factory.
+    config.max_tokens = min(config.max_tokens or 256, 256)
+    config.timeout_seconds = min(config.timeout_seconds or 30, 30)
+    config.connect_timeout_seconds = min(config.connect_timeout_seconds, 15)
+    llm = _build_llm(config)
+    provider = llm.profile.provider_id
+    probe_kwargs = {}
+    if not llm.profile.thinking_always_on:
+        if llm.profile.thinking_toggle_style == "extra_body_thinking":
+            probe_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif llm.profile.thinking_toggle_style == "extra_body_enable_thinking":
+            probe_kwargs["extra_body"] = {"enable_thinking": False}
+    try:
+        async with asyncio.timeout(30):
+            response = await llm.ainvoke([HumanMessage(content="Reply with OK only.")], **probe_kwargs)
+        success = bool(response.content)
+        message = (
+            "基础请求通过；未验证工具调用、图片或长任务。配置尚未保存。"
+            if success else "端点已响应，但未返回可识别内容；请检查模型与协议。"
+        )
+    except Exception as exc:
+        # Provider exceptions can contain credentials or response bodies.
+        # Only expose their class, never stringify the exception.
+        success = False
+        message = f"连接测试失败（{type(exc).__name__}）；请检查地址、密钥、模型与协议。"
+    return Response.success(data=LLMConnectionTestResult(
+        success=success, provider=provider, api_type=config.api_type, message=message,
+    ))
 
 
 @router.get(

@@ -11,6 +11,7 @@ import type {
   GovernanceSummary,
   InstallSkillParams,
   LLMConfig,
+  LLMConnectionTestResult,
   MCPConfig,
   MCPServersData,
   PluginDetail,
@@ -48,6 +49,10 @@ export const configApi = {
 
   updateLLMConfig: (config: LLMConfig): Promise<LLMConfig> => {
     return post<LLMConfig>("/app-config/llm", config);
+  },
+
+  testLLMConnection: (config: LLMConfig): Promise<LLMConnectionTestResult> => {
+    return post<LLMConnectionTestResult>("/app-config/llm/test", config, { timeout: 35000 });
   },
 
   getAgentConfig: (): Promise<AgentConfig> => {

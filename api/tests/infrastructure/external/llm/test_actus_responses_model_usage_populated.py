@@ -6,9 +6,8 @@ The Responses API usage shape differs from Chat Completions:
     usage.input_tokens_details.cached_tokens    (vs prompt_tokens_details.cached_tokens)
     usage.output_tokens_details.reasoning_tokens (vs completion_tokens_details.reasoning_tokens)
 
-Current gap: ``actus_responses_model.py:705`` constructs the AIMessage without
-``usage_metadata``. The ``_astream`` path (line 710+) wraps ``_agenerate`` so it
-inherits the same gap. These tests lock the contract.
+Both ordinary responses and the final SSE chunk must expose usage_metadata.
+These tests lock the contract.
 """
 
 from __future__ import annotations
@@ -50,6 +49,7 @@ def _make_responses_api_response(
 ) -> Any:
     """Build a fake OpenAI Responses API response with .model_dump() + .usage."""
     dumped = {
+        "status": "completed",
         "output": [
             {
                 "type": "message",
@@ -129,12 +129,15 @@ class TestResponsesModelUsageMetadata:
     async def test_astream_preserves_usage_metadata(
         self, model: ActusResponsesModel
     ) -> None:
-        """_astream wraps _agenerate — the single yielded chunk must carry usage_metadata."""
+        """The completed SSE event carries authoritative usage exactly once."""
         mock_response = _make_responses_api_response(
             input_tokens=10, output_tokens=3
         )
+        async def events():
+            yield {"type": "response.completed", "response": mock_response}
+
         mock_client = AsyncMock()
-        mock_client.responses.create = AsyncMock(return_value=mock_response)
+        mock_client.responses.create = AsyncMock(return_value=events())
 
         with patch.object(model, "_get_client", return_value=mock_client):
             yielded = [
@@ -146,7 +149,7 @@ class TestResponsesModelUsageMetadata:
         assert yielded, "_astream yielded nothing"
         first: AIMessageChunk = yielded[0]
         assert first.usage_metadata is not None, (
-            "_astream (wrapping _agenerate) must preserve usage_metadata on "
+            "_astream final SSE chunk must preserve usage_metadata on "
             "the yielded AIMessageChunk so CostCallbackHandler sees it."
         )
         assert first.usage_metadata["input_tokens"] == 10
@@ -157,6 +160,7 @@ class TestResponsesModelUsageMetadata:
     ) -> None:
         """If provider omits usage, stays None so CostCallbackHandler marks row estimated."""
         dumped = {
+            "status": "completed",
             "output": [
                 {
                     "type": "message",

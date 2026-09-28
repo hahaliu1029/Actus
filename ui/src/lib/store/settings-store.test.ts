@@ -62,6 +62,7 @@ describe("settings-store", () => {
       base_url: "https://api.openai.com/v1",
       model_name: "gpt-4o",
       supports_vision: true,
+      supports_pdf_input: false,
       api_type: "chat_completions",
       temperature: 0.7,
       max_tokens: 4096,
@@ -211,7 +212,7 @@ describe("settings-store", () => {
   });
 
   it("installSkill 在请求期间设置 isInstallingSkill，并在结束后恢复", async () => {
-    let resolveInstall: (() => void) | null = null;
+    let resolveInstall!: () => void;
     mockedConfigApi.installSkill.mockImplementation(
       () =>
         new Promise<void>((resolve) => {
@@ -225,7 +226,7 @@ describe("settings-store", () => {
     });
 
     expect(useSettingsStore.getState().isInstallingSkill).toBe(true);
-    resolveInstall?.();
+    resolveInstall();
     await installPromise;
     expect(useSettingsStore.getState().isInstallingSkill).toBe(false);
   });
@@ -243,6 +244,8 @@ describe("settings-store", () => {
           source_ref: "github:owner/repo",
           runtime_type: "native",
           enabled: true,
+          created_at: "2026-04-16T00:00:00Z",
+          updated_at: "2026-04-16T00:00:00Z",
         },
       ],
     });
@@ -266,7 +269,7 @@ describe("settings-store", () => {
   });
 
   it("updateSkillRiskPolicy 在请求期间设置 isSkillRiskPolicyUpdating，并在结束后恢复", async () => {
-    let resolveUpdate: (() => void) | null = null;
+    let resolveUpdate!: () => void;
     mockedConfigApi.updateSkillRiskPolicy.mockImplementation(
       () =>
         new Promise((resolve) => {
@@ -279,7 +282,7 @@ describe("settings-store", () => {
       .updateSkillRiskPolicy({ mode: "enforce_confirmation" });
 
     expect(useSettingsStore.getState().isSkillRiskPolicyUpdating).toBe(true);
-    resolveUpdate?.();
+    resolveUpdate();
     const ok = await updatePromise;
 
     expect(ok).toBe(true);

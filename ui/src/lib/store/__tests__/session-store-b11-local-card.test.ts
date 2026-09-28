@@ -43,7 +43,7 @@ describe("appendLocalCommandCard (INV-B11-2)", () => {
     useSessionStore.setState((s) => ({
       currentSession: __test_applySSEToSession(s.currentSession!, {
         type: "message",
-        data: { role: "assistant", message: "real-reply", stream_id: "real-1" },
+        data: { role: "assistant", message: "real-reply", stream_id: "real-1", attachments: [] },
       }),
     }));
     const messages = useSessionStore

@@ -5,7 +5,7 @@ Covers:
   response_format→text.format) + tool_choice rewrite + sampling strip for DeepSeek Reasoner.
 - T31(e): Kimi ``json_object`` response_format maps into ``text={"format": ...}``.
 - T31b: per-call + bound ``tool_choice="required"`` is rewritten to ``"auto"`` under Kimi K2.
-- T32: ``_astream`` wrapper inherits the same 6-step pipeline (delegates to ``_agenerate``).
+- T32: ``_astream`` uses the same request pipeline as ``_agenerate``.
 """
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ class _MockResponseObj:
 
 def _fake_responses_output(content: str = "answer") -> _MockResponseObj:
     return _MockResponseObj({
+        "status": "completed",
         "output": [
             {
                 "type": "message",
@@ -59,6 +60,10 @@ def _capture_responses_params():
 
     async def fake_create(**params):
         captured.append(params)
+        if params.get("stream"):
+            async def events():
+                yield {"type": "response.completed", "response": _fake_responses_output()}
+            return events()
         return _fake_responses_output()
 
     return fake_create, captured
@@ -400,13 +405,8 @@ async def test_responses_adapter_per_call_and_bound_tool_choice_kimi() -> None:
 
 # ---------- T32 _astream wrapper inherits the pipeline ----------
 
-async def test_responses_adapter_astream_wrapper_inherits_shared_fields() -> None:
-    """T32: ``_astream`` wrapper → same 6-step pipeline applies.
-
-    The Responses adapter's ``_astream`` delegates to ``_agenerate``, so the
-    outbound SDK params seen by ``responses.create`` must reflect the same
-    pipeline rewrites (tool_choice + sampling strip + field remap).
-    """
+async def test_responses_adapter_astream_inherits_shared_fields() -> None:
+    """SSE requests share tool-choice, sampling and field-remap rewrites."""
     p = get_profile("deepseek_reasoner")
     model = ActusResponsesModel(
         base_url="https://api.deepseek.com/",
@@ -433,3 +433,4 @@ async def test_responses_adapter_astream_wrapper_inherits_shared_fields() -> Non
     assert "max_tokens" not in params
     assert "messages" not in params
     assert "input" in params
+    assert params["stream"] is True

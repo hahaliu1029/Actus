@@ -74,6 +74,7 @@ class _MockResponsesResponse:
 
 def _fake_responses_output(content: str = "answer") -> _MockResponsesResponse:
     return _MockResponsesResponse({
+        "status": "completed",
         "output": [
             {
                 "type": "message",

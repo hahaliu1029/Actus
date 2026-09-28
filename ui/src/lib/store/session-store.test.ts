@@ -33,7 +33,7 @@ vi.mock("@/lib/api/session-compaction", () => ({
 
 import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
-import type { ListSessionItem, Session, SupervisorSnapshot } from "@/lib/api/types";
+import type { ListSessionItem, Session, SSEEventData, SupervisorSnapshot } from "@/lib/api/types";
 import {
   deriveSandboxBadge,
   deriveStatusFromEvents,
@@ -762,7 +762,9 @@ describe("session-store", () => {
   it("sendChat 收到未知 control.action 时应保持状态并输出告警", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     mockedSessionApi.chat.mockImplementation((_sessionId, _params, onEvent, _onError, onClose) => {
-      onEvent({
+      // Deliberately invalid wire data exercises the runtime guard for future
+      // actions; keep the production ControlAction union closed.
+      const unknownActionEvent: unknown = {
         type: "control",
         data: {
           event_id: "evt-control-unknown",
@@ -770,7 +772,8 @@ describe("session-store", () => {
           action: "unknown_action",
           source: "system",
         },
-      });
+      };
+      onEvent(unknownActionEvent as SSEEventData);
       onClose?.();
       return () => {};
     });
@@ -856,7 +859,7 @@ describe("session-store", () => {
   });
 
   it("fetchSessionById 在 silent 模式下不应切换加载态", async () => {
-    let resolveSession: ((session: Session) => void) | null = null;
+    let resolveSession!: (session: Session) => void;
     mockedSessionApi.getSession.mockImplementation(
       () =>
         new Promise<Session>((resolve) => {
@@ -870,7 +873,7 @@ describe("session-store", () => {
 
     expect(useSessionStore.getState().isLoadingCurrentSession).toBe(false);
 
-    resolveSession?.(
+    resolveSession(
       buildSession({
         session_id: "s1",
         status: "running",

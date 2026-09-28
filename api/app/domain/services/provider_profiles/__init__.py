@@ -28,4 +28,5 @@ from app.domain.services.provider_profiles import dashscope_qwen as _dashscope_q
 from app.domain.services.provider_profiles import dashscope_qwen_vl as _dashscope_qwen_vl  # noqa: F401
 from app.domain.services.provider_profiles import gemini_compat as _gemini_compat  # noqa: F401
 from app.domain.services.provider_profiles import glm as _glm  # noqa: F401
+from app.domain.services.provider_profiles import glm_5_2 as _glm_5_2  # noqa: F401
 from app.domain.services.provider_profiles import minimax as _minimax  # noqa: F401

@@ -55,6 +55,7 @@ def _dict_response(
     if reasoning_tokens is not None:
         usage["output_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
     return {
+        "status": "completed",
         "output": [
             {
                 "type": "message",

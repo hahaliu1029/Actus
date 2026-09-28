@@ -13,9 +13,10 @@ Implements:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
-import re
+from xml.etree import ElementTree
 import uuid
 from typing import Any, AsyncIterator, List, Literal, Optional
 
@@ -379,250 +380,101 @@ class ActusChatModel(BaseChatModel):
 
     @staticmethod
     def _parse_tool_calls(raw_tool_calls: Any) -> list[dict]:
-        """Parse OpenAI tool_calls from response into LangChain format."""
-        if not raw_tool_calls:
-            return []
+        """Accept only complete, identifiable function calls with JSON objects.
 
-        tool_calls = []
-        for tc in raw_tool_calls:
-            # Handle both object and dict formats
-            if hasattr(tc, "function"):
-                fn = tc.function
-                # Guard: some providers return function as a string
-                if isinstance(fn, str):
-                    fn_name = fn
-                    fn_args = "{}"
-                else:
-                    fn_name = fn.name if hasattr(fn, "name") else fn.get("name", "")
-                    fn_args = fn.arguments if hasattr(fn, "arguments") else fn.get("arguments", "{}")
-                tc_id = tc.id if hasattr(tc, "id") else tc.get("id", "")
-            elif isinstance(tc, dict):
-                fn = tc.get("function", {})
-                if isinstance(fn, str):
-                    fn_name = fn
-                    fn_args = "{}"
-                else:
-                    fn_name = fn.get("name", "")
-                    fn_args = fn.get("arguments", "{}")
-                tc_id = tc.get("id", "")
-            else:
-                continue
-
-            # Deserialize JSON arguments
-            if isinstance(fn_args, str):
-                try:
-                    fn_args = json.loads(fn_args)
-                except json.JSONDecodeError:
-                    fn_args = {}
-
-            tool_calls.append({
-                "id": tc_id,
-                "name": fn_name,
-                "args": fn_args,
-            })
-        return tool_calls
-
-    # ---- Fallback: extract tool calls from content text -------------------- #
-
-    # Skip fallback scanning on excessively long content to avoid
-    # performance issues from regex/brace-scanning on large outputs.
-    _MAX_CONTENT_TO_SCAN = 32_000
-
-    def _extract_tool_calls_from_content(
-        self, content: str,
-    ) -> tuple[list[dict], str]:
-        """Fallback: extract tool calls embedded in content text.
-
-        Some LLM providers (e.g. MiniMax) return tool calls as XML or JSON
-        inside the ``content`` field instead of the structured ``tool_calls``
-        response field. This method attempts to detect and parse them.
-
-        Only tool names that match bound tools are accepted (avoids false
-        positives).
-
-        Limitations:
-        - Nested XML inside parameter values is not supported (e.g.
-          ``<command>echo <b>hi</b></command>`` will not parse correctly).
-        - Content longer than ``_MAX_CONTENT_TO_SCAN`` chars is skipped.
-
-        Returns ``(tool_calls, cleaned_content)`` where *tool_calls* is in
-        LangChain format and *cleaned_content* has the matched text removed.
+        Never repair partial JSON or substitute empty arguments: the result is
+        executable input, so a malformed call invalidates the whole response.
         """
-        if not content or not self._bound_tool_names:
-            return [], content
-        if len(content) > self._MAX_CONTENT_TO_SCAN:
-            return [], content
+        def field(value: Any, name: str) -> Any:
+            return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
 
-        valid_names = self._bound_tool_names
-
-        # --- Strategy 1: XML <invoke name="...">...</invoke> --- #
-        tool_calls, cleaned = self._try_extract_xml_invoke(content, valid_names)
-        if tool_calls:
-            return tool_calls, cleaned
-
-        # --- Strategy 2: JSON object with "name" + "arguments" --- #
-        tool_calls, cleaned = self._try_extract_json_tool_call(content, valid_names)
-        if tool_calls:
-            return tool_calls, cleaned
-
-        return [], content
-
-    # -- XML extraction ---------------------------------------------------- #
-
-    # Bounded quantifiers prevent catastrophic backtracking on malformed input.
-    _RE_INVOKE = re.compile(
-        r'<invoke\s+name="([^"]{1,256})"[^>]{0,256}>([\s\S]{0,16384}?)</invoke>',
-        re.DOTALL,
-    )
-    _RE_XML_PARAM = re.compile(r'<(\w{1,64})>(.{0,4096}?)</\1>', re.DOTALL)
-    # Tags inside <invoke> that are control metadata, not tool arguments
-    _XML_CONTROL_TAGS = frozenset({"end_turn"})
-    # Marker that immediately precedes XML tool calls (e.g. "minimax:tool_call")
-    # Anchored to line start via MULTILINE to avoid corrupting normal text.
-    _RE_TOOL_CALL_MARKER = re.compile(r'^\w+:tool_call\s*$', re.MULTILINE)
-
-    def _try_extract_xml_invoke(
-        self, content: str, valid_names: frozenset[str],
-    ) -> tuple[list[dict], str]:
-        """Try to extract ``<invoke name="tool">`` blocks from *content*.
-
-        Only removes matched (accepted) spans — unrecognised tool names are
-        left intact in the returned content.
-        """
-        tool_calls: list[dict] = []
-        accepted_spans: list[tuple[int, int]] = []
-
-        for match in self._RE_INVOKE.finditer(content):
-            tool_name = match.group(1)
-            inner = match.group(2)
-
-            if tool_name not in valid_names:
-                continue
-
-            # Parse child XML elements as arguments
-            args: dict[str, Any] = {}
-            for pm in self._RE_XML_PARAM.finditer(inner):
-                key = pm.group(1)
-                if key in self._XML_CONTROL_TAGS:
-                    continue
-                value = pm.group(2).strip()
-                # Try to interpret as JSON value (number, bool, null, etc.)
-                try:
-                    args[key] = json.loads(value)
-                except (json.JSONDecodeError, ValueError):
-                    args[key] = value
-
-            tool_calls.append({
-                "id": f"fallback_{uuid.uuid4().hex[:8]}",
-                "name": tool_name,
-                "args": args,
-            })
-            accepted_spans.append((match.start(), match.end()))
-
-        if not tool_calls:
-            return [], content
-
-        # Remove only accepted spans (reverse order to preserve indices)
-        cleaned = content
-        for start, end in reversed(accepted_spans):
-            cleaned = cleaned[:start] + cleaned[end:]
-        # Remove line-anchored tool_call markers (e.g. "minimax:tool_call")
-        cleaned = self._RE_TOOL_CALL_MARKER.sub("", cleaned)
-        cleaned = cleaned.strip()
-
-        logger.info(
-            "[FALLBACK_TOOL_CALL] Extracted %d XML tool call(s) from content "
-            "(model=%s): %s",
-            len(tool_calls), self.model_name,
-            [tc["name"] for tc in tool_calls],
-        )
-        return tool_calls, cleaned
-
-    # -- JSON extraction --------------------------------------------------- #
+        calls: list[dict] = []
+        seen: set[str] = set()
+        for tc in raw_tool_calls or []:
+            fn = field(tc, "function")
+            name, raw, call_id = field(fn, "name"), field(fn, "arguments"), field(tc, "id")
+            if not isinstance(name, str) or not name.strip() or not isinstance(call_id, str) or not call_id.strip():
+                raise ServerRequestsError("LLM returned a tool call without a valid name or id")
+            if call_id in seen:
+                raise ServerRequestsError("LLM returned duplicate tool call ids")
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else raw
+            except (ValueError, TypeError) as exc:
+                raise ServerRequestsError("LLM returned invalid or incomplete tool arguments") from exc
+            if not isinstance(args, dict):
+                raise ServerRequestsError("LLM tool arguments must be a JSON object")
+            try:
+                json.dumps(args, allow_nan=False)
+            except (ValueError, TypeError) as exc:
+                raise ServerRequestsError("LLM tool arguments contain invalid JSON values") from exc
+            seen.add(call_id)
+            calls.append({"id": call_id, "name": name, "args": args})
+        return calls
 
     @staticmethod
-    def _find_json_objects(text: str) -> list[tuple[int, int, dict]]:
-        """Find top-level JSON objects in *text* via brace-depth scanning.
+    def _validate_finish_reason(reason: Any) -> str:
+        if reason not in ("stop", "tool_calls"):
+            label = reason if isinstance(reason, str) else "missing"
+            raise ServerRequestsError(f"LLM response did not finish successfully (finish_reason={label})")
+        return reason
 
-        Returns list of ``(start, end, parsed_dict)`` tuples.
-        Uses ``str.find`` to skip non-brace characters efficiently.
+    # ---- Explicit provider content-tool compatibility ------------------- #
+
+    _MAX_CONTENT_TO_SCAN = 32_000
+
+    def _extract_tool_calls_from_content(self, content: str) -> tuple[list[dict], str]:
+        """Decode a complete MiniMax tool envelope only for opted-in profiles.
+
+        Prose, bare JSON/XML and code examples remain content. A bound tool name
+        alone is not evidence that the model intended an executable call.
         """
-        results: list[tuple[int, int, dict]] = []
-        i = 0
-        length = len(text)
-        while i < length:
-            next_brace = text.find('{', i)
-            if next_brace == -1:
-                break
-            i = next_brace
-            depth = 0
-            end = i
-            for j in range(i, length):
-                if text[j] == '{':
-                    depth += 1
-                elif text[j] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end = j + 1
-                        break
-            if depth == 0 and end > i:
-                try:
-                    obj = json.loads(text[i:end])
-                    if isinstance(obj, dict):
-                        results.append((i, end, obj))
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                i = end
-            else:
-                i += 1
-        return results
-
-    _RE_CODE_FENCE = re.compile(r'```(?:json)?\s*\n?\s*```', re.MULTILINE)
-
-    def _try_extract_json_tool_call(
-        self, content: str, valid_names: frozenset[str],
-    ) -> tuple[list[dict], str]:
-        """Try to extract JSON tool call objects from *content*.
-
-        Recognises objects like ``{"name": "tool", "arguments": {...}}``.
-        """
-        tool_calls: list[dict] = []
-        spans_to_remove: list[tuple[int, int]] = []
-
-        for start, end, obj in self._find_json_objects(content):
-            name = obj.get("name", "")
-            arguments = obj.get("arguments")
-
-            if not name or name not in valid_names:
-                continue
-            if not isinstance(arguments, dict):
-                continue
-
-            tool_calls.append({
-                "id": f"fallback_{uuid.uuid4().hex[:8]}",
-                "name": name,
-                "args": arguments,
-            })
-            spans_to_remove.append((start, end))
-
-        if not tool_calls:
+        if (not self.profile.emits_tool_calls_in_content or not content
+                or not self._bound_tool_names or len(content) > self._MAX_CONTENT_TO_SCAN):
             return [], content
-
-        # Remove matched JSON spans (reverse order to preserve indices)
-        cleaned = content
-        for start, end in reversed(spans_to_remove):
-            cleaned = cleaned[:start] + cleaned[end:]
-        # Strip leftover empty code fences
-        cleaned = self._RE_CODE_FENCE.sub('', cleaned)
-        cleaned = cleaned.strip()
-
-        logger.info(
-            "[FALLBACK_TOOL_CALL] Extracted %d JSON tool call(s) from content "
-            "(model=%s): %s",
-            len(tool_calls), self.model_name,
-            [tc["name"] for tc in tool_calls],
-        )
-        return tool_calls, cleaned
+        body = content.strip()
+        if body.startswith("<minimax:tool_call>") and body.endswith("</minimax:tool_call>"):
+            body = body[len("<minimax:tool_call>"):-len("</minimax:tool_call>")]
+        elif body.startswith("minimax:tool_call\n"):
+            body = body[len("minimax:tool_call\n"):]
+        else:
+            return [], content
+        # Forbid declarations/entities and code fences before XML parsing.
+        if "<!" in body or "<?" in body or "```" in body:
+            return [], content
+        try:
+            root = ElementTree.fromstring(f"<calls>{body}</calls>")
+        except ElementTree.ParseError:
+            return [], content
+        if root.text and root.text.strip():
+            return [], content
+        calls: list[dict] = []
+        for invoke in root:
+            name = invoke.get("name")
+            if (invoke.tag != "invoke" or name not in self._bound_tool_names
+                    or set(invoke.attrib) != {"name"}
+                    or (invoke.text and invoke.text.strip())
+                    or (invoke.tail and invoke.tail.strip())):
+                return [], content
+            args: dict[str, Any] = {}
+            for param in invoke:
+                key = param.get("name") if param.tag == "parameter" else param.tag
+                if (not key or len(param) or (param.tail and param.tail.strip())
+                        or (param.attrib and not (param.tag == "parameter" and set(param.attrib) == {"name"}))
+                        or key in args):
+                    return [], content
+                if key == "end_turn":
+                    continue
+                value = (param.text or "").strip()
+                try:
+                    args[key] = json.loads(value)
+                except ValueError:
+                    args[key] = value
+            calls.append({"id": f"fallback_{uuid.uuid4().hex}", "name": name, "args": args})
+        try:
+            json.dumps(calls, allow_nan=False)
+        except (ValueError, TypeError):
+            return [], content
+        return (calls, "") if calls else ([], content)
 
     # ---- LangChain interface: _generate (sync) --------------------------- #
 
@@ -772,16 +624,22 @@ class ActusChatModel(BaseChatModel):
 
         # Extract message from response
         choice = response.choices[0]
+        finish_reason = self._validate_finish_reason(getattr(choice, "finish_reason", None))
         message = choice.message
         content = message.content or ""
+        refusal = getattr(message, "refusal", None)
+        refusal = refusal if isinstance(refusal, str) else None
         tool_calls = self._parse_tool_calls(message.tool_calls)
 
         # A7 P0.1: parse reasoning_content out of the provider-specific key.
         # For generic_openai (supports_thinking=False) this returns {}.
         ak = parse_chat_completion_message(message, profile)
+        if refusal:
+            ak["refusal"] = refusal
+            content = content or refusal
 
         # Fallback: if no structured tool_calls, try extracting from content
-        if not tool_calls and content:
+        if not tool_calls and content and not refusal:
             tool_calls, content = self._extract_tool_calls_from_content(content)
 
         # Validate: entirely empty response (no content, no tool_calls) is
@@ -797,6 +655,7 @@ class ActusChatModel(BaseChatModel):
             content=content,
             tool_calls=tool_calls,
             additional_kwargs=ak,
+            response_metadata={"finish_reason": finish_reason},
             usage_metadata=_extract_usage_metadata(getattr(response, "usage", None)),
         )
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
@@ -975,6 +834,14 @@ class ActusChatModel(BaseChatModel):
         # funneling every mid-stream ``APIError`` to the same-endpoint
         # retry path is the correct routing regardless of subclass.
         has_content = False
+        has_refusal = False
+        finish_reason: str | None = None
+        pending_calls: list[dict] = []
+        current_calls: dict[int, dict] = {}
+        buffered_content: list[str] = []
+        # Content-tool compatibility needs the complete envelope before it can
+        # distinguish visible text from a call. Other profiles stream normally.
+        buffer_content = bool(profile.emits_tool_calls_in_content and self._bound_tool_names)
         try:
             async for chunk in stream:
                 # B4 M0: OpenAI with stream_options.include_usage=true sends a
@@ -999,29 +866,54 @@ class ActusChatModel(BaseChatModel):
                         yield usage_gen
                     continue
 
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                reason = getattr(choice, "finish_reason", None)
+                delta = choice.delta
 
-                # Extract content
-                content = delta.content or ""
+                content = getattr(delta, "content", None) or ""
+                refusal = getattr(delta, "refusal", None)
+                refusal = refusal if isinstance(refusal, str) else None
+                if finish_reason is not None and (content or refusal or getattr(delta, "tool_calls", None)):
+                    raise ServerRequestsError("LLM stream returned output after its finish reason")
+                if reason is not None:
+                    finish_reason = self._validate_finish_reason(reason)
+                if refusal:
+                    has_refusal = True
+                    content = content or refusal
+                if buffer_content:
+                    buffered_content.append(content)
 
-                # Extract tool_call_chunks for streaming aggregation
-                tool_call_chunks = []
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        fn = tc.function if hasattr(tc, "function") else None
-                        tool_call_chunks.append({
-                            "index": tc.index if hasattr(tc, "index") else 0,
-                            "id": tc.id if hasattr(tc, "id") and tc.id else None,
-                            "name": fn.name if fn and hasattr(fn, "name") and fn.name else None,
-                            "args": fn.arguments if fn and hasattr(fn, "arguments") else "",
-                        })
+                # Do not expose partially repaired tool_calls from LangChain's
+                # parse_partial_json. Release the whole batch only after the
+                # stream has terminated successfully and every call is valid.
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    idx = getattr(tc, "index", None)
+                    if not isinstance(idx, int) or idx < 0:
+                        raise ServerRequestsError("LLM tool stream omitted a valid call index")
+                    call_id = getattr(tc, "id", None)
+                    entry = current_calls.get(idx)
+                    if entry is None or (call_id and entry["id"] and call_id != entry["id"]):
+                        entry = {"index": idx, "id": "", "function": {"name": "", "arguments": ""}}
+                        current_calls[idx] = entry
+                        pending_calls.append(entry)
+                    if call_id:
+                        entry["id"] = call_id
+                    fn = getattr(tc, "function", None)
+                    for key in ("name", "arguments"):
+                        part = getattr(fn, key, None)
+                        if part is not None:
+                            if not isinstance(part, str):
+                                raise ServerRequestsError("LLM tool stream contains a non-string function delta")
+                            entry["function"][key] += part
 
                 # A7 P0.1: parse reasoning_content out of the provider-specific
                 # key on the delta. For generic_openai (supports_thinking=False)
                 # this returns {} and the chunk passes through unchanged.
                 chunk_ak = parse_chat_completion_stream_chunk(delta, profile)
 
-                if content or tool_call_chunks or chunk_ak:
+                if refusal:
+                    chunk_ak["refusal"] = refusal
+                if content or pending_calls:
                     has_content = True
 
                 # Some providers attach usage to the final delta chunk (rather
@@ -1031,15 +923,14 @@ class ActusChatModel(BaseChatModel):
                 )
 
                 ai_chunk = AIMessageChunk(
-                    content=content,
-                    tool_call_chunks=tool_call_chunks if tool_call_chunks else [],
+                    content="" if buffer_content else content,
                     additional_kwargs=chunk_ak,
                     usage_metadata=chunk_usage_meta,
                 )
                 gen_chunk = ChatGenerationChunk(message=ai_chunk)
 
                 if run_manager:
-                    await run_manager.on_llm_new_token(content, chunk=gen_chunk)
+                    await run_manager.on_llm_new_token(ai_chunk.content, chunk=gen_chunk)
 
                 yield gen_chunk
         except TRANSIENT_OPENAI_EXCEPTIONS as exc:
@@ -1051,6 +942,19 @@ class ActusChatModel(BaseChatModel):
             # subclasses which almost never fire mid-stream). Funnel them
             # all to ServerRequestsError so the llm_node retry fires.
             raise translate_transient(self, exc) from exc
+        finally:
+            close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+
+        self._validate_finish_reason(finish_reason)
+        ordered_calls = sorted(pending_calls, key=lambda call: call["index"])
+        tool_calls = self._parse_tool_calls(ordered_calls)
+        final_content = "".join(buffered_content)
+        if buffer_content and not tool_calls and not has_refusal:
+            tool_calls, final_content = self._extract_tool_calls_from_content(final_content)
 
         # Validate: stream produced zero useful chunks (same 404-in-200 scenario)
         if not has_content:
@@ -1058,6 +962,18 @@ class ActusChatModel(BaseChatModel):
                 f"LLM ({self.model_name}) stream returned empty response "
                 f"(no content, no tool_calls in any chunk)"
             )
+
+        terminal = ChatGenerationChunk(message=AIMessageChunk(
+            content=final_content,
+            tool_call_chunks=[{
+                "index": i, "id": call["id"], "name": call["name"],
+                "args": json.dumps(call["args"], ensure_ascii=False),
+            } for i, call in enumerate(tool_calls)],
+            response_metadata={"finish_reason": finish_reason},
+        ))
+        if run_manager:
+            await run_manager.on_llm_new_token(final_content, chunk=terminal)
+        yield terminal
 
     # ---- bind_tools ------------------------------------------------------ #
 

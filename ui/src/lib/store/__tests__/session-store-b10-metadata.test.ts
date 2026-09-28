@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __test_applySSEToSession, useSessionStore } from "../session-store";
 import type { SessionEventRecord } from "../session-store";
+import type { ToolEventEnvelopeV1 } from "@/lib/api/types";
 
 vi.mock("../../api/session", () => ({
   sessionApi: {
@@ -33,7 +34,7 @@ vi.mock("@/lib/api/session-compaction", () => ({
   fetchCompactionOriginalContent: vi.fn(),
 }));
 
-const TOOL_EVENT_WITH_METADATA: SessionEventRecord = {
+const TOOL_EVENT_WITH_METADATA = {
   event: "tool",
   data: {
     event_id: "1000-7",
@@ -50,7 +51,7 @@ const TOOL_EVENT_WITH_METADATA: SessionEventRecord = {
     display_icon: "file",
     tool_source: { source: "native", category: "file", canonical_name: "file_read" },
   },
-};
+} satisfies SessionEventRecord & { data: ToolEventEnvelopeV1 };
 
 describe("INV-B10-6: equal-seq merge 元数据保持 (recovery ≡ live)", () => {
   beforeEach(() => {

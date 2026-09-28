@@ -56,7 +56,7 @@ def _make_responses_api_response(
                 "arguments": fc.get("arguments", "{}"),
             })
 
-    return {"output": output}
+    return {"status": "completed", "output": output}
 
 
 class _MockResponseObj:
@@ -595,20 +595,23 @@ class TestAGenerate:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _astream (fallback to _agenerate)
+# Tests: _astream (Responses SSE)
 # ---------------------------------------------------------------------------
 
 
 class TestAStream:
-    """Test _astream -- should fallback to _agenerate for Responses API."""
+    """Test _astream consumes Responses terminal events."""
 
     async def test_stream_returns_result(self, model: ActusResponsesModel) -> None:
         """_astream should yield at least one chunk with the response content."""
         from langchain_core.messages import AIMessageChunk
 
         mock_resp = _MockResponseObj(_make_responses_api_response(text="Streamed response"))
+        async def events():
+            yield {"type": "response.completed", "response": mock_resp}
+
         mock_client = AsyncMock()
-        mock_client.responses.create = AsyncMock(return_value=mock_resp)
+        mock_client.responses.create = AsyncMock(return_value=events())
 
         with patch.object(model, "_get_client", return_value=mock_client):
             collected = []
@@ -621,6 +624,7 @@ class TestAStream:
             c.message.content for c in collected if c.message.content
         )
         assert "Streamed response" in full_content
+        assert mock_client.responses.create.call_args.kwargs["stream"] is True
 
 
 # ---------------------------------------------------------------------------

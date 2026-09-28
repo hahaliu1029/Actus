@@ -74,6 +74,7 @@ class AppConfigService:
 
     async def update_llm_config(self, llm_config: LLMConfig) -> LLMConfig:
         """根据传递的llm_config更新语言模型提供商配置"""
+        self.validate_llm_provider(llm_config.provider)
         # 1.获取应用配置
         app_config = await self._load_app_config()
 
@@ -86,6 +87,17 @@ class AppConfigService:
         self.app_config_repository.save(app_config)
 
         return app_config.llm_config
+
+    @staticmethod
+    def validate_llm_provider(provider: str | None) -> None:
+        from app.application.errors.exceptions import ConfigError, ValidationError
+        from app.domain.services.provider_profiles import get_profile
+
+        if provider and provider.strip():
+            try:
+                get_profile(provider.strip())
+            except ConfigError as exc:
+                raise ValidationError("未知的模型兼容策略，请重新选择 provider") from exc
 
     async def get_agent_config(self) -> AgentConfig:
         """获取Agent通用配置"""
@@ -115,6 +127,7 @@ class AppConfigService:
         self, config: FileUnderstandingConfig
     ) -> FileUnderstandingConfig:
         """更新文件理解配置"""
+        self.validate_llm_provider(config.vision_fallback.provider)
         app_config = await self._load_app_config()
         # 保留已有 api_key（前端提交空字符串表示不更新）
         if not config.vision_fallback.api_key.strip():

@@ -519,212 +519,57 @@ def _make_model_with_tools(tool_names: list[str]) -> ActusChatModel:
     return model
 
 
-class TestExtractToolCallsFromContentXML:
-    """Test XML <invoke> pattern extraction."""
-
-    def test_minimax_style_xml(self) -> None:
-        """MiniMax-style XML with :tool_call marker and <invoke> block."""
-        model = _make_model_with_tools(["message_notify_user"])
-        content = (
-            "💭 思考过程\n用户要求分析图片。\n\n"
-            "minimax:tool_call\n"
-            '<invoke name="message_notify_user">'
-            "<end_turn>true</end_turn>"
-            "<text>正在调用工具...</text>"
-            "</invoke>"
-        )
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 1
-        assert tool_calls[0]["name"] == "message_notify_user"
-        assert tool_calls[0]["args"] == {"text": "正在调用工具..."}
-        assert "end_turn" not in json.dumps(tool_calls[0]["args"])
-        assert tool_calls[0]["id"].startswith("fallback_")
-        # Cleaned content should not contain the XML or marker
-        assert "<invoke" not in cleaned
-        assert "minimax:tool_call" not in cleaned
-        # But should preserve the thinking text
-        assert "思考过程" in cleaned
-
-    def test_multiple_xml_invocations(self) -> None:
-        """Multiple <invoke> blocks should all be extracted."""
-        model = _make_model_with_tools(["file_read", "shell_execute"])
-        content = (
-            '<invoke name="file_read"><filepath>/tmp/a.txt</filepath></invoke>\n'
-            '<invoke name="shell_execute"><command>ls -la</command></invoke>'
-        )
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 2
-        assert tool_calls[0]["name"] == "file_read"
-        assert tool_calls[0]["args"] == {"filepath": "/tmp/a.txt"}
-        assert tool_calls[1]["name"] == "shell_execute"
-        assert tool_calls[1]["args"] == {"command": "ls -la"}
-
-    def test_xml_with_numeric_arg(self) -> None:
-        """Numeric values in XML args should be parsed as numbers."""
-        model = _make_model_with_tools(["shell_wait_process"])
-        content = '<invoke name="shell_wait_process"><seconds>5</seconds></invoke>'
-        tool_calls, _ = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 1
-        assert tool_calls[0]["args"]["seconds"] == 5
-
-    def test_xml_with_boolean_arg(self) -> None:
-        """Boolean values in XML args should be parsed as booleans."""
-        model = _make_model_with_tools(["file_write"])
-        content = '<invoke name="file_write"><filepath>/tmp/f</filepath><append>true</append></invoke>'
-        tool_calls, _ = model._extract_tool_calls_from_content(content)
-        assert tool_calls[0]["args"]["append"] is True
-
-    def test_xml_unknown_tool_name_ignored(self) -> None:
-        """XML invoke with a tool name not in bound tools should be ignored."""
+class TestContentToolEnvelope:
+    @pytest.mark.parametrize("profile", ["generic_openai", "openai_official", "minimax"])
+    @pytest.mark.parametrize("content", [
+        '{"name":"file_read","arguments":{"filepath":"/etc/hosts"}}',
+        'Example only; do not execute:\n```json\n{"name":"file_read","arguments":{}}\n```',
+        '<invoke name="file_read"><filepath>/tmp/a</filepath></invoke>',
+        'Example:\nminimax:tool_call\n<invoke name="file_read"><filepath>/tmp/a</filepath></invoke>',
+        '```xml\n<minimax:tool_call><invoke name="file_read"/></minimax:tool_call>\n```',
+        'Normal response with no calls.',
+    ])
+    def test_text_examples_never_become_calls(self, profile, content):
+        from app.domain.services.provider_profiles import get_profile
         model = _make_model_with_tools(["file_read"])
-        content = '<invoke name="nonexistent_tool"><x>1</x></invoke>'
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
+        model.profile = get_profile(profile)
+        assert model._extract_tool_calls_from_content(content) == ([], content)
 
-    def test_xml_end_turn_tag_excluded(self) -> None:
-        """The <end_turn> control tag should not appear in extracted args."""
-        model = _make_model_with_tools(["search_web"])
-        content = '<invoke name="search_web"><end_turn>true</end_turn><query>test</query></invoke>'
-        tool_calls, _ = model._extract_tool_calls_from_content(content)
-        assert "end_turn" not in tool_calls[0]["args"]
-        assert tool_calls[0]["args"]["query"] == "test"
+    @pytest.mark.parametrize("envelope", [
+        'minimax:tool_call\n{body}', '<minimax:tool_call>{body}</minimax:tool_call>',
+    ])
+    def test_complete_opted_in_envelope(self, envelope):
+        from app.domain.services.provider_profiles import get_profile
+        model = _make_model_with_tools(["file_read", "file_write"])
+        model.profile = get_profile("minimax")
+        body = ('<invoke name="file_read"><parameter name="filepath">/tmp/a</parameter></invoke>'
+                '<invoke name="file_write"><append>true</append><count>5</count></invoke>')
+        calls, content = model._extract_tool_calls_from_content(envelope.format(body=body))
+        assert content == ""
+        assert [call["name"] for call in calls] == ["file_read", "file_write"]
+        assert [call["args"] for call in calls] == [{"filepath": "/tmp/a"}, {"append": True, "count": 5}]
+        assert len({call["id"] for call in calls}) == 2
 
-
-class TestExtractToolCallsFromContentJSON:
-    """Test JSON-in-content extraction."""
-
-    def test_basic_json_tool_call(self) -> None:
-        """JSON object with name + arguments should be extracted."""
-        model = _make_model_with_tools(["search_web"])
-        content = (
-            'I will search for you.\n'
-            '{"name": "search_web", "arguments": {"query": "python tutorial"}}'
-        )
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 1
-        assert tool_calls[0]["name"] == "search_web"
-        assert tool_calls[0]["args"] == {"query": "python tutorial"}
-        assert "search_web" not in cleaned
-        assert "I will search for you." in cleaned
-
-    def test_json_in_code_fence(self) -> None:
-        """JSON inside ```json ... ``` code fence."""
+    def test_marker_requires_profile_opt_in(self):
         model = _make_model_with_tools(["file_read"])
-        content = (
-            "Let me read that file:\n"
-            '```json\n'
-            '{"name": "file_read", "arguments": {"filepath": "/etc/hosts"}}\n'
-            '```'
-        )
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 1
-        assert tool_calls[0]["name"] == "file_read"
-        assert tool_calls[0]["args"]["filepath"] == "/etc/hosts"
+        content = 'minimax:tool_call\n<invoke name="file_read"/>'
+        assert model._extract_tool_calls_from_content(content) == ([], content)
 
-    def test_json_unknown_tool_ignored(self) -> None:
-        """JSON object with unknown tool name should not be extracted."""
+    @pytest.mark.parametrize("body", [
+        '<invoke name="file_read"><filepath>/tmp/a</filepath>',
+        '<invoke name="file_read"/><invoke name="unknown"/>',
+        '<invoke name="file_read"><x><nested/></x></invoke>',
+        '<invoke name="file_read"><x>1</x><x>2</x></invoke>',
+        '<!DOCTYPE test [<!ENTITY a "x">]><invoke name="file_read"/>',
+        '<invoke name="file_read"/> explanation',
+        'x' * 32001,
+    ])
+    def test_ambiguous_or_invalid_envelope_kept_as_text(self, body):
+        from app.domain.services.provider_profiles import get_profile
         model = _make_model_with_tools(["file_read"])
-        content = '{"name": "unknown_tool", "arguments": {"x": 1}}'
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
-
-    def test_json_missing_arguments_ignored(self) -> None:
-        """JSON object without 'arguments' dict should not be extracted."""
-        model = _make_model_with_tools(["file_read"])
-        content = '{"name": "file_read", "args": {"filepath": "/tmp"}}'
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-
-    def test_multiple_json_tool_calls(self) -> None:
-        """Multiple JSON tool call objects in content."""
-        model = _make_model_with_tools(["file_read", "shell_execute"])
-        content = (
-            '{"name": "file_read", "arguments": {"filepath": "/a.txt"}}\n'
-            '{"name": "shell_execute", "arguments": {"command": "ls"}}'
-        )
-        tool_calls, _ = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 2
-
-
-class TestExtractToolCallsNoFalsePositives:
-    """Ensure normal content without tool calls is not misinterpreted."""
-
-    def test_normal_text_unchanged(self) -> None:
-        """Plain text content should not trigger extraction."""
-        model = _make_model_with_tools(["file_read", "shell_execute"])
-        content = "The file was read successfully. Here are the results..."
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
-
-    def test_empty_content(self) -> None:
-        """Empty content returns empty."""
-        model = _make_model_with_tools(["file_read"])
-        tool_calls, cleaned = model._extract_tool_calls_from_content("")
-        assert tool_calls == []
-        assert cleaned == ""
-
-    def test_no_bound_tools(self) -> None:
-        """Without bound tools, no extraction should happen."""
-        model = ActusChatModel(base_url="https://x", api_key="k", model_name="m")
-        model._bound_tools = None
-        model._bound_tool_names = frozenset()
-        content = '<invoke name="file_read"><x>1</x></invoke>'
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
-
-    def test_json_object_without_name_key(self) -> None:
-        """Random JSON in content that isn't a tool call."""
-        model = _make_model_with_tools(["file_read"])
-        content = 'The config is: {"host": "localhost", "port": 8080}'
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
-
-    def test_xml_like_content_without_invoke(self) -> None:
-        """Content with XML-like tags but not <invoke> should be left alone."""
-        model = _make_model_with_tools(["file_read"])
-        content = "<result><status>ok</status></result>"
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
-
-    def test_content_exceeding_max_scan_length(self) -> None:
-        """Content longer than _MAX_CONTENT_TO_SCAN is skipped entirely."""
-        model = _make_model_with_tools(["file_read"])
-        # Create content just over the limit
-        content = "x" * (model._MAX_CONTENT_TO_SCAN + 1)
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert tool_calls == []
-        assert cleaned == content
-
-    def test_tool_call_marker_not_corrupting_normal_text(self) -> None:
-        """Text containing 'tool_call' as a substring should NOT be removed."""
-        model = _make_model_with_tools(["file_read"])
-        content = (
-            'See the tool_call field for details.\n'
-            '<invoke name="file_read"><filepath>/tmp/a</filepath></invoke>'
-        )
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 1
-        # The normal text should be preserved — marker regex is line-anchored
-        assert "tool_call" in cleaned
-
-    def test_only_accepted_xml_blocks_removed(self) -> None:
-        """Unrecognised invoke blocks should remain in content."""
-        model = _make_model_with_tools(["file_read"])
-        content = (
-            '<invoke name="file_read"><filepath>/tmp/a</filepath></invoke>\n'
-            '<invoke name="unknown_tool"><x>1</x></invoke>'
-        )
-        tool_calls, cleaned = model._extract_tool_calls_from_content(content)
-        assert len(tool_calls) == 1
-        assert tool_calls[0]["name"] == "file_read"
-        # The unknown_tool invoke should still be in the cleaned content
-        assert "unknown_tool" in cleaned
+        model.profile = get_profile("minimax")
+        content = f"minimax:tool_call\n{body}"
+        assert model._extract_tool_calls_from_content(content) == ([], content)
 
 
 class TestFallbackIntegrationInAgenerate:
@@ -734,8 +579,9 @@ class TestFallbackIntegrationInAgenerate:
         """When API returns no tool_calls but content has XML, fallback extracts it."""
         model = _make_model_with_tools(["mcp_MiniMax_understand_image"])
 
+        from app.domain.services.provider_profiles import get_profile
+        model.profile = get_profile("minimax")
         xml_content = (
-            "让我调用工具来分析图片。\n\n"
             "minimax:tool_call\n"
             '<invoke name="mcp_MiniMax_understand_image">'
             "<image_url>http://example.com/img.png</image_url>"

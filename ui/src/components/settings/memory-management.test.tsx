@@ -241,7 +241,7 @@ describe("MemoryManagement smoke", () => {
     const user = userEvent.setup();
     mockedMemoryApi.getCleanupConfig.mockResolvedValue({ rollout_at: null });
     mockedMemoryApi.deleteLegacy.mockRejectedValueOnce(
-      new ApiError("network down", 0),
+      new ApiError({ msg: "network down", code: 0, httpStatus: 0 }),
     );
     render(<MemoryManagement />);
 

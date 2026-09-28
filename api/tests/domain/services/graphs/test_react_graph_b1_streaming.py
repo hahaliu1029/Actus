@@ -157,6 +157,18 @@ class TestIncrementalCalling:
 
 
 class TestChunkBoundaryCancel:
+    async def test_truncated_tool_arguments_fail_before_returning_execution_state(self):
+        from app.application.errors.exceptions import ServerRequestsError
+
+        queue: asyncio.Queue = asyncio.Queue()
+        llm_node = _build_llm_node(
+            streaming=True, incremental=True,
+            chunks=[_chunk([_tcc(0, id="t1", name="file_write", args='{"path":"/x"')])],
+        )
+        with pytest.raises(ServerRequestsError, match="incomplete streamed tool arguments"):
+            await llm_node(_state(), {"configurable": {"event_queue": queue}})
+        assert queue.empty()
+
     async def test_chunk_boundary_cancel_behavior(self):
         """R14#1 P1（行为测试，替代纯静态 tripwire）+ R15#1 前置：
         streaming ON + incremental ON + queue 存在；首 chunk 含不完整 tool_call。

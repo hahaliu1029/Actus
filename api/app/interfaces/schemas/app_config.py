@@ -4,6 +4,13 @@ from app.domain.models.app_config import MCPTransport
 from pydantic import BaseModel, Field
 
 
+class LLMConnectionTestResult(BaseModel):
+    success: bool
+    provider: str
+    api_type: str
+    message: str
+
+
 class ListMCPServerItem(BaseModel):
     """​MCP服务列表条目选项"""
 

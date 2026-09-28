@@ -86,6 +86,10 @@ export type MCPTransport = "stdio" | "sse" | "streamable_http";
 
 export type LLMConfig = {
   base_url: string;
+  provider?: string | null;
+  supports_response_format?: boolean;
+  timeout_seconds?: number;
+  connect_timeout_seconds?: number;
   api_key?: string;
   model_name: string;
   supports_vision: boolean;
@@ -103,6 +107,13 @@ export type LLMConfig = {
   token_estimator: "hybrid" | "char" | "provider_api";
   token_safety_factor: number;
   unknown_model_context_window: number;
+};
+
+export type LLMConnectionTestResult = {
+  success: boolean;
+  provider: string;
+  api_type: string;
+  message: string;
 };
 
 export type ToolConfirmationConfig = {
@@ -134,6 +145,8 @@ export type VisionFallbackConfig = {
   api_key?: string;
   model_name: string;
   api_type: "chat_completions" | "responses" | "auto";
+  provider?: string | null;
+  supports_response_format?: boolean;
 };
 
 export type AudioProcessorConfig = {
@@ -462,6 +475,8 @@ export type RenewTakeoverResponse = {
 export type ChatMessageData = {
   event_id?: string;
   created_at?: number;
+  /** Backend BaseEventData cursor; legacy messages may omit it or send null. */
+  seq?: number | null;
   role: "user" | "assistant" | "system";
   message: string;
   stream_id?: string;

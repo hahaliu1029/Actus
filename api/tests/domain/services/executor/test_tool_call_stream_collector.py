@@ -1,6 +1,9 @@
 """B1-2 ToolCallStreamCollector — spec §5.2 failure-mode table driven."""
 from __future__ import annotations
 
+import pytest
+
+from app.application.errors.exceptions import ServerRequestsError
 from langchain_core.messages import AIMessageChunk
 
 from app.domain.services.executor import CompletedToolCall, ToolCallStreamCollector
@@ -51,53 +54,27 @@ class TestIncrementalCompletion:
 
 
 class TestFailureModeTable:
-    def test_empty_or_none_args_is_empty_dict(self):
+    @pytest.mark.parametrize("raw", ["", None, '{"a": 1', '[]', 'null', '{"x":NaN}', '{"x":Infinity}'])
+    def test_invalid_raw_arguments_cannot_execute(self, raw):
         c = ToolCallStreamCollector()
-        c.ingest(_chunk([_tcc(0, id="a", name="noarg", args="")]))
-        _, tail = c.finalize()
-        assert tail and tail[0].args == {}
+        c.ingest(_chunk([_tcc(0, id="a", name="f", args=raw)]))
+        with pytest.raises(ServerRequestsError, match="arguments"):
+            c.finalize()
 
-        # §5.2 第一行的 None 分支（R2#4 修：与 "" 分开断言）
-        c2 = ToolCallStreamCollector()
-        c2.ingest(_chunk([_tcc(0, id="b", name="noarg", args=None)]))
-        _, tail2 = c2.finalize()
-        assert tail2 and tail2[0].args == {}
-
-    def test_malformed_tail_args_no_incremental_but_authoritative_keeps_langchain_semantics(self):
-        """R14#4 分歧 fixture：parse_partial_json 可救回（'{"a": 1'→{"a": 1}）但
-        strict json.loads 拒绝 → 零增量发射；权威合并消息仍按 LangChain 自身
-        语义处置（本测试杀死「collector 偷读 .tool_calls」的规避实现）。"""
+    @pytest.mark.parametrize("call_id,name", [(None, "f"), ("a", None)])
+    def test_missing_identity_cannot_execute(self, call_id, name):
         c = ToolCallStreamCollector()
-        c.ingest(_chunk([_tcc(0, id="a", name="f", args='{"a": 1')]))  # 无闭括号
-        final, tail = c.finalize()
-        assert tail == [], "strict json.loads 失败 → 不发增量 CALLING"
-        # 权威产物：与 chunk-sum 基线逐字段一致（LangChain parse_partial_json
-        # 可能把它救进 .tool_calls——那是执行侧既有语义，collector 不干预）
-        baseline = _chunk([_tcc(0, id="a", name="f", args='{"a": 1')])
-        assert final.tool_calls == baseline.tool_calls
-        assert final.invalid_tool_calls == baseline.invalid_tool_calls
+        c.ingest(_chunk([_tcc(0, id=call_id, name=name, args="{}")]))
+        with pytest.raises(ServerRequestsError, match="identity"):
+            c.finalize()
 
-    def test_completed_without_id_or_name_not_emitted(self):
+    def test_duplicate_final_id_rejects_batch(self):
         c = ToolCallStreamCollector()
-        c.ingest(_chunk([_tcc(0, id=None, name="f", args="{}")]))
-        _, tail = c.finalize()
-        assert tail == []
-
-        c2 = ToolCallStreamCollector()
-        c2.ingest(_chunk([_tcc(0, id="a", name=None, args="{}")]))
-        _, tail2 = c2.finalize()
-        assert tail2 == []
-
-    def test_duplicate_final_id_second_not_emitted(self):
-        """R2#4 修：显式捕获 ingest 返回——精确证明「后者不发」而非计数上界。"""
-        c = ToolCallStreamCollector()
-        first = c.ingest(_chunk([_tcc(0, id="dup", name="f", args="{}")]))
-        assert first == []                       # 尚在累积
+        c.ingest(_chunk([_tcc(0, id="dup", name="f", args="{}")]))
         switched = c.ingest(_chunk([_tcc(1, id="dup", name="f", args="{}")]))
-        assert [t.tool_call_id for t in switched] == ["dup"], \
-            "第一个 dup 在 index 切换点完成发射"
-        _, tail = c.finalize()
-        assert tail == [], "重复 final id：第二个绝不发增量 CALLING（§5.2）"
+        assert [t.tool_call_id for t in switched] == ["dup"]
+        with pytest.raises(ServerRequestsError, match="identity"):
+            c.finalize()
 
     def test_usage_only_chunk_joins_sum_skips_dispatch(self):
         c = ToolCallStreamCollector()
@@ -117,8 +94,8 @@ class TestFailureModeTable:
         assert [t.tool_call_id for t in done] == ["a"]
         # index 0 在关闭后迟到 → 降级：此后零增量发射（已发的不撤回）
         c.ingest(_chunk([_tcc(0, args='{"late": true}')]))
-        _, tail = c.finalize()
-        assert tail == [], "降级后不再发增量（b 的尾部完成被抑制）"
+        with pytest.raises(ServerRequestsError, match="arguments"):
+            c.finalize()
         assert c.degraded is True
 
 

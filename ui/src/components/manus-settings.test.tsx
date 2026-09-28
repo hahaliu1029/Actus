@@ -1,10 +1,14 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { configApi } from "@/lib/api/config";
+import type { FileUnderstandingConfig } from "@/lib/api/types";
 
 type SettingsState = {
   llmConfig: {
     base_url: string;
+    provider?: string | null;
+    supports_response_format?: boolean;
     model_name: string;
     api_type: "chat_completions" | "responses" | "auto";
     temperature: number;
@@ -39,6 +43,8 @@ type SettingsState = {
   isSkillRiskPolicyUpdating: boolean;
   loadAll: ReturnType<typeof vi.fn>;
   updateLLMConfig: ReturnType<typeof vi.fn>;
+  fileUnderstanding?: FileUnderstandingConfig | null;
+  updateFileUnderstandingConfig?: ReturnType<typeof vi.fn>;
   updateAgentConfig: ReturnType<typeof vi.fn>;
   addMCPServer: ReturnType<typeof vi.fn>;
   deleteMCPServer: ReturnType<typeof vi.fn>;
@@ -160,6 +166,7 @@ const settingsState: SettingsState = {
 };
 
 const mockIsAdmin = vi.fn(() => true);
+const originalLLMConfig = settingsState.llmConfig;
 
 vi.mock("@/lib/store/settings-store", () => ({
   // ExtensionsOverview 的 unmount cleanup 会调
@@ -200,6 +207,70 @@ vi.mock("@/lib/store/session-store", () => ({
 }));
 
 import { ManusSettings } from "./manus-settings";
+
+describe("模型接入配置契约", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockIsAdmin.mockReturnValue(true);
+    settingsState.llmConfig = originalLLMConfig ? { ...originalLLMConfig } : null;
+    settingsState.isLoading = false;
+    settingsState.updateLLMConfig.mockClear();
+    settingsState.fileUnderstanding = {
+      vision_fallback: { enabled: true, base_url: "https://proxy.example.test/v1", model_name: "claude-sonnet-4-6", api_type: "chat_completions", provider: "anthropic_compat", supports_response_format: false },
+      audio: { provider: "disabled", openai_base_url: "", openai_model: "" },
+      video: { max_keyframes: 5, extract_audio: false, frame_strategy: "uniform", scene_threshold: 0.3 },
+    };
+    settingsState.updateFileUnderstandingConfig = vi.fn();
+  });
+
+  it("显示显式兼容策略且修改地址会清除旧策略", async () => {
+    settingsState.llmConfig = { ...settingsState.llmConfig!, provider: "glm" };
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+    await openLLMTab();
+    expect(screen.getByLabelText("模型兼容策略")).toHaveValue("glm");
+    await user.type(screen.getByLabelText("提供商基础地址（base_url）"), "/new");
+    expect(screen.getByLabelText("模型兼容策略")).toHaveValue("");
+    await user.selectOptions(screen.getByLabelText("模型兼容策略"), "anthropic_compat");
+    await user.click(screen.getByRole("switch", { name: "支持 response_format" }));
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(settingsState.updateLLMConfig).toHaveBeenCalledWith(expect.objectContaining({ provider: "anthropic_compat", supports_response_format: false }));
+  });
+
+  it("模型配置加载失败时禁用默认值保存与测试", async () => {
+    settingsState.llmConfig = null;
+    render(<ManusSettings />);
+    await openLLMTab();
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "测试连接" })).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("当前模型配置尚未加载");
+    expect(settingsState.updateLLMConfig).not.toHaveBeenCalled();
+  });
+
+  it("测试当前表单而不保存，修改后不再显示旧的通过结果", async () => {
+    const probe = vi.spyOn(configApi, "testLLMConnection").mockResolvedValue({ success: true, provider: "openai_official", api_type: "chat_completions", message: "基础请求通过；配置尚未保存。" });
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+    await openLLMTab();
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(probe).toHaveBeenCalledWith(expect.objectContaining({ model_name: "gpt-4o" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("基础请求通过");
+    expect(settingsState.updateLLMConfig).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText("模型名"), "-new");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("视觉模型独立兼容策略和 response_format 随保存提交", async () => {
+    const user = userEvent.setup();
+    render(<ManusSettings />);
+    await user.click(screen.getAllByRole("button")[0]);
+    await user.click(screen.getByRole("button", { name: "文件理解" }));
+    expect(screen.getByLabelText("视觉模型兼容策略")).toHaveValue("anthropic_compat");
+    expect(screen.getByRole("switch", { name: "视觉模型支持 response_format" })).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(settingsState.updateFileUnderstandingConfig).toHaveBeenCalledWith(expect.objectContaining({ vision_fallback: expect.objectContaining({ provider: "anthropic_compat", supports_response_format: false }) }));
+  });
+});
 
 async function openSkillTab() {
   const user = userEvent.setup();

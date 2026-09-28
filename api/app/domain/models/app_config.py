@@ -2,8 +2,21 @@ import uuid
 from enum import Enum
 import re
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+
+
+def validate_llm_base_url(value: str) -> str:
+    """Keep provider-specific API prefixes; reject operation URLs and URL extras."""
+    normalized = str(HttpUrl(value))
+    url = urlsplit(normalized)
+    path = unquote(url.path).rstrip("/").lower()
+    if path.endswith(("/chat/completions", "/responses")):
+        raise ValueError("请填写 API 基础地址，不要包含 /chat/completions 或 /responses")
+    if url.query or url.fragment or url.username or url.password:
+        raise ValueError("API 基础地址不能包含查询参数、片段或用户凭据")
+    return normalized
 
 
 class LLMConfig(BaseModel):
@@ -17,7 +30,7 @@ class LLMConfig(BaseModel):
     provider: str | None = None
     """A7: provider_id (see provider_profiles/ constants: kimi_k2 / kimi_k2_6 /
     deepseek_chat / deepseek_reasoner / dashscope_qwen / dashscope_qwen_vl /
-    anthropic_compat / gemini_compat / minimax / glm / openai_official /
+    anthropic_compat / gemini_compat / minimax / glm / glm_5_2 / glm_5_2_coding / openai_official /
     generic_openai).
 
     A7 P1 (2026-04-23): DashScope 拆 text / vl 两个 profile；当 base_url 命中
@@ -115,6 +128,11 @@ class LLMConfig(BaseModel):
     )  # B5 C9 / M2-PR0: system prompt token 预算上限。PromptAssembler 用这个硬封顶 section 装配结果，
     # compute_effective_window() 把它从 context_window 里扣掉，留给 history 的预算。
     # M2-PR0 bump 3500→10000 为 memory sections (user/rule/fact_index) 留出空间。
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def validate_base_url(cls, value: Any) -> str:
+        return validate_llm_base_url(str(value))
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):
@@ -390,6 +408,14 @@ class VisionFallbackConfig(BaseModel):
     api_key: str = ""
     model_name: str = ""
     api_type: Literal["chat_completions", "responses", "auto"] = "chat_completions"
+    provider: str | None = None
+    supports_response_format: bool = True
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def validate_base_url(cls, value: Any) -> str:
+        value = str(value).strip()
+        return validate_llm_base_url(value) if value else ""
 
 
 class AudioProcessorConfig(BaseModel):

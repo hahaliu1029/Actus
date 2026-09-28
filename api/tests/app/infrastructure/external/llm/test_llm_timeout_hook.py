@@ -52,7 +52,7 @@ def _make_responses_api_response(content: str = "ok") -> SimpleNamespace:
     content_item = {"type": "output_text", "text": content}
     output_item = {"type": "message", "role": "assistant", "content": [content_item]}
     return SimpleNamespace(
-        model_dump=lambda: {"output": [output_item], "usage": {}},
+        model_dump=lambda: {"status": "completed", "output": [output_item], "usage": {}},
     )
 
 
