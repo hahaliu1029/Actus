@@ -106,8 +106,8 @@
     --input: oklch(0.91 0 0);
     --ring: oklch(0.52 0 0);
     /* Semantic surfaces — layered backgrounds */
-    --surface-1: oklch(0.975 0.002 80);
-    --surface-2: oklch(0.965 0.002 80);
+    --surface-1: #ffffff;
+    --surface-2: #f7f7f8;
     --surface-3: oklch(0.945 0 0);
     /* Brand accent — neutral with depth */
     --accent-brand: oklch(0.28 0.02 260);
@@ -121,7 +121,7 @@
     --chart-4: oklch(0.828 0.189 84.429);
     --chart-5: oklch(0.769 0.188 70.08);
     /* Sidebar */
-    --sidebar: oklch(0.985 0 0);
+    --sidebar: #f7f7f8;
     --sidebar-foreground: oklch(0.13 0 0);
     --sidebar-primary: oklch(0.16 0 0);
     --sidebar-primary-foreground: oklch(0.99 0 0);
@@ -140,15 +140,15 @@
 .dark {
     --background: oklch(0.13 0 0);
     --foreground: oklch(0.96 0 0);
-    --card: oklch(0.17 0 0);
+    --card: #1d1e20;
     --card-foreground: oklch(0.96 0 0);
-    --popover: oklch(0.17 0 0);
+    --popover: #242527;
     --popover-foreground: oklch(0.96 0 0);
     --primary: oklch(0.93 0 0);
     --primary-foreground: oklch(0.13 0 0);
     --secondary: oklch(0.22 0 0);
     --secondary-foreground: oklch(0.93 0 0);
-    --muted: oklch(0.22 0 0);
+    --muted: #262729;
     --muted-foreground: oklch(0.65 0 0);
     --accent: oklch(0.22 0 0);
     --accent-foreground: oklch(0.93 0 0);
@@ -158,8 +158,8 @@
     --border-strong: oklch(1 0 0 / 0.15);
     --input: oklch(1 0 0 / 0.1);
     --ring: oklch(0.55 0 0);
-    --surface-1: oklch(0.15 0 0);
-    --surface-2: oklch(0.17 0 0);
+    --surface-1: #101112;
+    --surface-2: #191a1c;
     --surface-3: oklch(0.20 0 0);
     --accent-brand: oklch(0.78 0.02 260);
     --accent-brand-foreground: oklch(0.13 0 0);
@@ -169,7 +169,7 @@
     --chart-3: oklch(0.769 0.188 70.08);
     --chart-4: oklch(0.627 0.265 303.9);
     --chart-5: oklch(0.645 0.246 16.439);
-    --sidebar: oklch(0.15 0 0);
+    --sidebar: #191a1c;
     --sidebar-foreground: oklch(0.96 0 0);
     --sidebar-primary: oklch(0.93 0 0);
     --sidebar-primary-foreground: oklch(0.13 0 0);
@@ -205,12 +205,164 @@
     to { opacity: 1; transform: scale(1); }
 }
 
+/* Companion motion stays local; streamed text and historical messages never replay. */
+.actus-companion {
+    --gaze-x: 0px;
+    --gaze-y: 0px;
+    width: 96px;
+    height: 96px;
+    flex-shrink: 0;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.actus-companion-float {
+    transform-origin: 64px 104px;
+    animation: companion-breathe 5.6s ease-in-out infinite;
+}
+
+.actus-companion-shadow {
+    transform-origin: 64px 117px;
+    animation: companion-shadow 5.6s ease-in-out infinite;
+}
+
+.actus-companion-body {
+    transform-origin: 64px 104px;
+    transition: transform 450ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.actus-companion-face {
+    transform: translate(var(--gaze-x), var(--gaze-y));
+    transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.actus-companion-eyes {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: companion-blink 6.8s ease-in-out infinite;
+}
+
+.actus-companion-smile {
+    opacity: 0.12;
+    transition: opacity 220ms ease-out;
+}
+
+.actus-companion-hand {
+    opacity: 0;
+    transform-box: fill-box;
+    transform-origin: 15% 90%;
+}
+
+.actus-companion:is(:hover, :focus-visible, [data-greeting="true"]) .actus-companion-smile,
+.actus-home:has(.actus-composer textarea:focus) .actus-companion-smile {
+    opacity: 1;
+}
+
+.actus-home:has(.actus-composer textarea:focus) .actus-companion-body {
+    transform: rotate(-5deg) translateY(2px);
+}
+
+.actus-home:has(.actus-composer textarea:focus) .actus-companion-face {
+    transform: translate(2px, 5px);
+}
+
+.actus-companion[data-greeting="true"] .actus-companion-hand {
+    opacity: 1;
+    animation: companion-wave 900ms ease-in-out;
+}
+
+.actus-companion[data-greeting="true"] .actus-companion-body {
+    animation: companion-hello 900ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.actus-composer {
+    transition: border-color 200ms ease-out, box-shadow 240ms ease-out, transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.actus-composer:focus-within {
+    transform: translateY(-2px);
+}
+
+.actus-send { transition-duration: 220ms; }
+.actus-send:disabled { transform: scale(0.92); }
+.actus-action-icon { display: flex; animation: action-appear 180ms ease-out; }
+
+.actus-suggestion {
+    transition: background-color 160ms, border-color 160ms, color 160ms, transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (hover: hover) {
+    .actus-suggestion:hover { transform: translateY(-2px); }
+}
+.actus-suggestion:active { transform: translateY(0) scale(0.97); }
+
+.actus-panel-enter { animation: workspace-appear 260ms cubic-bezier(0.22, 1, 0.36, 1); }
+
+.actus-thinking { display: inline-flex; align-items: center; gap: 3px; height: 16px; }
+.actus-thinking i {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: thinking-dot 1.2s ease-in-out infinite;
+}
+.actus-thinking i:nth-child(2) { animation-delay: 140ms; }
+.actus-thinking i:nth-child(3) { animation-delay: 280ms; }
+
+[data-motion-paused="true"] .actus-motion-loop { animation-play-state: paused; }
+
+@keyframes companion-breathe {
+    0%, 100% { transform: translateY(0) rotate(-2deg) scale(1); }
+    50% { transform: translateY(-5px) rotate(2deg) scale(1.015, 1.025); }
+}
+@keyframes companion-shadow {
+    0%, 100% { transform: scaleX(1); opacity: 0.09; }
+    50% { transform: scaleX(0.82); opacity: 0.05; }
+}
+@keyframes companion-blink {
+    0%, 42%, 46%, 72%, 76%, 100% { transform: scaleY(1); }
+    44%, 74% { transform: scaleY(0.1); }
+}
+@keyframes companion-wave {
+    0%, 100% { transform: rotate(0); }
+    20%, 60% { transform: rotate(-28deg); }
+    40%, 80% { transform: rotate(15deg); }
+}
+@keyframes companion-hello {
+    0%, 100% { transform: rotate(0) translateY(0); }
+    30% { transform: rotate(-8deg) translateY(-4px); }
+    65% { transform: rotate(5deg) translateY(-2px); }
+}
+@keyframes action-appear {
+    from { opacity: 0; transform: scale(0.65); }
+    to { opacity: 1; transform: scale(1); }
+}
+@keyframes workspace-appear {
+    from { opacity: 0; transform: translateX(12px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+@keyframes thinking-dot {
+    0%, 60%, 100% { opacity: 0.4; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-3px); }
+}
+
 /* ─── Reduced motion ─── */
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
+    }
+    .actus-motion-loop,
+    .actus-companion-body,
+    .actus-companion-hand {
+        animation: none !important;
+    }
+    .actus-companion-face,
+    .actus-companion-body,
+    .actus-composer,
+    .actus-suggestion {
+        transform: none !important;
     }
 }
 

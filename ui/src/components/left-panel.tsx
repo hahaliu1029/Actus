@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Moon, Plus, RotateCcw, Sun, Trash } from "lucide-react";
+import { MessageCircle, Moon, Plus, RotateCcw, Search, Sun, Trash, X } from "lucide-react";
 import { useTheme } from "next-themes";
 
 import { StatusIndicator } from "@/components/status-indicator";
+import { ActusMark } from "@/components/actus-mark";
+import { Sidebar, SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -44,6 +46,9 @@ function getBackgroundPhaseLabel(
 export function LeftPanel() {
   const router = useRouter();
   const pathname = usePathname();
+  const { setOpenMobile } = useSidebar();
+  const [search, setSearch] = useState("");
+  const [creating, setCreating] = useState(false);
 
   // C1a: filter probe child sessions (parent_session_id non-null) out of
   // the LeftPanel list view.
@@ -100,10 +105,26 @@ export function LeftPanel() {
   const isDarkMode = resolvedTheme === "dark";
   const themeLabel =
     resolvedTheme == null ? "切换主题" : isDarkMode ? "浅色模式" : "深色模式";
+  const searchTerm = search.trim().toLocaleLowerCase();
+  const visibleSessions = sessions.filter((session) =>
+    `${session.title || ""} ${session.latest_message || ""}`.toLocaleLowerCase().includes(searchTerm)
+  );
+
+  const navigate = (path: string) => {
+    router.push(path);
+    setOpenMobile(false);
+  };
 
   const handleCreate = async () => {
-    const createdId = await createSession();
-    router.push(`/sessions/${createdId}`);
+    setCreating(true);
+    try {
+      const createdId = await createSession();
+      navigate(`/sessions/${createdId}`);
+    } catch (error) {
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "新建对话失败，请重试" });
+    } finally {
+      setCreating(false);
+    }
   };
 
   const handleDelete = async (sessionId: string) => {
@@ -130,36 +151,42 @@ export function LeftPanel() {
   };
 
   return (
-    <aside className="hidden h-screen w-[280px] border-r border-border bg-card p-3 md:flex md:flex-col">
+    <Sidebar className="border-border-subtle">
+    <aside className="flex h-full min-h-0 flex-col px-3 pb-3 pt-4" aria-label="对话导航">
+      <div className="mb-6 flex items-center justify-between px-2">
+        <button onClick={() => navigate("/")} className="flex items-center gap-2.5 rounded-lg text-lg font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-ring" aria-label="Actus 主页">
+          <ActusMark className="size-8" />Actus
+        </button>
+        <SidebarTrigger aria-label="收起对话列表" className="size-8 rounded-full text-muted-foreground" />
+      </div>
       <button
         onClick={() => {
           void handleCreate();
         }}
-        className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-border px-3 py-2 text-sm text-foreground/80 transition-colors hover:bg-accent"
+        disabled={creating}
+        className="mb-3 flex w-full items-center gap-2.5 rounded-xl border border-border bg-card px-3 py-2.5 text-sm font-medium text-foreground/90 transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"
       >
-        <Plus size={16} /> 新建任务
+        <Plus size={17} /> {creating ? "正在创建…" : "新建对话"}
       </button>
 
-      {backgroundQuota ? (
-        <div className="mb-2 flex items-center justify-between border-b border-border pb-2 text-[11px] text-muted-foreground">
-          <span>后台额度</span>
-          <span className="font-medium text-foreground">
-            {backgroundQuota.user_used}/{backgroundQuota.user_limit}
-          </span>
-          <span>
-            全局 {backgroundQuota.system_used}/{backgroundQuota.system_limit}
-          </span>
-        </div>
-      ) : null}
+      <div className="mb-6 flex items-center gap-2 rounded-xl px-3 py-2 text-muted-foreground focus-within:bg-card focus-within:ring-1 focus-within:ring-border-strong">
+        <Search size={15} className="shrink-0" />
+        <input aria-label="搜索对话" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索对话" className="w-full min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-foreground" />
+        {search ? <button onClick={() => setSearch("")} aria-label="清除搜索" className="rounded hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"><X size={14} /></button> : null}
+      </div>
+      <h2 className="mb-2 px-3 text-[11px] font-medium text-muted-foreground">最近对话</h2>
 
-      <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+      <div className="min-h-0 flex-1 space-y-1 overflow-y-auto" aria-label="最近对话列表">
         {isLoadingSessions ? (
           <div className="rounded-xl border border-border bg-muted px-3 py-2 text-sm text-muted-foreground">
             正在加载会话...
           </div>
         ) : null}
 
-        {sessions.map((session) => {
+        {!isLoadingSessions && visibleSessions.length === 0 ? (
+          <p className="px-3 py-6 text-center text-xs leading-6 text-muted-foreground">{searchTerm ? "没有找到匹配的对话，试试其他关键词。" : "从一个新对话开始。你的想法和进展会留在这里。"}</p>
+        ) : null}
+        {visibleSessions.map((session) => {
           const backgroundSnapshot =
             session.supervisor_snapshot?.execution_mode === "background"
               ? session.supervisor_snapshot
@@ -171,20 +198,24 @@ export function LeftPanel() {
           return (
             <div
               key={session.session_id}
-              className={`group rounded-xl border px-3 py-2 transition-colors duration-150 ${
+              className={`group rounded-xl border px-3 py-3 transition-colors duration-150 ${
                 currentSessionId === session.session_id
-                  ? "border-border-strong bg-accent"
-                  : "border-transparent hover:border-border hover:bg-accent/60"
+                  ? "border-border bg-accent"
+                  : "border-transparent hover:bg-accent/70"
               }`}
             >
               <button
-                onClick={() => router.push(`/sessions/${session.session_id}`)}
-                className="w-full text-left"
+                onClick={() => navigate(`/sessions/${session.session_id}`)}
+                aria-current={currentSessionId === session.session_id ? "page" : undefined}
+                className="w-full rounded text-left focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring"
               >
-                <p className="truncate text-sm font-medium text-foreground">
+                <p className="flex items-center gap-2 text-sm font-medium text-foreground">
+                  <MessageCircle size={14} className="shrink-0 text-muted-foreground" />
+                  <span className="truncate">
                   {session.title || "未命名会话"}
+                  </span>
                 </p>
-                <p className="truncate text-xs text-muted-foreground">
+                <p className="mt-1.5 truncate text-xs text-muted-foreground">
                   {session.latest_message || "暂无消息"}
                 </p>
               </button>
@@ -207,7 +238,7 @@ export function LeftPanel() {
                   onClick={() => {
                     setDeletingSessionId(session.session_id);
                   }}
-                  className="invisible rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive group-hover:visible"
+                  className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:outline-2 focus-visible:outline-ring md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100"
                   aria-label="删除会话"
                 >
                   <Trash size={14} />
@@ -240,10 +271,17 @@ export function LeftPanel() {
         })}
       </div>
 
-      <div className="mt-2 border-t border-border pt-2">
+      <div className="mt-3 border-t border-border-subtle pt-3">
+        {backgroundQuota ? (
+          <div className="mb-2 flex items-center gap-2 px-3 text-[10px] text-muted-foreground">
+            <span>后台额度</span>
+            <span>{backgroundQuota.user_used}/{backgroundQuota.user_limit}</span>
+            <span className="ml-auto">全局 {backgroundQuota.system_used}/{backgroundQuota.system_limit}</span>
+          </div>
+        ) : null}
         <button
           onClick={() => setTheme(isDarkMode ? "light" : "dark")}
-          className="relative flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="relative flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
         >
           <span className="relative size-4">
             <Sun
@@ -286,5 +324,6 @@ export function LeftPanel() {
         </DialogContent>
       </Dialog>
     </aside>
+    </Sidebar>
   );
 }

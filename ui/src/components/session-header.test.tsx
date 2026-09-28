@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render as renderComponent, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -77,13 +77,23 @@ vi.mock("@/components/manus-settings", () => ({
   ManusSettings: () => <button type="button">设置</button>,
 }));
 
+vi.mock("@/components/session-cost-summary", () => ({
+  SessionCostSummary: ({ sessionId }: { sessionId: string }) => (
+    <span data-testid="session-cost-summary">费用：{sessionId}</span>
+  ),
+}));
+
+import { Sidebar, SidebarProvider } from "@/components/ui/sidebar";
 import { SessionHeader } from "./session-header";
+
+const render = (element: React.ReactNode) =>
+  renderComponent(element, { wrapper: SidebarProvider });
 
 describe("SessionHeader", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockUseIsMobile.mockReturnValue(false);
-    mockSessionState.currentSession = { title: "任务标题", status: "running" };
+    mockSessionState.currentSession = { session_id: "sid-1", title: "任务标题", status: "running" };
     mockStopSession.mockResolvedValue(undefined);
     mockDeleteSession.mockResolvedValue(undefined);
     mockFetchSessionById.mockResolvedValue(undefined);
@@ -93,19 +103,29 @@ describe("SessionHeader", () => {
     });
   });
 
-  it("桌面端显示返回主页、设置、退出登录、停止、删除", () => {
+  it("桌面端聚焦标题、状态和费用，低频操作收进更多菜单", async () => {
+    const user = userEvent.setup();
     render(<SessionHeader sessionId="sid-1" />);
 
-    expect(screen.getByRole("link", { name: "返回主页" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "任务标题" })).toBeInTheDocument();
+    expect(screen.getByText("执行中")).toBeInTheDocument();
+    expect(screen.getByTestId("session-cost-summary")).toHaveTextContent("sid-1");
     expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "退出登录" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "删除" })).toBeInTheDocument();
+    expect(screen.queryByText("会话 ID：sid-1")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "删除" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "更多操作" }));
+    expect(screen.getByText("会话 ID：sid-1")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "返回主页" })).toHaveAttribute("href", "/");
+    expect(screen.getByRole("menuitem", { name: "退出登录" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "删除" })).toBeInTheDocument();
   });
 
-  it("移动端通过更多菜单触发退出登录和停止操作", async () => {
+  it("移动端通过更多菜单退出登录，停止仍可直接操作", async () => {
     const user = userEvent.setup();
     mockUseIsMobile.mockReturnValue(true);
+    mockSessionState.currentSession = { session_id: "sid-2", title: "任务标题", status: "running" };
     render(<SessionHeader sessionId="sid-2" />);
 
     // 点击更多操作按钮打开菜单
@@ -116,13 +136,35 @@ describe("SessionHeader", () => {
     const logoutMenuItem = await screen.findByRole("menuitem", { name: "退出登录" });
     await user.click(logoutMenuItem);
 
-    // 再次打开菜单点击停止
-    await user.click(moreButton);
-    const stopMenuItem = await screen.findByRole("menuitem", { name: "停止" });
-    await user.click(stopMenuItem);
+    await user.click(screen.getByRole("button", { name: "停止" }));
 
     expect(mockLogout).toHaveBeenCalledTimes(1);
     expect(mockStopSession).toHaveBeenCalledWith("sid-2");
+  });
+
+  it("移动端可从会话头打开会话侧栏", async () => {
+    const user = userEvent.setup();
+    mockUseIsMobile.mockReturnValue(true);
+    render(
+      <>
+        <Sidebar>会话历史内容</Sidebar>
+        <SessionHeader sessionId="sid-1" />
+      </>
+    );
+    expect(screen.queryByText("会话历史内容")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "打开会话侧栏" }));
+    expect(await screen.findByText("会话历史内容")).toBeVisible();
+  });
+
+  it("从菜单删除仍需确认，并删除当前路由会话", async () => {
+    const user = userEvent.setup();
+    render(<SessionHeader sessionId="sid-1" />);
+    await user.click(screen.getByRole("button", { name: "更多操作" }));
+    await user.click(screen.getByRole("menuitem", { name: "删除" }));
+    expect(mockDeleteSession).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "确认" }));
+    expect(mockDeleteSession).toHaveBeenCalledWith("sid-1");
+    expect(mockReplace).toHaveBeenCalledWith("/");
   });
 
   it("顶部不再显示主动接管入口", () => {
@@ -142,6 +184,9 @@ describe("SessionHeader", () => {
     expect(
       screen.queryByRole("button", { name: "结束接管" })
     ).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "任务标题" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "正在加载会话" })).toBeInTheDocument();
+    expect(screen.queryByTestId("session-cost-summary")).not.toBeInTheDocument();
     expect(mockEndTakeover).not.toHaveBeenCalled();
   });
 
@@ -160,7 +205,8 @@ describe("SessionHeader", () => {
     });
   });
 
-  it("currentSession 与路由一致但非 takeover 时，结束接管隐藏、停止/删除仍在(INV-B)", () => {
+  it("currentSession 与路由一致但非 takeover 时，结束接管隐藏、停止和删除入口仍可用", async () => {
+    const user = userEvent.setup();
     mockSessionState.currentSession = {
       session_id: "B",
       status: "running",
@@ -171,7 +217,8 @@ describe("SessionHeader", () => {
       screen.queryByRole("button", { name: "结束接管" })
     ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "删除" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "更多操作" }));
+    expect(screen.getByRole("menuitem", { name: "删除" })).toBeInTheDocument();
   });
 
   it("从不匹配(A)切到匹配(B,takeover)后，结束接管由隐藏变为显示", () => {
@@ -196,8 +243,7 @@ describe("SessionHeader", () => {
     ).toBeInTheDocument();
   });
 
-  it("移动端：currentSession 不匹配路由时，下拉菜单中无结束接管项", async () => {
-    const user = userEvent.setup();
+  it("移动端：currentSession 不匹配路由时，不显示结束接管", () => {
     mockUseIsMobile.mockReturnValue(true);
     mockSessionState.currentSession = {
       session_id: "A",
@@ -205,13 +251,12 @@ describe("SessionHeader", () => {
       title: "任务标题",
     };
     render(<SessionHeader sessionId="B" />);
-    await user.click(screen.getByRole("button", { name: "更多操作" }));
     expect(
-      screen.queryByRole("menuitem", { name: "结束接管" })
+      screen.queryByRole("button", { name: "结束接管" })
     ).not.toBeInTheDocument();
   });
 
-  it("移动端：currentSession 匹配路由且 takeover 时，下拉菜单显示结束接管项", async () => {
+  it("移动端：currentSession 匹配路由且 takeover 时，可直接结束接管", async () => {
     const user = userEvent.setup();
     mockUseIsMobile.mockReturnValue(true);
     mockSessionState.currentSession = {
@@ -220,13 +265,11 @@ describe("SessionHeader", () => {
       title: "任务标题",
     };
     render(<SessionHeader sessionId="B" />);
-    await user.click(screen.getByRole("button", { name: "更多操作" }));
-    expect(
-      await screen.findByRole("menuitem", { name: "结束接管" })
-    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "结束接管" }));
+    expect(mockEndTakeover).toHaveBeenCalledWith("B", { handoff_mode: "continue" });
   });
 
-  it("非回归：停止按钮始终渲染且作用于路由 sessionId(无论 currentSession 是否匹配)", async () => {
+  it("路由切换时旧会话不可触发当前路由的停止操作", async () => {
     const user = userEvent.setup();
     mockSessionState.currentSession = {
       session_id: "A",
@@ -234,7 +277,28 @@ describe("SessionHeader", () => {
       title: "任务标题",
     };
     render(<SessionHeader sessionId="B" />);
+    const stopButton = screen.getByRole("button", { name: "停止" });
+    expect(stopButton).toBeDisabled();
+    await user.click(stopButton);
+    expect(mockStopSession).not.toHaveBeenCalled();
+  });
+
+  it("已完成会话不再允许停止", async () => {
+    const user = userEvent.setup();
+    mockSessionState.currentSession = { session_id: "sid-1", title: "任务标题", status: "completed" };
+    render(<SessionHeader sessionId="sid-1" />);
+    const stopButton = screen.getByRole("button", { name: "停止" });
+    expect(stopButton).toBeDisabled();
+    await user.click(stopButton);
+    expect(mockStopSession).not.toHaveBeenCalled();
+  });
+
+  it("停止失败显示错误并恢复可重试状态", async () => {
+    const user = userEvent.setup();
+    mockStopSession.mockRejectedValueOnce(new Error("连接中断，请重试"));
+    render(<SessionHeader sessionId="sid-1" />);
     await user.click(screen.getByRole("button", { name: "停止" }));
-    expect(mockStopSession).toHaveBeenCalledWith("B");
+    expect(mockSetMessage).toHaveBeenCalledWith({ type: "error", text: "连接中断，请重试" });
+    expect(screen.getByRole("button", { name: "停止" })).toBeEnabled();
   });
 });

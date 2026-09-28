@@ -543,10 +543,10 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
   );
 
   return (
-    <section className="flex h-full min-h-[560px] flex-col rounded-3xl border border-border bg-surface-2 p-3 shadow-[var(--shadow-card)]">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h2 className="text-[32px] font-semibold tracking-tight text-foreground">Actus 的电脑</h2>
-        <div className="flex items-center gap-2">
+    <section className="flex h-full min-h-[480px] flex-col rounded-2xl border border-border-subtle bg-surface-2 p-3">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-base font-medium tracking-tight text-foreground">Actus 的电脑</h2>
+        <div className="flex flex-wrap items-center gap-2">
           {canStartTakeover && !sandboxOff ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -655,6 +655,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
               rel="noreferrer"
               className="inline-flex items-center rounded-xl border border-border bg-card p-2 text-muted-foreground transition-colors hover:bg-accent"
               title="打开实时窗口（VNC）"
+              aria-label="打开实时窗口（VNC）"
             >
               <Expand size={16} />
             </Link>
@@ -666,14 +667,15 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
         {selectedMode === "shell" ? <TerminalSquare size={14} /> : <Globe size={14} />}
         <span>
           {selectedMode === "shell"
-            ? "Actus 正在使用终端"
-            : "Actus 正在使用浏览器"}
+            ? running ? "Actus 正在使用终端" : "终端预览"
+            : running ? "Actus 正在使用浏览器" : "浏览器预览"}
         </span>
       </div>
 
       <div className="mb-3 flex items-center gap-2">
         <button
           type="button"
+          aria-pressed={selectedMode === "shell"}
           onClick={() => {
             lockAndSwitchMode("shell");
           }}
@@ -688,6 +690,7 @@ export const WorkbenchPanel = memo(function WorkbenchPanel({
         </button>
         <button
           type="button"
+          aria-pressed={selectedMode === "browser"}
           onClick={() => {
             lockAndSwitchMode("browser");
           }}

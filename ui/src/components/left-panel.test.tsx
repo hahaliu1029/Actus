@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { SidebarProvider } from "@/components/ui/sidebar";
 
 const mockPush = vi.fn();
 const storeMocks = vi.hoisted(() => ({
@@ -84,20 +85,32 @@ vi.mock("@/lib/store/ui-store", () => ({
 
 import { LeftPanel } from "./left-panel";
 
+function renderPanel() {
+  return render(<SidebarProvider><LeftPanel /></SidebarProvider>);
+}
+
 describe("LeftPanel", () => {
+  beforeEach(() => {
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+  });
+
   it("会话列表容器应使用独立纵向滚动", async () => {
-    const { container } = render(<LeftPanel />);
+    renderPanel();
 
     await screen.findByText("后台额度");
     expect(screen.getByText("测试会话")).toBeInTheDocument();
     expect(screen.getByText("执行中")).toBeInTheDocument();
     expect(screen.queryByText("running")).not.toBeInTheDocument();
-    const list = container.querySelector("aside > div.space-y-1") as HTMLElement;
+    const list = screen.getByLabelText("最近对话列表");
     expect(list.className).toContain("overflow-y-auto");
   });
 
   it("后台会话显示用户可读的队列状态", async () => {
-    render(<LeftPanel />);
+    renderPanel();
 
     await screen.findByText("后台额度");
     expect(screen.getByText("后台")).toBeInTheDocument();
@@ -108,7 +121,7 @@ describe("LeftPanel", () => {
   });
 
   it("显示后台额度读数", async () => {
-    render(<LeftPanel />);
+    renderPanel();
 
     expect(await screen.findByText("后台额度")).toBeInTheDocument();
     expect(screen.getByText("2/5")).toBeInTheDocument();
@@ -116,7 +129,7 @@ describe("LeftPanel", () => {
   });
 
   it("挂起后台会话可触发重试", async () => {
-    render(<LeftPanel />);
+    renderPanel();
 
     const retryButton = await screen.findByRole("button", { name: /重试/ });
     sessionApiMocks.getBackgroundQuota.mockClear();
@@ -126,5 +139,27 @@ describe("LeftPanel", () => {
       expect(storeMocks.retryFromSuspend).toHaveBeenCalledWith("sid-1");
       expect(sessionApiMocks.getBackgroundQuota).toHaveBeenCalled();
     });
+  });
+
+  it("搜索标题或消息，并可清除无匹配的搜索", async () => {
+    renderPanel();
+    await screen.findByText("后台额度");
+    const search = screen.getByRole("textbox", { name: "搜索对话" });
+    fireEvent.change(search, { target: { value: "最新消息" } });
+    expect(screen.getByText("测试会话")).toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "找不到的内容" } });
+    expect(screen.queryByText("测试会话")).not.toBeInTheDocument();
+    expect(screen.getByText("没有找到匹配的对话，试试其他关键词。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "清除搜索" }));
+    expect(screen.getByText("测试会话")).toBeInTheDocument();
+  });
+
+  it("新建对话后进入新会话，选择历史会话可返回", async () => {
+    renderPanel();
+    await screen.findByText("后台额度");
+    fireEvent.click(screen.getByRole("button", { name: "新建对话" }));
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/sessions/sid-2"));
+    fireEvent.click(screen.getByRole("button", { name: /测试会话 最新消息/ }));
+    expect(mockPush).toHaveBeenLastCalledWith("/sessions/sid-1");
   });
 });

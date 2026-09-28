@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 type MockSession = {
   session_id: string;
   title: string | null;
-  status: "pending" | "running" | "waiting" | "completed" | "timed_out";
+  status: "pending" | "running" | "waiting" | "completed" | "timed_out" | "takeover";
   sandbox_mode?: "always" | "on_demand" | "off";
   supervisor_snapshot?: {
     execution_mode: "foreground" | "background";
@@ -98,6 +98,7 @@ const sessionApiMocks = vi.hoisted(() => ({
   })),
   viewFile: vi.fn(async () => ({ filepath: "/tmp/file.txt", content: "" })),
 }));
+const viewport = vi.hoisted(() => ({ width: 1440 }));
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ id: "s-b" }),
@@ -142,7 +143,9 @@ vi.mock("@/components/session-task-dock", async (importOriginal) => {
 });
 
 vi.mock("@/components/workbench-panel", () => ({
-  WorkbenchPanel: () => <div data-testid="workbench-panel" />,
+  WorkbenchPanel: ({ visible }: { visible: boolean }) => (
+    <div data-testid="workbench-panel" data-visible={visible} />
+  ),
 }));
 
 vi.mock("@/lib/api/session", () => ({
@@ -150,17 +153,18 @@ vi.mock("@/lib/api/session", () => ({
 }));
 
 vi.mock("@/hooks/use-mobile", () => ({
-  useIsMobile: () => false,
+  useIsMobile: (breakpoint = 768) => viewport.width < breakpoint,
 }));
 
 vi.mock("@/components/ui/button", () => ({
   Button: ({
     children,
-    onClick,
+    ...props
   }: {
     children: React.ReactNode;
-    onClick?: () => void;
-  }) => <button onClick={onClick}>{children}</button>,
+    variant?: string;
+    size?: string;
+  } & React.ButtonHTMLAttributes<HTMLButtonElement>) => <button {...props}>{children}</button>,
 }));
 
 vi.mock("@/components/ui/dialog", () => ({
@@ -169,18 +173,6 @@ vi.mock("@/components/ui/dialog", () => ({
     <div>{children}</div>
   ),
   DialogTitle: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-}));
-
-vi.mock("@/components/ui/sheet", () => ({
-  Sheet: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  SheetContent: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  SheetDescription: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  SheetHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  SheetTitle: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 
 vi.mock("@/lib/store/transfer-store", () => ({
@@ -218,6 +210,7 @@ import SessionPage from "./page";
 
 describe("SessionPage", () => {
   beforeEach(() => {
+    viewport.width = 1440;
     Object.defineProperty(HTMLElement.prototype, "scrollTo", {
       configurable: true,
       value: vi.fn(),
@@ -284,7 +277,7 @@ describe("SessionPage", () => {
 
     render(<SessionPage />);
 
-    screen.getByRole("button", { name: /final-report\.pdf/i }).click();
+    fireEvent.click(screen.getByRole("button", { name: /final-report\.pdf/i }));
 
     await waitFor(() => {
       expect(sessionStoreState.downloadSandboxFile).toHaveBeenCalledWith(
@@ -307,10 +300,8 @@ describe("SessionPage", () => {
 
     render(<SessionPage />);
 
-    expect(screen.getByText("当前状态：")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
     expect(screen.queryByText("completed")).not.toBeInTheDocument();
-    expect(screen.queryByText("正在执行中")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("流式事件增长时只滚动事件区，不撑高外层页面", () => {
@@ -394,8 +385,6 @@ describe("SessionPage", () => {
 
     render(<SessionPage />);
 
-    expect(screen.getByText("当前状态：")).toBeInTheDocument();
-    expect(screen.getByText("执行中")).toBeInTheDocument();
     expect(screen.queryByText("running")).not.toBeInTheDocument();
 
     await waitFor(() => {
@@ -853,10 +842,11 @@ describe("SessionPage", () => {
       render(<SessionPage />);
 
       expect(screen.queryAllByTestId("workbench-panel")).toHaveLength(0);
+      expect(screen.queryByRole("button", { name: "打开工作区" })).not.toBeInTheDocument();
     });
 
     it.each<"always" | "on_demand" | undefined>(["always", "on_demand", undefined])(
-      "非 off (%s) 会话仍渲染 WorkbenchPanel（回归）",
+      "非 off (%s) 会话按需打开和收起工作区",
       (mode) => {
         sessionStoreState.currentSession = {
           session_id: "s-b",
@@ -868,11 +858,57 @@ describe("SessionPage", () => {
 
         render(<SessionPage />);
 
-        expect(
-          screen.queryAllByTestId("workbench-panel").length
-        ).toBeGreaterThan(0);
+        expect(screen.queryByTestId("workbench-panel")).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "打开工作区" }));
+        expect(screen.getByRole("complementary", { name: "工作区" })).toContainElement(
+          screen.getByTestId("workbench-panel")
+        );
+        fireEvent.click(screen.getByRole("button", { name: "收起工作区" }));
+        expect(screen.queryByTestId("workbench-panel")).not.toBeInTheDocument();
       }
     );
+
+    it.each([390, 820, 1199])("%dpx 宽度从工作区入口打开抽屉，关闭后回到对话", async (width) => {
+      viewport.width = width;
+      render(<SessionPage />);
+      expect(screen.queryByTestId("workbench-panel")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "打开工作区" }));
+      const drawer = await screen.findByRole("dialog", { name: "工作区" });
+      expect(drawer).toContainElement(screen.getByTestId("workbench-panel"));
+      expect(screen.getByTestId("workbench-panel")).toHaveAttribute("data-visible", "true");
+      expect(screen.queryByRole("complementary", { name: "工作区" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog", { name: "工作区" })).not.toBeInTheDocument();
+      });
+      expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    });
+
+    it("1200px 起工作区作为侧面板打开", () => {
+      viewport.width = 1200;
+      render(<SessionPage />);
+      fireEvent.click(screen.getByRole("button", { name: "打开工作区" }));
+      expect(screen.getByRole("complementary", { name: "工作区" })).toBeInTheDocument();
+      expect(screen.queryByRole("dialog", { name: "工作区" })).not.toBeInTheDocument();
+      expect(screen.getByTestId("workbench-panel")).toHaveAttribute("data-visible", "true");
+    });
+
+    it("中等宽度进入终端接管时会自动打开工作区抽屉", async () => {
+      viewport.width = 820;
+      sessionStoreState.currentSession = {
+        session_id: "s-b",
+        title: "B 会话",
+        status: "takeover",
+        events: [{
+          event: "control",
+          data: { takeover_id: "takeover-1", scope: "shell" },
+        }],
+      };
+      render(<SessionPage />);
+      expect(await screen.findByRole("dialog", { name: "工作区" })).toBeInTheDocument();
+      expect(screen.getByTestId("workbench-panel")).toHaveAttribute("data-visible", "true");
+    });
 
     it("off 会话中 sandbox-only 文件行照常渲染但下载与预览按钮均禁用并带 tooltip", () => {
       sessionStoreState.currentSession = {

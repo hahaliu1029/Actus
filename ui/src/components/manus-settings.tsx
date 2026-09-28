@@ -440,7 +440,7 @@ export function ManusSettings() {
   return (
     <Dialog open={open} onOpenChange={handleMainDialogOpen}>
       <DialogTrigger asChild>
-        <button className="inline-flex h-9 w-9 items-center justify-center rounded-md border text-foreground/85 transition-colors hover:bg-accent">
+        <button aria-label="设置" className="inline-flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
           <Settings size={16} />
         </button>
       </DialogTrigger>

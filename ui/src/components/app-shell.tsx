@@ -7,12 +7,14 @@ import { GlobalNotice } from "@/components/global-notice";
 import { LeftPanel } from "@/components/left-panel";
 import { TransferPanel } from "@/components/transfer-panel";
 import { SidebarProvider } from "@/components/ui/sidebar";
+import { usePageVisibility } from "@/hooks/use-page-visibility";
 
 const PUBLIC_ROUTES = new Set(["/login", "/register"]);
 
 export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) {
   const pathname = usePathname();
   const isPublicRoute = PUBLIC_ROUTES.has(pathname || "");
+  const isPageVisible = usePageVisibility();
 
   return (
     <AuthGuard>
@@ -21,13 +23,9 @@ export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) 
         <div className="min-h-screen bg-surface-1">{children}</div>
       ) : (
         <SidebarProvider
-          className="h-screen overflow-hidden"
-          style={{
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            // @ts-expect-error
-            "--sidebar-width": "300px",
-            "--sidebar-width-icon": "300px",
-          }}
+          data-motion-paused={!isPageVisible}
+          className="h-dvh min-h-0 overflow-hidden"
+          style={{ "--sidebar-width": "272px" } as React.CSSProperties}
         >
           <LeftPanel />
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-surface-1">

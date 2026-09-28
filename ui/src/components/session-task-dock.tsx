@@ -80,7 +80,7 @@ export const SessionTaskDock = memo(function SessionTaskDock({
   return (
     <div className={cn("w-full", className)}>
       <div className="mx-auto w-full max-w-4xl">
-        <div className="rounded-2xl border border-border bg-card shadow-[var(--shadow-elevated)]">
+        <div className="rounded-2xl border border-border bg-card">
           <button
             type="button"
             aria-label={expanded ? "收起任务摘要" : "展开任务摘要"}

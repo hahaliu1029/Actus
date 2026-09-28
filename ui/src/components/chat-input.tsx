@@ -485,8 +485,8 @@ export function ChatInput({
   return (
     <div
       className={cn(
-        "rounded-3xl border border-border bg-card p-3 shadow-[var(--shadow-card)] transition-all",
-        "focus-within:border-border-strong focus-within:shadow-[var(--shadow-elevated)] focus-within:ring-1 focus-within:ring-ring/20",
+        "actus-composer rounded-[28px] border border-border bg-card p-3 shadow-[var(--shadow-subtle)]",
+        "focus-within:border-border-strong focus-within:ring-2 focus-within:ring-ring/10",
         className
       )}
     >
@@ -611,6 +611,7 @@ export function ChatInput({
         <textarea
           ref={textareaRef}
           rows={1}
+          aria-label="消息"
           value={text}
           disabled={disableInput}
           onChange={(event) => setText(event.target.value)}
@@ -665,14 +666,14 @@ export function ChatInput({
                 ? "接管中，暂不支持发送消息"
                 : "分配一个任务或提问任何问题..."
           }
-          className="max-h-[220px] min-h-[38px] w-full resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
+          className="max-h-[220px] min-h-[48px] w-full resize-none bg-transparent px-3 py-2 text-base leading-7 text-foreground outline-none placeholder:text-muted-foreground md:text-[15px]"
         />
       </div>
 
       <div className="mt-2 flex items-center justify-between px-1">
         <button
           onClick={handleUploadClick}
-          className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50"
           disabled={disableInput}
           aria-label="上传文件"
         >
@@ -680,20 +681,22 @@ export function ChatInput({
         </button>
 
         <div className="flex items-center gap-2">
-          <span className="hidden text-xs text-muted-foreground sm:inline">Enter 发送，Shift+Enter 换行</span>
+          <span className="hidden text-[11px] text-muted-foreground sm:inline">Enter 发送，Shift+Enter 换行</span>
           <button
             onClick={handlePrimaryAction}
             disabled={showStopAction ? false : disableInput || !canSubmit}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground transition-all active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+            className="actus-send inline-flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-foreground transition-[opacity,transform] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
             aria-label={showStopAction ? "停止任务" : "发送"}
           >
-            {showStopAction ? (
-              <Square size={14} />
-            ) : uploading ? (
-              <Loader2 size={16} className="animate-spin" />
-            ) : (
-              <ArrowUp size={16} />
-            )}
+            <span key={showStopAction ? "stop" : uploading ? "upload" : "send"} className="actus-action-icon">
+              {showStopAction ? (
+                <Square size={14} />
+              ) : uploading ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <ArrowUp size={16} />
+              )}
+            </span>
           </button>
         </div>
       </div>

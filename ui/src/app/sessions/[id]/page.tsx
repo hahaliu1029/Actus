@@ -33,7 +33,6 @@ import {
   toDisplayImageUrl,
   toSearchThumbnail,
 } from "@/components/tool-visual";
-import { StatusIndicator } from "@/components/status-indicator";
 import { SubagentResearchButton } from "@/components/subagent-research-button";
 import { SessionTaskDock } from "@/components/session-task-dock";
 import { WorkbenchPanel } from "@/components/workbench-panel";
@@ -68,7 +67,6 @@ import {
   parseToolEventEnvelope,
 } from "@/lib/session-ui";
 import { toolCardOverrideKey } from "@/lib/tool-display";
-import { getSessionStatusMeta } from "@/lib/status-copy";
 import { t } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
@@ -319,9 +317,9 @@ function renderEventItem(
 
     if (role === "user") {
       return (
-        <div key={eventKey} className="mt-4 flex flex-col items-end">
+        <div key={eventKey} className="mt-6 flex flex-col items-end">
           <div className="mb-1 text-xs text-muted-foreground">{timeText}</div>
-          <div className="max-w-[90%] rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
+          <div className="max-w-[90%] rounded-3xl bg-muted px-5 py-3 text-sm text-foreground">
             <p className="whitespace-pre-wrap leading-7">{message || "（空消息）"}</p>
             {renderMessageAttachments(attachments, onPreviewFile)}
           </div>
@@ -336,15 +334,15 @@ function renderEventItem(
     const embeddedAttachments = extracted?.embeddedAttachments || [];
 
     return (
-      <div key={eventKey} className="mt-4">
-        <div className="mb-1 flex items-center justify-between">
+      <div key={eventKey} className="mt-7">
+        <div className="mb-2 flex items-center justify-between">
           <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground/85">
             <Bot size={16} />
             Actus
           </div>
           <span className="text-xs text-muted-foreground">{timeText}</span>
         </div>
-        <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
+        <div className="rounded-2xl py-1 text-sm leading-7 text-foreground/90">
           <MarkdownRenderer content={isPartial ? (stripXmlTags(displayMessage) || "（空消息）") : (displayMessage || "（空消息）")} />
           {renderMessageAttachments(attachments, onPreviewFile)}
           {embeddedAttachments.length > 0 ? (
@@ -747,7 +745,7 @@ export default function SessionPage() {
   const updateTransferProgress = useTransferStore((s) => s.updateProgress);
   const completeTransferTask = useTransferStore((s) => s.completeTask);
   const failTransferTask = useTransferStore((s) => s.failTask);
-  const isMobile = useIsMobile();
+  const isCompactWorkbench = useIsMobile(1200);
 
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewTitle, setPreviewTitle] = useState("预览");
@@ -764,8 +762,8 @@ export default function SessionPage() {
     src: string;
     title: string;
   } | null>(null);
-  const [desktopWorkbenchVisible, setDesktopWorkbenchVisible] = useState(true);
-  const [mobileWorkbenchOpen, setMobileWorkbenchOpen] = useState(false);
+  const [desktopWorkbenchVisible, setDesktopWorkbenchVisible] = useState(false);
+  const [workbenchSheetOpen, setWorkbenchSheetOpen] = useState(false);
   const [showMerged, setShowMerged] = useState(false);
 
   // B10: 工具卡折叠 user override — key = `${sessionId}:${tool_call_id}` (R3#3).
@@ -889,10 +887,6 @@ export default function SessionPage() {
       ),
     [eventList, visibleSession?.status]
   );
-  const currentStatusMeta = useMemo(
-    () => getSessionStatusMeta(visibleSession?.status || "pending"),
-    [visibleSession?.status]
-  );
   const sandboxDestroyed = useMemo(
     () => isSandboxDestroyed(eventList),
     [eventList]
@@ -902,7 +896,7 @@ export default function SessionPage() {
   // and sandbox-only file rows disable their download/preview actions (they
   // would 409). Absent / always / on_demand keep the current behavior.
   const sandboxOff = visibleSession?.sandbox_mode === "off";
-  const workbenchVisible = (!isMobile && desktopWorkbenchVisible) || (isMobile && mobileWorkbenchOpen);
+  const workbenchVisible = isCompactWorkbench ? workbenchSheetOpen : desktopWorkbenchVisible;
   const isCurrentSessionStreaming = Boolean(sessionId) && isChatting && chatSessionId === sessionId;
   const isBackgroundSuspended =
     visibleSession?.supervisor_snapshot?.execution_mode === "background" &&
@@ -926,7 +920,7 @@ export default function SessionPage() {
     backgroundSnapshot.retry_budget_remaining > 0;
 
   useEffect(() => {
-    if (!isMobile) {
+    if (!isCompactWorkbench) {
       return;
     }
     if (visibleSession?.status !== "takeover") {
@@ -935,8 +929,8 @@ export default function SessionPage() {
     if (takeoverMeta.takeoverScope === "browser") {
       return;
     }
-    setMobileWorkbenchOpen(true);
-  }, [isMobile, takeoverMeta.takeoverScope, visibleSession?.status]);
+    setWorkbenchSheetOpen(true);
+  }, [isCompactWorkbench, takeoverMeta.takeoverScope, visibleSession?.status]);
 
   useEffect(() => {
     if (!sessionId || !sessionRunning) {
@@ -1372,20 +1366,10 @@ export default function SessionPage() {
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <SessionHeader sessionId={sessionId} />
 
-      <div className="mx-auto flex min-h-0 w-full max-w-[1700px] flex-1 gap-4 px-4 py-4">
-        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div className="mb-3 flex items-center justify-between">
+      <div className="mx-auto flex min-h-0 w-full max-w-[1480px] flex-1 gap-6 px-4 pb-4 pt-2 sm:px-6 lg:gap-8 lg:px-8">
+        <main className="mx-auto flex min-h-0 w-full min-w-0 max-w-[800px] flex-1 flex-col">
+          <div className="mb-3 flex flex-wrap items-center justify-end gap-2">
             <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span className="inline-flex items-center gap-1">
-                <span>当前状态：</span>
-                <StatusIndicator meta={currentStatusMeta} />
-              </span>
-              {sessionRunning ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
-                  <Loader2 size={12} className="animate-spin" />
-                  正在执行中
-                </span>
-              ) : null}
               {autoDegradeSnapshot ? (
                 <span className="inline-flex max-w-full flex-wrap items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
                   <AlertCircle size={12} />
@@ -1420,24 +1404,31 @@ export default function SessionPage() {
             </div>
             <div className="flex items-center gap-2">
               <SubagentResearchButton parentSessionId={sessionId} />
-              {isMobile ? (
+              {!sandboxOff && isCompactWorkbench ? (
                 <Button
-                  variant="outline"
-                  className="rounded-xl border-border"
+                  variant="ghost"
+                  size="sm"
+                  className="rounded-full text-muted-foreground hover:text-foreground"
+                  aria-expanded={workbenchSheetOpen}
+                  aria-controls="session-workbench"
+                  onClick={() => setWorkbenchSheetOpen(true)}
                 >
                   <PanelRightOpen size={16} />
                   打开工作区
                 </Button>
-              ) : (
+              ) : !sandboxOff ? (
                 <Button
-                  variant="outline"
-                  className="rounded-xl border-border"
+                  variant="ghost"
+                  size="sm"
+                  className="rounded-full text-muted-foreground hover:text-foreground"
+                  aria-expanded={desktopWorkbenchVisible}
+                  aria-controls="session-workbench"
                   onClick={() => setDesktopWorkbenchVisible(!desktopWorkbenchVisible)}
                 >
                   {desktopWorkbenchVisible ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
-                  {desktopWorkbenchVisible ? "隐藏工作区" : "显示工作区"}
+                  {desktopWorkbenchVisible ? "收起工作区" : "打开工作区"}
                 </Button>
-              )}
+              ) : null}
             </div>
           </div>
 
@@ -1486,7 +1477,7 @@ export default function SessionPage() {
               </>
             ) : null}
             {eventList.length === 0 ? (
-              <div className="rounded-2xl border border-border bg-card p-3 text-sm text-muted-foreground">
+              <div className="flex min-h-48 items-center justify-center px-4 text-center text-sm text-muted-foreground">
                 暂无会话事件，输入消息后开始。
               </div>
             ) : (
@@ -1515,9 +1506,13 @@ export default function SessionPage() {
               )
             )}
             {isCurrentSessionStreaming ? (
-              <div className="mt-3 inline-flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
-                <Loader2 size={14} className="animate-spin" />
-                正在持续生成执行结果...
+              <div className="mt-4 inline-flex items-center gap-2 px-1 py-2 text-sm text-muted-foreground" role="status">
+                <span className="actus-thinking" aria-hidden="true">
+                  <i className="actus-motion-loop" />
+                  <i className="actus-motion-loop" />
+                  <i className="actus-motion-loop" />
+                </span>
+                正在处理…
               </div>
             ) : null}
             <SessionTaskDock
@@ -1531,7 +1526,7 @@ export default function SessionPage() {
             />
           </div>
 
-          <div className="mt-3 border-t border-border bg-surface-1 pt-3">
+          <div className="mt-3 shrink-0 bg-surface-1 pt-2">
             {sandboxDestroyed ? (
               <div className="flex flex-col items-center gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-5 text-center dark:border-red-500/30 dark:bg-red-500/10">
                 <XCircle size={24} className="text-red-500" />
@@ -1565,8 +1560,8 @@ export default function SessionPage() {
           </div>
         </main>
 
-        {!isMobile && desktopWorkbenchVisible && !sandboxOff ? (
-          <aside className="sticky top-[84px] hidden h-[calc(100vh-104px)] min-h-[620px] w-[620px] shrink-0 self-start lg:block xl:w-[660px]">
+        {!isCompactWorkbench && desktopWorkbenchVisible && !sandboxOff ? (
+          <aside id="session-workbench" aria-label="工作区" className="actus-panel-enter h-full min-h-0 w-[42%] min-w-[280px] max-w-[560px] shrink-0 overflow-y-auto">
             <WorkbenchPanel
               sessionId={sessionId}
               status={visibleSession?.status || "pending"}
@@ -1582,9 +1577,13 @@ export default function SessionPage() {
         ) : null}
       </div>
 
-      <Sheet open={mobileWorkbenchOpen} onOpenChange={setMobileWorkbenchOpen}>
-        <SheetContent side="right" className="w-full max-w-none border-l-border p-3 sm:max-w-[620px]">
-          {sandboxOff ? null : (
+      {isCompactWorkbench && !sandboxOff ? (
+        <Sheet open={workbenchSheetOpen} onOpenChange={setWorkbenchSheetOpen}>
+          <SheetContent id="session-workbench" side="right" className="w-full max-w-none overflow-y-auto border-l-border p-3 sm:max-w-[620px]">
+            <SheetHeader className="sr-only">
+              <SheetTitle>工作区</SheetTitle>
+              <SheetDescription>查看执行结果，或接管浏览器与终端。</SheetDescription>
+            </SheetHeader>
             <WorkbenchPanel
               sessionId={sessionId}
               status={visibleSession?.status || "pending"}
@@ -1593,12 +1592,12 @@ export default function SessionPage() {
               takeoverExpiresAt={takeoverMeta.takeoverExpiresAt}
               snapshots={workbenchSnapshots}
               running={sessionRunning}
-              visible={mobileWorkbenchOpen}
+              visible={workbenchVisible}
               onPreviewImage={handlePreviewImage}
             />
-          )}
-        </SheetContent>
-      </Sheet>
+          </SheetContent>
+        </Sheet>
+      ) : null}
 
       <Sheet
         open={previewOpen}

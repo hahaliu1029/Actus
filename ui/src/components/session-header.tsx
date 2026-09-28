@@ -3,11 +3,13 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { EllipsisVertical, House } from "lucide-react";
+import { Ellipsis, House, LogOut, Square, Trash2 } from "lucide-react";
 
 import { ManusSettings } from "@/components/manus-settings";
 import { SessionCostSummary } from "@/components/session-cost-summary";
+import { StatusIndicator } from "@/components/status-indicator";
 import { Button } from "@/components/ui/button";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import {
   Dialog,
   DialogContent,
@@ -20,18 +22,19 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useAuth } from "@/hooks/use-auth";
-import { useIsMobile } from "@/hooks/use-mobile";
 import { sessionApi } from "@/lib/api/session";
+import { getSessionStatusMeta } from "@/lib/status-copy";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
 export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const router = useRouter();
   const { logout } = useAuth();
-  const isMobile = useIsMobile();
   const session = useSessionStore((state) => state.currentSession);
   const stopSession = useSessionStore((state) => state.stopSession);
   const deleteSession = useSessionStore((state) => state.deleteSession);
@@ -39,6 +42,7 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const setMessage = useUIStore((state) => state.setMessage);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [takeoverSubmitting, setTakeoverSubmitting] = useState(false);
+  const [stopSubmitting, setStopSubmitting] = useState(false);
 
   // A4-0 follow-up (a): only trust currentSession when it is THIS route's
   // session. During an A→B route switch, fetchSessionById(B) is async, so
@@ -48,9 +52,21 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   const isSessionLoaded = session?.session_id === sessionId;
   const status = isSessionLoaded ? session?.status : undefined;
   const canEndTakeover = status === "takeover";
+  const canStop = status !== undefined && ["running", "waiting", "finishing", "takeover_pending", "takeover"].includes(status);
 
   const handleStop = async () => {
-    await stopSession(sessionId);
+    if (!canStop || stopSubmitting) return;
+    setStopSubmitting(true);
+    try {
+      await stopSession(sessionId);
+    } catch (error) {
+      setMessage({
+        type: "error",
+        text: error instanceof Error ? error.message : "停止任务失败",
+      });
+    } finally {
+      setStopSubmitting(false);
+    }
   };
 
   const handleDelete = async () => {
@@ -78,117 +94,85 @@ export function SessionHeader({ sessionId }: Readonly<{ sessionId: string }>) {
   };
 
   return (
-    <header className="sticky top-0 z-10 flex items-center justify-between border-b border-border bg-surface-1/95 px-4 py-3 backdrop-blur-sm">
-      <div className="min-w-0">
-        <Link
-          href="/"
-          className="mb-1 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-        >
-          <House size={13} />
-          返回主页
-        </Link>
-        <h1 className="text-base font-semibold text-foreground">
-          {session?.title || "未命名任务"}
-        </h1>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <p className="text-xs text-muted-foreground">会话 ID：{sessionId}</p>
-          <SessionCostSummary sessionId={sessionId} />
+    <header className="z-10 flex min-h-16 shrink-0 items-center justify-between gap-3 bg-surface-1 px-4 py-3 sm:px-6">
+      <div className="flex min-w-0 items-center gap-3">
+        <SidebarTrigger aria-label="打开会话侧栏" className="size-9 shrink-0 rounded-full" />
+        <div className="min-w-0">
+          <h1 className="truncate text-sm font-medium text-foreground sm:text-base">
+            {isSessionLoaded ? session?.title || "未命名任务" : "正在加载会话"}
+          </h1>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            {isSessionLoaded ? (
+              <>
+                <StatusIndicator meta={getSessionStatusMeta(status)} />
+                <SessionCostSummary key={sessionId} sessionId={sessionId} />
+              </>
+            ) : null}
+          </div>
         </div>
       </div>
-      {isMobile ? (
-        <div className="flex items-center gap-2">
-          <ManusSettings />
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="outline"
-                size="icon"
-                className="rounded-xl border-border text-foreground/80"
-                aria-label="更多操作"
-              >
-                <EllipsisVertical size={16} />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-40">
-              {canEndTakeover ? (
-                <DropdownMenuItem
-                  disabled={takeoverSubmitting}
-                  onClick={() => {
-                    void handleEndTakeover();
-                  }}
-                >
-                  结束接管
-                </DropdownMenuItem>
-              ) : null}
-              <DropdownMenuItem
-                onClick={() => {
-                  logout();
-                }}
-              >
-                退出登录
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => {
-                  void handleStop();
-                }}
-              >
-                停止
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                className="text-red-600 focus:text-red-600"
-                onClick={() => {
-                  setDeleteDialogOpen(true);
-                }}
-              >
-                删除
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      ) : (
-        <div className="flex items-center gap-2">
-          <ManusSettings />
-          {canEndTakeover ? (
+      <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+        {canEndTakeover ? (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={takeoverSubmitting}
+            className="rounded-full border-border text-foreground/80"
+            onClick={() => {
+              void handleEndTakeover();
+            }}
+          >
+            结束接管
+          </Button>
+        ) : null}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-9 rounded-full text-muted-foreground hover:text-foreground"
+          aria-label="停止"
+          title="停止任务"
+          disabled={!canStop || stopSubmitting}
+          onClick={() => {
+            void handleStop();
+          }}
+        >
+          <Square size={15} />
+        </Button>
+        <ManusSettings />
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
             <Button
-              variant="outline"
-              disabled={takeoverSubmitting}
-              className="rounded-xl border-border text-foreground/80"
-              onClick={() => {
-                void handleEndTakeover();
-              }}
+              variant="ghost"
+              size="icon"
+              className="size-9 rounded-full text-muted-foreground hover:text-foreground"
+              aria-label="更多操作"
             >
-              结束接管
+              <Ellipsis size={18} />
             </Button>
-          ) : null}
-          <Button
-            variant="outline"
-            className="rounded-xl border-border text-foreground/80"
-            onClick={() => {
-              logout();
-            }}
-          >
-            退出登录
-          </Button>
-          <Button
-            variant="outline"
-            className="rounded-xl border-border text-foreground/80"
-            onClick={() => {
-              void handleStop();
-            }}
-          >
-            停止
-          </Button>
-          <Button
-            variant="outline"
-            className="rounded-xl border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
-            onClick={() => {
-              setDeleteDialogOpen(true);
-            }}
-          >
-            删除
-          </Button>
-        </div>
-      )}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-64 rounded-xl p-1.5">
+            <DropdownMenuLabel className="break-all text-xs font-normal text-muted-foreground">
+              会话 ID：{sessionId}
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild>
+              <Link href="/">
+                <House size={15} />
+                返回主页
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => logout()}>
+              <LogOut size={15} />
+              退出登录
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" onClick={() => setDeleteDialogOpen(true)}>
+              <Trash2 size={15} />
+              删除
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
 
       <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
         <DialogContent className="max-w-md rounded-2xl border-border">
