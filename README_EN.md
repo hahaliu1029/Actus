@@ -15,6 +15,14 @@
 
 ---
 
+## Introduction Video
+
+A 55-second tour of task execution, isolated sandboxes, and human takeover in Actus.
+
+https://github.com/user-attachments/assets/796246c2-dcea-4def-89ce-9baedb2eb402
+
+[Download the original 1080p video (MP4)](assets/actus-motion.mp4?raw=true)
+
 ## Overview
 
 Actus is organized around three application runtimes:

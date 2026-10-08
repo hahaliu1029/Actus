@@ -15,6 +15,14 @@
 
 ---
 
+## 介绍视频
+
+用 55 秒了解 Actus 的任务执行、独立沙箱与人工接管。
+
+https://github.com/user-attachments/assets/796246c2-dcea-4def-89ce-9baedb2eb402
+
+[下载 1080p 原视频（MP4）](assets/actus-motion.mp4?raw=true)
+
 ## 项目概览
 
 Actus 由三个核心应用运行时组成：
